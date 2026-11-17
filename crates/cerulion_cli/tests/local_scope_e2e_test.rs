@@ -2,6 +2,9 @@
 //! Real-binary local-scope refusals and precedence over network locators.
 //! Each spawn reads a private shared-memory registry and Cerulion home.
 
+#[cfg(unix)]
+mod fresh_executable;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -36,6 +39,19 @@ fn run(root: &Path, args: &[&str], network: Option<&str>) -> Output {
 /// netd at the private netd socket, and the run fails if the command connected
 /// to it.
 fn run_with(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let (output, netd_contact) = run_watching_netd(root, args, env);
+    if let Some(contact) = netd_contact {
+        panic!(
+            "a local command reached the network daemon ({contact}); stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    output
+}
+
+/// [`run_with`]'s run, returning with the output how the command reached the
+/// stand-in netd (`None` when it did not) instead of failing on it.
+fn run_watching_netd(root: &Path, args: &[&str], env: &[(&str, &str)]) -> (Output, Option<String>) {
     #[cfg(unix)]
     let netd = StandInNetd::bind(&root.join("netd.sock"));
     let home = root.join("home");
@@ -60,19 +76,16 @@ fn run_with(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Output {
     }
     let output = command.output().expect("run the real CLI");
     #[cfg(unix)]
-    match netd.listener.accept() {
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        other => panic!(
-            "a local command connected to the network daemon ({other:?}); stderr:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        ),
-    }
+    let contact = match netd.listener.accept() {
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => None,
+        other => Some(format!("connected: {other:?}")),
+    };
     #[cfg(not(unix))]
-    assert!(
-        !root.join("netd.sock").exists(),
-        "a local command created a network-daemon socket"
-    );
-    output
+    let contact = root
+        .join("netd.sock")
+        .exists()
+        .then(|| "created a network-daemon socket".to_string());
+    (output, contact)
 }
 
 /// A listener at the private netd socket path, unlinked on drop so the next
@@ -324,36 +337,72 @@ fn schema_info_under_a_kill_switch_opens_no_session_or_daemon() {
     }
 }
 
-#[test]
-fn pair_under_the_network_kill_switch_refuses_before_discovery() {
-    // Control: with no switch, an unpinned robot name is looked up over mDNS
-    // and the miss names that lookup.
-    let root = tempfile::tempdir().unwrap();
-    let control = run_with(root.path(), &["pair", "scope-bot"], &[]);
-    let error = String::from_utf8_lossy(&control.stderr);
-    assert_eq!(control.status.code(), Some(1), "{error}");
-    assert!(error.contains("did not answer mDNS"), "{error}");
+/// The exact refusal `main.rs` prints for the hidden `cerulion pair` stub
+/// (its `PAIR_UNAVAILABLE_MSG`), as the whole of stderr. Kept as a duplicate
+/// literal on purpose: `cerulion_cli` has no lib target, so the duplicate is
+/// what pins the shipped text, and an edit to either side fails here.
+const PAIR_UNAVAILABLE: &str = "Error: code pairing is not available in this release; robots on \
+                                your account are reached by signing in with `cerulion login`\n";
 
-    for value in ["off", "typo"] {
+#[test]
+fn hidden_pair_refuses_every_spelling_before_discovery_the_switch_and_the_gate() {
+    let spellings: [&[&str]; 5] = [
+        &["pair"],
+        &["pair", "scope-bot"],
+        &["pair", "scope-bot", "--code", "SWAN-42"],
+        &["pair", "--eid", "ab", "--relay-disabled"],
+        &["pair", "--help"],
+    ];
+    let quiet_iceoryx2 = ("IOX2_LOG_LEVEL", "error");
+    for args in spellings {
+        // A signed-in machine, with no switch and under two spellings of it:
+        // the same refusal, and `run_with` fails the run had it reached netd.
+        for network in [None, Some("off"), Some("typo")] {
+            let root = tempfile::tempdir().unwrap();
+            let mut env = vec![quiet_iceoryx2];
+            if let Some(value) = network {
+                env.push(("CERULION_NETWORK", value));
+            }
+            let output = run_with(root.path(), args, &env);
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{args:?} {network:?}: {error}"
+            );
+            assert_eq!(error, PAIR_UNAVAILABLE, "{args:?} {network:?}");
+            assert!(output.stdout.is_empty(), "{args:?} {network:?}");
+        }
+        // A machine that never signed in, with no terminal: the login gate
+        // refuses a gated verb with exit 7 there (the control), so exit 2
+        // proves the stub answers above it.
         let root = tempfile::tempdir().unwrap();
+        let fresh = root.path().join("never-signed-in");
+        std::fs::create_dir_all(&fresh).unwrap();
+        let fresh = fresh.to_str().unwrap();
+        let control = run_with(
+            root.path(),
+            &["graph", "list"],
+            &[quiet_iceoryx2, ("CERULION_HOME", fresh)],
+        );
+        assert_eq!(
+            control.status.code(),
+            Some(7),
+            "the gate refuses a gated verb on this home: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
         let output = run_with(
             root.path(),
-            &["pair", "scope-bot"],
-            &[("CERULION_NETWORK", value)],
+            args,
+            &[quiet_iceoryx2, ("CERULION_HOME", fresh)],
         );
         let error = String::from_utf8_lossy(&output.stderr);
-        assert_eq!(output.status.code(), Some(1), "{value}: {error}");
-        assert!(
-            error.contains(&format!(
-                "cerulion pair reaches the robot over the network, which CERULION_NETWORK={value}"
-            )),
-            "{value}: {error}"
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "{args:?} never signed in: {error}"
         );
-        assert!(
-            error.contains("unset CERULION_NETWORK to pair"),
-            "{value}: {error}"
-        );
-        assert!(!error.contains("mDNS"), "{value}: {error}");
+        assert_eq!(error, PAIR_UNAVAILABLE, "{args:?} never signed in");
     }
 }
 
@@ -387,6 +436,261 @@ fn remote_viz_under_a_kill_switch_refuses_before_any_daemon() {
             !root.path().join("vizd.sock").exists(),
             "{name}={value}: a refused remote viz reached a vizd socket"
         );
+    }
+}
+
+/// A machine device key in the run's Cerulion home, and a script standing in
+/// for `cerulion-connectd` that writes the returned marker file when it runs
+/// and answers `{}`. Returns the script's path and the marker's.
+#[cfg(unix)]
+fn stand_in_connectd(root: &Path) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let key = home.join("desk.key");
+    std::fs::write(&key, [7u8; 32]).unwrap();
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let marker = root.join("connectd-ran");
+    let helper = root.join("connectd-helper");
+    fresh_executable::install_script(
+        &helper,
+        &format!(
+            "#!/bin/sh\nprintf ran > '{}'\nprintf '{{}}'\n",
+            marker.display()
+        ),
+    );
+    (helper, marker)
+}
+
+#[test]
+#[cfg(unix)]
+fn robot_verbs_under_the_network_switch_refuse_before_the_helper_runs() {
+    let robot = "ab".repeat(32);
+    let verbs: [(&str, Vec<&str>); 3] = [
+        (
+            "topic-publish",
+            vec![
+                "topic",
+                "pub",
+                "/scope/cmd",
+                "std_msgs/String",
+                "{data: hi}",
+            ],
+        ),
+        ("topic-snapshot", vec!["topic", "snapshot", "/scope/cam"]),
+        (
+            "service-call",
+            vec!["service", "call", "/scope/trigger", "std_srvs/srv/Trigger"],
+        ),
+    ];
+    for (verb, mut args) in verbs {
+        args.extend(["--robot", robot.as_str()]);
+        // Control: with no switch the CLI reaches the helper, so the marker's
+        // absence below is the switch's doing.
+        let root = tempfile::tempdir().unwrap();
+        let (helper, marker) = stand_in_connectd(root.path());
+        let helper = helper.to_str().unwrap();
+        let control = run_with(root.path(), &args, &[("CERULION_CONNECTD_BIN", helper)]);
+        assert!(
+            marker.exists(),
+            "{verb}: the control run did not reach the helper: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+
+        // `off`, and an unrecognized value, which fails closed: both refuse
+        // and the refusal names the value.
+        for (network, label) in [
+            ("off", "CERULION_NETWORK=off"),
+            (
+                "typo",
+                "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)",
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (helper, marker) = stand_in_connectd(root.path());
+            let helper = helper.to_str().unwrap();
+            let output = run_with(
+                root.path(),
+                &args,
+                &[
+                    ("CERULION_CONNECTD_BIN", helper),
+                    ("CERULION_NETWORK", network),
+                ],
+            );
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !marker.exists(),
+                "{verb} {network}: the helper ran: {error}"
+            );
+            assert_eq!(output.status.code(), Some(2), "{verb} {network}: {error}");
+            assert!(
+                error.contains(&format!(
+                    "--robot {robot} reaches the robot over the network, which {label} \
+                     disables; unset CERULION_NETWORK to call its {verb} verb"
+                )),
+                "{verb} {network}: {error}"
+            );
+            assert!(output.stdout.is_empty(), "{verb} {network}");
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn rcp_under_the_network_switch_refuses_before_the_helper_runs() {
+    let robot = "ab".repeat(32);
+    // Control: with no switch the CLI reaches the helper, so the marker's
+    // absence below is the switch's doing.
+    let root = tempfile::tempdir().unwrap();
+    let (helper, marker) = stand_in_connectd(root.path());
+    let helper = helper.to_str().unwrap();
+    let control = run_with(
+        root.path(),
+        &["rcp", robot.as_str()],
+        &[("CERULION_CONNECTD_BIN", helper)],
+    );
+    assert!(
+        marker.exists(),
+        "the control run did not reach the helper: {}",
+        String::from_utf8_lossy(&control.stderr)
+    );
+
+    // `off` in the variable or the flag, and an unrecognized value, which
+    // fails closed: each refuses and the refusal names the value.
+    let unrecognized =
+        "CERULION_NETWORK=typo (an unrecognized value, which fails closed to local-only)";
+    for (flag, network, label, remedy) in [
+        (
+            None,
+            Some("off"),
+            "CERULION_NETWORK=off",
+            "unset CERULION_NETWORK",
+        ),
+        (None, Some("typo"), unrecognized, "unset CERULION_NETWORK"),
+        (Some("off"), None, "--network off", "drop --network"),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (helper, marker) = stand_in_connectd(root.path());
+        let helper = helper.to_str().unwrap();
+        let mut args = vec!["rcp", robot.as_str()];
+        if let Some(flag) = flag {
+            args.extend(["--network", flag]);
+        }
+        let mut env = vec![("CERULION_CONNECTD_BIN", helper)];
+        if let Some(network) = network {
+            env.push(("CERULION_NETWORK", network));
+        }
+        let output = run_with(root.path(), &args, &env);
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(!marker.exists(), "{label}: the helper ran: {error}");
+        assert_eq!(output.status.code(), Some(2), "{label}: {error}");
+        assert!(
+            error.contains(&format!(
+                "cerulion rcp reaches the robot over the network, which {label} disables; \
+                 {remedy} to reach the robot's rcpd"
+            )),
+            "{label}: {error}"
+        );
+        assert!(output.stdout.is_empty(), "{label}");
+    }
+}
+
+#[test]
+#[cfg(all(unix, debug_assertions))]
+fn topic_pub_under_a_kill_switch_offers_nothing_on_the_lan() {
+    let args = [
+        "topic",
+        "pub",
+        "/scope/pub-local",
+        "std_msgs/String",
+        "{data: hi}",
+        "--wait-subscribers",
+        "0",
+    ];
+    let published = "published: topic=/scope/pub-local type=std_msgs/String frames=1 \
+                     subscribers=0\n";
+    // Control: with no switch the publish registers the topic with netd, so
+    // the stand-in netd is reached.
+    let root = short_tempdir();
+    let (control, contact) = run_watching_netd(root.path(), &args, &[]);
+    let log = String::from_utf8_lossy(&control.stderr);
+    assert!(contact.is_some(), "control reached no netd:\n{log}");
+    assert_eq!(String::from_utf8_lossy(&control.stdout), published, "{log}");
+
+    for switches in KILL_SWITCHES {
+        let root = short_tempdir();
+        let output = run_with(root.path(), &args, &with_markers(switches));
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{switches:?}: {log}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            published,
+            "{switches:?}"
+        );
+        assert!(!log.contains(SESSION_MARKER), "{switches:?}:\n{log}");
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn topic_pub_of_an_unknown_type_under_a_kill_switch_asks_no_robot() {
+    for switches in KILL_SWITCHES {
+        let root = tempfile::tempdir().unwrap();
+        let output = run_with(
+            root.path(),
+            &[
+                "topic",
+                "pub",
+                "/scope/pub-missing",
+                "scope_msgs/Missing",
+                "{}",
+            ],
+            &with_markers(switches),
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{switches:?}: {error}");
+        assert!(
+            error.contains("unknown message type 'scope_msgs/Missing'"),
+            "{switches:?}: {error}"
+        );
+        assert!(
+            !error.contains("no robot on the LAN served it"),
+            "{switches:?}: {error}"
+        );
+        assert!(!error.contains(SESSION_MARKER), "{switches:?}: {error}");
+        assert!(output.stdout.is_empty(), "{switches:?}");
+    }
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn topic_snapshot_under_a_kill_switch_demands_no_remote_topic() {
+    for switches in KILL_SWITCHES {
+        let root = short_tempdir();
+        let output = run_with(
+            root.path(),
+            &[
+                "topic",
+                "snapshot",
+                "/scope/snap-missing",
+                "--timeout",
+                "0.3",
+            ],
+            &with_markers(switches),
+        );
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(3), "{switches:?}: {error}");
+        assert!(
+            error.contains("'/scope/snap-missing' could not be opened within 0.3 s"),
+            "{switches:?}: {error}"
+        );
+        assert!(
+            error.contains("remote discovery is disabled by"),
+            "{switches:?}: {error}"
+        );
+        assert!(!error.contains(SESSION_MARKER), "{switches:?}: {error}");
+        assert!(!error.contains(LADDER_MARKER), "{switches:?}: {error}");
+        assert!(output.stdout.is_empty(), "{switches:?}");
     }
 }
 

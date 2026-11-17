@@ -123,7 +123,7 @@ fn expect_graph(
         prefix: "oee".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -138,7 +138,7 @@ fn expect_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
@@ -146,6 +146,7 @@ fn expect_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -356,7 +357,7 @@ fn promise_graph(
         prefix: "oep".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -371,7 +372,7 @@ fn promise_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
@@ -379,6 +380,7 @@ fn promise_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

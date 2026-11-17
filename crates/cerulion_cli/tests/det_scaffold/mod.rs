@@ -147,6 +147,7 @@ pub fn build_graph_config(shape: &Shape) -> GraphConfig {
     let input = |source: &str| InputDef {
         name: "inp".to_string(),
         source: source.to_string(),
+        ..Default::default()
     };
     GraphConfig {
         level_assignments: None,
@@ -156,7 +157,7 @@ pub fn build_graph_config(shape: &Shape) -> GraphConfig {
         prefix: GRAPH_PREFIX.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "ticker".to_string(),
@@ -165,7 +166,7 @@ pub fn build_graph_config(shape: &Shape) -> GraphConfig {
                 outputs: vec![out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "relay".to_string(),
@@ -174,7 +175,7 @@ pub fn build_graph_config(shape: &Shape) -> GraphConfig {
                 outputs: vec![out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "sink".to_string(),
@@ -210,7 +211,7 @@ pub fn build_multirate_config(shape: &Shape, slow_lidar: bool) -> GraphConfig {
         topic: None,
     };
     let source = |id: &str, node_type: &str| NodeDef {
-        fuse: None,
+        isolate: None,
         ros2: None,
         params: Default::default(),
         id: id.to_string(),
@@ -221,6 +222,7 @@ pub fn build_multirate_config(shape: &Shape, slow_lidar: bool) -> GraphConfig {
     let input = |name: &str| InputDef {
         name: name.to_string(),
         source: format!("{name}/out"),
+        ..Default::default()
     };
     GraphConfig {
         level_assignments: None,
@@ -240,7 +242,7 @@ pub fn build_multirate_config(shape: &Shape, slow_lidar: bool) -> GraphConfig {
                 },
             ),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 ros2: None,
                 params: Default::default(),
                 id: "fusion".to_string(),

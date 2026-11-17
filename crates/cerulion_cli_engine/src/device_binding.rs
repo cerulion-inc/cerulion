@@ -257,6 +257,21 @@ fn unreadable_cert(path: &std::path::Path, e: &std::io::Error) -> CliError {
     ))
 }
 
+/// Decode a cached `base64url(postcard(SignedDeviceCert))` blob, with no
+/// signature or chain check. A blob that does not decode is a loud
+/// [`CliError::Login`] naming `cerulion login`.
+pub fn decode_device_cert(cert_b64: &str) -> CliResult<SignedDeviceCert> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(cert_b64.as_bytes())
+        .map_err(|e| CliError::Login(format!("the cached device cert is not base64url: {e}")))?;
+    postcard::from_bytes(&bytes).map_err(|e| {
+        CliError::Login(format!(
+            "the cached device cert did not decode as a SignedDeviceCert: {e} \
+             (re-run `cerulion login` to refresh it)"
+        ))
+    })
+}
+
 /// Pure core: decode a `base64url(postcard(SignedDeviceCert))` blob and assert it
 /// attests `expected_device_key`, returning the verified [`DeviceBinding`]. A
 /// blob that does not decode, or a cert whose `device_key` is not this machine's key,
@@ -265,15 +280,7 @@ pub fn verify_device_binding(
     cert_b64: &str,
     expected_device_key: &[u8; 32],
 ) -> CliResult<DeviceBinding> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cert_b64.as_bytes())
-        .map_err(|e| CliError::Login(format!("the cached device cert is not base64url: {e}")))?;
-    let signed: SignedDeviceCert = postcard::from_bytes(&bytes).map_err(|e| {
-        CliError::Login(format!(
-            "the cached device cert did not decode as a SignedDeviceCert: {e} \
-             (re-run `cerulion login` to refresh it)"
-        ))
-    })?;
+    let signed = decode_device_cert(cert_b64)?;
     // The I1 device↔account binding read is the ONE shared verifier
     // (`SignedDeviceCert::account_for_device_key`) — the netd WAN dial
     // config resolves the SAME cert through it, so the two can never derive a

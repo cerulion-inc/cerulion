@@ -15,12 +15,10 @@
 //!
 //! ## Name resolution
 //!
-//! A positional ROBOT name resolves via `~/.cerulion/robots.toml` — which
-//! `cerulion pair <robot>` WRITES on a successful pairing, so a paired robot's
-//! name just works here with no flags. (`cerulion pair` additionally resolves a
-//! name LIVE from the robot's mDNS TXT `eid=` record —
-//! [`crate::mdns_discovery::resolve_robot_eid`]; `connect` uses the pinned
-//! `robots.toml` entry the pairing left behind.)
+//! A positional ROBOT name resolves via the `name = "<eid>"` pins in
+//! `~/.cerulion/robots.toml`, so a pinned robot's name just works here with no
+//! flags. No `cerulion` verb writes the file while `cerulion pair` is a hidden
+//! stub: it holds hand-written pins and any an earlier pairing wrote.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -187,8 +185,8 @@ pub fn desk_key_path() -> Option<PathBuf> {
 
 /// The default `--key-file` to hand `cerulion-connectd connect` when the user
 /// passed none: this machine's key IF one exists (a paired desk), else `None`
-/// (an unpaired desk, so an ephemeral key the robot refuses, which is the
-/// correct "pair first" signal). Never generates a key; it may write the
+/// (a desk with no key, so an ephemeral key the robot refuses, which is the
+/// correct "not on the access list" signal). Never generates a key; it may write the
 /// second name of an existing one (adoption, or the `desk.key` alias).
 ///
 /// The path handed over is [`desk_key_path`], the legacy name of the key
@@ -201,7 +199,7 @@ pub fn desk_key_path() -> Option<PathBuf> {
 ///
 /// A machine key that cannot be read, is the wrong size, or disagrees with the
 /// legacy `desk.key`.
-fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
+pub(crate) fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
     let Some(layout) = crate::auth::identity_layout() else {
         return Ok(None);
     };
@@ -221,7 +219,7 @@ fn default_connect_key_file() -> CliResult<Option<PathBuf>> {
 
 /// Load the `~/.cerulion/robots.toml` name→eid map (empty if the file is absent
 /// or unreadable — a missing file is normal).
-fn load_robots() -> BTreeMap<String, String> {
+pub(crate) fn load_robots() -> BTreeMap<String, String> {
     let Some(path) = robots_toml_path() else {
         return BTreeMap::new();
     };
@@ -260,8 +258,7 @@ pub fn resolve_eid_with(
             } else {
                 Err(CliError::Validation(format!(
                     "unknown robot '{pos}': not a 64-char-hex endpoint id and not pinned in \
-                     ~/.cerulion/robots.toml. Pair it first with `cerulion pair {pos}` (which \
-                     pins it), pass `--eid <hex>`, or add a `[robots]` entry \
+                     ~/.cerulion/robots.toml. Pass `--eid <hex>`, or add a `[robots]` entry \
                      (`{pos} = \"<64-hex-eid>\"`)."
                 )))
             }
@@ -282,8 +279,8 @@ pub fn resolve_eid_with(
 /// robot choose which cached artifact it is handed, i.e. ask for another robot's signed
 /// epoch (whose revoked account/device ids are not its business). The epoch cache is
 /// filed under "the name this desk knows the robot by", and `~/.cerulion/robots.toml`
-/// is exactly that record — written by `cerulion pair`, which pins the name→eid binding
-/// the dial then authenticates cryptographically.
+/// is exactly that record: the desk's own name→eid pins, whose binding the dial then
+/// authenticates cryptographically.
 ///
 /// Two ways a name is desk-verified:
 ///
@@ -580,12 +577,26 @@ pub fn resolve_connectd_bin() -> CliResult<PathBuf> {
     resolve_connectd_bin_from_dirs(env_override, exe_dir, resolved_dir, &|p| p.exists())
 }
 
+/// The notice `cerulion connect` prints when the kill switch keeps it off the
+/// network: `--network` (`flag`) or `CERULION_NETWORK` (`env`) at exactly
+/// `off`, the value `cerulion-connectd connect` engages the switch on (`None`
+/// = not given). `cerulion connect` then exits 0, as the helper does for the
+/// same refusal, without resolving the robot or spawning the helper. `None`
+/// when neither is `off`. PURE.
+pub fn network_refusal(flag: Option<&str>, env: Option<&str>) -> Option<&'static str> {
+    (flag == Some("off") || env == Some("off")).then_some(NETWORK_REFUSAL)
+}
+
+/// The text of [`network_refusal`].
+pub const NETWORK_REFUSAL: &str = "cerulion connect: network kill-switch engaged (--network off / \
+                                   CERULION_NETWORK=off), refusing to connect; exiting cleanly";
+
 /// Resolve the full spawn plan: the robot eid + the argv + the binary path.
 ///
 /// When the user passed no `--key-file`, this machine's paired key
 /// (`~/.cerulion/desk.key`, the same key as `identity/device.key`) is used
 /// automatically IF it exists (see
-/// `default_connect_key_file`) — so a desk paired via `cerulion pair` connects
+/// `default_connect_key_file`), so a desk on the robot's access list connects
 /// with no flags.
 pub fn plan(args: &ConnectArgs) -> CliResult<ConnectPlan> {
     // ONE read of `robots.toml` per plan. If `resolve_eid` and
@@ -756,6 +767,35 @@ fn forward_shutdown_to_child(child: &mut Child) -> Option<ExitStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `connect` refuses on exactly `off` in the flag or the variable, the
+    /// value `cerulion-connectd connect` reads; every other value connects.
+    #[test]
+    fn connect_refuses_on_exactly_off_in_the_flag_or_the_variable() {
+        let refusal = "cerulion connect: network kill-switch engaged (--network off / \
+                       CERULION_NETWORK=off), refusing to connect; exiting cleanly";
+        for (flag, env) in [
+            (Some("off"), None),
+            (None, Some("off")),
+            (Some("off"), Some("off")),
+            (Some("on"), Some("off")),
+        ] {
+            assert_eq!(
+                network_refusal(flag, env),
+                Some(refusal),
+                "{flag:?} {env:?}"
+            );
+        }
+        for (flag, env) in [
+            (None, None),
+            (Some("OFF"), None),
+            (None, Some(" off")),
+            (None, Some("")),
+            (Some("of"), Some("on")),
+        ] {
+            assert_eq!(network_refusal(flag, env), None, "{flag:?} {env:?}");
+        }
+    }
 
     fn robots(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs

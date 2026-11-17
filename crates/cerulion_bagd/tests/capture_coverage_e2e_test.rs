@@ -83,10 +83,10 @@ const HASH: u64 = 0x1420_1420_1420_1420;
 const POST_WINDOW_MS: u64 = 300;
 /// Generous liveness ceiling for every capture-side condition wait.
 const CAPTURE_DEADLINE: Duration = Duration::from_secs(60);
-/// A liveness ceiling for [`await_rescan_tap`], deliberately stated in seconds
+/// A liveness ceiling for [`await_discovered_tap`], deliberately stated in seconds
 /// rather than in units of [`DISCOVERY_RESCAN_INTERVAL`].
 const TAP_ATTACH_DEADLINE: Duration = Duration::from_secs(20);
-/// How often [`await_rescan_tap`] asks.
+/// How often [`await_discovered_tap`] asks.
 const TAP_ATTACH_POLL: Duration = Duration::from_millis(5);
 /// How long the run-binding arm's recorder runs BEFORE
 /// its window has anything in it.
@@ -166,10 +166,10 @@ fn captures(dir: &Path) -> Vec<PathBuf> {
 /// A rendezvous on the STATE the next publish depends on, never a sleep: a
 /// data-only tap requests no late-joiner history, so a frame committed before
 /// the tap attaches lands in no queue at all. Same helper, same reasoning, as
-/// `discovery_e2e_test::await_rescan_tap` — copied rather than shared because
+/// `discovery_e2e_test::await_discovered_tap` - copied rather than shared because
 /// each integration test binary compiles its own `mod common`, and hoisting a
 /// second harness into it for one caller buys nothing.
-fn await_rescan_tap(mgr: &TransportManager, topic: &str) {
+fn await_discovered_tap(mgr: &TransportManager, topic: &str) {
     let start = Instant::now();
     loop {
         if mgr.topic_subscriber_count(topic) >= 1 {
@@ -177,7 +177,7 @@ fn await_rescan_tap(mgr: &TransportManager, topic: &str) {
         }
         assert!(
             start.elapsed() < TAP_ATTACH_DEADLINE,
-            "bagd's discovery rescan never attached a tap to '{topic}' after {:?} (the rescan \
+            "bagd's discovery never attached a tap to '{topic}' after {:?} (the fallback \
              cadence is {DISCOVERY_RESCAN_INTERVAL:?}). Every frame published from here would \
              land in no queue at all, so this is a FAILURE of the recorder or of this harness — \
              not a coverage bug in the assertions below",
@@ -345,7 +345,7 @@ fn a_capture_says_which_of_its_topics_the_recorder_was_told_about_and_which_it_f
     // The CO-TENANT: a live producer nobody told this recorder about, created
     // after it armed — the shape a second graph on the machine produces.
     let mut stranger_pub = publisher(&mgr, &stranger, 256);
-    await_rescan_tap(&mgr, &stranger);
+    await_discovered_tap(&mgr, &stranger);
 
     for seq in 0..8u32 {
         declared_pub

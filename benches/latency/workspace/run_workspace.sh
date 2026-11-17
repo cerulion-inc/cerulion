@@ -230,7 +230,8 @@
 #                             Any other value is an env-contract violation
 #                             (exit 2).
 #   CERULION                  path to the cerulion binary (default: the
-#                             repo's target/release/cerulion, rebuilt here)
+#                             repo's target/release/cerulion, rebuilt here
+#                             with the cerulion-netd it spawns beside it)
 #
 # Exit codes: 0 ok · 1 hard failure (loud) · 2 env-contract violation
 #             (incl. the retired `default` leg refusal) ·
@@ -987,8 +988,16 @@ clean_iox2_state() {
 export CERULION_LOGIN_GATE=off
 CERULION="${CERULION:-$REPO_ROOT/target/release/cerulion}"
 echo "Rebuilding cerulion binary + workspace cdylibs (release) for iceoryx2 parity..."
-if ! ( cd "$REPO_ROOT" && cargo build -p cerulion_cli --release ); then
-    echo "!!! pre-sweep cerulion_cli rebuild failed — aborting (would run stale binary)" >&2
+# cerulion_netd rides the SAME cargo invocation as the CLI. Every leg serves
+# the network (no CERULION_NETWORK override, see the run command below), so
+# `graph run` spawns the `cerulion-netd` gateway from beside the binary that
+# runs it (or from CERULION_NETD_BIN), and a CLI-only build leaves no daemon
+# there: the leg fails before its first sample. One invocation builds the
+# pair the way the release does. bench.py names a missing or stale daemon,
+# beside a CERULION override or named by CERULION_NETD_BIN, before any cell
+# runs; a CERULION_NETD_BIN naming the daemon this build writes is exempt.
+if ! ( cd "$REPO_ROOT" && cargo build -p cerulion_cli -p cerulion_netd --release ); then
+    echo "!!! pre-sweep cerulion_cli + cerulion_netd rebuild failed, aborting (would run stale binaries)" >&2
     exit 1
 fi
 if ! ( cd "$SCRIPT_DIR" && cargo build --release ); then
@@ -1086,9 +1095,10 @@ file_size() { wc -c <"$1" 2>/dev/null | tr -d '[:space:]'; }
 # A POSITIVE witness that the mode this row is labeled with is the mode the
 # run EXECUTED: every worker logs one INFO line, "worker build path resolved
 # from the stamped execution mode", carrying `execution_mode=<Lockstep|FreeRun>`
-# (graph_cmd.rs). It passes the CLI's default `cerulion=info` filter for
-# workers; an exported RUST_LOG that drops cerulion INFO removes the line, and
-# the witness then fails the leg loudly rather than passing it. The log
+# (graph_cmd.rs). `graph run` and its workers default to `warn`, so RUN_CMD
+# below sets RUST_LOG=error,cerulion=info itself when none is exported; an
+# exported RUST_LOG that drops cerulion INFO removes the line, and the
+# witness then fails the leg loudly rather than passing it. The log
 # carries ANSI escapes between a field's name and its `=`, so they are
 # stripped first. Exactly RANKS lines, every one naming WANT_MODE; anything
 # else (a missing worker line, a stale binary that logs no such line, the
@@ -1253,6 +1263,12 @@ run_size_once() {
         CER_BENCH_RAW_DUMP_DIR="$CER_BENCH_RAW_DUMP_DIR"
         CER_BENCH_RAW_NAME="$CER_BENCH_RAW_NAME"
         IOX2_LOG_LEVEL=error
+        # `graph run`, its workers and its recorder default to `warn`, which
+        # hides the INFO lines this harness reads: the execution-mode witness
+        # and the host's "live loop delivery telemetry". `error` keeps the
+        # error floor for iceoryx2 and zenoh, which an explicit spec would
+        # otherwise drop. An exported RUST_LOG still wins.
+        RUST_LOG="${RUST_LOG:-error,cerulion=info}"
         # Guarded like `DMA_ENV` above, and for the same reason: under `set -u`
         # bash 3.2, which is the only bash on a stock macOS host, refuses
         # `"${ARR[@]}"` when ARR is EMPTY. `PACING_FLAGS` is empty for a pacing

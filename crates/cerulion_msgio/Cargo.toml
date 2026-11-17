@@ -1,0 +1,32 @@
+[package]
+name = "cerulion_msgio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Messages as JSON or YAML text on local shared memory: encode and publish, call a service, snapshot a camera frame, decode one message"
+readme = "README.md"
+keywords = ["robotics", "ros2", "json", "yaml", "cerulion"]
+categories = ["science::robotics", "encoding"]
+# A crates.io download carries the sources, the README, the license text and
+# this manifest.
+include = ["src/", "Cargo.toml", "README.md", "LICENSE"]
+
+[lints]
+workspace = true
+
+[dependencies]
+cerulion_core = { workspace = true }
+native_ros2_messages = { workspace = true }
+thiserror = "2"
+tracing = "0.1"
+serde_yaml = "0.9"
+serde_json = "1"
+# `snapshot` encodes a camera frame as JPEG and reads a JPEG's size.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# The robot-side `topic-snapshot` verb returns the JPEG as base64 text.
+base64 = "0.22"
+# A default snapshot file goes in a new randomly named private directory.
+tempfile = "3"

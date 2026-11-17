@@ -58,7 +58,9 @@ const VALIDATE_PARTITION_FN: &str = "pub fn validate_partition(";
 /// The seed + repair the derivation applies.
 const SEED_CALL: &str = "seed_and_repair_block_colocation(";
 /// The two derivation entry points.
-const AUTO_PARTITION_FN: &str = "pub fn auto_partition(";
+const AUTO_PARTITION_FN: &str = "pub fn auto_partition_with_options(";
+/// The public entry point: it calls [`AUTO_PARTITION_FN`] with the default options.
+const AUTO_PARTITION_WRAPPER_FN: &str = "pub fn auto_partition(";
 const BASELINE_FN: &str = "pub fn baseline_process_per_node(";
 /// The greedy fusion loop's header — everything the seed must precede.
 const GREEDY_LOOP: &str = "for &(coupling, pi, ci) in &candidates";
@@ -218,6 +220,16 @@ fn the_block_colocation_refusal_lives_inside_the_shared_partition_validator() {
 fn the_seed_is_applied_on_both_derivation_entry_points() {
     let (code, depth) = code_only(&partition_src());
     assert_eq!(depth, 0, "unbalanced block comment in partition.rs");
+    let wrapper = find_in(&code, AUTO_PARTITION_WRAPPER_FN);
+    let wrapper_end = code[wrapper + AUTO_PARTITION_WRAPPER_FN.len()..]
+        .find("\npub fn ")
+        .map(|o| wrapper + AUTO_PARTITION_WRAPPER_FN.len() + o)
+        .unwrap_or(code.len());
+    assert!(
+        code[wrapper..wrapper_end].contains("auto_partition_with_options("),
+        "`{AUTO_PARTITION_WRAPPER_FN}` does not call `auto_partition_with_options(`, \
+         so the seed check below does not cover it"
+    );
     for (fn_header, why) in [
         (
             AUTO_PARTITION_FN,

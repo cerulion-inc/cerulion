@@ -81,8 +81,8 @@
 //! | the `Box` itself | `NodeContext`, `ShutdownSignal` |
 //! | its two `IndexMap` values | `AnyPublisher`, `AnySubscriber` |
 //! | those enums' payloads | `CerulionPublisher`, `CerulionSubscriber` |
-//! | by value inside the subscriber | `SampleGate`, `DropOldestProbe`, `BlockProbe`, `BackpressureProbe`, `StreamObservation`, `FrozenSlot`, `ConsumeMode` |
-//! | by value inside the publisher | `MaxSliceLen`, `AdaptiveSizer`, `NotifyDeliveryLatch`, `OutputDiscardLatch` |
+//! | by value inside the subscriber | `SampleGate`, `DropOldestProbe`, `BlockProbe`, `DrainClipLatch`, `FailureRegimeLatch`, `BackpressureProbe`, `StreamObservation`, `FrozenSlot`, `ConsumeMode` |
+//! | by value inside the publisher | `MaxSliceLen`, `AdaptiveSizer`, `NotifyDeliveryLatch`, `OutputDiscardLatch`, `BlockSendHook` |
 //! | the v12/v16 read-outcome chain | `ReadOutcomeStage`, `StageInner`, `StagedReadOutcome`, `ReadOutcomeKind`, `ReadSiteRole`, `ReadStageRole` |
 //! | the QoS store the node drains | `QosEventStore` |
 //! | `NodeContext.transport` (`graph/node.rs`) | `TransportManager` |
@@ -169,17 +169,11 @@
 //! unchanged tree — which is a *correct* signal to re-snapshot, not a false
 //! alarm.
 //!
-//! The assumption this table used to rest on, "the same rustc compiles both
-//! host and cdylib", is no longer merely assumed: [`crate::RUSTC_FINGERPRINT`]
-//! (ABI v22) is compared across the cdylib FFI boundary at LOAD time
-//! (`DylibNodeEntry::load`) and a host/cdylib pair built by different rustc
-//! releases is refused before either side runs. That guard exists precisely
-//! because this table's size and offset pin CANNOT see every divergence: two
-//! rustc releases can agree on every struct size and offset here and still
-//! encode a niche-holding `Option::None` with a different bit pattern (rustc
-//! 1.97.0 changed it), a class of ABI break this static table is structurally
-//! blind to, since it only measures size, align and offset, never bit
-//! patterns.
+//! The stable node boundary passes fixed C descriptors and host-owned scalar
+//! leases. These Rust layouts remain internal implementation regression pins;
+//! they no longer describe values shared between the host and a plugin.
+//! `cerulion_node_abi/tests/frozen_layout.rs` pins the compiler-independent
+//! records, including their literal IDs, sizes, alignment and field offsets.
 
 use crate::CERULION_ABI_VERSION;
 
@@ -328,7 +322,7 @@ struct Expected {
 /// Asserted equal to [`crate::CERULION_ABI_VERSION`] before anything else is
 /// compared: a bump that did not re-take the snapshot is exactly as much of a
 /// defect as a layout change that did not bump.
-const EXPECTED_ABI: u32 = 28;
+const EXPECTED_ABI: u32 = 33;
 
 const IOX2_PORTS: &str =
     "embeds iceoryx2 port types by value, whose layouts come from per-OS `iceoryx2-pal-posix` \
@@ -410,6 +404,8 @@ static EXPECTED: &[Expected] = &[
             "fault_inject_publish_raw_after",
             "fault_inject_send_overflow_frame_after",
             "fault_inject_send_raw_loan",
+            // v31: the send-window test seam, `None` outside a test.
+            "block_send_hook",
             "frames_dropped_overflow",
             "frames_dropped_invariant_violation",
             "frames_dropped_send_fail",
@@ -433,14 +429,25 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS_AND_DOORBELL,
-            // Re-measured at ABI 26 on aarch64-apple-darwin, the one target this
-            // row's arm judges: the doorbell field's rank moved from 19 to 3 and
-            // the sixteen fields ranked 3 to 18 each moved up by one. No other
-            // field moved, and the field SET did not change.
+            // Re-measured at ABI 31 on aarch64-apple-darwin, the one target this
+            // row's arm judges (`dump_measured_table`): `block_send_hook` takes
+            // rank 2, and every field ranked 2 or above before it moves up by
+            // one.
             ranks: &[
-                8, 9, 0, 1, 12, 35, 6, 29, 30, 10, 28, 13, 14, 31, 15, 4, 5, 32, 16, 17, 18, 2, 19,
-                3, 11, 20, 21, 36, 33, 37, 22, 23, 24, 25, 26, 34, 7, 27,
+                9, 10, 0, 1, 13, 36, 7, 30, 31, 11, 29, 14, 15, 32, 16, 5, 6, 33, 2, 17, 18, 19, 3,
+                20, 4, 12, 21, 22, 37, 34, 38, 23, 24, 25, 26, 27, 35, 8, 28,
             ],
+        },
+    },
+    // v31: the send-window test seam the publisher holds by value. Its
+    // variants hold a `std` box or nothing.
+    Expected {
+        name: "BlockSendHook",
+        fields: &[],
+        layout: Layout::Pinned {
+            size: 16,
+            align: 8,
+            offsets: &[],
         },
     },
     Expected {
@@ -453,6 +460,9 @@ static EXPECTED: &[Expected] = &[
             "probe",
             "pending_backpressure_event",
             "fault_inject_receive_after",
+            // v30: the drain's per-frame `(sequence, token)` list, staged as
+            // `BatchFrame` records before a multi-frame read.
+            "batch_frames",
             // v18: the cached effective borrow budget — see the
             // field doc and the v18 paragraph on `CERULION_ABI_VERSION`.
             "max_borrowed_samples",
@@ -484,9 +494,13 @@ static EXPECTED: &[Expected] = &[
         ],
         layout: Layout::FieldSetOnly {
             reason: IOX2_PORTS,
+            // Re-measured at ABI 31 on aarch64-apple-darwin (`dump_measured_table`):
+            // `probe` grows with `BlockProbe` and moves from rank 10 to rank 8,
+            // and `topic` and `drain_scratch`, ranked 8 and 9 before it, each
+            // move up by one.
             ranks: &[
-                7, 10, 5, 0, 9, 6, 11, 12, 13, 8, 14, 19, 1, 2, 24, 20, 3, 4, 25, 15, 21, 22, 16,
-                23, 17, 18,
+                9, 11, 6, 0, 8, 7, 12, 2, 13, 14, 10, 15, 20, 1, 3, 25, 21, 4, 5, 26, 16, 22, 23,
+                17, 24, 18, 19,
             ],
         },
     },
@@ -542,11 +556,36 @@ static EXPECTED: &[Expected] = &[
             "regime_started_ns",
             "regime_count",
             "buffer_capacity",
+            // v31: the flood-suppression latch of drains clipped at 0.
+            "drain_clips",
         ],
+        // v31: `drain_clips` (a 56-byte `RefCell<DrainClipLatch>`) lands at
+        // 72 and moves `armed` from 72 to 128; the struct grows 80 -> 136
+        // (MEASURED via `dump_measured_table`).
         layout: Layout::Pinned {
-            size: 80,
+            size: 136,
             align: 8,
-            offsets: &[0, 40, 16, 24, 72, 48, 56, 64],
+            offsets: &[0, 40, 16, 24, 128, 48, 56, 64, 72],
+        },
+    },
+    // v31: held by value in `BlockProbe.drain_clips`, inside a `RefCell`.
+    Expected {
+        name: "DrainClipLatch",
+        fields: &["latch", "clean_run", "close_after"],
+        layout: Layout::Pinned {
+            size: 48,
+            align: 8,
+            offsets: &[16, 0, 8],
+        },
+    },
+    // v31: held by value in `DrainClipLatch.latch`.
+    Expected {
+        name: "FailureRegimeLatch",
+        fields: &["failing", "suppressed", "total_failures", "next_decade"],
+        layout: Layout::Pinned {
+            size: 32,
+            align: 8,
+            offsets: &[24, 0, 8, 16],
         },
     },
     Expected {
@@ -557,18 +596,18 @@ static EXPECTED: &[Expected] = &[
             ranks: &[0, 2, 3, 1],
         },
     },
-    // This row did NOT move when `BlockProbe` grew 72 -> 80.
-    // An enum is sized by its LARGEST variant, and that is `DropOldestProbe`
-    // (120) — so the 8-byte growth of a smaller variant is absorbed by padding
-    // that already existed. Recorded because the obvious reading of "BlockProbe
-    // grew" is that its enclosing enum grew too, and a future reader
-    // re-snapshotting on that assumption would be chasing a number that is
-    // correct.
+    // An enum is at least as large as its LARGEST variant, plus room for its
+    // tag unless a niche of that variant holds it. This row did not move when
+    // `BlockProbe` grew 72 -> 80, because `DropOldestProbe` (120) was the
+    // largest and the growth fit in padding that already existed. At v31
+    // `BlockProbe` grows 80 -> 136 and becomes the largest variant, and the
+    // enum measures 136, the same size, so its tag sits in a niche of
+    // `BlockProbe` (MEASURED via `dump_measured_table`).
     Expected {
         name: "BackpressureProbe",
         fields: &[],
         layout: Layout::Pinned {
-            size: 120,
+            size: 136,
             align: 8,
             offsets: &[],
         },
@@ -644,18 +683,26 @@ static EXPECTED: &[Expected] = &[
         // that carries this field is the one the `PlanInner` row below states:
         // the gate's own struct is pinned by OFFSET and gains the rule byte in
         // the same change, and one version describes one shipped layout.
+        // v29 adds `annotates_every_read: bool`, which takes offset rank 7
+        // (last); every other field keeps its rank (MEASURED via
+        // `dump_measured_table`). v30 adds `records_batch_frames: AtomicBool`,
+        // which takes offset rank 6: `role` moves from rank 6 to 7 and
+        // `annotates_every_read` from 7 to 8, and every other field keeps its
+        // rank (MEASURED via `dump_measured_table`).
         fields: &[
             "input_idx",
             "role",
             "capacity",
             "armed",
             "records_every_consult",
+            "records_batch_frames",
+            "annotates_every_read",
             "pending",
             "inner",
         ],
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[3, 6, 1, 4, 5, 2, 0],
+            ranks: &[3, 7, 1, 4, 5, 6, 8, 2, 0],
         },
     },
     Expected {
@@ -663,6 +710,7 @@ static EXPECTED: &[Expected] = &[
         fields: &[
             "records",
             "fold_anchor",
+            "run_writer",
             "last_served_seq",
             "dropped",
             "dropped_reported",
@@ -670,14 +718,14 @@ static EXPECTED: &[Expected] = &[
             "next_decade",
         ],
         // Re-snapshot (MEASURED via `dump_measured_table`, never
-        // hand-computed): `fold_anchor: FoldAnchor` is a one-byte enum that
-        // lands at offset 57, in what was tail padding — the struct stays 64
-        // bytes and every other offset is unchanged. It carries the two facts a
+        // hand-computed), at v19: `fold_anchor: FoldAnchor` is a one-byte enum
+        // that landed at offset 57, in what was tail padding; the struct
+        // stayed 64 bytes and every other offset was unchanged. It carries the two facts a
         // run count asserts that no single record can hold: that the run is
         // ADJACENT (a drop at the rim breaks it) and that its provenance is its
         // own (a bare read never folds into an annotated pair's read half).
         //
-        // The ABI VERSION is unchanged at 19, on the same rule applied to
+        // At v19 the ABI VERSION was unchanged at 19, on the same rule applied to
         // `StagedReadOutcome` two entries down: the version already moved for
         // this struct family, and a later change to an FFI-closure struct in
         // the same release is a re-snapshot rather than a second bump. Host and
@@ -692,10 +740,13 @@ static EXPECTED: &[Expected] = &[
         // structs across the same FFI cannot
         // share a version, or a cdylib built against one reads the other's fields
         // at the wrong offsets.
+        // v29 adds `run_writer: [Option<u64>; 2]`, 32 bytes at offset 0: the
+        // struct grows from 64 to 96 bytes and every other field moves
+        // (MEASURED via `dump_measured_table`).
         layout: Layout::Pinned {
-            size: 64,
+            size: 96,
             align: 8,
-            offsets: &[0, 57, 24, 32, 40, 56, 48],
+            offsets: &[32, 89, 0, 56, 64, 72, 88, 80],
         },
     },
     Expected {
@@ -744,14 +795,18 @@ static EXPECTED: &[Expected] = &[
     // ---- the ENFORCEMENT side (v24) -------------------------------------
     Expected {
         name: "ReadPlanStage",
-        fields: &["key", "rim", "blocker", "armed", "now_step", "inner"],
+        fields: &[
+            "key", "rim", "blocker", "armed", "now_step", "inner", "feed",
+        ],
         // MEASURED via `dump_measured_table`, never hand computed: the field
         // order this target packs the row in, as the permutation of its
         // offsets. The row entered the table at v24 and its order is pinned
         // from v25, the version that made a re-pack of this family visible.
+        // v29 adds `feed`, the replay's private-feed slot, which packs between
+        // `inner` and `rim` (MEASURED via `dump_measured_table`).
         layout: Layout::FieldSetOnly {
             reason: STD_MUTEX,
-            ranks: &[0, 3, 4, 5, 1, 2],
+            ranks: &[0, 4, 5, 6, 1, 2, 3],
         },
     },
     Expected {
@@ -989,6 +1044,7 @@ static ENUM_PAYLOADS: &[(&str, EnumPayload)] = &[
         ),
     ),
     ("ConsumeMode", EnumPayload::NothingFirstParty),
+    ("BlockSendHook", EnumPayload::NothingFirstParty),
     ("ReadOutcomeKind", EnumPayload::NothingFirstParty),
     ("ReadSiteRole", EnumPayload::NothingFirstParty),
     ("ReadStageRole", EnumPayload::NothingFirstParty),
@@ -1030,6 +1086,8 @@ fn measured() -> Vec<MeasuredStruct> {
     all.extend(crate::transport::adaptive_sizer::abi_layout_pins());
     all.extend(crate::transport::notify_delivery_latch::abi_layout_pins());
     all.extend(crate::transport::output_discard_latch::abi_layout_pins());
+    all.extend(crate::transport::failure_regime_latch::abi_layout_pins());
+    all.extend(crate::transport::drain_clip_latch::abi_layout_pins());
     all.extend(crate::wire::abi_layout_pins());
     all.extend(crate::read_outcome::abi_layout_pins());
     all.extend(crate::scheduler::handle::abi_layout_pins());

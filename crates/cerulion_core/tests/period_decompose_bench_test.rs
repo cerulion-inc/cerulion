@@ -262,7 +262,7 @@ fn chain_graph(
             // The period source — an in-graph producer with NO inputs (a normal
             // in-graph topic, NOT an absolute external `source:`).
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "src".to_string(),
@@ -271,7 +271,7 @@ fn chain_graph(
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "relay".to_string(),
@@ -280,11 +280,12 @@ fn chain_graph(
                     name: "inp".to_string(),
                     // relay triggers on the source's output topic.
                     source: "src/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -293,6 +294,7 @@ fn chain_graph(
                     name: "inp".to_string(),
                     // sink triggers on relay's output topic.
                     source: "relay/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

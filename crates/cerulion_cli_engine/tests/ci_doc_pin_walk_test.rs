@@ -292,6 +292,10 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["examples"],
         &[],
     ),
+    // The crate's own unit tests: `src/graph/config.rs` joins the networking
+    // and user API pages onto the manifest directory to check that they name
+    // every key a network egress entry accepts.
+    ("cerulion_core", "cerulion_core", &["docs"], &[]),
     // The test map it gates, held in a const and joined onto the root.
     (
         "cerulion_core",
@@ -1312,14 +1316,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 79 where the root manifest's `members` array lists 78: the extra one is the
+/// 87 where the root manifest's `members` array lists 86: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 79;
+const WORKSPACE_MEMBER_COUNT: usize = 87;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -3378,6 +3382,10 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_cli", "cerulion_hygiene", "crate-path"),
     ("cerulion_cli", "cerulion_telemetry", "crate-path"),
     ("cerulion_cli", "cerulion_viz", "crate-path"),
+    // fresh_executable_test's COPIES table reads each crate's copy of the helper by path.
+    ("cerulion_cli", "cerulion_cli_engine", "crate-path"),
+    ("cerulion_cli", "cerulion_netd", "crate-path"),
+    ("cerulion_cli", "cerulion_wsd", "crate-path"),
     // ros2_run_e2e_test names the preload the launcher injects,
     // `libcerulion_heaphook.so`, which is the artifact cerulion_heaphook builds.
     ("cerulion_cli", "cerulion_heaphook", "dlopen"),
@@ -3439,6 +3447,9 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_hygiene", "go2_tf_source", "crate-path"),
     // crate_license_texts_test reads `crates/native_ros2_messages`.
     ("cerulion_hygiene", "native_ros2_messages", "crate-path"),
+    // eye/source.rs's unit test reads `../cerulion_cli_engine/src` for the
+    // node names `bag play` and the resim mint their transports with.
+    ("cerulion_rcpd", "cerulion_cli_engine", "crate-path"),
     // hot_path_dependency_gate walks `examples/go2`, which holds that member.
     ("cerulion_telemetry", "go2_tf_source", "crate-path"),
     // heaphook's own unit test reads `../cerulion_heaphook/src`.

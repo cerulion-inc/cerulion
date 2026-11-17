@@ -1,0 +1,17 @@
+error: `consume = latest` is not accepted on a trigger input of a `sync_window_ms` or `unbounded_sync` node: a Sync node fires once per aligned set of its trigger inputs, in set order, and does not take a per-input consumption mode. `consume = latest` applies to the one trigger input of a data-triggered node.
+ --> tests/ui/input_consume_latest_on_sync.rs:8:5
+  |
+8 |     left: Vector3,
+  |     ^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_consume_latest_on_sync.rs:9:7
+  |
+9 |     #[input(trigger)]
+  |       ^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_consume_latest_on_sync.rs:7:7
+  |
+7 |     #[input(trigger, consume = latest)]
+  |       ^^^^^

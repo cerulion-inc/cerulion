@@ -27,6 +27,7 @@
 //! - Insertion order = execution order (Principle #5: Graph is source of truth)
 //! - Integer nanosecond arithmetic throughout (no floating-point drift)
 
+pub mod block;
 pub mod catchup_clamp;
 // The clamp's WIRING pins (all three `decide_node` call
 // sites + the once-per-step read). In-crate because two of the three sites are
@@ -374,7 +375,7 @@ impl RefillOutcome {
 /// verdicts.
 ///
 /// Deliberately ONE multiplexed op rather than four hooks, mirroring the ONE
-/// FFI symbol (`cerulion_node_sync_head_op`) it crosses on a cdylib: the four
+/// host-table `input_head` entry it crosses for a stable plugin: the four
 /// are transitions of ONE state machine, and four separate hooks would admit
 /// partial-capability nodes (advance-without-void) the degrade logic would then
 /// have to enumerate.
@@ -389,6 +390,16 @@ pub enum SyncHeadOp {
     /// consume it — re-offering it would fire the node again on one frame.
     FillRefill,
     /// The NON-CONSUMING "has another frame arrived behind the head?" probe.
+    ///
+    /// `NodeEntry::probe_trigger_input` asks it too, for a Data
+    /// `consume = latest` input read through two subscribers, where no head is
+    /// held: there `Present` means the body subscriber's queue holds a frame
+    /// and `Nothing` means it holds none, and the step fires the node only on
+    /// `Present` (or `Failed`). The graph asks this of a Data input only on
+    /// an entry whose `NodeEntry::probes_trigger_input` is `true` (on a
+    /// stable node library, the host owns this probe), since an entry
+    /// answering `Nothing` while that queue holds a frame leaves the input
+    /// unfired.
     ProbeNext,
     /// Pop the next frame into the staged slot and report its stamp.
     ///
@@ -497,6 +508,14 @@ struct ScheduledNode {
     // Timing state (managed by scheduler)
     next_fire_ns: Option<u64>,
     pending_data_count: u64,
+    /// The node's `Data` trigger input declares `consume = latest`: a step
+    /// that fires the node with any pending arrival fires it ONCE and clears
+    /// the count, because that one fire's read drains the queue to its newest
+    /// frame. A deferred step (`throttle_ms`, a `block` gate) returns before
+    /// the collapse and keeps the count.
+    /// Set at graph build by [`Scheduler::set_data_consume_latest`]; `false`
+    /// (one fire per arrival) otherwise.
+    data_consume_latest: bool,
     /// Per trigger-input HEAD — the frame this input contributes to
     /// the set currently being formed, keyed by the RESOLVED SOURCE TOPIC.
     ///
@@ -644,6 +663,14 @@ struct ScheduledNode {
     /// sizing is byte-identical.
     throttle_ns: Option<u64>,
 
+    /// The `block` hold of a producer with `block` consumers, read only by
+    /// [`Scheduler::ns_until_next_fire`]: when a due node held by a full
+    /// credit slot can next fire ([`crate::scheduler::block::node_hold`]).
+    /// The decision stays in `pre_fire_check`; both read the same slots and
+    /// stall marks, and this read changes neither. `None` for every node
+    /// without a `block` consumer, which contributes nothing.
+    block_hold: Option<Arc<dyn Fn() -> crate::scheduler::block::BlockHold + Send + Sync>>,
+
     /// How many times a TRACE-DRIVEN fire burst
     /// ([`FireKind::Replay`]) asked this node's [`TriggerRefill`] hook for the
     /// next FIFO frame and got NOTHING.
@@ -658,6 +685,10 @@ struct ScheduledNode {
     /// read via [`Scheduler::replay_refill_shortfalls`]. Zero on every live path
     /// (nothing but the Replay arm touches it).
     replay_refill_shortfalls: u64,
+    /// Does the trace-driven burst this node is about to run end on a
+    /// trailing refill (see [`Scheduler::set_replay_trailing_refills`])? Set
+    /// by `take_planned_fire` from the plan, read by `tick_replay_burst`.
+    replay_trailing_refill: bool,
     /// Refills whose empty answer the REPLAY READ GATE caused, a queued frame
     /// the recording had not read yet. Split out from
     /// [`Self::replay_refill_shortfalls`] rather than folded into it because
@@ -876,6 +907,15 @@ struct ScheduledNode {
     /// keeps `ScheduledNode` `Send` (the rayon wide path moves disjoint
     /// `&mut ScheduledNode` to workers).
     trace_fragment: Vec<TraceEntry>,
+
+    /// The node is a member of a census chain, called by
+    /// [`Scheduler::call_chain_member`] when its chain head's level ends. While
+    /// chain calls are engaged for a step, [`Scheduler::decide_fires`] neither
+    /// runs this node's QoS windows nor decides it at its own level.
+    chain_member: bool,
+    /// The chain call of THIS step fired the node, and its entries wait in
+    /// `trace_fragment` for the node's own level to merge them.
+    chain_prefired: bool,
 
     /// RECORD side: the per-node publish-DISCARD signal, bumped by
     /// this node's publishers (`OutputProxy::Drop`'s all-defer discard,
@@ -1212,6 +1252,10 @@ pub(crate) struct FireDecision {
     /// same-count reorder).
     pub(crate) idx: usize,
     pub(crate) kind: FireKind,
+    /// A chain call already fired this node in this step: the tick passes do
+    /// not fire it again, and the merge writes the entries waiting in its
+    /// `trace_fragment` at this decision's position. `kind` is unused.
+    pub(crate) prefired: bool,
 }
 
 /// The index-keyed scratch entry [`Scheduler::tick_decided_parallel`]
@@ -1739,6 +1783,12 @@ struct PlannedFire {
     /// did NOT perform — reported by [`Scheduler::unconsumed_replay_fires`]
     /// rather than silently dropped (the never-fire class).
     consumed: bool,
+    /// The recording's burst for this node and step ended on a TRAILING
+    /// REFILL: its refill after the last fire POPPED a frame that the
+    /// [`DATA_PENDING_CARRY_CLAMP`] cap or the node's pre-fire check then left
+    /// unfired, and the next step's first fire serves it. Set by
+    /// [`Scheduler::set_replay_trailing_refills`].
+    trailing_refill: bool,
 }
 
 /// The installed trace-driven fire plan for ONE step.
@@ -1836,6 +1886,14 @@ pub struct Scheduler {
     /// changed is the build-time `info!` `GraphRuntime` emits per (level,
     /// qualifying topic).
     forced_serial_rest_walks: u64,
+    /// Whether the current step calls chain members (set by the runtime at the
+    /// top of every step through [`Self::set_chain_calls_engaged`]).
+    chain_calls_engaged: bool,
+    /// Chain calls made so far (see [`Self::chain_calls_made`]).
+    chain_calls_made: u64,
+    /// The inline-trace mutant, read once when the runtime marks the members.
+    #[cfg(feature = "oracle-mutants")]
+    chain_call_inline_trace_mutant: bool,
     /// The optional recording trace-ring hook (see [`TraceRingHook`]).
     /// `None` (the default, and the only state on non-unix targets) = today's
     /// behavior: the ring arm in [`RingTraceSink::push_entry`] is one
@@ -2034,6 +2092,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2060,6 +2122,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2097,6 +2163,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2128,6 +2198,10 @@ impl Scheduler {
             steps_begun: 0,
             entries_appended: 0,
             forced_serial_rest_walks: 0,
+            chain_calls_engaged: false,
+            chain_calls_made: 0,
+            #[cfg(feature = "oracle-mutants")]
+            chain_call_inline_trace_mutant: false,
             trace_ring: None,
             catchup_arm: None,
             catchup_cap_override: None,
@@ -2140,11 +2214,17 @@ impl Scheduler {
         }
     }
 
-    /// Nanoseconds until the soonest pending `Period` fire,
-    /// or `None` if no enabled Period node has a pending deadline and no
-    /// enabled Data node carries a FIFO backlog (which reports due-NOW). PURE
+    /// Nanoseconds until the soonest pending fire, or `None` if no enabled
+    /// node has one with a deadline: a node held by a `block` slot that only
+    /// a drain or a release frees contributes none. A Period node reports its
+    /// next deadline; a node due NOW
+    /// reports 0: a Data node carrying a FIFO backlog, a Sync node carrying a
+    /// Sync backlog (a complete aligned set it has not fired), or an External
+    /// node with a pending mark (a fire a pre-fire check deferred). PURE
     /// READ — reads only `policy` + `next_fire_ns` + `pending_data_count` +
-    /// `data_backlog_hint` + the disabled flag; performs no
+    /// `data_backlog_hint` + `sync_backlog_hint` + `external_triggered` + the
+    /// disabled flag, and a due node's throttle
+    /// window and `block` hold (a read of its credit slots); performs no
     /// `advance`/`fire`/trace/mutation. Called ONLY from the live loop
     /// (`GraphRuntime::run_live`) to size the WaitSet timeout so a `period_ms`
     /// node fires on time between data events. NEVER called from
@@ -2180,6 +2260,16 @@ impl Scheduler {
                     // waits for an unrelated publish to wake the loop, or for the
                     // 250 ms liveliness cap, where Data recovers at the 1 ms floor.
                     TriggerPolicy::Sync { .. } if n.sync_backlog_hint => Some(0),
+                    // An External node whose mark the last step left set owes
+                    // a fire that a pre-fire check (a full `block` slot or
+                    // `throttle_ms`) deferred. For a doorbell or pipe source
+                    // nothing rings for it again: the sweep drained the source
+                    // when it set the mark. A device fd source stays ready
+                    // until the node reads it. Either way the node is due NOW,
+                    // so the throttle window and the `block` hold below bound
+                    // the wait at the instant it can fire. An unmarked
+                    // External node owes nothing and adds no deadline.
+                    TriggerPolicy::External if n.external_triggered => Some(0),
                     _ => None,
                 }?;
                 // A node that is DUE but THROTTLE-DEFERRED
@@ -2194,14 +2284,25 @@ impl Scheduler {
                 // cannot reach this arm anyway (`throttle_ms` and `period_ms`
                 // are mutually exclusive at the macro), so in practice this
                 // lifts a `Some(0)` to the remaining window.
-                //
-                // BLOCK-deferred nodes are deliberately NOT covered: block has
-                // its own wake channel (the credit word), and a deadline the
-                // loop polls toward would race the wake it now has.
-                Some(match n.throttle_remaining_ns(now_ns) {
+                let due = match n.throttle_remaining_ns(now_ns) {
                     Some(remaining) => due.max(remaining),
                     None => due,
-                })
+                };
+                // A node held by a full `block` slot is due by the same
+                // signals and cannot run either. It runs at the earliest
+                // `block_timeout_ms` release of its full slots, or after a
+                // drain or a release, each of which wakes the loop itself (the
+                // consumer drains on this level loop, or the peer's drain
+                // rings the credit park). A slot the loop may not wait on, or
+                // whose stall clock the next evaluation must start, keeps the
+                // node due.
+                match n.block_hold.as_ref().map(|hold| hold()) {
+                    None | Some(crate::scheduler::block::BlockHold::Clear) => Some(due),
+                    Some(crate::scheduler::block::BlockHold::Until(at_ns)) => {
+                        Some(due.max(at_ns.saturating_sub(now_ns)))
+                    }
+                    Some(crate::scheduler::block::BlockHold::UntilWake) => None,
+                }
             })
             .min()
     }
@@ -2430,6 +2531,7 @@ impl Scheduler {
             node_id: Arc::clone(&node_id_arc),
             next_fire_ns,
             pending_data_count: 0,
+            data_consume_latest: false,
             sync_heads: IndexMap::new(),
             // Installed later (graph build) for TRANSPORT-backed Sync
             // nodes only; a pure-scheduler embedder keeps the hand-driven
@@ -2453,8 +2555,10 @@ impl Scheduler {
             // Installed at graph build for nodes that
             // declare `throttle_ms`; absent means the node has no rate cap.
             throttle_ns: None,
+            block_hold: None,
             // Only a trace-driven replay burst ever bumps this.
             replay_refill_shortfalls: 0,
+            replay_trailing_refill: false,
             replay_enforced_empty_refills: 0,
             // No pauses until a replay engine installs some.
             replay_pauses: NodeReplayPauses::default(),
@@ -2490,6 +2594,8 @@ impl Scheduler {
             // Starts empty; the within-level fire passes grow it once,
             // then reuse its capacity (mem::take / clear / write-back).
             trace_fragment: Vec::new(),
+            chain_member: false,
+            chain_prefired: false,
             // Defaults; the runtime overwrites discard_signal +
             // replay_suppress with the Arcs it shares into the publishers.
             discard_signal,
@@ -2734,6 +2840,7 @@ impl Scheduler {
                 fire_count: fire.fire_count,
                 interval_ns: fire.interval_ns,
                 consumed: false,
+                trailing_refill: false,
             });
         }
         if outcome.is_err() {
@@ -2745,6 +2852,74 @@ impl Scheduler {
         }
         self.replay_plan = Some(plan);
         outcome
+    }
+
+    /// Mark the nodes of the installed plan whose recorded burst at `step`
+    /// ended on a TRAILING REFILL: after the live burst's last fire its refill
+    /// hook popped one more frame, and the [`DATA_PENDING_CARRY_CLAMP`] cap or
+    /// the node's pre-fire check stopped the burst with that frame frozen
+    /// unfired (`tick_data_burst`'s `refilled_unfired` arm). The trace-driven
+    /// burst then drives the refill hook once after its last fire, as the live
+    /// burst did, so the next step's first fire serves the same frame.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::GraphError`] when no plan is installed for `step`, or
+    /// a named node has no planned fire there, is not a `Data` node with a
+    /// refill hook, or neither fires the cap at that step nor carries a
+    /// pre-fire check: a recording cannot hold a trailing refill on such a
+    /// node.
+    pub fn set_replay_trailing_refills(
+        &mut self,
+        step: u64,
+        node_ids: &[&str],
+    ) -> TransportResult<()> {
+        let refuse = |node_id: &str, why: &str| TransportError::GraphError {
+            reason: format!(
+                "replay fire plan (step {step}): node '{node_id}' cannot carry a trailing \
+                 refill: {why}"
+            ),
+        };
+        let cap = DATA_PENDING_CARRY_CLAMP as u32;
+        for node_id in node_ids {
+            let Some((idx, _, node)) = self.nodes.get_full(*node_id) else {
+                return Err(TransportError::NodeNotFound {
+                    // hot-path-alloc-ok: cold: plan-install ERROR arm.
+                    node_id: (*node_id).to_string(),
+                });
+            };
+            if !matches!(node.policy, TriggerPolicy::Data) || node.trigger_refill.is_none() {
+                return Err(refuse(node_id, "it is not a Data node with a refill hook"));
+            }
+            let deferrable = node.pre_fire_check.is_some();
+            let Some(plan) = self.replay_plan.as_mut().filter(|p| p.step == step) else {
+                return Err(refuse(node_id, "no fire plan is installed for this step"));
+            };
+            match plan.slots.get_mut(idx).and_then(Option::as_mut) {
+                Some(slot) if slot.fire_count == cap || deferrable => slot.trailing_refill = true,
+                Some(slot) => {
+                    return Err(refuse(
+                        node_id,
+                        // hot-path-alloc-ok: cold: replay fire-plan install ERROR arm.
+                        &format!(
+                            "it fires {} times, not the cap of {cap}, and has no pre-fire check",
+                            slot.fire_count
+                        ),
+                    ));
+                }
+                None => return Err(refuse(node_id, "it has no planned fire at this step")),
+            }
+        }
+        Ok(())
+    }
+
+    /// Does `node_id` carry a trigger refill hook (a unified `Data` binding)?
+    /// `false` for an unknown node.
+    #[must_use]
+    pub fn has_trigger_refill(&self, node_id: &str) -> bool {
+        self.nodes
+            .get(node_id)
+            .is_some_and(|n| n.trigger_refill.is_some())
     }
 
     /// Drop the trace-driven fire plan — the scheduler decides
@@ -2799,6 +2974,13 @@ impl Scheduler {
     /// `ScheduledNode::replay_refill_shortfalls`. `None` for an unknown id.
     pub fn replay_refill_shortfalls(&self, node_id: &str) -> Option<u64> {
         self.nodes.get(node_id).map(|n| n.replay_refill_shortfalls)
+    }
+
+    /// Testing-only: does this node carry a between-fires refill hook
+    /// ([`Self::set_trigger_refill`])? `None` for an unknown id.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn has_trigger_refill_for_test(&self, node_id: &str) -> Option<bool> {
+        self.nodes.get(node_id).map(|n| n.trigger_refill.is_some())
     }
 
     /// How many times this node's trace-driven burst asked its refill hook for
@@ -3278,10 +3460,19 @@ impl Scheduler {
                 return None;
             }
         }
+        node.replay_trailing_refill = planned.trailing_refill;
         match &node.policy {
             TriggerPolicy::Data => {
                 node.data_backlog_hint = false;
-                let consumed = node.pending_data_count.min(u64::from(planned.fire_count));
+                // A `consume = latest` fire spends EVERY pending arrival, as
+                // `decide_node` does live: on the Separate discipline each
+                // queued frame signalled one, and the one fire's read drained
+                // them all.
+                let consumed = if node.data_consume_latest && planned.fire_count > 0 {
+                    node.pending_data_count
+                } else {
+                    node.pending_data_count.min(u64::from(planned.fire_count))
+                };
                 node.pending_data_count -= consumed;
                 node.pending_data_count_shared
                     .store(node.pending_data_count, Ordering::Release);
@@ -3564,7 +3755,7 @@ impl Scheduler {
     /// The capture carrier calls this at a due step boundary, where "right
     /// now" is the state AFTER the step completed, which is what an anchor at
     /// `S` means. Nothing here reads a clock or mutates anything: the
-    /// three fields are copied out and the caller owns what happens next.
+    /// scheduler's fields are copied out and the caller owns what happens next.
     ///
     /// `None` for an id this scheduler does not hold — a carrier walking a
     /// recording's node list against a live graph is the ordinary reason, and
@@ -3579,15 +3770,22 @@ impl Scheduler {
     /// scheduler itself was holding. This states the second, because the second
     /// is the one a rebuilt `Scheduler` cannot recover.
     ///
-    /// # This fills THREE of the section's four fields
+    /// # This fills the scheduler's fields of the section
     ///
     /// `NodeFrameworkState` is the CARRIER's composite view (see its own doc).
-    /// The fourth, `input_service`, is a TRANSPORT fact: the wire `sequence` of
-    /// the last frame each per-message FIFO input's tick actually read — which
-    /// the scheduler does not hold and cannot invent, so this leaves it `None`
-    /// and the graph runtime's capture site fills it in from the ports. A
-    /// caller that uses this value verbatim therefore states "no cursor", which
-    /// is the accurate reading of a scheduler asked on its own.
+    /// This fills `next_fire_ns`, `pending_data_count`,
+    /// `sync_input_timestamps` and `stopped` (`disabled`: a `NodeError::Fatal`
+    /// return, the consecutive-panic breaker or [`Self::restore_stopped_nodes`]
+    /// stopped the node).
+    ///
+    /// `input_service` is a TRANSPORT fact: the wire `sequence` of the last
+    /// frame each per-message FIFO input's tick actually read, which the
+    /// scheduler does not hold and cannot invent, so this leaves it `None` and
+    /// the graph runtime's capture site fills it in from the ports. A caller
+    /// that uses this value verbatim therefore states "no cursor", which is
+    /// the accurate reading of a scheduler asked on its own. The capture-time
+    /// Sync tail (`sync_capture_high_water`, `sync_epoch_floor`) is left empty
+    /// the same way; the runtime fills it for a capture-time Sync node.
     // hot-path-alloc-ok-fn: cold: introspection read for the state-capture plane
     pub fn node_framework_state(
         &self,
@@ -3631,6 +3829,7 @@ impl Scheduler {
             input_service: None,
             sync_capture_high_water: Default::default(),
             sync_epoch_floor: None,
+            stopped: node.disabled,
         })
     }
 
@@ -3758,6 +3957,46 @@ impl Scheduler {
         }
     }
 
+    /// Stop each node in `ids` on a resumed run, as a recording's framework
+    /// sections state it
+    /// ([`crate::state_restore::NodeFrameworkState::stopped`]).
+    ///
+    /// Sets `disabled` and nothing else, so the node fires no more: a decided
+    /// fire, a planned replay fire and an `External` trigger mark all skip it,
+    /// as after the live stop. It does not set the fatal-stop flag, change the
+    /// consecutive-panic count or write the node-death ledger, so this run
+    /// records no failure for the node. [`Self::reset_node`] lifts the stop
+    /// like any other.
+    ///
+    /// Every id is checked before any node changes: the first id, in the
+    /// set's order, that this scheduler does not hold is refused as
+    /// [`TransportError::NodeNotFound`] and no node is stopped.
+    ///
+    /// Must be called after the build and BEFORE the first `step()`, like
+    /// every other restore seam.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    pub fn restore_stopped_nodes(
+        &mut self,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> TransportResult<()> {
+        let indices = ids
+            .iter()
+            .map(|id| {
+                self.nodes
+                    .get_index_of(id.as_str())
+                    .ok_or_else(|| TransportError::NodeNotFound {
+                        node_id: id.clone(),
+                    })
+            })
+            .collect::<TransportResult<Vec<usize>>>()?;
+        for idx in indices {
+            if let Some((_, node)) = self.nodes.get_index_mut(idx) {
+                node.disabled = true;
+            }
+        }
+        Ok(())
+    }
+
     /// Configure a per-input expected interval
     /// for `node_id`. After this call, every `step()` checks the
     /// elapsed time since the last data on `input_name`; if it
@@ -3833,6 +4072,35 @@ impl Scheduler {
                 backlog_latch: FailureRegimeLatch::new(),
             },
         );
+        Ok(())
+    }
+
+    /// Declare that `node_id`'s `Data` trigger input is `consume = latest`.
+    ///
+    /// From then on a step that fires the node with any pending arrival
+    /// fires it once and clears the count, where the `fifo` default fires
+    /// once per arrival; a deferred step keeps the count. The arrivals beyond
+    /// the first are not owed fires: the one fire's read drains the queue to
+    /// the newest frame. Refused for a node whose policy is not `Data`, the
+    /// [`Self::set_trigger_refill`] rule.
+    // hot-path-alloc-ok-fn: cold: graph BUILD, once per `consume = latest` node
+    pub fn set_data_consume_latest(&mut self, node_id: &str) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        if !matches!(node.policy, TriggerPolicy::Data) {
+            return Err(TransportError::SchedulerError {
+                reason: format!(
+                    "set_data_consume_latest() not valid for node '{}' with policy {:?}: \
+                     `consume = latest` applies to a data-trigger node",
+                    node_id, node.policy
+                ),
+            });
+        }
+        node.data_consume_latest = true;
         Ok(())
     }
 
@@ -4235,6 +4503,29 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Install `node_id`'s `block` hold, so [`Self::ns_until_next_fire`]
+    /// reports when a node held by a full credit slot can next fire instead
+    /// of `Some(0)` for as long as it is held.
+    ///
+    /// Paired with [`Self::set_pre_fire_check`] at the graph build, over the
+    /// same slots: the closure owns the decision, this owns the wake sizing.
+    /// Without it a held node keeps the 1 ms floor re-evaluation.
+    // hot-path-alloc-ok-fn: cold: a graph-BUILD setter; the `to_string` names
+    // an unknown node on a refusal that ends the build.
+    pub fn set_block_hold<F>(&mut self, node_id: &str, hold: F) -> TransportResult<()>
+    where
+        F: Fn() -> crate::scheduler::block::BlockHold + Send + Sync + 'static,
+    {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                node_id: node_id.to_string(),
+            })?;
+        node.block_hold = Some(Arc::new(hold));
+        Ok(())
+    }
+
     /// Install (or replace) the Block defer-the-fire
     /// pre-fire predicate for `node_id`. The closure is invoked at the
     /// top of every `evaluate_node` call BEFORE any trigger policy
@@ -4521,11 +4812,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return or by the
-    /// consecutive-panic breaker? A disabled node never fires until
-    /// [`Self::reset_node`] re-enables it. `false` for an unknown id. One map
-    /// lookup, no allocation: the live loop reads it per external binding per
-    /// wait.
+    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return, by the
+    /// consecutive-panic breaker or by [`Self::restore_stopped_nodes`]? A
+    /// disabled node never fires until [`Self::reset_node`] re-enables it.
+    /// `false` for an unknown id. One map lookup, no allocation: the live loop
+    /// reads it per external binding per wait.
     pub fn is_node_disabled(&self, node_id: &str) -> bool {
         self.nodes.get(node_id).is_some_and(|n| n.disabled)
     }
@@ -5397,8 +5688,26 @@ impl Scheduler {
             self.decide_fires_from_plan(node_ids, new_time);
             return;
         }
+        let chain_calls = self.chain_calls_engaged;
         for id in node_ids {
             if let Some(idx) = self.nodes.get_index_of(id.as_str()) {
+                // A chain member was decided, and fired if due, by its chain
+                // call earlier in this step. A fire it made keeps its place
+                // here so the merge writes its entries at this position.
+                if chain_calls && self.nodes[idx].chain_member {
+                    let node = &mut self.nodes[idx];
+                    if std::mem::take(&mut node.chain_prefired) {
+                        self.fire_decisions.push(FireDecision {
+                            node_id: Arc::clone(&node.node_id),
+                            idx,
+                            kind: FireKind::Single {
+                                fire_time_ns: new_time,
+                            },
+                            prefired: true,
+                        });
+                    }
+                    continue;
+                }
                 self.run_qos_windows(idx, new_time);
                 // SAFETY: `idx` from `get_index_of` two lines above; `run_qos_windows`
                 // does not restructure the map.
@@ -5408,8 +5717,12 @@ impl Scheduler {
                 // returns owned `kind` / `node_id` — so pushing into the
                 // disjoint `self.fire_decisions` field compiles under NLL.
                 if let Some(kind) = Self::decide_node(&node_id, node, new_time, cap_override) {
-                    self.fire_decisions
-                        .push(FireDecision { node_id, idx, kind });
+                    self.fire_decisions.push(FireDecision {
+                        node_id,
+                        idx,
+                        kind,
+                        prefired: false,
+                    });
                 }
             } else {
                 // A level node id absent from the
@@ -5465,10 +5778,113 @@ impl Scheduler {
             };
             if let Some(kind) = self.take_planned_fire(idx, id, new_time) {
                 let node_id = Arc::clone(&self.nodes[idx].node_id);
-                self.fire_decisions
-                    .push(FireDecision { node_id, idx, kind });
+                self.fire_decisions.push(FireDecision {
+                    node_id,
+                    idx,
+                    kind,
+                    prefired: false,
+                });
             }
         }
+    }
+
+    /// Mark `node_id` a chain member (see [`Self::call_chain_member`]). Returns
+    /// false when the scheduler holds no such node.
+    // hot-path-alloc-ok-fn: cold: called once per chain member at graph build
+    pub(crate) fn mark_chain_member(&mut self, node_id: &str) -> bool {
+        #[cfg(feature = "oracle-mutants")]
+        {
+            self.chain_call_inline_trace_mutant =
+                std::env::var_os(crate::graph::CHAIN_CALL_INLINE_TRACE_MUTANT_ENV).is_some();
+        }
+        match self.nodes.get_mut(node_id) {
+            Some(node) => {
+                node.chain_member = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Engage or disengage chain calls for the step about to run. Disengaged,
+    /// every chain member decides and fires at its own level, which is the
+    /// queued path.
+    pub(crate) fn set_chain_calls_engaged(&mut self, engaged: bool) {
+        self.chain_calls_engaged = engaged;
+    }
+
+    /// Whether the recording drives this scheduler's fires (a trace-driven
+    /// fire plan or intra-step pauses are installed).
+    pub(crate) fn replay_drives_fires(&self) -> bool {
+        self.replay_plan.is_some() || self.replay_pauses_armed
+    }
+
+    /// How many chain calls this scheduler has made since build. A call is
+    /// counted whether or not the member was due.
+    #[doc(hidden)]
+    pub fn chain_calls_made(&self) -> u64 {
+        self.chain_calls_made
+    }
+
+    /// Call one chain member: run its QoS windows, decide it, and when it is
+    /// due freeze its latest-value inputs through `snapshot` and fire it into
+    /// its own `trace_fragment`. The member's input was drained by the caller
+    /// just before, exactly as its level's drain would have drained it.
+    ///
+    /// The entries stay in the fragment and the node is marked prefired;
+    /// [`Self::decide_fires`] at the member's own level turns that mark into a
+    /// prefired decision at the member's graph position, and the tick passes
+    /// write the fragment there. `global_level` is the member's own level, so
+    /// every entry carries the level the queued path stamps.
+    ///
+    /// Returns whether the member fired.
+    pub(crate) fn call_chain_member(
+        &mut self,
+        node_id: &str,
+        new_time: u64,
+        global_level: usize,
+        step: u64,
+        snapshot: &mut dyn FnMut(&str),
+    ) -> bool {
+        let Some(idx) = self.nodes.get_index_of(node_id) else {
+            debug_assert!(false, "chain member {node_id} not in the scheduler");
+            return false;
+        };
+        self.chain_calls_made += 1;
+        self.run_qos_windows(idx, new_time);
+        let cap_override = self.catchup_cap_override;
+        let node = &mut self.nodes[idx];
+        let id = Arc::clone(&node.node_id);
+        let Some(kind) = Self::decide_node(&id, node, new_time, cap_override) else {
+            return false;
+        };
+        snapshot(&id);
+        #[cfg(feature = "oracle-mutants")]
+        {
+            if self.chain_call_inline_trace_mutant {
+                let max_trace = self.max_trace_entries;
+                let node = &mut self.nodes[idx];
+                Self::tick_node(
+                    &id,
+                    node,
+                    kind,
+                    global_level,
+                    step,
+                    &mut self.trace,
+                    max_trace,
+                    &mut self.entries_appended,
+                    self.trace_ring.as_mut(),
+                );
+                return true;
+            }
+        }
+        let node = &mut self.nodes[idx];
+        let mut frag = std::mem::take(&mut node.trace_fragment);
+        frag.clear();
+        Self::tick_node_into(&id, node, kind, global_level, step, &mut frag);
+        node.trace_fragment = frag;
+        node.chain_prefired = true;
+        true
     }
 
     /// Lend the filled decision buffer to the runtime (which iterates
@@ -5518,6 +5934,18 @@ impl Scheduler {
             // SAFETY: `idx` was minted by `get_index_of` in `decide_fires` and the
             // IndexMap is not mutated within a step, so the index is valid.
             let (_, node) = self.nodes.get_index_mut(d.idx).unwrap();
+            if d.prefired {
+                let mut sink = RingTraceSink {
+                    trace: &mut self.trace,
+                    max_trace_entries: max_trace,
+                    entries_appended: &mut self.entries_appended,
+                    ring: self.trace_ring.as_mut(),
+                };
+                for e in node.trace_fragment.drain(..) {
+                    sink.push_entry(e);
+                }
+                continue;
+            }
             Self::tick_node(
                 &d.node_id,
                 node,
@@ -5586,6 +6014,11 @@ impl Scheduler {
         // THIS step's clamp (see `decide_fires`).
         let cap_override = self.catchup_cap_override;
         for id in node_ids {
+            debug_assert!(
+                !(self.chain_calls_engaged
+                    && self.nodes.get(id.as_str()).is_some_and(|n| n.chain_member)),
+                "chain member {id} reached the block subset while chain calls are engaged"
+            );
             let Some(idx) = self.nodes.get_index_of(id.as_str()) else {
                 // Same loud desync guard as `decide_fires`: a level node id
                 // absent from the scheduler is a levelization/registration
@@ -7185,7 +7618,17 @@ impl Scheduler {
                     // due-NOW through `ns_until_next_fire`, so on the live path
                     // the wake window stays at the loop's 1 ms floor until it
                     // clears — never a busy-spin, and never a per-frame tail.
-                    let fire_count = node.pending_data_count.min(DATA_PENDING_CARRY_CLAMP);
+                    //
+                    // A `consume = latest` node fires ONCE however many
+                    // arrivals are pending, and none carry: its read drains
+                    // the queue to the newest frame, so the older arrivals
+                    // have no frame left to serve.
+                    let fire_count = if node.data_consume_latest {
+                        node.pending_data_count = 1;
+                        1
+                    } else {
+                        node.pending_data_count.min(DATA_PENDING_CARRY_CLAMP)
+                    };
                     node.pending_data_count -= fire_count;
                     node.pending_data_count_shared
                         .store(node.pending_data_count, Ordering::Release);
@@ -7605,7 +8048,9 @@ impl Scheduler {
     /// [`TriggerRefill`] hook whether another frame is queued, and stops when
     /// the hook reports nothing. Here the LENGTH is given — the recording states
     /// it — so the hook is driven once per fire beyond the first, purely to POP
-    /// the next FIFO frame into the subscriber's frozen slot. That is what makes
+    /// the next FIFO frame into the subscriber's frozen slot, and once after
+    /// the last fire on a step the plan marks with a trailing refill
+    /// ([`Self::set_replay_trailing_refills`]). That is what makes
     /// the k-th replayed fire read the k-th recorded frame rather than re-reading
     /// the head, and it is the same `NodeEntry::drain_trigger_input` the live
     /// refill calls (never a bypass — a bypass injection would silently lose the
@@ -7706,6 +8151,25 @@ impl Scheduler {
             fire_time = fire_time.saturating_add(interval_ns);
             if node.disabled {
                 break;
+            }
+        }
+        // The recorded burst ended on a TRAILING REFILL: the live burst's
+        // refill popped one more frame after its last fire and the cap froze it
+        // unfired. Drive the hook once more so the same frame sits in the
+        // frozen slot, and set the backlog hint as the live burst does.
+        let trailing = std::mem::take(&mut node.replay_trailing_refill);
+        #[cfg(feature = "oracle-mutants")]
+        let trailing = trailing && !crate::replay_feed::mutants::trailing_refills_dropped();
+        if trailing && !node.disabled {
+            if let Some(r) = refill.as_ref() {
+                let outcome = (r.drain)();
+                // A trailing refill that finds nothing precedes no fire, so it
+                // is no input shortfall: the frame it would have frozen is the
+                // next step's, served by that step's boundary drain.
+                if outcome.popped > 0 {
+                    Self::note_trigger_arrival(node, &r.input, outcome.latest_ts);
+                    node.data_backlog_hint = true;
+                }
             }
         }
     }
@@ -8408,6 +8872,11 @@ impl Scheduler {
         // idx/IndexMap-desync branch below — unreachable while the IndexMap is not mutated mid-step
         let mut orphan_ids: Vec<Arc<str>> = Vec::new();
         for d in decisions.iter() {
+            // A prefired decision fires in no pass; PASS 3 merges its
+            // waiting entries at its position like any other fragment.
+            if d.prefired {
+                continue;
+            }
             if d.idx >= n {
                 // Out-of-range idx = idx/IndexMap desync (the IndexMap was
                 // mutated between decide_fires and here). Collect for the loud
@@ -9059,8 +9528,8 @@ pub fn record_backpressure_event_n(
                     input = %input_name,
                     policy = "block",
                     total,
-                    "backpressure event: producer's tick deferred (sole-Block-consumer-full \
-                     or all-Block-buffers-full) — no data lost, \
+                    "backpressure event: producer's tick deferred because this `block` \
+                     consumer's credit slot is full; no data lost, \
                      `backpressure_block_fires_deferred_count` incremented"
                 );
             } else {
@@ -9157,6 +9626,245 @@ mod tests {
                 callback: noop_callback(),
             })
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Chain calls: a member fired early keeps its trace position.
+    // -----------------------------------------------------------------------
+
+    /// Three data nodes on one level, `m` a chain member between `a` and `b`
+    /// in graph order.
+    fn chain_level() -> (Scheduler, Vec<String>) {
+        let mut s = Scheduler::new();
+        for id in ["a", "m", "b"] {
+            add_data(&mut s, id);
+        }
+        assert!(s.mark_chain_member("m"));
+        assert!(!s.mark_chain_member("absent"));
+        (s, vec!["a".to_string(), "m".to_string(), "b".to_string()])
+    }
+
+    fn one_thread_pool() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread pool")
+    }
+
+    /// Run the level the way the runtime does: decide, then tick.
+    fn run_chain_level(s: &mut Scheduler, ids: &[String], t: u64, step: u64) {
+        s.decide_fires(ids, t);
+        let mut d = s.take_decisions();
+        s.tick_decided_parallel(
+            &mut d,
+            1,
+            step,
+            &one_thread_pool(),
+            &HashSet::new(),
+            RestWalk::Unconstrained,
+        );
+        s.return_decisions(d);
+    }
+
+    fn trace_ids(s: &mut Scheduler) -> Vec<String> {
+        s.trace().iter().map(|e| e.node_id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_called_member_is_written_at_its_graph_position_in_its_own_level() {
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(true);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        for id in &ids {
+            s.signal_data(id).unwrap();
+        }
+        let mut snapshots = Vec::new();
+        let mut note = |id: &str| snapshots.push(id.to_string());
+        assert!(s.call_chain_member("m", t, 1, step, &mut note));
+        assert_eq!(snapshots, vec!["m"], "the call freezes the member's inputs");
+        assert!(s.trace().is_empty(), "the call's entry waits for its level");
+        s.decide_fires(&ids, t);
+        let decisions = s.take_decisions();
+        let prefired: Vec<bool> = decisions.iter().map(|d| d.prefired).collect();
+        assert_eq!(prefired, vec![false, true, false]);
+        s.return_decisions(decisions);
+        // Decide again from scratch on a fresh step to run the full level.
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(true);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        for id in &ids {
+            s.signal_data(id).unwrap();
+        }
+        assert!(s.call_chain_member("m", t, 1, step, &mut |_: &str| {}));
+        run_chain_level(&mut s, &ids, t, step);
+        assert_eq!(trace_ids(&mut s), vec!["a", "m", "b"]);
+        assert!(s
+            .trace()
+            .iter()
+            .all(|e| e.global_level == 1 && e.step == step));
+        assert_eq!(s.chain_calls_made(), 1);
+        // The member does not fire again at its level.
+        assert_eq!(s.pending_data_count("m"), 0);
+    }
+
+    #[test]
+    fn a_called_member_that_is_not_due_leaves_no_decision() {
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(true);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        s.signal_data("a").unwrap();
+        assert!(!s.call_chain_member("m", t, 1, step, &mut |_: &str| {}));
+        assert_eq!(s.chain_calls_made(), 1, "an undue call is still a call");
+        run_chain_level(&mut s, &ids, t, step);
+        assert_eq!(trace_ids(&mut s), vec!["a"]);
+    }
+
+    #[test]
+    fn a_disengaged_step_decides_the_member_at_its_own_level() {
+        let (mut s, ids) = chain_level();
+        s.set_chain_calls_engaged(false);
+        let t = s.begin_step(Duration::from_millis(1));
+        let step = s.current_step();
+        for id in &ids {
+            s.signal_data(id).unwrap();
+        }
+        run_chain_level(&mut s, &ids, t, step);
+        assert_eq!(trace_ids(&mut s), vec!["a", "m", "b"]);
+        assert_eq!(s.chain_calls_made(), 0);
+    }
+
+    /// What the chain call and its trace buffer cost on one node with an empty
+    /// tick, beside the level path's own decide and fire of the same node.
+    ///
+    /// Each row times one operation with a pair of clock reads; the
+    /// `clock-pair` row is that pair alone, the floor every other row sits on.
+    ///
+    /// - `call`: one chain call (QoS windows, decide, freeze, fire into the
+    ///   node's own trace buffer) of a due member.
+    /// - `merge`: the member's level writing that buffer: decide (which turns
+    ///   the mark into a decision) and the tick pass that drains it.
+    /// - `queued-level`: the level path for the same node: decide and fire
+    ///   straight into the trace.
+    /// - `fire-buffered` / `fire-inline`: the fire alone, into the node's
+    ///   buffer or straight into the trace. Their difference and `merge` are
+    ///   what holding an entry costs.
+    ///
+    /// ```bash
+    /// cargo test -p cerulion_core --lib --release -- --ignored --nocapture \
+    ///     --test-threads=1 what_a_chain_call_costs
+    /// ```
+    #[test]
+    #[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+    fn what_a_chain_call_costs() {
+        use std::time::Instant;
+        const N: usize = 20_000;
+        const WARMUP: usize = 2_000;
+        fn report(label: &str, mut v: Vec<u64>) {
+            assert_eq!(v.len(), N, "{label} collected {} samples", v.len());
+            v.sort_unstable();
+            let pct = |p: f64| v[((p / 100.0 * v.len() as f64).ceil() as usize).saturating_sub(1)];
+            println!(
+                "{label:<14} n={:>6} p50={:>6} ns p99={:>6} ns min={:>6} ns",
+                v.len(),
+                pct(50.0),
+                pct(99.0),
+                v[0]
+            );
+        }
+        if cfg!(debug_assertions) {
+            panic!("this measurement is meaningful only in a release build");
+        }
+        let ids = vec!["m".to_string()];
+        let pool = one_thread_pool();
+        let serial = HashSet::new();
+        let mut rows: [Vec<u64>; 6] = Default::default();
+        let mut s = Scheduler::new();
+        add_data(&mut s, "m");
+        s.mark_chain_member("m");
+        s.set_trace_limit(1024);
+        let mut q = Scheduler::new();
+        add_data(&mut q, "m");
+        q.set_trace_limit(1024);
+        for i in 0..(N + WARMUP) {
+            let keep = i >= WARMUP;
+            let a = Instant::now();
+            let b = Instant::now();
+            if keep {
+                rows[0].push((b - a).as_nanos() as u64);
+            }
+            // The chain call, then its merge.
+            s.set_chain_calls_engaged(true);
+            let t = s.begin_step(Duration::from_millis(1));
+            let step = s.current_step();
+            s.signal_data("m").unwrap();
+            let a = Instant::now();
+            let fired = s.call_chain_member("m", t, 1, step, &mut |_: &str| {});
+            let b = Instant::now();
+            assert!(fired);
+            s.decide_fires(&ids, t);
+            let mut d = s.take_decisions();
+            s.tick_decided_parallel(&mut d, 1, step, &pool, &serial, RestWalk::Unconstrained);
+            let c = Instant::now();
+            s.return_decisions(d);
+            if keep {
+                rows[1].push((b - a).as_nanos() as u64);
+                rows[2].push((c - b).as_nanos() as u64);
+            }
+            // The level path for the same node.
+            let t = q.begin_step(Duration::from_millis(1));
+            let step = q.current_step();
+            q.signal_data("m").unwrap();
+            let a = Instant::now();
+            q.decide_fires(&ids, t);
+            let mut d = q.take_decisions();
+            q.tick_decided_parallel(&mut d, 1, step, &pool, &serial, RestWalk::Unconstrained);
+            let b = Instant::now();
+            q.return_decisions(d);
+            if keep {
+                rows[3].push((b - a).as_nanos() as u64);
+            }
+            // The fire alone, buffered and inline.
+            let max_trace = q.max_trace_entries;
+            let kind = FireKind::Data {
+                fire_time_ns: t,
+                fire_count: 1,
+            };
+            let node = q.nodes.get_index_mut(0).unwrap().1;
+            let mut frag = std::mem::take(&mut node.trace_fragment);
+            frag.clear();
+            let a = Instant::now();
+            Scheduler::tick_node_into("m", node, kind, 1, step, &mut frag);
+            let b = Instant::now();
+            node.trace_fragment = frag;
+            node.trace_fragment.clear();
+            let a2 = Instant::now();
+            Scheduler::tick_node(
+                "m",
+                node,
+                kind,
+                1,
+                step,
+                &mut q.trace,
+                max_trace,
+                &mut q.entries_appended,
+                None,
+            );
+            let b2 = Instant::now();
+            if keep {
+                rows[4].push((b - a).as_nanos() as u64);
+                rows[5].push((b2 - a2).as_nanos() as u64);
+            }
+        }
+        let [pair, call, merge, queued, buffered, inline] = rows;
+        report("clock-pair", pair);
+        report("call", call);
+        report("merge", merge);
+        report("queued-level", queued);
+        report("fire-buffered", buffered);
+        report("fire-inline", inline);
     }
 
     fn add_sync(scheduler: &mut Scheduler, id: &str, inputs: &[&str], window: Option<Duration>) {
@@ -10040,6 +10748,7 @@ mod tests {
                 idx,
                 node_id: Arc::from(id.as_str()),
                 kind,
+                prefired: false,
             });
         }
         let pool = rayon::ThreadPoolBuilder::new()
@@ -10614,6 +11323,213 @@ mod tests {
             "the supply really was drained by the burst, not left behind"
         );
     }
+
+    /// A replay step marked with a trailing refill drives the refill hook once
+    /// after the burst's last fire, leaving the frame frozen for the next
+    /// step; an unmarked step asks only between fires.
+    #[test]
+    fn a_trailing_refill_drives_the_hook_once_after_the_last_fire() {
+        let cap = DATA_PENDING_CARRY_CLAMP as u32;
+        for (marked, want) in [(false, u64::from(cap) - 1), (true, u64::from(cap))] {
+            let mut replay =
+                Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+            add_data(&mut replay, "sink");
+            let calls = Arc::new(AtomicU64::new(0));
+            let calls_hook = Arc::clone(&calls);
+            replay
+                .set_trigger_refill("sink", "inp", move || {
+                    calls_hook.fetch_add(1, Ordering::Relaxed);
+                    RefillOutcome::drained(1, Some(7), false)
+                })
+                .unwrap();
+            replay
+                .set_replay_fire_plan(
+                    0,
+                    &[ReplayFire {
+                        node_id: "sink",
+                        first_fire_ns: 1_000_000,
+                        fire_count: cap,
+                        interval_ns: 0,
+                    }],
+                )
+                .unwrap();
+            if marked {
+                replay.set_replay_trailing_refills(0, &["sink"]).unwrap();
+            }
+            replay.step(Duration::from_millis(10));
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                want,
+                "marked={marked}: the hook is asked between fires, and once more after the \
+                 last on a marked step"
+            );
+            assert_eq!(replay.replay_refill_shortfalls("sink"), Some(0));
+        }
+    }
+
+    /// The trailing-refill marker refuses every node a recording cannot hold
+    /// one on, each by name.
+    #[test]
+    fn a_trailing_refill_is_refused_where_no_burst_can_end_on_one() {
+        let cap = DATA_PENDING_CARRY_CLAMP as u32;
+        let mut s = Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+        add_data(&mut s, "sink");
+        add_data(&mut s, "bare");
+        add_period(&mut s, "tick", Duration::from_millis(1));
+        s.set_trigger_refill("sink", "inp", RefillOutcome::empty_queue)
+            .unwrap();
+        let plan = |fires: u32| {
+            [
+                ReplayFire {
+                    node_id: "sink",
+                    first_fire_ns: 1_000_000,
+                    fire_count: fires,
+                    interval_ns: 0,
+                },
+                ReplayFire {
+                    node_id: "bare",
+                    first_fire_ns: 1_000_000,
+                    fire_count: cap,
+                    interval_ns: 0,
+                },
+                ReplayFire {
+                    node_id: "tick",
+                    first_fire_ns: 1_000_000,
+                    fire_count: cap,
+                    interval_ns: 0,
+                },
+            ]
+        };
+        // No plan installed for the step.
+        let err = s.set_replay_trailing_refills(0, &["sink"]).unwrap_err();
+        assert!(err.to_string().contains("no fire plan"), "{err}");
+        s.set_replay_fire_plan(0, &plan(3)).unwrap();
+        // An unknown node.
+        assert!(matches!(
+            s.set_replay_trailing_refills(0, &["ghost"]),
+            Err(TransportError::NodeNotFound { .. })
+        ));
+        // A Data node with no refill hook, and a Period node.
+        for id in ["bare", "tick"] {
+            let err = s.set_replay_trailing_refills(0, &[id]).unwrap_err();
+            assert!(err.to_string().contains("refill hook"), "{id}: {err}");
+        }
+        // Below the cap, with no pre-fire check.
+        let err = s.set_replay_trailing_refills(0, &["sink"]).unwrap_err();
+        assert!(err.to_string().contains("not the cap"), "{err}");
+        // At the cap it is accepted.
+        s.set_replay_fire_plan(0, &plan(cap)).unwrap();
+        s.set_replay_trailing_refills(0, &["sink"]).unwrap();
+    }
+
+    fn add_external(scheduler: &mut Scheduler, id: &str, fires: &Arc<AtomicU64>) {
+        let fires = Arc::clone(fires);
+        scheduler
+            .add_node(NodeConfig {
+                id: id.to_string(),
+                policy: TriggerPolicy::External,
+                callback: Box::new(move || {
+                    fires.fetch_add(1, Ordering::Relaxed);
+                }),
+            })
+            .unwrap();
+    }
+
+    /// An External node's mark that a full `block` slot deferred is a fire
+    /// owed with nothing left to ring, so the wait sizing reports the slot's
+    /// release deadline. Unmarked, the same held node reports nothing.
+    #[test]
+    fn a_deferred_external_mark_reports_its_block_release_deadline() {
+        use crate::scheduler::block::BlockHold;
+        use std::sync::atomic::AtomicBool;
+        const RELEASE_AT_NS: u64 = 10_000_000;
+
+        let clock = Arc::new(crate::clock::VirtualClock::new());
+        let mut s = Scheduler::with_virtual_clock(Arc::clone(&clock));
+        let fires = Arc::new(AtomicU64::new(0));
+        add_external(&mut s, "ext", &fires);
+        let held = Arc::new(AtomicBool::new(true));
+        let gate = Arc::clone(&held);
+        s.set_pre_fire_check("ext", move |_now_ns| gate.load(Ordering::Relaxed))
+            .unwrap();
+        let hold = Arc::clone(&held);
+        s.set_block_hold("ext", move || {
+            if hold.load(Ordering::Relaxed) {
+                BlockHold::Until(RELEASE_AT_NS)
+            } else {
+                BlockHold::Clear
+            }
+        })
+        .unwrap();
+
+        assert_eq!(
+            s.ns_until_next_fire(0),
+            None,
+            "unmarked, a held External node owes no fire and adds no deadline"
+        );
+        s.trigger_external("ext").unwrap();
+        s.step(Duration::ZERO);
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            0,
+            "the full slot deferred the mark"
+        );
+        assert_eq!(s.ns_until_next_fire(0), Some(RELEASE_AT_NS));
+        assert_eq!(s.ns_until_next_fire(4_000_000), Some(6_000_000));
+
+        held.store(false, Ordering::Relaxed);
+        s.step(Duration::from_millis(10));
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            1,
+            "the released mark fires once"
+        );
+        assert_eq!(
+            s.ns_until_next_fire(10_000_000),
+            None,
+            "served, the node owes nothing again"
+        );
+    }
+
+    /// The same for a mark a `throttle_ms` window deferred: the wait sizing
+    /// reports the end of the window.
+    #[test]
+    fn a_deferred_external_mark_reports_its_throttle_deadline() {
+        const THROTTLE_NS: u64 = 50_000_000;
+        const FIRED_AT_NS: u64 = 10_000_000;
+
+        let clock = Arc::new(crate::clock::VirtualClock::new());
+        let mut s = Scheduler::with_virtual_clock(Arc::clone(&clock));
+        let fires = Arc::new(AtomicU64::new(0));
+        add_external(&mut s, "ext", &fires);
+        s.set_throttle_ns("ext", THROTTLE_NS).unwrap();
+        let handle = s.node_handle("ext").unwrap();
+        s.set_pre_fire_check("ext", move |now_ns| {
+            crate::graph::runtime::throttle_defers(
+                handle.fire_count(),
+                now_ns,
+                handle.last_fire_ns(),
+                THROTTLE_NS,
+            )
+        })
+        .unwrap();
+
+        clock.set(FIRED_AT_NS);
+        s.trigger_external("ext").unwrap();
+        s.step(Duration::ZERO);
+        assert_eq!(fires.load(Ordering::Relaxed), 1, "the first mark fires");
+        assert_eq!(s.ns_until_next_fire(FIRED_AT_NS), None, "and is spent");
+
+        s.trigger_external("ext").unwrap();
+        s.step(Duration::ZERO);
+        assert_eq!(
+            fires.load(Ordering::Relaxed),
+            1,
+            "the throttle deferred the second"
+        );
+        assert_eq!(s.ns_until_next_fire(FIRED_AT_NS), Some(THROTTLE_NS));
+        assert_eq!(s.ns_until_next_fire(35_000_000), Some(25_000_000));
+    }
 }
 
 /// The per-set Sync ALIGN DRIVER, driven against a hand-written
@@ -10664,10 +11580,8 @@ mod align_driver_tests {
 
     /// The double.
     ///
-    /// **The failure model mirrors the real FFI SPLIT, and that is load-bearing.**
-    /// `FillBoundary` / `FillRefill` do NOT cross `cerulion_node_sync_head_op` —
-    /// they ride the pre-existing drain symbols — so a fixture whose
-    /// `sync_head_op` fails still FILLS its heads. A double that failed the
+    /// The double faults descent operations while its fill operations remain
+    /// live, so its heads fill before a `sync_head_op` refusal. A double that failed the
     /// fills too would never reach the verdict loop at all: completeness would
     /// fail first, no gate would ever be scanned, and the arms that exist to
     /// pin the gate's failure POSITION would silently test nothing. (Measured:
@@ -11055,11 +11969,9 @@ mod align_driver_tests {
         );
     }
 
-    /// The TOTAL failure regime (a poisoned cdylib `NODES` mutex:
-    /// every `sync_head_op` returns a failure code).
+    /// A failure regime where every descent operation is refused.
     ///
-    /// The fills still work — they ride the drain symbols, not
-    /// `cerulion_node_sync_head_op` — so the heads fill and a complete
+    /// The double keeps fills live, so the heads fill and a complete
     /// in-window tuple forms. The ARGMIN's own probe is then the FIRST head op
     /// issued, it fails, and the failed-probe policy resolves it to `None` at that site: nothing
     /// to descend to, so the node FIRES GREEDY. Sound membership, loudly

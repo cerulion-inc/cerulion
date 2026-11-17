@@ -82,7 +82,7 @@ fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         prefix: "bp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -97,7 +97,7 @@ fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -105,6 +105,7 @@ fn block_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -209,6 +210,8 @@ fn block_input_meta(depth: usize) -> InputMeta {
         depth,
         backpressure: BackpressurePolicy::Block,
         expect_within_ms: None,
+        accumulate: false,
+        consume: Default::default(),
     }
 }
 
@@ -240,7 +243,7 @@ fn draining_block_graph(
         prefix: "dbp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -255,7 +258,7 @@ fn draining_block_graph(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -263,6 +266,7 @@ fn draining_block_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -371,16 +375,13 @@ fn block_drain_resume_no_data_loss() {
 }
 
 // ===========================================================================
-// Mixed-consumer degrade. A topic with one `block`
-// consumer + one `drop_oldest` consumer → `is_all_block()` is false → the
-// producer is NOT deferred (fires full rate) and the block consumer degrades
-// to native drop_oldest. Asserts the producer fires at the UN-pressured rate
-// (the non-block sibling isn't starved) and the block consumer's
-// `backpressure_block_fires_deferred_count` stays 0.
+// Mixed topic. A topic with one `block` consumer + one `drop_oldest`
+// consumer: the `block` consumer holds its own credit slot and defers the
+// producer at its depth; the `drop_oldest` consumer holds none.
 // ===========================================================================
 
 /// A stalled block consumer (never drains) sharing a topic with a
-/// drop_oldest sibling. On a mixed topic this should degrade — never defer.
+/// drop_oldest sibling. It still defers the producer at its depth.
 #[cerulion_node(external)]
 #[derive(Default)]
 struct MixedBlockConsumer {
@@ -422,7 +423,7 @@ impl DropOldestConsumer {
 }
 
 #[test]
-fn mixed_block_dropoldest_producer_not_deferred() {
+fn mixed_block_dropoldest_block_consumer_still_defers() {
     let config = GraphConfig {
         level_assignments: None,
         network: None,
@@ -434,7 +435,7 @@ fn mixed_block_dropoldest_producer_not_deferred() {
         prefix: "mbp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -449,7 +450,7 @@ fn mixed_block_dropoldest_producer_not_deferred() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "blocker".to_string(),
@@ -457,11 +458,12 @@ fn mixed_block_dropoldest_producer_not_deferred() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),
@@ -469,6 +471,7 @@ fn mixed_block_dropoldest_producer_not_deferred() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -496,24 +499,27 @@ fn mixed_block_dropoldest_producer_not_deferred() {
     }
 
     let producer_fires = runtime.node_handle("producer").unwrap().fire_count();
-    // The producer fires once per 10ms step — UN-pressured. On a mixed topic
-    // the block consumer degrades and installs no defer edge, so the producer
-    // is never deferred (decision K — don't starve the non-block sibling).
+    // The block consumer never drains, so its slot fills at depth 2 and the
+    // producer defers from then on, whatever the drop_oldest sibling does.
     assert_eq!(
-        producer_fires, steps as u64,
-        "producer must fire at the un-pressured rate on a mixed topic (block \
-         consumer degrades to drop_oldest, no defer) — got {producer_fires}"
+        producer_fires, 2,
+        "the block consumer of a mixed topic defers the producer at its depth, got \
+         {producer_fires}"
     );
-    // The degraded block consumer must record ZERO defers — its block policy
-    // was downgraded, so no outstanding mirror / pre-fire edge was wired.
     let blocker_deferred = runtime
         .node_handle("blocker")
         .unwrap()
         .backpressure_block_fires_deferred_count("inp");
     assert_eq!(
-        blocker_deferred, 0,
-        "a degraded (mixed-topic) block consumer must observe 0 block defers \
-         (got {blocker_deferred})"
+        blocker_deferred,
+        steps as u64 - 2,
+        "every step after the slot filled is a block defer"
+    );
+    let dropper = runtime.node_handle("dropper").unwrap();
+    assert_eq!(
+        dropper.backpressure_block_fires_deferred_count("inp"),
+        0,
+        "the drop_oldest sibling records no block defer"
     );
 }
 
@@ -562,7 +568,7 @@ fn block_declared_depth_honored_beyond_global_default() {
         prefix: "depbp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -577,7 +583,7 @@ fn block_declared_depth_honored_beyond_global_default() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -585,6 +591,7 @@ fn block_declared_depth_honored_beyond_global_default() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -630,13 +637,10 @@ fn block_declared_depth_honored_beyond_global_default() {
 }
 
 // ===========================================================================
-// The degrade contract's negative
-// pin is mixed_block_dropoldest_producer_not_deferred (no defers, producer
-// un-pressured). This is the POSITIVE half: a `block` input on a MIXED topic
-// lands in the wiring chain's `else` arm and gets a REAL drop_oldest probe —
-// when the un-deferred producer overflows its buffer, evictions are counted
-// and its `#[on_event]` handler sees a DropOldest event (the policy
-// flip is user-visible, exactly as USER_API documents the degrade).
+// The mixed topic's POSITIVE half under load: a slow `block` consumer next
+// to a `drop_oldest` sibling, fed by a producer far faster than it drains. The
+// block input stays LOSSLESS (no eviction is counted on it), the producer is
+// deferred, and the consumer's `#[on_event]` handler sees `Block` events.
 // ===========================================================================
 
 /// Flooding producer for the degraded-positive test: publishes every 5 ms,
@@ -658,9 +662,9 @@ impl MixedFloodProducer {
     }
 }
 
-/// A SLOW block consumer (drains every 60 ms) on a mixed topic. Degraded to
-/// drop_oldest: ~12 publishes land per drain cycle against a 4-deep buffer,
-/// so iceoryx2 evicts between drains and the probe must count it.
+/// A SLOW block consumer (drains every 60 ms) on a mixed topic. ~12
+/// publishes would land per drain cycle against a 2-deep queue; the producer
+/// is deferred instead, so nothing is evicted.
 #[cerulion_node(period_ms = 60)]
 #[derive(Default)]
 struct DegradedBlockConsumer {
@@ -679,22 +683,16 @@ impl DegradedBlockConsumer {
     #[on_event(input = "inp")]
     fn on_inp_pressure(&mut self, event: BackpressureEvent) {
         assert!(
-            matches!(event.policy, BackpressurePolicy::DropOldest),
-            "a DEGRADED block input must surface DropOldest events (the \
-             policy flip is user-visible), got {:?}",
+            matches!(event.policy, BackpressurePolicy::Block),
+            "a block input on a mixed topic surfaces Block events, got {:?}",
             event.policy
-        );
-        assert!(
-            event.dropped > 0,
-            "a drop_oldest event carries the evicted count (got {})",
-            event.dropped
         );
         self.fires.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[test]
-fn mixed_topic_degraded_block_counts_drop_oldest() {
+fn mixed_topic_block_consumer_stays_lossless_under_a_flood() {
     let fires = Arc::new(AtomicU64::new(0));
     let config = GraphConfig {
         level_assignments: None,
@@ -707,7 +705,7 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
         prefix: "mdp".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -722,7 +720,7 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "blocker".to_string(),
@@ -730,11 +728,12 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dropper".to_string(),
@@ -742,6 +741,7 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -773,22 +773,20 @@ fn mixed_topic_degraded_block_counts_drop_oldest() {
         runtime.step(Duration::from_millis(5));
     }
     let handle = runtime.node_handle("blocker").unwrap();
-    let evicted = handle.backpressure_drop_oldest_count("inp");
-    assert!(
-        evicted > 0,
-        "the degraded block input's drop_oldest probe must count real \
-         iceoryx2 evictions (got {evicted})"
-    );
     assert_eq!(
-        handle.backpressure_block_fires_deferred_count("inp"),
+        handle.backpressure_drop_oldest_count("inp"),
         0,
-        "the degraded input observes zero block defers (no defer edge wired)"
+        "the block input of a mixed topic loses nothing"
+    );
+    let deferred = handle.backpressure_block_fires_deferred_count("inp");
+    assert!(
+        deferred >= 20,
+        "the flood producer is deferred on the block slot (got {deferred})"
     );
     let fired = fires.load(Ordering::Relaxed);
     assert!(
         fired >= 1,
-        "the degraded input's #[on_event] handler must fire with a \
-         DropOldest event (got {fired})"
+        "the block input's #[on_event] handler fires with a Block event (got {fired})"
     );
 }
 
@@ -984,7 +982,7 @@ fn a_trace_driven_plan_reaches_the_block_and_non_block_level_seams() {
     let (mut config, mut factories) = block_graph();
     config.prefix = "bpplan".to_string();
     config.nodes.push(NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "solo".to_string(),
@@ -1079,7 +1077,7 @@ fn the_graph_runtime_pause_wrappers_drive_the_seam_on_the_fused_block_path() {
     // level seam in the same step and pins the report's insertion order across
     // the two seams (`producer` idx 0, `consumer` idx 1, `solo` idx 2).
     config.nodes.push(NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "solo".to_string(),
@@ -1368,7 +1366,7 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
         prefix: "pausedeliv".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 id: "producer".to_string(),
                 node_type: "block_producer".to_string(),
@@ -1383,13 +1381,14 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
                 ros2: None,
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 id: "listener".to_string(),
                 node_type: "drain_all_listener".to_string(),
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
                 ros2: None,
@@ -1407,6 +1406,8 @@ fn the_injection_hook_publishes_a_real_frame_that_reaches_the_consumer_in_the_sa
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )

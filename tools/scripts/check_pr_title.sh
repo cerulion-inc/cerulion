@@ -166,7 +166,7 @@ check_title() {
         fail "the PR title is empty"
         return
     fi
-    if ! printf '%s' "$_t" | grep -qE "$TITLE_RE"; then
+    if ! grep -qE "$TITLE_RE" <<<"$_t"; then
         # The title itself is not printed: the CI log keeps what it prints after
         # the author edits the title, and the title is on the pull request page.
         fail "PR title does not match '<type>(<scope>): <description>'
@@ -192,7 +192,7 @@ check_branch() { # <branch> [pr-number] [author]
     # name is checked like any other. The TITLE is still checked by the
     # caller: the exemption covers the name that cannot change, not the title
     # that can.
-    if [ -n "$_pr" ] && printf '%s\n' "$GRANDFATHERED_BRANCHES" | grep -qxF -e "$_pr $_b"; then
+    if [ -n "$_pr" ] && grep -qxF -e "$_pr $_b" <<<"$GRANDFATHERED_BRANCHES"; then
         return
     fi
     # A forge-minted bot branch (see the header): the AUTHOR and the shape both
@@ -200,19 +200,19 @@ check_branch() { # <branch> [pr-number] [author]
     # skipped for the pair. `-e` keeps a login starting with `-` from being read
     # as an option.
     if [ -n "$_ba" ] \
-       && printf '%s\n' "$BOT_AUTHORS" | grep -qxF -e "$_ba" \
-       && printf '%s' "$_b" | grep -qE "$BOT_BRANCH_RE"; then
+       && grep -qxF -e "$_ba" <<<"$BOT_AUTHORS" \
+       && grep -qE "$BOT_BRANCH_RE" <<<"$_b"; then
         return
     fi
     # The tracker check runs FIRST and reports its own remedy: a branch whose
     # slug carries an id still matches the shape rule, so a shape-only message
     # would tell the author their branch is fine.
-    if printf '%s' "$_b" | grep -qE "$TRACKER_RE"; then
+    if grep -qE "$TRACKER_RE" <<<"$_b"; then
         fail "head branch '$_b' carries a tracker id — put it in the PR BODY instead.
     A branch name is permanent and public; the id links from the body and means
     nothing outside the tracker. Rename to '<type>/<what-it-does>'."
     fi
-    if ! printf '%s' "$_b" | grep -qE "$BRANCH_RE"; then
+    if ! grep -qE "$BRANCH_RE" <<<"$_b"; then
         fail "head branch '$_b' does not match '<type>/<kebab-slug>'
     types: ${TYPES//|/, }
     lowercase letters, digits and hyphens only, e.g. 'fix/held-input-replay'
@@ -340,7 +340,7 @@ violations=0")
     # Precondition: the derivation must itself be a tracker id, or every
     # tracker row below is vacuous.
     _run=$((_run + 1))
-    if ! printf '%s' "$_tid" | grep -qE "$TRACKER_RE"; then
+    if ! grep -qE "$TRACKER_RE" <<<"$_tid"; then
         printf 'SELF-TEST FAIL: could not derive a tracker-id sample from TRACKER_RE (got: %s)\n' "$_tid" >&2
         _fails=$((_fails + 1))
     fi

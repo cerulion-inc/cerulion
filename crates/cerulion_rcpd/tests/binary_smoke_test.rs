@@ -89,15 +89,23 @@ fn stdio_answers_initialize_with_the_server_name() {
 /// Start the binary on `manifest_yaml`, initialize, and return the
 /// `tools/list` reply's tools.
 fn tools_over_stdio(manifest_yaml: &str) -> Vec<serde_json::Value> {
+    tools_and_stderr_over_stdio(manifest_yaml).0
+}
+
+/// [`tools_over_stdio`], and what the binary wrote to stderr by then.
+fn tools_and_stderr_over_stdio(manifest_yaml: &str) -> (Vec<serde_json::Value>, String) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("rcp.yaml");
     std::fs::write(&path, manifest_yaml).expect("write manifest");
+    let stderr_path = dir.path().join("stderr.log");
+    let stderr = std::fs::File::create(&stderr_path).expect("stderr file");
     let mut child = Command::new(env!("CARGO_BIN_EXE_cerulion-rcpd"))
         .arg("--manifest")
         .arg(&path)
+        .env_remove(cerulion_rcpd::eye::JEV_KEY_FILE_ENV)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("run cerulion-rcpd");
     let mut stdin = child.stdin.take().expect("stdin");
@@ -135,7 +143,8 @@ fn tools_over_stdio(manifest_yaml: &str) -> Vec<serde_json::Value> {
     let _ = child.kill();
     let _ = child.wait();
     first.expect("an initialize reply within 60 s");
-    tools.expect("a tools/list reply within 60 s")
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    (tools.expect("a tools/list reply within 60 s"), stderr)
 }
 
 /// A manifest on journal topics private to this process and `tag`, with one
@@ -199,6 +208,106 @@ fn the_binary_refuses_an_irreversible_tool_under_the_refuse_switch() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("arm.cut") && stderr.contains("limits.irreversible"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn jev_off_on_and_status_drive_the_switch_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let prefix = format!("rcpd_smoke_jev_{}", std::process::id());
+    let path = dir.path().join("rcp.yaml");
+    std::fs::write(
+        &path,
+        format!(
+            "robot: smoke
+eyes:
+  jev:
+    frame_topic: /{prefix}/wrist
+    ask_topic: /{prefix}/ask
+    answer_topic: /{prefix}/answer
+    question_sets:
+      - name: press
+        state: A wrist camera frame.
+        questions:
+          rim: {{ type: box, instructions: The rim in `frame`. }}
+"
+        ),
+    )
+    .expect("write manifest");
+    let run = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_cerulion-rcpd"))
+            .arg("jev")
+            .args(args)
+            .arg("--manifest")
+            .arg(&path)
+            .env_remove(cerulion_rcpd::eye::JEV_KEY_FILE_ENV)
+            .output()
+            .expect("run cerulion-rcpd");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let status = run(&["status"]);
+    assert!(status.contains("jev: off"), "no key on file: {status}");
+    assert!(
+        status.contains("credential: credential_missing"),
+        "{status}"
+    );
+    assert!(status.contains("model: typesafe/jev-1.14"), "{status}");
+    let off = run(&["off"]);
+    assert!(off.contains("Jev is off"), "{off}");
+    let switch = dir.path().join(".cerulion/rcp/jev.switch");
+    assert_eq!(
+        std::fs::read_to_string(&switch).expect("switch").trim(),
+        "off"
+    );
+    assert!(run(&["status"]).contains("switch: off"));
+    let on = run(&["on"]);
+    assert!(
+        on.contains("cerulion-rcpd jev off"),
+        "the notice names the off switch: {on}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&switch).expect("switch").trim(),
+        "on"
+    );
+}
+
+#[test]
+fn an_eye_that_cannot_open_its_ports_leaves_the_tools_served() {
+    let prefix = format!("rcpd_smoke_eye_{}", std::process::id());
+    // A frame topic longer than the transport allows: the eye's ports fail.
+    let long = "f".repeat(300);
+    let yaml = format!(
+        "robot: smoke
+journal:
+  calls_topic: /{prefix}/calls
+  results_topic: /{prefix}/results
+eyes:
+  jev:
+    base_url: http://127.0.0.1:9/api/v1
+    frame_topic: /{prefix}/{long}
+    ask_topic: /{prefix}/ask
+    answer_topic: /{prefix}/answer
+    question_sets:
+      - name: press
+        state: A wrist camera frame.
+        questions:
+          rim: {{ type: box, instructions: The rim in `frame`. }}
+{CUT_TOOL}"
+    );
+    let (tools, stderr) = tools_and_stderr_over_stdio(&yaml);
+    assert_eq!(
+        names(&tools),
+        ["arm.cut", "estop", "estop_clear"],
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("the Jev eye did not start; serving without it"),
         "{stderr}"
     );
 }

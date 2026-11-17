@@ -155,8 +155,8 @@ pub use crate::scheduler::{LivelinessCause, LivelinessEvent, LivelinessState};
 #[cfg(any(test, feature = "test-helpers"))]
 pub use crate::graph::node::ClosureNodeEntry;
 pub use crate::graph::node::{
-    AnyPublisher, AnySubscriber, BackpressurePolicy, ExternalSource, InputMeta, NodeContext,
-    NodeEntry, NodeInfo, OutputMeta, ShutdownSignal,
+    AnyPublisher, AnySubscriber, BackpressurePolicy, ExternalSource, InputConsume, InputMeta,
+    NodeContext, NodeEntry, NodeInfo, OutputMeta, ShutdownSignal,
 };
 
 // Runtime graph types, then the node macros

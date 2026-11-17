@@ -40,8 +40,8 @@ use cerulion_bag::{BagReader, BagWriter, BagWriterConfig, TopicSchema};
 use cerulion_bagd::{RecordHealth, TopicHealth, RECORD_HEALTH_VERSION};
 use cerulion_cli_engine::replay_cmd::ReplayError;
 use cerulion_cli_engine::replay_engine::{
-    self, FireSide, RecordHealthReport, RecordedMessages, RecordedTrace, ReplayInputs, ReplayNodes,
-    ReplayOutcome, ViolationClass,
+    self, ByteDifference, DifferenceKind, DifferenceValue, FireSide, RecordHealthReport,
+    RecordedMessages, RecordedTrace, ReplayInputs, ReplayNodes, ReplayOutcome, ViolationClass,
 };
 use cerulion_core::graph::config::GraphConfig;
 use cerulion_core::graph::GraphRuntime;
@@ -194,6 +194,64 @@ struct RelayNode {
 impl RelayNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         self.out.x = self.inp.x + self.addend;
+        Ok(())
+    }
+}
+
+/// The relay with a `consume = latest` trigger: each step that sees frames
+/// fires it once, on the newest.
+#[cerulion_node]
+#[derive(Default)]
+struct LatestRelayNode {
+    #[input(trigger, consume = latest)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl LatestRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
+/// [`LatestRelayNode`] throttled to one fire per 12 ms: at the reference
+/// run's 5 ms step a frame arriving in the step after a fire is held through
+/// two deferred steps.
+#[cerulion_node(throttle_ms = 12)]
+#[derive(Default)]
+struct ThrottledLatestRelayNode {
+    #[input(trigger, consume = latest)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl ThrottledLatestRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
+/// [`LatestRelayNode`] behind an 8 ms `sample` gate: at the 5 ms step the
+/// gate admits the newest frame of every other step.
+#[cerulion_node]
+#[derive(Default)]
+struct SampledLatestRelayNode {
+    #[input(trigger, consume = latest, backpressure = sample(8))]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl SampledLatestRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + 100.0;
         Ok(())
     }
 }
@@ -721,6 +779,10 @@ struct Recording {
     /// steering plane stands down — which is exactly what a shared-bus
     /// fixture with invented ids measures and mistakes for "a recording carries no annotations".
     publisher_ids: IndexMap<String, Vec<(String, u128)>>,
+    /// The reference runtime's own per-stage staging rows, as a recorder stamps
+    /// them into a manifest's `read_log_capacities`: `{node: [[input_idx, role
+    /// byte, capacity], ...]}`.
+    stage_rows: serde_json::Value,
 }
 
 /// One external-topic driver for the reference run: the absolute topic + the
@@ -857,6 +919,7 @@ fn record_uniform_with_read_log_and_feed(
         16,
         true,
         Some(feed),
+        &[],
     )
 }
 
@@ -909,11 +972,16 @@ fn record_reference_impl(
         subscriber_buffer,
         read_log,
         None,
+        &[],
     )
 }
 
 /// [`record_reference_impl`] with `in_step_feed`, which parks one drive's
-/// publisher where a node can reach it ([`InStepFeed`]).
+/// publisher where a node can reach it ([`InStepFeed`]), and `drivers`, the
+/// `external` nodes the run fires before every step, as their device's wake
+/// does live.
+// Every argument is one independent knob of the reference run.
+#[allow(clippy::too_many_arguments)]
 fn record_reference_impl_fed(
     graph_yaml: &str,
     make_factories: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
@@ -922,6 +990,7 @@ fn record_reference_impl_fed(
     subscriber_buffer: usize,
     read_log: bool,
     in_step_feed: Option<&InStepFeed>,
+    drivers: &[&str],
 ) -> Recording {
     let config = cerulion_core::graph::parse_graph(graph_yaml).expect("reference graph parses");
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
@@ -1021,6 +1090,11 @@ fn record_reference_impl_fed(
                 proxy.x = *value;
                 drop(proxy); // publish
             }
+        }
+        for id in drivers {
+            runtime
+                .trigger_external(id)
+                .unwrap_or_else(|e| panic!("reference driver {id} must fire: {e}"));
         }
         runtime.step(Duration::from_millis(*delta_ms));
         // The per-step STEP_BOUNDARY record: the step's ADVANCED clock (what
@@ -1123,6 +1197,20 @@ fn record_reference_impl_fed(
     if let Some(feed) = in_step_feed {
         feed.slot.lock().expect("feed slot").take();
     }
+    let stage_rows = {
+        let mut map = serde_json::Map::new();
+        for id in &node_ids {
+            let rows: Vec<serde_json::Value> = runtime
+                .read_outcome_stage_capacities(id)
+                .iter()
+                .map(|c| serde_json::json!([c.input_idx, c.role.wire(), c.capacity]))
+                .collect();
+            if !rows.is_empty() {
+                map.insert(id.clone(), serde_json::Value::Array(rows));
+            }
+        }
+        serde_json::Value::Object(map)
+    };
     runtime.shutdown();
 
     Recording {
@@ -1133,6 +1221,7 @@ fn record_reference_impl_fed(
         input_names,
         pending_after,
         publisher_ids,
+        stage_rows,
     }
 }
 
@@ -1268,12 +1357,12 @@ fn write_bag_with_coordination(
     path: &std::path::Path,
     coordination: replay_engine::CoordinationMode,
 ) {
-    write_bag_with_recorder_json(rec, path, production_recorder_json(coordination));
+    write_bag_with_recorder_json(rec, path, pre_stamp_recorder_json(coordination));
 }
 
 /// [`write_bag_with_coordination`] with the `recorder.json` supplied verbatim.
 ///
-/// The seam an ARCHIVED-format case needs: `production_recorder_json` stamps
+/// The seam an ARCHIVED-format case needs: `pre_stamp_recorder_json` stamps
 /// [`replay_engine::recorder_stamps_consult_records`] unconditionally, so every
 /// bag this binary writes is format 7 and a format <= 6 bag (the shape older
 /// recorders wrote) is otherwise unreachable from this file.
@@ -1296,11 +1385,45 @@ fn write_bag_with_recorder_json(rec: &Recording, path: &std::path::Path, recorde
 }
 
 /// The `recorder.json` bytes a real recorder writes for `coordination` (see
-/// [`write_bag_with_coordination`]).
-fn production_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec<u8> {
+/// [`write_bag_with_coordination`]), WITHOUT the `node_external` driver stamp:
+/// the document a recorder made before the stamp wrote, which a replay judges
+/// drivers on by the build it replays.
+///
+/// For a graph whose build declares no `external` node a replay classifies a
+/// stamped bag and an unstamped one alike (no driver either way) and warns
+/// about nothing. The driver fixtures that go through it pin the arm an older
+/// recording takes: the build's declaration decides, one warn says so, and the
+/// report says `replayed_build`. A fixture about the stamp states it by hand
+/// ([`stamped_recorder_json`]).
+fn pre_stamp_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec<u8> {
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&cerulion_cli_engine::graph_cmd::render_recorder_json(
+            std::time::Duration::from_nanos(1_783_092_278_948_123_456),
+            coordination,
+            &std::collections::BTreeMap::new(),
+        ))
+        .expect("the production recorder.json parses");
+    doc.as_object_mut()
+        .expect("an object")
+        .remove("node_external")
+        .expect("the production writer stamps the driver flags");
+    serde_json::to_vec(&doc).expect("re-render")
+}
+
+/// The `recorder.json` bytes a real recorder writes for `coordination` whose
+/// loaded nodes declare the driver flags `stamp` (node id, `external`), stated
+/// by hand: the production renderer, with a hand-written `node_external`.
+fn stamped_recorder_json(
+    coordination: replay_engine::CoordinationMode,
+    stamp: &[(&str, bool)],
+) -> Vec<u8> {
     cerulion_cli_engine::graph_cmd::render_recorder_json(
         std::time::Duration::from_nanos(1_783_092_278_948_123_456),
         coordination,
+        &stamp
+            .iter()
+            .map(|(id, external)| ((*id).to_string(), *external))
+            .collect(),
     )
 }
 
@@ -1355,7 +1478,7 @@ fn write_bag_coordinated_with_capacities(
         None,
         inputs_json,
         Some(serde_json::json!(0)),
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         None,
         Some(capacities),
@@ -1515,7 +1638,7 @@ fn write_bag_with_annotations(
         None,
         inputs_json,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         publishers,
         None,
         None,
@@ -1598,6 +1721,34 @@ fn write_producer_labels(
     resolved: &[u16],
     labels: &[ProducerLabel<'_>],
 ) -> cerulion_bag::BagResult<()> {
+    write_producer_labels_encoded(c, channel, resolved, labels, encode_label_as_recorded)
+}
+
+/// How a crafted bag encodes one producer label record onto the reserved
+/// channel.
+type LabelEncoder = fn(&cerulion_bag::ProducerRecord) -> Vec<u8>;
+
+/// A label record exactly as the recorder writes it.
+fn encode_label_as_recorded(record: &cerulion_bag::ProducerRecord) -> Vec<u8> {
+    record.encode().to_vec()
+}
+
+/// A label record as a newer Cerulion writes it: this build's layout under
+/// the next version byte, which this build's decoder refuses.
+fn encode_label_as_a_newer_version(record: &cerulion_bag::ProducerRecord) -> Vec<u8> {
+    let mut body = record.encode().to_vec();
+    body[0] = cerulion_bag::PRODUCER_RECORD_VERSION + 1;
+    body
+}
+
+/// [`write_producer_labels`] with each record's bytes from `encode`.
+fn write_producer_labels_encoded(
+    c: &mut cerulion_bag::ChunkScope<'_>,
+    channel: u16,
+    resolved: &[u16],
+    labels: &[ProducerLabel<'_>],
+    encode: LabelEncoder,
+) -> cerulion_bag::BagResult<()> {
     for (i, ((_, attribution, publisher_id), data_channel)) in
         labels.iter().zip(resolved).enumerate()
     {
@@ -1611,7 +1762,7 @@ fn write_producer_labels(
             i as u32,
             0,
             0,
-            &[&record.encode()[..]],
+            &[&encode(&record)[..]],
         )?;
     }
     Ok(())
@@ -1644,6 +1795,41 @@ fn write_bag_impl(
     producer_labels: Option<&[ProducerLabel<'_>]>,
     // The additive per-input staging-rim table.
     read_log_capacities: Option<serde_json::Value>,
+) {
+    write_bag_impl_encoded(
+        rec,
+        path,
+        env_json,
+        schema_name,
+        wire_fixed_size,
+        record_coverage,
+        inputs_json,
+        read_log_capacity,
+        recorder_json,
+        publishers_json,
+        producer_labels,
+        read_log_capacities,
+        encode_label_as_recorded,
+    );
+}
+
+/// [`write_bag_impl`] with each producer label record's bytes from
+/// `encode_label`.
+#[allow(clippy::too_many_arguments)]
+fn write_bag_impl_encoded(
+    rec: &Recording,
+    path: &std::path::Path,
+    env_json: Option<&[u8]>,
+    schema_name: &str,
+    wire_fixed_size: u32,
+    record_coverage: Option<&[u8]>,
+    inputs_json: Option<serde_json::Value>,
+    read_log_capacity: Option<serde_json::Value>,
+    recorder_json: Option<Vec<u8>>,
+    publishers_json: Option<serde_json::Value>,
+    producer_labels: Option<&[ProducerLabel<'_>]>,
+    read_log_capacities: Option<serde_json::Value>,
+    encode_label: LabelEncoder,
 ) {
     let topics: Vec<TopicSchema> = rec
         .messages
@@ -1682,7 +1868,7 @@ fn write_bag_impl(
         for (i, r) in rec.trace.iter().enumerate() {
             c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
         }
-        write_producer_labels(c, labels_channel, &label_channels, labels)?;
+        write_producer_labels_encoded(c, labels_channel, &label_channels, labels, encode_label)?;
         Ok(())
     })
     .unwrap();
@@ -1803,13 +1989,25 @@ fn load_inputs(path: &std::path::Path) -> LoadedInputs {
         .node_ids;
     let env = reader.attachment("env.json").unwrap().map(|a| a.data);
     // The recorder identity, read the way the production gate
-    // reads it. A MALFORMED attachment folds to `None` (treated-as-absent —
-    // the shipped `read_recorder_info` posture, warn-never-refuse), so a
-    // crafted-corruption arm cannot accidentally become a parse panic here.
+    // reads it. A MALFORMED attachment folds to `None` (treated-as-absent),
+    // so a crafted-corruption arm cannot accidentally become a parse panic
+    // here. The driver stamp is read and admitted against the bag's graph by
+    // the PRODUCTION functions the gate calls (serde skips the field), and a
+    // stamp the gate would refuse fails the fixture loudly rather than
+    // replaying as a recording with no stamp.
     let recorder = reader
         .attachment("__cerulion/recorder.json")
         .unwrap()
-        .and_then(|a| serde_json::from_slice::<replay_engine::RecorderInfo>(&a.data).ok());
+        .and_then(|a| {
+            let mut info = serde_json::from_slice::<replay_engine::RecorderInfo>(&a.data).ok()?;
+            let doc: serde_json::Value = serde_json::from_slice(&a.data).ok()?;
+            info.driver_stamp = replay_engine::DriverStamp::admit(
+                replay_engine::RecordedDriverStamp::read(doc.as_object()?),
+                &config,
+            )
+            .expect("a fixture's driver stamp describes its graph");
+            Some(info)
+        });
     // Zero-copy recorded index + streamed trace over the SAME mapped bag —
     // mirrors the production `run_replay` gate exit.
     let messages = RecordedMessages::from_reader(reader.clone()).expect("index recorded messages");
@@ -2003,12 +2201,14 @@ fn replay_inner_with_transport(
         recorder,
         record_health,
         duration_bound_ns,
+        feed_index_budget: None,
         report_path,
         fire_tap,
         tolerance,
         strict_state,
         allow_param_change,
         record_out: None,
+        purpose: legacy_purpose(),
     };
     let factories = make_factories(&transport);
     let nodes = ReplayNodes::Injected {
@@ -2017,6 +2217,20 @@ fn replay_inner_with_transport(
         factories,
     };
     replay_engine::run_engine(inputs, nodes)
+}
+
+/// The purpose the arms of this file that predate read identity replay under.
+///
+/// They exercise the queue re-creation path (cross-rank injection, its
+/// steering and stand-downs, the read gate over real queues), which is the path
+/// a resim without `--verify` and every bag recorded before read identity take,
+/// so they run as a resim. `CER_REPLAY_TEST_PURPOSE=verify` runs them fed
+/// instead, to sweep the fed path over every shape this file records.
+fn legacy_purpose() -> replay_engine::ReplayPurpose {
+    match std::env::var("CER_REPLAY_TEST_PURPOSE").as_deref() {
+        Ok("verify") => replay_engine::ReplayPurpose::Verify,
+        _ => replay_engine::ReplayPurpose::Resim,
+    }
 }
 
 /// The TEST'S OWN resolver of a [`Recording`]'s FIRE records to canonical
@@ -2282,6 +2496,26 @@ fn sync_quiet_read_log_oracle(steps: u64) -> Vec<(u64, u32, u16, u16, u64, u32)>
 
 /// Two sources → one two-plain-input consumer (the
 /// two-EDGE verifier graph).
+/// [`source_relay_yaml`] with the relay's topic listed in
+/// `multi_publisher_topics`: one writer still, but an edge whose wire sequence
+/// the verifier may not attribute without a resolvable producer token, which is
+/// where an unresolvable one stands the edge down.
+fn source_relay_multi_writer_yaml() -> &'static str {
+    "name: srgraph\nprefix: sr\nmulti_publisher_topics:\n  - /sr/source/out\nnodes:\n\
+     \x20 - id: source\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: source/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// [`two_source_fusion_yaml`] with input `a`'s topic listed in
+/// `multi_publisher_topics`, so `a` is the edge an unresolvable token stands
+/// down and `b` is compared.
+fn two_source_fusion_a_multi_writer_yaml() -> &'static str {
+    "name: fugraph\nprefix: fu\nmulti_publisher_topics:\n  - /fu/sa/out\nnodes:\n\
+     \x20 - id: sa\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sb\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: fuse\n    type: fusion_node\n    inputs:\n      - name: a\n        source: sa/out\n      - name: b\n        source: sb/out\n"
+}
+
 fn two_source_fusion_yaml() -> &'static str {
     "name: fugraph\nprefix: fu\nnodes:\n\
      \x20 - id: sa\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
@@ -2453,6 +2687,166 @@ fn two_replays_of_same_bag_are_byte_identical() {
     );
 }
 
+/// A `block` consumer (depth 2) that never drains in a short run: its 1 s
+/// period puts its first fire past the last step, so its producer is held
+/// whenever the slot is full.
+#[cerulion_node(period_ms = 1000)]
+#[derive(Default)]
+struct StalledBlockNode {
+    #[input(backpressure = block, depth = 2)]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl StalledBlockNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
+        Ok(())
+    }
+}
+
+/// `holder` (5 ms period) publishes the mixed topic `/bt/holder/out`: `gate`
+/// reads it `block` with `block_timeout_ms: 50` and never drains, and `tap`
+/// reads it `drop_oldest` and relays each frame to `/bt/tap/out`.
+fn block_timeout_yaml() -> &'static str {
+    "name: btgraph\nprefix: bt\nnodes:\n\
+     \x20 - id: holder\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: gate\n    type: stalled_block_node\n    inputs:\n      - name: inp\n        source: holder/out\n        block_timeout_ms: 50\n\
+     \x20 - id: tap\n    type: relay_node\n    inputs:\n      - name: inp\n        source: holder/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn block_timeout_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("holder", Box::new(SourceNodeEntry::new())),
+        ("gate", Box::new(StalledBlockNodeEntry::new())),
+        ("tap", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// Every `block` slot release event in `lines` for `gate.inp`, in log order,
+/// as `(releases, held_ms)`; `held_ms` rides only the loud first-of-regime
+/// line (`releases` a power of ten).
+fn gate_release_events(lines: &[&str]) -> Vec<(u64, Option<u64>)> {
+    let field = |line: &str, key: &str| -> Option<u64> {
+        let at = line.find(key)? + key.len();
+        let digits: String = line[at..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        digits.parse().ok()
+    };
+    lines
+        .iter()
+        .filter(|l| l.contains("`block` slot released") && l.contains("consumer_node=gate"))
+        .map(|l| {
+            (
+                field(l, " releases=").expect("a release event carries its count"),
+                field(l, " held_ms="),
+            )
+        })
+        .collect()
+}
+
+/// A whole-run replay of a lockstep recording re-executes `block`: a producer
+/// held on a mixed topic and a `block_timeout_ms` release on its one-producer
+/// local edge come out of the replay exactly as live, and two replays are
+/// identical.
+///
+/// The hand oracle. Step `k` moves the clock to `5(k+1)` ms. `holder` fires
+/// at 5 and 10 ms (steps 0 and 1) and fills `gate`'s slot; from step 2 (15
+/// ms) the slot reads full and `holder` is held. The `block_timeout_ms` clock
+/// starts at the slot's first full evaluation, at 15 ms, not at the 10 ms
+/// publish that filled it, so at step 12 (65 ms) the slot has read full with
+/// no drain for 50 ms: it is released once, and `holder` fires its two
+/// oldest missed periods (15 and 20 ms) before the slot reads full again at
+/// 65 ms, which starts the next 50 ms stretch. So the releases fall at steps
+/// 12, 22 and 32, and `holder` publishes `x = 1..=8` over 35 steps. `tap`
+/// relays each frame in the step it is published, at that step's clock.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_lockstep_replay_holds_and_releases_a_block_producer_exactly_as_live() {
+    const STEPS: usize = 35;
+    let ms = |t: u64| t * 1_000_000;
+    let fire = |step: u64, level: usize, node: &str, t: u64| (step, level, node.to_string(), ms(t));
+    let expected_fires = vec![
+        fire(0, 0, "holder", 5),
+        fire(0, 1, "tap", 5),
+        fire(1, 0, "holder", 10),
+        fire(1, 1, "tap", 10),
+        fire(12, 0, "holder", 15),
+        fire(12, 0, "holder", 20),
+        fire(12, 1, "tap", 65),
+        fire(12, 1, "tap", 65),
+        fire(22, 0, "holder", 25),
+        fire(22, 0, "holder", 30),
+        fire(22, 1, "tap", 115),
+        fire(22, 1, "tap", 115),
+        fire(32, 0, "holder", 35),
+        fire(32, 0, "holder", 40),
+        fire(32, 1, "tap", 165),
+        fire(32, 1, "tap", 165),
+    ];
+    let expected_x: Vec<f64> = (1..=8).map(f64::from).collect();
+    // One run's releases: counts 1, 2 and 3, each after 50 ms held.
+    let one_run = vec![(1, Some(50)), (2, None), (3, None)];
+
+    let rec = record_uniform(block_timeout_yaml(), block_timeout_factories, &[], STEPS);
+    assert_eq!(resolved_fire_oracle(&rec), expected_fires, "the live fires");
+    for topic in ["/bt/holder/out", "/bt/tap/out"] {
+        let xs: Vec<f64> = rec.messages[topic].iter().map(|f| frame_x(f)).collect();
+        assert_eq!(xs, expected_x, "the live frames on {topic}");
+    }
+    logs_assert(|lines: &[&str]| match gate_release_events(lines) {
+        got if got == one_run => Ok(()),
+        got => Err(format!("live releases {got:?}, expected {one_run:?}")),
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("block_timeout.mcap");
+    write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::Lockstep);
+    let (a, fires_a) = replay_with_tap(&bag, block_timeout_factories);
+    let (b, fires_b) = replay_with_tap(&bag, block_timeout_factories);
+    let (a, b) = (a.expect("replay runs"), b.expect("replay runs"));
+    for outcome in [&a, &b] {
+        assert_eq!(
+            outcome.coordination,
+            replay_engine::CoordinationReport {
+                mode: replay_engine::CoordinationMode::Lockstep,
+                inferred: false,
+            },
+            "the bag replays under the lockstep contract"
+        );
+        // Every frame of both topics byte for byte as live, and the same
+        // fires: the replay re-ran the hold and the release itself.
+        assert!(outcome.passed, "byte-exact: {:?}", outcome.violations);
+        assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 2));
+        assert!(
+            outcome.trace_divergence.is_none(),
+            "{:?}",
+            outcome.trace_divergence
+        );
+        assert_eq!(outcome.ticks_replayed, STEPS);
+    }
+    for fires in [&fires_a, &fires_b] {
+        let (recorded_side, replayed_side) = tap_sides(fires);
+        assert_eq!(recorded_side, expected_fires, "recorded side, in order");
+        assert_eq!(replayed_side, expected_fires, "replayed side, in order");
+    }
+    // Live, then each replay, released the slot at the same counts.
+    let three_runs: Vec<(u64, Option<u64>)> = one_run.repeat(3);
+    logs_assert(|lines: &[&str]| match gate_release_events(lines) {
+        got if got == three_runs => Ok(()),
+        got => Err(format!("releases {got:?}, expected {three_runs:?}")),
+    });
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap(),
+        "two replays produce byte-identical outcomes"
+    );
+    assert_eq!(fires_a, fires_b, "two replays fire identically");
+}
+
 // ===========================================================================
 // 3. Perturbation — a flipped payload byte in the bag
 // ===========================================================================
@@ -2493,6 +2887,7 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ref difference,
         } => {
             assert_eq!(index, 2, "frame index named");
             assert_eq!(
@@ -2501,9 +2896,41 @@ fn flipped_payload_byte_is_a_byte_mismatch_violation() {
                 "the flip was at the first payload byte"
             );
             assert_eq!((recorded_len, replayed_len), (64, 64));
+            assert_eq!(difference.path.as_deref(), Some("x"));
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
+    // The line names the field and both values. Oracle: frame 2's relay x
+    // is 3.0 + 100 = 103.0 (LE `00 00 00 00 00 c0 59 40`); byte 0 XOR 0xFF
+    // reads back as 103.00000000000362, the RECORDED side.
+    assert_eq!(
+        relay_violations[0].detail,
+        "frame 2 on '/sr/relay/out' differs at x: recorded 103.00000000000362, replayed 103.0 \
+         (recorded 64 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(&relay_violations[0].class).unwrap()["difference"],
+        serde_json::json!({
+            "kind": "field",
+            "path": "x",
+            "recorded": 103.00000000000362,
+            "replayed": 103.0,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": null,
+            "region": null,
+            "reason": null,
+            "more": 0,
+        })
+    );
+    // Determinism: a second replay of the same diverging bag names the same
+    // field with the same values, byte for byte.
+    let again = replay(&bag, source_relay_factories, None, None).unwrap();
+    assert_eq!(
+        serde_json::to_string(&outcome.violations).unwrap(),
+        serde_json::to_string(&again.violations).unwrap(),
+        "two replays of one diverging bag report identically"
+    );
     // The source topic (untouched) still passes.
     assert!(outcome
         .violations
@@ -2659,6 +3086,7 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ..
         } => {
             assert_eq!(index, 1, "the flipped common-prefix frame is named");
             assert_eq!(first_diff_byte_offset, WireHeader::SIZE);
@@ -2666,6 +3094,13 @@ fn count_mismatch_and_byte_flip_on_one_topic_yield_both_violations_in_order() {
         }
         ref other => panic!("expected ByteMismatch second, got {other:?}"),
     }
+    // Oracle: frame 1's relay x is 2.0 + 100 = 102.0; byte 0 XOR 0xFF reads
+    // back as 102.00000000000362.
+    assert_eq!(
+        relay[1].detail,
+        "frame 1 on '/sr/relay/out' differs at x: recorded 102.00000000000362, replayed 102.0 \
+         (recorded 64 B, replayed 64 B)"
+    );
     // The untouched source topic still passes.
     assert!(outcome
         .violations
@@ -2721,6 +3156,117 @@ fn changed_relay_factory_diverges_on_relay_topic_only() {
             .all(|v| v.topic != "/sr/source/out"),
         "the source topic must still match (only the relay changed)"
     );
+}
+
+/// The source and relay bag replayed against a relay that adds 101 instead of
+/// 100, under `purpose`: the outcome, plus the bag path for the renderers.
+fn replay_changed_relay(
+    dir: &std::path::Path,
+    purpose: replay_engine::ReplayPurpose,
+) -> (ReplayOutcome, std::path::PathBuf) {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 5);
+    let bag = dir.join("changed_relay.mcap");
+    write_bag(&rec, &bag, None);
+    let candidate = || {
+        factories(vec![
+            ("source", Box::new(SourceNodeEntry::new())),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 101.0,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let (outcome, _) = ri_replay(&bag, candidate, purpose);
+    let outcome = outcome.expect("the changed relay replays to a verdict");
+    // Hand oracle: every relay frame carries the new addend, so the topic's
+    // ONE violation is a byte mismatch at its first frame, and the unchanged
+    // source matches.
+    match outcome.violations.as_slice() {
+        [v] if v.topic == "/sr/relay/out" => assert!(
+            matches!(v.class, ViolationClass::ByteMismatch { index: 0, .. }),
+            "{v:?}"
+        ),
+        other => panic!("expected exactly one violation, on /sr/relay/out: {other:?}"),
+    }
+    (outcome, bag)
+}
+
+/// A bare `--resim` warns each data violation, naming its topic: its neutral
+/// summary only COUNTS the differing topics (pinned below), so the warn is the
+/// one place its terminal names which topic changed and where.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_bare_resim_warns_each_data_violation_by_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_changed_relay(dir.path(), replay_engine::ReplayPurpose::Resim);
+
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+        &bag,
+    );
+    assert!(
+        summary.contains("1 of 2 topic(s) differ") && !summary.contains("/sr/relay/out"),
+        "the neutral summary counts the topic without naming it: {summary}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: data violation")
+            })
+            .collect();
+        match (
+            warned.as_slice(),
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+        ) {
+            // Hand oracle: frame 0's relay adds 101 instead of 100 to x = 1.0.
+            ([line], 0)
+                if line.contains(
+                    "frame 0 on '/sr/relay/out' differs at x: recorded 101.0, replayed 102.0 \
+                     (recorded 64 B, replayed 64 B)",
+                ) =>
+            {
+                Ok(())
+            }
+            (other, infos) => Err(format!(
+                "expected ONE WARN naming /sr/relay/out's x and no INFO twin, got {other:?} \
+                 and {infos} INFO line(s)"
+            )),
+        }
+    });
+}
+
+/// `--verify` states each data violation in its verdict block, so the engine
+/// logs it at `info` rather than printing the same frame twice on the terminal.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_states_each_data_violation_in_its_verdict_and_logs_it_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_changed_relay(dir.path(), replay_engine::ReplayPurpose::Verify);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("FRAME-CONTENT DIVERGENCE") && verdict.contains("/sr/relay/out"),
+        "the verdict block names the topic: {verdict}"
+    );
+    // The absence guard is paired with a positive count over the same capture.
+    logs_assert(|lines: &[&str]| {
+        match (
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+            cerulion_core::testing::count_at(lines, "WARN", "replay: data violation"),
+        ) {
+            (1, 0) => Ok(()),
+            (infos, warns) => Err(format!(
+                "expected ONE INFO and no WARN, got {infos} INFO and {warns} WARN line(s)"
+            )),
+        }
+    });
 }
 
 // ===========================================================================
@@ -3080,13 +3626,220 @@ fn external_frames_are_reinjected_and_downstream_matches() {
     assert_eq!(outcome.topics_passed, 1);
 }
 
+fn latest_relay_yaml(node_type: &str) -> String {
+    format!(
+        "name: lrg\nprefix: lr\nnodes:\n\
+         \x20 - id: relay\n    type: {node_type}\n    inputs:\n      - name: inp\n        source: /lr/ext/cam\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+    )
+}
+
+fn latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![("relay", Box::new(LatestRelayNodeEntry::new()))])
+}
+
+fn throttled_latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![(
+        "relay",
+        Box::new(ThrottledLatestRelayNodeEntry::new()),
+    )])
+}
+
+fn sampled_latest_relay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![(
+        "relay",
+        Box::new(SampledLatestRelayNodeEntry::new()),
+    )])
+}
+
+/// Record `per_step` bursts into a latest relay, anchor the recorded outputs
+/// to `oracle` (each the served frame plus 100), then replay the bag twice:
+/// both replays pass byte-exact with no schedule divergence and are
+/// byte-identical to each other. The same recording stamped free run is then
+/// judged by the fire re-derivation, and written as a fed `--verify` bag it is
+/// replayed with every read fed its recorded frames; a `sample(N)` relay's fed
+/// replay is refused instead, because its decimated read names none of the
+/// frames it popped.
+fn latest_relay_round_trip(
+    node_type: &str,
+    make: fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    per_step: Vec<Vec<f64>>,
+    oracle: &[f64],
+) {
+    let frames: usize = per_step.iter().map(Vec::len).sum();
+    let steps = per_step.len();
+    let externals = vec![ExternalDrive {
+        topic: "/lr/ext/cam".to_string(),
+        per_step,
+    }];
+    let yaml = latest_relay_yaml(node_type);
+    let rec = record_uniform_with_read_log(&yaml, make, &externals, steps);
+    let out: Vec<f64> = rec.messages["/lr/relay/out"]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(out, oracle, "{node_type}: the recorded outputs");
+    assert_eq!(
+        rec.messages["/lr/ext/cam"].len(),
+        frames,
+        "every external frame recorded"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("latest.mcap");
+    write_bag(&rec, &bag, None);
+    let a = replay(&bag, make, None, None).expect("replay runs");
+    assert_clean_verdict(&a, node_type);
+    assert!(
+        a.topics_checked >= 1 && a.topics_passed == a.topics_checked,
+        "{node_type}: every topic was compared and passed: {} of {}",
+        a.topics_passed,
+        a.topics_checked
+    );
+    assert!(
+        a.injection_stand_downs.is_empty(),
+        "{node_type}: no injection stood down: {:?}",
+        a.injection_stand_downs
+    );
+    let b = replay(&bag, make, None, None).expect("replay runs");
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+
+    // The same recording stamped free run: the fire re-derivation runs only
+    // on a free-run bag, so this is where the latest decider reads a real
+    // read log. A `LatestFire` finding surfaces as the trace divergence
+    // `assert_clean_verdict` requires to be absent.
+    let free = dir.path().join("latest_free_run.mcap");
+    write_bag_with_coordination(&rec, &free, replay_engine::CoordinationMode::FreeRun);
+    let f = replay(&free, make, None, None).expect("free-run replay runs");
+    assert_clean_verdict(&f, &format!("{node_type} (free run)"));
+    // A clean verdict also follows from the verifier standing aside, so the
+    // arm refuses every stand-down note: a whole-rank decline, a node whose
+    // metadata could not be read, a whole-node read-log stand-down and a
+    // stand-down of any decider. The one stand-down a healthy relay here
+    // carries is the sampled relay's `decimated_read`, which a decimated read
+    // causes by rule.
+    let sampled = node_type == "sampled_latest_relay_node";
+    let stood_aside: Vec<_> = f
+        .rederivation_notes
+        .iter()
+        .filter(|n| {
+            n.kind == replay_engine::RederivationNoteKind::StandDown
+                && !(sampled && n.code.as_deref() == Some("decimated_read"))
+        })
+        .collect();
+    assert!(
+        stood_aside.is_empty(),
+        "{node_type}: the verifier judged the free-run bag: {stood_aside:?}"
+    );
+
+    // The same recording as a fed `--verify` bag (the production free-run
+    // recorder stamp and the per-stage staging rows): every read is fed the
+    // frames its recorded read named. A burst drain is fed its batch frames
+    // and its served frame, and a boundary that re-offers a held frame pops
+    // nothing, so it is fed nothing. A decimated read names none of the
+    // frames it popped, so the sampled relay is refused by name.
+    let fed = dir.path().join("latest_fed.mcap");
+    ri_capped_bag(&rec, &fed);
+    let (fed_outcome, _) = ri_replay(&fed, make, replay_engine::ReplayPurpose::Verify);
+    if sampled {
+        let err = fed_outcome.expect_err("a fed replay of a decimated latest read is refused");
+        let msg = err.to_string();
+        assert_eq!(err.exit_code(), 2, "{node_type}: {msg}");
+        assert!(
+            msg.contains("read_identity_decimated_unattributed"),
+            "{node_type}: {msg}"
+        );
+    } else {
+        let fed_outcome = fed_outcome.expect("the fed replay runs");
+        ri_assert_fed(&fed_outcome);
+        assert_clean_verdict(&fed_outcome, &format!("{node_type} (fed)"));
+        let stood_aside: Vec<_> = fed_outcome
+            .rederivation_notes
+            .iter()
+            .filter(|n| n.kind == replay_engine::RederivationNoteKind::StandDown)
+            .collect();
+        assert!(
+            stood_aside.is_empty(),
+            "{node_type}: the verifier judged the fed replay: {stood_aside:?}"
+        );
+    }
+}
+
+/// A `consume = latest` relay fed BURSTS: one output per step that saw
+/// frames, the step's newest frame plus 100. As `fifo` the relay would
+/// publish one output per frame (eight), so the recording oracle catches the
+/// latest wiring being removed; the replay half pins that the replayed run
+/// reproduces the recorded reads and fires.
+#[test]
+#[serial]
+fn a_latest_relay_fed_bursts_replays_byte_exact() {
+    latest_relay_round_trip(
+        "latest_relay_node",
+        latest_relay_factories,
+        vec![
+            vec![1.0, 2.0, 3.0],
+            vec![],
+            vec![4.0],
+            vec![5.0, 6.0, 7.0, 8.0],
+            vec![],
+        ],
+        &[103.0, 104.0, 108.0],
+    );
+}
+
+/// A DEFERRED latest fire replays byte-exact: frame 2 arrives in the step
+/// after a fire, is held through two throttled steps with nothing newer, and
+/// the fire that ends the window serves it.
+#[test]
+#[serial]
+fn a_held_latest_frame_replays_byte_exact() {
+    latest_relay_round_trip(
+        "throttled_latest_relay_node",
+        throttled_latest_relay_factories,
+        vec![vec![1.0], vec![2.0], vec![], vec![], vec![], vec![]],
+        &[101.0, 102.0],
+    );
+}
+
+/// A held frame SUPERSEDED during the defer replays byte-exact: frames 3 and
+/// 4 arrive while frame 2 is held, and the fire that ends the window serves
+/// frame 4.
+#[test]
+#[serial]
+fn a_superseded_latest_frame_replays_byte_exact() {
+    latest_relay_round_trip(
+        "throttled_latest_relay_node",
+        throttled_latest_relay_factories,
+        vec![vec![1.0], vec![2.0], vec![3.0], vec![4.0], vec![], vec![]],
+        &[101.0, 104.0],
+    );
+}
+
+/// A `sample(8)` latest relay replays byte-exact: the gate sees each step's
+/// newest frame (2 at 0 ms, 3 at 5 ms, 5 at 10 ms) and admits the first and
+/// the third, the step between them decimated. A fed `--verify` replay of the
+/// same recording is refused, `read_identity_decimated_unattributed`.
+#[test]
+#[serial]
+fn a_sampled_latest_relay_replays_byte_exact() {
+    latest_relay_round_trip(
+        "sampled_latest_relay_node",
+        sampled_latest_relay_factories,
+        vec![vec![1.0, 2.0], vec![3.0], vec![4.0, 5.0], vec![]],
+        &[102.0, 105.0],
+    );
+}
+
 // ===========================================================================
-// 10. Env divergence (WARN-only, never exit-affecting)
+// 10. Env divergence (never exit-affecting)
 // ===========================================================================
 
 #[test]
 #[serial]
-fn env_divergence_is_warn_only_and_surfaced() {
+fn env_divergence_never_fails_the_run_and_is_surfaced() {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 4);
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("env.mcap");
@@ -3128,6 +3881,21 @@ fn env_divergence_is_warn_only_and_surfaced() {
         !names.contains(&"CER_REPLAY_HASHED"),
         "matching hashed var must NOT surface"
     );
+    // No runtime Cerulion starts reads it, so the report entry says so.
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_PLAIN"),
+        serde_json::Value::Null
+    );
+}
+
+/// The `--report` JSON's `read_by` value for the divergence named `name`.
+fn env_read_by(outcome: &ReplayOutcome, name: &str) -> serde_json::Value {
+    let d = outcome
+        .env_divergence
+        .iter()
+        .find(|d| d.name == name)
+        .unwrap_or_else(|| panic!("{name} diverged: {:?}", outcome.env_divergence));
+    serde_json::to_value(d).expect("an entry serializes")["read_by"].clone()
 }
 
 #[test]
@@ -3154,6 +3922,10 @@ fn env_redacted_hash_mismatch_is_surfaced() {
         matches!(d.kind, replay_engine::EnvDivergenceKind::HashChanged),
         "redacted value change is a HashChanged, got {:?}",
         d.kind
+    );
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_HASHED2"),
+        serde_json::Value::Null
     );
 }
 
@@ -4465,6 +5237,7 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
             first_diff_byte_offset,
             recorded_len,
             replayed_len,
+            ..
         } => {
             assert_eq!(index, 3, "the extended frame is the last of 4");
             assert_eq!(
@@ -4475,6 +5248,28 @@ fn extended_recorded_frame_reports_diff_at_common_length() {
         }
         ref other => panic!("expected ByteMismatch, got {other:?}"),
     }
+    // Every value of the two frames is equal: the four extra bytes sit past
+    // the Vector3's last field (payload 24, frame byte 64).
+    assert_eq!(
+        source_violations[0].detail,
+        "frame 3 on '/sr/source/out' differs at byte 64, in bytes past the last field; every \
+         field value is equal (recorded 68 B, replayed 64 B)"
+    );
+    assert_eq!(
+        serde_json::to_value(&source_violations[0].class).unwrap()["difference"],
+        serde_json::json!({
+            "kind": "layout",
+            "path": null,
+            "recorded": null,
+            "replayed": null,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": 64,
+            "region": "trailing_bytes",
+            "reason": null,
+            "more": 0,
+        })
+    );
 }
 
 // ===========================================================================
@@ -4493,7 +5288,7 @@ fn env_missing_recorded_var_is_missing_divergence() {
     std::env::remove_var("CER_REPLAY_ABSENT_V"); // ensure absent
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let d = outcome
         .env_divergence
         .iter()
@@ -4503,6 +5298,10 @@ fn env_missing_recorded_var_is_missing_divergence() {
         matches!(d.kind, replay_engine::EnvDivergenceKind::Missing),
         "got {:?}",
         d.kind
+    );
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_ABSENT_V"),
+        serde_json::Value::Null
     );
 }
 
@@ -4526,7 +5325,7 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
     let outcome = replay(&bag, source_relay_factories, None, None).unwrap();
     std::env::remove_var("CER_REPLAY_NULL_PRESENT");
 
-    assert!(outcome.passed, "env divergence is warn-only");
+    assert!(outcome.passed, "env divergence never fails the run");
     let names: Vec<&str> = outcome
         .env_divergence
         .iter()
@@ -4546,6 +5345,343 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
         .find(|d| d.name == "CER_REPLAY_NULL_ABSENT")
         .unwrap();
     assert!(matches!(d.kind, replay_engine::EnvDivergenceKind::Missing));
+    assert_eq!(
+        env_read_by(&outcome, "CER_REPLAY_NULL_ABSENT"),
+        serde_json::Value::Null
+    );
+}
+
+/// The singular NOTE line, hand-written: one differing variable that no
+/// runtime Cerulion starts reads.
+const ENV_NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
+                            Cerulion does not read it to decide what the re-execution runs, so \
+                            it matters only if code in one of your nodes reads it. Run with -v \
+                            to list it.";
+
+/// The WARNING line for `CERULION_REPLAY_TEST_KNOB` with a changed value,
+/// hand-written.
+const ENV_KNOB_WARNING: &str = "WARNING: environment variable CERULION_REPLAY_TEST_KNOB has a \
+                                different value than in the recording. Cerulion reads its \
+                                settings from CERULION_ and IOX2_ variables, so this one can \
+                                change the re-execution.";
+
+/// The `env.json` the two emission-level arms record: a Cerulion knob with the
+/// value `a`, and a variable no runtime Cerulion starts reads, hashed (FNV-1a
+/// 64 of `a` is the published vector `af63dc4c8601ec8c`).
+fn knob_and_other_env_json() -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "CERULION_REPLAY_TEST_KNOB": "a",
+        "CER_REPLAY_OTHER": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+    }))
+    .unwrap()
+}
+
+/// A completed run logs each environment divergence ONCE, at INFO: the
+/// verdict prints the variable Cerulion reads as a WARNING line, so its log
+/// line is for a log pipeline, and the NOTE line counts the other one, which
+/// `-v` lists. No environment line is a WARN, so the default output shows each
+/// divergence once.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_completed_run_logs_every_env_divergence_at_info_and_warns_none() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, source_relay_factories, None, None);
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let outcome = outcome.expect("the clean recording replays");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert_eq!(
+        verdict.lines().filter(|l| *l == ENV_KNOB_WARNING).count(),
+        1,
+        "the verdict prints the knob once: {verdict}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        let env_warns = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: an environment variable")
+            })
+            .count();
+        match (knob.as_slice(), other.as_slice(), env_warns) {
+            ([k], [o], 0)
+                if cerulion_core::testing::line_level(k) == Some("INFO")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && k.contains(
+                        "replay: an environment variable that can change the re-execution \
+                         differs from the recording",
+                    )
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged")
+                    && o.contains("replay: an environment variable differs from the recording")
+                    && !o.contains("read_by=") =>
+            {
+                Ok(())
+            }
+            (k, o, warns) => Err(format!(
+                "expected ONE INFO naming the knob with its reader, ONE INFO naming the other \
+                 variable and no environment WARN, got {k:?}, {o:?} and {warns} WARN(s)"
+            )),
+        }
+    });
+}
+
+/// A PASSING run whose `--report` cannot be written returns the write error
+/// (exit 5) and the CLI prints only that error, no verdict, so a variable that
+/// can change the re-execution is logged at WARN, once, naming its reader; the
+/// other variable stays at INFO.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_passing_run_whose_report_cannot_be_written_warns_a_loud_env_variable() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels_report_fail.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+    let blocker = dir.path().join("iam_a_regular_file");
+    std::fs::write(&blocker, b"x").unwrap();
+    let report = blocker.join("report.json"); // parent is a file, so unwritable.
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, source_relay_factories, None, Some(report));
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let err = outcome.expect_err("a passing run whose report cannot be written is an error");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("cannot write report")),
+        "{err:?}"
+    );
+    assert_eq!(err.exit_code(), 5);
+
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        match (knob.as_slice(), other.as_slice()) {
+            ([k], [o])
+                if cerulion_core::testing::line_level(k) == Some("WARN")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged") =>
+            {
+                Ok(())
+            }
+            (k, o) => Err(format!(
+                "expected ONE WARN naming the knob with its reader and ONE INFO naming the \
+                 other variable, got {k:?} and {o:?}"
+            )),
+        }
+    });
+}
+
+/// An ABORTED run renders no verdict and no summary (the CLI prints only the
+/// aborting error), so a variable that can change the re-execution is logged
+/// there at WARN, once, naming its reader; the other variable stays at INFO.
+///
+/// The single-rank source and relay bag with `source` refusing to init, so
+/// rank 0's pass aborts at build.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_aborted_run_warns_a_loud_env_variable_and_logs_the_others_at_info() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_levels_aborted.mcap");
+    write_bag(&rec, &bag, Some(&knob_and_other_env_json()));
+    let make = || {
+        factories(vec![
+            (
+                "source",
+                Box::new(InitFailsEntry {
+                    inner: Box::new(SourceNodeEntry::new()),
+                }) as Box<dyn NodeEntry>,
+            ),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 100.0,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+
+    std::env::set_var("CERULION_REPLAY_TEST_KNOB", "b");
+    std::env::set_var("CER_REPLAY_OTHER", "foobar");
+    let outcome = replay(&bag, make, None, None);
+    std::env::remove_var("CERULION_REPLAY_TEST_KNOB");
+    std::env::remove_var("CER_REPLAY_OTHER");
+    let err = outcome.expect_err("the source refuses to init, so the run aborts");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("refuses to init")),
+        "{err:?}"
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let knob: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CERULION_REPLAY_TEST_KNOB"))
+            .collect();
+        let other: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("env_var=CER_REPLAY_OTHER"))
+            .collect();
+        match (knob.as_slice(), other.as_slice()) {
+            ([k], [o])
+                if cerulion_core::testing::line_level(k) == Some("WARN")
+                    && k.contains("change=ValueChanged")
+                    && k.contains("read_by=cerulion")
+                    && k.contains(
+                        "replay: an environment variable that can change the re-execution \
+                         differs from the recording",
+                    )
+                    && cerulion_core::testing::line_level(o) == Some("INFO")
+                    && o.contains("change=HashChanged") =>
+            {
+                Ok(())
+            }
+            (k, o) => Err(format!(
+                "expected ONE WARN naming the knob with its reader and ONE INFO naming the \
+                 other variable, got {k:?} and {o:?}"
+            )),
+        }
+    });
+}
+
+/// Every divergence kind, `Added` included, leaves a clean replay PASSING and
+/// its exit code unchanged under BOTH purposes, and the `--report` JSON carries
+/// each entry with its `read_by`.
+#[test]
+#[serial]
+fn every_env_divergence_kind_leaves_a_clean_replay_passing_in_both_modes() {
+    use cerulion_cli_engine::resim_cmd::{resim_exit_code, ResimReport, EXIT_PASS};
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_every_kind.mcap");
+    // FNV-1a 64 of `a` is the published vector `af63dc4c8601ec8c`.
+    let env = serde_json::json!({
+        "CER_REPLAY_GONE": "v",
+        "CERULION_REPLAY_TEST_PLAIN": "a",
+        "CER_REPLAY_HASHED3": {"redacted": true, "fnv64": "af63dc4c8601ec8c"},
+    });
+    write_bag(&rec, &bag, Some(&serde_json::to_vec(&env).unwrap()));
+
+    for purpose in [
+        replay_engine::ReplayPurpose::Resim,
+        replay_engine::ReplayPurpose::Verify,
+    ] {
+        let report_path = dir.path().join(format!("env_every_kind_{purpose:?}.json"));
+        std::env::remove_var("CER_REPLAY_GONE");
+        std::env::set_var("CERULION_REPLAY_TEST_PLAIN", "b");
+        std::env::set_var("CER_REPLAY_HASHED3", "foobar");
+        std::env::set_var("CERULION_REPLAY_TEST_ADDED", "1");
+        let (outcome, _) = ri_replay_reporting(
+            &bag,
+            source_relay_factories,
+            purpose,
+            None,
+            None,
+            Some(report_path.clone()),
+        );
+        std::env::remove_var("CERULION_REPLAY_TEST_PLAIN");
+        std::env::remove_var("CER_REPLAY_HASHED3");
+        std::env::remove_var("CERULION_REPLAY_TEST_ADDED");
+        let outcome = outcome.expect("the clean recording replays");
+
+        let ours: Vec<(&str, String)> = outcome
+            .env_divergence
+            .iter()
+            .filter(|d| d.name.starts_with("CER_REPLAY_") || d.name.starts_with("CERULION_REPLAY_"))
+            .map(|d| (d.name.as_str(), format!("{:?}", d.kind)))
+            .collect();
+        assert_eq!(
+            ours,
+            vec![
+                ("CERULION_REPLAY_TEST_ADDED", "Added".to_string()),
+                ("CERULION_REPLAY_TEST_PLAIN", "ValueChanged".to_string()),
+                ("CER_REPLAY_GONE", "Missing".to_string()),
+                ("CER_REPLAY_HASHED3", "HashChanged".to_string()),
+            ],
+            "{purpose:?}"
+        );
+        assert!(outcome.passed, "{purpose:?}: {:?}", outcome.violations);
+        let report = ResimReport::from_outcome(&outcome);
+        let verify = purpose == replay_engine::ReplayPurpose::Verify;
+        assert_eq!(resim_exit_code(&report, verify), EXIT_PASS, "{purpose:?}");
+        for expected in [
+            "WARNING: environment variable CERULION_REPLAY_TEST_ADDED is set now and was not set \
+             in the recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, \
+             so this one can change the re-execution.",
+            "WARNING: environment variable CERULION_REPLAY_TEST_PLAIN has a different value than \
+             in the recording. Cerulion reads its settings from CERULION_ and IOX2_ variables, so \
+             this one can change the re-execution.",
+        ] {
+            assert!(
+                report.env_lines.iter().any(|l| l == expected),
+                "{purpose:?}: {:?}",
+                report.env_lines
+            );
+        }
+
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report_path).expect("the report is written"))
+                .expect("the report is JSON");
+        let entry = |name: &str| -> serde_json::Value {
+            json["env_divergence"]
+                .as_array()
+                .expect("env_divergence is an array")
+                .iter()
+                .find(|e| e["name"] == name)
+                .unwrap_or_else(|| panic!("{name} in the report: {json}"))
+                .clone()
+        };
+        assert_eq!(
+            entry("CERULION_REPLAY_TEST_ADDED"),
+            serde_json::json!({
+                "name": "CERULION_REPLAY_TEST_ADDED",
+                "kind": {"kind": "Added"},
+                "detail": "variable 'CERULION_REPLAY_TEST_ADDED' is set at replay but absent \
+                           from the recording",
+                "read_by": "cerulion",
+            })
+        );
+        assert_eq!(
+            entry("CER_REPLAY_HASHED3"),
+            serde_json::json!({
+                "name": "CER_REPLAY_HASHED3",
+                "kind": {"kind": "HashChanged"},
+                "detail": "redacted variable 'CER_REPLAY_HASHED3' hash changed since recording \
+                           (recorded af63dc4c8601ec8c, now 85944171f73967e8)",
+                "read_by": null,
+            })
+        );
+        assert_eq!(entry("CER_REPLAY_GONE")["read_by"], serde_json::Value::Null);
+    }
 }
 
 // ===========================================================================
@@ -4571,6 +5707,7 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -4583,6 +5720,9 @@ fn failing_outcome_skeleton() -> ReplayOutcome {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -4674,6 +5814,77 @@ fn render_verdict_failing_branch_reports_declined_topics_in_its_summary() {
     assert!(!s.contains(".."), "no doubled period in the row tail: {s}");
 }
 
+/// A topic declined for two causes, a refused read log on rank 0 and frames
+/// rank 1 captured that were not compared, carries a row per cause, and the
+/// verdict counts it as ONE declined topic that did not match, with
+/// divergences withheld, while it lists both rows. Hand oracle.
+#[test]
+#[serial]
+fn render_verdict_counts_a_topic_declined_for_two_causes_once() {
+    use cerulion_cli_engine::replay_engine::{DeclinedFrameComparison, Violation};
+    let outcome = ReplayOutcome {
+        topics_checked: 2,
+        topics_passed: 0,
+        violations: vec![Violation {
+            topic: "/g/real/out".to_string(),
+            class: ViolationClass::MissingTopic,
+            detail: "a genuine violation on an un-steered topic".to_string(),
+        }],
+        declined_frame_comparisons: vec![
+            DeclinedFrameComparison {
+                topic: "/g/bus".to_string(),
+                ranks: vec![0],
+                code: "verifier_declined_census".to_string(),
+                reason: "the read log was refused.".to_string(),
+                matched_under_fallback: false,
+                withheld: Vec::new(),
+            },
+            DeclinedFrameComparison {
+                topic: "/g/bus".to_string(),
+                ranks: vec![1],
+                code: "split_topic_frames_unattributed".to_string(),
+                reason: "these frames were not compared".to_string(),
+                matched_under_fallback: false,
+                withheld: vec![Violation {
+                    topic: "/g/bus".to_string(),
+                    class: ViolationClass::MissingTopic,
+                    detail: "withheld-detail".to_string(),
+                }],
+            },
+        ],
+        ..failing_outcome_skeleton()
+    };
+
+    let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
+    assert!(
+        s.contains(
+            "0/2 topic(s) matched and were credited; 1 DECLINED (0 of them matched under the \
+             fallback, not credited); 1 violation(s):"
+        ),
+        "one declined topic, whatever its rows: {s}"
+    );
+    assert!(
+        s.contains(
+            "NOTE: the frame comparison was DECLINED on 1 topic(s) (0 matched under the \
+             fallback, 1 had divergences withheld)."
+        ),
+        "the NOTE counts the topic once: {s}"
+    );
+    assert!(
+        s.contains(
+            "  - topic /g/bus (rank(s) [0]) [verifier_declined_census]: 0 withheld divergence(s)"
+        ),
+        "the read-log row: {s}"
+    );
+    assert!(
+        s.contains(
+            "  - topic /g/bus (rank(s) [1]) [split_topic_frames_unattributed]: 1 withheld \
+             divergence(s)"
+        ),
+        "the split row: {s}"
+    );
+}
+
 #[test]
 #[serial]
 fn render_verdict_failing_branch_lists_all_classes_in_order() {
@@ -4714,6 +5925,7 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
                 first_diff_byte_offset: 32,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
             detail: "detail-e".to_string(),
         },
@@ -4736,6 +5948,7 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -4748,6 +5961,9 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -4775,10 +5991,15 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         s.contains("FRAME-CONTENT DIVERGENCE: /tmp/x.mcap"),
         "verdict:\n{s}"
     );
-    assert!(
-        s.contains("WARNING: env divergence: variable 'SOME_VAR' value changed since recording"),
+    // SOME_VAR is read by no runtime Cerulion starts, so it is counted by the
+    // one NOTE line and never named.
+    assert_eq!(
+        s.lines().filter(|l| *l == ENV_NOTE_ONE).count(),
+        1,
         "verdict:\n{s}"
     );
+    assert!(!s.contains("SOME_VAR"), "verdict:\n{s}");
+    assert!(!s.contains("WARNING:"), "verdict:\n{s}");
     // The line says what its numbers MEAN. A line printing
     // `topics_passed/topics_checked` as "matched" would under-report once a
     // declined-but-matched topic exists — such a topic matched and is deliberately
@@ -4810,6 +6031,81 @@ fn render_verdict_failing_branch_lists_all_classes_in_order() {
         );
         prev_pos = pos;
     }
+}
+
+/// The PASS path counts a differing shell variable in ONE NOTE line above the
+/// verdict, names no variable and prints no hash and no `WARNING:`.
+///
+/// Hand-built outcome whose only finding is a `SHLVL` hash change, under the
+/// clean provenance states (a stamped contract, reads fed by identity, a clean
+/// read log), each of which prints nothing, so the whole verdict is two
+/// hand-written lines.
+#[test]
+#[serial]
+fn render_verdict_pass_path_counts_an_other_variable_in_one_note() {
+    use cerulion_cli_engine::replay_engine::{EnvDivergence, EnvDivergenceKind};
+    let outcome = ReplayOutcome {
+        ros2_entries_skipped: Vec::new(),
+        passed: true,
+        node_failures: vec![],
+        ticks_replayed: 7,
+        topics_checked: 2,
+        topics_passed: 2,
+        violations: vec![],
+        trace_divergence: None,
+        env_divergence: vec![EnvDivergence {
+            name: "SHLVL".to_string(),
+            kind: EnvDivergenceKind::HashChanged,
+            detail: "redacted variable 'SHLVL' hash changed since recording (recorded \
+                     af63dc4c8601ec8c, now 85944171f73967e8)"
+                .to_string(),
+        }],
+        recorder: None,
+        record_health: RecordHealthReport::Absent,
+        tolerated_ragged_tails: vec![],
+        unmodelled_topics: vec![],
+        driver_inputs: None,
+        resume: None,
+        covered_range: None,
+        read_log_divergence: None,
+        read_log: replay_engine::ReadLogStatus::VerifiedClean {
+            edges_compared: 0,
+            quarantined_nodes: 0,
+            quarantined_edges: 0,
+        },
+        read_log_quarantine: Vec::new(),
+        read_log_verdict: None,
+        read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
+        read_identity: replay_engine::ReadIdentityReport::Fed {
+            reads: 0,
+            frames: 0,
+        },
+        coordination: replay_engine::CoordinationReport {
+            mode: replay_engine::CoordinationMode::Lockstep,
+            inferred: false,
+        },
+        divergence_classes: vec![],
+        injection_stand_downs: Vec::new(),
+        declined_frame_comparisons: Vec::new(),
+        injection_coverage: Vec::new(),
+        rederivation_notes: Vec::new(),
+        replay_input_shortfalls: Vec::new(),
+        injection_anomalies: Vec::new(),
+        rank_execution: Vec::new(),
+        aborted: None,
+        report_version: replay_engine::REPORT_VERSION,
+        record_out: None,
+        record_out_error: None,
+    };
+
+    let s = replay_engine::render_verdict(&outcome, std::path::Path::new("/tmp/x.mcap"));
+    assert_eq!(
+        s,
+        format!(
+            "{ENV_NOTE_ONE}\nreplay PASS: /tmp/x.mcap (7 tick(s) replayed, 2/2 topic(s) matched \
+             byte-for-byte and were credited)\n"
+        )
+    );
 }
 
 /// The per-topic frame-MONOTONICITY killer. Two recorded frames
@@ -5358,6 +6654,7 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -5370,6 +6667,9 @@ fn render_verdict_trace_divergence_section_exact_lines() {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -5467,6 +6767,7 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -5477,6 +6778,9 @@ fn render_verdict_trace_divergence_non_positional_exact_lines() {
         // would let it be silently absent.
         read_log_verdict: None,
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::FreeRun,
             inferred: false,
@@ -5656,7 +6960,22 @@ fn rederivation_note_serde_spelling_is_pinned() {
         "a carried-heads disclosure mints no token: {json}"
     );
 
-    // …and the five spellings are DISTINCT, which a per-variant assertion
+    // The SIXTH kind: a `consume = latest` input judged with one queue
+    // excused before its node's first fire. Judged, so never a `stand_down`;
+    // like the carried-heads note it carries no code.
+    let excused = replay_engine::RederivationNote {
+        kind: replay_engine::RederivationNoteKind::LatestBeforeFirstFire,
+        code: None,
+        ..carried
+    };
+    let json = serde_json::to_value(&excused).unwrap();
+    assert_eq!(json["kind"], "latest_before_first_fire");
+    assert!(
+        json.get("code").is_none(),
+        "a before-first-fire note mints no token: {json}"
+    );
+
+    // …and the six spellings are DISTINCT, which a per-variant assertion
     // above cannot see (two variants renamed to one string would satisfy both).
     let all = [
         replay_engine::RederivationNoteKind::StandDown,
@@ -5664,6 +6983,7 @@ fn rederivation_note_serde_spelling_is_pinned() {
         replay_engine::RederivationNoteKind::ReadSiteCensus,
         replay_engine::RederivationNoteKind::ProducerLabels,
         replay_engine::RederivationNoteKind::CarriedHeads,
+        replay_engine::RederivationNoteKind::LatestBeforeFirstFire,
     ];
     let kinds: std::collections::BTreeSet<String> = all
         .iter()
@@ -5675,9 +6995,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
                 .to_string()
         })
         .collect();
-    assert_eq!(kinds.len(), 5, "every note kind has its own wire spelling");
+    assert_eq!(kinds.len(), 6, "every note kind has its own wire spelling");
     // The list above is TOTAL — an EXHAUSTIVE match over the
-    // enum, with no wildcard, so adding a sixth kind (or deleting one) fails
+    // enum, with no wildcard, so adding a seventh kind (or deleting one) fails
     // to COMPILE here rather than leaving the spelling walk one short.
     for k in &all {
         let _spelled: &str = match k {
@@ -5686,6 +7006,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
             replay_engine::RederivationNoteKind::ReadSiteCensus => "read_site_census",
             replay_engine::RederivationNoteKind::ProducerLabels => "producer_labels",
             replay_engine::RederivationNoteKind::CarriedHeads => "carried_heads",
+            replay_engine::RederivationNoteKind::LatestBeforeFirstFire => {
+                "latest_before_first_fire"
+            }
         };
         assert_eq!(serde_json::to_value(k).unwrap(), _spelled);
     }
@@ -7338,7 +8661,7 @@ fn write_multi_rank_bag_with_producers(
         path,
         |_| {},
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -7431,7 +8754,7 @@ fn write_multi_rank_bag_coordinated(
         path,
         tweak,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         &[],
         ProducerAttributionFixture::default(),
@@ -7463,7 +8786,7 @@ fn write_multi_rank_bag_coordinated_with_staging(
         path,
         tweak,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         &[],
         ProducerAttributionFixture::default(),
@@ -7492,7 +8815,7 @@ fn write_multi_rank_bag_coordinated_with_attachments(
         path,
         |_| {},
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
         None,
         &[],
         ProducerAttributionFixture::default(),
@@ -9712,11 +11035,13 @@ fn replay_probing_reader(
         recorder: None,
         record_health: RecordHealthReport::Absent,
         duration_bound_ns: None,
+        feed_index_budget: None,
         report_path: None,
         fire_tap: None,
         tolerance: None,
         strict_state: false,
         allow_param_change: false,
+        purpose: replay_engine::ReplayPurpose::Verify,
         record_out: None,
     };
     let nodes = ReplayNodes::Injected {
@@ -9734,8 +11059,8 @@ fn replay_probing_reader(
 fn many_step_source_relay_bag(dir: &std::path::Path, steps: usize) -> std::path::PathBuf {
     let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
     // Anchor the recording (not a self-compare): source.out.x == step+1.
-    for k in 0..steps {
-        assert_eq!(frame_x(&rec.messages["/sr/source/out"][k]), (k + 1) as f64);
+    for (k, frame) in rec.messages["/sr/source/out"][..steps].iter().enumerate() {
+        assert_eq!(frame_x(frame), (k + 1) as f64);
     }
     let bag = dir.join("advise_source_relay.mcap");
     write_bag(&rec, &bag, None);
@@ -9963,9 +11288,9 @@ fn advise_behind_de_pins_a_lagging_topics_frozen_consume_cursor() {
         steps,
     );
     // Anchor (not a self-compare): every topic recorded byte-clean, x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_lagging_topic.mcap");
@@ -10123,9 +11448,9 @@ fn advise_behind_engages_and_verdict_is_stable_under_a_lagging_consumed_topic() 
         steps,
     );
     // Anchor (not a self-compare): every recorded frame x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_reread_lagging.mcap");
@@ -10294,9 +11619,9 @@ fn advise_behind_evicted_pages_re_fault_byte_identical() {
         steps,
     );
     // Anchor the RECORDING (not a self-compare): every recorded frame x == step+1.
-    for k in 0..steps {
-        for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
-            assert_eq!(frame_x(&rec.messages[t][k]), (k + 1) as f64);
+    for t in ["/mp/src_a1/out", "/mp/src_a2/out", "/mp/src_b/out"] {
+        for (k, frame) in rec.messages[t][..steps].iter().enumerate() {
+            assert_eq!(frame_x(frame), (k + 1) as f64);
         }
     }
     let bag = dir.path().join("advise_refault_bytes.mcap");
@@ -11238,6 +12563,19 @@ topics:
             .any(|v| matches!(v.class, ViolationClass::ToleranceExceeded { .. })),
         "x stayed within tolerance — no ToleranceExceeded expected: {:?}",
         outcome.violations
+    );
+    // The byte mismatch names y, never the tolerated x that also changed
+    // (x is declared first). Oracle: frame 0 records x = 1.0, y = 0.0; the
+    // candidate writes x = 1.01 (judged by the metric) and y = 1.0.
+    let byte = outcome
+        .violations
+        .iter()
+        .find(|v| matches!(v.class, ViolationClass::ByteMismatch { .. }))
+        .expect("asserted above");
+    assert_eq!(
+        byte.detail,
+        "frame 0 on '/tg/source/out' differs at y: recorded 0.0, replayed 1.0 (recorded 64 B, \
+         replayed 64 B)"
     );
 }
 
@@ -12332,6 +13670,353 @@ fn a_partial_report_write_failure_never_masks_the_aborting_error() {
     );
 }
 
+/// The `sy` rank-0 producer A, panicking from its third fire on: the shape
+/// that leaves a COMPLETED rank 0 with a panic-class node failure.
+#[cerulion_node(period_ms = 33)]
+#[derive(Default)]
+struct PanicAtTick3SyncProdA {
+    #[output]
+    out: Vector3,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl PanicAtTick3SyncProdA {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        if self.counter >= 3.0 {
+            panic!("injected candidate crash at tick {}", self.counter);
+        }
+        self.out.x = self.counter;
+        Ok(())
+    }
+}
+
+/// Write the `sy` bag with rank 1's staging rows stated, the shape a
+/// `--verify` replay fed by read identity needs (the rows
+/// `a_two_rank_free_run_bag_with_per_edge_rims_still_verifies` measured:
+/// `fusion`'s two body stages; rank 0 has no read stage and states none).
+fn write_sy_verify_bag(rec: Recording, path: &std::path::Path, edit: impl FnOnce(&mut Recording)) {
+    let staging = |rank: u32| -> Option<serde_json::Value> {
+        (rank == 1)
+            .then(|| serde_json::json!({ "capacities": { "fusion": [[0, 0, 64], [1, 0, 64]] } }))
+    };
+    write_sy_bag_overridden(
+        rec,
+        path,
+        edit,
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        None,
+        Some(&staging),
+    );
+}
+
+/// **An aborted `--verify` warns the data violation its completed rank
+/// found.**
+///
+/// A run a rank aborts returns the aborting error, and the CLI prints that
+/// error and no verdict, so the completed ranks' findings reach the terminal
+/// only as log lines: they must be `WARN`, never the `INFO` a completed
+/// `--verify` uses beside its verdict block.
+///
+/// Hand oracle: the `sy` bag with the first payload byte of `/sy/prod_a/out`
+/// frame 2 flipped, so rank 0 re-produces the original frame and its one
+/// violation is a byte mismatch on that topic at index 2; rank 1 refuses to
+/// init. The partial report holds exactly that violation, and the log names
+/// it once at `WARN` with no `INFO` twin.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_aborted_verify_warns_the_data_violation_its_completed_rank_found() {
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("aborted_verify_violation.mcap");
+    write_sy_verify_bag(rec, &bag, |rec| {
+        let frame = &mut rec.messages.get_mut(SY_A_TOPIC).unwrap()[2];
+        frame[WireHeader::SIZE] ^= 0xFF;
+    });
+    let report = dir.path().join("aborted_verify_violation.json");
+
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        sy_rank1_init_fails_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
+    let err = outcome.expect_err("rank 1's node refuses to init, so the run aborts");
+    let ReplayError::Internal { reason } = &err else {
+        panic!("a build failure is the exit-5 Internal class: {err:?}");
+    };
+    assert!(
+        reason.contains("rank 1") && reason.contains("refuses to init"),
+        "the aborting error is what returns: {reason}"
+    );
+
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    let violations = json["violations"].as_array().expect("violations array");
+    assert_eq!(violations.len(), 1, "{json}");
+    assert_eq!(violations[0]["topic"], SY_A_TOPIC, "{json}");
+    assert_eq!(
+        (
+            violations[0]["class"]["kind"].as_str(),
+            violations[0]["class"]["index"].as_u64(),
+            violations[0]["class"]["first_diff_byte_offset"].as_u64(),
+        ),
+        (Some("ByteMismatch"), Some(2), Some(WireHeader::SIZE as u64)),
+        "the flipped byte is a byte mismatch at frame 2, first payload byte: {}",
+        violations[0]
+    );
+    // The report names the field and both values. Oracle: frame 2's x is 3.0
+    // (`00 .. 08 40`); byte 0 XOR 0xFF reads back as 3.0000000000001132.
+    assert_eq!(
+        violations[0]["class"]["difference"],
+        serde_json::json!({
+            "kind": "field",
+            "path": "x",
+            "recorded": 3.0000000000001132,
+            "replayed": 3.0,
+            "field_byte": null,
+            "field_char": null,
+            "byte_offset": null,
+            "region": null,
+            "reason": null,
+            "more": 0,
+        }),
+        "{}",
+        violations[0]
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains("replay: data violation")
+            })
+            .collect();
+        match (
+            warned.as_slice(),
+            cerulion_core::testing::count_at(lines, "INFO", "replay: data violation"),
+        ) {
+            ([line], 0) if line.contains(SY_A_TOPIC) => Ok(()),
+            (other, infos) => Err(format!(
+                "expected ONE WARN naming {SY_A_TOPIC} and no INFO twin, got {other:?} and \
+                 {infos} INFO line(s)"
+            )),
+        }
+    });
+}
+
+/// **An aborted `--verify` warns the node failure its completed rank
+/// suffered.**
+///
+/// The same abort as above with rank 0's producer A panicking from its third
+/// fire: the partial report names `prod_a` as the one failed node, and the log
+/// names it once at `WARN`. No finding of the completed rank is logged at
+/// `INFO`, because no verdict and no summary is printed to state it.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_aborted_verify_warns_the_node_failure_its_completed_rank_suffered() {
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("aborted_verify_failure.mcap");
+    write_sy_verify_bag(rec, &bag, |_| {});
+    let report = dir.path().join("aborted_verify_failure.json");
+    let make = || {
+        factories(vec![
+            (
+                "prod_a",
+                Box::new(PanicAtTick3SyncProdAEntry::new()) as Box<dyn NodeEntry>,
+            ),
+            (
+                "prod_b",
+                Box::new(SyncProdBEntry::new()) as Box<dyn NodeEntry>,
+            ),
+            (
+                "fusion",
+                Box::new(InitFailsEntry {
+                    inner: Box::new(SumFusionNodeEntry::new()),
+                }) as Box<dyn NodeEntry>,
+            ),
+        ])
+    };
+
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        make,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
+    let err = outcome.expect_err("rank 1's node refuses to init, so the run aborts");
+    assert!(
+        matches!(&err, ReplayError::Internal { reason } if reason.contains("rank 1")),
+        "{err:?}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    let failed: Vec<&str> = json["node_failures"]
+        .as_array()
+        .expect("node_failures array")
+        .iter()
+        .map(|f| f["node_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(failed, vec!["prod_a"], "{json}");
+
+    logs_assert(|lines: &[&str]| {
+        let marker = "replay: node suffered a panic-class failure";
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| cerulion_core::testing::line_level(l) == Some("WARN") && l.contains(marker))
+            .collect();
+        let infos = [
+            marker,
+            "replay: data violation",
+            "replay: structural trace divergence",
+        ]
+        .iter()
+        .map(|m| cerulion_core::testing::count_at(lines, "INFO", m))
+        .sum::<usize>();
+        match (warned.as_slice(), infos) {
+            ([line], 0) if line.contains("node_id=prod_a") => Ok(()),
+            (other, infos) => Err(format!(
+                "expected ONE WARN naming prod_a and no INFO finding, got {other:?} and \
+                 {infos} INFO line(s)"
+            )),
+        }
+    });
+}
+
+/// The source and relay bag replayed under `purpose` against a source that
+/// panics from tick 3 (the fixture of
+/// `panicking_candidate_reports_node_failure_and_renders_all_blocks`): one
+/// failed node, `source`, and a fire-schedule divergence downstream of it.
+fn replay_panicking_source(
+    dir: &std::path::Path,
+    purpose: replay_engine::ReplayPurpose,
+) -> (ReplayOutcome, std::path::PathBuf) {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 6);
+    let bag = dir.join("panicking_source.mcap");
+    write_bag(&rec, &bag, None);
+    let make = || {
+        factories(vec![
+            ("source", Box::new(PanicAtTick3SourceNodeEntry::new())),
+            (
+                "relay",
+                Box::new(RelayNodeEntry::with_state(RelayNode {
+                    addend: 100.0,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let (outcome, _) = ri_replay(&bag, make, purpose);
+    let outcome = outcome.expect("the panicking candidate replays to an outcome");
+    let failed: Vec<&str> = outcome
+        .node_failures
+        .iter()
+        .map(|f| f.node_id.as_str())
+        .collect();
+    assert_eq!(failed, vec!["source"], "{:?}", outcome.node_failures);
+    assert!(
+        outcome.trace_divergence.is_some(),
+        "the thinner replayed schedule is a fire-schedule divergence"
+    );
+    (outcome, bag)
+}
+
+/// A completed `--verify` states the schedule divergence and the node failure
+/// in its own blocks, so it logs each of them once at `INFO` and never at
+/// `WARN`.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_logs_its_schedule_divergence_and_node_failure_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_panicking_source(dir.path(), replay_engine::ReplayPurpose::Verify);
+
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        verdict.contains("FIRE-SCHEDULE DIVERGENCE") && verdict.contains("NODE FAILURE"),
+        "the verdict states both in their own blocks: {verdict}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let counts = [
+            "replay: structural trace divergence",
+            "replay: node suffered a panic-class failure",
+        ]
+        .map(|m| {
+            (
+                cerulion_core::testing::count_at(lines, "INFO", m),
+                cerulion_core::testing::count_at(lines, "WARN", m),
+            )
+        });
+        match counts {
+            [(1, 0), (1, 0)] => Ok(()),
+            other => Err(format!(
+                "expected ONE INFO and no WARN for the divergence and the failure, got \
+                 (info, warn) {other:?}"
+            )),
+        }
+    });
+}
+
+/// A bare `--resim` warns the schedule divergence with its position, which
+/// its neutral summary does not state, and logs the node failure, which the
+/// summary names, at `INFO`.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_bare_resim_warns_its_schedule_divergence_by_position_and_logs_a_node_failure_at_info() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outcome, bag) = replay_panicking_source(dir.path(), replay_engine::ReplayPurpose::Resim);
+    let position = outcome
+        .trace_divergence
+        .as_ref()
+        .map(|td| td.position)
+        .expect("a divergence");
+
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+        &bag,
+    );
+    assert!(
+        summary.contains("NODE FAILURE: 'source'"),
+        "the neutral summary names the failed node: {summary}"
+    );
+    let at = format!("position={position}");
+    logs_assert(|lines: &[&str]| {
+        let marker = "replay: structural trace divergence";
+        let warned: Vec<&&str> = lines
+            .iter()
+            .filter(|l| cerulion_core::testing::line_level(l) == Some("WARN") && l.contains(marker))
+            .collect();
+        let failure = "replay: node suffered a panic-class failure";
+        match (
+            warned.as_slice(),
+            cerulion_core::testing::count_at(lines, "INFO", marker),
+            cerulion_core::testing::count_at(lines, "INFO", failure),
+            cerulion_core::testing::count_at(lines, "WARN", failure),
+        ) {
+            ([line], 0, 1, 0) if line.contains(&at) => Ok(()),
+            (other, infos, failure_infos, failure_warns) => Err(format!(
+                "expected ONE WARN divergence naming {at} with no INFO twin, and the failure \
+                 at INFO only; got {other:?}, {infos} INFO divergence line(s), \
+                 {failure_infos} INFO and {failure_warns} WARN failure line(s)"
+            )),
+        }
+    });
+}
+
 // ===========================================================================
 // Reporter structural pins (count, accounting, no-payload-dump)
 // ===========================================================================
@@ -12362,6 +14047,7 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
                 first_diff_byte_offset: 40,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
             detail: "c".to_string(),
         },
@@ -12381,6 +14067,7 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         covered_range: None,
         read_log_divergence: None,
@@ -12393,6 +14080,9 @@ fn render_verdict_violation_count_equals_rendered_body_lines() {
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
         // A hand-built outcome for the verdict renderer: the
         // unstamped shape (no stamp ⇒ inferred lockstep).
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: true,
@@ -12587,11 +14277,6 @@ fn large_frame_byte_mismatch_detail_is_offset_bounded_no_payload_dump() {
         v.detail.len(),
         &v.detail[..v.detail.len().min(200)]
     );
-    assert!(
-        v.detail.contains("differs at byte"),
-        "detail carries the offset: {}",
-        v.detail
-    );
     match v.class {
         ViolationClass::ByteMismatch {
             first_diff_byte_offset,
@@ -12599,6 +14284,15 @@ fn large_frame_byte_mismatch_detail_is_offset_bounded_no_payload_dump() {
             replayed_len,
             ..
         } => {
+            // The detail names the bumped element and both values. Oracle:
+            // positions[i] == i, and the candidate adds 1.0 to element 2048.
+            assert_eq!(
+                v.detail,
+                format!(
+                    "frame 0 on '/bg/source/out' differs at positions[2048]: recorded 2048.0, \
+                     replayed 2049.0 (recorded {recorded_len} B, replayed {replayed_len} B)"
+                )
+            );
             assert!(
                 recorded_len > 30_000 && replayed_len == recorded_len,
                 "large equal-length frames: {recorded_len}/{replayed_len}"
@@ -12920,6 +14614,7 @@ fn coverage_naming(node: &str, version: u32, rings: usize, node_idx: Option<u32>
 /// head-step gate does when a recorder attaches mid-run.
 fn make_mid_run(rec: &Recording, first_step: u64) -> Recording {
     Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec
             .trace
@@ -12978,6 +14673,32 @@ fn write_checkpoint_bag_with_capture(
     capture_anchor_target_ns: Option<u64>,
     recorder_json: Option<Vec<u8>>,
 ) {
+    write_checkpoint_bag_with_manifest_keys(
+        rec,
+        path,
+        state,
+        state_coverage,
+        record_coverage,
+        capture_anchor_target_ns,
+        recorder_json,
+        serde_json::Map::new(),
+    )
+}
+
+/// [`write_checkpoint_bag_with_capture`] with `manifest_keys` added to the
+/// rank-0 trace manifest, which is where a recorder stamps the staging rows
+/// and the publisher table a replay fed by read identity plans from.
+#[allow(clippy::too_many_arguments)]
+fn write_checkpoint_bag_with_manifest_keys(
+    rec: &Recording,
+    path: &std::path::Path,
+    state: &[Vec<u8>],
+    state_coverage: Option<&[u8]>,
+    record_coverage: Option<&[u8]>,
+    capture_anchor_target_ns: Option<u64>,
+    recorder_json: Option<Vec<u8>>,
+    manifest_keys: serde_json::Map<String, serde_json::Value>,
+) {
     let topics: Vec<TopicSchema> = rec
         .messages
         .keys()
@@ -13024,6 +14745,9 @@ fn write_checkpoint_bag_with_capture(
     // every pre-existing checkpoint bag's manifest is byte-identical.
     if let Some(inputs) = &rec.input_names {
         manifest_json["inputs"] = serde_json::json!(inputs);
+    }
+    for (key, value) in manifest_keys {
+        manifest_json[key] = value;
     }
     let manifest = serde_json::to_vec(&manifest_json).unwrap();
     w.write_attachment(
@@ -13149,7 +14873,7 @@ fn write_stamped_checkpoint_bag(
         Some(&checkpoint_coverage(1, Some(CHECKPOINT_NODE_IDX))),
         None,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
     );
     bag
 }
@@ -14266,6 +15990,7 @@ fn make_mid_run_with_tap_attach(rec: &Recording, first_step: u64, attach_ns: u64
             .retain(|f| WireHeader::read_from_buf(f).is_some_and(|h| h.timestamp_ns >= attach_ns));
     }
     Recording {
+        stage_rows: serde_json::Value::Null,
         messages,
         trace: rec
             .trace
@@ -15991,6 +17716,7 @@ fn write_cp3_bag(
                 input_service: Some(BTreeMap::new()),
                 sync_capture_high_water: Default::default(),
                 sync_epoch_floor: None,
+                stopped: false,
             },
         ),
     ));
@@ -16159,6 +17885,7 @@ fn write_backlog_bag(
                     input_service: service.clone(),
                     sync_capture_high_water: Default::default(),
                     sync_epoch_floor: None,
+                    stopped: false,
                 },
             ),
         ),
@@ -17162,6 +18889,7 @@ fn a_backlog_a_recording_cannot_attribute_to_one_topic_is_withheld() {
                     input_service: Some(cursors),
                     sync_capture_high_water: Default::default(),
                     sync_epoch_floor: None,
+                    stopped: false,
                 },
             ),
         ),
@@ -17836,6 +19564,7 @@ fn a_zero_length_section_is_refused_at_the_anchor_not_blamed_on_the_node() {
             input_service: Some(BTreeMap::new()),
             sync_capture_high_water: Default::default(),
             sync_epoch_floor: None,
+            stopped: false,
         },
     );
     fusion[16..20].copy_from_slice(&0u32.to_le_bytes());
@@ -18684,13 +20413,58 @@ fn a_zero_delta_replay_is_deterministic_across_replays() {
 //    the STEPS records on the edge is tampered, so a per-record warn emits
 //    STEPS lines where the pin requires exactly ONE.
 
-/// The kind-6 records of a recording, decoded to (step, node_idx, input_idx,
-/// kind, served_seq, popped) — the test's OWN resolver (deliberately not the
-/// engine's).
+/// Re-bind every producer annotation to the read it precedes: an annotation
+/// REPEATS its read's served sequence (the join key), so an arm that tampers a
+/// read's sequence re-binds the annotation too, or the verifier reads the pair
+/// as a corrupt log and stands the edge down instead of comparing it.
+fn rebind_annotations(trace: &mut [TraceRingRecord]) {
+    for i in 0..trace.len() {
+        let r = trace[i];
+        if r.record_type != RECORD_TYPE_READ_OUTCOME
+            || unpack_read_outcome_meta(r.global_level).1
+                != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+        {
+            continue;
+        }
+        let input = unpack_read_outcome_meta(r.global_level).0;
+        if let Some(read) = trace[i + 1..].iter().find(|n| {
+            is_read_record(n)
+                && n.node_idx == r.node_idx
+                && unpack_read_outcome_meta(n.global_level).0 == input
+        }) {
+            trace[i].fire_time_ns = read.fire_time_ns;
+        }
+    }
+}
+
+/// Remove every producer annotation: the read log of a recorder that
+/// annotated no edge, for the arms that inject annotations of their own onto a
+/// recording and need it free of the ones every edge carries from
+/// `trace_format` 8 on.
+fn strip_annotations(rec: &mut Recording) {
+    rec.trace.retain(|r| {
+        r.record_type != RECORD_TYPE_READ_OUTCOME
+            || unpack_read_outcome_meta(r.global_level).1
+                != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+    });
+}
+
+/// A kind-6 record that is not a producer annotation.
+fn is_read_record(r: &TraceRingRecord) -> bool {
+    r.record_type == RECORD_TYPE_READ_OUTCOME
+        && unpack_read_outcome_meta(r.global_level).1
+            != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+}
+
+/// The kind-6 READ records of a recording, decoded to (step, node_idx,
+/// input_idx, kind, served_seq, popped), the test's OWN resolver (deliberately
+/// not the engine's). Producer annotations are left out: from `trace_format` 8
+/// every edge carries them, one per writer run, and the hand oracles below
+/// describe the reads ([`is_read_record`]).
 fn kind6_records(rec: &Recording) -> Vec<(u64, u32, u16, u16, u64, u32)> {
     rec.trace
         .iter()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .map(|r| {
             let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
             (
@@ -19061,11 +20835,9 @@ fn assert_edge_read_verdict(outcome: &ReplayOutcome, label: &str) {
 }
 
 /// (a) CLEAN BAG → the verifier runs, WARNS nothing, and claims its clean
-/// verification POSITIVELY: no report field, no warn, verdict untouched —
-/// and the verdict prints the `read log: verified clean (N edge(s)
-/// compared)` line, which this arm asserts ("silent" here
-/// means no WARN-class output, not no output — the positive status line is
-/// deliberate, it is what makes a clean cycle auditable). The recording's
+/// verification POSITIVELY in the `--report` JSON (`read_log.status ==
+/// "verified_clean"` with its edge count), while the terminal verdict leaves a
+/// clean verification to its PASS line and prints no `read log:` line. The recording's
 /// kind-6 content is anchored to a HAND oracle first (anti-vacuity: a
 /// verifier that never saw a record would also warn nothing — the oracle
 /// proves the bag really carries the read log, and
@@ -19148,11 +20920,16 @@ fn read_log_clean_bag_verifies_clean_with_no_warns() {
     // The always-present status field, internally tagged snake_case.
     assert_eq!(parsed["read_log"]["status"], "verified_clean");
     assert_eq!(parsed["read_log"]["edges_compared"], 1);
-    // And the human verdict carries the one-line status on the PASS path.
+    // The human verdict leaves a clean verification to the PASS line: the
+    // report above carries the status and its edge count.
     let verdict = replay_engine::render_verdict(&outcome, &bag);
     assert!(
-        verdict.contains("read log: verified clean (1 edge(s) compared)"),
-        "verdict: {verdict}"
+        !verdict.contains("read log:"),
+        "a clean verification prints no `read log:` line: {verdict}"
+    );
+    assert!(
+        verdict.contains("replay PASS: "),
+        "the PASS line carries the verdict: {verdict}"
     );
 }
 
@@ -19188,12 +20965,15 @@ fn read_log_tamper_is_the_exit_6_schedule_verdict() {
     // and fires are untouched, so ONLY the read log disagrees with the
     // re-execution.
     let mut tampered_count = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered_count += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert_eq!(
         tampered_count, steps,
         "every step's serving record tampered"
@@ -19363,12 +21143,15 @@ fn a_divergence_the_quarantine_excludes_renders_no_diverged_line_and_exits_0() {
          quarantines from: {k6:?}"
     );
     let mut tampered = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert_eq!(tampered, steps, "every step's serving record tampered");
 
     // ── LEG A: the divergence is outside every quarantine ⇒ DIVERGED, exit 6.
@@ -19390,9 +21173,11 @@ fn a_divergence_the_quarantine_excludes_renders_no_diverged_line_and_exits_0() {
 
     // ── LEG B: the same divergence, now inside a node quarantine's scope.
     let mut retagged = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == 3
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.node_idx == relay_idx && r.step == 3)
+    {
         let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
         assert_eq!(
             input_idx, 0,
@@ -19572,13 +21357,17 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
 
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
-    write_bag_with_recorder_json(&rec, &stamped, production_recorder_json(lockstep));
-    // This bag is recorded BY THIS BINARY, so it stamps 7: the
-    // format that says every gated consult wrote a kind-6 record. The reason is
+    write_bag_with_recorder_json(&rec, &stamped, pre_stamp_recorder_json(lockstep));
+    // This bag is recorded BY THIS BINARY, so it stamps 9
+    // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
+    // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
-    // in this file that is fed by `production_recorder_json`; the arms that
+    // in this file that is fed by `pre_stamp_recorder_json`; the arms that
     // stamp 4, 5 or 6 EXPLICITLY are the ones testing old-format reading.
-    assert_eq!(recorded_trace_format(&stamped), 7);
+    assert_eq!(
+        recorded_trace_format(&stamped),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o5 =
         replay(&stamped, source_relay_factories, None, None).expect("the format-5 bag replays");
     let rl = o5
@@ -19681,7 +21470,7 @@ fn read_log_popped_tamper_is_the_exit_6_schedule_verdict() {
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 2)
+        .find(|r| is_read_record(r) && r.step == 2)
         .expect("step-2 kind-6 record exists");
     assert_eq!(
         cerulion_core::trace_ring::unpack_read_outcome_popped(target.duration_ns),
@@ -19993,7 +21782,9 @@ fn read_log_missing_recorded_record_reports_recorded_none() {
     let before = rec.trace.len();
     rec.trace
         .retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 3));
-    assert_eq!(before - rec.trace.len(), 1, "exactly one record deleted");
+    // The edge has one writer, whose run opened with an annotation at its
+    // first read, so step 3 holds the read alone.
+    assert_eq!(before - rec.trace.len(), 1, "exactly one read deleted");
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("readlog_missing_rec.mcap");
     write_bag(&rec, &bag, None);
@@ -20037,7 +21828,7 @@ fn read_log_unknown_kind_is_labeled_and_is_the_exit_6_verdict() {
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == 2)
+        .find(|r| is_read_record(r) && r.step == 2)
         .expect("step-2 kind-6 record exists");
     // Role-0 — this crafts a FOREIGN outcome KIND, and the
     // record's site is not what is under test.
@@ -20089,12 +21880,15 @@ fn read_log_two_edges_tampered_counts_edges_and_steps_distinctly() {
     assert!(k6.iter().any(|r| r.2 == 0) && k6.iter().any(|r| r.2 == 1));
     let mut rec = rec;
     let mut tampered = 0;
-    for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in rec
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert!(
         tampered >= 2,
         "both edges' real reads tampered ({tampered})"
@@ -20184,12 +21978,14 @@ fn read_log_two_rank_tamper_is_attributed_to_the_rank1_edge() {
         &bag,
         |per_rank| {
             let mut n = 0;
-            for r in per_rank[1].iter_mut().filter(|r| {
-                r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-            }) {
+            for r in per_rank[1]
+                .iter_mut()
+                .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+            {
                 r.fire_time_ns += 1000;
                 n += 1;
             }
+            rebind_annotations(&mut per_rank[1]);
             assert_eq!(n, steps, "every rank-1 serving kind-6 record tampered");
         },
     );
@@ -20516,14 +22312,14 @@ fn read_log_a_tampered_read_inside_the_window_still_diverges_on_a_ragged_bag() {
     let bag = dir.path().join("readlog_ragged_tamper.mcap");
     write_ragged_tail_read_log_bag(&rec, &bag, |rank1| {
         let mut n = 0;
-        for r in rank1.iter_mut().filter(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
-                && r.step == 0
-                && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-        }) {
+        for r in rank1
+            .iter_mut()
+            .filter(|r| is_read_record(r) && r.step == 0 && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+        {
             r.fire_time_ns += 1000; // the served seq
             n += 1;
         }
+        rebind_annotations(rank1);
         assert_eq!(n, 1, "exactly the step-0 serving kind-6 record is tampered");
     });
 
@@ -20698,7 +22494,9 @@ fn read_log_a_replayed_read_the_recording_lost_inside_the_window_still_diverges(
             // one position short of the replayed side at a step it still
             // covers.
             rank1.retain(|r| !(r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == lost_step));
-            assert_eq!(before - rank1.len(), 1, "exactly one record removed");
+            // The edge's one writer opened its run at the first read, so the
+            // step holds the read alone.
+            assert_eq!(before - rank1.len(), 1, "exactly one read removed");
         });
 
         let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -20862,7 +22660,7 @@ fn a_quarantine_does_not_erase_divergences_found_on_other_nodes() {
     // Tamper A's step-0 and step-1 records (+1000 on the served seq).
     let mut tampered = 0;
     for r in rec.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME
+        is_read_record(r)
             && r.node_idx == relay_idx
             && r.step <= 1
             && r.fire_time_ns != READ_OUTCOME_NO_FRAME
@@ -20870,6 +22668,7 @@ fn a_quarantine_does_not_erase_divergences_found_on_other_nodes() {
         r.fire_time_ns += 1000;
         tampered += 1;
     }
+    rebind_annotations(&mut rec.trace);
     assert_eq!(tampered, 2, "relay's step-0/1 serving records tampered");
     // Empty B's manifest input list — the mixed-version hole.
     rec.input_names
@@ -21647,10 +23446,12 @@ fn the_fold_is_deterministic_across_runs() {
     let a = fold_burst_recording();
     let b = fold_burst_recording();
 
+    // Reads only: a producer annotation's aux word is a token over the run's
+    // own port ids, which are random per run by construction.
     let reads = |rec: &Recording| -> Vec<(u64, u32, u16, u16, u64, u64)> {
         rec.trace
             .iter()
-            .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+            .filter(|r| is_read_record(r))
             .map(|r| {
                 let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
                 (
@@ -21697,7 +23498,7 @@ fn a_recorded_run_longer_than_the_replayed_one_is_reported() {
     let target = rec
         .trace
         .iter_mut()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .filter(|r| is_read_record(r))
         .find(|r| cerulion_core::trace_ring::unpack_read_outcome_run(r.duration_ns) >= 2)
         .expect("the fixture folds — see the premise in the sibling arm");
     let popped = cerulion_core::trace_ring::unpack_read_outcome_popped(target.duration_ns);
@@ -21752,7 +23553,7 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+        .find(|r| is_read_record(r))
         .expect("the recording carries read records");
     let popped = cerulion_core::trace_ring::unpack_read_outcome_popped(target.duration_ns);
     target.duration_ns = cerulion_core::trace_ring::pack_read_outcome_aux_run(popped, HOSTILE_RUN);
@@ -21837,13 +23638,13 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 7 on every
-/// bag this binary writes (every gated consult records), so every "corpus" bag
-/// elsewhere in this file is a format-**7** bag, a PRECONDITION that roles are
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 9 on every
+/// bag this binary writes (every gated consult, and every frame of each batch
+/// that fits its read stage's window, record), so every "corpus" bag elsewhere in this file is a format-**9** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 7, the consult term
-/// outranks the fold term). Reading an archived bag is a compatibility claim
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 9, the identity and
+/// consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a
 /// recording stripped of the records those formats never wrote
@@ -22825,7 +24626,7 @@ fn a_free_run_peer_past_rank_zero_is_deducted_at_its_own_ceiling() {
         // rank 0's own last boundary, which is the whole point of the shape.
         |per_rank| per_rank[0].retain(|r| r.step <= 2),
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         Some(15_000_000),
@@ -23017,10 +24818,10 @@ fn an_explicitly_lockstep_bag_replays_byte_identically_and_says_so() {
         }
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert_eq!(
-        verdict.lines().next(),
-        Some("coordination: lockstep"),
-        "an EXPLICIT stamp carries no inferred suffix: {verdict}"
+    assert!(
+        !verdict.contains("coordination:"),
+        "an EXPLICIT stamp is the contract the recording ran under, so the verdict \
+         prints no coordination line (the report below carries it): {verdict}"
     );
     assert_eq!(
         read_report(&report)["coordination"],
@@ -23060,6 +24861,7 @@ fn write_free_run_skewed_bag_on(
     skewed_rank: u32,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23147,13 +24949,10 @@ fn free_run_crafted_bag_replays_byte_exact_per_rank() {
         }
     );
     let verdict = replay_engine::render_verdict(&outcome, &bag);
-    assert_eq!(
-        verdict.lines().next(),
-        Some(
-            "coordination: free_run (per-rank boundary streams + read-log agreement; \
-             cross-rank lockstep equality not applicable)"
-        ),
-        "the skip is stated on the provenance line: {verdict}"
+    assert!(
+        !verdict.contains("coordination:"),
+        "a stamped free_run contract prints no coordination line; the outcome above \
+         and the report's coordination block carry it: {verdict}"
     );
     // The replay RAN — phase 2 refuses BEFORE the first step, so a non-empty
     // tap is the discriminator against a refusal that merely changed shape.
@@ -23242,6 +25041,7 @@ fn write_free_run_ragged_head_bag(
     coordination: replay_engine::CoordinationMode,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23396,6 +25196,7 @@ fn free_run_per_rank_replay_is_deterministic() {
 /// an implementation that never installs the plan passes every other free-run arm.
 fn write_free_run_silent_last_step_bag(rec: &Recording, path: &std::path::Path, silent_step: u64) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23512,6 +25313,7 @@ fn write_free_run_ragged_tail_bag(
     coordination: replay_engine::CoordinationMode,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23674,6 +25476,7 @@ fn the_same_ragged_tail_is_still_tolerated_on_a_lockstep_bag() {
     // would be refused for (phase 2) — so the lockstep twin is written by the
     // same trimming with NO skew.
     let mut trimmed = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23766,6 +25569,7 @@ fn write_free_run_unmanifested_producer_bag(
     skew_ghost: bool,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -23937,6 +25741,7 @@ fn write_mid_run_bag(
     coordination: Option<replay_engine::CoordinationMode>,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec
             .trace
@@ -24014,7 +25819,7 @@ fn write_stamped_checkpoint_bag_with_deadline(
         Some(&checkpoint_coverage(1, Some(CHECKPOINT_NODE_IDX))),
         None,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
     );
     bag
 }
@@ -24204,6 +26009,541 @@ fn two_resims_of_a_one_rank_free_run_mid_run_bag_are_byte_identical() {
         serde_json::to_string(&a).unwrap(),
         serde_json::to_string(&b).unwrap(),
         "two resumed resims of one bag must produce one report"
+    );
+}
+
+// ===========================================================================
+// A `consume = latest` node stopped before a resumed pass's anchor
+//
+// Real recordings of a node that returns `NodeError::Fatal`: before the
+// anchor of a one-rank free-run resume, and inside the resumed slice. The
+// bag records no stop, so a resumed pass whose slice never shows the node
+// running stands the unread-frame rule down by name, and a pass whose slice
+// shows it running still convicts the fire it misses.
+// ===========================================================================
+
+/// How a [`StoppingLatestSinkNode`] build fails on a frame at or past a
+/// value. Either way that fire publishes nothing.
+#[derive(Debug, Clone, Copy)]
+enum SinkFailure {
+    /// `NodeError::Fatal`, which stops the node.
+    Fatal(f64),
+    /// `NodeError::Logic`, which the node keeps firing past.
+    Logic(f64),
+}
+
+/// A `consume = latest` sink whose trigger input is read through a second
+/// subscriber: a `sample(N)` input never shares the boundary drain's
+/// subscriber, and `sample(1)` at the reference run's 5 ms step decimates
+/// nothing. Each fire publishes the served frame plus 100, except a fire
+/// whose frame the build's [`SinkFailure`] fails on.
+#[cerulion_node]
+#[derive(Default)]
+struct StoppingLatestSinkNode {
+    #[input(trigger, consume = latest, backpressure = sample(1), depth = 1)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    /// How this build fails, if at all. Set by the factory; a restore leaves
+    /// it as built, so a resumed candidate keeps its own.
+    #[cerulion(reconstruct)]
+    fails: Option<SinkFailure>,
+}
+
+#[cerulion_node_impl]
+impl StoppingLatestSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        match self.fails {
+            Some(SinkFailure::Fatal(at)) if self.inp.x >= at => {
+                return Err(NodeError::Fatal("the sink stops at this frame".to_string()));
+            }
+            Some(SinkFailure::Logic(at)) if self.inp.x >= at => {
+                return Err(NodeError::Logic("the sink skips this frame".to_string()));
+            }
+            _ => {}
+        }
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
+/// The stopping sink's node id, at ring index 1 after the counter.
+const LS_SINK: &str = "sink";
+/// Its output topic.
+const LS_SINK_TOPIC: &str = "/stop/sink/out";
+/// The steps every stopping-sink recording runs.
+const LS_STEPS: usize = 12;
+/// The step a resumed bag of it begins at; its anchor is the step before.
+const LS_FIRST_STEP: u64 = 4;
+
+/// The [`CounterEntry`] counter, publishing `0, 1, 2, ...` one per step, read
+/// by the [`StoppingLatestSinkNode`] sink.
+fn ls_yaml() -> &'static str {
+    "name: stop\nprefix: stop\nnodes:\n\
+     \x20 - id: counter\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sink\n    type: stopping_latest_sink_node\n    inputs:\n      - name: inp\n        source: /stop/counter/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn ls_factories(fails: SinkFailure) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (CP_NODE, Box::new(CounterEntry::new()) as Box<dyn NodeEntry>),
+        (
+            LS_SINK,
+            Box::new(StoppingLatestSinkNodeEntry::with_state(
+                StoppingLatestSinkNode {
+                    fails: Some(fails),
+                    ..Default::default()
+                },
+            )),
+        ),
+    ])
+}
+
+/// The steps at which `rec` holds a FIRE of the sink, and the steps at which
+/// it holds a read of the sink's input with `kind` minted at `role`.
+fn ls_sink_records(
+    rec: &Recording,
+    kind: cerulion_core::read_outcome::ReadOutcomeKind,
+    role: ReadSiteRole,
+) -> (Vec<u64>, Vec<u64>) {
+    let sink = rec
+        .node_ids
+        .iter()
+        .position(|id| id == LS_SINK)
+        .expect("the sink is in the manifest") as u32;
+    let fires = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == sink)
+        .map(|r| r.step)
+        .collect();
+    let reads = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink)
+        .filter(|r| {
+            let (_, k, ro) =
+                cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level);
+            k == kind.wire() && ro == role
+        })
+        .map(|r| r.step)
+        .collect();
+    (fires, reads)
+}
+
+/// Record the stopping-sink graph with its read log, the sink stopping at the
+/// frame `stop_at`, and check the recording against the hand oracle: the
+/// counter publishes `0..LS_STEPS`, the sink fires at steps `0..=stop_at` and
+/// publishes the frame plus 100 at every fire but the stopping one, its body
+/// served a frame at every fire, and its boundary drain counted one frame at
+/// every step, the steps after the stop included. That last fact is what a
+/// stopped node leaves in a bag. Each of the sink's two read sites carries one
+/// producer annotation, at step 0: the counter is the one writer, so its run
+/// never closes.
+fn ls_reference(stop_at: u64) -> Recording {
+    let rec = record_uniform_with_read_log(
+        ls_yaml(),
+        || ls_factories(SinkFailure::Fatal(stop_at as f64)),
+        &[],
+        LS_STEPS,
+    );
+    let counter: Vec<f64> = rec.messages["/stop/counter/out"]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(
+        counter,
+        (0..LS_STEPS).map(|k| k as f64).collect::<Vec<_>>(),
+        "the counter publishes one frame per step"
+    );
+    let sink: Vec<f64> = rec.messages[LS_SINK_TOPIC]
+        .iter()
+        .map(|f| frame_x(f))
+        .collect();
+    assert_eq!(
+        sink,
+        (0..stop_at).map(|k| k as f64 + 100.0).collect::<Vec<_>>(),
+        "the sink publishes the frame plus 100 until the frame it stops at"
+    );
+    let (fires, served) = ls_sink_records(
+        &rec,
+        cerulion_core::read_outcome::ReadOutcomeKind::Served,
+        ReadSiteRole::Body,
+    );
+    assert_eq!(fires, (0..=stop_at).collect::<Vec<_>>(), "the sink's fires");
+    assert_eq!(served, fires, "the sink's body read a frame at every fire");
+    let (_, drained) = ls_sink_records(
+        &rec,
+        cerulion_core::read_outcome::ReadOutcomeKind::DrainedBatch,
+        ReadSiteRole::Drain,
+    );
+    assert_eq!(
+        drained,
+        (0..LS_STEPS as u64).collect::<Vec<_>>(),
+        "the boundary drain counts the sink's input at every step, after the stop too"
+    );
+    for role in [ReadSiteRole::Body, ReadSiteRole::Drain] {
+        let (_, annotated) = ls_sink_records(
+            &rec,
+            cerulion_core::read_outcome::ReadOutcomeKind::Producer,
+            role,
+        );
+        assert_eq!(
+            annotated,
+            vec![0],
+            "the {role:?} site's writer run opens at step 0"
+        );
+    }
+    rec
+}
+
+/// A one-rank free-run bag of `rec` that begins at [`LS_FIRST_STEP`], with
+/// the counter's anchor at the step before it and, when `sink_anchor` is set,
+/// the sink's: a node the resumed pass executes needs its anchor, and one it
+/// never executes needs none. Its manifest carries the staging rows and the
+/// publisher table a recorder stamps, so a `--verify` replay of it plans each
+/// read's feed by read identity as it does on a recorder's bag.
+fn write_ls_resumed_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    sink_anchor: bool,
+) -> std::path::PathBuf {
+    let mid = make_mid_run(rec, LS_FIRST_STEP);
+    let bag = dir.path().join(name);
+    // The counter published `0..LS_FIRST_STEP` up to the anchor step.
+    let mut records = state_records(
+        CHECKPOINT_RUN,
+        LS_FIRST_STEP - 1,
+        0,
+        &anchor_blob(CHECKPOINT_SHAPE, LS_FIRST_STEP),
+    );
+    let mut named: Vec<(&str, u32)> = vec![(CP_NODE, 0)];
+    if sink_anchor {
+        let mut blob = cerulion_core::state::VecSink::new();
+        cerulion_core::state_restore::capture_anchor_blob(
+            &StoppingLatestSinkNode::default(),
+            &mut blob,
+        )
+        .expect("the sink's state fits an unbounded sink");
+        records.extend(state_records(
+            CHECKPOINT_RUN,
+            LS_FIRST_STEP - 1,
+            1,
+            &blob.into_inner(),
+        ));
+        named.push((LS_SINK, 1));
+    }
+    let mut manifest_keys = serde_json::Map::new();
+    manifest_keys.insert("read_log_capacity".to_string(), serde_json::json!(0));
+    manifest_keys.insert("read_log_capacities".to_string(), rec.stage_rows.clone());
+    manifest_keys.insert("publishers".to_string(), ri_publishers(rec));
+    write_checkpoint_bag_with_manifest_keys(
+        &mid,
+        &bag,
+        &records,
+        Some(&coverage_for_nodes(&named)),
+        None,
+        None,
+        Some(ri_free_run_recorder_json()),
+        manifest_keys,
+    );
+    bag
+}
+
+/// Every `rederivation_notes` entry of `outcome` as the `--report` JSON spells
+/// it, as `(kind, subject, code)`.
+fn rederivation_note_rows(outcome: &ReplayOutcome) -> Vec<(String, String, Option<String>)> {
+    outcome
+        .rederivation_notes
+        .iter()
+        .map(|note| {
+            let n = serde_json::to_value(note).expect("a note serializes");
+            (
+                n["kind"].as_str().unwrap_or_default().to_string(),
+                n["subject"].as_str().unwrap_or_default().to_string(),
+                n["code"].as_str().map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+/// The CLI's own exit code for `outcome`, under `--verify` when `verify` is
+/// set and under a neutral `--resim all` otherwise.
+fn resim_exit(outcome: &ReplayOutcome, verify: bool) -> u8 {
+    cerulion_cli_engine::resim_cmd::resim_exit_code(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(outcome),
+        verify,
+    )
+}
+
+/// A `--verify` replay of a stopping-sink bag that begins at
+/// [`LS_FIRST_STEP`] is refused before its first step: the sink's first read
+/// in the bag continues the counter's writer run, which the recording opened
+/// with a producer annotation at step 0, before the bag's first step, so the
+/// read names no writer and a replay fed by read identity cannot feed it
+/// (`read_identity_absent`, exit 2).
+fn assert_ls_verify_refuses(bag: &std::path::Path, fails: SinkFailure) {
+    let (refused, _) = ri_replay(
+        bag,
+        || ls_factories(fails),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = refused.expect_err("a --verify replay of the resumed bag is refused");
+    match &err {
+        ReplayError::ReadLogNotEnforceable {
+            edge,
+            cause,
+            detail,
+        } => {
+            assert_eq!(edge.as_deref(), Some("sink.inp"), "{err:?}");
+            assert_eq!(cause, "read_identity_absent", "{err:?}");
+            assert!(
+                detail.contains("step 4, writer none, sequence 4"),
+                "{detail}"
+            );
+        }
+        other => panic!("expected ReadLogNotEnforceable, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2, "not replay-grade for a fed replay");
+}
+
+/// A sink stopped at its third frame (step 2), the step before a resumed pass's
+/// anchor, fires nothing and reads nothing in the slice while its boundary
+/// drain counts one frame per step. The bag records no stop.
+///
+/// `--verify` refuses the bag before its first step ([`assert_ls_verify_refuses`],
+/// exit 2), so it reaches no verdict on the sink and passes nothing. A neutral
+/// `--resim all` replays it, and its resumed pass cannot tell the stop from a
+/// node the scheduler never fired: at depth 1 and one writer the fourth count
+/// in the slice (step 7) passes the reads, two frames in delivery and the one
+/// queue excused before a first fire, and the unread-frame rule stands down by
+/// name. The stand-down is not silent: it is a `stand_down` note with its code
+/// beside the judged `latest_before_first_fire` note, and one WARN line on
+/// stderr names the node and the code. It is not a finding either, so the
+/// outcome passes and moves no exit code. The same recording replayed from its
+/// start under `--verify` is fed by read identity, re-executes the stop, stands
+/// nothing down and exits 0.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_silent() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = ls_reference(2);
+    let bag = write_ls_resumed_bag(&dir, "ls_stopped_before.mcap", &rec, false);
+    assert_ls_verify_refuses(&bag, SinkFailure::Fatal(2.0));
+
+    let (outcome, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("the resumed neutral resim runs");
+    let resume = outcome
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(resume.first_replay_step, LS_FIRST_STEP);
+    assert_eq!(
+        resume.restored_nodes,
+        vec![CP_NODE.to_string()],
+        "the stopped sink executes nothing in the slice, so it needs no anchor"
+    );
+    assert_eq!(outcome.ticks_replayed, LS_STEPS - LS_FIRST_STEP as usize);
+    assert!(outcome.passed, "{outcome:?}");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert_eq!(resim_exit(&outcome, false), 0, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0, "{outcome:?}");
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+        &bag,
+    );
+    assert!(
+        summary.contains("observation: the re-executed frames match the recording byte-for-byte"),
+        "{summary}"
+    );
+
+    assert_eq!(
+        rederivation_note_rows(&outcome),
+        vec![
+            (
+                "stand_down".to_string(),
+                LS_SINK.to_string(),
+                Some("latest_unfired_since_anchor".to_string()),
+            ),
+            (
+                "latest_before_first_fire".to_string(),
+                LS_SINK.to_string(),
+                None,
+            ),
+        ],
+        "the stand-down is named by its code beside the judged note"
+    );
+    assert!(
+        has_stand_down(
+            &outcome,
+            LS_SINK,
+            replay_rederive::StandDownReason::LatestUnfiredSinceAnchor
+        ),
+        "{:?}",
+        stand_down_details(&outcome)
+    );
+    let details = stand_down_details(&outcome);
+    assert!(
+        details[0]
+            .1
+            .starts_with("not verified: node 'sink' consume = latest fire count"),
+        "{details:?}"
+    );
+
+    // From the start the reads open their own writer runs, so `--verify`
+    // feeds them: the sink's body read at its fires (steps 0 to 2) and its
+    // drain read at every step, one frame each.
+    let from_start = dir.path().join("ls_stopped_from_start.mcap");
+    write_bag_impl(
+        &rec,
+        &from_start,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(&rec)),
+        None,
+        Some(rec.stage_rows.clone()),
+    );
+    let (replayed, _) = ri_replay(
+        &from_start,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let replayed = replayed.expect("the from-start --verify replay runs");
+    assert_eq!(ri_assert_fed(&replayed), (15, 15), "{replayed:?}");
+    assert!(replayed.passed, "{replayed:?}");
+    assert_eq!(resim_exit(&replayed, true), 0);
+    assert!(
+        replayed.rederivation_notes.is_empty(),
+        "the from-start pass re-executes the stop, so the rule judged the sink in full: {:?}",
+        replayed.rederivation_notes
+    );
+
+    logs_assert(|lines: &[&str]| {
+        let loud: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                l.split_whitespace().any(|t| t == "WARN")
+                    && l.contains("code=\"latest_unfired_since_anchor\"")
+            })
+            .collect();
+        match loud.as_slice() {
+            [line] if line.contains("node_id=sink") => Ok(()),
+            _ => Err(format!(
+                "expected exactly one WARN naming the sink and the code, got {}: {loud:?}",
+                loud.len()
+            )),
+        }
+    });
+}
+
+/// A sink that fires inside a resumed pass and stops itself there, at its
+/// seventh frame (step 6), replayed by a build that returns a recoverable error
+/// on that frame instead: the replay re-executes the recorded fires, the fire
+/// at step 6 publishes nothing in either build, the candidate is not stopped
+/// there, and the recording holds no fire after it while the boundary drain
+/// keeps counting.
+///
+/// `--verify` refuses the bag before its first step ([`assert_ls_verify_refuses`],
+/// exit 2). A neutral `--resim all` replays it, and the slice shows the node
+/// running, so the unread-frame rule judges it: the fourth count after the fire
+/// at step 6 (step 10) passes the frame that fire's read took and two in
+/// delivery, a fire-schedule finding (the class `--verify` exits 6 on) with
+/// nothing stood down, which the neutral summary reports as a differing fire
+/// schedule. The build the recording ran re-executes the stop at step 6 and
+/// re-derives clean, with nothing stood down either.
+#[test]
+#[serial]
+fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_convicted() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = ls_reference(6);
+    let bag = write_ls_resumed_bag(&dir, "ls_stops_inside.mcap", &rec, true);
+    assert_ls_verify_refuses(&bag, SinkFailure::Logic(6.0));
+
+    let (candidate, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Logic(6.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let candidate = candidate.expect("the resumed neutral resim runs");
+    let resume = candidate
+        .resume
+        .as_ref()
+        .expect("a mid-run bag reports its resume");
+    assert_eq!(
+        resume.restored_nodes,
+        vec![CP_NODE.to_string(), LS_SINK.to_string()]
+    );
+    assert!(
+        candidate.violations.is_empty(),
+        "{:?}",
+        candidate.violations
+    );
+    let d = candidate
+        .trace_divergence
+        .as_ref()
+        .expect("the missed fire is a fire-schedule divergence");
+    for part in [
+        "fire-schedule divergence: rank 0",
+        "node 'sink' step 10 consume = latest fire count",
+        "re-derived 1 fire(s), recorded 0 fire(s)",
+        "the trigger drain counted 4 frame(s) after the fire at step 6",
+        "reads took 1 and its writers can still have been delivering 2",
+    ] {
+        assert!(
+            d.detail.contains(part),
+            "{part:?} missing from: {}",
+            d.detail
+        );
+    }
+    assert!(!candidate.passed);
+    assert_eq!(resim_exit(&candidate, false), 0, "{candidate:?}");
+    assert_eq!(resim_exit(&candidate, true), 6, "{candidate:?}");
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&candidate),
+        &bag,
+    );
+    assert!(
+        summary.contains("observation: the re-executed fire schedule differs from the recording"),
+        "{summary}"
+    );
+    assert!(
+        stand_down_details(&candidate).is_empty(),
+        "a node the slice shows running is judged, never stood down: {:?}",
+        stand_down_details(&candidate)
+    );
+
+    let (recorded_build, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(6.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let recorded_build = recorded_build.expect("the resumed neutral resim runs");
+    assert!(recorded_build.passed, "{recorded_build:?}");
+    assert!(
+        recorded_build.trace_divergence.is_none(),
+        "{:?}",
+        recorded_build.trace_divergence
+    );
+    assert_eq!(resim_exit(&recorded_build, true), 0);
+    assert!(
+        recorded_build.rederivation_notes.is_empty(),
+        "the re-executed stop explains every count after it: {:?}",
+        recorded_build.rederivation_notes
     );
 }
 
@@ -24440,6 +26780,7 @@ fn write_stamped_cp3_bag(
                 input_service: Some(BTreeMap::new()),
                 sync_capture_high_water: Default::default(),
                 sync_epoch_floor: None,
+                stopped: false,
             },
         ),
     ));
@@ -24454,7 +26795,7 @@ fn write_stamped_cp3_bag(
         ])),
         None,
         None,
-        Some(production_recorder_json(coordination)),
+        Some(pre_stamp_recorder_json(coordination)),
     );
     bag
 }
@@ -24674,6 +27015,7 @@ fn write_free_run_backlog_bag(
                     input_service: service,
                     sync_capture_high_water: Default::default(),
                     sync_epoch_floor: None,
+                    stopped: false,
                 },
             ),
         ),
@@ -24685,7 +27027,7 @@ fn write_free_run_backlog_bag(
         )),
         None,
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
     );
@@ -24885,8 +27227,8 @@ fn free_run_nonzero_epoch_first_boundary_does_not_burst_period_catchup() {
     let steps = 4usize;
     let mut rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], steps);
     // Anchor the RECORDING to a hand oracle before re-basing it.
-    for k in 0..steps {
-        assert_eq!(frame_x(&rec.messages["/sr/source/out"][k]), (k + 1) as f64);
+    for (k, frame) in rec.messages["/sr/source/out"][..steps].iter().enumerate() {
+        assert_eq!(frame_x(frame), (k + 1) as f64);
     }
     rebase_recording_onto_epoch(&mut rec, EPOCH_NS);
 
@@ -24931,6 +27273,7 @@ fn write_trailing_rank_frame_bag(
     coordination: replay_engine::CoordinationMode,
 ) {
     let mut rec = Recording {
+        stage_rows: serde_json::Value::Null,
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -25128,7 +27471,7 @@ fn inject_before_first_read(
         .trace
         .iter()
         .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == node_idx
                 && unpack_read_outcome_meta(r.global_level).0 == input_idx
         })
@@ -25157,7 +27500,7 @@ fn inject_after_first_read(
         .trace
         .iter()
         .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == node_idx
                 && unpack_read_outcome_meta(r.global_level).0 == input_idx
         })
@@ -25198,9 +27541,9 @@ fn a_lockstep_bag_carrying_overflow_markers_replays_and_labels_the_hole() {
     // not: the stamp came up because of the records, not because of the marker.
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
-        "a bag this binary records stamps 7 (roles, folded runs and a record at \
-         every consult), marker or no marker"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "a bag this binary records stamps the current format (roles, folded runs, \
+         a record at every consult, read identity and batch frames), marker or no marker"
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -25244,7 +27587,13 @@ fn a_lockstep_bag_carrying_overflow_markers_replays_and_labels_the_hole() {
 fn a_resolvable_producer_token_verifies_clean() {
     const PUB_ID: u128 = 0x0102_0304_0506_0708_090A_0B0C_0D0E_0F10;
     let token = cerulion_core::wire::fnv1a_hash(&PUB_ID.to_le_bytes());
-    let mut rec = record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], 6);
+    let mut rec = record_uniform_with_read_log(
+        source_relay_multi_writer_yaml(),
+        source_relay_factories,
+        &[],
+        6,
+    );
+    strip_annotations(&mut rec);
     let (_step, _served) = inject_before_first_read(&mut rec, 1, 0, |step, served| {
         TraceRingRecord::read_outcome_producer(
             step,
@@ -25266,12 +27615,12 @@ fn a_resolvable_producer_token_verifies_clean() {
         Some(serde_json::json!({ format!("{PUB_ID:032x}"): ["source", "out"] })),
     );
 
-    // 7: the consult records, not the annotation. What an annotation must
+    // 8: the consult records and read identity, not the annotation. What an annotation must
     // not do is push the RECORD-TYPE space, and it does not.
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
-        "a bag this binary records stamps 7, annotation or no annotation"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "a bag this binary records stamps the current format, annotation or no annotation"
     );
 
     let outcome = replay(&bag, source_relay_factories, None, None).expect("replay runs");
@@ -25313,8 +27662,13 @@ fn foreign_publisher_token_stands_the_edge_down_and_never_guesses() {
         "the two spellings must differ, or the collision fixture is a single entry"
     );
     let build = |publishers: Option<serde_json::Value>, name: &str| {
-        let mut rec =
-            record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], 6);
+        let mut rec = record_uniform_with_read_log(
+            source_relay_multi_writer_yaml(),
+            source_relay_factories,
+            &[],
+            6,
+        );
+        strip_annotations(&mut rec);
         inject_before_first_read(&mut rec, 1, 0, |step, served| {
             TraceRingRecord::read_outcome_producer(
                 step,
@@ -25428,6 +27782,7 @@ fn a_producer_annotation_that_does_not_bind_to_its_read_stands_the_edge_down() {
     let build = |shape: &str, name: &str| {
         let mut rec =
             record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], 6);
+        strip_annotations(&mut rec);
         let key_of = |served: u64| (served != READ_OUTCOME_NO_FRAME).then_some(served as u32);
         match shape {
             "control" => {
@@ -25598,11 +27953,12 @@ fn a_stood_down_edge_scopes_a_clean_verification_rather_than_erasing_it() {
     let build = |publishers: Option<serde_json::Value>, name: &str| {
         let steps = 6;
         let mut rec = record_uniform_with_read_log(
-            two_source_fusion_yaml(),
+            two_source_fusion_a_multi_writer_yaml(),
             two_source_fusion_factories,
             &[],
             steps,
         );
+        strip_annotations(&mut rec);
         let fuse_idx = rec
             .node_ids
             .iter()
@@ -25832,6 +28188,7 @@ fn a_manifest_that_names_two_inputs_the_same_quarantines_the_node() {
             &[],
             steps,
         );
+        strip_annotations(&mut rec);
         let fuse_idx = rec
             .node_ids
             .iter()
@@ -25862,7 +28219,7 @@ fn a_manifest_that_names_two_inputs_the_same_quarantines_the_node() {
                 .trace
                 .iter()
                 .position(|r| {
-                    r.record_type == RECORD_TYPE_READ_OUTCOME
+                    is_read_record(r)
                         && r.node_idx == fuse_idx
                         && unpack_read_outcome_meta(r.global_level).0 == input_idx
                         && r.fire_time_ns != READ_OUTCOME_NO_FRAME
@@ -26388,12 +28745,17 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         violations: vec![Violation {
             topic: "/vocab/relay/out".to_string(),
             class: ViolationClass::ByteMismatch {
+                // timestamp_ns is header bytes 24..32; 7 and 9 first differ
+                // at its low byte.
                 index: 0,
-                first_diff_byte_offset: 32,
+                first_diff_byte_offset: 24,
                 recorded_len: 56,
                 replayed_len: 56,
+                difference: synthetic_difference(),
             },
-            detail: "frame 0 differs at byte 32".to_string(),
+            detail: "frame 0 on '/vocab/relay/out' differs in the wire header at timestamp_ns: \
+                     recorded 7 ns, replayed 9 ns (recorded 56 B, replayed 56 B)"
+                .to_string(),
         }],
         trace_divergence: Some(TraceDivergenceReport {
             position: 3,
@@ -26407,6 +28769,7 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         record_health: RecordHealthReport::Absent,
         tolerated_ragged_tails: vec![],
         unmodelled_topics: vec![],
+        driver_inputs: None,
         resume: None,
         read_log_divergence: Some(replay_engine::ReadLogDivergenceReport {
             diverging_edges: 1,
@@ -26427,6 +28790,9 @@ fn verdict_phrases_match_the_canonical_vocabulary() {
         // would let it be silently absent.
         read_log_verdict: None,
         read_log_enforcement: replay_engine::ReadLogEnforcement::NotApplicable,
+        read_identity: replay_engine::ReadIdentityReport::BestEffort {
+            reason: String::new(),
+        },
         coordination: replay_engine::CoordinationReport {
             mode: replay_engine::CoordinationMode::Lockstep,
             inferred: false,
@@ -26515,10 +28881,16 @@ fn exit_codes_and_precedence_are_unchanged_by_the_rename() {
         // The provenance line, which the exit-code
         // precedence likewise does not read.
         coordination: Some("coordination: lockstep".to_string()),
+        // The environment block, which the exit-code precedence does not
+        // read: an environment divergence never changes the exit code.
+        env_lines: vec![],
         // Report-only harness findings; the exit-code precedence
         // does not read them either.
         injection_anomalies: vec![],
         input_shortfalls: vec![],
+        // The driver lines, which the exit-code precedence does not read.
+        driver_lines: vec![],
+        driver_frames_uncompared: false,
     };
     // The documented precedence, unchanged: 3 preempts 6 preempts 1.
     assert_eq!(resim_exit_code(&report(true, true, true), true), 3);
@@ -26581,12 +28953,15 @@ fn divergence_classes_are_read_off_real_replays_not_only_a_hand_built_outcome() 
     let mut tampered =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
     let mut tampered_count = 0;
-    for r in tampered.trace.iter_mut().filter(|r| {
-        r.record_type == RECORD_TYPE_READ_OUTCOME && r.fire_time_ns != READ_OUTCOME_NO_FRAME
-    }) {
+    for r in tampered
+        .trace
+        .iter_mut()
+        .filter(|r| is_read_record(r) && r.fire_time_ns != READ_OUTCOME_NO_FRAME)
+    {
         r.fire_time_ns += 1000;
         tampered_count += 1;
     }
+    rebind_annotations(&mut tampered.trace);
     assert_eq!(
         tampered_count, steps,
         "precondition: the recording really carries a read log to tamper (one \
@@ -26716,6 +29091,8 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         // on every COMPLETED run, so it never appears on a corpus bag; declared
         // so the key-set walk below knows it when a bag does abort.
         "aborted",
+        // How the replay fed its reads, serialized on every path.
+        "read_identity",
     ];
     /// The SUB-keys of the four blocks that carry the
     /// verdict's own structure, walked ONE level down.
@@ -26880,14 +29257,15 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
         &bag_stamped,
         replay_engine::CoordinationMode::Lockstep,
     );
-    // The stamp is 7: every bag this binary writes records every gated
-    // consult, so the "with a stamp" case is a format-7 one. What this
+    // The stamp is 9: every bag this binary writes records every gated
+    // consult and every frame of each batch that fits its read stage's window,
+    // so the "with a stamp" case is a format-9 one. What this
     // precondition is FOR is unchanged: the corpus's stamped case must go down
     // the EXPLICIT-stamp branch (`inferred: false`) rather than the inferred
     // one, and it must be the same clean recording as the unstamped cases.
     assert_eq!(
         recorded_trace_format(&bag_stamped),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "precondition: a bag this binary stamps carries read-site roles, folds \
          runs and records every consult, so this really is the corpus recording \
          WITH an explicit stamp"
@@ -26902,8 +29280,13 @@ fn format_2_and_3_corpus_replays_byte_exact_including_single_anchor_resume() {
     // every read-site rule down its pre-roles arm. A corpus gate whose whole
     // job is byte-exact back-compat has to keep it.
     let bag_archived = dir.path().join("corpus_archived_format3.mcap");
+    // An archived recorder annotated no single-writer edge, so the archived
+    // case carries no annotation: read at the archived width, an annotation's
+    // token would decode as a run count and stand the edge down instead.
+    let mut archived_rec = clean.clone();
+    strip_annotations(&mut archived_rec);
     write_bag_with_recorder_json(
-        &clean,
+        &archived_rec,
         &bag_archived,
         recorder_json_at_trace_format(replay_engine::CoordinationMode::Lockstep, 3),
     );
@@ -27155,6 +29538,7 @@ fn write_throttled_backlog_bag(
                     input_service: service.clone(),
                     sync_capture_high_water: Default::default(),
                     sync_epoch_floor: None,
+                    stopped: false,
                 },
             ),
         ),
@@ -27253,6 +29637,7 @@ fn a_capture_window_and_a_service_cursor_combine_rather_than_overwrite() {
                     input_service: service_table("inp", Some(cursor)),
                     sync_capture_high_water: Default::default(),
                     sync_epoch_floor: None,
+                    stopped: false,
                 },
             ),
         ),
@@ -27835,7 +30220,7 @@ fn write_sy_bag(
         rec,
         path,
         edit,
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
     )
 }
 
@@ -27856,7 +30241,7 @@ fn write_sy_bag_stamped_inputs_per_rank(
         rec,
         path,
         |_rec| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         Some(inputs),
         None,
     )
@@ -27873,7 +30258,7 @@ fn write_sy_bag_mixed_regime(
         rec,
         path,
         |_rec| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(staging),
     )
@@ -27938,7 +30323,7 @@ fn a_two_rank_free_run_bag_with_per_edge_rims_still_verifies() {
         rec.clone(),
         &bag,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -27994,6 +30379,72 @@ fn a_two_rank_free_run_bag_with_per_edge_rims_still_verifies() {
     assert_clean_verdict(&outcome, "free-run bag stating per-edge rims");
 }
 
+/// A two-rank FREE-RUN resim does not call the consuming rank's correct
+/// cross-rank sources possible typos.
+///
+/// `fusion` (rank 1) reads `prod_a/out` and `prod_b/out` (rank 0), written
+/// relative, the starter graph's shape. The per-rank split absolutizes both and
+/// drops their producers from rank 1's view, so the pass build re-validated a
+/// graph whose two in-prefix sources had no producer and warned "matches no
+/// declared output" once per source on every verify of a multi-process
+/// recording. The live worker hands the same view its sibling set; the pass now
+/// does too.
+///
+/// The positive half proves the rank-1 pass was BUILT and ran (its two edges were
+/// compared), so the absence below cannot pass on a pass that never validated.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_two_rank_free_run_resim_does_not_call_a_correct_cross_rank_source_a_typo() {
+    let rec =
+        record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("free_run_cross_rank_sources.mcap");
+    let staging = |rank: u32| -> Option<serde_json::Value> {
+        (rank == 1)
+            .then(|| serde_json::json!({ "capacities": { "fusion": [[0, 0, 64], [1, 0, 64]] } }))
+    };
+    write_sy_bag_overridden(
+        rec,
+        &bag,
+        |_| {},
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        None,
+        Some(&staging),
+    );
+
+    let outcome = replay(&bag, sy_bounded_factories, None, None).expect("replay runs");
+    assert_eq!(
+        outcome.coordination.mode,
+        replay_engine::CoordinationMode::FreeRun
+    );
+    assert_clean_verdict(&outcome, "two-rank free-run bag");
+    match outcome.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. } => {
+            assert_eq!(
+                edges_compared, 2,
+                "rank 1's two edges: {:?}",
+                outcome.read_log
+            );
+        }
+        other => panic!("the rank-1 pass must have run and compared its edges: {other:?}"),
+    }
+
+    logs_assert(|lines: &[&str]| {
+        let typo_lines: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("matches no declared output"))
+            .collect();
+        if typo_lines.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "a correct cross-rank source was reported as a possible typo: {typo_lines:?}"
+            ))
+        }
+    });
+}
+
 /// **The PRODUCTION shape whose decline must be
 /// reported under its own cause.**
 ///
@@ -28024,7 +30475,7 @@ fn an_unreadable_staging_declaration_declines_under_its_own_cause() {
         rec.clone(),
         &bag,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -28130,7 +30581,7 @@ fn a_scoped_refusal_still_states_its_evidence_and_remedy() {
         rec.clone(),
         &bag_unnamed,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging_unnamed),
     );
@@ -28173,7 +30624,7 @@ fn a_scoped_refusal_still_states_its_evidence_and_remedy() {
         rec,
         &bag_in_rank,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging_in_rank),
     );
@@ -28238,7 +30689,7 @@ fn a_free_run_bag_naming_a_stage_no_rank_claims_is_still_refused() {
         rec.clone(),
         &bag,
         |_| {},
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
         None,
         Some(&staging),
     );
@@ -30864,9 +33315,8 @@ fn recorder_json_at_trace_format(
     coordination: replay_engine::CoordinationMode,
     trace_format: u32,
 ) -> Vec<u8> {
-    let mut obj: serde_json::Value =
-        serde_json::from_slice(&production_recorder_json(coordination))
-            .expect("the production recorder.json parses");
+    let mut obj: serde_json::Value = serde_json::from_slice(&pre_stamp_recorder_json(coordination))
+        .expect("the production recorder.json parses");
     obj["trace_format"] = serde_json::json!(trace_format);
     serde_json::to_vec(&obj).expect("re-serializing a parsed object cannot fail")
 }
@@ -30967,7 +33417,7 @@ fn write_sy_single_rank_free_run_bag(
         rec,
         path,
         edit,
-        production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
     )
 }
 
@@ -31253,7 +33703,7 @@ fn inject_peek_at_a_firing_step(rec: &mut Recording, role: ReadSiteRole) {
         .trace
         .iter()
         .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == SY_FUSION_NODE_IDX
                 && r.step == firing_step
                 && unpack_read_outcome_meta(r.global_level).0 == SY_INPUT_A_IDX
@@ -31283,7 +33733,7 @@ fn sy_latest_served_seq(rec: &Recording) -> u32 {
     rec.trace
         .iter()
         .filter(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == SY_FUSION_NODE_IDX
                 && unpack_read_outcome_meta(r.global_level).0 == SY_INPUT_A_IDX
                 && r.fire_time_ns != cerulion_core::trace_ring::READ_OUTCOME_NO_FRAME
@@ -31385,8 +33835,8 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
     );
     assert_eq!(
         recorded_trace_format(&base_bag),
-        7,
-        "PRECONDITION: every bag this binary writes stamps 7"
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "PRECONDITION: every bag this binary writes stamps the current format"
     );
     let base = replay(&base_bag, sy_bounded_factories, None, None).expect("the baseline replays");
     assert!(
@@ -31412,7 +33862,10 @@ fn the_trace_format_stamp_gates_whether_role_bits_are_read() {
         &stamped,
         inject_duplicate_drain_batch,
     );
-    assert_eq!(recorded_trace_format(&stamped), 7);
+    assert_eq!(
+        recorded_trace_format(&stamped),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o5 = replay(&stamped, sy_bounded_factories, None, None).expect("the format-5 bag replays");
     assert!(
         has_stand_down(
@@ -31562,7 +34015,10 @@ fn a_pre_format_seven_sync_bag_replays_with_the_matchers_silence_adopted() {
         &modern,
         |_rec| {},
     );
-    assert_eq!(recorded_trace_format(&modern), 7);
+    assert_eq!(
+        recorded_trace_format(&modern),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let o7 = replay(&modern, sy_bounded_factories, None, None)
         .expect("a format-7 per-set Sync bag replays");
     assert!(
@@ -31676,7 +34132,7 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
     );
     assert_eq!(
         recorded_trace_format(&unwritten),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: the stamp says roles MAY be believed, the only \
          configuration in which an unnamed role's handling is observable"
     );
@@ -31723,7 +34179,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &named,
         |_| {},
     );
-    assert_eq!(recorded_trace_format(&named), 7);
+    assert_eq!(
+        recorded_trace_format(&named),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let onamed = replay(&named, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&onamed),
@@ -31745,7 +34204,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &explicit,
         inject_duplicate_drain_batch,
     );
-    assert_eq!(recorded_trace_format(&explicit), 7);
+    assert_eq!(
+        recorded_trace_format(&explicit),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let oexp = replay(&explicit, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&oexp),
@@ -31764,7 +34226,10 @@ fn an_unwritten_role_on_a_stamped_bag_falls_back_to_ambiguity() {
         &impossible,
         inject_impossible_shape_read,
     );
-    assert_eq!(recorded_trace_format(&impossible), 7);
+    assert_eq!(
+        recorded_trace_format(&impossible),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let oimp = replay(&impossible, sy_bounded_factories, None, None).expect("the control replays");
     assert_eq!(
         read_site_stand_downs(&oimp),
@@ -31910,7 +34375,9 @@ fn an_impossible_read_shape_is_reported_and_is_the_exit_6_verdict() {
 /// been written by any recorder" is not the same statement as "we declined to
 /// judge this decider". A healthy multi-rank replay legitimately declines
 /// several deciders per rank, so the generic loop STAYS `debug!`; the
-/// corrupt-recording arm alone is `warn!`.
+/// corrupt-recording arm is `warn!`, and so is the unfired-since-anchor one
+/// (pinned by
+/// `a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_silent`).
 ///
 /// Both halves in ONE body, over ONE recording shape, because neither means
 /// anything alone: a suite that only asserted the loud head would pass an
@@ -32077,7 +34544,7 @@ fn a_finding_on_a_body_heavy_stream_carries_its_census_in_the_report() {
         |rec| {
             let mut relabelled = 0usize;
             for r in rec.trace.iter_mut() {
-                if r.record_type != RECORD_TYPE_READ_OUTCOME || r.node_idx != SY_FUSION_NODE_IDX {
+                if !is_read_record(r) || r.node_idx != SY_FUSION_NODE_IDX {
                     continue;
                 }
                 let (input_idx, kind) = unpack_read_outcome_meta(r.global_level);
@@ -32177,7 +34644,7 @@ fn a_per_set_sync_descent_is_folded_from_its_head_not_declined() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: the roles may be believed, or the arm proves nothing"
     );
     let outcome = replay(&bag, sy_bounded_factories, None, None)
@@ -32526,6 +34993,8 @@ fn a_format_5_corpus_bag_replays_byte_exact_including_its_report() {
         "read_log_enforcement",
         // The PARTIAL-report marker, absent on a completed run.
         "aborted",
+        // How the replay fed its reads.
+        "read_identity",
     ];
 
     let dir = tempfile::tempdir().unwrap();
@@ -32537,8 +35006,8 @@ fn a_format_5_corpus_bag_replays_byte_exact_including_its_report() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
-        "this 'corpus' bag is RECORDED BY THIS BINARY, so it stamps 7. \
+        replay_engine::SUPPORTED_TRACE_FORMAT,
+        "this 'corpus' bag is RECORDED BY THIS BINARY, so it stamps the current format. \
          It is not an old-format arm: reading a genuinely older bag is pinned \
          by `a_format_5_bag_written_by_the_old_packer_still_replays`, which \
          crafts one through `pack_read_outcome_aux` (high half ZERO) and stamps 5"
@@ -32686,7 +35155,11 @@ fn a_body_role_batch_is_steered_to_the_body_queue() {
             &bag,
             |rec| inject_frame_neutral_batch_with_role(rec, role),
         );
-        assert_eq!(recorded_trace_format(&bag), 7, "{role:?}: role-stamped bag");
+        assert_eq!(
+            recorded_trace_format(&bag),
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            "{role:?}: role-stamped bag"
+        );
 
         let outcome = replay(&bag, sy_bounded_factories, None, None)
             .expect("the replay runs whatever the read log says");
@@ -32787,7 +35260,11 @@ fn a_truncated_marker_reaches_both_queues_under_every_role() {
                 );
             },
         );
-        assert_eq!(recorded_trace_format(&bag), 7, "role {wire}: stamped bag");
+        assert_eq!(
+            recorded_trace_format(&bag),
+            replay_engine::SUPPORTED_TRACE_FORMAT,
+            "role {wire}: stamped bag"
+        );
 
         let outcome = replay(&bag, sy_bounded_factories, None, None)
             .expect("a truncated read log never refuses the replay");
@@ -32860,7 +35337,10 @@ fn a_truncated_marker_reaches_both_queues_under_every_role() {
             );
         },
     );
-    assert_eq!(recorded_trace_format(&peek_bag), 7);
+    assert_eq!(
+        recorded_trace_format(&peek_bag),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let opeek = replay(&peek_bag, sy_bounded_factories, None, None)
         .expect("an impossible marker never refuses the replay");
     assert!(
@@ -32955,7 +35435,10 @@ fn a_peek_steers_to_the_drain_queue_and_an_unwritten_role_steers_by_kind() {
             );
         },
     );
-    assert_eq!(recorded_trace_format(&peek_bag), 7);
+    assert_eq!(
+        recorded_trace_format(&peek_bag),
+        replay_engine::SUPPORTED_TRACE_FORMAT
+    );
     let opeek = replay(&peek_bag, sy_bounded_factories, None, None)
         .expect("a peek-role record never refuses the replay");
     let sd = injection_stand_down(&opeek, SY_A_TOPIC).unwrap_or_else(|| {
@@ -33003,7 +35486,7 @@ fn a_peek_steers_to_the_drain_queue_and_an_unwritten_role_steers_by_kind() {
     );
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the stamp says roles MAY be believed, the only configuration in which \
          an unnamed role's handling is observable"
     );
@@ -34654,7 +37137,7 @@ fn a_wiring_blocked_topic_with_no_recorded_read_replays_with_the_note() {
     for r in rec
         .trace
         .iter_mut()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx)
+        .filter(|r| is_read_record(r) && r.node_idx == sink_idx)
     {
         r.global_level = pack_read_outcome_meta(
             0,
@@ -34682,7 +37165,7 @@ fn a_wiring_blocked_topic_with_no_recorded_read_replays_with_the_note() {
         &bag,
         |_| {},
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -34812,6 +37295,12 @@ fn a_partitioned_topic_attributes_a_byte_mismatch_to_its_own_writer() {
     assert!(
         detail.contains("from writer right/bus"),
         "the violation names the DRIFTING writer: {detail}"
+    );
+    // And the field: the recording's y was set to 42.0, the writer replays 0.0.
+    assert_eq!(
+        detail,
+        "frame 1 on '/co/shared_bus' from writer right/bus differs at y: recorded 42.0, \
+         replayed 0.0 (recorded 64 B, replayed 64 B)"
     );
     assert!(
         !detail.contains("left/bus"),
@@ -35313,7 +37802,7 @@ fn write_sb_bag(
             }
         },
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -35530,9 +38019,10 @@ fn the_shared_bus_fixture_verdict_is_deterministic() {
 // A rank that owns one of the bus's writers publishes its half LIVE and asks the
 // bag for the other half. That overlap is what the engine has to make work:
 // the capture and the injector become two positional readers of one recorded
-// stream (each gets its own feed), the injector's publisher id stands in for the
-// foreign writer in the per-writer capture partition, and `inject_planned` walks
-// PAST the frames the local producer republishes instead of injecting them too.
+// stream (each gets its own feed), the per-writer capture partition leaves out
+// the frames published under the injector's publisher id, recorded copies of
+// the foreign writers' frames, and `inject_planned` walks PAST the frames the
+// local producer republishes instead of injecting them too.
 
 /// Which topics a replay reported a violation on, deduped and sorted.
 fn sb_dirty(outcome: &ReplayOutcome) -> Vec<String> {
@@ -36192,7 +38682,10 @@ fn a_split_bus_verifies_per_writer_while_a_two_connection_consumer_cannot() {
 }
 
 /// THE PER-PARTITION ORACLE: one writer's drift across a SPLIT is attributed to
-/// THAT writer, and the other partition stays clean.
+/// THAT writer, and the other partition stays clean, whichever rank the
+/// drifting writer runs on: `left` on rank 0, whose pass also injects `right`'s
+/// recorded frames for `local`, or `right` on rank 1, the last rank that
+/// writes the bus.
 ///
 /// Without this the headline arm above is satisfied by a capture that skipped
 /// the bus entirely. Here the bus really is compared, per writer, with the
@@ -36202,52 +38695,61 @@ fn a_split_bus_verifies_per_writer_while_a_two_connection_consumer_cannot() {
 #[test]
 #[serial]
 fn a_split_partition_attributes_a_byte_mismatch_to_its_own_writer() {
-    let mut rec = sb_recording();
-    sb_assert_premise(&rec);
-    // Perturb the SECOND `right` frame, in a word the writer classifier ignores
-    // (`sb_writer_of` reads `x`), so the labels stay the ones the recorder wrote.
-    let perturbed = rec.messages[SB_TOPIC]
-        .iter_mut()
-        .filter(|f| frame_x(f) >= CO_SPLIT)
-        .nth(1)
-        .expect("the right writer produced at least two frames");
-    co_perturb_y(perturbed, 42.0);
+    for (drifting, clean) in [("left", "right"), ("right", "left")] {
+        let mut rec = sb_recording();
+        sb_assert_premise(&rec);
+        // Perturb the drifting writer's SECOND frame, in a word the writer
+        // classifier ignores (`sb_writer_of` reads `x`), so the labels stay
+        // the ones the recorder wrote.
+        let perturbed = rec.messages[SB_TOPIC]
+            .iter_mut()
+            .filter(|f| sb_writer_of(f) == drifting)
+            .nth(1)
+            .expect("each writer produced at least two frames");
+        co_perturb_y(perturbed, 42.0);
 
-    let dir = tempfile::tempdir().unwrap();
-    let bag = dir.path().join("shared_bus_split_perturbed.mcap");
-    write_sb_bag(rec, &bag, sb_split3_rank_of, 3);
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir
+            .path()
+            .join(format!("shared_bus_split_perturbed_{drifting}.mcap"));
+        write_sb_bag(rec, &bag, sb_split3_rank_of, 3);
 
-    let outcome = replay(&bag, sb_factories, None, None).expect("replay runs");
-    assert!(!outcome.passed, "a perturbed recording must not pass");
-    let bus: Vec<&replay_engine::Violation> = outcome
-        .violations
-        .iter()
-        .filter(|v| v.topic == SB_TOPIC)
-        .collect();
-    assert_eq!(
-        bus.len(),
-        1,
-        "exactly ONE violation on the split bus — the right writer's: {bus:?}"
-    );
-    let detail = &bus[0].detail;
-    assert!(
-        detail.contains("from writer right/bus"),
-        "the violation names the DRIFTING writer, across the rank split: {detail}"
-    );
-    assert!(
-        !detail.contains("left/bus"),
-        "and not the clean one, which lives on another rank entirely: {detail}"
-    );
-    // The clean partition's own frames are still compared: the mismatch is at
-    // the RIGHT writer's own index 1, not the merged stream's index 3.
-    assert!(
-        matches!(
-            bus[0].class,
-            replay_engine::ViolationClass::ByteMismatch { index: 1, .. }
-        ),
-        "and it is a byte mismatch at the right writer's own index 1: {:?}",
-        bus[0].class
-    );
+        let outcome = replay(&bag, sb_factories, None, None).expect("replay runs");
+        assert!(
+            !outcome.passed,
+            "{drifting}: a perturbed recording must not pass"
+        );
+        let bus: Vec<&replay_engine::Violation> = outcome
+            .violations
+            .iter()
+            .filter(|v| v.topic == SB_TOPIC)
+            .collect();
+        assert_eq!(
+            bus.len(),
+            1,
+            "{drifting}: exactly ONE violation on the split bus, the drifting writer's: {bus:?}"
+        );
+        // The recording's y was set to 42.0, and the writer replays 0.0.
+        assert_eq!(
+            bus[0].detail,
+            format!(
+                "frame 1 on '{SB_TOPIC}' from writer {drifting}/bus differs at y: recorded \
+                 42.0, replayed 0.0 (recorded 64 B, replayed 64 B)"
+            ),
+            "{drifting}: the violation names the DRIFTING writer, across the rank split, and \
+             not {clean}, which runs on another rank"
+        );
+        // The clean partition's own frames are still compared: the mismatch is
+        // at the drifting writer's own index 1, not the merged stream's.
+        assert!(
+            matches!(
+                bus[0].class,
+                replay_engine::ViolationClass::ByteMismatch { index: 1, .. }
+            ),
+            "{drifting}: a byte mismatch at the writer's own index 1: {:?}",
+            bus[0].class
+        );
+    }
 }
 
 /// The SPLIT verdict is deterministic across two replays AND equals a
@@ -36492,7 +38994,8 @@ fn c6_a_clean_partitioned_ragged_tail_is_tolerated_with_the_single_rank_note() {
     );
     // The single-rank note, BYTE-IDENTICAL: the owner set has one
     // member, so the multi-rank rendering never engages. Recorded 6 + 6,
-    // replayed 8 + 8, extra 4 inside a 2-step × 2-frames-per-step window.
+    // replayed 8 + 8: each writer's 2 extras inside its own window of 2
+    // steps × its 1 frame per step.
     assert_eq!(
         notes,
         vec![&format!(
@@ -36637,21 +39140,23 @@ fn rt_split_rank_of(id: &str) -> u32 {
     u32::from(id == "right")
 }
 
-/// (iii) A SPLIT bus — writers on different ranks, each rank ragged by its own
-/// width — is tolerated up to the SUM of the owning ranks' windows, and the
-/// note names BOTH ranks with their own causes; the single-owner topic beside
-/// it keeps the single-rank note byte for byte.
+/// (iii) A SPLIT bus, its writers on different ranks, each rank ragged by its
+/// own width, is tolerated writer by writer, each writer's extras within its
+/// own rank's tail times its own frames per step, and the note names BOTH
+/// ranks with their own causes; the single-owner topic beside it keeps the
+/// single-rank note byte for byte.
 ///
 /// Rank 0's final recorded step banks a boundary and no fires (width 1, the
 /// fire-less-final-step shape); rank 1 exits after step 5 (width 2, the peer-tail
 /// shape). `left` re-fires 1 frame, `right` 2: three trailing extras on a bus
-/// whose per-step count is 2. A map naming only the FIRST writer's rank —
-/// rank 0, window 1 × 2 = 2 — refuses the three as over-bound: a clean
-/// replay of a legal recording, failed on an owner it half-read. The sum
-/// (1 + 2) × 2 = 6 admits them.
+/// whose writers publish 1 frame per step each. A window read off the FIRST
+/// writer's rank alone, 1 step, refuses `right`'s 2: a clean replay of a
+/// legal recording, failed on an owner it half-read. Writer by writer,
+/// `left`'s 1 fits its window of 1 step × 1 frame and `right`'s 2 its window
+/// of 2 steps × 1 frame.
 #[test]
 #[serial]
-fn c6_a_split_bus_is_tolerated_up_to_the_summed_windows_of_its_owning_ranks() {
+fn c6_a_split_bus_is_tolerated_writer_by_writer_within_each_owning_rank_s_tail() {
     let mut rec = record_uniform(rt_yaml(), rt_factories, &[], RT_STEPS);
     rt_assert_premise(&rec);
     rt_drop_writer_tail(&mut rec, "left", 1);
@@ -36675,16 +39180,16 @@ fn c6_a_split_bus_is_tolerated_up_to_the_summed_windows_of_its_owning_ranks() {
     let (notes, violations) = rt_bus_verdict(&outcome);
     assert!(
         outcome.passed && violations.is_empty(),
-        "three trailing extras on a bus owned by two ragged ranks are tolerated by \
-         the SUM of their windows: passed={} {:?}",
+        "three trailing extras on a bus owned by two ragged ranks are tolerated, \
+         each writer's within its own window: passed={} {:?}",
         outcome.passed,
         outcome.violations
     );
     assert_eq!(
         notes,
         vec![&format!(
-            "frame: 3 trailing frame(s) on '{RT_TOPIC}' tolerated: the topic's writers span \
-             2 ranks whose tails add up — rank 0: final recorded step banked its step \
+            "frame: 3 trailing frame(s) on '{RT_TOPIC}' tolerated: the tails of 2 ranks \
+             explain them: rank 0: final recorded step banked its step \
              boundary with no fires behind it (either the step ran and fired nothing, or the \
              worker shut down between the step boundary and the step's fires — the recording \
              cannot tell which; 1 step(s)); rank 1: ragged shutdown tail (2 step(s)) \
@@ -36711,6 +39216,104 @@ fn c6_a_split_bus_is_tolerated_up_to_the_summed_windows_of_its_owning_ranks() {
         )],
         "the single-owner fire-less note is the single-rank text: {:?}",
         outcome.tolerated_ragged_tails
+    );
+}
+
+/// (iv) A SPLIT bus's tolerance is bounded writer by writer: one rank's tail
+/// never explains another rank's writer's extra frame.
+///
+/// Rank 0 (`left`) banks a final boundary and no fires (width 1); rank 1
+/// (`right`) records every step (width 0) and lost the frame of its last fire.
+/// `left` re-fires 1 frame inside its own window, `right` replays 1 frame no
+/// window of its own explains. The two extras fit rank 0's 1 step × the bus's
+/// 2 frames per step, which is what a topic-wide bound read; writer by writer,
+/// `right`'s is past rank 1's empty tail, so the bus takes no tolerance and
+/// both writers' extras are reported: exit 1, and no note on the bus.
+#[test]
+#[serial]
+fn c6_one_rank_s_tail_never_explains_another_rank_s_writer() {
+    let mut rec = record_uniform(rt_yaml(), rt_factories, &[], RT_STEPS);
+    rt_assert_premise(&rec);
+    rt_drop_writer_tail(&mut rec, "left", 1);
+    rt_drop_writer_tail(&mut rec, "right", 1);
+    rec.messages
+        .get_mut(RT_LONE_TOPIC)
+        .expect("lone recorded")
+        .pop();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("rt_split_per_writer.mcap");
+    rt_bag(&rec, &bag, rt_split_rank_of, |per_rank| {
+        // Rank 0: keep every boundary, drop the FIRES of its final step.
+        per_rank[0].retain(|r| r.step <= 6 || r.record_type == RECORD_TYPE_STEP_BOUNDARY);
+    });
+
+    let outcome = replay(&bag, rt_factories, None, None).expect("replay runs");
+    let (notes, violations) = rt_bus_verdict(&outcome);
+    assert!(!outcome.passed, "{:?}", outcome.violations);
+    assert!(notes.is_empty(), "no tolerance on the bus: {notes:?}");
+    let got: Vec<(&ViolationClass, &str)> = violations
+        .iter()
+        .map(|v| (&v.class, v.detail.as_str()))
+        .collect();
+    let extra = |writer: &str| {
+        format!("recorded 7 frame(s), replay produced 8 on '{RT_TOPIC}' from writer {writer}/bus")
+    };
+    assert!(
+        matches!(
+            got.as_slice(),
+            [
+                (ViolationClass::ExtraMessages { recorded: 7, replayed: 8 }, left),
+                (ViolationClass::ExtraMessages { recorded: 7, replayed: 8 }, right),
+            ] if *left == extra("left") && *right == extra("right")
+        ),
+        "each writer's extra frame: {got:?}"
+    );
+}
+
+/// (v) Each writer one ragged rank runs has a window of its own, its rank's
+/// tail times its own frames per step, which the frames the other writers
+/// publish in the same steps never widen.
+///
+/// Both writers on rank 1, which exits after step 5 (width 2), each at 1 frame
+/// per step on a bus of 2 frames per step: a window of 2 × 1 = 2 frames for
+/// each writer. The recording lost each writer's last 3 frames and the replay
+/// produces them, 3 trailing extras per writer, past its window, though they
+/// fit the rank's 2 steps × the bus's 2 frames. Exit 1, each writer's extras
+/// reported, and no note on the bus. The CONTROL, 2 extras per writer, is
+/// `c6_a_clean_partitioned_ragged_tail_is_tolerated_with_the_single_rank_note`.
+#[test]
+#[serial]
+fn c6_each_co_located_writer_is_bounded_by_its_own_window() {
+    let mut rec = record_uniform(rt_yaml(), rt_factories, &[], RT_STEPS);
+    rt_assert_premise(&rec);
+    rt_drop_writer_tail(&mut rec, "left", 3);
+    rt_drop_writer_tail(&mut rec, "right", 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("rt_co_located_window.mcap");
+    rt_bag(&rec, &bag, rt_writers_on_rank1, |per_rank| {
+        per_rank[1].retain(|r| r.step <= 5)
+    });
+
+    let outcome = replay(&bag, rt_factories, None, None).expect("replay runs");
+    let (notes, violations) = rt_bus_verdict(&outcome);
+    assert!(!outcome.passed, "{:?}", outcome.violations);
+    assert!(notes.is_empty(), "no tolerance on the bus: {notes:?}");
+    let got: Vec<(&ViolationClass, &str)> = violations
+        .iter()
+        .map(|v| (&v.class, v.detail.as_str()))
+        .collect();
+    let extra = |writer: &str| {
+        format!("recorded 5 frame(s), replay produced 8 on '{RT_TOPIC}' from writer {writer}/bus")
+    };
+    assert!(
+        matches!(
+            got.as_slice(),
+            [
+                (ViolationClass::ExtraMessages { recorded: 5, replayed: 8 }, left),
+                (ViolationClass::ExtraMessages { recorded: 5, replayed: 8 }, right),
+            ] if *left == extra("left") && *right == extra("right")
+        ),
+        "each writer's extra frames: {got:?}"
     );
 }
 
@@ -36787,7 +39390,7 @@ fn a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence() {
     write_sy_single_rank_free_run_bag(rec, &bag, |_| {});
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: roles are on the wire and may be believed"
     );
 
@@ -36985,7 +39588,7 @@ fn steps_fired_on_silently_reoffered_heads(rec: &Recording, node: &str) -> Vec<u
         .trace
         .iter()
         .filter(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME
+            is_read_record(r)
                 && r.node_idx == idx
                 && matches!(
                     read_site_role(r.global_level),
@@ -37089,7 +39692,7 @@ fn c6_a_sync_node_with_a_late_context_input_replays_clean_on_carried_heads() {
     write_sy_single_rank_free_run_bag(rec, &bag, |_| {});
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "PRECONDITION: roles on the wire"
     );
 
@@ -37300,7 +39903,7 @@ fn c6_a_finished_pass_holds_no_capture_port_into_the_next_ranks_pass() {
         &bag,
         |_| {},
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         None,
@@ -37691,9 +40294,10 @@ fn a_diverged_read_log_is_the_exit_6_schedule_verdict_naming_edge_step_and_seque
     let target = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == TAMPERED_STEP)
+        .find(|r| is_read_record(r) && r.step == TAMPERED_STEP)
         .expect("the step-3 kind-6 record exists");
     target.fire_time_ns = CLAIMED_SEQ;
+    rebind_annotations(&mut rec.trace);
 
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("readlog_verdict.mcap");
@@ -37803,11 +40407,7 @@ fn an_uncovered_read_log_on_a_produced_edge_is_an_exit_2_refusal() {
     let mut rec =
         record_uniform_with_read_log(source_relay_yaml(), source_relay_factories, &[], steps);
     let mut restamped = 0;
-    for r in rec
-        .trace
-        .iter_mut()
-        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
-    {
+    for r in rec.trace.iter_mut().filter(|r| is_read_record(r)) {
         // input_idx 0 (the relay's one input), the PRODUCER annotation kind, no
         // site claim: an annotation names the publisher of the read that follows
         // it and occupies no position in the pop stream.
@@ -37958,10 +40558,7 @@ fn a_bag_side_hole_on_rank_1_is_refused_before_rank_0_executes() {
         &bag,
         |per_rank| {
             let mut restamped = 0;
-            for r in per_rank[1]
-                .iter_mut()
-                .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
-            {
+            for r in per_rank[1].iter_mut().filter(|r| is_read_record(r)) {
                 // The PRODUCER annotation kind, no site claim: an annotation
                 // names the publisher of the read that follows it and occupies no
                 // position in the pop stream, so not one of rank 1's records
@@ -38140,9 +40737,7 @@ fn a_recorded_read_the_replay_never_performs_is_the_exit_6_never_arrived_verdict
     let at = rec
         .trace
         .iter()
-        .position(|r| {
-            r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx && r.step == last
-        })
+        .position(|r| is_read_record(r) && r.node_idx == relay_idx && r.step == last)
         .expect("the record the oracle just read");
     let twin = rec.trace[at];
     rec.trace.insert(at + 1, twin);
@@ -38349,20 +40944,32 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
     let held = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP)
+        .find(|r| is_read_record(r) && r.step == HELD_STEP)
         .expect("the step-3 kind-6 record exists");
     held.global_level = pack_read_outcome_meta(0, READ_OUTCOME_HELD, ReadSiteRole::Body);
     held.fire_time_ns = HELD_STEP - 2;
     held.duration_ns = 0;
+    rebind_annotations(&mut rec.trace);
     // Step 4 then pops BOTH queued frames and serves the newer, which is what a
     // drain-to-latest read does with a one-frame backlog. Its served sequence is
-    // unchanged: the newer of the two IS the frame it already served.
+    // unchanged: the newer of the two IS the frame it already served. From
+    // `trace_format` 9 the recorder names the older frame, seq 2, in a
+    // `BatchFrame` record just before the read.
     let caught_up = rec
         .trace
-        .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == HELD_STEP + 1)
+        .iter()
+        .position(|r| is_read_record(r) && r.step == HELD_STEP + 1)
         .expect("the step-4 kind-6 record exists");
-    caught_up.duration_ns = 2;
+    rec.trace[caught_up].duration_ns = 2;
+    let mut older = rec.trace[caught_up];
+    older.global_level = pack_read_outcome_meta(
+        0,
+        cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME,
+        ReadSiteRole::Body,
+    );
+    older.fire_time_ns = HELD_STEP - 1;
+    older.duration_ns = 0;
+    rec.trace.insert(caught_up, older);
     assert_eq!(
         kind6_records(&rec),
         vec![
@@ -38370,6 +40977,14 @@ fn a_produced_frame_present_early_is_admitted_at_its_recorded_step() {
             served(1),
             served(2),
             (3, 1, 0, READ_OUTCOME_HELD, 1, 0),
+            (
+                4,
+                1,
+                0,
+                cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME,
+                2,
+                0
+            ),
             (4, 1, 0, READ_OUTCOME_SERVED, 3, 2),
             served(5),
         ],
@@ -38460,7 +41075,7 @@ fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() 
     let short = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHORT_STEP)
+        .find(|r| is_read_record(r) && r.step == SHORT_STEP)
         .expect("the step-4 kind-6 record exists");
     short.duration_ns = CLAIMED_POPS;
     assert_eq!(
@@ -38530,7 +41145,7 @@ fn a_recorded_pop_the_drain_cannot_deliver_is_the_enforcements_exit_6_verdict() 
 ///
 /// 1. the RECORDING holds it: the hand oracle `quiet_relay_read_log_oracle`,
 ///    derived from the fixture's two rates, names one `none` record per EVEN step
-///    and one pop per ODD step, and the bag stamps 7;
+///    and one pop per ODD step, and the bag stamps 7 or later;
 /// 2. the replay is BYTE EXACT with it: the per-edge verifier pairs the empty
 ///    consults position for position and retains nothing, and the gate reports
 ///    `enforced` over the relay's one stage with no over-run;
@@ -38560,7 +41175,7 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
     write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the recorder stamps the format whose rule this bag was written under"
     );
 
@@ -38658,7 +41273,7 @@ fn an_empty_boundary_drain_is_recorded_at_format_seven_and_replays_byte_exact() 
 ///
 /// 1. the RECORDING is what the rates say: the hand oracle
 ///    `sync_quiet_read_log_oracle` names three records per step and the bag
-///    stamps 7. The consumer FIRES on every odd step, so a refill align pass
+///    stamps 7 or later. The consumer FIRES on every odd step, so a refill align pass
 ///    really ran there, and its two empty fills are absent from the table;
 /// 2. the replay is BYTE EXACT and the two logs pair position for position;
 /// 3. the GATE is armed over the one gateable edge and reports no over-run: a
@@ -38715,7 +41330,7 @@ fn a_per_set_syncs_refill_align_pass_records_nothing_and_replays_byte_exact() {
     write_bag_with_coordination(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
     assert_eq!(
         recorded_trace_format(&bag),
-        7,
+        replay_engine::SUPPORTED_TRACE_FORMAT,
         "the recorder stamps the format whose rule this bag was written under"
     );
 
@@ -39208,12 +41823,13 @@ fn a_popped_record_that_names_no_sequence_is_an_exit_2_refusal() {
     let shapeless = rec
         .trace
         .iter_mut()
-        .find(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.step == SHAPELESS_STEP)
+        .find(|r| is_read_record(r) && r.step == SHAPELESS_STEP)
         .expect("the step-2 kind-6 record exists");
     shapeless.global_level =
         pack_read_outcome_meta(0, READ_OUTCOME_DRAINED_BATCH, ReadSiteRole::Drain);
     shapeless.fire_time_ns = READ_OUTCOME_NO_FRAME;
     shapeless.duration_ns = POPPED;
+    rebind_annotations(&mut rec.trace);
     assert_eq!(
         kind6_records(&rec)
             .into_iter()
@@ -39326,7 +41942,7 @@ fn write_capture_shaped_bag(
         "application/json",
         0,
         0,
-        &production_recorder_json(replay_engine::CoordinationMode::FreeRun),
+        &pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun),
     )
     .unwrap();
     w.write_attachment(
@@ -39610,7 +42226,7 @@ fn a_capture_whose_peer_kept_no_complete_step_is_refused_by_the_replay() {
             );
         },
         None,
-        Some(production_recorder_json(
+        Some(pre_stamp_recorder_json(
             replay_engine::CoordinationMode::FreeRun,
         )),
         Some(15_000_000),
@@ -39623,5 +42239,8622 @@ fn a_capture_whose_peer_kept_no_complete_step_is_refused_by_the_replay() {
     match &refused {
         Err(ReplayError::RecordingInconsistent { .. }) => {}
         other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
+}
+
+// ===========================================================================
+// Read identity: every read fed exactly its recorded frames
+// ===========================================================================
+//
+// The ORACLE here is the consumers' own view, independent of every record the
+// product writes: each writer stamps its identity into the payload (`x` = the
+// writer, `y` = its own sequence, `z` = a value derived from both), and each
+// consumer appends what it observed at every fire to `RI_READS`. A replay
+// reproduces the reads exactly when every consumer's observation list equals
+// the live run's, element for element.
+
+/// What one consumer observed at one fire: `(consumer tag, x, y, z)` as f64
+/// bit patterns, so equality is exact.
+type RiRead = (u64, u64, u64, u64);
+
+static RI_READS: std::sync::Mutex<Vec<RiRead>> = std::sync::Mutex::new(Vec::new());
+
+fn ri_log(tag: f64, x: f64, y: f64, z: f64) {
+    RI_READS
+        .lock()
+        .unwrap()
+        .push((tag.to_bits(), x.to_bits(), y.to_bits(), z.to_bits()));
+}
+
+fn ri_take() -> Vec<RiRead> {
+    std::mem::take(&mut *RI_READS.lock().unwrap())
+}
+
+/// A writer that stamps its identity into every frame.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct RiWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// A SLOW latest-value consumer: it fires every third step on a depth-2 queue,
+/// so the live queue drops the oldest of the three frames published in between.
+#[cerulion_node(period_ms = 15)]
+#[derive(Default)]
+struct RiSlowSink {
+    #[input(depth = 2)]
+    inp: Vector3,
+    tag: f64,
+}
+
+#[cerulion_node_impl]
+impl RiSlowSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(self.tag, self.inp.x, self.inp.y, self.inp.z);
+        Ok(())
+    }
+}
+
+/// A per-message consumer: one fire per arriving frame.
+#[cerulion_node]
+#[derive(Default)]
+struct RiFifoSink {
+    #[input(trigger)]
+    inp: Vector3,
+    tag: f64,
+}
+
+#[cerulion_node_impl]
+impl RiFifoSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(self.tag, self.inp.x, self.inp.y, self.inp.z);
+        Ok(())
+    }
+}
+
+/// A per-message consumer on a queue deep enough to hold a whole capped burst.
+#[cerulion_node]
+#[derive(Default)]
+struct RiDeepFifoSink {
+    #[input(trigger, depth = 64)]
+    inp: Vector3,
+    tag: f64,
+}
+
+#[cerulion_node_impl]
+impl RiDeepFifoSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(self.tag, self.inp.x, self.inp.y, self.inp.z);
+        Ok(())
+    }
+}
+
+const RI_SLOW: f64 = 1.0;
+const RI_FAST: f64 = 2.0;
+const RI_SINK: f64 = 3.0;
+const RI_STEPS: usize = 60;
+/// The reads every consumer of an arm must make, live and replayed alike: a
+/// comparison over fewer is no evidence.
+const RI_MIN_READS: usize = 15;
+
+/// One writer fanned out to a SLOW latest consumer (live evictions) and a
+/// per-message consumer.
+fn ri_evict_yaml() -> &'static str {
+    "name: riev\nprefix: riev\nnodes:\n\
+     \x20 - id: src\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: slow\n    type: ri_slow_sink\n    inputs:\n      - name: inp\n        source: src/out\n\
+     \x20 - id: fast\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: src/out\n"
+}
+
+fn ri_evict_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "src",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 1.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "slow",
+            Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+                tag: RI_SLOW,
+                ..Default::default()
+            })),
+        ),
+        (
+            "fast",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_FAST,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// Three writers on ONE `multi_publisher_topics` topic, read per message.
+fn ri_multi_writer_yaml() -> &'static str {
+    "name: rimw\nprefix: rimw\nmulti_publisher_topics:\n  - /rimw/bus\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimw/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimw/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimw/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /rimw/bus\n"
+}
+
+fn ri_multi_writer_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", writer(1.0)),
+        ("w2", writer(2.0)),
+        ("w3", writer(3.0)),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A live run, recorded with its read log, and what each consumer observed.
+struct RiLive {
+    rec: Recording,
+    reads: Vec<RiRead>,
+}
+
+fn ri_record(yaml: &str, make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>) -> RiLive {
+    ri_take();
+    let rec = record_reference_impl(yaml, make, &[], &vec![DELTA_MS; RI_STEPS], 16, true);
+    RiLive {
+        rec,
+        reads: ri_take(),
+    }
+}
+
+/// The writer node of a recorded frame, read off the frame's own `x`.
+fn ri_writer_node(frame: &[u8]) -> String {
+    format!("w{}", frame_x(frame) as u64)
+}
+
+/// The publisher table of every output `rec` published.
+fn ri_publishers(rec: &Recording) -> serde_json::Value {
+    let mut writers: Vec<(String, String)> = Vec::new();
+    for (node, outputs) in &rec.publisher_ids {
+        for (output, _) in outputs {
+            writers.push((node.clone(), output.clone()));
+        }
+    }
+    let writer_refs: Vec<(&str, &str)> = writers
+        .iter()
+        .map(|(n, o)| (n.as_str(), o.as_str()))
+        .collect();
+    publishers_table(rec, &writer_refs)
+}
+
+/// One producer label per frame of every topic `rec` recorded from several
+/// writers, the writer read off the frame's own `x`.
+fn ri_frame_label_rows(rec: &Recording) -> Vec<(String, cerulion_bag::ProducerAttribution, u128)> {
+    let mut label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = Vec::new();
+    for (topic, frames) in &rec.messages {
+        let distinct: std::collections::BTreeSet<u64> =
+            frames.iter().map(|f| frame_x(f) as u64).collect();
+        if distinct.len() < 2 {
+            continue;
+        }
+        for (i, f) in frames.iter().enumerate() {
+            label_rows.push((
+                topic.clone(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                real_publisher_id(rec, &ri_writer_node(f), "out"),
+            ));
+        }
+    }
+    label_rows
+}
+
+/// Write `live` as a single-rank free-run bag the way a recorder does: the
+/// production `recorder.json`, the stage rows, the publisher table and, on a
+/// topic with several writers, one producer label per frame.
+fn ri_bag(rec: &Recording, path: &std::path::Path, recorder_json: Vec<u8>) {
+    ri_bag_labelled(rec, path, recorder_json, true);
+}
+
+/// [`ri_bag`], writing the per-frame producer labels only when `labelled`:
+/// without them the bag declares the label channel and labels no frame, as a
+/// recorder that never armed labelling on a topic writes it.
+fn ri_bag_labelled(
+    rec: &Recording,
+    path: &std::path::Path,
+    recorder_json: Vec<u8>,
+    labelled: bool,
+) {
+    let label_rows = if labelled {
+        ri_frame_label_rows(rec)
+    } else {
+        Vec::new()
+    };
+    let labels: Vec<ProducerLabel<'_>> = label_rows
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    // A graph with no read stage declares no staging, as the recorder writes
+    // it: a present-but-empty table is refused as declaring nothing.
+    let declares_staging = rec
+        .stage_rows
+        .as_object()
+        .is_some_and(|rows| !rows.is_empty());
+    write_bag_impl(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        declares_staging.then(|| serde_json::json!(0)),
+        Some(recorder_json),
+        Some(ri_publishers(rec)),
+        Some(&labels),
+        declares_staging.then(|| rec.stage_rows.clone()),
+    );
+}
+
+/// Write `live` as a two-rank free-run bag: the nodes `on_rank1` names on rank
+/// 1, every other node on rank 0, each rank declaring the stage rows of its own
+/// nodes, with the publisher table and the per-frame producer labels
+/// [`ri_bag`] writes.
+fn ri_two_rank_bag(rec: &Recording, path: &std::path::Path, on_rank1: fn(&str) -> bool) {
+    ri_two_rank_bag_labelled(rec, path, on_rank1, true);
+}
+
+/// [`ri_two_rank_bag`], writing the per-frame producer labels only when
+/// `labelled` ([`ri_bag_labelled`]).
+fn ri_two_rank_bag_labelled(
+    rec: &Recording,
+    path: &std::path::Path,
+    on_rank1: fn(&str) -> bool,
+    labelled: bool,
+) {
+    ri_two_rank_bag_stamped(rec, path, on_rank1, labelled, ri_free_run_recorder_json());
+}
+
+/// [`ri_two_rank_bag_labelled`] under the `recorder.json` `recorder_json`.
+fn ri_two_rank_bag_stamped(
+    rec: &Recording,
+    path: &std::path::Path,
+    on_rank1: fn(&str) -> bool,
+    labelled: bool,
+    recorder_json: Vec<u8>,
+) {
+    let label_rows = if labelled {
+        ri_frame_label_rows(rec)
+    } else {
+        Vec::new()
+    };
+    ri_two_rank_bag_with_labels(rec, path, on_rank1, &label_rows, recorder_json);
+}
+
+/// [`ri_two_rank_bag_stamped`] writing `label_rows` as the per-frame producer
+/// labels.
+fn ri_two_rank_bag_with_labels(
+    rec: &Recording,
+    path: &std::path::Path,
+    on_rank1: fn(&str) -> bool,
+    label_rows: &[(String, cerulion_bag::ProducerAttribution, u128)],
+    recorder_json: Vec<u8>,
+) {
+    ri_ranked_bag_with_labels(
+        rec,
+        path,
+        move |id: &str| u32::from(on_rank1(id)),
+        2,
+        label_rows,
+        recorder_json,
+    );
+}
+
+/// Write `live` as a free-run bag of `rank_count` ranks, each node on the rank
+/// `rank_of` names, each rank declaring the stage rows of its own nodes, with
+/// the publisher table and `label_rows` as the per-frame producer labels.
+fn ri_ranked_bag_with_labels(
+    rec: &Recording,
+    path: &std::path::Path,
+    rank_of: impl Fn(&str) -> u32 + Copy,
+    rank_count: u32,
+    label_rows: &[(String, cerulion_bag::ProducerAttribution, u128)],
+    recorder_json: Vec<u8>,
+) {
+    let stage_rows = rec.stage_rows.clone();
+    let staging = move |rank: u32| -> Option<serde_json::Value> {
+        let rows: serde_json::Map<String, serde_json::Value> = stage_rows
+            .as_object()?
+            .iter()
+            .filter(|(node, _)| rank_of(node) == rank)
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        // A rank with no read stage declares no table: a present-but-empty one
+        // is refused as declaring nothing.
+        (!rows.is_empty()).then(|| serde_json::json!({ "capacities": rows }))
+    };
+    let labels: Vec<ProducerLabel<'_>> = label_rows
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        rank_count,
+        MpLayout::PerStepBatches,
+        path,
+        |_| {},
+        None,
+        Some(recorder_json),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(ri_publishers(rec)),
+            labels: &labels,
+        },
+        Some(&staging),
+        &[],
+    );
+}
+
+fn ri_free_run_recorder_json() -> Vec<u8> {
+    pre_stamp_recorder_json(replay_engine::CoordinationMode::FreeRun)
+}
+
+/// The production `recorder.json` restamped at an older `trace_format`.
+fn ri_recorder_json_at(format: u32) -> Vec<u8> {
+    let mut v: serde_json::Value = serde_json::from_slice(&ri_free_run_recorder_json()).unwrap();
+    v["trace_format"] = serde_json::json!(format);
+    serde_json::to_vec(&v).unwrap()
+}
+
+/// Replay `bag` under `purpose`, returning the outcome and what every consumer
+/// observed.
+fn ri_replay(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_bounded(bag, make, purpose, None, None)
+}
+
+/// [`ri_replay`] under a `--duration` bound and a feed index budget.
+fn ri_replay_bounded(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_reporting(
+        bag,
+        make,
+        purpose,
+        duration_bound_ns,
+        feed_index_budget,
+        None,
+    )
+}
+
+/// [`ri_replay_bounded`] that also writes `--report` to `report_path`.
+fn ri_replay_reporting(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+    report_path: Option<std::path::PathBuf>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_replay_stamped(
+        bag,
+        make,
+        purpose,
+        duration_bound_ns,
+        feed_index_budget,
+        report_path,
+        RecordHealthReport::Absent,
+        None,
+    )
+}
+
+/// [`ri_replay_reporting`] of a bag whose record-health stamp reads
+/// `record_health`, writing `--record-out` to `record_out` when it is given.
+// Every argument is one independent knob of the replay.
+#[allow(clippy::too_many_arguments)]
+fn ri_replay_stamped(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    purpose: replay_engine::ReplayPurpose,
+    duration_bound_ns: Option<u64>,
+    feed_index_budget: Option<u64>,
+    report_path: Option<std::path::PathBuf>,
+    record_health: RecordHealthReport,
+    record_out: Option<std::path::PathBuf>,
+) -> (Result<ReplayOutcome, ReplayError>, Vec<RiRead>) {
+    ri_take();
+    // The plan `run_replay` builds: the input bag's user channels and catalog,
+    // and no current-workspace schema, so each channel's hash comes from the
+    // first frame written to it.
+    let record_out = record_out.map(|path| {
+        let reader = BagReader::open(bag).expect("the input bag opens");
+        let channels = reader
+            .channels()
+            .expect("the input bag lists its channels")
+            .into_iter()
+            .filter(|c| !c.topic.starts_with(cerulion_bag::RESERVED_PREFIX))
+            .collect();
+        cerulion_cli_engine::resim_record_out::RecordOutPlan {
+            path,
+            channels,
+            catalog: reader.schema_catalog(),
+            current: std::collections::BTreeMap::new(),
+        }
+    });
+    let (config, trace, node_ids, recorded_messages, env_json, recorder) = load_inputs(bag);
+    let clock = Arc::new(VirtualClock::new());
+    let transport = cerulion_core::transport::TransportManager::init_for_test(
+        cerulion_core::transport::TransportConfig {
+            node_name: "cerulion_ri_replay".into(),
+            clock: clock.clone(),
+            subscriber_buffer_size: 16,
+            network: None,
+        },
+        cerulion_core::testing::iceoryx_test_config(),
+    )
+    .expect("isolated replay transport");
+    let inputs = ReplayInputs {
+        ros2_entries_skipped: Vec::new(),
+        config,
+        trace,
+        node_ids,
+        recorded_messages,
+        env_json,
+        recorder,
+        record_health,
+        duration_bound_ns,
+        feed_index_budget,
+        report_path,
+        fire_tap: None,
+        tolerance: None,
+        strict_state: false,
+        allow_param_change: false,
+        record_out,
+        purpose,
+    };
+    let outcome = replay_engine::run_engine(
+        inputs,
+        ReplayNodes::Injected {
+            transport,
+            clock,
+            factories: make(),
+        },
+    );
+    (outcome, ri_take())
+}
+
+/// Per consumer, its observations in order.
+fn ri_by_consumer(reads: &[RiRead]) -> std::collections::BTreeMap<u64, Vec<(u64, u64, u64)>> {
+    let mut out: std::collections::BTreeMap<u64, Vec<(u64, u64, u64)>> =
+        std::collections::BTreeMap::new();
+    for (tag, x, y, z) in reads {
+        out.entry(*tag).or_default().push((*x, *y, *z));
+    }
+    out
+}
+
+/// The judge: every consumer in `tags` made at least [`RI_MIN_READS`] reads on
+/// both sides, and its replayed reads equal its live reads. `Err` names the
+/// first difference.
+fn ri_judge(live: &[RiRead], replayed: &[RiRead], tags: &[f64]) -> Result<usize, String> {
+    let live = ri_by_consumer(live);
+    let replayed = ri_by_consumer(replayed);
+    let mut compared = 0;
+    for tag in tags {
+        let key = tag.to_bits();
+        let l = live.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        let r = replayed.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+        assert!(
+            l.len() >= RI_MIN_READS,
+            "consumer {tag} made {} live reads, below the floor {RI_MIN_READS}",
+            l.len()
+        );
+        if let Some(i) = (0..l.len().max(r.len())).find(|&i| l.get(i) != r.get(i)) {
+            let show = |v: Option<&(u64, u64, u64)>| {
+                v.map(|(x, y, z)| (f64::from_bits(*x), f64::from_bits(*y), f64::from_bits(*z)))
+            };
+            return Err(format!(
+                "consumer {tag}: read {i} differs: live {:?}, replayed {:?} ({} live, {} replayed)",
+                show(l.get(i)),
+                show(r.get(i)),
+                l.len(),
+                r.len()
+            ));
+        }
+        compared += l.len();
+    }
+    Ok(compared)
+}
+
+/// The live run of the eviction fixture really evicted and really fanned out.
+fn ri_assert_evict_premise(live: &RiLive) {
+    let by = ri_by_consumer(&live.reads);
+    let slow: Vec<f64> = by[&RI_SLOW.to_bits()]
+        .iter()
+        .map(|(_, y, _)| f64::from_bits(*y))
+        .collect();
+    let fast = &by[&RI_FAST.to_bits()];
+    assert!(
+        slow.windows(2).any(|w| w[1] - w[0] > 1.0),
+        "PREMISE: the slow consumer skips sequences the live queue evicted: {slow:?}"
+    );
+    assert!(
+        fast.len() > slow.len(),
+        "PREMISE: two consumers read one topic at different rates (fan-out): fast {} slow {}",
+        fast.len(),
+        slow.len()
+    );
+    // A multi-frame read is exercised: some slow read popped two frames.
+    let popped_two = live.rec.trace.iter().any(|r| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME
+            && unpack_read_outcome_meta(r.global_level).1 == READ_OUTCOME_SERVED
+            && unpack_read_outcome_popped(r.duration_ns) >= 2
+    });
+    assert!(
+        popped_two,
+        "PREMISE: a slow read popped more than one frame"
+    );
+}
+
+fn ri_assert_fed(outcome: &ReplayOutcome) -> (usize, usize) {
+    match &outcome.read_identity {
+        replay_engine::ReadIdentityReport::Fed { reads, frames } => {
+            assert!(
+                *reads > 0 && *frames >= *reads,
+                "{:?}",
+                outcome.read_identity
+            );
+            (*reads, *frames)
+        }
+        other => panic!("a --verify replay of a format-9 free-run bag is fed: {other:?}"),
+    }
+}
+
+/// One consumer read site's share of a recording's read log.
+#[derive(Debug, Default, Clone, Copy)]
+struct RiSiteRecords {
+    /// Producer annotations staged at the site.
+    annotations: usize,
+    /// Read records of the site.
+    reads: usize,
+    /// Read records of the site that name a served frame: each carried its own
+    /// annotation under the per-read rule writer runs replaced.
+    serving: usize,
+}
+
+/// Per (consumer node, input index, read site), its read-log records.
+fn ri_site_records(
+    rec: &Recording,
+) -> std::collections::BTreeMap<(String, u16, usize), RiSiteRecords> {
+    let mut out: std::collections::BTreeMap<(String, u16, usize), RiSiteRecords> =
+        std::collections::BTreeMap::new();
+    for r in rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+    {
+        let node = rec.node_ids[r.node_idx as usize].clone();
+        let site = cerulion_core::read_outcome::writer_run_site(
+            cerulion_core::trace_ring::read_site_role(r.global_level),
+        );
+        let input = unpack_read_outcome_meta(r.global_level).0;
+        let entry = out.entry((node, input, site)).or_default();
+        if is_read_record(r) {
+            entry.reads += 1;
+            if r.fire_time_ns != READ_OUTCOME_NO_FRAME {
+                entry.serving += 1;
+            }
+        } else {
+            entry.annotations += 1;
+        }
+    }
+    out
+}
+
+/// The read log's record count, and what the per-read rule would have staged:
+/// one more record per serving read.
+fn ri_record_sizes(rec: &Recording) -> (usize, usize) {
+    let sites = ri_site_records(rec);
+    let now: usize = sites.values().map(|s| s.reads + s.annotations).sum();
+    let per_read: usize = sites.values().map(|s| s.reads + s.serving).sum();
+    (now, per_read)
+}
+
+/// A single-writer edge stages ONE producer annotation per read site for the
+/// whole recording: the annotation opens the writer's run and every later read
+/// of the site is that writer's.
+#[test]
+#[serial]
+fn a_single_writer_edge_records_one_annotation_per_run() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let sites = ri_site_records(&live.rec);
+    for consumer in ["slow", "fast"] {
+        let of: Vec<(&(String, u16, usize), &RiSiteRecords)> = sites
+            .iter()
+            .filter(|((n, _, _), _)| n == consumer)
+            .collect();
+        let serving: usize = of.iter().map(|(_, s)| s.serving).sum();
+        assert!(
+            serving >= RI_MIN_READS,
+            "PREMISE: {consumer} served enough reads to make one annotation evidence: {of:?}"
+        );
+        for (key, site) in of {
+            let want = usize::from(site.serving > 0);
+            assert_eq!(
+                site.annotations, want,
+                "{key:?}: one writer, one run, one annotation: {site:?}"
+            );
+        }
+    }
+    let (now, per_read) = ri_record_sizes(&live.rec);
+    println!("RI_RECORDS evict: read_log_records={now} per_read_rule={per_read}");
+    assert!(
+        now < per_read,
+        "writer runs stage fewer records ({now} vs {per_read})"
+    );
+}
+
+/// Live evictions and fan-out: every replayed read equals the live read.
+#[test]
+#[serial]
+fn identity_fed_replay_reproduces_reads_under_live_evictions_and_fan_out() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    ri_assert_evict_premise(&live);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_evict.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    let (reads, frames) = ri_assert_fed(&outcome);
+    assert!(
+        frames > reads,
+        "a slow read popped two frames, so more frames than reads were fed ({frames} vs {reads})"
+    );
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).expect("reads equal");
+    println!("RI_ORACLE evict: compared={compared} fed_reads={reads} fed_frames={frames}");
+    assert!(
+        outcome.passed,
+        "the fed replay passes: {:?}",
+        outcome.violations
+    );
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    assert!(
+        !verdict.contains("reads:"),
+        "reads fed by identity print no line; `ri_assert_fed` read it off the outcome: \
+         {verdict}"
+    );
+}
+
+/// Two writers and no consumer.
+fn ri_no_consumer_yaml() -> &'static str {
+    "name: rinc\nprefix: rinc\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn ri_no_consumer_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![("w1", writer(1.0)), ("w2", writer(2.0))])
+}
+
+/// Two writers and no consumer, one writer per rank: the bag of a multi-process
+/// run, or of a process whose sources each run in an executor unit of their own
+/// (`isolate: true`). No node wires a read stage, so
+/// no rank manifest states staging rows, and a `--verify` replay has no read to
+/// place: it is fed zero reads and passes.
+#[test]
+#[serial]
+fn a_fed_replay_of_a_graph_with_no_consumer_feeds_no_read_and_passes() {
+    let live = ri_record(ri_no_consumer_yaml(), ri_no_consumer_factories);
+    assert_eq!(
+        live.rec.stage_rows,
+        serde_json::json!({}),
+        "PREMISE: no node wires a read stage"
+    );
+    let published: Vec<(&String, usize)> = live
+        .rec
+        .messages
+        .iter()
+        .map(|(topic, frames)| (topic, frames.len()))
+        .collect();
+    assert!(
+        published.len() == 2 && published.iter().all(|(_, n)| *n >= RI_MIN_READS),
+        "PREMISE: both writers published: {published:?}"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_no_consumer.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w2");
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_no_consumer_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("a fed replay of a graph with no consumer runs");
+    assert_eq!(
+        outcome.read_identity,
+        replay_engine::ReadIdentityReport::Fed {
+            reads: 0,
+            frames: 0
+        },
+        "no node reads, so no read is fed"
+    );
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert!(
+        replayed.is_empty(),
+        "no consumer logged a read: {replayed:?}"
+    );
+}
+
+/// A bag that states no staging rows is still refused when a node of its graph
+/// consumes: the eviction fixture's bag, written without the staging-row table
+/// and its sentinel scalar, is refused before its first step, naming the rows.
+#[test]
+#[serial]
+fn a_fed_replay_of_a_consumer_whose_bag_states_no_staging_rows_is_refused_by_name() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_no_rows.mcap");
+    write_bag_impl(
+        &live.rec,
+        &bag,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        live.rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        None,
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(&live.rec)),
+        Some(&[]),
+        None,
+    );
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a fed replay of a consumer with no staging rows is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_unplanned",
+        "the bag states no per-stage staging rows",
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+    assert!(replayed.is_empty(), "no step ran: {replayed:?}");
+}
+
+/// The feed index bytes a fed replay of `bag` needs, read off the refusal a
+/// zero budget answers.
+fn ri_feed_index_need(bag: &std::path::Path, duration_bound_ns: Option<u64>) -> u64 {
+    let (outcome, _) = ri_replay_bounded(
+        bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        duration_bound_ns,
+        Some(0),
+    );
+    let msg = outcome
+        .expect_err("a zero feed index budget is refused")
+        .to_string();
+    let rest = msg
+        .split("need a feed index of ")
+        .nth(1)
+        .unwrap_or_else(|| panic!("the refusal names the bytes needed: {msg}"));
+    rest.split(' ').next().unwrap().parse().unwrap()
+}
+
+fn ri_evict_bag(dir: &std::path::Path) -> std::path::PathBuf {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let bag = dir.join("ri_budget.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    bag
+}
+
+/// A feed index budget well above what the reads need: the replay is fed and
+/// passes.
+#[test]
+#[serial]
+fn a_fed_replay_under_its_feed_index_budget_is_fed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    assert!(
+        need > 0 && need.is_multiple_of(cerulion_cli_engine::replay_feed::FEED_INDEX_ENTRY_BYTES),
+        "{need}"
+    );
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(need * 4),
+    );
+    let outcome = outcome.expect("the fed replay runs under its budget");
+    ri_assert_fed(&outcome);
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// A feed index budget exactly equal to what the reads need is enough.
+#[test]
+#[serial]
+fn a_fed_replay_at_exactly_its_feed_index_budget_is_fed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(need),
+    );
+    let outcome = outcome.expect("the fed replay runs at exactly its budget");
+    ri_assert_fed(&outcome);
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// A feed index budget one entry below what the reads need refuses the replay
+/// with exit 2, naming the budget, the need and the flag that raises it.
+#[test]
+#[serial]
+fn a_fed_replay_over_its_feed_index_budget_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let need = ri_feed_index_need(&bag, None);
+    let budget = need - cerulion_cli_engine::replay_feed::FEED_INDEX_ENTRY_BYTES;
+    let (outcome, replayed) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        Some(budget),
+    );
+    let err = outcome.expect_err("a replay over its feed index budget is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_feed_index_budget".to_string(),
+        format!("need a feed index of {need} bytes"),
+        format!("feed index budget of {budget} bytes"),
+        "--feed-index-budget".to_string(),
+    ] {
+        assert!(msg.contains(&part), "the refusal names `{part}`: {msg}");
+    }
+    assert!(replayed.is_empty(), "no step ran: {replayed:?}");
+}
+
+/// A `--duration` bound covering part of the bag indexes only the frames the
+/// steps inside it read.
+#[test]
+#[serial]
+fn a_short_duration_indexes_fewer_frames_than_the_whole_bag() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let whole = ri_feed_index_need(&bag, None);
+    let quarter_ns = (RI_STEPS as u64 / 4) * DELTA_MS * 1_000_000;
+    let bounded = ri_feed_index_need(&bag, Some(quarter_ns));
+    assert!(
+        bounded > 0 && bounded * 2 < whole,
+        "a quarter of the bag needs well under half its index ({bounded} vs {whole})"
+    );
+    let (outcome, _) = ri_replay_bounded(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        Some(quarter_ns),
+        Some(bounded),
+    );
+    let outcome = outcome.expect("the bounded fed replay runs under the bounded need");
+    ri_assert_fed(&outcome);
+    // The bound re-executes the first quarter of the steps, so the source's
+    // topic is short by the rest and that is the outcome's one violation; the
+    // reads inside the bound are fed and the read log stays clean.
+    match outcome.violations.as_slice() {
+        [v] if v.topic == "/riev/src/out" => match v.class {
+            ViolationClass::MissingMessages { recorded, replayed } => {
+                assert_eq!((recorded, replayed), (RI_STEPS, RI_STEPS / 4), "{v:?}");
+            }
+            ref other => panic!("expected MissingMessages, got {other:?}"),
+        },
+        other => panic!("one truncation violation on the source's topic: {other:?}"),
+    }
+    assert!(
+        outcome.trace_divergence.is_none() && outcome.read_log_divergence.is_none(),
+        "{:?} {:?}",
+        outcome.trace_divergence,
+        outcome.read_log_divergence
+    );
+}
+
+/// Two fed replays of graphs with identical node names run at the same time on
+/// ONE shared iceoryx2 config. Each private feed service carries
+/// its replay's identifier, so neither replay attaches to the other's feeds and
+/// both are fed and pass.
+#[test]
+#[serial]
+fn two_concurrent_fed_replays_sharing_an_iceoryx2_config_do_not_cross_feeds() {
+    // Two graphs with the same node ids (src, slow, fast) under different
+    // prefixes: their own topics differ, so the only names the two replays could
+    // share are the private feed services, which carry the node id.
+    let dir = tempfile::tempdir().unwrap();
+    let mut bags = Vec::new();
+    for prefix in ["riev", "rievb"] {
+        let yaml = ri_evict_yaml().replacen("prefix: riev", &format!("prefix: {prefix}"), 1);
+        let live = ri_record(&yaml, ri_evict_factories);
+        ri_assert_evict_premise(&live);
+        let bag = dir.path().join(format!("ri_concurrent_{prefix}.mcap"));
+        ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+        bags.push(bag);
+    }
+    let shared = cerulion_core::testing::iceoryx_test_config();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let run = |name: &'static str, bag: &std::path::Path| {
+        let bag = bag.to_path_buf();
+        let shared = shared.clone();
+        let barrier = barrier.clone();
+        std::thread::spawn(move || {
+            let (config, trace, node_ids, recorded_messages, env_json, recorder) =
+                load_inputs(&bag);
+            let clock = Arc::new(VirtualClock::new());
+            let transport = cerulion_core::transport::TransportManager::init_for_test(
+                cerulion_core::transport::TransportConfig {
+                    node_name: name.into(),
+                    clock: clock.clone(),
+                    subscriber_buffer_size: 16,
+                    network: None,
+                },
+                shared,
+            )
+            .expect("replay transport on the shared config");
+            barrier.wait();
+            replay_engine::run_engine(
+                ReplayInputs {
+                    ros2_entries_skipped: Vec::new(),
+                    config,
+                    trace,
+                    node_ids,
+                    recorded_messages,
+                    env_json,
+                    recorder,
+                    record_health: RecordHealthReport::Absent,
+                    duration_bound_ns: None,
+                    feed_index_budget: None,
+                    report_path: None,
+                    fire_tap: None,
+                    tolerance: None,
+                    strict_state: false,
+                    allow_param_change: false,
+                    record_out: None,
+                    purpose: replay_engine::ReplayPurpose::Verify,
+                },
+                ReplayNodes::Injected {
+                    transport,
+                    clock,
+                    factories: ri_evict_factories(),
+                },
+            )
+        })
+    };
+    let a = run("cerulion_ri_concurrent_a", &bags[0]);
+    let b = run("cerulion_ri_concurrent_b", &bags[1]);
+    for outcome in [a.join().unwrap(), b.join().unwrap()] {
+        let outcome = outcome.expect("each concurrent fed replay runs");
+        ri_assert_fed(&outcome);
+        assert!(
+            outcome.passed,
+            "a concurrent fed replay is fed only its own frames: {:?}",
+            outcome.violations
+        );
+    }
+    ri_take();
+}
+
+/// A consumer whose node id is 230 characters long. Every private feed name
+/// carries a fixed-width digest of the node id, so the name stays inside the
+/// transport's topic limit, the fed replay builds its feeds, and every replayed
+/// read equals the live read.
+#[test]
+#[serial]
+fn a_fed_replay_of_a_node_with_a_230_character_id_builds_its_feeds() {
+    let long = format!("slow_{}", "z".repeat(225));
+    assert_eq!(long.len(), 230);
+    let yaml = ri_evict_yaml().replacen("id: slow", &format!("id: {long}"), 1);
+    let make = || {
+        let mut f = ri_evict_factories();
+        let entry = f
+            .shift_remove("slow")
+            .expect("the evict fixture has a slow sink");
+        f.insert(long.clone(), entry);
+        f
+    };
+    let live = ri_record(&yaml, make);
+    ri_assert_evict_premise(&live);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_long_node.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let outcome = outcome.expect("the fed replay of a long node id builds its feeds");
+    ri_assert_fed(&outcome);
+    ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).expect("reads equal");
+    assert!(
+        outcome.passed,
+        "the fed replay passes: {:?}",
+        outcome.violations
+    );
+}
+
+/// Two ranks, the consumers' rank built FIRST: its fed inputs read a topic only
+/// the second rank produces, so no port of the first pass created that topic's
+/// service. The fed build opens no real subscriber on it and still stands up its
+/// liveliness probe, and every replayed read equals the live read.
+#[test]
+#[serial]
+fn a_fed_consumer_rank_built_before_its_producer_rank_reproduces_its_reads() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    ri_assert_evict_premise(&live);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_two_rank.mcap");
+    // Rank 0 = the consumers, rank 1 = the writer.
+    let rank_of = |id: &str| u32::from(id == "src");
+    let stage_rows = live.rec.stage_rows.clone();
+    let staging = move |rank: u32| -> Option<serde_json::Value> {
+        let rows: serde_json::Map<String, serde_json::Value> = stage_rows
+            .as_object()?
+            .iter()
+            .filter(|(node, _)| u32::from(node.as_str() == "src") == rank)
+            .map(|(n, v)| (n.clone(), v.clone()))
+            .collect();
+        // A rank with no read stage (the writer's) declares no table: a
+        // present-but-empty one is refused as declaring nothing.
+        (!rows.is_empty()).then(|| serde_json::json!({ "capacities": rows }))
+    };
+    let mut writers: Vec<(String, String)> = Vec::new();
+    for (node, outputs) in &live.rec.publisher_ids {
+        for (output, _) in outputs {
+            writers.push((node.clone(), output.clone()));
+        }
+    }
+    let writer_refs: Vec<(&str, &str)> = writers
+        .iter()
+        .map(|(n, o)| (n.as_str(), o.as_str()))
+        .collect();
+    write_multi_rank_bag_impl(
+        &live.rec,
+        rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(ri_free_run_recorder_json()),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(publishers_table(&live.rec, &writer_refs)),
+            labels: &[],
+        },
+        Some(&staging),
+        &[],
+    );
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the two-rank fed replay builds and runs");
+    ri_assert_fed(&outcome);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST]).expect("reads equal");
+    println!("RI_ORACLE two_rank: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// Three writers on one topic: every replayed read equals the live read, by
+/// writer and sequence.
+#[test]
+#[serial]
+fn identity_fed_replay_reproduces_reads_of_three_writers_on_one_topic() {
+    let live = ri_record(ri_multi_writer_yaml(), ri_multi_writer_factories);
+    let by = ri_by_consumer(&live.reads);
+    let writers: std::collections::BTreeSet<u64> =
+        by[&RI_SINK.to_bits()].iter().map(|(x, _, _)| *x).collect();
+    assert_eq!(writers.len(), 3, "PREMISE: the sink read all three writers");
+    let (now, per_read) = ri_record_sizes(&live.rec);
+    println!("RI_RECORDS three_writers: read_log_records={now} per_read_rule={per_read}");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_three_writers.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_multi_writer_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SINK]).expect("reads equal");
+    println!("RI_ORACLE three_writers: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// MUTANT: the recorded identity dropped from the bag. On a single-writer
+/// edge one annotation opens the writer's run, so dropping it leaves every
+/// read of the run unattributed. The replay refuses by name (node, input,
+/// writer, sequence) at the first of them, before its first step.
+#[test]
+#[serial]
+fn a_dropped_read_identity_is_refused_by_node_input_writer_and_sequence() {
+    let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let slow_idx = live.rec.node_ids.iter().position(|n| n == "slow").unwrap() as u32;
+    // The slow consumer's run-opening annotation, whose read POPPED a frame,
+    // and the served sequence of that read. From `trace_format` 9 the
+    // annotation can precede the `BatchFrame` records of a read that popped
+    // several frames, which sit between it and the read.
+    let trace = &live.rec.trace;
+    let is_slow_read =
+        |r: &TraceRingRecord| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == slow_idx;
+    let (pos, named) = (0..trace.len())
+        .filter(|&i| {
+            is_slow_read(&trace[i])
+                && unpack_read_outcome_meta(trace[i].global_level).1
+                    == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+        })
+        .find_map(|i| {
+            let read = trace[i + 1..]
+                .iter()
+                .filter(|r| is_slow_read(r))
+                .find(|r| !is_batch_frame_record(r))?;
+            (unpack_read_outcome_meta(read.global_level).1 == READ_OUTCOME_SERVED
+                && unpack_read_outcome_popped(read.duration_ns) > 0)
+                .then_some((i, read.fire_time_ns))
+        })
+        .expect("the slow consumer's run opens with an annotation");
+    live.rec.trace.remove(pos);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_dropped_identity.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a read with no recorded identity is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_absent",
+        "node 'slow'",
+        "input 'inp'",
+        "writer none",
+        &format!("sequence {named}"),
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// MUTANT: one recorded identity dropped on the three-writer topic, where the
+/// writers' sequences run in step so the read before it names the same
+/// sequence of another writer. A multi-writer edge carries an annotation
+/// before every read, so the read is refused by name as having no writer
+/// rather than fed the previous read's writer's frame.
+#[test]
+#[serial]
+fn a_dropped_read_identity_on_three_writers_is_refused_by_name() {
+    let mut live = ri_record(ri_multi_writer_yaml(), ri_multi_writer_factories);
+    let sink_idx = live.rec.node_ids.iter().position(|n| n == "sink").unwrap() as u32;
+    let trace = &live.rec.trace;
+    let is_sink_read =
+        |r: &TraceRingRecord| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx;
+    let pos = (0..trace.len())
+        .filter(|&i| {
+            is_sink_read(&trace[i])
+                && unpack_read_outcome_meta(trace[i].global_level).1
+                    == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+        })
+        .filter(|&i| {
+            // The read before this pair names the same sequence: the shape a
+            // carry by byte equality would misattribute.
+            let prev = trace[..i]
+                .iter()
+                .rev()
+                .find(|r| is_read_record(r) && is_sink_read(r));
+            let next = trace[i + 1..]
+                .iter()
+                .find(|r| is_read_record(r) && is_sink_read(r));
+            matches!((prev, next), (Some(p), Some(n))
+                if p.fire_time_ns == n.fire_time_ns
+                    && unpack_read_outcome_popped(n.duration_ns) > 0)
+        })
+        .nth(2)
+        .expect("PREMISE: back-to-back sink reads of one sequence from two writers");
+    let named = live.rec.trace[pos].fire_time_ns;
+    live.rec.trace.remove(pos);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_three_writers_dropped_identity.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_multi_writer_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a read with no recorded identity is refused");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    for part in [
+        "read_identity_absent",
+        "node 'sink'",
+        "writer none",
+        &format!("sequence {named}"),
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// Three writers on one topic read by a SLOW latest-value consumer, so a read
+/// pops the newest two frames, of two different writers.
+fn ri_multi_writer_batch_yaml() -> &'static str {
+    "name: rimb\nprefix: rimb\nmulti_publisher_topics:\n  - /rimb/bus\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimb/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimb/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimb/bus\n\
+     \x20 - id: sink\n    type: ri_slow_sink\n    inputs:\n      - name: inp\n        source: /rimb/bus\n"
+}
+
+fn ri_multi_writer_batch_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", writer(1.0)),
+        ("w2", writer(2.0)),
+        ("w3", writer(3.0)),
+        (
+            "sink",
+            Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+                tag: RI_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The multi-writer batch recording: some sink read popped more than one
+/// frame, and the read log names the frames it did not serve in `BatchFrame`
+/// records.
+fn ri_multi_writer_batch_live() -> RiLive {
+    let live = ri_record(
+        ri_multi_writer_batch_yaml(),
+        ri_multi_writer_batch_factories,
+    );
+    let popped_two = live.rec.trace.iter().any(|r| {
+        is_read_record(r)
+            && unpack_read_outcome_popped(r.duration_ns) >= 2
+            && r.fire_time_ns != READ_OUTCOME_NO_FRAME
+    });
+    assert!(popped_two, "PREMISE: a read popped more than one frame");
+    assert!(
+        live.rec.trace.iter().any(is_batch_frame_record),
+        "PREMISE: the read log names a batch's other frames"
+    );
+    live
+}
+
+/// A `BatchFrame` record: one frame a read consumed and did not serve.
+fn is_batch_frame_record(r: &TraceRingRecord) -> bool {
+    r.record_type == RECORD_TYPE_READ_OUTCOME
+        && unpack_read_outcome_meta(r.global_level).1
+            == cerulion_core::trace_ring::READ_OUTCOME_BATCH_FRAME
+}
+
+/// A read that popped several frames on a topic with several writers names
+/// each frame it did not serve in a `BatchFrame` record under that frame's
+/// own writer annotation, so the fed replay feeds every frame of the batch
+/// by `(writer, sequence)` and each replayed read equals the live read.
+#[test]
+#[serial]
+fn a_batch_on_a_multi_writer_edge_is_fed_each_frame_under_its_writer() {
+    let live = ri_multi_writer_batch_live();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_multi_writer_batch.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_multi_writer_batch_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("a batch on several writers is fed");
+    let (reads, frames) = ri_assert_fed(&outcome);
+    assert!(
+        frames > reads,
+        "the batches' other frames are fed: {reads} reads, {frames} frames"
+    );
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SINK]).expect("reads equal");
+    println!("RI_ORACLE multi_writer_batch: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+// ---------------------------------------------------------------------------
+// Writers whose sequences run apart on one bus: a fed consumer's drop_oldest
+// probe keeps one baseline per recorded writer, as the live probe keeps one
+// per writer port.
+// ---------------------------------------------------------------------------
+
+/// A writer at five frames per step: its wire sequence runs five times as fast
+/// as a once-per-step writer's on the same bus.
+#[cerulion_node(period_ms = 1)]
+#[derive(Default)]
+struct RiFastWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiFastWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// How one consumer's eviction accounting rides its read log entry: the events
+/// its `#[on_event]` handler saw, times this, plus the loss count the last
+/// event carried.
+const RI_EVENT_SCALE: f64 = 1_000_000.0;
+
+/// A per-message `drop_oldest` consumer whose queue holds a whole step (16
+/// frames per writer, the deepest a `multi_publisher_topics` bus admits), so the
+/// live queue evicts nothing. Its handler counts eviction events and keeps the
+/// last event's loss count; every fire logs both beside the frame it read.
+#[cerulion_node]
+#[derive(Default)]
+struct RiDeepEventSink {
+    #[input(trigger, backpressure = drop_oldest, depth = 16)]
+    inp: Vector3,
+    tag: f64,
+    events: f64,
+    lost: f64,
+}
+
+#[cerulion_node_impl]
+impl RiDeepEventSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(
+            self.tag,
+            self.inp.x,
+            self.inp.y,
+            self.events * RI_EVENT_SCALE + self.lost,
+        );
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_backpressure(&mut self, e: BackpressureEvent) {
+        self.events += 1.0;
+        self.lost = e.count_total as f64;
+    }
+}
+
+/// The same consumer on a depth-two queue, so the live queue evicts the fast
+/// writer's oldest frames every step.
+#[cerulion_node]
+#[derive(Default)]
+struct RiShallowEventSink {
+    #[input(trigger, backpressure = drop_oldest, depth = 2)]
+    inp: Vector3,
+    tag: f64,
+    events: f64,
+    lost: f64,
+}
+
+#[cerulion_node_impl]
+impl RiShallowEventSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        ri_log(
+            self.tag,
+            self.inp.x,
+            self.inp.y,
+            self.events * RI_EVENT_SCALE + self.lost,
+        );
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_backpressure(&mut self, e: BackpressureEvent) {
+        self.events += 1.0;
+        self.lost = e.count_total as f64;
+    }
+}
+
+const RI_DEEP: f64 = 4.0;
+const RI_SHALLOW: f64 = 5.0;
+
+/// Three writers on one bus, the middle one five times as fast, read per
+/// message by a deep and a shallow `drop_oldest` consumer.
+fn ri_writer_baseline_yaml() -> &'static str {
+    "name: riwb\nprefix: riwb\nmulti_publisher_topics:\n  - /riwb/bus\nnodes:\n\
+     \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: w2\n    type: ri_fast_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riwb/bus\n\
+     \x20 - id: deep\n    type: ri_deep_event_sink\n    inputs:\n      - name: inp\n        source: /riwb/bus\n\
+     \x20 - id: shallow\n    type: ri_shallow_event_sink\n    inputs:\n      - name: inp\n        source: /riwb/bus\n"
+}
+
+fn ri_writer_baseline_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let writer = |w: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: w,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", writer(1.0)),
+        (
+            "w2",
+            Box::new(RiFastWriterNodeEntry::with_state(RiFastWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        ("w3", writer(3.0)),
+        (
+            "deep",
+            Box::new(RiDeepEventSinkEntry::with_state(RiDeepEventSink {
+                tag: RI_DEEP,
+                ..Default::default()
+            })),
+        ),
+        (
+            "shallow",
+            Box::new(RiShallowEventSinkEntry::with_state(RiShallowEventSink {
+                tag: RI_SHALLOW,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// `(events, loss count)` as one consumer's read logged them.
+fn ri_event_accounting(z: u64) -> (u64, u64) {
+    let z = f64::from_bits(z);
+    let events = (z / RI_EVENT_SCALE).floor();
+    (events as u64, (z - events * RI_EVENT_SCALE) as u64)
+}
+
+/// The hand oracle over one side's reads, live or replayed.
+///
+/// Per step, writers 1 and 3 publish one frame each and writer 2 publishes
+/// five, read in turn by both consumers.
+///
+/// * The deep consumer's queue holds a whole step, so it never loses a frame:
+///   every read logs no event and a loss count of 0.
+/// * The shallow consumer's queue keeps the newest two frames per writer, so
+///   each step evicts exactly three of writer 2's five, seen by the first of
+///   its two writer 2 reads; writers 1 and 3 lose nothing, so the reads
+///   between two steps' evictions are clean and every eviction opens a new
+///   event. Every read therefore logs a loss count of exactly three per event.
+///
+/// A probe that took the three writers for one stream reads, at the shallow
+/// consumer, writer 1's first frame followed by writer 2's fourth as two lost
+/// frames: an event and a loss count the live run never had. From there on
+/// writer 2's sequence leads, and writers 1 and 3 read as re-delivery.
+fn ri_assert_per_writer_accounting(side: &str, reads: &[RiRead]) {
+    let by = ri_by_consumer(reads);
+    let deep = by
+        .get(&RI_DEEP.to_bits())
+        .unwrap_or_else(|| panic!("{side}: the deep consumer read"));
+    assert!(
+        deep.len() >= RI_MIN_READS,
+        "{side}: deep made {} reads",
+        deep.len()
+    );
+    for (i, (_, _, z)) in deep.iter().enumerate() {
+        assert_eq!(
+            ri_event_accounting(*z),
+            (0, 0),
+            "{side}: deep read {i} saw an eviction event its queue never had"
+        );
+    }
+    let shallow = by
+        .get(&RI_SHALLOW.to_bits())
+        .unwrap_or_else(|| panic!("{side}: the shallow consumer read"));
+    assert!(
+        shallow.len() >= RI_MIN_READS,
+        "{side}: shallow made {} reads",
+        shallow.len()
+    );
+    for (i, (_, _, z)) in shallow.iter().enumerate() {
+        let (events, lost) = ri_event_accounting(*z);
+        assert_eq!(
+            lost,
+            3 * events,
+            "{side}: shallow read {i}: {events} events must carry {} lost frames, not {lost}",
+            3 * events
+        );
+    }
+    let (events, _) = ri_event_accounting(shallow.last().expect("shallow read").2);
+    assert!(
+        events as usize >= RI_MIN_READS,
+        "{side}: one eviction event per step, {events} over {RI_STEPS} steps"
+    );
+}
+
+/// Three writers whose wire sequences run apart on one bus, read through two
+/// `drop_oldest` consumers with an `#[on_event]` handler each: every replayed
+/// read, its event count and its loss count included, equals the live read.
+/// The fed replay publishes every writer's frames through one feed port, and
+/// the consumers' probes still count each recorded writer's sequence apart.
+#[test]
+#[serial]
+fn a_fed_replay_counts_evictions_per_recorded_writer_on_one_bus() {
+    let live = ri_record(ri_writer_baseline_yaml(), ri_writer_baseline_factories);
+    let writers: std::collections::BTreeSet<u64> = ri_by_consumer(&live.reads)
+        [&RI_SHALLOW.to_bits()]
+        .iter()
+        .map(|(x, _, _)| *x)
+        .collect();
+    assert_eq!(
+        writers.len(),
+        3,
+        "PREMISE: the shallow consumer read all three writers"
+    );
+    ri_assert_per_writer_accounting("live", &live.reads);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_writer_baselines.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_writer_baseline_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    ri_assert_per_writer_accounting("replayed", &replayed);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_DEEP, RI_SHALLOW]).expect("reads equal");
+    println!("RI_ORACLE writer_baselines: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// The same three writers and two consumers split over two ranks, the writers
+/// on rank 1 and the consumers on rank 0. Rank 0's subgraph writes nothing on
+/// the bus, so its own view of the bus names no publisher slots, while the
+/// live consumers read the bus at its `multi_publisher_topics` slots of 16.
+/// The fed consumers' feeds hold those 16, so each recorded writer keeps its
+/// baseline and every replayed read, its event count and its loss count
+/// included, equals the live read against the same hand oracle.
+#[test]
+#[serial]
+fn a_fed_consumer_rank_counts_evictions_of_three_writers_on_another_rank() {
+    let live = ri_record(ri_writer_baseline_yaml(), ri_writer_baseline_factories);
+    ri_assert_per_writer_accounting("live", &live.reads);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_writer_baselines_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id.starts_with('w'));
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_writer_baseline_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the two-rank fed replay runs");
+    ri_assert_fed(&outcome);
+    ri_assert_per_writer_accounting("replayed", &replayed);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_DEEP, RI_SHALLOW]).expect("reads equal");
+    println!("RI_ORACLE writer_baselines_two_rank: compared={compared}");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+}
+
+/// Remove every `BatchFrame` record and the producer annotation staged with it
+/// (the record just before it, on the same node and input); returns the
+/// `(batch frames, annotations)` removed.
+fn strip_batch_frames(trace: &mut Vec<TraceRingRecord>) -> (usize, usize) {
+    let mut keep = vec![true; trace.len()];
+    let (mut frames, mut annotations) = (0, 0);
+    for i in 0..trace.len() {
+        if !is_batch_frame_record(&trace[i]) {
+            continue;
+        }
+        keep[i] = false;
+        frames += 1;
+        let input = unpack_read_outcome_meta(trace[i].global_level).0;
+        if let Some(prev) = i.checked_sub(1) {
+            let p = &trace[prev];
+            if p.record_type == RECORD_TYPE_READ_OUTCOME
+                && p.node_idx == trace[i].node_idx
+                && unpack_read_outcome_meta(p.global_level)
+                    == (input, cerulion_core::trace_ring::READ_OUTCOME_PRODUCER)
+            {
+                keep[prev] = false;
+                annotations += 1;
+            }
+        }
+    }
+    let mut kept = keep.into_iter();
+    trace.retain(|_| kept.next().unwrap_or(true));
+    (frames, annotations)
+}
+
+/// The same recording with its `BatchFrame` records and their annotations
+/// removed, which is the read log of a recorder below `trace_format` 9 and of
+/// a batch deeper than its read stage's window: a read that popped several
+/// frames names only its newest. The fed replay refuses it by name rather than
+/// feed frames counted back from the served one.
+#[test]
+#[serial]
+fn a_batch_whose_frames_are_not_named_is_refused_by_name() {
+    let mut live = ri_multi_writer_batch_live();
+    let (frames, annotations) = strip_batch_frames(&mut live.rec.trace);
+    assert_eq!(
+        frames, annotations,
+        "PREMISE: an edge that annotates every read stages each batch frame with its annotation"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_multi_writer_batch_unnamed.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_multi_writer_batch_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a batch whose frames are not named is refused");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    assert!(
+        msg.contains("read_identity_batch_unattributed") && msg.contains("node 'sink'"),
+        "{msg}"
+    );
+}
+
+/// A bag recorded below `trace_format` 9 holds no `BatchFrame` records, and a
+/// `--verify` replay of it stages none either, so the two read logs hold the
+/// same positions and the replay passes: the multi-writer batch recording with
+/// its batch frames and their annotations removed, stamped as a format 8
+/// lockstep bag and as a format 7 free-run bag, both replayed on the queue
+/// re-creation path. The control is the same recording unstripped at format 9
+/// lockstep, whose recorded batch frames the replay stages too.
+#[test]
+#[serial]
+fn a_batch_recorded_below_format_nine_replays_clean_under_verify() {
+    let live = ri_multi_writer_batch_live();
+    let lockstep = replay_engine::CoordinationMode::Lockstep;
+    let fixtures = [
+        (
+            "format9_lockstep_control",
+            false,
+            pre_stamp_recorder_json(lockstep),
+        ),
+        (
+            "format8_lockstep",
+            true,
+            recorder_json_at_trace_format(lockstep, 8),
+        ),
+        ("format7_free_run", true, ri_recorder_json_at(7)),
+    ];
+    for (name, strip, recorder_json) in fixtures {
+        let mut rec = live.rec.clone();
+        if strip {
+            let (frames, annotations) = strip_batch_frames(&mut rec.trace);
+            assert!(
+                frames > 0 && frames == annotations,
+                "PREMISE {name}: batch frames removed with their annotations: \
+                 {frames} frames, {annotations} annotations"
+            );
+        } else {
+            assert!(
+                rec.trace.iter().any(is_batch_frame_record),
+                "PREMISE {name}: the control keeps its batch frames"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ri_batch_{name}.mcap"));
+        ri_bag(&rec, &bag, recorder_json);
+        let (outcome, _) = ri_replay(
+            &bag,
+            ri_multi_writer_batch_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{name}: the bag replays: {e}"));
+        assert!(
+            matches!(
+                outcome.read_identity,
+                replay_engine::ReadIdentityReport::BestEffort { .. }
+            ),
+            "{name}: replayed on the queue re-creation path: {:?}",
+            outcome.read_identity
+        );
+        println!(
+            "RI_BELOW_NINE {name}: passed={} violations={:?} read_log={:?}",
+            outcome.passed, outcome.violations, outcome.read_log_divergence
+        );
+        assert!(
+            outcome.passed && outcome.read_log_divergence.is_none(),
+            "{name}: the replay stages the batch frames its recording staged: {:?} {:?}",
+            outcome.violations,
+            outcome.read_log_divergence
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A burst that fires the cap with a frame left over: the live burst's refill
+// after its last fire pops that frame and freezes it unfired, and the next
+// step's first fire serves it.
+// ---------------------------------------------------------------------------
+
+const RC_TOPIC: &str = "/ricap/ext/cam";
+const RC_STEPS: usize = 4;
+
+fn ri_capped_yaml() -> &'static str {
+    "name: ricap\nprefix: ricap\nnodes:\n\
+     \x20 - id: sink\n    type: ri_deep_fifo_sink\n    inputs:\n      - name: inp\n        source: /ricap/ext/cam\n"
+}
+
+fn ri_capped_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![(
+        "sink",
+        Box::new(RiDeepFifoSinkEntry::with_state(RiDeepFifoSink {
+            tag: RI_SINK,
+            ..Default::default()
+        })),
+    )])
+}
+
+/// The capped-burst recording: one cap of frames at each of the first two
+/// steps, a few after, its read log then carrying the trailing refill. The
+/// recorder of a consumer whose queue refills during its burst pops the next
+/// step's first frame at the cap step's end; this in-process recording stages
+/// no arrival inside a burst, so its next step's first pop record (and the
+/// annotation before it) is moved to the end of the cap step, which is the
+/// read log that recorder writes for the same frames and the same fires.
+fn ri_capped_live() -> RiLive {
+    let cap = usize::try_from(cerulion_core::scheduler::DATA_PENDING_CARRY_CLAMP).unwrap();
+    let mut x = 0.0;
+    let per_step: Vec<Vec<f64>> = (0..RC_STEPS)
+        .map(|k| {
+            let n = if k < 2 { cap } else { 3 };
+            (0..n)
+                .map(|_| {
+                    x += 1.0;
+                    x
+                })
+                .collect()
+        })
+        .collect();
+    ri_take();
+    let mut rec = record_reference_impl(
+        ri_capped_yaml(),
+        ri_capped_factories,
+        &[ExternalDrive {
+            topic: RC_TOPIC.to_string(),
+            per_step,
+        }],
+        &[DELTA_MS; RC_STEPS],
+        cap,
+        true,
+    );
+    let reads = ri_take();
+    let sink_idx = rec.node_ids.iter().position(|n| n == "sink").unwrap() as u32;
+    let sink_record =
+        |r: &TraceRingRecord| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == sink_idx;
+    let fires_at = |rec: &Recording, step: u64| {
+        rec.trace
+            .iter()
+            .filter(|r| {
+                r.record_type == RECORD_TYPE_FIRE && r.node_idx == sink_idx && r.step == step
+            })
+            .count()
+    };
+    let pops_at = |rec: &Recording, step: u64| {
+        rec.trace
+            .iter()
+            .filter(|r| sink_record(r) && is_read_record(r) && r.step == step)
+            .map(|r| unpack_read_outcome_popped(r.duration_ns) as usize)
+            .sum::<usize>()
+    };
+    for step in 0..2 {
+        assert_eq!(
+            (fires_at(&rec, step), pops_at(&rec, step)),
+            (cap, cap),
+            "PREMISE: step {step} fires the cap, one pop per fire"
+        );
+    }
+    {
+        // Step 1's first pop: its annotation and its read.
+        let first = rec
+            .trace
+            .iter()
+            .position(|r| sink_record(r) && r.step == 1)
+            .expect("PREMISE: step 1 reads");
+        assert!(
+            !is_read_record(&rec.trace[first]) && is_read_record(&rec.trace[first + 1]),
+            "PREMISE: a read of a producer-less external topic is preceded by its own annotation"
+        );
+        let mut moved: Vec<TraceRingRecord> = rec.trace.drain(first..first + 2).collect();
+        for r in &mut moved {
+            r.step = 0;
+        }
+        let last0 = rec
+            .trace
+            .iter()
+            .rposition(|r| sink_record(r) && r.step == 0)
+            .expect("PREMISE: step 0 reads");
+        for (i, r) in moved.into_iter().enumerate() {
+            rec.trace.insert(last0 + 1 + i, r);
+        }
+        assert_eq!(
+            pops_at(&rec, 0),
+            cap + 1,
+            "the cap step holds the trailing pop"
+        );
+        assert_eq!(pops_at(&rec, 1), cap - 1);
+    }
+    RiLive { rec, reads }
+}
+
+/// The capped-burst bag: no producer labels (one external writer).
+fn ri_capped_bag(rec: &Recording, path: &std::path::Path) {
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        None,
+        None,
+        Some(rec.stage_rows.clone()),
+    );
+}
+
+/// A burst that fired the cap and carried one frame into the next step
+/// replays read for read under `--verify`: the trace-driven burst drives the
+/// trailing refill the recording holds, so the next step's first fire serves
+/// the carried frame. The pop-count re-derivation reads both steps clean, and
+/// a neutral resim of the same bag reports no fire-schedule divergence.
+#[test]
+#[serial]
+fn a_capped_burst_carries_its_trailing_frame_and_replays_read_for_read() {
+    let live = ri_capped_live();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_capped.mcap");
+    ri_capped_bag(&live.rec, &bag);
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_capped_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    ri_assert_fed(&outcome);
+    let compared = ri_judge(&live.reads, &replayed, &[RI_SINK]).expect("reads equal");
+    println!("RI_ORACLE capped_burst: compared={compared}");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(outcome.passed, "{:?}", outcome.violations);
+
+    let (neutral, _) = ri_replay(
+        &bag,
+        ri_capped_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let neutral = neutral.expect("the neutral resim runs");
+    let verdict = replay_engine::render_verdict(&neutral, &bag);
+    assert!(
+        !verdict.contains("FIFO pop count"),
+        "a capped burst's trailing pop is no fire-schedule divergence: {verdict}"
+    );
+}
+
+/// MUTANT: the trace-driven burst drops the trailing refill. The carried frame
+/// is never fed at the cap step and every later read of the consumer is one
+/// frame early, which the oracle catches.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_oracle_catches_a_dropped_trailing_refill() {
+    let live = ri_capped_live();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_capped_mutant.mcap");
+    ri_capped_bag(&live.rec, &bag);
+    let guard = cerulion_core::replay_feed::mutants::drop_trailing_refills();
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_capped_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    drop(guard);
+    let outcome = outcome.expect("the mutant replay runs: it refuses nothing up front");
+    let judged = ri_judge(&live.reads, &replayed, &[RI_SINK]);
+    println!(
+        "RI_MUTANT drop_trailing_refills: passed={} judged={judged:?}",
+        outcome.passed
+    );
+    assert!(
+        judged.is_err(),
+        "the oracle caught no read divergence without the trailing refill"
+    );
+    assert!(!outcome.passed, "and the replay verdict is not a pass");
+}
+
+/// MUTANT: the bag lost one frame a read consumed. Refused by name.
+#[test]
+#[serial]
+fn a_frame_missing_from_the_bag_is_refused_by_name() {
+    let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let topic = "/riev/src/out";
+    let lost = live.rec.messages[topic].remove(20);
+    let lost_seq = WireHeader::read_from_buf(&lost).unwrap().sequence;
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_lost_frame.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a consumed frame missing from the bag is refused");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    assert!(
+        msg.contains("read_identity_frame_missing")
+            && msg.contains(&format!("sequence {lost_seq}")),
+        "{msg}"
+    );
+}
+
+/// A second writer's port id for the shared-topic arms below: no node of the
+/// eviction fixture publishes under it.
+const RI_SECOND_WRITER: u128 = 0x0B0B_0B0B_0B0B_0B0B_0B0B_0B0B_0B0B_0B0B;
+
+/// One producer label a recording carries: topic, attribution, writer port id.
+type RiLabelRow = (String, cerulion_bag::ProducerAttribution, u128);
+
+/// The eviction recording made a SHARED topic: the frame `src` published at
+/// one consumed sequence is replaced by a second writer's frame at that same
+/// sequence, and the topic carries the labels a recorder writes once a second
+/// writer appears (one `FrameLabel` per frame, naming its writer). Every read
+/// still names `src`, so `src`'s frame at that sequence is missing and the
+/// second writer's frame is the only frame there. Returns the recording, its
+/// labels and that sequence.
+fn ri_second_writer_live() -> (RiLive, Vec<RiLabelRow>, u32) {
+    let mut live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let topic = "/riev/src/out";
+    let src = real_publisher_id(&live.rec, "src", "out");
+    let frames = live
+        .rec
+        .messages
+        .get_mut(topic)
+        .expect("PREMISE: src's topic is recorded");
+    let swapped = 20;
+    let seq = WireHeader::read_from_buf(&frames[swapped])
+        .unwrap()
+        .sequence;
+    frames[swapped][WireHeader::SIZE..WireHeader::SIZE + 8].copy_from_slice(&2.0f64.to_le_bytes());
+    let labels = (0..frames.len())
+        .map(|i| {
+            let writer = if i == swapped { RI_SECOND_WRITER } else { src };
+            (
+                topic.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                writer,
+            )
+        })
+        .collect();
+    (live, labels, seq)
+}
+
+/// Write the shared-topic recording as a single-rank free-run bag, as
+/// [`ri_bag`] does, with its label records' bytes from `encode`.
+fn ri_second_writer_bag(
+    rec: &Recording,
+    labels: &[RiLabelRow],
+    path: &std::path::Path,
+    encode: LabelEncoder,
+) {
+    let labels: Vec<ProducerLabel<'_>> = labels
+        .iter()
+        .map(|(t, a, id)| (t.as_str(), *a, *id))
+        .collect();
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl_encoded(
+        rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(rec)),
+        Some(&labels),
+        Some(rec.stage_rows.clone()),
+        encode,
+    );
+}
+
+/// A shared topic whose reads name only one writer, whose labels this build
+/// cannot decode, is refused by name rather than fed the other writer's frame
+/// at the sequence a read names.
+///
+/// With readable labels the read whose frame is missing is refused as missing
+/// (the control: the second writer's frame sits at that sequence and the
+/// labeled lookup does not take it). With every label record at a newer
+/// version, the labels read as absent, and a frame found by its sequence alone
+/// would be the second writer's, fed as `src`'s.
+#[test]
+#[serial]
+fn a_shared_topic_whose_labels_cannot_be_read_is_refused_not_fed_by_sequence() {
+    let (live, labels, seq) = ri_second_writer_live();
+    let topic = "/riev/src/out";
+    let dir = tempfile::tempdir().unwrap();
+
+    let readable = dir.path().join("ri_second_writer_readable.mcap");
+    ri_second_writer_bag(&live.rec, &labels, &readable, encode_label_as_recorded);
+    let (outcome, _) = ri_replay(
+        &readable,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("PREMISE: src's frame at the swapped sequence is missing");
+    let msg = err.to_string();
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    assert!(
+        msg.contains("read_identity_frame_missing") && msg.contains(&format!("sequence {seq}")),
+        "PREMISE: with readable labels the missing frame is refused as missing: {msg}"
+    );
+
+    let unreadable = dir.path().join("ri_second_writer_unreadable.mcap");
+    ri_second_writer_bag(
+        &live.rec,
+        &labels,
+        &unreadable,
+        encode_label_as_a_newer_version,
+    );
+    let (outcome, replayed) = ri_replay(
+        &unreadable,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = match outcome {
+        Err(err) => err,
+        Ok(outcome) => panic!(
+            "a fed replay ran over labels it could not read (read identity {:?}, passed {}); \
+             the reads compared to live: {:?}",
+            outcome.read_identity,
+            outcome.passed,
+            ri_judge(&live.reads, &replayed, &[RI_SLOW, RI_FAST])
+        ),
+    };
+    let msg = err.to_string();
+    println!("RI_REFUSAL labels_unread: {msg}");
+    assert_eq!(err.exit_code(), 2, "{msg}");
+    for part in [
+        "read_identity_labels_unread",
+        &format!("topic '{topic}'"),
+        "this build cannot decode",
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// A bag recorded before read identity keeps the queue re-creation path, and
+/// its verdict says the reads were replayed best effort.
+#[test]
+#[serial]
+fn a_bag_recorded_before_read_identity_replays_best_effort_and_says_so() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_format_seven.mcap");
+    ri_bag(&live.rec, &bag, ri_recorder_json_at(7));
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("an older bag still replays");
+    match &outcome.read_identity {
+        replay_engine::ReadIdentityReport::BestEffort { reason } => {
+            assert!(reason.contains("below trace format 8"), "{reason}")
+        }
+        other => panic!("an older bag is not fed: {other:?}"),
+    }
+    assert!(replay_engine::render_verdict(&outcome, &bag)
+        .contains("reads: best effort, no read identity"));
+}
+
+/// A neutral resim keeps the queue re-creation, so the candidate's frames reach
+/// its in-rank consumers; its verdict says the reads were not fed.
+#[test]
+#[serial]
+fn a_neutral_resim_keeps_the_queues_and_is_not_fed() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_neutral.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("a neutral resim runs");
+    match &outcome.read_identity {
+        replay_engine::ReadIdentityReport::BestEffort { reason } => {
+            assert!(reason.contains("--verify"), "{reason}")
+        }
+        other => panic!("a neutral resim is not fed: {other:?}"),
+    }
+    assert!(
+        !replayed.is_empty(),
+        "the neutral resim re-executed the consumers"
+    );
+}
+
+/// MUTANT (`oracle-mutants`): the feed serves each read by recorded timestamp
+/// instead of by identity. The oracle must see the reads diverge.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_oracle_catches_a_feed_by_timestamp() {
+    for (name, yaml, make, tags) in [
+        (
+            "evict",
+            ri_evict_yaml(),
+            ri_evict_factories as fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+            vec![RI_SLOW, RI_FAST],
+        ),
+        (
+            "three_writers",
+            ri_multi_writer_yaml(),
+            ri_multi_writer_factories as fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+            vec![RI_SINK],
+        ),
+    ] {
+        let live = ri_record(yaml, make);
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ri_mutant_{name}.mcap"));
+        ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+        let guard = cerulion_cli_engine::replay_feed::mutants::feed_by_timestamp();
+        let (outcome, replayed) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+        drop(guard);
+        let _ = outcome;
+        let verdict = ri_judge(&live.reads, &replayed, &tags);
+        println!("RI_MUTANT by_timestamp {name}: {verdict:?}");
+        assert!(
+            verdict.is_err(),
+            "the oracle caught no divergence on {name} under the timestamp feed"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-writer edges keep an annotation before every read, under every trace
+// format: a replay stages the recording's records on such an edge, so both
+// sides truncate at the same rim whatever the writers' token sequence.
+// ---------------------------------------------------------------------------
+
+/// The read-log stage rim the multi-writer fixture declares for the relay's
+/// input: the floor, which a window of three annotated reads (six records)
+/// overflows.
+const OB_RIM: u32 = 4;
+const OB_STEPS: usize = 8;
+const OB_BURST: usize = 3;
+
+/// The writer id the fixture's frame `i` is labelled with: one writer, or two
+/// external writers alternating frame by frame.
+fn ob_writer(i: usize, two_writers: bool) -> u128 {
+    if two_writers && i % 2 == 1 {
+        LBL_OTHER
+    } else {
+        LBL_WRITER
+    }
+}
+
+/// The relay's recorded read stream rewritten to what a recorder stages on a
+/// multi-writer edge at a rim of [`OB_RIM`]: per step window, an annotation
+/// before every serving read naming its frame's writer, pairs admitted both or
+/// neither at the rim, and one overflow marker carrying the window's dropped
+/// records. Returns the records dropped.
+fn ob_every_read_trace(rec: &mut Recording, two_writers: bool) -> usize {
+    let relay_idx = rec.node_ids.iter().position(|id| id == "relay").unwrap() as u32;
+    let mut out: Vec<TraceRingRecord> = Vec::with_capacity(rec.trace.len() * 2);
+    let mut window: Vec<TraceRingRecord> = Vec::new();
+    let mut dropped_total = 0usize;
+    let mut frame_ordinal = 0usize;
+    let mut flush = |window: &mut Vec<TraceRingRecord>, out: &mut Vec<TraceRingRecord>| {
+        let Some(first) = window.first().copied() else {
+            return;
+        };
+        let mut staged = 0u32;
+        let mut dropped = 0u32;
+        for r in window.drain(..) {
+            let serving = unpack_read_outcome_popped(r.duration_ns) > 0
+                && r.fire_time_ns != READ_OUTCOME_NO_FRAME;
+            let need = if serving { 2 } else { 1 };
+            let writer = ob_writer(frame_ordinal, two_writers);
+            if serving {
+                frame_ordinal += 1;
+            }
+            if staged + need > OB_RIM {
+                dropped += need;
+                continue;
+            }
+            if serving {
+                out.push(TraceRingRecord::read_outcome_producer(
+                    r.step,
+                    relay_idx,
+                    unpack_read_outcome_meta(r.global_level).0,
+                    Some(r.fire_time_ns as u32),
+                    cerulion_core::wire::fnv1a_hash(&writer.to_le_bytes()),
+                    cerulion_core::trace_ring::read_site_role(r.global_level),
+                ));
+            }
+            out.push(r);
+            staged += need;
+        }
+        if dropped > 0 {
+            dropped_total += dropped as usize;
+            out.push(TraceRingRecord::read_outcome_truncated(
+                first.step,
+                relay_idx,
+                unpack_read_outcome_meta(first.global_level).0,
+                dropped,
+                cerulion_core::read_outcome::ReadSiteRole::Body,
+            ));
+        }
+    };
+    for r in &rec.trace {
+        let relay_read = r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == relay_idx;
+        if relay_read && !is_read_record(r) {
+            continue;
+        }
+        if relay_read {
+            if window.first().is_some_and(|w| w.step != r.step) {
+                flush(&mut window, &mut out);
+            }
+            window.push(*r);
+            continue;
+        }
+        flush(&mut window, &mut out);
+        out.push(*r);
+    }
+    flush(&mut window, &mut out);
+    rec.trace = out;
+    dropped_total
+}
+
+/// A bag of the external relay on a `multi_publisher_topics` topic, three
+/// frames per step, its read log in the shape a recorder stages on that edge,
+/// stamped by `recorder_json`. Returns the records the rim dropped.
+fn ob_multi_writer_bag(path: &std::path::Path, recorder_json: Vec<u8>, two_writers: bool) -> usize {
+    let per_step: Vec<Vec<f64>> = (0..OB_STEPS)
+        .map(|k| (0..OB_BURST).map(|i| (k * 10 + i + 1) as f64).collect())
+        .collect();
+    let mut rec = record_uniform_with_read_log(
+        lbl_yaml(),
+        ext_relay_factories,
+        &[ExternalDrive {
+            topic: LBL_TOPIC.to_string(),
+            per_step,
+        }],
+        OB_STEPS,
+    );
+    let frames = rec.messages[LBL_TOPIC].len();
+    assert_eq!(
+        frames,
+        OB_STEPS * OB_BURST,
+        "PREMISE: every burst frame recorded"
+    );
+    let dropped = ob_every_read_trace(&mut rec, two_writers);
+    let mut rows = serde_json::Map::new();
+    rows.insert(
+        "relay".to_string(),
+        serde_json::json!([[
+            0,
+            cerulion_core::read_outcome::ReadStageRole::Body.wire(),
+            OB_RIM
+        ]]),
+    );
+    let labels: Vec<ProducerLabel<'_>> = (0..frames)
+        .map(|i| {
+            (
+                LBL_TOPIC,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                ob_writer(i, two_writers),
+            )
+        })
+        .collect();
+    let inputs_json = rec.input_names.as_ref().map(|i| serde_json::json!(i));
+    write_bag_impl(
+        &rec,
+        path,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        inputs_json,
+        Some(serde_json::json!(0)),
+        Some(recorder_json),
+        Some(lbl_publishers()),
+        Some(&labels),
+        Some(serde_json::Value::Object(rows)),
+    );
+    dropped
+}
+
+/// The production lockstep `recorder.json`, at this build's trace format.
+fn ob_lockstep_recorder_json() -> Vec<u8> {
+    pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep)
+}
+
+/// The two multi-writer fixtures: a format 7 free-run bag with one external
+/// writer, and a format 8 lockstep bag (replayed on the queue re-creation path,
+/// not fed) with two external writers that the replay's one publisher stands
+/// in for.
+fn ob_fixtures() -> [(&'static str, Vec<u8>, bool); 2] {
+    [
+        ("format7_one_writer", ri_recorder_json_at(7), false),
+        (
+            "format8_lockstep_two_writers",
+            ob_lockstep_recorder_json(),
+            true,
+        ),
+    ]
+}
+
+/// A multi-writer edge whose stage truncated at its recorded rim replays under
+/// `--verify` with the read log equal: the replay stages an annotation before
+/// every read on it, as the recorder did, whatever writer serves the replayed
+/// frames, and truncates where the recording did.
+#[test]
+#[serial]
+fn a_truncated_multi_writer_stage_replays_its_truncation_under_verify() {
+    for (name, recorder_json, two_writers) in ob_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ob_{name}.mcap"));
+        let dropped = ob_multi_writer_bag(&bag, recorder_json, two_writers);
+        assert!(
+            dropped >= OB_STEPS,
+            "PREMISE {name}: every window overflowed the rim ({dropped} dropped)"
+        );
+        let (outcome, _) = ri_replay(
+            &bag,
+            ext_relay_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{name}: the bag replays: {e}"));
+        println!(
+            "OB_COMPAT {name}: passed={} dropped={dropped} violations={:?}",
+            outcome.passed, outcome.violations
+        );
+        assert!(
+            outcome.passed,
+            "{name}: the replay truncates at the recording's rim: {:?}",
+            outcome.violations
+        );
+    }
+}
+
+/// MUTANT: the runtime stages writer runs on multi-writer edges. The replayed
+/// stage then holds every window of the relay's reads, so the recorded overflow
+/// markers have no partner and the read log diverges, on both fixtures.
+#[cfg(feature = "oracle-mutants")]
+#[test]
+#[serial]
+fn the_oracle_catches_writer_runs_on_a_multi_writer_edge() {
+    for (name, recorder_json, two_writers) in ob_fixtures() {
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(format!("ob_mutant_{name}.mcap"));
+        ob_multi_writer_bag(&bag, recorder_json, two_writers);
+        let guard = cerulion_core::replay_feed::mutants::writer_runs_on_multi_writer_edges();
+        let (outcome, _) = ri_replay(
+            &bag,
+            ext_relay_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        drop(guard);
+        let caught = match &outcome {
+            Ok(o) => !o.passed,
+            Err(_) => true,
+        };
+        println!(
+            "RI_MUTANT writer_runs_on_multi_writer_edges {name}: {:?}",
+            outcome.as_ref().map(|o| (o.passed, &o.violations))
+        );
+        assert!(caught, "{name}: the read log caught no divergence");
+    }
+}
+
+// ===========================================================================
+// External (driver) nodes: their outputs are recorded inputs
+// ===========================================================================
+//
+// A driver reads a device only the live run has. The reference run builds the
+// camera below CONNECTED, so every wake publishes the device's next reading;
+// a replay builds it with no device, the way a camera node finds no open fd at
+// replay, so its tick publishes nothing. Every frame carries the device id in
+// `x` (one writer per topic, which is what the read-identity bag writers read
+// `x` as), the reading's index `k` in `y`, and a value in `z`: the device's k-th
+// reading is the hand oracle `z = 3k + 2`, and the meter publishes
+// `z * gain + 1`, so every recorded and replayed value below is checked against
+// arithmetic, never against another run.
+
+/// The tag the camera logs each reading it publishes under.
+const DRV_CAMERA: f64 = 6.0;
+/// The tag the meter logs each frame it reads under.
+const DRV_METER: f64 = 7.0;
+/// The recorded meter's gain.
+const DRV_GAIN: f64 = 10.0;
+/// The camera device's id, in every frame's `x`.
+const DRV_DEVICE: f64 = 1.0;
+/// The camera's output topic.
+const DRV_IMAGE: &str = "/drv/cam/image";
+/// The meter's output topic.
+const DRV_BRIGHTNESS: &str = "/drv/meter/brightness";
+
+/// A camera driver: an `external` node fired by its device.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvCameraNode {
+    #[output]
+    image: Vector3,
+    /// The device is attached: true in the live run only.
+    connected: bool,
+    /// Readings published so far.
+    frames: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvCameraNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        if !self.connected {
+            // No device: nothing to dequeue, and an output a tick never
+            // writes is never published.
+            return Ok(());
+        }
+        self.frames += 1.0;
+        let k = self.frames;
+        let reading = 3.0 * k + 2.0;
+        self.image.x = DRV_DEVICE;
+        self.image.y = k;
+        self.image.z = reading;
+        ri_log(DRV_CAMERA, DRV_DEVICE, k, reading);
+        Ok(())
+    }
+}
+
+/// A data-triggered meter over the camera's frames.
+#[cerulion_node]
+#[derive(Default)]
+struct DrvMeterNode {
+    #[input(trigger)]
+    image: Vector3,
+    #[output]
+    brightness: Vector3,
+    gain: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvMeterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let x = self.image.x;
+        let y = self.image.y;
+        let z = self.image.z;
+        ri_log(DRV_METER, x, y, z);
+        self.brightness.x = x;
+        self.brightness.y = y;
+        self.brightness.z = z * self.gain + 1.0;
+        Ok(())
+    }
+}
+
+/// The camera feeding the meter: the shape of `examples/v4l2_camera`.
+fn drv_yaml() -> &'static str {
+    "name: drv\nprefix: drv\nnodes:\n\
+     \x20 - id: cam\n    type: drv_camera_node\n    outputs:\n      - name: image\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: meter\n    type: drv_meter_node\n    inputs:\n      - name: image\n        source: cam/image\n    outputs:\n      - name: brightness\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn drv_factories(connected: bool, gain: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "cam",
+            Box::new(DrvCameraNodeEntry::with_state(DrvCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "meter",
+            Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                gain,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live run: the camera's device is attached.
+fn drv_live_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_factories(true, DRV_GAIN)
+}
+
+/// The replayed candidate: the same nodes, and no device.
+fn drv_replay_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_factories(false, DRV_GAIN)
+}
+
+/// A candidate whose meter changed its gain.
+fn drv_changed_meter_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_factories(false, DRV_GAIN + 1.0)
+}
+
+/// A Vector3 wire frame's `(x, y, z)`.
+fn drv_xyz(frame: &[u8]) -> (f64, f64, f64) {
+    let payload = &frame[WireHeader::SIZE..];
+    let at = |i: usize| f64::from_le_bytes(payload[i * 8..i * 8 + 8].try_into().unwrap());
+    (at(0), at(1), at(2))
+}
+
+/// The live run, its camera fired before every step as its device wakes it,
+/// anchored to the hand oracle: the camera published reading k = 1..=N with
+/// `z = 3k + 2`, the meter read each in order and published `z = 30k + 21`.
+fn drv_record() -> RiLive {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_yaml(),
+        drv_live_factories,
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["cam"],
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let image = &live.rec.messages[DRV_IMAGE];
+    assert!(
+        image.len() >= RI_MIN_READS,
+        "PREMISE: the camera published every wake: {} frames",
+        image.len()
+    );
+    for (i, f) in image.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 3.0 * k + 2.0),
+            "recorded camera frame {i}"
+        );
+    }
+    let brightness = &live.rec.messages[DRV_BRIGHTNESS];
+    assert!(
+        brightness.len() >= RI_MIN_READS,
+        "PREMISE: the meter published: {} frames",
+        brightness.len()
+    );
+    for (i, f) in brightness.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 30.0 * k + 21.0),
+            "recorded meter frame {i}"
+        );
+    }
+    let meter_reads: Vec<(f64, f64, f64)> = ri_by_consumer(&live.reads)
+        .remove(&DRV_METER.to_bits())
+        .unwrap_or_default()
+        .iter()
+        .map(|(x, y, z)| (f64::from_bits(*x), f64::from_bits(*y), f64::from_bits(*z)))
+        .collect();
+    let want: Vec<(f64, f64, f64)> = (1..=brightness.len())
+        .map(|k| (DRV_DEVICE, k as f64, 3.0 * k as f64 + 2.0))
+        .collect();
+    assert_eq!(
+        meter_reads, want,
+        "the live meter read every reading in order"
+    );
+    live
+}
+
+/// The camera and the meter in one process (`--single-process`): a
+/// single-rank free-run bag.
+fn drv_single_rank_bag(live: &RiLive, dir: &std::path::Path) -> std::path::PathBuf {
+    let bag = dir.join("drv_single.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    bag
+}
+
+/// One process per node, the `graph run` default: the meter on rank 1.
+fn drv_two_rank_bag(live: &RiLive, dir: &std::path::Path) -> std::path::PathBuf {
+    let bag = dir.join("drv_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "meter");
+    bag
+}
+
+/// A `--verify` replay of a driver graph passes with exit 0: the meter is fed
+/// the camera's recorded frames by read identity, reproduces its recorded
+/// readings byte for byte and is the one topic checked and credited. The
+/// camera's topic is a recorded input, so no `missing-topic` is reported
+/// although the replayed camera, with no device, published nothing. Both
+/// process layouts.
+#[test]
+#[serial]
+fn a_verify_of_a_driver_graph_feeds_the_driver_frames_and_passes() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let meter_reads = ri_by_consumer(&live.reads)[&DRV_METER.to_bits()].len();
+    for (layout, bag) in [
+        ("single-rank", drv_single_rank_bag(&live, dir.path())),
+        ("two-rank", drv_two_rank_bag(&live, dir.path())),
+    ] {
+        let (outcome, replayed) = ri_replay(
+            &bag,
+            drv_replay_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: no violation, the camera's topic least of all: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}: the replay passes");
+        assert_eq!(resim_exit(&outcome, true), 0, "{layout}: exit 0");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked and credited"
+        );
+        assert_eq!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::Fed {
+                reads: meter_reads,
+                frames: meter_reads
+            },
+            "{layout}: each meter read was fed the one camera frame it read live"
+        );
+        let compared = ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: {e}"));
+        assert_eq!(compared, meter_reads, "{layout}");
+        assert!(
+            !ri_by_consumer(&replayed).contains_key(&DRV_CAMERA.to_bits()),
+            "{layout}: the replayed camera had no device and published nothing"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[], &[])),
+            "{layout}: the camera's topic is the one recorded input"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        let pass_line = format!(
+            "replay PASS: {} ({} tick(s) replayed, 1/1 topic(s) matched byte-for-byte and were \
+             credited)",
+            bag.display(),
+            outcome.ticks_replayed
+        );
+        let input_note = format!(
+            "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were \
+             NOT compared (driver nodes, as the replayed build declares them: cam): {DRV_IMAGE}"
+        );
+        assert_eq!(
+            verdict.lines().rev().take(2).collect::<Vec<_>>(),
+            vec![pass_line.as_str(), input_note.as_str()],
+            "{layout}: the verdict ends with the NOTE naming the camera and its topic, then \
+             the PASS line: {verdict}"
+        );
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![input_note.as_str()],
+            "{layout}: one driver NOTE: {verdict}"
+        );
+        assert!(!verdict.contains("missing-topic"), "{layout}: {verdict}");
+    }
+}
+
+/// The camera graph's stamp, stated by hand: the camera ran as a driver, the
+/// meter as an ordinary node.
+fn drv_stamp() -> Vec<u8> {
+    stamped_recorder_json(
+        replay_engine::CoordinationMode::FreeRun,
+        &[("cam", true), ("meter", false)],
+    )
+}
+
+/// A recording whose stamp names its drivers, replayed by the build that
+/// declares the same ones, is classified BY THE RECORDING: `--verify` passes
+/// 1/1 with exit 0 over the same frames as an unstamped one, the NOTE says the
+/// drivers are as the recording declares them, the `--report` says
+/// `declared_by: recording`, and nothing warns that the driver set came from
+/// the build. Both process layouts.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_stamped_driver_bag_whose_build_matches_passes_classified_by_the_recording() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_stamped_single.mcap");
+    ri_bag(&live.rec, &single, drv_stamp());
+    let two_rank = dir.path().join("drv_stamped_two_rank.mcap");
+    ri_two_rank_bag_stamped(&live.rec, &two_rank, |id| id == "meter", true, drv_stamp());
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        let report = dir.path().join(format!("drv_stamped_report_{run}.json"));
+        let (outcome, replayed) = ri_replay_reporting(
+            bag,
+            drv_replay_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked"
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: the meter read the recorded frames: {e}"));
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(replay_engine::DriverInputsReport {
+                declared_by: replay_engine::DriverSetSource::Recording,
+                ..drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[], &[])
+            }),
+            "{layout}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).expect("the report is written"))
+                .expect("the report is JSON");
+        assert_eq!(
+            json["driver_inputs"]["declared_by"], "recording",
+            "{layout}: {json}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the recording declares them: cam): \
+                 {DRV_IMAGE}"
+            )],
+            "{layout}: {verdict}"
+        );
+    }
+    logs_assert(|lines: &[&str]| {
+        match cerulion_core::testing::count_at(lines, "WARN", DRV_FALLBACK_WARN) {
+            0 => Ok(()),
+            n => Err(format!("a stamped bag takes no fallback: {n} warn(s)")),
+        }
+    });
+}
+
+/// Two replays of the same stamped bag by the same build write the same
+/// `--report` bytes, `declared_by` included (Replay = Live).
+#[test]
+#[serial]
+fn a_verify_of_a_stamped_driver_graph_is_deterministic() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_stamped_det.mcap");
+    ri_bag(&live.rec, &bag, drv_stamp());
+    let reports: Vec<Vec<u8>> = (0..2)
+        .map(|run| {
+            let report = dir.path().join(format!("drv_stamped_det_{run}.json"));
+            let (outcome, _) = ri_replay_reporting(
+                &bag,
+                drv_replay_factories,
+                replay_engine::ReplayPurpose::Verify,
+                None,
+                None,
+                Some(report.clone()),
+            );
+            assert!(outcome.expect("the replay runs").passed, "run {run}");
+            std::fs::read(&report).expect("the report is written")
+        })
+        .collect();
+    assert_eq!(reports[0], reports[1], "two runs, one report");
+    let json: serde_json::Value = serde_json::from_slice(&reports[0]).expect("JSON");
+    assert_eq!(json["driver_inputs"]["declared_by"], "recording");
+}
+
+/// A node whose metadata cannot be read, as a corrupt library's is.
+struct DrvUnreadableInfo;
+
+impl NodeEntry for DrvUnreadableInfo {
+    fn info(&self) -> cerulion_core::TransportResult<cerulion_core::NodeInfo> {
+        Err(cerulion_core::TransportError::GraphError {
+            reason: "corrupt node info".to_string(),
+        })
+    }
+    fn init(&mut self, _context: cerulion_core::NodeContext) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        Ok(())
+    }
+}
+
+/// The other direction: the stamp records the camera as a driver and the
+/// replayed build does not declare it external, whether it runs it as a
+/// period node or cannot even read its metadata. The replay is REFUSED
+/// (exit 2) naming the node before any pass runs, so no consumer reads a
+/// frame.
+#[test]
+#[serial]
+fn a_recorded_driver_the_build_does_not_declare_external_is_refused_naming_it() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_driver_lost.mcap");
+    ri_bag(&live.rec, &bag, drv_stamp());
+    let want = "this bag is not replay-grade FOR THIS WORKSPACE: 1 node(s) changed whether they \
+                are external (driver) nodes since the bag was recorded:\n  \
+                - cam: recorded as an external (driver) node; the replayed build does not \
+                declare it external\n\
+                A replay takes a driver's outputs as recorded inputs and compares every other \
+                node's outputs, so it judges each node the way the recording ran it, and it \
+                cannot judge a node the replayed build runs the other way. Re-record the bag \
+                with the current workspace, or check out the recording-era node sources before \
+                replaying.";
+    let period_cam = || {
+        factories(vec![
+            (
+                "cam",
+                Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                    writer: 1.0,
+                    ..Default::default()
+                })) as Box<dyn NodeEntry>,
+            ),
+            (
+                "meter",
+                Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                    gain: DRV_GAIN,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    let unreadable_cam = || {
+        factories(vec![
+            ("cam", Box::new(DrvUnreadableInfo) as Box<dyn NodeEntry>),
+            (
+                "meter",
+                Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                    gain: DRV_GAIN,
+                    ..Default::default()
+                })),
+            ),
+        ])
+    };
+    for (build, make) in [
+        (
+            "period",
+            &period_cam as &dyn Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+        ),
+        ("unreadable", &unreadable_cam),
+    ] {
+        let (outcome, replayed) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+        match outcome {
+            Err(e @ ReplayError::DriverSetDrift { .. }) => {
+                assert_eq!(e.to_string(), want, "{build}");
+                assert_eq!(e.exit_code(), 2, "{build}");
+            }
+            other => panic!("{build}: expected the refusal, got {other:?}"),
+        }
+        assert!(replayed.is_empty(), "{build}: no consumer read a frame");
+    }
+}
+
+/// A [`replay_engine::DriverInputsReport`] built from hand-written lists,
+/// with no unattributed shared topic.
+fn drv_inputs(
+    nodes: &[&str],
+    input: &[&str],
+    shared: &[&str],
+    unfed: &[&str],
+    unread: &[&str],
+) -> replay_engine::DriverInputsReport {
+    let owned = |list: &[&str]| list.iter().map(|t| (*t).to_string()).collect::<Vec<_>>();
+    replay_engine::DriverInputsReport {
+        nodes: owned(nodes),
+        // Every driver fixture that uses this helper writes a bag with no
+        // driver stamp (`ri_free_run_recorder_json`), the arm an older
+        // recording takes; a stamped fixture overrides it.
+        declared_by: replay_engine::DriverSetSource::ReplayedBuild,
+        input_topics: owned(input),
+        shared_topics: owned(shared),
+        unattributed_topics: Vec::new(),
+        unfed_topics: owned(unfed),
+        unread_topics: owned(unread),
+    }
+}
+
+/// The verdict lines that speak of external (driver) nodes, in order.
+fn drv_driver_lines(verdict: &str) -> Vec<&str> {
+    verdict
+        .lines()
+        .filter(|l| l.contains("external (driver)"))
+        .collect()
+}
+
+/// A candidate whose meter changed fails with exit 1, naming the meter's
+/// topic as a byte mismatch and nothing about the camera's.
+#[test]
+#[serial]
+fn a_changed_meter_in_a_driver_graph_exits_1_naming_its_topic() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    for (layout, bag) in [
+        ("single-rank", drv_single_rank_bag(&live, dir.path())),
+        ("two-rank", drv_two_rank_bag(&live, dir.path())),
+    ] {
+        let (outcome, _) = ri_replay(
+            &bag,
+            drv_changed_meter_factories,
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(!outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 1, "{layout}: exit 1");
+        let named: Vec<(&str, &ViolationClass)> = outcome
+            .violations
+            .iter()
+            .map(|v| (v.topic.as_str(), &v.class))
+            .collect();
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(DRV_BRIGHTNESS, ViolationClass::ByteMismatch { .. })]
+            ),
+            "{layout}: exactly the meter's byte mismatch: {named:?}"
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        assert!(
+            verdict.contains(&format!("  - {DRV_BRIGHTNESS} [byte-mismatch]: ")),
+            "{layout}: {verdict}"
+        );
+        assert!(
+            !verdict.contains(&format!("  - {DRV_IMAGE} [")),
+            "{layout}: no violation names the camera's topic: {verdict}"
+        );
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the replayed build declares them: cam): \
+                 {DRV_IMAGE}"
+            )],
+            "{layout}: the FAIL verdict names the recorded input too: {verdict}"
+        );
+    }
+}
+
+/// A bag whose record-health stamp says the recorder lost camera frames still
+/// fails with exit 1, naming the camera's topic: its input stream is not the
+/// one the live meter read.
+#[test]
+#[serial]
+fn a_driver_topic_stamped_lossy_still_fails_naming_it() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let (outcome, _) = ri_replay_stamped(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        None,
+        health_stamp(&[(DRV_IMAGE, 2, 1, false, false)], 0),
+        None,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    assert_sole_tap_loss(&outcome, DRV_IMAGE, 2, 1, false);
+    assert_eq!(resim_exit(&outcome, true), 1);
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 1),
+        "the lossy camera topic is checked and failed, the meter's passed"
+    );
+}
+
+/// A replay that aborts after the camera's rank completed still names the
+/// camera topic's record-side loss in its partial `--report`: the stamp is a
+/// fact about the bag, judged once a rank of the topic's driver completed,
+/// though nothing compares the topic's frames. The meter's rank refuses to
+/// init, so its topic is not judged.
+#[test]
+#[serial]
+fn a_partial_report_names_a_lossy_driver_topic_whose_rank_completed() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let report = dir.path().join("drv_partial_report.json");
+    let (outcome, _) = ri_replay_stamped(
+        &bag,
+        || {
+            factories(vec![
+                (
+                    "cam",
+                    Box::new(DrvCameraNodeEntry::with_state(DrvCameraNode::default())),
+                ),
+                (
+                    "meter",
+                    Box::new(InitFailsEntry {
+                        inner: Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                            gain: DRV_GAIN,
+                            ..Default::default()
+                        })),
+                    }),
+                ),
+            ])
+        },
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+        health_stamp(&[(DRV_IMAGE, 2, 1, false, false)], 0),
+        None,
+    );
+    let err = outcome.expect_err("the meter refuses to init, so the run aborts at rank 1");
+    assert_eq!(err.exit_code(), 5, "{err}");
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&report).expect("the partial report is written despite the abort"),
+    )
+    .expect("the partial report is JSON");
+    assert_eq!(json["aborted"]["failed_at_rank"], 1, "{json}");
+    assert_eq!(
+        json["rank_execution"]
+            .as_array()
+            .map(|ranks| ranks.iter().map(|r| r["rank"].clone()).collect::<Vec<_>>()),
+        Some(vec![serde_json::json!(0)]),
+        "the camera's rank completed: {json}"
+    );
+    assert_eq!(
+        (
+            json["topics_checked"].as_u64(),
+            json["topics_passed"].as_u64()
+        ),
+        (Some(1), Some(0)),
+        "the lossy camera topic is checked and failed, the meter's is not judged: {json}"
+    );
+    let violations: Vec<(&str, &str, u64)> = json["violations"]
+        .as_array()
+        .expect("violations is an array")
+        .iter()
+        .map(|v| {
+            (
+                v["topic"].as_str().unwrap_or_default(),
+                v["class"]["kind"].as_str().unwrap_or_default(),
+                v["class"]["frames_lost"].as_u64().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        violations,
+        vec![(DRV_IMAGE, "RecordSideTapLoss", 2)],
+        "exactly the camera topic's record-side loss: {json}"
+    );
+}
+
+/// A bag that lost a camera frame the meter read is refused with exit 2,
+/// naming the meter's read and the lost frame: the replay never feeds it
+/// another frame in its place.
+#[test]
+#[serial]
+fn a_driver_bag_missing_a_frame_the_meter_read_is_refused_naming_it() {
+    let mut live = drv_record();
+    // Reading k = 11, a frame the live meter read (it read every one).
+    let lost = live.rec.messages[DRV_IMAGE].remove(10);
+    assert_eq!(
+        drv_xyz(&lost),
+        (DRV_DEVICE, 11.0, 35.0),
+        "PREMISE: reading k = 11 is 3k + 2"
+    );
+    let lost_seq = WireHeader::read_from_buf(&lost)
+        .expect("a camera frame carries a wire header")
+        .sequence;
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let (outcome, _) = ri_replay(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a read of a frame the bag lost is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    let msg = err.to_string();
+    for part in [
+        "read_identity_frame_missing",
+        "node 'meter'",
+        "input 'image'",
+        &format!("topic '{DRV_IMAGE}'"),
+        &format!("sequence {lost_seq}: "),
+        "the recorder lost it",
+    ] {
+        assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
+    }
+}
+
+/// Two replays of one driver bag are identical: the same `--report` bytes and
+/// the same reads, element for element.
+#[test]
+#[serial]
+fn a_verify_of_a_driver_graph_is_deterministic() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let mut runs = Vec::new();
+    for run in 0..2 {
+        let report = dir.path().join(format!("drv_report_{run}.json"));
+        let (outcome, replayed) = ri_replay_reporting(
+            &bag,
+            drv_replay_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("run {run}: {e}"));
+        assert!(outcome.passed, "run {run}: {:?}", outcome.violations);
+        runs.push((
+            std::fs::read(&report).expect("the report is written"),
+            replayed,
+        ));
+    }
+    assert!(!runs[0].1.is_empty(), "PREMISE: the meter read");
+    assert_eq!(runs[0].0, runs[1].0, "byte-identical reports");
+    assert_eq!(runs[0].1, runs[1].1, "identical reads");
+}
+
+/// A neutral `--resim all` of the two-rank bag feeds the meter through the
+/// injector on its cross-rank edge, since a resim without `--verify` feeds no
+/// read by identity: the camera's topic is still the meter's input there, and
+/// the meter still reproduces its readings.
+#[test]
+#[serial]
+fn a_neutral_resim_of_a_driver_graph_injects_the_driver_frames_across_ranks() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_two_rank_bag(&live, dir.path());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("the neutral resim runs");
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::BestEffort { .. }
+        ),
+        "PREMISE: a neutral resim feeds no read by identity: {:?}",
+        outcome.read_identity
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 1));
+    ri_judge(&live.reads, &replayed, &[DRV_METER]).expect("the meter's reads are the live ones");
+    drv_assert_neutral_summary_names_the_input(
+        &outcome,
+        &bag,
+        &format!(
+            "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and were \
+             NOT compared (driver nodes, as the replayed build declares them: cam): {DRV_IMAGE}"
+        ),
+    );
+}
+
+/// The neutral `--resim` summary of `outcome` prints `input_note` under its
+/// count of one produced topic, and its match observation names the driver
+/// frames the comparison left out.
+fn drv_assert_neutral_summary_names_the_input(
+    outcome: &ReplayOutcome,
+    bag: &std::path::Path,
+    input_note: &str,
+) {
+    let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+        &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(outcome),
+        bag,
+    );
+    let lines: Vec<&str> = summary.lines().map(str::trim).collect();
+    let count = format!(
+        "re-executed {} step(s), 1 produced topic(s)",
+        outcome.ticks_replayed
+    );
+    let observation = "observation: the re-executed frames match the recording byte-for-byte, \
+                       except the external (driver) frames the NOTE lines above leave out, which \
+                       were not compared";
+    let at = lines
+        .iter()
+        .position(|l| *l == count)
+        .unwrap_or_else(|| panic!("the summary counts one produced topic: {summary}"));
+    assert_eq!(
+        lines.get(at + 1..at + 3),
+        Some(&[input_note, observation][..]),
+        "the driver NOTE follows the count, then the narrowed observation: {summary}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("byte-for-byte")).count(),
+        1,
+        "{summary}"
+    );
+}
+
+/// The recorded period writer's output topic in the reclassification graph.
+const DRV_RECLASS_OUT: &str = "/drvx/src/out";
+/// The meter's output topic in the reclassification graph.
+const DRV_RECLASS_BRIGHTNESS: &str = "/drvx/meter/brightness";
+
+/// A period writer (`src`, writer 1) feeding the meter.
+fn drv_reclass_yaml() -> &'static str {
+    "name: drvx\nprefix: drvx\nnodes:\n\
+     \x20 - id: src\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: meter\n    type: drv_meter_node\n    inputs:\n      - name: image\n        source: src/out\n    outputs:\n      - name: brightness\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// What a build declares in place of the recorded period writer: an
+/// `external` node whose k-th tick writes `(1, k, -1)`, a changed output.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvReclassifiedNode {
+    #[output]
+    out: Vector3,
+    /// Ticks run so far.
+    ticks: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvReclassifiedNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1.0;
+        self.out.x = 1.0;
+        self.out.y = self.ticks;
+        self.out.z = -1.0;
+        Ok(())
+    }
+}
+
+/// The reclassification graph with `src` as `src_entry` builds it.
+fn drv_reclass_factories(src_entry: Box<dyn NodeEntry>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", src_entry),
+        (
+            "meter",
+            Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                gain: DRV_GAIN,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live reclassification run: `src` a period writer publishing
+/// `(1, k, 1_000_000 + 7k)`, the meter reading each and publishing
+/// `(1, k, 10_000_001 + 70k)`, anchored to that hand oracle.
+fn drv_reclass_record() -> RiLive {
+    let live = ri_record(drv_reclass_yaml(), || {
+        drv_reclass_factories(Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: 1.0,
+            ..Default::default()
+        })))
+    });
+    let out = &live.rec.messages[DRV_RECLASS_OUT];
+    let c = out.len();
+    assert!(c >= RI_MIN_READS, "PREMISE: the writer published: {c}");
+    for (i, f) in out.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (1.0, k, 1_000_000.0 + 7.0 * k),
+            "recorded writer frame {i}"
+        );
+    }
+    let brightness = &live.rec.messages[DRV_RECLASS_BRIGHTNESS];
+    assert_eq!(brightness.len(), c, "PREMISE: the meter read every frame");
+    for (i, f) in brightness.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (1.0, k, 10_000_001.0 + 70.0 * k),
+            "recorded meter frame {i}"
+        );
+    }
+    live
+}
+
+/// The build that declares the recorded period writer `src` external.
+fn drv_reclassified_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    drv_reclass_factories(Box::new(DrvReclassifiedNodeEntry::with_state(
+        DrvReclassifiedNode::default(),
+    )))
+}
+
+/// The fallback warn an unstamped recording's replay logs when its build
+/// declares a driver.
+const DRV_FALLBACK_WARN: &str = "the driver set comes from the build being replayed";
+
+/// A recording made BEFORE the driver stamp records no node's policy, so the
+/// replayed build's declarations decide which nodes are drivers. A build that
+/// declares `external` a node recorded as a period writer, and changes what it
+/// writes, takes that node's outputs as recorded inputs: its changed frames,
+/// which `--record-out` holds as `(1, k, -1)`, are not compared, the meter is
+/// fed the recorded frames and reproduces its readings, and `--verify` passes
+/// 1/1 with exit 0. That narrowing cannot be caught on such a bag, so it is
+/// stated where a reader of the run sees it: ONE warn per replay naming the
+/// node, the verdict NOTE, and the `--report`'s `driver_inputs`, whose
+/// `declared_by` is `replayed_build`. One process and two.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn an_unstamped_bag_whose_build_declares_a_recorded_node_external_warns_and_names_it() {
+    let live = drv_reclass_record();
+    let c = live.rec.messages[DRV_RECLASS_OUT].len();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_reclass_single.mcap");
+    ri_bag(&live.rec, &single, ri_free_run_recorder_json());
+    let two_rank = dir.path().join("drv_reclass_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &two_rank, |id| id == "meter");
+    let changed: Vec<(f64, f64, f64)> = (1..=c).map(|k| (1.0, k as f64, -1.0)).collect();
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        let record_out = dir.path().join(format!("drv_reclass_out_{run}.mcap"));
+        let report = dir.path().join(format!("drv_reclass_report_{run}.json"));
+        let (outcome, replayed) = ri_replay_stamped(
+            bag,
+            drv_reclassified_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report.clone()),
+            RecordHealthReport::Absent,
+            Some(record_out.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked"
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: the meter read the recorded frames: {e}"));
+        assert_eq!(
+            drv_record_out_frames(&record_out)
+                .get(DRV_RECLASS_OUT)
+                .cloned()
+                .unwrap_or_default(),
+            changed,
+            "{layout}: the reclassified node published its changed output"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["src"], &[DRV_RECLASS_OUT], &[], &[], &[])),
+            "{layout}"
+        );
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&report).expect("the report is written"))
+                .expect("the report is JSON");
+        assert_eq!(
+            json["driver_inputs"],
+            serde_json::json!({
+                "nodes": ["src"],
+                "declared_by": "replayed_build",
+                "input_topics": [DRV_RECLASS_OUT],
+                "shared_topics": [],
+                "unattributed_topics": [],
+                "unfed_topics": [],
+                "unread_topics": [],
+            }),
+            "{layout}: {json}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the replayed build declares them: src): \
+                 {DRV_RECLASS_OUT}"
+            )],
+            "{layout}: {verdict}"
+        );
+    }
+    // ONE fallback warn per replay (two replays), each naming the node and
+    // the graph as fields.
+    logs_assert(|lines: &[&str]| {
+        let warns: Vec<&&str> = lines
+            .iter()
+            .filter(|l| {
+                cerulion_core::testing::line_level(l) == Some("WARN")
+                    && l.contains(DRV_FALLBACK_WARN)
+            })
+            .collect();
+        match warns.as_slice() {
+            [a, b]
+                if [a, b].iter().all(|l| {
+                    l.contains("node_ids=src")
+                        && l.contains("driver_nodes=1")
+                        && l.contains("graph=drvx")
+                }) =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected one fallback warn per replay naming src, got {other:?}"
+            )),
+        }
+    });
+}
+
+/// A recording made with the driver stamp says which nodes ran as drivers,
+/// and the replay judges by it: a build that declares `external` the node
+/// the stamp records as an ordinary period writer is REFUSED (exit 2) naming
+/// the node and the way it changed, under `--verify` and the neutral
+/// `--resim all` alike, before any pass runs. No `--report` and no
+/// `--record-out` is written, and no consumer read a frame. One process and
+/// two.
+#[test]
+#[serial]
+fn a_build_that_newly_declares_a_recorded_node_external_is_refused_naming_it() {
+    let live = drv_reclass_record();
+    let dir = tempfile::tempdir().unwrap();
+    let stamp = stamped_recorder_json(
+        replay_engine::CoordinationMode::FreeRun,
+        &[("meter", false), ("src", false)],
+    );
+    let single = dir.path().join("drv_reclass_stamped_single.mcap");
+    ri_bag(&live.rec, &single, stamp.clone());
+    let two_rank = dir.path().join("drv_reclass_stamped_two_rank.mcap");
+    ri_two_rank_bag_stamped(&live.rec, &two_rank, |id| id == "meter", true, stamp);
+    let want = "this bag is not replay-grade FOR THIS WORKSPACE: 1 node(s) changed whether they \
+                are external (driver) nodes since the bag was recorded:\n  \
+                - src: recorded as an ordinary node; the replayed build declares it external\n\
+                A replay takes a driver's outputs as recorded inputs and compares every other \
+                node's outputs, so it judges each node the way the recording ran it, and it \
+                cannot judge a node the replayed build runs the other way. Re-record the bag \
+                with the current workspace, or check out the recording-era node sources before \
+                replaying.";
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        for purpose in [
+            replay_engine::ReplayPurpose::Verify,
+            replay_engine::ReplayPurpose::Resim,
+        ] {
+            let record_out = dir
+                .path()
+                .join(format!("drv_refused_out_{run}_{purpose:?}.mcap"));
+            let report = dir
+                .path()
+                .join(format!("drv_refused_report_{run}_{purpose:?}.json"));
+            let (outcome, replayed) = ri_replay_stamped(
+                bag,
+                drv_reclassified_factories,
+                purpose,
+                None,
+                None,
+                Some(report.clone()),
+                RecordHealthReport::Absent,
+                Some(record_out.clone()),
+            );
+            match outcome {
+                Err(e @ ReplayError::DriverSetDrift { .. }) => {
+                    assert_eq!(e.to_string(), want, "{layout} {purpose:?}");
+                    assert_eq!(e.exit_code(), 2, "{layout} {purpose:?}");
+                }
+                other => panic!("{layout} {purpose:?}: expected the refusal, got {other:?}"),
+            }
+            assert!(!report.exists(), "{layout} {purpose:?}: no report");
+            assert!(
+                !record_out.exists(),
+                "{layout} {purpose:?}: no --record-out"
+            );
+            assert!(
+                replayed.is_empty(),
+                "{layout} {purpose:?}: no consumer read a frame: {replayed:?}"
+            );
+        }
+    }
+}
+
+/// The camera device's k-th reading, `(device, k, 3k + 2)`, as the bus
+/// camera publishes it.
+fn drv_reading(k: f64) -> (f64, f64, f64) {
+    (DRV_DEVICE, k, 3.0 * k + 2.0)
+}
+
+/// A camera alone: a graph whose only node is a driver, such as a
+/// capture-only graph recorded for later.
+fn drv_cam_only_yaml() -> &'static str {
+    "name: drvc\nprefix: drvc\nnodes:\n\
+     \x20 - id: cam\n    type: drv_camera_node\n    outputs:\n      - name: image\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// The camera-only graph's one topic.
+const DRV_CAM_ONLY_IMAGE: &str = "/drvc/cam/image";
+
+fn drv_cam_only_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![(
+        "cam",
+        Box::new(DrvCameraNodeEntry::with_state(DrvCameraNode {
+            connected,
+            ..Default::default()
+        })),
+    )])
+}
+
+/// A `--verify` of a graph whose only node is a driver compares nothing: the
+/// camera's topic is a recorded input and no node re-computes a topic, so the
+/// verdict is the `0/0` PASS with exit 0. Two WARN lines say so at the default
+/// log level, one naming the topic no node reads and one stating that nothing
+/// was compared; the verdict's NOTE lines and the `--report`'s
+/// `driver_inputs` say the same, so neither a log filter nor a report reader
+/// can take the `0/0` for a comparison.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_of_a_driver_only_graph_passes_comparing_nothing_and_warns() {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_cam_only_yaml(),
+        || drv_cam_only_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["cam"],
+    );
+    ri_take();
+    let image = &rec.messages[DRV_CAM_ONLY_IMAGE];
+    assert!(
+        image.len() >= RI_MIN_READS,
+        "PREMISE: the camera published every wake: {} frames",
+        image.len()
+    );
+    for (i, f) in image.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 3.0 * k + 2.0),
+            "recorded frame {i}"
+        );
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_cam_only.mcap");
+    ri_bag(&rec, &bag, ri_free_run_recorder_json());
+    let report = dir.path().join("drv_cam_only_report.json");
+    let (outcome, replayed) = ri_replay_reporting(
+        &bag,
+        || drv_cam_only_factories(false),
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert!(outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 0);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (0, 0));
+    assert!(
+        replayed.is_empty(),
+        "the replayed camera had no device and published nothing: {replayed:?}"
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(drv_inputs(
+            &["cam"],
+            &[DRV_CAM_ONLY_IMAGE],
+            &[],
+            &[],
+            &[DRV_CAM_ONLY_IMAGE]
+        ))
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the report is written"))
+            .expect("the report is JSON");
+    assert_eq!(
+        (
+            &json["passed"],
+            &json["topics_checked"],
+            &json["driver_inputs"]
+        ),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!(0),
+            &serde_json::json!({
+                "nodes": ["cam"],
+                "declared_by": "replayed_build",
+                "input_topics": [DRV_CAM_ONLY_IMAGE],
+                "shared_topics": [],
+                "unattributed_topics": [],
+                "unfed_topics": [],
+                "unread_topics": [DRV_CAM_ONLY_IMAGE],
+            })
+        ),
+        "the report names the uncompared, unread driver topic beside its 0/0 pass: {json}"
+    );
+    let verdict = replay_engine::render_verdict(&outcome, &bag);
+    let pass_line = format!(
+        "replay PASS: {} ({} tick(s) replayed, 0/0 topic(s) matched byte-for-byte and were \
+         credited)",
+        bag.display(),
+        outcome.ticks_replayed
+    );
+    assert!(verdict.lines().any(|l| l == pass_line), "{verdict}");
+    assert_eq!(
+        drv_driver_lines(&verdict),
+        vec![
+            format!(
+                "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs and \
+                 were NOT compared (driver nodes, as the replayed build declares them: cam): \
+                 {DRV_CAM_ONLY_IMAGE}"
+            ),
+            format!(
+                "NOTE: 1 external (driver) topic(s) are read by no node, so nothing in this \
+                 replay verifies them: {DRV_CAM_ONLY_IMAGE}"
+            ),
+            "NOTE: no topic was compared against the recording: no node other than an \
+             external (driver) node recorded or replayed a frame"
+                .to_string(),
+        ],
+        "{verdict}"
+    );
+    for phrase in [
+        "no node in the graph reads these external (driver) topics",
+        "no topic was compared against the recording",
+    ] {
+        logs_assert(|lines: &[&str]| {
+            let hits: Vec<&&str> = lines.iter().filter(|l| l.contains(phrase)).collect();
+            match hits.as_slice() {
+                [line] if line.contains("WARN") && line.contains(DRV_CAM_ONLY_IMAGE) => Ok(()),
+                other => Err(format!(
+                    "expected exactly ONE WARN line `{phrase}` naming {DRV_CAM_ONLY_IMAGE}, \
+                     got {other:?}"
+                )),
+            }
+        });
+    }
+}
+
+/// A lockstep recording of the camera graph, which `--single-process
+/// --record` of a one-unit graph makes, is not supported: the resim never fires
+/// the camera, so the schedule diverges at the camera's first recorded fire
+/// (exit 6, ahead of the meter's missing topic) and one WARN names the driver
+/// topic and the remedy.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_lockstep_recording_of_a_driver_graph_diverges_naming_the_driver() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_lockstep.mcap");
+    ri_bag(
+        &live.rec,
+        &bag,
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep),
+    );
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the lockstep replay runs");
+    assert!(!outcome.passed);
+    assert_eq!(
+        resim_exit(&outcome, true),
+        6,
+        "the schedule divergence wins"
+    );
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the camera's recorded fires are not replayed");
+    assert_eq!(
+        divergence.recorded.as_ref().map(|f| f.node_id.as_str()),
+        Some("cam"),
+        "the first divergence is the camera's first recorded fire: {}",
+        divergence.detail
+    );
+    assert!(divergence.detail.contains("cam"), "{}", divergence.detail);
+    assert!(
+        replayed.is_empty(),
+        "neither node fired, so the meter read nothing: {replayed:?}"
+    );
+    let named: Vec<(&str, &ViolationClass)> = outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class))
+        .collect();
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(DRV_BRIGHTNESS, ViolationClass::MissingTopic)]
+        ),
+        "the meter, never fed, published nothing: {named:?}"
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[DRV_IMAGE], &[])),
+        "a lockstep replay feeds the meter none of the camera's frames"
+    );
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("this recording is lockstep"))
+            .collect();
+        match hits.as_slice() {
+            [line]
+                if line.contains("WARN")
+                    && line.contains(DRV_IMAGE)
+                    && line.contains("without `--single-process`") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected exactly ONE WARN line naming {DRV_IMAGE} and the remedy, got {other:?}"
+            )),
+        }
+    });
+}
+
+/// The tag the shared-bus sink logs each frame it reads under.
+const DRV_BUS_SINK: f64 = 8.0;
+/// The topic the camera and the period writer share.
+const DRV_BUS: &str = "/drvbus/bus";
+
+/// A camera driver whose output is named `out`, the name the read-identity
+/// bag writers label a shared topic's frames by.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvBusCameraNode {
+    #[output]
+    out: Vector3,
+    /// The device is attached: true in the live run only.
+    connected: bool,
+    /// Readings published so far.
+    frames: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvBusCameraNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        if !self.connected {
+            return Ok(());
+        }
+        self.frames += 1.0;
+        let (x, y, z) = drv_reading(self.frames);
+        self.out.x = x;
+        self.out.y = y;
+        self.out.z = z;
+        Ok(())
+    }
+}
+
+/// The camera (`w1`, device 1) and a period writer (`w2`) on one
+/// `multi_publisher_topics` topic, read per message by a sink.
+fn drv_bus_yaml() -> &'static str {
+    "name: drvbus\nprefix: drvbus\nmulti_publisher_topics:\n  - /drvbus/bus\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvbus/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvbus/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /drvbus/bus\n"
+}
+
+/// The shared-bus graph, the camera `connected` and the writer stamping
+/// `writer` into its frames.
+fn drv_bus_factories(connected: bool, writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer,
+                ..Default::default()
+            })),
+        ),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: DRV_BUS_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live shared-bus run, anchored to the hand oracle: the bus carries the
+/// camera's readings `(1, k, 3k + 2)` and the writer's frames
+/// `(2, c, 2_000_000 + 7c)`, each writer's in order.
+fn drv_bus_record() -> RiLive {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_bus_yaml(),
+        || drv_bus_factories(true, 2.0),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let (mut camera, mut writer) = (0usize, 0usize);
+    for (i, f) in live.rec.messages[DRV_BUS].iter().enumerate() {
+        let (x, y, z) = drv_xyz(f);
+        if x == DRV_DEVICE {
+            camera += 1;
+            let k = camera as f64;
+            assert_eq!((x, y, z), (DRV_DEVICE, k, 3.0 * k + 2.0), "bus frame {i}");
+        } else {
+            writer += 1;
+            let c = writer as f64;
+            assert_eq!((x, y, z), (2.0, c, 2_000_000.0 + 7.0 * c), "bus frame {i}");
+        }
+    }
+    assert!(
+        camera >= RI_MIN_READS && writer >= RI_MIN_READS,
+        "PREMISE: both writers published: {camera} camera and {writer} writer frames"
+    );
+    live
+}
+
+/// The camera alone on rank 1, the writer and the sink on rank 0.
+fn drv_bus_two_rank_bag(live: &RiLive, dir: &std::path::Path) -> std::path::PathBuf {
+    let bag = dir.join("drv_bus_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w1");
+    bag
+}
+
+/// A `multi_publisher_topics` topic a driver shares with a period writer is
+/// compared over the writer's frames only: the camera's are recorded inputs,
+/// fed to the sink with the writer's, so the verify passes with the bus
+/// checked and credited. In one process, and with the camera alone in its
+/// own process, whose pass then captures nothing.
+#[test]
+#[serial]
+fn a_topic_a_driver_shares_is_compared_over_its_other_writer_and_passes() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_bus_single.mcap");
+    ri_bag(&live.rec, &single, ri_free_run_recorder_json());
+    for (layout, bag) in [
+        ("single-rank", single),
+        ("two-rank", drv_bus_two_rank_bag(&live, dir.path())),
+    ] {
+        let (outcome, replayed) = ri_replay(
+            &bag,
+            || drv_bus_factories(false, 2.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the bus is checked and credited"
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_BUS_SINK])
+            .unwrap_or_else(|e| panic!("{layout}: the sink read the live frames: {e}"));
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["w1"], &[], &[DRV_BUS], &[], &[])),
+            "{layout}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![format!(
+                "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                 compared over the other writers' frames only (driver nodes, as the replayed \
+                 build declares them: w1): {DRV_BUS}"
+            )],
+            "{layout}: {verdict}"
+        );
+    }
+}
+
+/// A changed period writer on the shared topic fails with exit 1 as a byte
+/// mismatch on that topic, from that writer.
+#[test]
+#[serial]
+fn a_changed_writer_on_a_topic_a_driver_shares_exits_1_naming_it() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_bus_single.mcap");
+    ri_bag(&live.rec, &single, ri_free_run_recorder_json());
+    for (layout, bag) in [
+        ("single-rank", single),
+        ("two-rank", drv_bus_two_rank_bag(&live, dir.path())),
+    ] {
+        let (outcome, _) = ri_replay(
+            &bag,
+            || drv_bus_factories(false, 4.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(!outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 1, "{layout}");
+        let named: Vec<(&str, &ViolationClass, &str)> = outcome
+            .violations
+            .iter()
+            .map(|v| (v.topic.as_str(), &v.class, v.detail.as_str()))
+            .collect();
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(DRV_BUS, ViolationClass::ByteMismatch { .. }, detail)] if detail.contains("w2/out")
+            ),
+            "{layout}: exactly the writer's byte mismatch: {named:?}"
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+    }
+}
+
+/// A neutral `--resim all` of the single-process bag does not feed the meter,
+/// which runs beside the camera: a resim without `--verify` injects no in-rank
+/// topic. One WARN names the camera's topic and the reason, the meter does not
+/// reproduce its live reads, and the neutral run still exits 0.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_neutral_resim_beside_the_driver_warns_that_it_does_not_feed_the_reader() {
+    let live = drv_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = drv_single_rank_bag(&live, dir.path());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        drv_replay_factories,
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("the neutral resim runs");
+    assert_eq!(
+        resim_exit(&outcome, false),
+        0,
+        "a neutral run makes no verdict"
+    );
+    assert!(
+        ri_judge(&live.reads, &replayed, &[DRV_METER]).is_err(),
+        "the meter, fed no camera frame, does not reproduce its live reads"
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(drv_inputs(&["cam"], &[DRV_IMAGE], &[], &[DRV_IMAGE], &[])),
+        "the outcome names the camera's topic as unfed"
+    );
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("does not feed the frames the external (driver) nodes"))
+            .collect();
+        match hits.as_slice() {
+            [line]
+                if line.contains("WARN")
+                    && line.contains(DRV_IMAGE)
+                    && line.contains("without --verify") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected exactly ONE WARN line naming {DRV_IMAGE} and the reason, got {other:?}"
+            )),
+        }
+    });
+}
+
+/// A lockstep recording of the shared-bus graph, whose camera writes only the
+/// `multi_publisher_topics` topic, diverges at exit 6 like any lockstep
+/// recording with a driver, and its one lockstep WARN names the camera, the
+/// shared topic and the remedy.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_lockstep_recording_of_a_driver_on_a_shared_topic_warns_naming_it() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_bus_lockstep.mcap");
+    ri_bag(
+        &live.rec,
+        &bag,
+        pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep),
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        || drv_bus_factories(false, 2.0),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the lockstep replay runs");
+    assert!(!outcome.passed);
+    assert_eq!(
+        resim_exit(&outcome, true),
+        6,
+        "the schedule divergence wins"
+    );
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the camera's recorded fires are not replayed");
+    assert_eq!(
+        divergence.recorded.as_ref().map(|f| f.node_id.as_str()),
+        Some("w1"),
+        "the first divergence is the camera's first recorded fire: {}",
+        divergence.detail
+    );
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("this recording is lockstep"))
+            .collect();
+        match hits.as_slice() {
+            [line]
+                if line.contains("WARN")
+                    && line.contains("node_ids=w1")
+                    && line.contains(DRV_BUS)
+                    && line.contains("without `--single-process`") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected exactly ONE WARN line naming w1, {DRV_BUS} and the remedy, got \
+                 {other:?}"
+            )),
+        }
+    });
+}
+
+/// A neutral `--resim all` of the single-process shared-bus bag feeds the
+/// sink none of the camera's frames, since a resim without `--verify` injects
+/// no in-rank topic: the sink reads only the period writer's frames, and one
+/// WARN names the shared topic and the reason.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_neutral_resim_beside_a_driver_on_a_shared_topic_warns_that_it_does_not_feed_it() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_bus_single.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        || drv_bus_factories(false, 2.0),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let outcome = outcome.expect("the neutral resim runs");
+    assert_eq!(
+        resim_exit(&outcome, false),
+        0,
+        "a neutral run makes no verdict"
+    );
+    let sink_reads = ri_by_consumer(&replayed)
+        .remove(&DRV_BUS_SINK.to_bits())
+        .unwrap_or_default();
+    assert!(
+        !sink_reads.is_empty(),
+        "PREMISE: the sink read the writer's frames"
+    );
+    assert!(
+        sink_reads.iter().all(|(x, _, _)| f64::from_bits(*x) == 2.0),
+        "the sink read only the period writer's frames, none of the camera's: {sink_reads:?}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("does not feed the frames the external (driver) nodes"))
+            .collect();
+        match hits.as_slice() {
+            [line]
+                if line.contains("WARN")
+                    && line.contains(DRV_BUS)
+                    && line.contains("without --verify") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "expected exactly ONE WARN line naming {DRV_BUS} and the reason, got {other:?}"
+            )),
+        }
+    });
+}
+
+/// The tag the silent-writer sink logs each frame it reads under.
+const DRV_SILENT_SINK: f64 = 9.0;
+/// The topic the camera shares with a writer that never publishes.
+const DRV_SILENT_BUS: &str = "/drvsil/bus";
+
+/// A period writer that never publishes: its tick writes no output.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct DrvSilentWriterNode {
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl DrvSilentWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Ok(())
+    }
+}
+
+/// The camera (`w1`) and a silent writer (`w2`) on one
+/// `multi_publisher_topics` topic, read per message by a sink.
+fn drv_silent_yaml() -> &'static str {
+    "name: drvsil\nprefix: drvsil\nmulti_publisher_topics:\n  - /drvsil/bus\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvsil/bus\n\
+     \x20 - id: w2\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvsil/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /drvsil/bus\n"
+}
+
+fn drv_silent_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(DrvSilentWriterNodeEntry::with_state(
+                DrvSilentWriterNode::default(),
+            )),
+        ),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: DRV_SILENT_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live run of the silent-writer graph, anchored to the hand oracle (every
+/// bus frame is the camera's reading `(1, k, 3k + 2)`), written into `dir` as a
+/// single-rank free-run bag that labels every frame of the bus with the
+/// camera's publisher, as a recorder does. Returns the bag and the live reads.
+fn drv_silent_record_bag(dir: &std::path::Path) -> (std::path::PathBuf, Vec<RiRead>) {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_silent_yaml(),
+        || drv_silent_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    let live_reads = ri_take();
+    let bus = &rec.messages[DRV_SILENT_BUS];
+    assert!(
+        bus.len() >= RI_MIN_READS,
+        "PREMISE: the camera published every wake: {} frames",
+        bus.len()
+    );
+    for (i, f) in bus.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 3.0 * k + 2.0),
+            "every bus frame is the camera's: frame {i}"
+        );
+    }
+    let camera = real_publisher_id(&rec, "w1", "out");
+    let label_rows: Vec<ProducerLabel<'_>> = (0..bus.len())
+        .map(|i| {
+            (
+                DRV_SILENT_BUS,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                camera,
+            )
+        })
+        .collect();
+    let bag = dir.join("drv_silent.mcap");
+    write_bag_impl(
+        &rec,
+        &bag,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        Some(serde_json::json!(0)),
+        Some(ri_free_run_recorder_json()),
+        Some(ri_publishers(&rec)),
+        Some(&label_rows),
+        Some(rec.stage_rows.clone()),
+    );
+    (bag, live_reads)
+}
+
+/// A topic a driver shares with a writer that published nothing, live or
+/// replayed, holds only the driver's frames: they are recorded inputs, so the
+/// topic carries no frame to compare and the verify passes with `0/0` rather
+/// than reporting the driver's frames as missing, with the WARN that nothing
+/// was compared. The bag labels every frame of the topic with the camera's
+/// publisher, as a recorder does.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_shared_topic_only_its_driver_published_is_not_reported_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, live_reads) = drv_silent_record_bag(dir.path());
+    let (outcome, replayed) = ri_replay(
+        &bag,
+        || drv_silent_factories(false),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert!(outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 0);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (0, 0));
+    ri_judge(&live_reads, &replayed, &[DRV_SILENT_SINK]).expect("the sink read the live frames");
+    assert_eq!(
+        drv_driver_lines(&replay_engine::render_verdict(&outcome, &bag)),
+        vec![
+            format!(
+                "NOTE: 1 topic(s) an external (driver) node shares with other writers were \
+                 compared over the other writers' frames only (driver nodes, as the replayed \
+                 build declares them: w1): {DRV_SILENT_BUS}"
+            ),
+            "NOTE: no topic was compared against the recording: no node other than an \
+             external (driver) node recorded or replayed a frame"
+                .to_string(),
+        ],
+        "the 0/0 verdict says it compared nothing"
+    );
+    logs_assert(|lines: &[&str]| {
+        let hits: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("no topic was compared against the recording"))
+            .collect();
+        match hits.as_slice() {
+            [line] if line.contains("WARN") && line.contains(DRV_SILENT_BUS) => Ok(()),
+            other => Err(format!(
+                "expected exactly ONE WARN line naming {DRV_SILENT_BUS}, got {other:?}"
+            )),
+        }
+    });
+}
+
+/// The teleop's output topic.
+const DRV_TELEOP_CMD: &str = "/drvt/teleop/cmd";
+/// The meter's output topic in the teleop graph.
+const DRV_TELEOP_BRIGHTNESS: &str = "/drvt/meter/brightness";
+
+/// A teleop driver: an `external` node fired by its key pump that writes its
+/// command on every tick, as `KeyboardTeleop` does. With the pump attached
+/// (the live run) its k-th command carries the key reading `3k + 2`; with
+/// none (a replay) no key arrives and its k-th tick writes the zero command
+/// `(1, k, 0)`, so a replayed tick still publishes.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvTeleopNode {
+    #[output]
+    cmd: Vector3,
+    /// The key pump is attached: true in the live run only.
+    connected: bool,
+    /// Ticks run so far.
+    ticks: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvTeleopNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1.0;
+        let k = self.ticks;
+        self.cmd.x = DRV_DEVICE;
+        self.cmd.y = k;
+        self.cmd.z = if self.connected { 3.0 * k + 2.0 } else { 0.0 };
+        Ok(())
+    }
+}
+
+/// The teleop feeding the meter.
+fn drv_teleop_yaml() -> &'static str {
+    "name: drvt\nprefix: drvt\nnodes:\n\
+     \x20 - id: teleop\n    type: drv_teleop_node\n    outputs:\n      - name: cmd\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: meter\n    type: drv_meter_node\n    inputs:\n      - name: image\n        source: teleop/cmd\n    outputs:\n      - name: brightness\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn drv_teleop_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "teleop",
+            Box::new(DrvTeleopNodeEntry::with_state(DrvTeleopNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "meter",
+            Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                gain: DRV_GAIN,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live teleop run, its teleop fired before every step as its key pump
+/// wakes it, anchored to the hand oracle: the teleop published command
+/// k = 1..=N as `(1, k, 3k + 2)`, the meter read each and published
+/// `(1, k, 30k + 21)`.
+fn drv_teleop_record() -> RiLive {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_teleop_yaml(),
+        || drv_teleop_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["teleop"],
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let cmd = &live.rec.messages[DRV_TELEOP_CMD];
+    assert!(
+        cmd.len() >= RI_MIN_READS,
+        "PREMISE: the teleop published every wake: {} frames",
+        cmd.len()
+    );
+    for (i, f) in cmd.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 3.0 * k + 2.0),
+            "recorded teleop frame {i}"
+        );
+    }
+    let brightness = &live.rec.messages[DRV_TELEOP_BRIGHTNESS];
+    assert_eq!(
+        brightness.len(),
+        cmd.len(),
+        "PREMISE: the meter read every command"
+    );
+    for (i, f) in brightness.iter().enumerate() {
+        let k = (i + 1) as f64;
+        assert_eq!(
+            drv_xyz(f),
+            (DRV_DEVICE, k, 30.0 * k + 21.0),
+            "recorded meter frame {i}"
+        );
+    }
+    live
+}
+
+/// Every message of a finalized `--record-out` bag as `(x, y, z)`, per topic
+/// in the order the bag holds them.
+fn drv_record_out_frames(path: &std::path::Path) -> BTreeMap<String, Vec<(f64, f64, f64)>> {
+    let reader = BagReader::open(path).expect("the --record-out bag opens");
+    assert!(
+        matches!(
+            reader
+                .completeness()
+                .expect("the bag states its completeness"),
+            cerulion_bag::BagCompleteness::Finalized
+        ),
+        "the --record-out bag is finalized"
+    );
+    let mut frames: BTreeMap<String, Vec<(f64, f64, f64)>> = BTreeMap::new();
+    for message in reader.messages().expect("the bag's messages") {
+        let message = message.expect("a readable message");
+        frames
+            .entry(message.topic)
+            .or_default()
+            .push(drv_xyz(&message.data));
+    }
+    frames
+}
+
+/// `--record-out` of a driver graph holds every frame its replayed driver
+/// published. A teleop whose tick writes its command with no key pump
+/// attached publishes on every recorded fire, and the output bag holds every
+/// frame the re-executed graph published: the zero commands `(1, k, 0)` and
+/// the meter's readings `(1, k, 30k + 21)`, k = 1..=N. The comparison still
+/// treats the teleop's topic as a recorded input: the meter is fed the
+/// recorded commands, reproduces its readings and is the one topic checked
+/// and credited, and the replayed zero commands, which differ from every
+/// recorded one, are no violation. Both process layouts under `--verify`, and
+/// the neutral resim of the two-process bag, which feeds the meter through
+/// its cross-rank injector. That injector runs in the meter's rank, which
+/// opens no `--record-out` tap on the teleop's topic; a tap that leaves out
+/// the frames its own rank injects is pinned by
+/// `record_out_of_a_tapped_shared_topic_leaves_out_the_frames_its_rank_injects`.
+#[test]
+#[serial]
+fn record_out_of_a_driver_graph_holds_every_frame_its_replayed_driver_published() {
+    let live = drv_teleop_record();
+    let n = live.rec.messages[DRV_TELEOP_CMD].len();
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_teleop_single.mcap");
+    ri_bag(&live.rec, &single, ri_free_run_recorder_json());
+    let two_rank = dir.path().join("drv_teleop_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &two_rank, |id| id == "meter");
+    let want_cmd: Vec<(f64, f64, f64)> = (1..=n).map(|k| (DRV_DEVICE, k as f64, 0.0)).collect();
+    let want_brightness: Vec<(f64, f64, f64)> = (1..=n)
+        .map(|k| (DRV_DEVICE, k as f64, 30.0 * k as f64 + 21.0))
+        .collect();
+    for (run, (layout, bag, purpose)) in [
+        (
+            "single-rank, --verify",
+            &single,
+            replay_engine::ReplayPurpose::Verify,
+        ),
+        (
+            "two-rank, --verify",
+            &two_rank,
+            replay_engine::ReplayPurpose::Verify,
+        ),
+        (
+            "two-rank, neutral",
+            &two_rank,
+            replay_engine::ReplayPurpose::Resim,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let out = dir.path().join(format!("drv_teleop_out_{run}.mcap"));
+        let (outcome, replayed) = ri_replay_stamped(
+            bag,
+            || drv_teleop_factories(false),
+            purpose,
+            None,
+            None,
+            None,
+            RecordHealthReport::Absent,
+            Some(out.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: the teleop's replayed commands are no violation: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the meter's topic is the one checked and credited"
+        );
+        assert_eq!(
+            outcome.record_out.as_deref(),
+            Some(out.display().to_string().as_str()),
+            "{layout}: the outcome names the finished output bag: {:?}",
+            outcome.record_out_error
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_METER])
+            .unwrap_or_else(|e| panic!("{layout}: the meter read the recorded commands: {e}"));
+        let frames = drv_record_out_frames(&out);
+        assert_eq!(
+            frames.get(DRV_TELEOP_CMD).cloned().unwrap_or_default(),
+            want_cmd,
+            "{layout}: the output holds every command the replayed teleop published"
+        );
+        assert_eq!(
+            frames
+                .get(DRV_TELEOP_BRIGHTNESS)
+                .cloned()
+                .unwrap_or_default(),
+            want_brightness,
+            "{layout}: the output holds every reading the replayed meter published"
+        );
+        assert_eq!(
+            frames.len(),
+            2,
+            "{layout}: the output holds the graph's two topics and nothing else: {:?}",
+            frames.keys().collect::<Vec<_>>()
+        );
+        if purpose == replay_engine::ReplayPurpose::Resim {
+            drv_assert_neutral_summary_names_the_input(
+                &outcome,
+                bag,
+                &format!(
+                    "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs \
+                     and were NOT compared (driver nodes, as the replayed build declares them: \
+                     teleop): {DRV_TELEOP_CMD}"
+                ),
+            );
+        }
+    }
+}
+
+/// A `--record-out` tap on the teleop's topic that cannot be opened refuses
+/// the pass with exit 5 naming the topic, and leaves no output bag: an output
+/// missing the driver's frames is never written. CONTROL in the same body:
+/// with the same fault armed and no `--record-out`, no tap is opened and the
+/// verify passes.
+#[test]
+#[serial]
+fn a_record_out_tap_on_a_driver_topic_that_cannot_be_opened_refuses_the_pass() {
+    let live = drv_teleop_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_teleop_tap_fault.mcap");
+    ri_bag(&live.rec, &bag, ri_free_run_recorder_json());
+    let out = dir.path().join("drv_teleop_tap_fault_out.mcap");
+    let _faulted = cerulion_cli_engine::replay_engine::fail_capture_open_for_test(DRV_TELEOP_CMD);
+    let (outcome, _) = ri_replay_stamped(
+        &bag,
+        || drv_teleop_factories(false),
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        None,
+        RecordHealthReport::Absent,
+        Some(out.clone()),
+    );
+    let err = outcome.expect_err("a --record-out tap the harness cannot open refuses the pass");
+    let ReplayError::Internal { reason } = &err else {
+        panic!("a harness observation failure is the exit-5 Internal class: {err:?}");
+    };
+    assert!(
+        reason.contains(DRV_TELEOP_CMD)
+            && reason.contains("--record-out tap")
+            && reason.contains("could not be opened"),
+        "the refusal names the topic, the tap and the failure: {reason}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert!(
+        !out.exists(),
+        "an aborted run leaves no partial output bag at {}",
+        out.display()
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        || drv_teleop_factories(false),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("without --record-out no tap is opened");
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 1));
+}
+
+/// The tag the teleop-bus sink logs each frame it reads under.
+const DRV_TELEOP_BUS_SINK: f64 = 10.0;
+/// The topic the teleop shares with a period writer.
+const DRV_TELEOP_BUS: &str = "/drvbt/bus";
+
+/// [`DrvTeleopNode`] on a shared bus, its output port named `out` as the
+/// bus label rows name each writer's (`ri_frame_label_rows`).
+#[cerulion_node(external)]
+#[derive(Default)]
+struct DrvBusTeleopNode {
+    #[output]
+    out: Vector3,
+    /// The key pump is attached: true in the live run only.
+    connected: bool,
+    /// Ticks run so far.
+    ticks: f64,
+}
+
+#[cerulion_node_impl]
+impl DrvBusTeleopNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1.0;
+        let k = self.ticks;
+        self.out.x = DRV_DEVICE;
+        self.out.y = k;
+        self.out.z = if self.connected { 3.0 * k + 2.0 } else { 0.0 };
+        Ok(())
+    }
+}
+
+/// The teleop (`w1`) and a period writer (`w2`, writer 2) on one
+/// `multi_publisher_topics` topic, read per message by a sink.
+fn drv_teleop_bus_yaml() -> &'static str {
+    "name: drvbt\nprefix: drvbt\nmulti_publisher_topics:\n  - /drvbt/bus\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_teleop_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvbt/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvbt/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /drvbt/bus\n"
+}
+
+fn drv_teleop_bus_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusTeleopNodeEntry::with_state(DrvBusTeleopNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: DRV_TELEOP_BUS_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The frames of one shared-bus stream split by writer: the teleop's (`x` is
+/// the device id 1) and the period writer's (`x` is 2), each in stream order.
+type DrvBusSplit = (Vec<(f64, f64, f64)>, Vec<(f64, f64, f64)>);
+
+fn drv_split_bus(frames: &[(f64, f64, f64)]) -> DrvBusSplit {
+    frames
+        .iter()
+        .copied()
+        .partition(|&(x, _, _)| x == DRV_DEVICE)
+}
+
+/// A topic a teleop shares with a period writer, the teleop's replayed ticks
+/// publishing their zero commands beside the writer's frames, is compared
+/// over the writer's frames only: the verify passes with the bus checked and
+/// credited, and the replayed zero commands, which differ from every recorded
+/// command, are no violation. `--record-out` holds both writers' frames: the
+/// zero commands `(1, k, 0)` and the writer's `(2, c, 2_000_000 + 7c)`. In
+/// one process, where the bag attributes each frame to its writer, and with
+/// the teleop alone in its own process.
+#[test]
+#[serial]
+fn a_shared_topic_compares_its_other_writer_while_its_replayed_driver_publishes() {
+    let (live, n, c) = drv_teleop_bus_record();
+    let want_written = drv_writer_frames(c);
+    let want_commands = drv_zero_commands(n);
+    let dir = tempfile::tempdir().unwrap();
+    let single = dir.path().join("drv_teleop_bus_single.mcap");
+    ri_bag(&live.rec, &single, ri_free_run_recorder_json());
+    let two_rank = dir.path().join("drv_teleop_bus_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &two_rank, |id| id == "w1");
+    for (run, (layout, bag)) in [("single-rank", &single), ("two-rank", &two_rank)]
+        .into_iter()
+        .enumerate()
+    {
+        let out = dir.path().join(format!("drv_teleop_bus_out_{run}.mcap"));
+        let (outcome, replayed) = ri_replay_stamped(
+            bag,
+            || drv_teleop_bus_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            None,
+            RecordHealthReport::Absent,
+            Some(out.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: the teleop's replayed commands are no violation: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{layout}: the bus is checked and credited"
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_TELEOP_BUS_SINK])
+            .unwrap_or_else(|e| panic!("{layout}: the sink read the live frames: {e}"));
+        let frames = drv_record_out_frames(&out);
+        let (out_commands, out_written) =
+            drv_split_bus(frames.get(DRV_TELEOP_BUS).map_or(&[][..], Vec::as_slice));
+        assert_eq!(
+            out_commands, want_commands,
+            "{layout}: the output holds every command the replayed teleop published"
+        );
+        assert_eq!(
+            out_written, want_written,
+            "{layout}: the output holds every frame the replayed writer published"
+        );
+    }
+}
+
+/// The live teleop-bus run, its teleop fired before every step as its key
+/// pump wakes it, anchored to the hand oracle: the bus carries the teleop's
+/// commands `(1, k, 3k + 2)`, k = 1..=n, and the writer's frames
+/// `(2, i, 2_000_000 + 7i)`, i = 1..=c, each writer's in order. Returns the
+/// run, `n` and `c`.
+fn drv_teleop_bus_record() -> (RiLive, usize, usize) {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_teleop_bus_yaml(),
+        || drv_teleop_bus_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let recorded: Vec<(f64, f64, f64)> = live.rec.messages[DRV_TELEOP_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .collect();
+    let (commands, written) = drv_split_bus(&recorded);
+    let (n, c) = (commands.len(), written.len());
+    assert!(
+        n >= RI_MIN_READS && c >= RI_MIN_READS,
+        "PREMISE: both writers published: {n} teleop and {c} writer frames"
+    );
+    assert_eq!(
+        commands,
+        (1..=n)
+            .map(|k| (DRV_DEVICE, k as f64, 3.0 * k as f64 + 2.0))
+            .collect::<Vec<_>>(),
+        "the recorded teleop commands"
+    );
+    assert_eq!(written, drv_writer_frames(c), "the recorded writer frames");
+    (live, n, c)
+}
+
+/// The period writer's first `c` bus frames, `(2, i, 2_000_000 + 7i)`.
+fn drv_writer_frames(c: usize) -> Vec<(f64, f64, f64)> {
+    (1..=c)
+        .map(|i| (2.0, i as f64, 2_000_000.0 + 7.0 * i as f64))
+        .collect()
+}
+
+/// The first `n` commands a replayed teleop with no key pump publishes,
+/// `(1, k, 0)`.
+fn drv_zero_commands(n: usize) -> Vec<(f64, f64, f64)> {
+    (1..=n).map(|k| (DRV_DEVICE, k as f64, 0.0)).collect()
+}
+
+/// A neutral `--record-out` of the teleop bus, with the teleop and the sink
+/// on rank 0 and the period writer on rank 1, holds every frame the
+/// re-executed graph published, each once: the teleop's zero commands
+/// `(1, k, 0)` and the writer's frames `(2, i, 2_000_000 + 7i)`. Rank 0 taps
+/// the bus, which only its teleop writes there, and also injects the writer's
+/// recorded frames on it for the sink, since a neutral resim feeds a
+/// cross-rank edge through an injector: the tap leaves the injector's frames
+/// out, so the writer's frames in the output are the ones rank 1 replayed.
+#[test]
+#[serial]
+fn record_out_of_a_tapped_shared_topic_leaves_out_the_frames_its_rank_injects() {
+    let (live, n, c) = drv_teleop_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_teleop_bus_writer_on_rank1.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w2");
+    let out = dir.path().join("drv_teleop_bus_neutral_out.mcap");
+    let (outcome, _) = ri_replay_stamped(
+        &bag,
+        || drv_teleop_bus_factories(false),
+        replay_engine::ReplayPurpose::Resim,
+        None,
+        None,
+        None,
+        RecordHealthReport::Absent,
+        Some(out.clone()),
+    );
+    let outcome = outcome.expect("the neutral resim runs");
+    assert_eq!(
+        resim_exit(&outcome, false),
+        0,
+        "a neutral run makes no verdict"
+    );
+    assert_eq!(
+        outcome.record_out.as_deref(),
+        Some(out.display().to_string().as_str()),
+        "the outcome names the finished output bag: {:?}",
+        outcome.record_out_error
+    );
+    let frames = drv_record_out_frames(&out);
+    assert_eq!(
+        frames.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![DRV_TELEOP_BUS],
+        "the output holds the graph's one topic"
+    );
+    let (out_commands, out_written) = drv_split_bus(&frames[DRV_TELEOP_BUS]);
+    assert_eq!(
+        out_commands,
+        drv_zero_commands(n),
+        "every command the replayed teleop published, once"
+    );
+    assert_eq!(
+        out_written,
+        drv_writer_frames(c),
+        "every frame the replayed writer published, once, and none the injector re-published"
+    );
+}
+
+/// A replay that aborts in the rank of a shared topic's re-executed writer
+/// judges nothing on that topic in its partial `--report`, though the rank of
+/// the driver that also writes it completed. A driver's frames are never
+/// compared, so the topic is owned by its other writers' ranks alone: the
+/// camera `w1` runs alone on rank 0, whose pass captures nothing, and the
+/// period writer `w2` and the sink run on rank 1, whose writer refuses to
+/// init.
+#[test]
+#[serial]
+fn a_partial_report_leaves_a_shared_topic_unjudged_when_only_its_drivers_rank_completed() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_bus_driver_on_rank0.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id != "w1");
+    let report = dir.path().join("drv_bus_partial_report.json");
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        || {
+            factories(vec![
+                (
+                    "w1",
+                    Box::new(DrvBusCameraNodeEntry::with_state(
+                        DrvBusCameraNode::default(),
+                    )),
+                ),
+                (
+                    "w2",
+                    Box::new(InitFailsEntry {
+                        inner: Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                            writer: 2.0,
+                            ..Default::default()
+                        })),
+                    }),
+                ),
+                (
+                    "sink",
+                    Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                        tag: DRV_BUS_SINK,
+                        ..Default::default()
+                    })),
+                ),
+            ])
+        },
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
+    let err = outcome.expect_err("the writer refuses to init, so the run aborts at rank 1");
+    assert_eq!(err.exit_code(), 5, "{err}");
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(&report).expect("the partial report is written despite the abort"),
+    )
+    .expect("the partial report is JSON");
+    assert_eq!(json["aborted"]["failed_at_rank"], 1, "{json}");
+    assert_eq!(
+        json["rank_execution"]
+            .as_array()
+            .map(|ranks| ranks.iter().map(|r| r["rank"].clone()).collect::<Vec<_>>()),
+        Some(vec![serde_json::json!(0)]),
+        "the camera's rank completed: {json}"
+    );
+    assert_eq!(
+        (
+            json["topics_checked"].as_u64(),
+            json["topics_passed"].as_u64()
+        ),
+        (Some(0), Some(0)),
+        "the bus is not judged: {json}"
+    );
+    assert_eq!(
+        json["violations"],
+        serde_json::json!([]),
+        "no violation names the bus: {json}"
+    );
+    assert_eq!(
+        json["driver_inputs"]["shared_topics"],
+        serde_json::json!([DRV_BUS]),
+        "the partial report names the topic the camera shares: {json}"
+    );
+}
+
+/// The shared-bus graph's bags whose producer-label channel labels no frame,
+/// as a recorder that never armed labelling on a topic writes it: in one
+/// process, and with the camera alone in its own process.
+fn drv_unlabelled_bags(
+    rec: &Recording,
+    dir: &std::path::Path,
+    name: &str,
+) -> [(&'static str, std::path::PathBuf); 2] {
+    let single = dir.join(format!("{name}_unlabelled_single.mcap"));
+    ri_bag_labelled(rec, &single, ri_free_run_recorder_json(), false);
+    let two_rank = dir.join(format!("{name}_unlabelled_two_rank.mcap"));
+    ri_two_rank_bag_labelled(rec, &two_rank, |id| id == "w1", false);
+    [("single-rank", single), ("two-rank", two_rank)]
+}
+
+/// A bag that does not attribute each frame of a topic a driver shares to
+/// its writer cannot say which frames are the driver's. A `--verify` feeds
+/// the sink's reads of that topic by their recorded identity, and their
+/// recorded writers are the camera and the period writer, so it refuses with
+/// exit 2, naming the read and `read_identity_frames_unattributed`. The same
+/// recording with its labels passes
+/// (`a_topic_a_driver_shares_is_compared_over_its_other_writer_and_passes`).
+/// One process and two.
+#[test]
+#[serial]
+fn a_verify_of_an_unattributed_topic_a_driver_shares_refuses_its_read() {
+    let live = drv_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    for (layout, bag) in drv_unlabelled_bags(&live.rec, dir.path(), "drv_bus") {
+        let (outcome, _) = ri_replay(
+            &bag,
+            || drv_bus_factories(false, 2.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let err = outcome.expect_err("a read of unattributed frames is refused");
+        assert_eq!(err.exit_code(), 2, "{layout}: {err}");
+        let msg = err.to_string();
+        for part in [
+            "read_identity_frames_unattributed",
+            "node 'sink', input 'inp'",
+            &format!("(topic '{DRV_BUS}')"),
+            "the topic's frames carry no writer labels while its reads name 2 writers",
+        ] {
+            assert!(
+                msg.contains(part),
+                "{layout}: the refusal names `{part}`: {msg}"
+            );
+        }
+    }
+}
+
+/// The topic the camera shares with a period writer, which no node reads.
+const DRV_UNREAD_BUS: &str = "/drvsh/bus";
+
+/// The camera (`w1`) and a period writer (`w2`, writer 2) on one
+/// `multi_publisher_topics` topic no node reads.
+fn drv_unread_bus_yaml() -> &'static str {
+    "name: drvsh\nprefix: drvsh\nmulti_publisher_topics:\n  - /drvsh/bus\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvsh/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvsh/bus\n"
+}
+
+fn drv_unread_bus_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A topic a driver shares with a period writer, which no node reads, is
+/// compared over every recorded frame, the camera's included, when the replay
+/// cannot attribute each frame to its writer: in a bag that labels no frame,
+/// and in a labelled bag whose frame index is over the verifier's record
+/// budget. The replayed camera has no device and publishes none, so the topic
+/// fails with exit 1 as a `missing-messages` violation, recorded `n + c`
+/// frames against the writer's `c` replayed ones, and the replayed stream,
+/// the writer's frames in order, first differs from the recorded one at the
+/// first recorded camera frame when that frame comes before the writer's
+/// last. The verdict NOTE and the outcome's `driver_inputs` name the topic as
+/// compared over every recorded frame. CONTROL in the same body: the labelled bag
+/// under the shipped budget passes, compared over the writer's frames only.
+/// One process and two.
+#[test]
+#[serial]
+fn an_unattributed_topic_a_driver_shares_is_compared_over_every_recorded_frame() {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_unread_bus_yaml(),
+        || drv_unread_bus_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    ri_take();
+    let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_UNREAD_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .collect();
+    let (camera, written) = drv_split_bus(&recorded);
+    let (n, c) = (camera.len(), written.len());
+    assert!(
+        n >= RI_MIN_READS && c >= RI_MIN_READS,
+        "PREMISE: both writers published: {n} camera and {c} writer frames"
+    );
+    assert_eq!(
+        camera,
+        (1..=n).map(|k| drv_reading(k as f64)).collect::<Vec<_>>(),
+        "the recorded camera readings"
+    );
+    assert_eq!(written, drv_writer_frames(c), "the recorded writer frames");
+    let first_camera = recorded
+        .iter()
+        .position(|&(x, _, _)| x == DRV_DEVICE)
+        .expect("PREMISE: the bus holds a camera frame");
+    let dir = tempfile::tempdir().unwrap();
+    let labelled_single = dir.path().join("drv_unread_bus_labelled_single.mcap");
+    ri_bag(&rec, &labelled_single, ri_free_run_recorder_json());
+    let labelled_two_rank = dir.path().join("drv_unread_bus_labelled_two_rank.mcap");
+    ri_two_rank_bag(&rec, &labelled_two_rank, |id| id == "w1");
+    let labelled = [
+        ("labelled single-rank", labelled_single),
+        ("labelled two-rank", labelled_two_rank),
+    ];
+    let attributed_note = format!(
+        "NOTE: 1 topic(s) an external (driver) node shares with other writers were compared \
+         over the other writers' frames only (driver nodes, as the replayed build declares \
+         them: w1): {DRV_UNREAD_BUS}"
+    );
+    for (layout, bag) in &labelled {
+        let (outcome, _) = ri_replay(
+            bag,
+            || drv_unread_bus_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert!(
+            outcome.passed,
+            "CONTROL: {layout}: the labelled bag passes under the shipped budget: {:?}",
+            outcome.violations
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "CONTROL: {layout}"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["w1"], &[], &[DRV_UNREAD_BUS], &[], &[])),
+            "CONTROL: {layout}: the bus is attributed"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![attributed_note.as_str()],
+            "CONTROL: {layout}: {verdict}"
+        );
+    }
+    let unattributed_note = drv_unattributed_note(DRV_UNREAD_BUS);
+    let unlabelled = drv_unlabelled_bags(&rec, dir.path(), "drv_unread_bus")
+        .map(|(layout, bag)| (layout.to_string(), bag, None));
+    let over_budget =
+        labelled.map(|(layout, bag)| (format!("{layout}, over budget"), bag, Some(1)));
+    for (layout, bag, budget) in unlabelled.into_iter().chain(over_budget) {
+        let _guard = budget.map(replay_engine::override_frame_index_record_budget);
+        let (outcome, _) = ri_replay(
+            &bag,
+            || drv_unread_bus_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert!(!outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 1, "{layout}: exit 1");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}: the bus is checked and failed"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(replay_engine::DriverInputsReport {
+                unattributed_topics: vec![DRV_UNREAD_BUS.to_string()],
+                ..drv_inputs(&["w1"], &[], &[DRV_UNREAD_BUS], &[], &[])
+            }),
+            "{layout}: the outcome names the bus as unattributed"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        assert_eq!(
+            drv_driver_lines(&verdict),
+            vec![unattributed_note.as_str()],
+            "{layout}: the NOTE says the camera's frames were compared: {verdict}"
+        );
+        let named: Vec<(&str, &ViolationClass)> = outcome
+            .violations
+            .iter()
+            .map(|v| (v.topic.as_str(), &v.class))
+            .collect();
+        let missing = |class: &ViolationClass| {
+            matches!(
+                class,
+                ViolationClass::MissingMessages { recorded, replayed }
+                    if *recorded == n + c && *replayed == c
+            )
+        };
+        let as_oracle = match named.as_slice() {
+            [(DRV_UNREAD_BUS, m)] => first_camera >= c && missing(m),
+            [(DRV_UNREAD_BUS, m), (DRV_UNREAD_BUS, ViolationClass::ByteMismatch { index, .. })] => {
+                first_camera < c && missing(m) && *index == first_camera
+            }
+            _ => false,
+        };
+        assert!(
+            as_oracle,
+            "{layout}: missing-messages {} against {c}, and a byte mismatch at frame \
+             {first_camera} when it is below {c}: {named:?}",
+            n + c
+        );
+    }
+}
+
+/// Every message of a finalized `--record-out` bag as its topic, sequence,
+/// log time, publish time and payload, in the order the bag holds them.
+type DrvBagMessages = Vec<(String, u32, u64, u64, Vec<u8>)>;
+
+fn drv_record_out_messages(path: &std::path::Path) -> DrvBagMessages {
+    let reader = BagReader::open(path).expect("the --record-out bag opens");
+    reader
+        .messages()
+        .expect("the bag's messages")
+        .map(|m| {
+            let m = m.expect("a readable message");
+            (m.topic, m.sequence, m.log_time, m.publish_time, m.data)
+        })
+        .collect()
+}
+
+/// Two `--verify` replays of one driver bag with `--record-out` write the
+/// same `--report` bytes and the same output bag, message for message: topic,
+/// sequence, timestamps and payload, in order. The teleop graph, whose
+/// replayed driver's commands reach the output through a `--record-out` tap,
+/// and the teleop bus, whose shared topic's diff leaves the teleop's frames
+/// out while the output holds both writers'; one process and two.
+#[test]
+#[serial]
+fn a_record_out_of_a_driver_graph_is_deterministic() {
+    type Make = fn() -> IndexMap<String, Box<dyn NodeEntry>>;
+    let teleop = drv_teleop_record();
+    let (bus, _, _) = drv_teleop_bus_record();
+    let dir = tempfile::tempdir().unwrap();
+    let teleop_single = dir.path().join("drv_det_teleop_single.mcap");
+    ri_bag(&teleop.rec, &teleop_single, ri_free_run_recorder_json());
+    let teleop_two = dir.path().join("drv_det_teleop_two_rank.mcap");
+    ri_two_rank_bag(&teleop.rec, &teleop_two, |id| id == "meter");
+    let bus_single = dir.path().join("drv_det_bus_single.mcap");
+    ri_bag(&bus.rec, &bus_single, ri_free_run_recorder_json());
+    let bus_two = dir.path().join("drv_det_bus_two_rank.mcap");
+    ri_two_rank_bag(&bus.rec, &bus_two, |id| id == "w1");
+    let teleop_make: Make = || drv_teleop_factories(false);
+    let bus_make: Make = || drv_teleop_bus_factories(false);
+    // One output path for both runs, so the report's `record_out` names the
+    // same file.
+    let out = dir.path().join("drv_det_out.mcap");
+    for (layout, bag, make) in [
+        ("teleop, single-rank", &teleop_single, teleop_make),
+        ("teleop, two-rank", &teleop_two, teleop_make),
+        ("teleop bus, single-rank", &bus_single, bus_make),
+        ("teleop bus, two-rank", &bus_two, bus_make),
+    ] {
+        let mut runs: Vec<(String, DrvBagMessages)> = Vec::new();
+        for run in 0..2 {
+            let report = dir.path().join(format!("drv_det_report_{run}.json"));
+            let (outcome, _) = ri_replay_stamped(
+                bag,
+                make,
+                replay_engine::ReplayPurpose::Verify,
+                None,
+                None,
+                Some(report.clone()),
+                RecordHealthReport::Absent,
+                Some(out.clone()),
+            );
+            let outcome = outcome.unwrap_or_else(|e| panic!("{layout}, run {run}: {e}"));
+            assert!(
+                outcome.passed,
+                "{layout}, run {run}: {:?}",
+                outcome.violations
+            );
+            let messages = drv_record_out_messages(&out);
+            std::fs::remove_file(&out).expect("the output bag is removed before the next run");
+            let report = String::from_utf8(std::fs::read(&report).expect("the report is written"))
+                .expect("the report is UTF-8");
+            runs.push((report, messages));
+        }
+        assert!(
+            !runs[0].1.is_empty(),
+            "PREMISE: {layout}: the output holds frames"
+        );
+        assert_eq!(runs[0].0, runs[1].0, "{layout}: byte-identical reports");
+        let (a, b) = (&runs[0].1, &runs[1].1);
+        if let Some(i) = (0..a.len().max(b.len())).find(|&i| a.get(i) != b.get(i)) {
+            panic!(
+                "{layout}: output message {i} differs between the runs: {:?} against {:?}",
+                a.get(i).map(|m| (&m.0, m.1, m.2, m.3)),
+                b.get(i).map(|m| (&m.0, m.1, m.2, m.3))
+            );
+        }
+    }
+}
+
+/// The verdict NOTE of `topic`, a topic the camera `w1` shares, compared over
+/// every recorded frame because the replay could not attribute each one to
+/// its writer.
+fn drv_unattributed_note(topic: &str) -> String {
+    format!(
+        "NOTE: 1 topic(s) an external (driver) node shares with other writers were compared \
+         over every recorded frame, the drivers' included, since the replay could not \
+         attribute each recorded frame to its writer (driver nodes, as the replayed build \
+         declares them: w1): {topic}"
+    )
+}
+
+/// The verdict NOTE of `topic`, a topic the camera `w1` shares, compared over
+/// the other writers' frames only.
+fn drv_attributed_note(topic: &str) -> String {
+    format!(
+        "NOTE: 1 topic(s) an external (driver) node shares with other writers were compared \
+         over the other writers' frames only (driver nodes, as the replayed build declares \
+         them: w1): {topic}"
+    )
+}
+
+/// The topic the camera shares with two other writers.
+const DRV_TRIO_BUS: &str = "/drvtri/bus";
+/// The tag the three-writer sink logs each frame it reads under.
+const DRV_TRIO_SINK: f64 = 11.0;
+
+/// The camera (`w1`), a period writer (`w2`) and a third writer (`w3`) on one
+/// `multi_publisher_topics` topic, read per message by a sink. `w3` is a
+/// period writer when `w3_publishes`, and a writer that never publishes
+/// otherwise.
+fn drv_trio_yaml(w3_publishes: bool) -> String {
+    let w3_type = if w3_publishes {
+        "ri_writer_node"
+    } else {
+        "drv_silent_writer_node"
+    };
+    format!(
+        "name: drvtri\nprefix: drvtri\nmulti_publisher_topics:\n  - /drvtri/bus\nnodes:\n\
+         \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtri/bus\n\
+         \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtri/bus\n\
+         \x20 - id: w3\n    type: {w3_type}\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtri/bus\n\
+         \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /drvtri/bus\n"
+    )
+}
+
+/// The three-writer graph, the camera `connected`, `w2` stamping `writer`
+/// into its frames and `w3` stamping 3 when it publishes.
+fn drv_trio_factories(
+    connected: bool,
+    writer: f64,
+    w3_publishes: bool,
+) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let w3: Box<dyn NodeEntry> = if w3_publishes {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: 3.0,
+            ..Default::default()
+        }))
+    } else {
+        Box::new(DrvSilentWriterNodeEntry::with_state(
+            DrvSilentWriterNode::default(),
+        ))
+    };
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer,
+                ..Default::default()
+            })),
+        ),
+        ("w3", w3),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: DRV_TRIO_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The live three-writer run, anchored to the hand oracle: the bus carries
+/// the camera's readings `(1, k, 3k + 2)`, `w2`'s frames
+/// `(2, c, 2_000_000 + 7c)` and, when `w3_publishes`, `w3`'s frames
+/// `(3, c, 3_000_000 + 7c)`, each writer's in order and one per step.
+fn drv_trio_record(w3_publishes: bool) -> RiLive {
+    ri_take();
+    let yaml = drv_trio_yaml(w3_publishes);
+    let rec = record_reference_impl_fed(
+        &yaml,
+        || drv_trio_factories(true, 2.0, w3_publishes),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    let live = RiLive {
+        rec,
+        reads: ri_take(),
+    };
+    let mut by_writer: BTreeMap<u64, Vec<(f64, f64, f64)>> = BTreeMap::new();
+    for f in &live.rec.messages[DRV_TRIO_BUS] {
+        let frame = drv_xyz(f);
+        by_writer.entry(frame.0 as u64).or_default().push(frame);
+    }
+    let per_step = |writer: f64| -> Vec<(f64, f64, f64)> {
+        (1..=RI_STEPS)
+            .map(|c| (writer, c as f64, writer * 1_000_000.0 + 7.0 * c as f64))
+            .collect()
+    };
+    let mut want: BTreeMap<u64, Vec<(f64, f64, f64)>> = BTreeMap::new();
+    want.insert(1, (1..=RI_STEPS).map(|k| drv_reading(k as f64)).collect());
+    want.insert(2, per_step(2.0));
+    if w3_publishes {
+        want.insert(3, per_step(3.0));
+    }
+    assert_eq!(by_writer, want, "the recorded bus, writer by writer");
+    live
+}
+
+/// A `multi_publisher_topics` topic a driver shares with writers in two
+/// processes is judged writer by writer, each in the process that runs it:
+/// with the camera and a changed period writer `w2` in one process and a third
+/// writer `w3` in another, the verify fails with exit 1 as one byte mismatch
+/// from `w2`, whether `w3` publishes nothing or its own frames, which match.
+/// CONTROL in the same body: the unchanged candidate passes with the bus
+/// checked and credited, and its sink reads the live frames.
+#[test]
+#[serial]
+fn a_changed_writer_on_a_shared_topic_split_across_processes_exits_1_naming_it() {
+    for w3_publishes in [false, true] {
+        let layout = if w3_publishes {
+            "w3 publishes"
+        } else {
+            "w3 silent"
+        };
+        let live = drv_trio_record(w3_publishes);
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join("drv_trio.mcap");
+        ri_two_rank_bag(&live.rec, &bag, |id| id == "w3");
+
+        let (outcome, replayed) = ri_replay(
+            &bag,
+            || drv_trio_factories(false, 2.0, w3_publishes),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome =
+            outcome.unwrap_or_else(|e| panic!("CONTROL: {layout}: the fed replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "CONTROL: {layout}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "CONTROL: {layout}");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "CONTROL: {layout}: the bus is checked and credited"
+        );
+        ri_judge(&live.reads, &replayed, &[DRV_TRIO_SINK])
+            .unwrap_or_else(|e| panic!("CONTROL: {layout}: the sink read the live frames: {e}"));
+        assert_eq!(
+            drv_driver_lines(&replay_engine::render_verdict(&outcome, &bag)),
+            vec![drv_attributed_note(DRV_TRIO_BUS)],
+            "CONTROL: {layout}"
+        );
+
+        let (outcome, _) = ri_replay(
+            &bag,
+            || drv_trio_factories(false, 4.0, w3_publishes),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the fed replay runs: {e}"));
+        assert!(!outcome.passed, "{layout}");
+        assert_eq!(resim_exit(&outcome, true), 1, "{layout}: exit 1");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+        let want_detail = format!(
+            "frame 0 on '{DRV_TRIO_BUS}' from writer w2/out differs at x: recorded 2.0, \
+             replayed 4.0; 1 more value(s) differ (recorded 64 B, replayed 64 B)"
+        );
+        let named: Vec<(&str, &ViolationClass, &str)> = outcome
+            .violations
+            .iter()
+            .map(|v| (v.topic.as_str(), &v.class, v.detail.as_str()))
+            .collect();
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(DRV_TRIO_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{layout}: exactly w2's byte mismatch: {named:?}"
+        );
+    }
+}
+
+/// Two `--verify` replays of the split three-writer bag with the changed
+/// writer `w2` write the same `--report` bytes, each naming `w2`'s byte
+/// mismatch and failing.
+#[test]
+#[serial]
+fn a_verify_of_a_shared_topic_split_across_processes_is_deterministic() {
+    let live = drv_trio_record(true);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("drv_trio_det.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w3");
+    let mut reports = Vec::new();
+    for run in 0..2 {
+        let report = dir.path().join(format!("drv_trio_report_{run}.json"));
+        let (outcome, _) = ri_replay_reporting(
+            &bag,
+            || drv_trio_factories(false, 4.0, true),
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report.clone()),
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("run {run}: {e}"));
+        assert_eq!(resim_exit(&outcome, true), 1, "run {run}");
+        let bytes = std::fs::read(&report).expect("the report is written");
+        let json: serde_json::Value = serde_json::from_slice(&bytes).expect("the report is JSON");
+        assert_eq!(json["passed"], serde_json::json!(false), "run {run}");
+        let violations: Vec<(&str, &str)> = json["violations"]
+            .as_array()
+            .expect("violations is an array")
+            .iter()
+            .map(|v| {
+                (
+                    v["class"]["kind"].as_str().unwrap_or_default(),
+                    v["detail"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
+        assert!(
+            matches!(
+                violations.as_slice(),
+                [("ByteMismatch", detail)] if detail.contains("from writer w2/out")
+            ),
+            "run {run}: exactly w2's byte mismatch: {violations:?}"
+        );
+        reports.push(bytes);
+    }
+    assert_eq!(reports[0], reports[1], "byte-identical reports");
+}
+
+/// The topic the camera shares with a period writer, read by a slow sink.
+const DRV_SLOW_BUS: &str = "/drvslow/bus";
+/// The tag the slow sink logs each frame it reads under.
+const DRV_SLOW_SINK: f64 = 12.0;
+
+/// The camera (`w1`) and a period writer (`w2`, writer 2) on one
+/// `multi_publisher_topics` topic, read by a latest-value sink that fires on
+/// every third step.
+fn drv_slow_bus_yaml() -> &'static str {
+    "name: drvslow\nprefix: drvslow\nmulti_publisher_topics:\n  - /drvslow/bus\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvslow/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvslow/bus\n\
+     \x20 - id: sink\n    type: ri_slow_sink\n    inputs:\n      - name: inp\n        source: /drvslow/bus\n"
+}
+
+fn drv_slow_bus_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "sink",
+            Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+                tag: DRV_SLOW_SINK,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A replay that does not feed reads by their recorded identity injects the
+/// recorded frames of a camera in a process of its own for the sink beside
+/// the period writer it shares a topic with. Those are the camera's recorded
+/// frames, inputs the comparison leaves out as it does a replayed driver's:
+/// a neutral `--resim all` and a `--verify` of a recording below trace
+/// format 8 both run to an outcome with no violation, and the verdict NOTE
+/// and the neutral summary say the bus was compared over the other writers'
+/// frames only. The sink fires on every third step, so what the injection
+/// publishes for it is not the camera's recorded stream frame for frame,
+/// which a per-writer comparison of the camera's frames refuses (exit 5,
+/// naming `writer w1/out`).
+#[test]
+#[serial]
+fn a_foreign_drivers_injected_frames_on_a_shared_topic_are_left_out_of_the_comparison() {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_slow_bus_yaml(),
+        || drv_slow_bus_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    ri_take();
+    let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_SLOW_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .collect();
+    let (camera, written) = drv_split_bus(&recorded);
+    assert_eq!(
+        camera,
+        (1..=RI_STEPS)
+            .map(|k| drv_reading(k as f64))
+            .collect::<Vec<_>>(),
+        "the recorded camera readings"
+    );
+    assert_eq!(
+        written,
+        drv_writer_frames(RI_STEPS),
+        "the recorded writer frames"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let neutral = dir.path().join("drv_slow_bus_two_rank.mcap");
+    ri_two_rank_bag(&rec, &neutral, |id| id == "w1");
+    let format7 = dir.path().join("drv_slow_bus_two_rank_format7.mcap");
+    ri_two_rank_bag_stamped(
+        &rec,
+        &format7,
+        |id| id == "w1",
+        true,
+        ri_recorder_json_at(7),
+    );
+    let note = drv_attributed_note(DRV_SLOW_BUS);
+    for (layout, bag, purpose) in [
+        ("neutral", &neutral, replay_engine::ReplayPurpose::Resim),
+        (
+            "format 7 verify",
+            &format7,
+            replay_engine::ReplayPurpose::Verify,
+        ),
+    ] {
+        let (outcome, _) = ri_replay(bag, || drv_slow_bus_factories(false), purpose);
+        let outcome = outcome.unwrap_or_else(|e| {
+            panic!("{layout}: the replay runs to an outcome, the camera's frames uncompared: {e}")
+        });
+        assert!(
+            matches!(
+                outcome.read_identity,
+                replay_engine::ReadIdentityReport::BestEffort { .. }
+            ),
+            "PREMISE: {layout}: no read is fed by identity: {:?}",
+            outcome.read_identity
+        );
+        assert!(
+            outcome.violations.is_empty(),
+            "{layout}: no violation names the bus: {:?}",
+            outcome.violations
+        );
+        assert_eq!(
+            outcome.topics_checked, 1,
+            "{layout}: the bus is checked over the writer's frames"
+        );
+        assert_eq!(
+            outcome.driver_inputs,
+            Some(drv_inputs(&["w1"], &[], &[DRV_SLOW_BUS], &[], &[])),
+            "{layout}: the bus is attributed"
+        );
+        assert_eq!(
+            drv_driver_lines(&replay_engine::render_verdict(&outcome, bag)),
+            vec![note.as_str()],
+            "{layout}"
+        );
+        let summary = cerulion_cli_engine::resim_cmd::render_resim_summary(
+            &cerulion_cli_engine::resim_cmd::ResimReport::from_outcome(&outcome),
+            bag,
+        );
+        let lines: Vec<&str> = summary.lines().map(str::trim).collect();
+        let count = format!(
+            "re-executed {} step(s), 1 produced topic(s)",
+            outcome.ticks_replayed
+        );
+        let at = lines
+            .iter()
+            .position(|l| *l == count)
+            .unwrap_or_else(|| panic!("{layout}: the summary counts the bus: {summary}"));
+        assert_eq!(
+            lines.get(at + 1),
+            Some(&note.as_str()),
+            "{layout}: the NOTE follows the count: {summary}"
+        );
+    }
+}
+
+/// A topic a driver shares is judged writer by writer over its other writers,
+/// never as a whole topic whose count leaves the driver's frames out. A writer
+/// that recorded no frame and now publishes is `extra-messages` from that
+/// writer, not an `extra-topic` the bag has no channel for: the camera's
+/// frames are in the bag. A writer that recorded frames and now publishes none
+/// beside a replayed teleop that publishes its commands is `missing-messages`
+/// from that writer, not a `missing-topic` the replay produced nothing on:
+/// `--record-out` holds the teleop's commands. Both exit 1.
+#[test]
+#[serial]
+fn a_shared_topic_names_the_writer_that_started_or_stopped_publishing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, _) = drv_silent_record_bag(dir.path());
+    let (outcome, _) = ri_replay(
+        &bag,
+        || {
+            factories(vec![
+                (
+                    "w1",
+                    Box::new(DrvBusCameraNodeEntry::with_state(
+                        DrvBusCameraNode::default(),
+                    )),
+                ),
+                (
+                    "w2",
+                    Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                        writer: 2.0,
+                        ..Default::default()
+                    })),
+                ),
+                (
+                    "sink",
+                    Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                        tag: DRV_SILENT_SINK,
+                        ..Default::default()
+                    })),
+                ),
+            ])
+        },
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    assert_eq!(
+        resim_exit(&outcome, true),
+        1,
+        "a writer that started: exit 1"
+    );
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    let started = format!(
+        "recorded 0 frame(s), replay produced {RI_STEPS} on '{DRV_SILENT_BUS}' from writer \
+         w2/out"
+    );
+    let named: Vec<(&str, &ViolationClass, &str)> = outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class, v.detail.as_str()))
+        .collect();
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(
+                DRV_SILENT_BUS,
+                ViolationClass::ExtraMessages { recorded: 0, replayed },
+                detail
+            )] if *replayed == RI_STEPS && *detail == started
+        ),
+        "the writer that started publishing, by name: {named:?}"
+    );
+
+    let (live, n, c) = drv_teleop_bus_record();
+    let teleop_bag = dir.path().join("drv_teleop_bus_single.mcap");
+    ri_bag(&live.rec, &teleop_bag, ri_free_run_recorder_json());
+    let out = dir.path().join("drv_teleop_bus_stopped_out.mcap");
+    let (outcome, _) = ri_replay_stamped(
+        &teleop_bag,
+        || {
+            factories(vec![
+                (
+                    "w1",
+                    Box::new(DrvBusTeleopNodeEntry::with_state(
+                        DrvBusTeleopNode::default(),
+                    )),
+                ),
+                (
+                    "w2",
+                    Box::new(DrvSilentWriterNodeEntry::with_state(
+                        DrvSilentWriterNode::default(),
+                    )),
+                ),
+                (
+                    "sink",
+                    Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                        tag: DRV_TELEOP_BUS_SINK,
+                        ..Default::default()
+                    })),
+                ),
+            ])
+        },
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        None,
+        RecordHealthReport::Absent,
+        Some(out.clone()),
+    );
+    let outcome = outcome.expect("the fed replay runs");
+    assert_eq!(
+        resim_exit(&outcome, true),
+        1,
+        "a writer that stopped: exit 1"
+    );
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    let stopped = format!(
+        "recorded {c} frame(s), replay produced 0 on '{DRV_TELEOP_BUS}' from writer w2/out"
+    );
+    let named: Vec<(&str, &ViolationClass, &str)> = outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class, v.detail.as_str()))
+        .collect();
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(
+                DRV_TELEOP_BUS,
+                ViolationClass::MissingMessages { recorded, replayed: 0 },
+                detail
+            )] if *recorded == c && *detail == stopped
+        ),
+        "the writer that stopped publishing, by name: {named:?}"
+    );
+    let frames = drv_record_out_frames(&out);
+    assert_eq!(
+        frames.get(DRV_TELEOP_BUS).cloned().unwrap_or_default(),
+        drv_zero_commands(n),
+        "the replayed teleop published its commands on the bus"
+    );
+}
+
+/// A topic a driver shares that the replay cannot attribute frame by frame is
+/// compared over every recorded frame, the camera's included, against the
+/// frames published on it in the process of its other writer, so a camera
+/// that publishes its recorded readings again does not make it pass. With the
+/// camera in a process of its own, its frames are not among the ones compared
+/// and the bus fails with exit 1 as a `missing-messages` violation, recorded
+/// `n + c` frames against the writer's `c` replayed ones, its replayed stream
+/// first differing at the first recorded camera frame when that comes before
+/// the writer's last, and the verdict NOTE says it was compared over every
+/// recorded frame. With the camera beside the writer, the two writers' frames
+/// reach one stream's comparison, which cannot tell their sequences apart and
+/// stops the replay naming the bus (exit 5).
+#[test]
+#[serial]
+fn an_unattributed_shared_topic_fails_though_its_driver_publishes_its_recorded_frames() {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_unread_bus_yaml(),
+        || drv_unread_bus_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    ri_take();
+    let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_UNREAD_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .collect();
+    let (camera, written) = drv_split_bus(&recorded);
+    let (n, c) = (camera.len(), written.len());
+    assert_eq!(
+        camera,
+        (1..=n).map(|k| drv_reading(k as f64)).collect::<Vec<_>>(),
+        "the recorded camera readings"
+    );
+    assert_eq!(written, drv_writer_frames(c), "the recorded writer frames");
+    assert!(
+        n >= RI_MIN_READS && c >= RI_MIN_READS,
+        "PREMISE: both writers published: {n} camera and {c} writer frames"
+    );
+    let first_camera = recorded
+        .iter()
+        .position(|&(x, _, _)| x == DRV_DEVICE)
+        .expect("PREMISE: the bus holds a camera frame");
+    let dir = tempfile::tempdir().unwrap();
+    let [(_, single), (_, two_rank)] = drv_unlabelled_bags(&rec, dir.path(), "drv_republish");
+
+    let (outcome, _) = ri_replay(
+        &two_rank,
+        || drv_unread_bus_factories(true),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the two-process replay runs");
+    assert!(!outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 1, "two processes: exit 1");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(replay_engine::DriverInputsReport {
+            unattributed_topics: vec![DRV_UNREAD_BUS.to_string()],
+            ..drv_inputs(&["w1"], &[], &[DRV_UNREAD_BUS], &[], &[])
+        }),
+        "the outcome names the bus as unattributed"
+    );
+    assert_eq!(
+        drv_driver_lines(&replay_engine::render_verdict(&outcome, &two_rank)),
+        vec![drv_unattributed_note(DRV_UNREAD_BUS)],
+        "the NOTE says every recorded frame was compared"
+    );
+    let named: Vec<(&str, &ViolationClass)> = outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class))
+        .collect();
+    let missing = |class: &ViolationClass| {
+        matches!(
+            class,
+            ViolationClass::MissingMessages { recorded, replayed }
+                if *recorded == n + c && *replayed == c
+        )
+    };
+    let as_oracle = match named.as_slice() {
+        [(DRV_UNREAD_BUS, m)] => first_camera >= c && missing(m),
+        [(DRV_UNREAD_BUS, m), (DRV_UNREAD_BUS, ViolationClass::ByteMismatch { index, .. })] => {
+            first_camera < c && missing(m) && *index == first_camera
+        }
+        _ => false,
+    };
+    assert!(
+        as_oracle,
+        "two processes: missing-messages {} against {c}, and a byte mismatch at frame \
+         {first_camera} when it is below {c}: {named:?}",
+        n + c
+    );
+
+    let (outcome, _) = ri_replay(
+        &single,
+        || drv_unread_bus_factories(true),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("one process: the one-stream comparison stops the replay");
+    assert_eq!(err.exit_code(), 5, "{err}");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&format!("capture tap lost frames on '{DRV_UNREAD_BUS}'")),
+        "the refusal names the bus: {msg}"
+    );
+}
+
+/// The topic the camera shares with two other writers, which no node reads.
+const DRV_UNREAD_TRIO_BUS: &str = "/drvtru/bus";
+
+/// The camera (`w1`), a period writer (`w2`, writer 2, one frame per step)
+/// and a fast writer (`w3`, writer 3, five frames per step) on one
+/// `multi_publisher_topics` topic no node reads.
+fn drv_unread_trio_yaml() -> &'static str {
+    "name: drvtru\nprefix: drvtru\nmulti_publisher_topics:\n  - /drvtru/bus\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtru/bus\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtru/bus\n\
+     \x20 - id: w3\n    type: ri_fast_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /drvtru/bus\n"
+}
+
+fn drv_unread_trio_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(RiFastWriterNodeEntry::with_state(RiFastWriterNode {
+                writer: 3.0,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The trio bag that labels no frame, `w3` in the second process.
+fn drv_unread_trio_bag(dir: &std::path::Path) -> (Recording, std::path::PathBuf) {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        drv_unread_trio_yaml(),
+        || drv_unread_trio_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    ri_take();
+    let bag = dir.join("drv_unread_trio_unlabelled_two_rank.mcap");
+    ri_two_rank_bag_labelled(&rec, &bag, |id| id == "w3", false);
+    (rec, bag)
+}
+
+/// A topic a driver shares that the replay cannot attribute frame by frame,
+/// whose two other writers run in two processes, each of which publishes no
+/// frame of the other's, is counted over both of them: every recorded frame,
+/// the camera's included, against the frames the two writers replayed, `w2`
+/// one frame per step and `w3` five. The replayed camera has no device and
+/// publishes none, so the topic is one `missing-messages` violation, recorded
+/// `7n` frames against `n + 5n`, and exit 1. Neither process's frames are
+/// compared byte for byte with every recorded frame, which interleaves the
+/// other's: no byte mismatch is reported. The NOTE names the bus as compared
+/// over every recorded frame.
+#[test]
+#[serial]
+fn an_unattributed_shared_topic_split_across_processes_is_counted_over_both_of_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rec, bag) = drv_unread_trio_bag(dir.path());
+    let recorded: Vec<(f64, f64, f64)> = rec.messages[DRV_UNREAD_TRIO_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .collect();
+    let of = |writer: f64| -> Vec<(f64, f64, f64)> {
+        recorded
+            .iter()
+            .copied()
+            .filter(|&(x, _, _)| x == writer)
+            .collect()
+    };
+    let n = RI_STEPS;
+    // `writer`'s first `count` frames, `(writer, c, writer * 1_000_000 + 7c)`.
+    let writer_frames = |writer: f64, count: usize| -> Vec<(f64, f64, f64)> {
+        (1..=count)
+            .map(|c| (writer, c as f64, writer * 1_000_000.0 + 7.0 * c as f64))
+            .collect()
+    };
+    assert_eq!(
+        of(DRV_DEVICE),
+        (1..=n).map(|k| drv_reading(k as f64)).collect::<Vec<_>>(),
+        "the recorded camera readings"
+    );
+    assert_eq!(of(2.0), writer_frames(2.0, n), "the recorded w2 frames");
+    assert_eq!(of(3.0), writer_frames(3.0, 5 * n), "the recorded w3 frames");
+    assert_eq!(recorded.len(), 7 * n, "PREMISE: nothing else is on the bus");
+    let (outcome, _) = ri_replay(
+        &bag,
+        || drv_unread_trio_factories(false),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(!outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 1, "exit 1");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(replay_engine::DriverInputsReport {
+            unattributed_topics: vec![DRV_UNREAD_TRIO_BUS.to_string()],
+            ..drv_inputs(&["w1"], &[], &[DRV_UNREAD_TRIO_BUS], &[], &[])
+        }),
+        "the outcome names the bus as unattributed"
+    );
+    let named = ri_named(&outcome);
+    let want = format!(
+        "recorded {} frame(s), replay produced {} on '{DRV_UNREAD_TRIO_BUS}'",
+        7 * n,
+        6 * n
+    );
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(DRV_UNREAD_TRIO_BUS, ViolationClass::MissingMessages { recorded, replayed }, detail)]
+                if (*recorded, *replayed) == (7 * n, 6 * n) && *detail == want
+        ),
+        "one count over both processes: {named:?}"
+    );
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "a failed topic is not declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+    assert_eq!(
+        drv_driver_lines(&replay_engine::render_verdict(&outcome, &bag)),
+        vec![drv_unattributed_note(DRV_UNREAD_TRIO_BUS)]
+    );
+}
+
+/// Two `--verify` replays of the unlabelled trio bag write the same
+/// `--report` bytes, each failing on the bus's one count.
+#[test]
+#[serial]
+fn a_verify_of_an_unattributed_shared_topic_split_across_processes_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bag) = drv_unread_trio_bag(dir.path());
+    let reports = ri_two_reports(dir.path(), "drv_trio_unlabelled", |report| {
+        ri_replay_reporting(
+            &bag,
+            || drv_unread_trio_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report),
+        )
+        .0
+    });
+    for (run, json) in reports.iter().enumerate() {
+        assert_eq!(json["passed"], serde_json::json!(false), "run {run}");
+        assert_eq!(
+            ri_report_classes(json),
+            vec!["MissingMessages".to_string()],
+            "run {run}"
+        );
+    }
+}
+
+/// Run `replay` twice, each writing `--report` to its own file under `dir`,
+/// assert the two files hold the same bytes, and return both parsed.
+fn ri_two_reports(
+    dir: &std::path::Path,
+    name: &str,
+    replay: impl Fn(std::path::PathBuf) -> Result<ReplayOutcome, ReplayError>,
+) -> Vec<serde_json::Value> {
+    let mut bytes: Vec<Vec<u8>> = Vec::new();
+    for run in 0..2 {
+        let report = dir.join(format!("{name}_report_{run}.json"));
+        replay(report.clone()).unwrap_or_else(|e| panic!("run {run}: {e}"));
+        bytes.push(std::fs::read(&report).expect("the report is written"));
+    }
+    assert_eq!(bytes[0], bytes[1], "byte-identical reports");
+    bytes
+        .iter()
+        .map(|b| serde_json::from_slice(b).expect("the report is JSON"))
+        .collect()
+}
+
+/// The `class.kind` of every violation in a `--report`.
+fn ri_report_classes(json: &serde_json::Value) -> Vec<String> {
+    json["violations"]
+        .as_array()
+        .expect("violations is an array")
+        .iter()
+        .map(|v| v["class"]["kind"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// One period writer's frames, `(writer, c, writer * 1_000_000 + 7c)` for
+/// `c = 1..=RI_STEPS`, one per step.
+fn ri_period_frames(writer: f64) -> Vec<(f64, f64, f64)> {
+    (1..=RI_STEPS)
+        .map(|c| (writer, c as f64, writer * 1_000_000.0 + 7.0 * c as f64))
+        .collect()
+}
+
+/// The recorded frames of `topic` in `rec`, split by writer (`x`), each in
+/// stream order.
+fn ri_frames_by_writer(rec: &Recording, topic: &str) -> BTreeMap<u64, Vec<(f64, f64, f64)>> {
+    let mut by_writer: BTreeMap<u64, Vec<(f64, f64, f64)>> = BTreeMap::new();
+    for f in &rec.messages[topic] {
+        let frame = drv_xyz(f);
+        by_writer.entry(frame.0 as u64).or_default().push(frame);
+    }
+    by_writer
+}
+
+/// The `(topic, class, detail)` of every violation of `outcome`.
+fn ri_named(outcome: &ReplayOutcome) -> Vec<(&str, &ViolationClass, &str)> {
+    outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class, v.detail.as_str()))
+        .collect()
+}
+
+/// The byte-mismatch line of a changed period writer `w2` that stamps 4 where
+/// it recorded 2: its first frame, on `topic`, differs at `x`, and `z` too.
+fn ri_changed_w2_line(topic: &str) -> String {
+    format!(
+        "frame 0 on '{topic}' from writer w2/out differs at x: recorded 2.0, replayed 4.0; 1 more \
+         value(s) differ (recorded 64 B, replayed 64 B)"
+    )
+}
+
+/// The topic a period writer shares with a writer that never publishes.
+const RI_SPLIT_SILENT_BUS: &str = "/risplit/bus";
+
+/// A period writer (`w2`) and a writer that never publishes (`w3`) on one
+/// `multi_publisher_topics` topic no node reads.
+fn ri_split_silent_yaml() -> &'static str {
+    "name: risplit\nprefix: risplit\nmulti_publisher_topics:\n  - /risplit/bus\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risplit/bus\n\
+     \x20 - id: w3\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risplit/bus\n"
+}
+
+fn ri_split_silent_factories(writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(DrvSilentWriterNodeEntry::with_state(
+                DrvSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// A `multi_publisher_topics` topic whose writers run in two processes is
+/// judged over both of them, not over the last one alone. With the period
+/// writer `w2` in the first process and a writer that publishes nothing, live
+/// or replayed, in the second, whose own capture holds no frame of the topic,
+/// the unchanged candidate passes with the topic checked and credited rather
+/// than failing as a `missing-topic` the replay produced nothing on, and a
+/// changed `w2` fails with exit 1 as one byte mismatch from `w2`. The bag
+/// labels every frame with `w2`'s publisher, as a recorder does.
+#[test]
+#[serial]
+fn a_split_topic_whose_last_process_publishes_nothing_is_judged_by_its_other_writer() {
+    let live = ri_record(ri_split_silent_yaml(), || ri_split_silent_factories(2.0));
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_period_frames(2.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_SPLIT_SILENT_BUS),
+        want,
+        "the recorded bus holds w2's frames alone"
+    );
+    let w2 = real_publisher_id(&live.rec, "w2", "out");
+    let label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = (0..RI_STEPS)
+        .map(|i| {
+            (
+                RI_SPLIT_SILENT_BUS.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                w2,
+            )
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_split_silent.mcap");
+    ri_two_rank_bag_with_labels(
+        &live.rec,
+        &bag,
+        |id| id == "w3",
+        &label_rows,
+        ri_free_run_recorder_json(),
+    );
+
+    let (outcome, _) = ri_replay(
+        &bag,
+        || ri_split_silent_factories(2.0),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("CONTROL: the replay runs");
+    assert!(
+        outcome.violations.is_empty(),
+        "CONTROL: {:?}",
+        outcome.violations
+    );
+    assert!(outcome.passed, "CONTROL");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 1),
+        "CONTROL: the bus is checked and credited"
+    );
+
+    let (outcome, _) = ri_replay(
+        &bag,
+        || ri_split_silent_factories(4.0),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert_eq!(resim_exit(&outcome, true), 1, "exit 1");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    let want_detail = ri_changed_w2_line(RI_SPLIT_SILENT_BUS);
+    let named = ri_named(&outcome);
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_SPLIT_SILENT_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                if *detail == want_detail
+        ),
+        "exactly w2's byte mismatch: {named:?}"
+    );
+}
+
+/// The topic two period writers share, read by a sink beside one of them.
+const RI_INJ_BUS: &str = "/riinj/bus";
+/// The tag the sink logs each frame it reads under.
+const RI_INJ_SINK: f64 = 13.0;
+
+/// Two period writers (`w2`, writer 2, and `w3`, writer 3) on one
+/// `multi_publisher_topics` topic, read by a per-message sink, or by a
+/// latest-value sink that fires on every third step when `slow`.
+fn ri_inj_yaml(slow: bool) -> String {
+    let sink = if slow { "ri_slow_sink" } else { "ri_fifo_sink" };
+    format!(
+        "name: riinj\nprefix: riinj\nmulti_publisher_topics:\n  - /riinj/bus\nnodes:\n\
+         \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj/bus\n\
+         \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj/bus\n\
+         \x20 - id: sink\n    type: {sink}\n    inputs:\n      - name: inp\n        source: /riinj/bus\n"
+    )
+}
+
+/// The two-writer graph, `w2` stamping `writer` into its frames.
+fn ri_inj_factories(slow: bool, writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let sink: Box<dyn NodeEntry> = if slow {
+        Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    } else {
+        Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 3.0,
+                ..Default::default()
+            })),
+        ),
+        ("sink", sink),
+    ])
+}
+
+/// A replay that does not feed reads by their recorded identity injects the
+/// recorded frames of a writer in another process for the nodes that read
+/// its topic. With the period writer `w2` alone in the first process, and the
+/// period writer `w3` and the bus's sink in the second, the second process
+/// injects `w2`'s recorded frames for the sink. Those are copies of what
+/// `w2`'s own process publishes, so they are left out of the comparison,
+/// which judges `w2` in that process. A per-message sink is injected every
+/// frame of `w2`, and a latest-value sink that fires on every third step only
+/// the frames it reads, which is not `w2`'s recorded stream frame for frame.
+/// With either, a neutral `--resim all` and a `--verify` of a recording below
+/// trace format 8 both run to an outcome with no violation and the bus
+/// checked, and a changed `w2` fails the verify as one byte mismatch from
+/// `w2`, though the process replayed after it injected `w2`'s recorded frames.
+/// That is exit 1 with the per-message sink. The latest-value sink's reads
+/// are reproduced only by a replay that feeds them by their recorded identity,
+/// so its read log diverges in both runs, and the exit is 6, which beats 1.
+#[test]
+#[serial]
+fn a_writers_frames_injected_in_another_process_are_left_out_of_the_comparison() {
+    for slow in [false, true] {
+        let layout = if slow {
+            "latest-value sink"
+        } else {
+            "per-message sink"
+        };
+        let live = ri_record(&ri_inj_yaml(slow), || ri_inj_factories(slow, 2.0));
+        let mut want = BTreeMap::new();
+        want.insert(2, ri_period_frames(2.0));
+        want.insert(3, ri_period_frames(3.0));
+        assert_eq!(
+            ri_frames_by_writer(&live.rec, RI_INJ_BUS),
+            want,
+            "{layout}: the recorded bus, writer by writer"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let neutral = dir.path().join("ri_inj.mcap");
+        ri_two_rank_bag(&live.rec, &neutral, |id| id != "w2");
+        let format7 = dir.path().join("ri_inj_format7.mcap");
+        ri_two_rank_bag_stamped(
+            &live.rec,
+            &format7,
+            |id| id != "w2",
+            true,
+            ri_recorder_json_at(7),
+        );
+        for (run, bag, purpose) in [
+            ("neutral", &neutral, replay_engine::ReplayPurpose::Resim),
+            (
+                "format 7 verify",
+                &format7,
+                replay_engine::ReplayPurpose::Verify,
+            ),
+        ] {
+            let (outcome, _) = ri_replay(bag, || ri_inj_factories(slow, 2.0), purpose);
+            let outcome = outcome
+                .unwrap_or_else(|e| panic!("{layout}: {run}: the replay runs to an outcome: {e}"));
+            assert!(
+                matches!(
+                    outcome.read_identity,
+                    replay_engine::ReadIdentityReport::BestEffort { .. }
+                ),
+                "PREMISE: {layout}: {run}: no read is fed by identity: {:?}",
+                outcome.read_identity
+            );
+            assert!(
+                outcome.violations.is_empty(),
+                "{layout}: {run}: {:?}",
+                outcome.violations
+            );
+            assert_eq!(
+                outcome.topics_checked, 1,
+                "{layout}: {run}: the bus is checked"
+            );
+            let sink_diverged = outcome.read_log_divergence.as_ref().map(|d| {
+                d.edges
+                    .iter()
+                    .map(|e| (e.node_id.as_str(), e.input.as_str()))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                sink_diverged,
+                slow.then(|| vec![("sink", "inp")]),
+                "PREMISE: {layout}: {run}: only the latest-value sink's read log diverges"
+            );
+        }
+
+        let (outcome, _) = ri_replay(
+            &format7,
+            || ri_inj_factories(slow, 4.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert_eq!(
+            resim_exit(&outcome, true),
+            if slow { 6 } else { 1 },
+            "{layout}: the exit"
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+        let want_detail = ri_changed_w2_line(RI_INJ_BUS);
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_INJ_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{layout}: exactly w2's byte mismatch: {named:?}"
+        );
+    }
+}
+
+/// The topic three period writers share, read by a sink beside one of them.
+const RI_INJ3_BUS: &str = "/riinj3/bus";
+
+/// Three period writers (`w1`, `w2` and `w3`, writers 1, 2 and 3) on one
+/// `multi_publisher_topics` topic, read by a per-message sink, or by a
+/// latest-value sink that fires on every third step when `slow`.
+fn ri_inj3_yaml(slow: bool) -> String {
+    let sink = if slow { "ri_slow_sink" } else { "ri_fifo_sink" };
+    format!(
+        "name: riinj3\nprefix: riinj3\nmulti_publisher_topics:\n  - /riinj3/bus\nnodes:\n\
+         \x20 - id: w1\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj3/bus\n\
+         \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj3/bus\n\
+         \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /riinj3/bus\n\
+         \x20 - id: sink\n    type: {sink}\n    inputs:\n      - name: inp\n        source: /riinj3/bus\n"
+    )
+}
+
+/// The three-writer graph, `w1` stamping `writer` into its frames.
+fn ri_inj3_factories(slow: bool, writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let sink: Box<dyn NodeEntry> = if slow {
+        Box::new(RiSlowSinkEntry::with_state(RiSlowSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    } else {
+        Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+            tag: RI_INJ_SINK,
+            ..Default::default()
+        }))
+    };
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w1", period(writer)),
+        ("w2", period(2.0)),
+        ("w3", period(3.0)),
+        ("sink", sink),
+    ])
+}
+
+/// The process of each node of the three-writer graph: `w1` and the sink in
+/// the first, `w2` in the second, `w3` in the third.
+fn ri_inj3_rank_of(id: &str) -> u32 {
+    match id {
+        "w2" => 1,
+        "w3" => 2,
+        _ => 0,
+    }
+}
+
+/// A replay that does not feed reads by their recorded identity injects the
+/// recorded frames of every writer in another process for the nodes that read
+/// their topic, through one publisher, however many writers that is. With the
+/// period writer `w1` and the bus's sink in the first process, `w2` in the
+/// second and `w3` in the third, the first process injects the recorded frames
+/// of both `w2` and `w3` for the sink. Those are copies of what the other two
+/// processes publish, so they are left out of the comparison, which judges
+/// each writer in the process that runs it. With a per-message sink or a
+/// latest-value sink that fires on every third step, a neutral `--resim all`
+/// and a `--verify` of a recording below trace format 8 both run to an outcome
+/// with no violation and the bus checked, and a changed `w1` fails the verify
+/// as one byte mismatch from `w1`. That is exit 1 with the per-message sink,
+/// and exit 6, which beats 1, with the latest-value sink, whose read log
+/// diverges in both runs.
+#[test]
+#[serial]
+fn the_frames_of_two_writers_injected_in_one_process_are_left_out_of_the_comparison() {
+    for slow in [false, true] {
+        let layout = if slow {
+            "latest-value sink"
+        } else {
+            "per-message sink"
+        };
+        let live = ri_record(&ri_inj3_yaml(slow), || ri_inj3_factories(slow, 1.0));
+        let mut want = BTreeMap::new();
+        want.insert(1, ri_period_frames(1.0));
+        want.insert(2, ri_period_frames(2.0));
+        want.insert(3, ri_period_frames(3.0));
+        assert_eq!(
+            ri_frames_by_writer(&live.rec, RI_INJ3_BUS),
+            want,
+            "{layout}: the recorded bus, writer by writer"
+        );
+        let label_rows = ri_frame_label_rows(&live.rec);
+        assert_eq!(
+            label_rows.len(),
+            3 * RI_STEPS,
+            "PREMISE: {layout}: the bag labels every frame of the bus"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let neutral = dir.path().join("ri_inj3.mcap");
+        ri_ranked_bag_with_labels(
+            &live.rec,
+            &neutral,
+            ri_inj3_rank_of,
+            3,
+            &label_rows,
+            ri_free_run_recorder_json(),
+        );
+        let format7 = dir.path().join("ri_inj3_format7.mcap");
+        ri_ranked_bag_with_labels(
+            &live.rec,
+            &format7,
+            ri_inj3_rank_of,
+            3,
+            &label_rows,
+            ri_recorder_json_at(7),
+        );
+        for (run, bag, purpose) in [
+            ("neutral", &neutral, replay_engine::ReplayPurpose::Resim),
+            (
+                "format 7 verify",
+                &format7,
+                replay_engine::ReplayPurpose::Verify,
+            ),
+        ] {
+            let (outcome, _) = ri_replay(bag, || ri_inj3_factories(slow, 1.0), purpose);
+            let outcome = outcome
+                .unwrap_or_else(|e| panic!("{layout}: {run}: the replay runs to an outcome: {e}"));
+            assert!(
+                matches!(
+                    outcome.read_identity,
+                    replay_engine::ReadIdentityReport::BestEffort { .. }
+                ),
+                "PREMISE: {layout}: {run}: no read is fed by identity: {:?}",
+                outcome.read_identity
+            );
+            assert!(
+                outcome.violations.is_empty(),
+                "{layout}: {run}: {:?}",
+                outcome.violations
+            );
+            assert_eq!(
+                outcome.topics_checked, 1,
+                "{layout}: {run}: the bus is checked"
+            );
+            let sink_diverged = outcome.read_log_divergence.as_ref().map(|d| {
+                d.edges
+                    .iter()
+                    .map(|e| (e.node_id.as_str(), e.input.as_str()))
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                sink_diverged,
+                slow.then(|| vec![("sink", "inp")]),
+                "PREMISE: {layout}: {run}: only the latest-value sink's read log diverges"
+            );
+        }
+
+        let (outcome, _) = ri_replay(
+            &format7,
+            || ri_inj3_factories(slow, 4.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{layout}: the replay runs: {e}"));
+        assert_eq!(
+            resim_exit(&outcome, true),
+            if slow { 6 } else { 1 },
+            "{layout}: the exit"
+        );
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 0),
+            "{layout}"
+        );
+        let want_detail = format!(
+            "frame 0 on '{RI_INJ3_BUS}' from writer w1/out differs at x: recorded 1.0, replayed \
+             4.0; 1 more value(s) differ (recorded 64 B, replayed 64 B)"
+        );
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_INJ3_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{layout}: exactly w1's byte mismatch: {named:?}"
+        );
+    }
+}
+
+/// The topic two period writers in two processes share.
+const RI_MIX_BUS: &str = "/rimix/bus";
+/// The topic a period writer shares with a writer that never publishes, both
+/// in the second process.
+const RI_MIX_AUX: &str = "/rimix/aux";
+
+/// Two period writers (`w2`, writer 2, and `w3`, writer 3) on one
+/// `multi_publisher_topics` topic, and a period writer (`a`, writer 5) and a
+/// writer that never publishes (`b`) on another. No node reads either.
+fn ri_mix_yaml() -> &'static str {
+    "name: rimix\nprefix: rimix\nmulti_publisher_topics:\n  - /rimix/bus\n  - /rimix/aux\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rimix/aux\n"
+}
+
+/// The two-topic graph, `w2` and `w3` stamping `w2` and `w3` into their
+/// frames.
+fn ri_mix_factories(w2: f64, w3: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w2", period(w2)),
+        ("w3", period(w3)),
+        ("a", period(5.0)),
+        (
+            "b",
+            Box::new(DrvSilentWriterNodeEntry::with_state(
+                DrvSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// The mixed bag, recorded from the unchanged graph: `w2` in the first
+/// process, `w3`, `a` and `b` in the second.
+fn ri_mix_bag(dir: &std::path::Path) -> (RiLive, std::path::PathBuf) {
+    let live = ri_record(ri_mix_yaml(), || ri_mix_factories(2.0, 3.0));
+    let bag = dir.join("ri_mix.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id != "w2");
+    (live, bag)
+}
+
+/// Replay the mixed bag with the verifier's record budget at the bus's
+/// `2 * RI_STEPS` frames, `w2` and `w3` stamping `w2` and `w3`, writing
+/// `--report` to `report` when it is given.
+fn ri_mix_replay(
+    bag: &std::path::Path,
+    w2: f64,
+    w3: f64,
+    report: Option<std::path::PathBuf>,
+) -> Result<ReplayOutcome, ReplayError> {
+    let _budget = replay_engine::override_frame_index_record_budget(2 * RI_STEPS);
+    ri_replay_reporting(
+        bag,
+        || ri_mix_factories(w2, w3),
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        report,
+    )
+    .0
+}
+
+/// A `multi_publisher_topics` topic that one process compares writer by
+/// writer and another as one stream is judged in both. `w2` runs in the
+/// first process, and `w3`, `a` and `b` in the second. With the verifier's
+/// record budget at the bus's `2n` frames, the first process, whose
+/// multi-publisher topics are the bus alone, attributes the bus's frames to
+/// their writers, while the second, whose bus and `/rimix/aux` hold `3n`,
+/// cannot. The second is counted over every recorded frame of the bus `w2`'s
+/// partition does not hold, `n`, against the `n` its writer `w3` replayed. Its
+/// one stream, `w3`'s frames alone, lines up with no recorded stream while
+/// the first process captured `w2`'s, so with the unchanged candidate the bus
+/// is DECLINED: exit 0, checked but not credited, the row naming the second
+/// process and withholding its one-stream byte mismatch at the first recorded
+/// frame that is not `w3`'s next one. A changed `w2` fails with exit 1 as one
+/// byte mismatch from `w2`, and nothing is declined. A changed `w3`, whose
+/// frames are not compared, is declined the same way, never credited.
+/// `/rimix/aux`, which only `a` publishes, matches as one stream.
+#[test]
+#[serial]
+fn a_split_topic_one_process_attributes_and_another_does_not_is_judged_in_both() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, bag) = ri_mix_bag(dir.path());
+    let mut want_bus = BTreeMap::new();
+    want_bus.insert(2, ri_period_frames(2.0));
+    want_bus.insert(3, ri_period_frames(3.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_MIX_BUS),
+        want_bus,
+        "the recorded bus, writer by writer"
+    );
+    let mut want_aux = BTreeMap::new();
+    want_aux.insert(5, ri_period_frames(5.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_MIX_AUX),
+        want_aux,
+        "the recorded aux topic holds a's frames alone"
+    );
+    // Where `w3`'s replayed frames, its own in order, first differ from the
+    // recorded bus.
+    let w3_at = live.rec.messages[RI_MIX_BUS]
+        .iter()
+        .map(|f| drv_xyz(f))
+        .zip(ri_period_frames(3.0))
+        .position(|(r, w)| r != w)
+        .expect("PREMISE: the bus interleaves the writers");
+    for (run, w2, w3) in [("CONTROL", 2.0, 3.0), ("changed w3", 2.0, 6.0)] {
+        let outcome = ri_mix_replay(&bag, w2, w3, None)
+            .unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{run}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{run}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{run}: exit 0");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (2, 1),
+            "{run}: the bus is checked and not credited, the aux topic passes"
+        );
+        let declined: Vec<_> = outcome
+            .declined_frame_comparisons
+            .iter()
+            .map(|d| {
+                (
+                    d.topic.as_str(),
+                    d.ranks.clone(),
+                    d.code.as_str(),
+                    d.matched_under_fallback,
+                    d.withheld
+                        .iter()
+                        .map(|v| (&v.class, v.detail.as_str()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        let at = if w3 == 3.0 { w3_at } else { 0 };
+        assert!(
+            matches!(
+                declined.as_slice(),
+                [(RI_MIX_BUS, ranks, "split_topic_frames_unattributed", false, withheld)]
+                    if *ranks == vec![1]
+                        && matches!(
+                            withheld.as_slice(),
+                            [(ViolationClass::ByteMismatch { index, .. }, detail)]
+                                if *index == at
+                                    && detail.starts_with(
+                                        &format!("frame {at} on '{RI_MIX_BUS}' differs ")
+                                    )
+                        )
+            ),
+            "{run}: the bus is declined for the second process: {declined:?}"
+        );
+        let verdict = replay_engine::render_verdict(&outcome, &bag);
+        assert!(
+            verdict.contains(&format!(
+                "  - topic {RI_MIX_BUS} (rank(s) [1]) [split_topic_frames_unattributed]: 1 \
+                 withheld divergence(s) "
+            )),
+            "{run}: the verdict names the declined bus: {verdict}"
+        );
+    }
+    let outcome = ri_mix_replay(&bag, 4.0, 3.0, None).expect("changed w2: the replay runs");
+    assert_eq!(resim_exit(&outcome, true), 1, "changed w2: exit 1");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 1),
+        "changed w2: the bus fails and the aux topic passes"
+    );
+    let want_detail = ri_changed_w2_line(RI_MIX_BUS);
+    let named = ri_named(&outcome);
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_MIX_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                if *detail == want_detail
+        ),
+        "changed w2: exactly w2's byte mismatch: {named:?}"
+    );
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "changed w2: a failed topic is not declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+}
+
+/// Two `--verify` replays of the mixed bag write the same `--report` bytes,
+/// each declining the bus.
+#[test]
+#[serial]
+fn a_verify_of_a_split_topic_one_process_attributes_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bag) = ri_mix_bag(dir.path());
+    let reports = ri_two_reports(dir.path(), "ri_mix", |report| {
+        ri_mix_replay(&bag, 2.0, 3.0, Some(report))
+    });
+    for (run, json) in reports.iter().enumerate() {
+        assert_eq!(json["passed"], serde_json::json!(true), "run {run}");
+        assert_eq!(
+            json["declined_frame_comparisons"][0]["code"],
+            serde_json::json!("split_topic_frames_unattributed"),
+            "run {run}: {json}"
+        );
+    }
+}
+
+/// A `multi_publisher_topics` topic whose writers run in two processes, one of
+/// which publishes every frame of it, is judged by that process alone when
+/// neither attributes the topic's frames to their writers: the period writer
+/// `w2`'s stream against every recorded frame, the writer that never publishes
+/// adding none. In either process order the unchanged candidate passes with the
+/// bus checked and credited, and a changed `w2` fails with exit 1 as one byte
+/// mismatch of the whole stream, which names no writer. The bag labels no
+/// frame.
+#[test]
+#[serial]
+fn a_split_topic_one_process_publishes_is_judged_by_that_process_alone() {
+    let live = ri_record(ri_split_silent_yaml(), || ri_split_silent_factories(2.0));
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_period_frames(2.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_SPLIT_SILENT_BUS),
+        want,
+        "the recorded bus holds w2's frames alone"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let w2_last: fn(&str) -> bool = |id| id == "w2";
+    let w2_first: fn(&str) -> bool = |id| id == "w3";
+    for (order, on_rank1) in [
+        ("w2 in the last process", w2_last),
+        ("w2 in the first process", w2_first),
+    ] {
+        let bag = dir.path().join(format!(
+            "ri_split_silent_unlabelled_{}.mcap",
+            on_rank1("w2")
+        ));
+        ri_two_rank_bag_labelled(&live.rec, &bag, on_rank1, false);
+        let (outcome, _) = ri_replay(
+            &bag,
+            || ri_split_silent_factories(2.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{order}: CONTROL: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{order}: CONTROL: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{order}: CONTROL");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (1, 1),
+            "{order}: CONTROL: the bus is checked and credited"
+        );
+        let (outcome, _) = ri_replay(
+            &bag,
+            || ri_split_silent_factories(4.0),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{order}: {e}"));
+        assert_eq!(resim_exit(&outcome, true), 1, "{order}: exit 1");
+        assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+        let want_detail = format!(
+            "frame 0 on '{RI_SPLIT_SILENT_BUS}' differs at x: recorded 2.0, replayed 4.0; 1 \
+             more value(s) differ (recorded 64 B, replayed 64 B)"
+        );
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_SPLIT_SILENT_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{order}: exactly the stream's byte mismatch: {named:?}"
+        );
+    }
+}
+
+/// The topic two period writers in two processes share, which no node reads.
+const RI_PAIR_BUS: &str = "/ripair/bus";
+
+/// Two period writers, `w2` and `w3`, on one `multi_publisher_topics` topic no
+/// node reads.
+fn ri_pair_yaml() -> &'static str {
+    "name: ripair\nprefix: ripair\nmulti_publisher_topics:\n  - /ripair/bus\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ripair/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ripair/bus\n"
+}
+
+/// The pair graph, `w2` and `w3` stamping `w2` and `w3` into their frames.
+fn ri_pair_factories(w2: f64, w3: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    factories(vec![("w2", period(w2)), ("w3", period(w3))])
+}
+
+/// A writer that stamps its identity into every frame, on every eighth step.
+#[cerulion_node(period_ms = 40)]
+#[derive(Default)]
+struct RiSlowWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiSlowWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// The topic a slow and a period writer share, which no node reads.
+const RI_TAIL_BUS: &str = "/ritail/bus";
+
+/// A writer on every eighth step (`w2`, writer 2) and a period writer (`w3`,
+/// writer 3) on one `multi_publisher_topics` topic no node reads.
+fn ri_tail_yaml() -> &'static str {
+    "name: ritail\nprefix: ritail\nmulti_publisher_topics:\n  - /ritail/bus\nnodes:\n\
+     \x20 - id: w2\n    type: ri_slow_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritail/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritail/bus\n"
+}
+
+fn ri_tail_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiSlowWriterNodeEntry::with_state(RiSlowWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 3.0,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A label-partitioned topic's ragged-tail tolerance is bounded writer by
+/// writer: one process's tail never explains another process's writer's
+/// frames. `w2` runs in the first process, on every eighth step, at 40 ms to
+/// 280 ms of the 300 ms run, so that process's final recorded step banked its
+/// boundary and no fires, a one-step tail. `w3` runs in the second, which recorded a fire on every step, and the
+/// bag lost the frame of its last fire, so `w3` replays one frame past its
+/// `n - 1` recorded ones, which no tail of its own explains. The two
+/// processes' one extra frame fits the first's window of one step of two
+/// frames, which is what a bound over the topic's counts read. Exit 1, one
+/// `extra-messages` violation from `w3`, and no tolerance note. The bag labels
+/// each frame with its writer.
+#[test]
+#[serial]
+fn one_process_tail_never_explains_another_process_writer_frames() {
+    let mut live = ri_record(ri_tail_yaml(), ri_tail_factories);
+    let n = RI_STEPS;
+    // `w2` fires at 40 ms, 80 ms, ..., 280 ms: seven frames.
+    let slow: Vec<(f64, f64, f64)> = (1..=7)
+        .map(|c| (2.0, c as f64, 2_000_000.0 + 7.0 * c as f64))
+        .collect();
+    let mut want = BTreeMap::new();
+    want.insert(2, slow);
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(ri_frames_by_writer(&live.rec, RI_TAIL_BUS), want, "PREMISE");
+    let frames = live
+        .rec
+        .messages
+        .get_mut(RI_TAIL_BUS)
+        .expect("the bus was recorded");
+    let last = frames
+        .iter()
+        .rposition(|f| frame_x(f) == 3.0)
+        .expect("w3 recorded a frame");
+    frames.remove(last);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_tail.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w3");
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_tail_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert_eq!(
+        resim_exit(&outcome, true),
+        1,
+        "exit 1: {:?} {:?}",
+        outcome.trace_divergence,
+        outcome.tolerated_ragged_tails
+    );
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    let named = ri_named(&outcome);
+    let want_detail = format!(
+        "recorded {} frame(s), replay produced {n} on '{RI_TAIL_BUS}' from writer w3/out",
+        n - 1
+    );
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_TAIL_BUS, ViolationClass::ExtraMessages { recorded, replayed }, detail)]
+                if (*recorded, *replayed) == (n - 1, n) && *detail == want_detail
+        ),
+        "exactly w3's extra frame: {named:?}"
+    );
+    assert!(
+        outcome.tolerated_ragged_tails.is_empty(),
+        "no tolerance note: {:?}",
+        outcome.tolerated_ragged_tails
+    );
+}
+
+/// A label-partitioned writer's ragged-tail window is its process's tail
+/// times the most frames the writer published in one recorded step, never the
+/// topic's: the slow-writer bag of
+/// `one_process_tail_never_explains_another_process_writer_frames`, with
+/// `w2`'s last two frames lost instead of `w3`'s. `w2` publishes one frame per
+/// fire, so the first process's one-step tail explains one of the two frames
+/// `w2` replays past its five recorded ones, though both fit one step of the
+/// bus's two frames, the frames `w2` and `w3` publish together on `w2`'s
+/// steps. Exit 1, one `extra-messages` violation from `w2`, and no tolerance
+/// note. The bag labels each frame with its writer.
+#[test]
+#[serial]
+fn a_writer_s_tail_window_is_its_own_frames_per_step_not_the_topic_s() {
+    let mut live = ri_record(ri_tail_yaml(), ri_tail_factories);
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_slow_frames(2.0));
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(ri_frames_by_writer(&live.rec, RI_TAIL_BUS), want, "PREMISE");
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_tail_slow_writer_lost_two.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w3");
+    assert_eq!(
+        load_inputs(&bag).3.max_burst(RI_TAIL_BUS),
+        2,
+        "PREMISE: the bus carries two frames in one step"
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_tail_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert_eq!(
+        resim_exit(&outcome, true),
+        1,
+        "exit 1: {:?} {:?}",
+        outcome.trace_divergence,
+        outcome.tolerated_ragged_tails
+    );
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+    let named = ri_named(&outcome);
+    let want_detail =
+        format!("recorded 5 frame(s), replay produced 7 on '{RI_TAIL_BUS}' from writer w2/out");
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_TAIL_BUS, ViolationClass::ExtraMessages { recorded: 5, replayed: 7 }, detail)]
+                if *detail == want_detail
+        ),
+        "exactly w2's extra frames: {named:?}"
+    );
+    assert!(
+        outcome.tolerated_ragged_tails.is_empty(),
+        "no tolerance note: {:?}",
+        outcome.tolerated_ragged_tails
+    );
+}
+
+/// The `--tolerance` rows of a topic whose writers run in two processes fold
+/// to one row per declaration, the worst frame over both: `w2` replays
+/// writer 4 where it recorded 2 and `w3` writer 6 where it recorded 3, so
+/// `x` differs by 2 and 3 and `z` by 2000000 and 3000000 on every frame, and
+/// each field's one row carries `w3`'s difference at its frame 0. Exit 1, and
+/// no other violation: every other byte of every frame is the recorded one.
+/// The bag labels each frame with its writer.
+#[test]
+#[serial]
+fn a_split_topic_tolerance_row_is_the_worst_over_its_processes() {
+    let live = ri_record(ri_pair_yaml(), || ri_pair_factories(2.0, 3.0));
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_pair_tolerance.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id == "w3");
+    let yaml = "\
+topics:
+  /ripair/bus:
+    fields:
+      x:
+        kind: max_abs
+        threshold: 0.5
+      z:
+        kind: max_abs
+        threshold: 0.5
+";
+    let outcome = replay_with_tolerance(&bag, || ri_pair_factories(4.0, 6.0), yaml, None)
+        .expect("the replay runs");
+    assert_eq!(resim_exit(&outcome, true), 1, "exit 1");
+    assert!(
+        outcome.violations.iter().all(|v| v.topic == RI_PAIR_BUS),
+        "{:?}",
+        outcome.violations
+    );
+    let rows: Vec<(&str, String)> = outcome
+        .violations
+        .iter()
+        .map(|v| {
+            let class = match &v.class {
+                ViolationClass::ToleranceExceeded {
+                    field,
+                    worst_value,
+                    worst_tick,
+                    ..
+                } => format!("{field:?} {worst_value:?} {worst_tick}"),
+                other => format!("{other:?}"),
+            };
+            (v.detail.as_str(), class)
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "field 'x' exceeded the max_abs tolerance on '/ripair/bus': worst value 3 vs \
+                 threshold 0.5 (worst at frame 0)",
+                "Some(\"x\") Some(3.0) 0".to_string()
+            ),
+            (
+                "field 'z' exceeded the max_abs tolerance on '/ripair/bus': worst value 3000000 \
+                 vs threshold 0.5 (worst at frame 0)",
+                "Some(\"z\") Some(3000000.0) 0".to_string()
+            ),
+        ],
+        "one row per declaration"
+    );
+}
+
+/// Drop the last frame the writer stamping `writer` recorded on `topic`.
+fn ri_drop_last_frame(rec: &mut Recording, topic: &str, writer: f64) {
+    let frames = rec.messages.get_mut(topic).expect("the topic was recorded");
+    let last = frames
+        .iter()
+        .rposition(|f| frame_x(f) == writer)
+        .expect("the writer recorded a frame");
+    frames.remove(last);
+}
+
+/// The recorded frames of `topic` in `rec`, in stream order.
+fn ri_recorded_xyz(rec: &Recording, topic: &str) -> Vec<(f64, f64, f64)> {
+    rec.messages[topic].iter().map(|f| drv_xyz(f)).collect()
+}
+
+/// The index of the first frame of `recorded` that is not the next frame of
+/// `frames`, one writer's stream.
+fn ri_first_differing(recorded: &[(f64, f64, f64)], frames: &[(f64, f64, f64)]) -> usize {
+    recorded
+        .iter()
+        .zip(frames)
+        .position(|(r, w)| r != w)
+        .expect("PREMISE: the recorded stream holds another writer's frame")
+}
+
+/// A slow writer's frames, `(writer, c, writer * 1_000_000 + 7c)` for
+/// `c = 1..=7`: one every eighth step, at 40 ms to 280 ms of the 300 ms run.
+fn ri_slow_frames(writer: f64) -> Vec<(f64, f64, f64)> {
+    (1..=7)
+        .map(|c| (writer, c as f64, writer * 1_000_000.0 + 7.0 * c as f64))
+        .collect()
+}
+
+/// The frame-tolerance notes of `outcome` on `topic`.
+fn ri_frame_notes<'a>(outcome: &'a ReplayOutcome, topic: &str) -> Vec<&'a str> {
+    let quoted = format!("'{topic}'");
+    outcome
+        .tolerated_ragged_tails
+        .iter()
+        .filter(|n| n.starts_with("frame:") && n.contains(&quoted))
+        .map(String::as_str)
+        .collect()
+}
+
+/// The frame-tolerance note of one trailing frame on `topic` that `rank`'s
+/// final recorded step, a boundary with no fires behind it, explains.
+fn ri_fireless_note(topic: &str, rank: u32, recorded: usize, replayed: usize) -> String {
+    format!(
+        "frame: 1 trailing frame(s) on '{topic}' tolerated: rank {rank}'s final recorded step \
+         banked its step boundary with no fires behind it (either the step ran and fired \
+         nothing, or the worker shut down between the step boundary and the step's fires \
+         \u{2014} the recording cannot tell which) (recorded {recorded}, replay produced \
+         {replayed})"
+    )
+}
+
+/// One declined frame comparison: its topic, ranks, code, whether it matched,
+/// and the classes of the violations it withheld.
+type RiDeclined<'a> = (&'a str, Vec<u32>, &'a str, bool, Vec<&'a ViolationClass>);
+
+/// Every declined frame comparison of `outcome`.
+fn ri_declined(outcome: &ReplayOutcome) -> Vec<RiDeclined<'_>> {
+    outcome
+        .declined_frame_comparisons
+        .iter()
+        .map(|d| {
+            (
+                d.topic.as_str(),
+                d.ranks.clone(),
+                d.code.as_str(),
+                d.matched_under_fallback,
+                d.withheld.iter().map(|v| &v.class).collect(),
+            )
+        })
+        .collect()
+}
+
+/// The topic a period writer shares with a writer that never publishes, read
+/// by a sink beside the silent one.
+const RI_SILENT_INJ_BUS: &str = "/risilinj/bus";
+/// The topic a second period writer shares with a second silent writer.
+const RI_SILENT_INJ_AUX: &str = "/risilinj/aux";
+
+/// A period writer (`w2`, writer 2) and a writer that never publishes (`w3`)
+/// on one `multi_publisher_topics` topic, read by a per-message sink, and a
+/// period writer (`a`, writer 5) and a writer that never publishes (`b`) on a
+/// second one no node reads.
+fn ri_silent_inj_yaml() -> &'static str {
+    "name: risilinj\nprefix: risilinj\nmulti_publisher_topics:\n  - /risilinj/bus\n  - /risilinj/aux\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/bus\n\
+     \x20 - id: w3\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/bus\n\
+     \x20 - id: sink\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /risilinj/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /risilinj/aux\n"
+}
+
+/// The silent-writer graph, `w2` stamping `writer` into its frames.
+fn ri_silent_inj_factories(writer: f64) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    let silent = || -> Box<dyn NodeEntry> {
+        Box::new(DrvSilentWriterNodeEntry::with_state(
+            DrvSilentWriterNode::default(),
+        ))
+    };
+    factories(vec![
+        ("w2", period(writer)),
+        ("w3", silent()),
+        (
+            "sink",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_INJ_SINK,
+                ..Default::default()
+            })),
+        ),
+        ("a", period(5.0)),
+        ("b", silent()),
+    ])
+}
+
+/// A `multi_publisher_topics` topic whose writers run in two processes is
+/// judged by the one process whose own writers published frames of it, beside
+/// another that injects its recorded frames. `w2` and `a` run in the first
+/// process, and `w3`, `b` and the bus's per-message sink in the second, which,
+/// in a `--verify` of a recording below trace format 8, injects `w2`'s
+/// recorded frames for the sink. The bag labels each bus frame with `w2`, and
+/// the verifier's record budget is the bus's `n` frames: the frames the
+/// second process injects fit it, while each process's two
+/// `multi_publisher_topics` topics, `2n` frames, do not, so neither process
+/// attributes the bus's frames to their writers, and the second captures the
+/// injected copies alone. The first's stream, `w2`'s frames, is compared with
+/// every recorded frame: the unchanged candidate passes with both topics
+/// checked and credited, and a changed `w2` fails with exit 1 as one byte
+/// mismatch of the whole stream, which names no writer. Nothing is declined
+/// in either run.
+#[test]
+#[serial]
+fn a_split_topic_one_process_publishes_beside_one_that_injects_is_judged_by_the_first_alone() {
+    let live = ri_record(ri_silent_inj_yaml(), || ri_silent_inj_factories(2.0));
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_period_frames(2.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_SILENT_INJ_BUS),
+        want,
+        "PREMISE: the recorded bus holds w2's frames alone"
+    );
+    assert_eq!(
+        live.rec.messages[RI_SILENT_INJ_AUX].len(),
+        n,
+        "PREMISE: the aux topic holds a's frames"
+    );
+    let w2 = real_publisher_id(&live.rec, "w2", "out");
+    let label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = (0..n)
+        .map(|i| {
+            (
+                RI_SILENT_INJ_BUS.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                w2,
+            )
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_silent_inj_format7.mcap");
+    ri_two_rank_bag_with_labels(
+        &live.rec,
+        &bag,
+        |id| matches!(id, "w3" | "sink" | "b"),
+        &label_rows,
+        ri_recorder_json_at(7),
+    );
+    for (run, writer) in [("CONTROL", 2.0), ("changed w2", 4.0)] {
+        let (outcome, _) = {
+            let _budget = replay_engine::override_frame_index_record_budget(n);
+            ri_replay(
+                &bag,
+                || ri_silent_inj_factories(writer),
+                replay_engine::ReplayPurpose::Verify,
+            )
+        };
+        let outcome = outcome.unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        assert!(
+            matches!(
+                outcome.read_identity,
+                replay_engine::ReadIdentityReport::BestEffort { .. }
+            ),
+            "PREMISE: {run}: no read is fed by identity: {:?}",
+            outcome.read_identity
+        );
+        assert!(
+            outcome.declined_frame_comparisons.is_empty(),
+            "{run}: nothing is declined: {:?}",
+            outcome.declined_frame_comparisons
+        );
+        if writer == 2.0 {
+            assert!(
+                outcome.violations.is_empty(),
+                "{run}: {:?}",
+                outcome.violations
+            );
+            assert!(outcome.passed, "{run}");
+            assert_eq!(
+                (outcome.topics_checked, outcome.topics_passed),
+                (2, 2),
+                "{run}: both topics are checked and credited"
+            );
+            continue;
+        }
+        assert_eq!(resim_exit(&outcome, true), 1, "{run}: exit 1");
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (2, 1),
+            "{run}: the bus fails and the aux topic passes"
+        );
+        let want_detail = format!(
+            "frame 0 on '{RI_SILENT_INJ_BUS}' differs at x: recorded 2.0, replayed 4.0; 1 more \
+             value(s) differ (recorded 64 B, replayed 64 B)"
+        );
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_SILENT_INJ_BUS, ViolationClass::ByteMismatch { index: 0, .. }, detail)]
+                    if *detail == want_detail
+            ),
+            "{run}: exactly the stream's byte mismatch: {named:?}"
+        );
+    }
+}
+
+/// The topic a camera in a process of its own shares with two writers that
+/// never publish, in two others.
+const RI_DRV3_BUS: &str = "/ridrv3/bus";
+/// The topic the first process's period writer shares with the second's
+/// writer that never publishes.
+const RI_DRV3_AUX: &str = "/ridrv3/aux";
+/// The bus sink beside `w2`.
+const RI_DRV3_SINK2: f64 = 31.0;
+/// The bus sink beside `w3`.
+const RI_DRV3_SINK3: f64 = 32.0;
+
+/// The camera (`w1`, a driver), two writers that never publish (`w2` and
+/// `w3`) and two per-message sinks (`s2`, `s3`) on one
+/// `multi_publisher_topics` topic, and a period writer (`a`, writer 5) and a
+/// writer that never publishes (`b`) on a second one no node reads.
+fn ri_drv3_yaml() -> &'static str {
+    "name: ridrv3\nprefix: ridrv3\nmulti_publisher_topics:\n  - /ridrv3/bus\n  - /ridrv3/aux\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv3/bus\n\
+     \x20 - id: w2\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv3/bus\n\
+     \x20 - id: w3\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv3/bus\n\
+     \x20 - id: s2\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /ridrv3/bus\n\
+     \x20 - id: s3\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /ridrv3/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv3/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv3/aux\n"
+}
+
+/// The camera graph, its device attached when `connected`.
+fn ri_drv3_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let silent = || -> Box<dyn NodeEntry> {
+        Box::new(DrvSilentWriterNodeEntry::with_state(
+            DrvSilentWriterNode::default(),
+        ))
+    };
+    let sink = |tag: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+            tag,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        ("w2", silent()),
+        ("w3", silent()),
+        ("s2", sink(RI_DRV3_SINK2)),
+        ("s3", sink(RI_DRV3_SINK3)),
+        (
+            "a",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 5.0,
+                ..Default::default()
+            })),
+        ),
+        ("b", silent()),
+    ])
+}
+
+/// `w2`, `s2` and `a` in the first process, `w3`, `s3` and `b` in the second,
+/// the camera in the third.
+fn ri_drv3_rank_of(id: &str) -> u32 {
+    match id {
+        "w1" => 2,
+        "w3" | "s3" | "b" => 1,
+        _ => 0,
+    }
+}
+
+/// The camera bag at trace format 7, recorded from the camera graph with its
+/// device attached: the bus holds the camera's `n` frames, each labelled with
+/// the camera, and the aux topic `a`'s `n`.
+fn ri_drv3_bag(dir: &std::path::Path) -> std::path::PathBuf {
+    ri_drv3_bag_stamped(dir, "ri_drv3_format7.mcap", ri_recorder_json_at(7))
+}
+
+/// [`ri_drv3_bag`] written as `name` under the recorder identity `recorder`.
+fn ri_drv3_bag_stamped(dir: &std::path::Path, name: &str, recorder: Vec<u8>) -> std::path::PathBuf {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        ri_drv3_yaml(),
+        || ri_drv3_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    ri_take();
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(
+        1,
+        (1..=n).map(|k| drv_reading(k as f64)).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        ri_frames_by_writer(&rec, RI_DRV3_BUS),
+        want,
+        "PREMISE: the recorded bus holds the camera's frames alone"
+    );
+    assert_eq!(
+        rec.messages[RI_DRV3_AUX].len(),
+        n,
+        "PREMISE: the aux topic holds a's frames"
+    );
+    let camera = real_publisher_id(&rec, "w1", "out");
+    let label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = (0..n)
+        .map(|i| {
+            (
+                RI_DRV3_BUS.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                camera,
+            )
+        })
+        .collect();
+    let bag = dir.join(name);
+    ri_ranked_bag_with_labels(&rec, &bag, ri_drv3_rank_of, 3, &label_rows, recorder);
+    bag
+}
+
+/// The recorded frames of a camera in a process of its own, which two other
+/// processes both feed from the bag to a sink beside a writer of the
+/// camera's topic, are counted once, as one such process alone counts them.
+/// The bus's other writers, `w2` in the first process and `w3` in the second,
+/// never publish, so the recorded bus holds the camera's `n` frames alone,
+/// and each process, in a `--verify` of a recording below trace format 8,
+/// injects them for its sink. The bag labels each bus frame with the camera,
+/// and the verifier's record budget is the bus's `n` frames: the frames each
+/// process injects fit it, while each process's two `multi_publisher_topics`
+/// topics, `2n` frames, do not, so neither process attributes the bus's
+/// frames to their writers, and each compares its stream, the camera's
+/// frames it feeds, with every recorded frame. The two count the camera's
+/// frames their injectors re-published once, `n` against the bus's `n`, so
+/// the unchanged candidate passes with both topics checked and credited,
+/// where counting them in neither failed the bus as a `missing-topic` the
+/// replay produced nothing on.
+#[test]
+#[serial]
+fn a_driver_s_frames_two_processes_feed_are_counted_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_drv3_bag(dir.path());
+    let (outcome, _) = {
+        let _budget = replay_engine::override_frame_index_record_budget(RI_STEPS);
+        ri_replay(
+            &bag,
+            || ri_drv3_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+        )
+    };
+    let outcome = outcome.expect("the replay runs");
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::BestEffort { .. }
+        ),
+        "PREMISE: no read is fed by identity: {:?}",
+        outcome.read_identity
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(replay_engine::DriverInputsReport {
+            unattributed_topics: vec![RI_DRV3_BUS.to_string()],
+            ..drv_inputs(&["w1"], &[], &[RI_DRV3_BUS], &[], &[])
+        }),
+        "PREMISE: no process attributes the bus"
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "nothing is declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+    assert!(outcome.passed);
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 2),
+        "both topics are checked and credited"
+    );
+}
+
+/// Two `--verify` replays of the camera bag write the same `--report` bytes,
+/// each passing with the bus counted over the camera's frames the two
+/// processes feed, once.
+#[test]
+#[serial]
+fn a_verify_of_a_driver_s_frames_two_processes_feed_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_drv3_bag(dir.path());
+    let reports = ri_two_reports(dir.path(), "ri_drv3", |report| {
+        let _budget = replay_engine::override_frame_index_record_budget(RI_STEPS);
+        ri_replay_reporting(
+            &bag,
+            || ri_drv3_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report),
+        )
+        .0
+    });
+    for (run, json) in reports.iter().enumerate() {
+        assert_eq!(json["passed"], serde_json::json!(true), "run {run}");
+        assert_eq!(
+            json["driver_inputs"]["unattributed_topics"],
+            serde_json::json!([RI_DRV3_BUS]),
+            "run {run}"
+        );
+    }
+}
+
+/// The topic a camera in a process of its own shares with two writers that
+/// never publish, in two others.
+const RI_DRV4_BUS: &str = "/ridrv4/bus";
+/// The topic two writers in the second process share, one of them a period
+/// writer.
+const RI_DRV4_AUX: &str = "/ridrv4/aux";
+
+/// The camera (`w1`, a driver), two writers that never publish (`w2` and
+/// `w3`) and a per-message sink (`s2`) on one `multi_publisher_topics`
+/// topic, and a period writer (`a`, writer 5) and a writer that never
+/// publishes (`b`) on a second one no node reads.
+fn ri_drv4_yaml() -> &'static str {
+    "name: ridrv4\nprefix: ridrv4\nmulti_publisher_topics:\n  - /ridrv4/bus\n  - /ridrv4/aux\nnodes:\n\
+     \x20 - id: w1\n    type: drv_bus_camera_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/bus\n\
+     \x20 - id: w2\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/bus\n\
+     \x20 - id: w3\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/bus\n\
+     \x20 - id: s2\n    type: ri_fifo_sink\n    inputs:\n      - name: inp\n        source: /ridrv4/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ridrv4/aux\n"
+}
+
+/// The `ri_drv4_yaml` graph, the camera's device attached when `connected`.
+fn ri_drv4_factories(connected: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let silent = || -> Box<dyn NodeEntry> {
+        Box::new(DrvSilentWriterNodeEntry::with_state(
+            DrvSilentWriterNode::default(),
+        ))
+    };
+    factories(vec![
+        (
+            "w1",
+            Box::new(DrvBusCameraNodeEntry::with_state(DrvBusCameraNode {
+                connected,
+                ..Default::default()
+            })),
+        ),
+        ("w2", silent()),
+        ("w3", silent()),
+        (
+            "s2",
+            Box::new(RiFifoSinkEntry::with_state(RiFifoSink {
+                tag: RI_DRV3_SINK2,
+                ..Default::default()
+            })),
+        ),
+        (
+            "a",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 5.0,
+                ..Default::default()
+            })),
+        ),
+        ("b", silent()),
+    ])
+}
+
+/// `w2` and `s2` in the first process, `w3`, `a` and `b` in the second, the
+/// camera in the third.
+fn ri_drv4_rank_of(id: &str) -> u32 {
+    match id {
+        "w1" => 2,
+        "w3" | "a" | "b" => 1,
+        _ => 0,
+    }
+}
+
+/// The second camera bag, recorded from the `ri_drv4_yaml` graph with its
+/// device attached and written as `name` under the recorder identity
+/// `recorder`: the bus holds the camera's `n` frames, each labelled with the
+/// camera, and the aux topic `a`'s frames.
+fn ri_drv4_bag(dir: &std::path::Path, name: &str, recorder: Vec<u8>) -> std::path::PathBuf {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        ri_drv4_yaml(),
+        || ri_drv4_factories(true),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["w1"],
+    );
+    ri_take();
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(
+        1,
+        (1..=n).map(|k| drv_reading(k as f64)).collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        ri_frames_by_writer(&rec, RI_DRV4_BUS),
+        want,
+        "PREMISE: the recorded bus holds the camera's frames alone"
+    );
+    let mut want_aux = BTreeMap::new();
+    want_aux.insert(5, ri_period_frames(5.0));
+    assert_eq!(
+        ri_frames_by_writer(&rec, RI_DRV4_AUX),
+        want_aux,
+        "PREMISE: the aux topic holds a's frames alone"
+    );
+    let camera = real_publisher_id(&rec, "w1", "out");
+    let label_rows: Vec<(String, cerulion_bag::ProducerAttribution, u128)> = (0..n)
+        .map(|i| {
+            (
+                RI_DRV4_BUS.to_string(),
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                camera,
+            )
+        })
+        .collect();
+    let bag = dir.join(name);
+    ri_ranked_bag_with_labels(&rec, &bag, ri_drv4_rank_of, 3, &label_rows, recorder);
+    bag
+}
+
+/// The recorded frames of a camera in a process of its own, which a process
+/// that attributes the camera's topic frame by frame feeds from the bag to a
+/// sink, are counted where another process cannot attribute the topic. The
+/// bus's other writers, `w2` in the first process and `w3` in the second,
+/// never publish, so the recorded bus holds the camera's `n` frames alone,
+/// each labelled with the camera, and the first process, in a `--verify` of
+/// a recording below trace format 8, injects them for its sink. The
+/// verifier's record budget is the bus's `n` frames: the first process's one
+/// `multi_publisher_topics` topic fits it, so it attributes the bus and
+/// leaves the camera's frames it injects out of `w2`'s partition, while the
+/// second's two topics, `2n` frames, do not, so it counts the bus as one
+/// stream, which holds no frame. The camera's frames the first process
+/// injected are counted once, `n` against the bus's `n`, so the unchanged
+/// candidate passes with both topics checked and credited, where counting
+/// them nowhere failed the bus as `n` missing frames.
+#[test]
+#[serial]
+fn a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_cannot() {
+    let n = RI_STEPS;
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_drv4_bag(dir.path(), "ri_drv4_format7.mcap", ri_recorder_json_at(7));
+    let (outcome, _) = {
+        let _budget = replay_engine::override_frame_index_record_budget(n);
+        ri_replay(
+            &bag,
+            || ri_drv4_factories(false),
+            replay_engine::ReplayPurpose::Verify,
+        )
+    };
+    let outcome = outcome.expect("the replay runs");
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::BestEffort { .. }
+        ),
+        "PREMISE: no read is fed by identity: {:?}",
+        outcome.read_identity
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(replay_engine::DriverInputsReport {
+            unattributed_topics: vec![RI_DRV4_BUS.to_string()],
+            ..drv_inputs(&["w1"], &[], &[RI_DRV4_BUS], &[], &[])
+        }),
+        "PREMISE: the second process does not attribute the bus"
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "nothing is declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+    assert!(outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 0, "exit 0");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 2),
+        "both topics are checked and credited"
+    );
+}
+
+/// `--verify` of `bag`, a free-run recording at this binary's trace format,
+/// under a record budget of the bus's `n` frames: the replay feeds every read
+/// by its recorded identity, the bus is compared over every recorded frame
+/// and fails with one violation of the class `want` accepts (exit 1), and the
+/// aux topic is checked and credited.
+fn ri_fed_driver_bus_fails(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    bus: &str,
+    want: fn(&ViolationClass) -> bool,
+) {
+    let (outcome, _) = {
+        let _budget = replay_engine::override_frame_index_record_budget(RI_STEPS);
+        ri_replay(bag, make, replay_engine::ReplayPurpose::Verify)
+    };
+    let outcome = outcome.expect("the replay runs");
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::Fed { .. }
+        ),
+        "PREMISE: every read is fed by identity: {:?}",
+        outcome.read_identity
+    );
+    assert_eq!(
+        outcome.driver_inputs,
+        Some(replay_engine::DriverInputsReport {
+            unattributed_topics: vec![bus.to_string()],
+            ..drv_inputs(&["w1"], &[], &[bus], &[], &[])
+        }),
+        "PREMISE: a process does not attribute the bus"
+    );
+    let named: Vec<(&str, &ViolationClass)> = outcome
+        .violations
+        .iter()
+        .map(|v| (v.topic.as_str(), &v.class))
+        .collect();
+    assert!(
+        matches!(named.as_slice(), [(topic, class)] if *topic == bus && want(class)),
+        "exactly the bus's violation: {:?}",
+        outcome.violations
+    );
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "nothing is declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+    assert!(!outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 1, "exit 1");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (2, 1),
+        "the bus fails and the aux topic passes"
+    );
+}
+
+/// The camera bag of `a_driver_s_frames_two_processes_feed_are_counted_once`
+/// recorded at this binary's trace format, whose `--verify` feeds every read
+/// by its recorded identity. Each process hands the camera's frames to its
+/// sink on a feed of its own, never on the bus, so neither capture holds a
+/// frame of the bus and nothing counts the camera's: the bus fails as a
+/// `missing-topic` the replay produced nothing on, where the trace-format-7
+/// twin, whose processes inject the camera's frames on the bus, passes.
+#[test]
+#[serial]
+fn a_fed_verify_counts_none_of_the_driver_frames_two_processes_feed() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_drv3_bag_stamped(dir.path(), "ri_drv3_fed.mcap", ri_free_run_recorder_json());
+    ri_fed_driver_bus_fails(
+        &bag,
+        || ri_drv3_factories(false),
+        RI_DRV3_BUS,
+        |class| matches!(class, ViolationClass::MissingTopic),
+    );
+}
+
+/// The camera bag of
+/// `a_driver_s_frames_an_attributing_process_feeds_are_counted_beside_one_that_cannot`
+/// recorded at this binary's trace format, whose `--verify` feeds every read
+/// by its recorded identity. The first process attributes the bus and hands
+/// the camera's frames to its sink on a feed of its own, never on the bus,
+/// so the second process's one stream counts no frame against the camera's
+/// `n`: the bus fails as `n` missing frames, where the trace-format-7 twin,
+/// whose first process injects the camera's frames on the bus, passes.
+#[test]
+#[serial]
+fn a_fed_verify_counts_none_of_the_driver_frames_an_attributing_process_feeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_drv4_bag(dir.path(), "ri_drv4_fed.mcap", ri_free_run_recorder_json());
+    ri_fed_driver_bus_fails(
+        &bag,
+        || ri_drv4_factories(false),
+        RI_DRV4_BUS,
+        |class| {
+            matches!(
+                class,
+                ViolationClass::MissingMessages {
+                    recorded: RI_STEPS,
+                    replayed: 0,
+                }
+            )
+        },
+    );
+}
+
+/// The slow-writer bag that labels no frame, `w2`, the slow writer, in the
+/// second process, recorded from the unchanged graph with the frame of `w2`'s
+/// last fire lost.
+fn ri_tail_split_bag(dir: &std::path::Path) -> (Recording, std::path::PathBuf) {
+    let mut live = ri_record(ri_tail_yaml(), ri_tail_factories);
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_slow_frames(2.0));
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(ri_frames_by_writer(&live.rec, RI_TAIL_BUS), want, "PREMISE");
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_BUS, 2.0);
+    let bag = dir.join("ri_tail_unlabelled.mcap");
+    ri_two_rank_bag_labelled(&live.rec, &bag, |id| id == "w2", false);
+    (live.rec, bag)
+}
+
+/// A ragged shutdown tail on a `multi_publisher_topics` topic whose writers
+/// run in two processes, neither of which attributes the topic's frames to
+/// their writers, is tolerated over the frames the two published together.
+/// The period writer `w3` runs in the first process, and the slow writer `w2`,
+/// on every eighth step, at 40 ms to 280 ms of the 300 ms run, in the second,
+/// whose final recorded step therefore banked its boundary and no fires, a
+/// one-step tail. The bag lost the frame of `w2`'s last fire, so the replay
+/// produces one frame past the recorded ones, inside the second's window, and
+/// the note names it. Each process's stream holds its own writer's frames
+/// alone, which no recorded stream lines up with, so the bus is DECLINED:
+/// exit 0, checked and not credited, the row naming both processes and
+/// withholding each stream's byte mismatch at the first recorded frame that
+/// is not that writer's next one. The bag labels no frame.
+#[test]
+#[serial]
+fn a_split_unattributed_topic_s_ragged_tail_is_tolerated_over_its_processes_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let (rec, bag) = ri_tail_split_bag(dir.path());
+    let n = RI_STEPS;
+    let recorded = ri_recorded_xyz(&rec, RI_TAIL_BUS);
+    assert_eq!(recorded.len(), n + 6, "PREMISE: w2 lost one frame");
+    let (w3_at, w2_at) = (
+        ri_first_differing(&recorded, &ri_period_frames(3.0)),
+        ri_first_differing(&recorded, &ri_slow_frames(2.0)),
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_tail_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!(resim_exit(&outcome, true), 0, "exit 0");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 0),
+        "the bus is checked and not credited"
+    );
+    assert_eq!(
+        ri_frame_notes(&outcome, RI_TAIL_BUS),
+        vec![ri_fireless_note(RI_TAIL_BUS, 1, n + 6, n + 7).as_str()]
+    );
+    let declined = ri_declined(&outcome);
+    assert!(
+        matches!(
+            declined.as_slice(),
+            [(RI_TAIL_BUS, ranks, "split_topic_frames_unattributed", false, withheld)]
+                if *ranks == vec![0, 1]
+                    && matches!(
+                        withheld.as_slice(),
+                        [
+                            ViolationClass::ByteMismatch { index: a, .. },
+                            ViolationClass::ByteMismatch { index: b, .. },
+                        ] if (*a, *b) == (w3_at, w2_at)
+                    )
+        ),
+        "the bus is declined for both processes: {declined:?}"
+    );
+}
+
+/// Two `--verify` replays of the slow-writer bag that labels no frame write
+/// the same `--report` bytes, each tolerating the bus's trailing frame in the
+/// second process's tail and declining the bus.
+#[test]
+#[serial]
+fn a_verify_of_a_split_topic_s_tolerated_tail_is_deterministic() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, bag) = ri_tail_split_bag(dir.path());
+    let note = ri_fireless_note(RI_TAIL_BUS, 1, RI_STEPS + 6, RI_STEPS + 7);
+    let reports = ri_two_reports(dir.path(), "ri_tail", |report| {
+        ri_replay_reporting(
+            &bag,
+            ri_tail_factories,
+            replay_engine::ReplayPurpose::Verify,
+            None,
+            None,
+            Some(report),
+        )
+        .0
+    });
+    for (run, json) in reports.iter().enumerate() {
+        assert_eq!(json["passed"], serde_json::json!(true), "run {run}");
+        assert_eq!(
+            json["declined_frame_comparisons"][0]["code"],
+            serde_json::json!("split_topic_frames_unattributed"),
+            "run {run}: {json}"
+        );
+        assert_eq!(
+            json["tolerated_ragged_tails"],
+            serde_json::json!([note]),
+            "run {run}"
+        );
+    }
+}
+
+/// The topic a slow and a period writer share in two processes.
+const RI_TAIL_MIX_BUS: &str = "/ritailmix/bus";
+
+/// A slow writer (`w2`, writer 2) and a period writer (`w3`, writer 3) on one
+/// `multi_publisher_topics` topic, and a period writer (`a`, writer 5) and a
+/// writer that never publishes (`b`) on a second; no node reads either.
+fn ri_tail_mix_yaml() -> &'static str {
+    "name: ritailmix\nprefix: ritailmix\nmulti_publisher_topics:\n  - /ritailmix/bus\n  - /ritailmix/aux\nnodes:\n\
+     \x20 - id: w2\n    type: ri_slow_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/bus\n\
+     \x20 - id: w3\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/bus\n\
+     \x20 - id: a\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/aux\n\
+     \x20 - id: b\n    type: drv_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /ritailmix/aux\n"
+}
+
+fn ri_tail_mix_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    let period = |writer: f64| -> Box<dyn NodeEntry> {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiSlowWriterNodeEntry::with_state(RiSlowWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        ("w3", period(3.0)),
+        ("a", period(5.0)),
+        (
+            "b",
+            Box::new(DrvSilentWriterNodeEntry::with_state(
+                DrvSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// A ragged shutdown tail on a `multi_publisher_topics` topic that one process
+/// attributes writer by writer and another does not is tolerated part by part.
+/// The slow writer `w2`, on every eighth step, at 40 ms to 280 ms of the
+/// 300 ms run, runs in the first process, whose final recorded step therefore
+/// banked its boundary and no fires, a one-step tail; `w3`, `a` and `b` run in
+/// the second. The bag lost the frame of `w2`'s last fire, so `w2` replays one
+/// frame past its 6 recorded ones, which the first process's window explains:
+/// the note names it. CONTROL: under the shipped record budget both processes
+/// attribute the bus's frames, which pass, the bus checked and credited. With
+/// the verifier's record budget at the bus's recorded frames, the first still
+/// attributes them and the second, whose two `multi_publisher_topics` topics
+/// hold more, does not: its `n` frames count against the `n` recorded frames
+/// `w2`'s partition does not hold. Its one stream, `w3`'s frames alone, is not
+/// compared, so the bus is DECLINED with the same note: exit 0, checked and not
+/// credited, the row withholding the stream's byte mismatch at the first
+/// recorded frame that is not `w3`'s next one. The bag labels each bus frame
+/// with its writer.
+#[test]
+#[serial]
+fn a_split_topic_s_ragged_tail_is_tolerated_part_by_part() {
+    let mut live = ri_record(ri_tail_mix_yaml(), ri_tail_mix_factories);
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_slow_frames(2.0));
+    want.insert(3, ri_period_frames(3.0));
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_TAIL_MIX_BUS),
+        want,
+        "PREMISE"
+    );
+    ri_drop_last_frame(&mut live.rec, RI_TAIL_MIX_BUS, 2.0);
+    let recorded = ri_recorded_xyz(&live.rec, RI_TAIL_MIX_BUS);
+    let w3_at = ri_first_differing(&recorded, &ri_period_frames(3.0));
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_tail_mix.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id != "w2");
+    let note = ri_fireless_note(RI_TAIL_MIX_BUS, 0, n + 6, n + 7);
+    for (run, budget) in [("CONTROL", None), ("one process attributes", Some(n + 6))] {
+        let (outcome, _) = {
+            let _budget = budget.map(replay_engine::override_frame_index_record_budget);
+            ri_replay(
+                &bag,
+                ri_tail_mix_factories,
+                replay_engine::ReplayPurpose::Verify,
+            )
+        };
+        let outcome = outcome.unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        assert!(
+            outcome.violations.is_empty(),
+            "{run}: {:?}",
+            outcome.violations
+        );
+        assert!(outcome.passed, "{run}");
+        assert_eq!(resim_exit(&outcome, true), 0, "{run}: exit 0");
+        assert_eq!(
+            ri_frame_notes(&outcome, RI_TAIL_MIX_BUS),
+            vec![note.as_str()],
+            "{run}"
+        );
+        let declined = ri_declined(&outcome);
+        if budget.is_none() {
+            assert_eq!(
+                (outcome.topics_checked, outcome.topics_passed),
+                (2, 2),
+                "{run}: both topics are checked and credited"
+            );
+            assert!(declined.is_empty(), "{run}: {declined:?}");
+            continue;
+        }
+        assert_eq!(
+            (outcome.topics_checked, outcome.topics_passed),
+            (2, 1),
+            "{run}: the bus is checked and not credited, the aux topic passes"
+        );
+        assert!(
+            matches!(
+                declined.as_slice(),
+                [(RI_TAIL_MIX_BUS, ranks, "split_topic_frames_unattributed", false, withheld)]
+                    if *ranks == vec![1]
+                        && matches!(
+                            withheld.as_slice(),
+                            [ViolationClass::ByteMismatch { index, .. }] if *index == w3_at
+                        )
+            ),
+            "{run}: the bus is declined for the second process: {declined:?}"
+        );
+    }
+}
+
+/// A writer that stamps its identity into one frame of the 300 ms run, at
+/// 280 ms.
+#[cerulion_node(period_ms = 280)]
+#[derive(Default)]
+struct RiOnceWriterNode {
+    #[output]
+    out: Vector3,
+    writer: f64,
+    counter: f64,
+}
+
+#[cerulion_node_impl]
+impl RiOnceWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.counter += 1.0;
+        self.out.x = self.writer;
+        self.out.y = self.counter;
+        self.out.z = self.writer * 1_000_000.0 + self.counter * 7.0;
+        Ok(())
+    }
+}
+
+/// The topic a period writer shares with a writer that publishes once.
+const RI_ONCE_BUS: &str = "/rionce/bus";
+
+/// A period writer (`w2`, writer 2) and a writer that publishes once in the
+/// run (`w3`, writer 3) on one `multi_publisher_topics` topic no node reads.
+fn ri_once_yaml() -> &'static str {
+    "name: rionce\nprefix: rionce\nmulti_publisher_topics:\n  - /rionce/bus\nnodes:\n\
+     \x20 - id: w2\n    type: ri_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rionce/bus\n\
+     \x20 - id: w3\n    type: ri_once_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rionce/bus\n"
+}
+
+fn ri_once_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "w2",
+            Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+                writer: 2.0,
+                ..Default::default()
+            })),
+        ),
+        (
+            "w3",
+            Box::new(RiOnceWriterNodeEntry::with_state(RiOnceWriterNode {
+                writer: 3.0,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A writer whose one frame of a `multi_publisher_topics` topic the bag lost
+/// is tolerated in its process's ragged shutdown tail beside the frames the
+/// other process published. The period writer `w2` runs in the first process,
+/// and `w3`, which publishes once in the 300 ms run, at 280 ms, in the second,
+/// whose final recorded step therefore banked its boundary and no fires, a
+/// one-step tail. The bag lost `w3`'s one frame, so the recorded bus holds
+/// `w2`'s `n` frames alone and the replay produces `n + 1`, the one extra
+/// frame inside the second's window: the note names it. The bag labels no
+/// frame, so neither process attributes the frames, and both published some,
+/// so neither stream is compared: the bus is DECLINED, exit 0, checked and not
+/// credited, the row naming both processes and withholding the second's byte
+/// mismatch at frame 0, while the first's stream matches every recorded frame.
+#[test]
+#[serial]
+fn a_writer_whose_one_frame_the_bag_lost_is_tolerated_in_its_process_s_tail() {
+    let mut live = ri_record(ri_once_yaml(), ri_once_factories);
+    let n = RI_STEPS;
+    let mut want = BTreeMap::new();
+    want.insert(2, ri_period_frames(2.0));
+    want.insert(3, vec![(3.0, 1.0, 3_000_007.0)]);
+    assert_eq!(
+        ri_frames_by_writer(&live.rec, RI_ONCE_BUS),
+        want,
+        "PREMISE: w3 published once"
+    );
+    ri_drop_last_frame(&mut live.rec, RI_ONCE_BUS, 3.0);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ri_once_unlabelled.mcap");
+    ri_two_rank_bag_labelled(&live.rec, &bag, |id| id == "w3", false);
+    let (outcome, _) = ri_replay(
+        &bag,
+        ri_once_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert_eq!(resim_exit(&outcome, true), 0, "exit 0");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (1, 0),
+        "the bus is checked and not credited"
+    );
+    assert_eq!(
+        ri_frame_notes(&outcome, RI_ONCE_BUS),
+        vec![ri_fireless_note(RI_ONCE_BUS, 1, n, n + 1).as_str()]
+    );
+    let declined = ri_declined(&outcome);
+    assert!(
+        matches!(
+            declined.as_slice(),
+            [(RI_ONCE_BUS, ranks, "split_topic_frames_unattributed", false, withheld)]
+                if *ranks == vec![0, 1]
+                    && matches!(
+                        withheld.as_slice(),
+                        [ViolationClass::ByteMismatch { index: 0, .. }]
+                    )
+        ),
+        "the bus is declined for both processes: {declined:?}"
+    );
+}
+
+/// The `--tolerance` rows of a split topic are judged where its frames are
+/// compared and withheld where they are not. The mixed bag of
+/// `a_split_topic_one_process_attributes_and_another_does_not_is_judged_in_both`,
+/// replayed with the verifier's record budget at the bus's `2n` frames and `x`
+/// bounded at 0.5 and `z` at 10000000 on the bus: `w2`'s partition in the
+/// first process is compared, and the second process's one stream, `w3`'s
+/// frames alone, is not. CONTROL: the unchanged candidate is DECLINED, exit
+/// 0, its row withholding the second process's `x` row, worst at the first
+/// recorded `w2` frame, whose 2 its `w3` frame reads as 3. A changed `w2`,
+/// stamping 4 where it recorded 2, moves `x` by 2 and `z` by 2000000 on every
+/// frame: exit 1, one `x` row from the first process, and nothing declined.
+#[test]
+#[serial]
+fn a_split_topic_s_tolerance_rows_are_judged_where_its_frames_are_compared() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, bag) = ri_mix_bag(dir.path());
+    let first_w2 = live.rec.messages[RI_MIX_BUS]
+        .iter()
+        .position(|f| frame_x(f) == 2.0)
+        .expect("PREMISE: w2 recorded a frame");
+    let yaml = "\
+topics:
+  /rimix/bus:
+    fields:
+      x:
+        kind: max_abs
+        threshold: 0.5
+      z:
+        kind: max_abs
+        threshold: 10000000
+";
+    let replay = |w2: f64| {
+        let _budget = replay_engine::override_frame_index_record_budget(2 * RI_STEPS);
+        replay_with_tolerance(&bag, || ri_mix_factories(w2, 3.0), yaml, None)
+    };
+
+    let outcome = replay(2.0).expect("CONTROL: the replay runs");
+    assert!(
+        outcome.violations.is_empty(),
+        "CONTROL: {:?}",
+        outcome.violations
+    );
+    assert_eq!(resim_exit(&outcome, true), 0, "CONTROL: exit 0");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 1));
+    let withheld: Vec<String> = outcome
+        .declined_frame_comparisons
+        .iter()
+        .flat_map(|d| d.withheld.iter())
+        .filter_map(|v| match &v.class {
+            ViolationClass::ToleranceExceeded {
+                field,
+                worst_value,
+                worst_tick,
+                ..
+            } => Some(format!("{field:?} {worst_value:?} {worst_tick}")),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        withheld,
+        vec![format!("Some(\"x\") Some(1.0) {first_w2}")],
+        "CONTROL: the second process's x row is withheld: {:?}",
+        outcome.declined_frame_comparisons
+    );
+
+    let outcome = replay(4.0).expect("changed w2: the replay runs");
+    assert_eq!(resim_exit(&outcome, true), 1, "changed w2: exit 1");
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (2, 1));
+    let named = ri_named(&outcome);
+    let want_detail = format!(
+        "field 'x' exceeded the max_abs tolerance on '{RI_MIX_BUS}': worst value 2 vs threshold \
+         0.5 (worst at frame 0)"
+    );
+    assert!(
+        matches!(
+            named.as_slice(),
+            [(RI_MIX_BUS, ViolationClass::ToleranceExceeded { .. }, detail)]
+                if *detail == want_detail
+        ),
+        "changed w2: exactly the first process's x row: {named:?}"
+    );
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "changed w2: a failed topic is not declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
+}
+
+/// A writer that never publishes, on every eighth step: its tick writes no
+/// output.
+#[cerulion_node(period_ms = 40)]
+#[derive(Default)]
+struct RiSlowSilentWriterNode {
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl RiSlowSilentWriterNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Ok(())
+    }
+}
+
+/// The topic a writer shares with a slow writer that never publishes.
+const RI_ALONE_BUS: &str = "/rialone/bus";
+
+/// A writer (`w2`, writer 2), a period writer or, when `slow`, one on every
+/// eighth step, and a writer that never publishes, on every eighth step
+/// (`w3`), on one `multi_publisher_topics` topic no node reads.
+fn ri_alone_yaml(slow: bool) -> String {
+    let w2 = if slow {
+        "ri_slow_writer_node"
+    } else {
+        "ri_writer_node"
+    };
+    format!(
+        "name: rialone\nprefix: rialone\nmulti_publisher_topics:\n  - /rialone/bus\nnodes:\n\
+         \x20 - id: w2\n    type: {w2}\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rialone/bus\n\
+         \x20 - id: w3\n    type: ri_slow_silent_writer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n        topic: /rialone/bus\n"
+    )
+}
+
+fn ri_alone_factories(slow: bool) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let w2: Box<dyn NodeEntry> = if slow {
+        Box::new(RiSlowWriterNodeEntry::with_state(RiSlowWriterNode {
+            writer: 2.0,
+            ..Default::default()
+        }))
+    } else {
+        Box::new(RiWriterNodeEntry::with_state(RiWriterNode {
+            writer: 2.0,
+            ..Default::default()
+        }))
+    };
+    factories(vec![
+        ("w2", w2),
+        (
+            "w3",
+            Box::new(RiSlowSilentWriterNodeEntry::with_state(
+                RiSlowSilentWriterNode::default(),
+            )),
+        ),
+    ])
+}
+
+/// The ragged-tail window of a `multi_publisher_topics` topic judged by the
+/// one process whose writers published its frames is that process's own.
+/// `w2` runs in the first process, and `w3`, which never publishes and fires
+/// on every eighth step, at 40 ms to 280 ms of the 300 ms run, in the second,
+/// whose final recorded step therefore banked its boundary and no fires, a
+/// one-step tail. The bag labels no frame. The period writer `w2` fires on
+/// every step, and the bag lost the frame of its last fire, so `w2` replays
+/// one frame past its `n - 1` recorded ones, which no tail of the first
+/// process explains, though the second's window would hold it: exit 1, one
+/// `extra-messages` violation of the whole stream, which names no writer, and
+/// no tolerance note. CONTROL: a slow `w2`, on every eighth step, leaves the
+/// first process's final recorded step without fires too, and with the frame
+/// of its last fire lost, its own window explains the extra frame: the bus
+/// passes, checked and credited, with the first process's note.
+#[test]
+#[serial]
+fn a_split_topic_judged_by_one_process_takes_that_process_s_tail_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let on_rank1: fn(&str) -> bool = |id| id == "w3";
+    for slow in [false, true] {
+        let run = if slow { "CONTROL" } else { "period w2" };
+        let mut live = ri_record(&ri_alone_yaml(slow), || ri_alone_factories(slow));
+        let frames = if slow {
+            ri_slow_frames(2.0)
+        } else {
+            ri_period_frames(2.0)
+        };
+        let n = frames.len();
+        let mut want = BTreeMap::new();
+        want.insert(2, frames);
+        assert_eq!(
+            ri_frames_by_writer(&live.rec, RI_ALONE_BUS),
+            want,
+            "PREMISE: {run}: the recorded bus holds w2's frames alone"
+        );
+        ri_drop_last_frame(&mut live.rec, RI_ALONE_BUS, 2.0);
+        let bag = dir.path().join(format!("ri_alone_{slow}.mcap"));
+        ri_two_rank_bag_labelled(&live.rec, &bag, on_rank1, false);
+        let (outcome, _) = ri_replay(
+            &bag,
+            || ri_alone_factories(slow),
+            replay_engine::ReplayPurpose::Verify,
+        );
+        let outcome = outcome.unwrap_or_else(|e| panic!("{run}: the replay runs: {e}"));
+        if slow {
+            assert!(
+                outcome.violations.is_empty(),
+                "{run}: {:?}",
+                outcome.violations
+            );
+            assert!(outcome.passed, "{run}");
+            assert_eq!(
+                (outcome.topics_checked, outcome.topics_passed),
+                (1, 1),
+                "{run}: the bus is checked and credited"
+            );
+            assert_eq!(
+                ri_frame_notes(&outcome, RI_ALONE_BUS),
+                vec![ri_fireless_note(RI_ALONE_BUS, 0, n - 1, n).as_str()],
+                "{run}"
+            );
+            continue;
+        }
+        assert_eq!(
+            resim_exit(&outcome, true),
+            1,
+            "{run}: exit 1: {:?} {:?}",
+            outcome.trace_divergence,
+            outcome.tolerated_ragged_tails
+        );
+        assert_eq!((outcome.topics_checked, outcome.topics_passed), (1, 0));
+        let want_detail = format!(
+            "recorded {} frame(s), replay produced {n} on '{RI_ALONE_BUS}'",
+            n - 1
+        );
+        let named = ri_named(&outcome);
+        assert!(
+            matches!(
+                named.as_slice(),
+                [(RI_ALONE_BUS, ViolationClass::ExtraMessages { recorded, replayed }, detail)]
+                    if (*recorded, *replayed) == (n - 1, n) && *detail == want_detail
+            ),
+            "{run}: exactly the stream's extra frame: {named:?}"
+        );
+        assert!(
+            outcome.tolerated_ragged_tails.is_empty(),
+            "{run}: no tolerance note: {:?}",
+            outcome.tolerated_ragged_tails
+        );
+    }
+}
+
+/// The `difference` entry of a hand-built [`ViolationClass::ByteMismatch`]
+/// whose renderer test reads only the class label and the detail it is
+/// given: a header difference, as `timestamp_ns` 7 against 9 reads.
+fn synthetic_difference() -> ByteDifference {
+    ByteDifference {
+        kind: DifferenceKind::Header,
+        path: Some("timestamp_ns".to_string()),
+        recorded: Some(DifferenceValue::UInt(7)),
+        replayed: Some(DifferenceValue::UInt(9)),
+        field_byte: None,
+        field_char: None,
+        byte_offset: None,
+        region: None,
+        reason: None,
+        more: 0,
     }
 }

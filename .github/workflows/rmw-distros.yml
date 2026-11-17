@@ -51,6 +51,14 @@ env:
   # emptied rather than left holding archives nothing will replace.
   CACHE_SAVE_NAMESPACES: ${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}
   CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
+  # CARGO BUILD-DIR LAYOUT, the same variable and value as ci.yml's `env`
+  # block, whose comment says what it does. Here it keeps the build-script
+  # output where gate.sh's bindgen check reads it,
+  # `target/release/build/rmw_cerulion-<hash>/out/bindings.rs`: cargo 1.100
+  # otherwise writes it to `target/release/build/rmw_cerulion/<hash>/out/`.
+  # The aarch64 Foxy job runs the gate in its own `docker run` and passes the
+  # variable in with `-e`.
+  __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT: "1"
 
 permissions:
   contents: read
@@ -138,7 +146,11 @@ jobs:
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             ca-certificates curl jq
           install -m 0755 -d /usr/share/keyrings
-          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+          # Plain --retry: the focal images' curl 7.68 predates
+          # --retry-all-errors. --connect-timeout and --max-time bound one
+          # attempt, so a stalled connection times out and is retried.
+          curl -fsSL --retry 5 --retry-delay 5 --connect-timeout 30 --max-time 60 \
+            https://cli.github.com/packages/githubcli-archive-keyring.gpg \
             -o /usr/share/keyrings/githubcli-archive-keyring.gpg
           chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
           arch=$(dpkg --print-architecture)
@@ -232,7 +244,9 @@ jobs:
           # non-truncating and the greps below read the FILE, not a live pipe.
           # RCLPY_TIMEOUT: the native exchange finishes far inside gate.sh's 600s
           # per-exchange default; 2400s keeps the per-exchange wall clear of the
-          # emulation slowdown. RMW_GATE_SKIP_SERIAL_SUITE=1 runs build + symbol
+          # emulation slowdown. RCLCPP_PAIR_SECS=120 gives each rclcpp pair's
+          # talker a 120s deadline in place of 15s (the listener's is 6s longer),
+          # for the same reason. RMW_GATE_SKIP_SERIAL_SUITE=1 runs build + symbol
           # audit + the staged-library digest + the exchanges, skipping the
           # in-process serial suite (see the POLICY line below).
           # The runner invokes `shell: bash` with -e; drop it only around the
@@ -243,7 +257,9 @@ jobs:
             --platform linux/arm64 \
             --shm-size=1g \
             -e CARGO_TERM_COLOR=never \
+            -e __CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT \
             -e RCLPY_TIMEOUT=2400 \
+            -e RCLCPP_PAIR_SECS=120 \
             -e RMW_GATE_SKIP_SERIAL_SUITE=1 \
             -v "$PWD":/w -w /w \
             ros:foxy-ros-base \
@@ -285,8 +301,15 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             build-essential curl ca-certificates git clang libclang-dev pkg-config procps
-          curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-            | sh -s -- -y --default-toolchain stable --profile minimal --component rustfmt
+          # To a file, not a pipe: curl discards a partial file before a retry,
+          # which it cannot do for output already sent into `sh`. Plain --retry,
+          # because focal's curl 7.68 predates --retry-all-errors.
+          # --connect-timeout and --max-time bound one attempt, so a stalled
+          # connection times out and is retried. The installer reads /dev/null:
+          # this script itself arrives on bash's stdin.
+          curl --proto "=https" --tlsv1.2 -sSf --retry 5 --retry-delay 5 \
+            --connect-timeout 30 --max-time 120 -o /tmp/rustup-init.sh https://sh.rustup.rs
+          sh /tmp/rustup-init.sh -y --default-toolchain stable --profile minimal --component rustfmt </dev/null
           . "$HOME/.cargo/env"
           rustc -vV; cargo -vV
 
@@ -296,10 +319,11 @@ jobs:
 
           # Scope on this emulated leg: build + nm symbol audit + the staged-
           # library digest + 3 fresh-process rclpy exchanges (both directions) +
-          # the wrong-payload self-test. The in-process serial suite is skipped
+          # the wrong-payload self-test + the 3 rclcpp talker/listener pairs.
+          # The in-process serial suite is skipped
           # (RMW_GATE_SKIP_SERIAL_SUITE=1); the POLICY line names the two tests
           # that drove the skip, so the gate reports what it judged.
-          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test; the in-process serial suite is deferred (two of its tests behave differently under emulation; both pass on the amd64 foxy lane in the same run)."
+          echo "POLICY: emulated aarch64 Foxy runs build + symbol audit + staged-library digest + 3 fresh-process rclpy exchanges + the wrong-payload self-test + 3 rclcpp talker/listener pairs; the in-process serial suite is deferred (two of its tests behave differently under emulation; both pass on the amd64 foxy lane in the same run)."
           echo "POLICY detail: rmw_wait_event_test::a_nine_entity_hop_drains_and_probes_only_what_fired breaches its per-hop drain budget under emulation (timing-sensitive)."
           echo "POLICY detail: rmw_shadow_take_test::c_copied_then_malformed_frame_retires_the_shadow_instead_of_recycling_it terminates the harness by SIGBUS under emulation (undiagnosed, under investigation)."
           bash tools/ci/rmw-distros/gate.sh foxy </dev/null

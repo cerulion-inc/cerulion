@@ -26,7 +26,7 @@ async fn serve(device_secret: [u8; 32]) -> Result<(), LinkError> {
 ```
 
 The crate also provides `dial`, length-prefixed frame streams
-(`open_frame_stream`, `read_frame`, `write_frame`), one-way streams for
+(`open_frame_stream`, `read_frame`, `read_frame_or_end`, `write_frame`), one-way streams for
 per-topic data, a synchronous `Read + Write` adapter over a QUIC stream
 (`QuicOpsStream`), and relay configuration (`RelayConfig`).
 

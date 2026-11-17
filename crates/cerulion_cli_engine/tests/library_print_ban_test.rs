@@ -274,6 +274,7 @@ fn the_scaffolding_templates_emit_the_print_ban() {
     // period_ms=100` produces.
     let macro_metadata = NodeMetadata {
         throttle_ms: None,
+        tick_within_ms: None,
         node_type: "print_ban_probe".to_string(),
         policy: Some(cerulion_core::MacroPolicy::Period { period_ms: 100 }),
         inputs: vec![],
@@ -283,6 +284,7 @@ fn the_scaffolding_templates_emit_the_print_ban() {
     // frozen oracle fixture uses.
     let raw_metadata = NodeMetadata {
         throttle_ms: None,
+        tick_within_ms: None,
         node_type: "print_ban_probe".to_string(),
         policy: None,
         inputs: vec![],

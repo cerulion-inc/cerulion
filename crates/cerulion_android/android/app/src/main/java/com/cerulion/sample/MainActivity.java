@@ -271,8 +271,29 @@ public final class MainActivity extends Activity {
             if (lanAccess != null) {
                 config.put("lan_access", lanAccess);
             }
-        } else if (getIntent().hasExtra("lan_access")) {
-            Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
+            // One locator the app dials, such as a desk behind `adb reverse`.
+            String connect = getIntent().getStringExtra("connect");
+            if (connect != null) {
+                config.put("connect", new JSONArray().put(connect));
+            }
+            // Host the paired remote plane, over the named relay choice
+            // ("public" or "disabled"); its keys live under files/remote.
+            String remote = getIntent().getStringExtra("remote");
+            if (remote != null) {
+                config.put("remote", new JSONObject()
+                        .put("enabled", true)
+                        .put("relay", remote));
+            }
+        } else {
+            if (getIntent().hasExtra("lan_access")) {
+                Log.w(TAG, "ignoring lan_access extra in a release build; LAN access remains paired");
+            }
+            if (getIntent().hasExtra("connect")) {
+                Log.w(TAG, "ignoring connect extra in a release build; the app dials no peer");
+            }
+            if (getIntent().hasExtra("remote")) {
+                Log.w(TAG, "ignoring remote extra in a release build; the app hosts no remote plane");
+            }
         }
         // No node_lib_dir: graph nodes come from the node registry of the
         // loaded runtime library.

@@ -22,6 +22,7 @@ use quote::{format_ident, quote};
 use syn::parse::Parser;
 use syn::DeriveInput;
 
+use crate::crate_root;
 use crate::parse::{FieldAttrs, FieldInputAttr, FieldOutputAttr, NodeAttr};
 use crate::registry::{self, NodePortEntry, RegisteredPort};
 use crate::state_derive;
@@ -66,6 +67,7 @@ fn to_snake_case(name: &str) -> String {
 
 /// Generate the full expansion for a `#[cerulion_node]` annotated struct.
 pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) -> TokenStream {
+    let __cer_root = crate_root::root();
     // Only structs with named or unit fields are supported.
     match &input.data {
         syn::Data::Struct(data) => {
@@ -209,24 +211,24 @@ pub fn generate(attr: &NodeAttr, field_attrs: &FieldAttrs, input: &DeriveInput) 
     // the `NodeInfo` returned by `info()`.
     let policy_with_call: TokenStream = if let Some(ms) = attr.node_level.period_ms {
         quote! {
-            .with_policy(::cerulion_core::graph::node::MacroPolicy::Period { period_ms: #ms })
+            .with_policy(#__cer_root::graph::node::MacroPolicy::Period { period_ms: #ms })
         }
     } else if let Some(ms) = attr.node_level.sync_window_ms {
         quote! {
-            .with_policy(::cerulion_core::graph::node::MacroPolicy::Sync { window_ms: #ms })
+            .with_policy(#__cer_root::graph::node::MacroPolicy::Sync { window_ms: #ms })
         }
     } else if attr.node_level.unbounded_sync {
         quote! {
-            .with_policy(::cerulion_core::graph::node::MacroPolicy::UnboundedSync)
+            .with_policy(#__cer_root::graph::node::MacroPolicy::UnboundedSync)
         }
     } else if attr.node_level.external {
         quote! {
-            .with_policy(::cerulion_core::graph::node::MacroPolicy::External)
+            .with_policy(#__cer_root::graph::node::MacroPolicy::External)
         }
     } else if let Some(name) = single_trigger_input_name.as_deref() {
         let name_lit = name.to_string();
         quote! {
-            .with_policy(::cerulion_core::graph::node::MacroPolicy::DataTrigger {
+            .with_policy(#__cer_root::graph::node::MacroPolicy::DataTrigger {
                 input_name: #name_lit.to_string(),
             })
         }
@@ -437,6 +439,7 @@ fn strip_field_attrs_and_inject_hidden(
     input: &DeriveInput,
     inject_default_derive: bool,
 ) -> DeriveInput {
+    let __cer_root = crate_root::root();
     let mut output = input.clone();
     if inject_default_derive {
         let derive_attr: syn::Attribute = syn::parse_quote!(#[derive(::std::default::Default)]);
@@ -494,10 +497,17 @@ fn strip_field_attrs_and_inject_hidden(
             let rt_field: syn::Field = syn::Field::parse_named
                 .parse2(quote! {
                     #[doc(hidden)]
-                    pub __cer_rt: ::cerulion_core::graph::node::CerNodeRuntimeFields
+                    pub __cer_rt: #__cer_root::graph::node::CerNodeRuntimeFields
                 })
                 .expect("hidden field __cer_rt parses");
             fields.named.push(rt_field);
+            let plugin_field: syn::Field = syn::Field::parse_named
+                .parse2(quote! {
+                    #[doc(hidden)]
+                    pub __cer_plugin: ::std::option::Option<#__cer_root::graph::node_plugin_abi::HostClient>
+                })
+                .expect("hidden plugin field parses");
+            fields.named.push(plugin_field);
         }
     }
     output
@@ -544,6 +554,7 @@ fn gen_shim_methods(
     ty_generics: &syn::TypeGenerics,
     where_clause: Option<&syn::WhereClause>,
 ) -> TokenStream {
+    let __cer_root = crate_root::root();
     quote! {
         #[automatically_derived]
         impl #impl_generics #struct_name #ty_generics #where_clause {
@@ -565,7 +576,7 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn now_ns(&self) -> u64 {
-                ::cerulion_core::clock::Clock::now_ns(&*self.__cer_rt.clock)
+                #__cer_root::clock::Clock::now_ns(&*self.__cer_rt.clock)
             }
 
             /// Raw wall-clock ns (clock-source shim):
@@ -581,7 +592,10 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn real_ns(&self) -> u64 {
-                ::cerulion_core::clock::real_ns()
+                if let ::std::option::Option::Some(client) = &self.__cer_plugin {
+                    return client.clock_real();
+                }
+                #__cer_root::clock::real_ns()
             }
 
             /// Virtual/controlled-clock ns, or `None` if the runtime is
@@ -598,7 +612,7 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn virt_ns(&self) -> ::std::option::Option<u64> {
-                ::cerulion_core::clock::Clock::virt_ns(&*self.__cer_rt.clock)
+                #__cer_root::clock::Clock::virt_ns(&*self.__cer_rt.clock)
             }
 
             /// External-master clock ns, or `None` if the runtime is NOT
@@ -612,7 +626,7 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn ext_ns(&self) -> ::std::option::Option<u64> {
-                ::cerulion_core::clock::Clock::ext_ns(&*self.__cer_rt.clock)
+                #__cer_root::clock::Clock::ext_ns(&*self.__cer_rt.clock)
             }
 
             /// Request graceful shutdown of the graph.
@@ -622,6 +636,10 @@ fn gen_shim_methods(
             #[inline]
             #[doc(hidden)]
             pub fn request_shutdown(&self) {
+                if let ::std::option::Option::Some(client) = &self.__cer_plugin {
+                    client.request_shutdown();
+                    return;
+                }
                 self.__cer_rt.shutdown_signal.request();
             }
         }
@@ -637,6 +655,7 @@ fn gen_wrapper(
     ty_generics: &syn::TypeGenerics,
     where_clause: Option<&syn::WhereClause>,
 ) -> TokenStream {
+    let __cer_root = crate_root::root();
     // `new()` needs `#struct_name: Default` on top of whatever the user wrote.
     // It cannot be appended as a second `where`: a node declared
     // `struct Node<T> where T: Send` already supplies one, and two on one item
@@ -661,35 +680,23 @@ fn gen_wrapper(
         #vis struct #entry_name #impl_generics #where_clause {
             /// The underlying node state.
             inner: #struct_name #ty_generics,
-            context: Option<::cerulion_core::graph::node::NodeContext>,
-            /// The runtime-classified NON-trigger latest-value input
-            /// names, marshalled across the cdylib FFI ONCE via
-            /// `cerulion_node_set_snapshot_inputs` and read on every step by
-            /// `cerulion_node_snapshot_inputs` so the per-step freeze allocates
-            /// nothing. Read ONLY by the `#[cfg(feature = "cdylib")]` FFI module
-            /// below; in the in-process (non-cdylib) build the host passes the
-            /// names directly to `NodeEntry::snapshot_inputs`, so this field is
-            /// unused there — `allow(dead_code)` rather than cfg-gate the field
-            /// (a cfg here would trip `unexpected_cfgs` in crates that don't
-            /// declare the `cdylib` feature; an empty `Vec` never allocates).
-            #[allow(dead_code)]
-            __snapshot_input_names: ::std::vec::Vec<::std::string::String>,
+            context: Option<#__cer_root::graph::node::NodeContext>,
             /// The graph's resolved `params:` values, handed over by
             /// `NodeEntry::set_params` at graph build and written into the
             /// user struct's `#[param]` fields by `init`, before the user's
             /// own `init` runs. `None` until set and again after `init`
             /// takes them; a node run with no `params:` keeps the defaults
             /// `new()` wrote.
-            __pending_params: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
+            __pending_params: ::std::option::Option<#__cer_root::graph::params::ParamValues>,
             /// Every `#[param]` field's value just after `init` wrote the
             /// graph's values, before the user's own `init`. A param is
             /// fixed for the run, so a state capture refuses once a field no
             /// longer holds its value here. `None` before `init`.
-            __cer_params_at_init: ::std::option::Option<::cerulion_core::graph::params::ParamValues>,
+            __cer_params_at_init: ::std::option::Option<#__cer_root::graph::params::ParamValues>,
             /// The node's `#[input(accumulate)]` buffers (empty for a node
             /// with none), filled at the step-boundary freeze and served to
             /// the tick.
-            __cer_accumulators: ::cerulion_core::transport::accumulate::AccumulatorSet,
+            __cer_accumulators: #__cer_root::transport::accumulate::AccumulatorSet,
         }
 
         impl #impl_generics #entry_name #ty_generics
@@ -703,11 +710,10 @@ fn gen_wrapper(
                 Self {
                     inner,
                     context: None,
-                    __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
                     __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
-                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
+                        #__cer_root::transport::accumulate::AccumulatorSet::new(),
                 }
             }
         }
@@ -719,11 +725,10 @@ fn gen_wrapper(
                 Self {
                     inner,
                     context: None,
-                    __snapshot_input_names: ::std::vec::Vec::new(),
                     __pending_params: ::std::option::Option::None,
                     __cer_params_at_init: ::std::option::Option::None,
                     __cer_accumulators:
-                        ::cerulion_core::transport::accumulate::AccumulatorSet::new(),
+                        #__cer_root::transport::accumulate::AccumulatorSet::new(),
                 }
             }
 
@@ -755,6 +760,7 @@ fn gen_wrapper(
 /// dispatch through the SHM-backed proxy/view, so no pre/post-tick
 /// snapshot bookkeeping is needed.
 fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
+    let __cer_root = crate_root::root();
     let NodeEntryParams {
         entry_name,
         struct_name,
@@ -783,7 +789,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         quote! {
             fn external_source(
                 &mut self,
-            ) -> ::std::option::Option<::cerulion_core::graph::node::ExternalSource> {
+            ) -> ::std::option::Option<#__cer_root::graph::node::ExternalSource> {
                 ::std::option::Option::Some(self.inner.__cer_user_external_source())
             }
         }
@@ -815,12 +821,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             let depth_tok: TokenStream = match i.depth {
                 Some(d) => quote! { #d },
                 None => {
-                    quote! { ::cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH }
+                    quote! { #__cer_root::graph::topology::DEFAULT_CONSUMER_DEPTH }
                 }
             };
             let backpressure_tok: TokenStream = match &i.backpressure {
                 Some(crate::parse::ParsedBackpressurePolicy::Block) => {
-                    quote! { ::cerulion_core::graph::node::BackpressurePolicy::Block }
+                    quote! { #__cer_root::graph::node::BackpressurePolicy::Block }
                 }
                 // `Some(Sample(n))` needs its own arm: falling into
                 // the `_` catch-all below would SILENTLY downgrade it to
@@ -828,26 +834,37 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 // would never reach the runtime as a Sample. Emit the real
                 // `Sample(n)` so the graph-runtime enforcement sees it.
                 Some(crate::parse::ParsedBackpressurePolicy::Sample(ms)) => {
-                    quote! { ::cerulion_core::graph::node::BackpressurePolicy::Sample(#ms) }
+                    quote! { #__cer_root::graph::node::BackpressurePolicy::Sample(#ms) }
                 }
                 // Explicit `drop_oldest` OR no declaration → the
                 // `DropOldest` default.
                 Some(crate::parse::ParsedBackpressurePolicy::DropOldest) | None => {
-                    quote! { ::cerulion_core::graph::node::BackpressurePolicy::DropOldest }
+                    quote! { #__cer_root::graph::node::BackpressurePolicy::DropOldest }
                 }
             };
             let expect_within_tok: TokenStream = match i.expect_within_ms {
                 Some(ms) => quote! { ::std::option::Option::Some(#ms) },
                 None => quote! { ::std::option::Option::None },
             };
+            let accumulate = i.accumulate.is_some();
+            let consume_tok: TokenStream = match i.consume {
+                Some(crate::parse::ParsedConsume::Latest) => {
+                    quote! { #__cer_root::graph::node::InputConsume::Latest }
+                }
+                Some(crate::parse::ParsedConsume::Fifo) | None => {
+                    quote! { #__cer_root::graph::node::InputConsume::Fifo }
+                }
+            };
             quote! {
-                ::cerulion_core::graph::node::InputMeta {
+                #__cer_root::graph::node::InputMeta {
                     name: #name.to_string(),
-                    schema_hash: <#ty as ::cerulion_core::message::ShmMessage>::SCHEMA_HASH,
+                    schema_hash: <#ty as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
                     trigger: #trigger,
                     depth: #depth_tok,
                     backpressure: #backpressure_tok,
                     expect_within_ms: #expect_within_tok,
+                    accumulate: #accumulate,
+                    consume: #consume_tok,
                 }
             }
         })
@@ -899,6 +916,15 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 ctx.drain_trigger_input(input_name)
             } else {
                 (0, ::core::option::Option::None)
+            }
+        }
+
+        // Lets the fire tap attribute each tick's commits to its outputs. An
+        // entry without a context (before `init`, after `shutdown`) cannot.
+        fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+            match self.context.as_ref() {
+                ::core::option::Option::Some(ctx) => ctx.output_commit_counts(out),
+                ::core::option::Option::None => false,
             }
         }
 
@@ -955,12 +981,12 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         fn sync_head_op(
             &mut self,
             input_name: &str,
-            op: ::cerulion_core::SyncHeadOp,
-        ) -> ::cerulion_core::SyncOpAnswer {
+            op: #__cer_root::SyncHeadOp,
+        ) -> #__cer_root::SyncOpAnswer {
             if let Some(ctx) = self.context.as_mut() {
                 ctx.sync_head_op(input_name, op)
             } else {
-                ::cerulion_core::SyncOpAnswer::Failed
+                #__cer_root::SyncOpAnswer::Failed
             }
         }
 
@@ -976,6 +1002,15 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         // make a runtime capability a function of a declaration the graph is
         // free to override.
         fn supports_sync_head_ops(&self) -> bool {
+            true
+        }
+
+        // Declare the `consume = latest` body probe. The trait default
+        // `probe_trigger_input` asks `sync_head_op(ProbeNext)`, which the
+        // forward above hands to `NodeContext::sync_head_op`; for a Data input
+        // that reports whether the subscriber the generated tick reads holds a
+        // frame. Stable probing uses the host's per-port input lease.
+        fn probes_trigger_input(&self) -> bool {
             true
         }
     };
@@ -1001,34 +1036,34 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
     // `state_shape` for the same reason.
     let state_methods = quote! {
         fn state_shape(&self) -> ::core::option::Option<u64> {
-            fn __cer_shape_of<T: ::cerulion_core::state::CerulionState>(_: &T) -> u64 {
-                <T as ::cerulion_core::state::CerulionState>::STATE_SHAPE
+            fn __cer_shape_of<T: #__cer_root::state::CerulionState>(_: &T) -> u64 {
+                <T as #__cer_root::state::CerulionState>::STATE_SHAPE
             }
             ::core::option::Option::Some(__cer_shape_of(&self.inner))
         }
 
         fn inline_safe(&self) -> bool {
-            fn __cer_inline_safe_of<T: ::cerulion_core::state::CerulionState>(_: &T) -> bool {
-                <T as ::cerulion_core::state::CerulionState>::INLINE_SAFE
+            fn __cer_inline_safe_of<T: #__cer_root::state::CerulionState>(_: &T) -> bool {
+                <T as #__cer_root::state::CerulionState>::INLINE_SAFE
             }
             __cer_inline_safe_of(&self.inner)
         }
 
         fn cer_probe(&self) -> bool {
-            ::cerulion_core::state::CerulionState::cer_probe(&self.inner)
+            #__cer_root::state::CerulionState::cer_probe(&self.inner)
         }
 
         fn capture_state(
             &self,
-            out: &mut dyn ::cerulion_core::state::StateSink,
-        ) -> ::cerulion_core::error::TransportResult<()> {
+            out: &mut dyn #__cer_root::state::StateSink,
+        ) -> #__cer_root::error::TransportResult<()> {
             // A param the node wrote after the graph set it cannot ride an
             // anchor (a param is not state), so a resume would run on the
             // graph's value instead: refuse the capture rather than record
             // an anchor that does not reproduce the live run.
             if let ::std::option::Option::Some(reason) = self.__cer_param_change() {
                 return ::std::result::Result::Err(
-                    ::cerulion_core::error::TransportError::GraphError {
+                    #__cer_root::error::TransportError::GraphError {
                         reason: ::std::format!(
                             "node '{}' state capture failed: {}", #diag_label, reason,
                         ),
@@ -1037,10 +1072,10 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             }
             // The user's fields, then the node's accumulate buffers (which
             // write nothing for a node without an accumulate input).
-            ::cerulion_core::state::CerulionState::cer_capture(&self.inner, out)
+            #__cer_root::state::CerulionState::cer_capture(&self.inner, out)
                 .and_then(|()| self.__cer_accumulators.capture(out))
                 .map_err(|e| {
-                ::cerulion_core::error::TransportError::GraphError {
+                #__cer_root::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state capture failed: {}", #diag_label, e,
                     ),
@@ -1051,11 +1086,11 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         fn restore_state(
             &mut self,
             payload: &[u8],
-        ) -> ::cerulion_core::error::TransportResult<()> {
-            let mut cursor = ::cerulion_core::state::StateCursor::new(payload);
-            ::cerulion_core::state::CerulionState::cer_restore(&mut self.inner, &mut cursor)
+        ) -> #__cer_root::error::TransportResult<()> {
+            let mut cursor = #__cer_root::state::StateCursor::new(payload);
+            #__cer_root::state::CerulionState::cer_restore(&mut self.inner, &mut cursor)
                 .and_then(|()| self.__cer_accumulators.restore(&mut cursor))
-                .map_err(|e| ::cerulion_core::error::TransportError::GraphError {
+                .map_err(|e| #__cer_root::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state restore failed: {}", #diag_label, e,
                     ),
@@ -1064,7 +1099,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             // recorded one — a drift signal the shape check cannot see, since a
             // `#[cerulion(serde)]` field folds only its NAME into `STATE_SHAPE`.
             cursor.finish().map_err(|e| {
-                ::cerulion_core::error::TransportError::GraphError {
+                #__cer_root::error::TransportError::GraphError {
                     reason: ::std::format!(
                         "node '{}' state restore failed: {}", #diag_label, e,
                     ),
@@ -1100,13 +1135,13 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             // different layout or none at all. A port that omitted it
             // would silently send the recorder back to the file.
             quote! {
-                ::cerulion_core::graph::node::OutputMeta::new(
+                #__cer_root::graph::node::OutputMeta::new(
                     #name.to_string(),
-                    <#ty as ::cerulion_core::message::ShmMessage>::SCHEMA_HASH,
-                    <#ty as ::cerulion_core::message::ShmMessage>::MAX_SLICE_LEN,
+                    <#ty as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
+                    <#ty as #__cer_root::message::ShmMessage>::MAX_SLICE_LEN,
                 )
                 .with_wire_fixed_size(
-                    <#ty as ::cerulion_core::message::ShmMessage>::WIRE_FIXED_SIZE,
+                    <#ty as #__cer_root::message::ShmMessage>::WIRE_FIXED_SIZE,
                 )
                 #promise_within_chain
             }
@@ -1153,19 +1188,19 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
         });
         quote! {
             where
-                #struct_name #ty_generics: ::cerulion_core::state::CerulionState,
+                #struct_name #ty_generics: #__cer_root::state::CerulionState,
                 #existing
         }
     };
 
     quote! {
         #[automatically_derived]
-        impl #impl_generics ::cerulion_core::graph::node::NodeEntry
+        impl #impl_generics #__cer_root::graph::node::NodeEntry
             for #entry_name #ty_generics
             #state_where_clause
         {
-            fn info(&self) -> ::cerulion_core::error::TransportResult<
-                ::cerulion_core::graph::node::NodeInfo,
+            fn info(&self) -> #__cer_root::error::TransportResult<
+                #__cer_root::graph::node::NodeInfo,
             > {
                 // Emit `OutputMeta` per
                 // `#[output]` port populated from the declared field
@@ -1185,7 +1220,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 #[allow(unused_imports)]
                 let _ = (#(#input_names),*); // silence unused-name warning
                 ::std::result::Result::Ok(
-                    ::cerulion_core::graph::node::NodeInfo::with_meta(
+                    #__cer_root::graph::node::NodeInfo::with_meta(
                         vec![#(#input_meta_exprs),*],
                         vec![#(#output_meta_exprs),*],
                     )
@@ -1193,6 +1228,9 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     #tick_within_with_call
                     #throttle_with_call
                     .with_params(vec![#(#param_spec_exprs),*])
+                    // The tick preamble refuses an output with no publisher,
+                    // so the graph build must refuse an unlisted output.
+                    .with_publisher_for_every_output()
                 )
             }
 
@@ -1203,18 +1241,18 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
             // at graph build.
             fn set_params(
                 &mut self,
-                params: &::cerulion_core::graph::params::ParamValues,
-            ) -> ::cerulion_core::error::TransportResult<()> {
+                params: &#__cer_root::graph::params::ParamValues,
+            ) -> #__cer_root::error::TransportResult<()> {
                 self.__pending_params = ::std::option::Option::Some(params.clone());
                 ::std::result::Result::Ok(())
             }
 
             fn init(
                 &mut self,
-                mut context: ::cerulion_core::graph::node::NodeContext,
-            ) -> ::cerulion_core::error::TransportResult<()> {
+                mut context: #__cer_root::graph::node::NodeContext,
+            ) -> #__cer_root::error::TransportResult<()> {
                 if self.context.is_some() {
-                    return Err(::cerulion_core::error::TransportError::NodeError {
+                    return Err(#__cer_root::error::TransportError::NodeError {
                         node_id: #diag_label.into(),
                         reason: "already initialized (double init)".into(),
                     });
@@ -1225,7 +1263,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 // must see the graph's value, not the default.
                 if let ::std::option::Option::Some(values) = self.__pending_params.take() {
                     self.inner.__cer_apply_params(&values).map_err(|e| {
-                        ::cerulion_core::error::TransportError::NodeError {
+                        #__cer_root::error::TransportError::NodeError {
                             node_id: #diag_label.into(),
                             reason: ::std::format!("param apply failed: {}", e),
                         }
@@ -1258,9 +1296,9 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 Ok(())
             }
 
-            fn tick(&mut self) -> ::cerulion_core::error::TransportResult<()> {
+            fn tick(&mut self) -> #__cer_root::error::TransportResult<()> {
                 let ctx = self.context.as_mut().ok_or_else(|| {
-                    ::cerulion_core::error::TransportError::NodeError {
+                    #__cer_root::error::TransportError::NodeError {
                         node_id: #diag_label.into(),
                         reason: "node not initialized".into(),
                     }
@@ -1268,7 +1306,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 self.inner.__cer_zero_copy_tick(ctx, &mut self.__cer_accumulators)
             }
 
-            fn shutdown(&mut self) -> ::cerulion_core::error::TransportResult<()> {
+            fn shutdown(&mut self) -> #__cer_root::error::TransportResult<()> {
                 // Invoke the user's optional `shutdown`
                 // method before dropping the context (so the user can
                 // still touch `self.now_ns()` / write outputs / etc.
@@ -1377,7 +1415,6 @@ fn json_escape(s: &str) -> String {
 ///   so node-side `tracing` events are host-visible; RUST_LOG comes from the
 ///   context's frozen env snapshot. See `install_cdylib_stderr_tracing`.
 /// - `cerulion_node_tick(u64) -> i32` — tick by handle
-/// - `cerulion_node_pump_history(u64) -> i32` — service quiescent late joiners by handle (ABI v7)
 /// - `cerulion_node_shutdown(u64) -> i32` — shutdown by handle, removes from map
 /// - `cerulion_take_last_error_kind() -> u32`: OPTIONAL (no ABI bump): the
 ///   `NodeErrorKind` wire code of the last error (0 = none), so a node error's
@@ -1431,6 +1468,7 @@ fn gen_cdylib(
     // parses as an empty list on the host.
     params_json: &str,
 ) -> TokenStream {
+    let __cer_root = crate_root::root();
     // ABI v6: build each input as a JSON OBJECT
     // `{"name":"x","expect_within_ms":N}` (the `expect_within_ms` key is
     // emitted only when the `#[input(expect_within_ms = N)]` attr is
@@ -1503,6 +1541,15 @@ fn gen_cdylib(
                     suffix.push_str(&format!(r#","backpressure":{{"sample":{n}}}"#));
                 }
                 None => {}
+            }
+            // The declared `consume`. ADDITIVE, like `wire_fixed_size` on the
+            // outputs: emitted only for `latest`, and an absent key is the
+            // host's `fifo` default, so a host that predates the key reads
+            // every node this macro emitted for `fifo` exactly as before.
+            // An explicit `consume = fifo` emits nothing, because it means
+            // the same as no declaration.
+            if i.consume == Some(crate::parse::ParsedConsume::Latest) {
+                suffix.push_str(r#","consume":"latest""#);
             }
             suffix
         })
@@ -1621,30 +1668,40 @@ fn gen_cdylib(
                 out_fd: *mut i64,
             ) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    use ::cerulion_core::graph::node::NodeEntry;
+                    use #__cer_root::graph::node::NodeEntry;
                     if out_fd.is_null() {
                         __cer_set_last_error(::std::string::String::from(
                             "cerulion_node_external_source: out_fd pointer was null",
                         ));
-                        return ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
+                        return #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
                     }
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_external_source: NODES mutex poisoned",
                             ));
-                            return ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
+                            return #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_external_source: node instance mutex poisoned",
+                            ));
+                            return #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
-                            // NODES poison containment: drive
+                            // Instance-lock poison containment: drive
                             // the user's `external_source()` under an INNER
                             // `catch_unwind` so a panicking override does NOT unwind
-                            // through the LIVE `NODES` MutexGuard (`guard`) — an
-                            // unwind through it would POISON `NODES` and brick every
-                            // node of this cdylib in-process. `external_source` is a
+                            // through the live instance guard (`guard`): an
+                            // unwind through it would poison the instance lock and
+                            // brick this node instance. `external_source` is a
                             // one-shot pre-binding query; unlike `tick`, torn node
                             // state is no concern — on panic the node simply stays
                             // inert and never ticks. The guard then drops NORMALLY
@@ -1658,12 +1715,12 @@ fn gen_cdylib(
                                         "cerulion_node_external_source: external_source \
                                          panicked; node has no external source",
                                     ));
-                                    return ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
+                                    return #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR;
                                 }
                             };
                             match source {
                                 ::std::option::Option::Some(
-                                    ::cerulion_core::graph::node::ExternalSource::Fd(raw),
+                                    #__cer_root::graph::node::ExternalSource::Fd(raw),
                                 ) => {
                                     // SAFETY: out_fd is a non-null, aligned, host-owned
                                     // i64 slot (checked above); the host reads it back
@@ -1671,15 +1728,15 @@ fn gen_cdylib(
                                     unsafe {
                                         *out_fd = raw as i64;
                                     }
-                                    ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_DEVICE_FD
+                                    #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_DEVICE_FD
                                 }
                                 ::std::option::Option::Some(
-                                    ::cerulion_core::graph::node::ExternalSource::Blocking(closure),
+                                    #__cer_root::graph::node::ExternalSource::Blocking(closure),
                                 ) => {
                                     // Tier-2 collapse: hand the closure to cerulion_core,
                                     // which spawns the pipe-backed doorbell helper and
                                     // returns Some(READ end), or None on pipe failure.
-                                    match ::cerulion_core::graph::node::spawn_cdylib_blocking_doorbell(
+                                    match #__cer_root::graph::node::spawn_cdylib_blocking_doorbell(
                                         closure,
                                     ) {
                                         ::std::option::Option::Some(read_fd) => {
@@ -1687,7 +1744,7 @@ fn gen_cdylib(
                                             unsafe {
                                                 *out_fd = read_fd as i64;
                                             }
-                                            ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_DOORBELL_FD
+                                            #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_DOORBELL_FD
                                         }
                                         ::std::option::Option::None => {
                                             // The pipe(2) failure was logged inside
@@ -1705,13 +1762,13 @@ fn gen_cdylib(
                                                  Blocking doorbell pipe/helper (pipe(2) failed); node \
                                                  stays inert",
                                             ));
-                                            ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR
+                                            #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR
                                         }
                                     }
                                 }
                                 ::std::option::Option::Some(
-                                    ::cerulion_core::graph::node::ExternalSource::HostDriven,
-                                ) => ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_HOST_DRIVEN,
+                                    #__cer_root::graph::node::ExternalSource::HostDriven,
+                                ) => #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_HOST_DRIVEN,
                                 // `ExternalSource` is `#[non_exhaustive]` — a future
                                 // variant this cdylib's cerulion_core doesn't know how to
                                 // collapse fails loudly rather than mis-binding.
@@ -1720,7 +1777,7 @@ fn gen_cdylib(
                                         "cerulion_node_external_source: unsupported ExternalSource \
                                          variant for this cerulion_core version",
                                     ));
-                                    ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR
+                                    #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR
                                 }
                                 // The generated external override always returns
                                 // `Some(..)`; `None` here means a hand-rolled entry
@@ -1730,7 +1787,7 @@ fn gen_cdylib(
                                         "cerulion_node_external_source: external node returned no \
                                          ExternalSource (None)",
                                     ));
-                                    ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR
+                                    #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR
                                 }
                             }
                         }
@@ -1738,7 +1795,7 @@ fn gen_cdylib(
                             __cer_set_last_error(::std::format!(
                                 "cerulion_node_external_source: handle {} not found", handle,
                             ));
-                            ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR
+                            #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR
                         }
                     }
                 }));
@@ -1748,7 +1805,7 @@ fn gen_cdylib(
                         __cer_set_last_error(::std::string::String::from(
                             "cerulion_node_external_source: panic caught by catch_unwind",
                         ));
-                        ::cerulion_core::graph::node::EXTERNAL_SOURCE_KIND_ERROR
+                        #__cer_root::graph::node::EXTERNAL_SOURCE_KIND_ERROR
                     }
                 }
             }
@@ -1757,11 +1814,19 @@ fn gen_cdylib(
         TokenStream::new()
     };
 
+    let stable = crate::plugin_codegen::generate(
+        entry_name,
+        node_name,
+        inputs,
+        outputs,
+        node_level.external,
+    );
     quote! {
         #[allow(unexpected_cfgs)]
         #[cfg(feature = "cdylib")]
         mod __cerulion_cdylib {
             use super::*;
+            #stable
 
             // Info JSON is built at first call
             // via `OnceLock` because each `#[output]` port's
@@ -1790,7 +1855,7 @@ fn gen_cdylib(
                     inputs.push_str(&::std::format!(
                         r#"{{"name":"{}","schema_hash":{}{}}}"#,
                         #input_field_names,
-                        <#input_field_types as ::cerulion_core::message::ShmMessage>::SCHEMA_HASH,
+                        <#input_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
                         #input_key_suffixes,
                     ));
                 )*
@@ -1802,7 +1867,7 @@ fn gen_cdylib(
                     if !first { outputs.push(','); }
                     first = false;
                     let max_slice_len_default =
-                        match <#output_field_types as ::cerulion_core::message::ShmMessage>::MAX_SLICE_LEN {
+                        match <#output_field_types as #__cer_root::message::ShmMessage>::MAX_SLICE_LEN {
                             ::std::option::Option::Some(n) =>
                                 ::std::format!("{}", n),
                             ::std::option::Option::None =>
@@ -1823,10 +1888,10 @@ fn gen_cdylib(
                     outputs.push_str(&::std::format!(
                         r#"{{"name":"{}","schema_hash":{},"max_slice_len_default":{},"promise_within_ms":{},"wire_fixed_size":{}}}"#,
                         #output_field_names,
-                        <#output_field_types as ::cerulion_core::message::ShmMessage>::SCHEMA_HASH,
+                        <#output_field_types as #__cer_root::message::ShmMessage>::SCHEMA_HASH,
                         max_slice_len_default,
                         #output_promise_within,
-                        <#output_field_types as ::cerulion_core::message::ShmMessage>::WIRE_FIXED_SIZE,
+                        <#output_field_types as #__cer_root::message::ShmMessage>::WIRE_FIXED_SIZE,
                     ));
                 )*
                 outputs.push(']');
@@ -1834,8 +1899,11 @@ fn gen_cdylib(
                 // node-level `tick_within_ms` / `throttle_ms` (each a
                 // leading-comma fragment, present only when declared)
                 // after `outputs` and before `policy`.
+                // `publisher_for_every_output`: the tick preamble refuses an
+                // output with no publisher, so the host graph build refuses
+                // an output this node declares and its graph does not list.
                 let json = ::std::format!(
-                    r#"{{"inputs":{},"outputs":{}{}{}{}}}"#,
+                    r#"{{"inputs":{},"outputs":{}{}{}{},"publisher_for_every_output":true}}"#,
                     inputs,
                     outputs,
                     #qos_json,
@@ -1865,8 +1933,26 @@ fn gen_cdylib(
             static NEXT_HANDLE: ::std::sync::atomic::AtomicU64 =
                 ::std::sync::atomic::AtomicU64::new(1); // 0 = error sentinel
 
-            static NODES: ::std::sync::Mutex<Option<::std::collections::HashMap<u64, #entry_name>>> =
+            // One lock per node INSTANCE, so two instances of this library in one
+            // process (on two executors, or on two fire-pool threads) tick
+            // concurrently. `NODES` maps a handle to its instance and is held
+            // only for the lookup, the insert and the remove, never across a
+            // call into node code. The inner `Option` is `None` once the
+            // instance is shut down, so a call racing the shutdown reports the
+            // handle as not found.
+            type __CerInstance = ::std::sync::Arc<::std::sync::Mutex<Option<#entry_name>>>;
+
+            static NODES: ::std::sync::Mutex<Option<::std::collections::HashMap<u64, __CerInstance>>> =
                 ::std::sync::Mutex::new(None);
+
+            /// The instance for `handle`: `Ok(None)` for an unknown handle,
+            /// `Err(())` when `NODES` is poisoned.
+            fn __cer_instance(handle: u64) -> ::std::result::Result<Option<__CerInstance>, ()> {
+                match NODES.lock() {
+                    Ok(guard) => Ok(guard.as_ref().and_then(|m| m.get(&handle)).cloned()),
+                    Err(_) => Err(()),
+                }
+            }
 
             // Per-cdylib thread-local
             // for the most recent FFI error message. Populated by tick /
@@ -1902,7 +1988,7 @@ fn gen_cdylib(
                 LAST_ERROR_KIND.with(|cell| cell.set(0));
             }
 
-            fn __cer_set_last_error_kind(e: &::cerulion_core::error::TransportError) {
+            fn __cer_set_last_error_kind(e: &#__cer_root::error::TransportError) {
                 let code = e.node_error_kind().map_or(0, |k| k.code());
                 LAST_ERROR_KIND.with(|cell| cell.set(code));
             }
@@ -1912,9 +1998,9 @@ fn gen_cdylib(
             // in-process macro node reports, so the host's fatal log line and
             // `Error:` verdict read the same for both build forms. Any other
             // error keeps the `<phase> failed: <error>` text.
-            fn __cer_set_node_failure(phase: &str, e: &::cerulion_core::error::TransportError) {
+            fn __cer_set_node_failure(phase: &str, e: &#__cer_root::error::TransportError) {
                 let msg = match e {
-                    ::cerulion_core::error::TransportError::NodeFailed { reason, .. } => {
+                    #__cer_root::error::TransportError::NodeFailed { reason, .. } => {
                         reason.clone()
                     }
                     other => ::std::format!("{} failed: {}", phase, other),
@@ -1934,19 +2020,14 @@ fn gen_cdylib(
 
             #[no_mangle]
             pub extern "C" fn cerulion_abi_version() -> u32 {
-                ::cerulion_core::transport::TRANSPORT_KIND.cdylib_abi_version()
+                #__cer_root::transport::TRANSPORT_KIND.cdylib_abi_version()
             }
 
-            // ABI v22: reports the rustc that compiled THIS cdylib, so the
-            // host can refuse a load where the two sides' compilers disagree
-            // on how a `repr(Rust)` type crossing the FFI (for example
-            // `Option<FrozenSlot>`) is laid out, a class the ABI version above
-            // cannot see, since two different rustc releases can agree on
-            // every struct size and offset and still encode `None`
-            // differently. See `cerulion_core::rustc_fingerprint`.
+            // Compiler provenance only. Stable loading checks the complete
+            // frozen table and boundary major; it ignores this legacy symbol.
             #[no_mangle]
             pub extern "C" fn cerulion_rustc_fingerprint() -> *const ::std::ffi::c_char {
-                ::cerulion_core::rustc_fingerprint_cstr()
+                #__cer_root::rustc_fingerprint_cstr()
             }
 
             #[no_mangle]
@@ -2024,14 +2105,12 @@ fn gen_cdylib(
             //
             // Init returns u64 handle (0 = failure; LAST_ERROR also set).
 
-            // `cerulion_node_platform_check`: the loader calls this at load,
-            // before init, so the probe runs against THIS cdylib's iceoryx2
-            // copy rather than the host's. Required on Android. 0 = supported;
-            // nonzero sets LAST_ERROR.
+            // Legacy diagnostic export only. Stable create also probes the
+            // node's linked iceoryx2 copy; Android node workspaces need the fork patch.
             #[no_mangle]
             pub extern "C" fn cerulion_node_platform_check() -> i32 {
                 let result = ::std::panic::catch_unwind(|| {
-                    ::cerulion_core::graph::node::cdylib_platform_check()
+                    #__cer_root::graph::node::cdylib_platform_check()
                 });
                 match result {
                     Ok(Ok(())) => 0,
@@ -2058,11 +2137,11 @@ fn gen_cdylib(
             // cannot drift. `params_json` is `None` for the plain symbol and
             // for an empty byte slice.
             fn __cer_init_with(
-                ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext,
+                ctx_ptr: *mut #__cer_root::graph::node::NodeContext,
                 params_json: ::std::option::Option<&[u8]>,
             ) -> u64 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    use ::cerulion_core::graph::node::NodeEntry;
+                    use #__cer_root::graph::node::NodeEntry as _;
 
                     if ctx_ptr.is_null() {
                         __cer_set_last_error(::std::string::String::from(
@@ -2077,7 +2156,7 @@ fn gen_cdylib(
                     let ctx = unsafe { *Box::from_raw(ctx_ptr) };
 
                     if let ::std::result::Result::Err(e) =
-                        ::cerulion_core::graph::node::cdylib_platform_check()
+                        #__cer_root::graph::node::cdylib_platform_check()
                     {
                         __cer_set_last_error(::std::format!(
                             "node library {}: {}",
@@ -2096,7 +2175,7 @@ fn gen_cdylib(
                     // env snapshot (determinism), empty ⇒ unset ⇒ "info".
                     {
                         let __cer_rust_log = ctx.env_str("RUST_LOG", "");
-                        ::cerulion_core::graph::node::install_cdylib_stderr_tracing(
+                        #__cer_root::graph::node::install_cdylib_stderr_tracing(
                             if __cer_rust_log.is_empty() {
                                 ::std::option::Option::None
                             } else {
@@ -2119,7 +2198,7 @@ fn gen_cdylib(
                     // ⇒ the Cerulion default (`error`).
                     {
                         let __cer_iox2_log = ctx.env_str("IOX2_LOG_LEVEL", "");
-                        ::cerulion_core::iceoryx_logger::init_iceoryx_log_level(
+                        #__cer_root::iceoryx_logger::init_iceoryx_log_level(
                             if __cer_iox2_log.is_empty() {
                                 ::std::option::Option::None
                             } else {
@@ -2136,7 +2215,7 @@ fn gen_cdylib(
                     if let ::std::option::Option::Some(bytes) = params_json {
                         let values = match ::std::str::from_utf8(bytes)
                             .map_err(|e| e.to_string())
-                            .and_then(::cerulion_core::graph::params::params_from_json)
+                            .and_then(#__cer_root::graph::params::params_from_json)
                         {
                             ::std::result::Result::Ok(values) => values,
                             ::std::result::Result::Err(e) => {
@@ -2168,7 +2247,10 @@ fn gen_cdylib(
                     };
                     let map = guard.get_or_insert_with(::std::collections::HashMap::new);
                     let handle = NEXT_HANDLE.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed);
-                    map.insert(handle, entry);
+                    map.insert(
+                        handle,
+                        ::std::sync::Arc::new(::std::sync::Mutex::new(Some(entry))),
+                    );
                     handle
                 }));
                 match result {
@@ -2183,7 +2265,7 @@ fn gen_cdylib(
             }
 
             #[no_mangle]
-            pub extern "C" fn cerulion_node_init(ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext) -> u64 {
+            pub extern "C" fn cerulion_node_init(ctx_ptr: *mut #__cer_root::graph::node::NodeContext) -> u64 {
                 __cer_init_with(ctx_ptr, ::std::option::Option::None)
             }
 
@@ -2200,7 +2282,7 @@ fn gen_cdylib(
             // carries `params:` (never a silently dead key).
             #[no_mangle]
             pub extern "C" fn cerulion_node_init_with_params(
-                ctx_ptr: *mut ::cerulion_core::graph::node::NodeContext,
+                ctx_ptr: *mut #__cer_root::graph::node::NodeContext,
                 params_ptr: *const u8,
                 params_len: usize,
             ) -> u64 {
@@ -2222,17 +2304,27 @@ fn gen_cdylib(
             #[no_mangle]
             pub extern "C" fn cerulion_node_tick(handle: u64) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    use ::cerulion_core::graph::node::NodeEntry;
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    use #__cer_root::graph::node::NodeEntry;
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_tick: NODES mutex poisoned",
                             ));
                             return 3_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_tick: node instance mutex poisoned",
+                            ));
+                            return 3_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => match node.tick() {
                             ::std::result::Result::Ok(()) => 0,
                             ::std::result::Result::Err(e) => {
@@ -2259,52 +2351,10 @@ fn gen_cdylib(
                 }
             }
 
-            // Mirror of `cerulion_node_tick` that
-            // services quiescent late joiners. `pump_history()` returns
-            // `()`, so the success path returns 0; the error codes match
-            // tick exactly (3 NODES poisoned / 4 handle not found /
-            // 2 panic).
-            #[no_mangle]
-            pub extern "C" fn cerulion_node_pump_history(handle: u64) -> i32 {
-                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    use ::cerulion_core::graph::node::NodeEntry;
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_pump_history: NODES mutex poisoned",
-                            ));
-                            return 3_i32;
-                        }
-                    };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-                        Some(node) => {
-                            node.pump_history();
-                            0
-                        }
-                        None => {
-                            __cer_set_last_error(::std::format!(
-                                "cerulion_node_pump_history: handle {} not found", handle,
-                            ));
-                            4
-                        }
-                    }
-                }));
-                match result {
-                    Ok(code) => code,
-                    Err(_) => {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_pump_history: panic caught by catch_unwind",
-                        ));
-                        2
-                    }
-                }
-            }
-
             #[no_mangle]
             pub extern "C" fn cerulion_node_shutdown(handle: u64) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    use ::cerulion_core::graph::node::NodeEntry;
+                    use #__cer_root::graph::node::NodeEntry;
                     let mut guard = match NODES.lock() {
                         Ok(g) => g,
                         Err(_) => {
@@ -2319,7 +2369,24 @@ fn gen_cdylib(
                     // Returning 0 instead would make a buggy
                     // loader sending a stale or never-registered handle
                     // look like a successful shutdown.
-                    let mut node = match guard.as_mut().and_then(|m| m.remove(&handle)) {
+                    let removed = guard.as_mut().and_then(|m| m.remove(&handle));
+                    drop(guard);
+                    // The instance lock waits out a call still running on it;
+                    // taking the entry out leaves `None` for any later caller.
+                    // A poisoned instance (a tick that panicked under its lock)
+                    // is refused with code 3: the node's `shutdown()` is not
+                    // called on state a panic may have left half-written.
+                    let taken = match removed.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(mut slot)) => slot.take(),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_shutdown: node instance mutex poisoned",
+                            ));
+                            return 3_i32;
+                        }
+                    };
+                    let mut node = match taken {
                         Some(n) => n,
                         None => {
                             __cer_set_last_error(::std::format!(
@@ -2346,657 +2413,12 @@ fn gen_cdylib(
                 }
             }
 
-            // OPTIONAL snapshot FFI (cross-step HOLD of non-trigger
-            // latest-value `#[input]`s for cdylib nodes). The host
-            // (`DylibNodeEntry`) resolves both symbols as OPTIONAL — a
-            // cdylib that doesn't export them still loads and
-            // behaves as before (its non-trigger inputs read live), so these
-            // are ADDITIVE and do NOT bump `CERULION_ABI_VERSION`. The same
-            // precedent governs the `cerulion_node_drain_trigger_input`
-            // below (unified trigger drain): optional, additive, no ABI bump —
-            // a symbol-less cdylib keeps the dual-subscriber drain. It also
-            // governs `cerulion_node_refill_trigger_input` and
-            // `cerulion_node_sync_head_op`.
-            //
-            // A symbol being bump-free is NOT the same as its FEATURE being
-            // bump-free, and the head-op export is the case that makes the distinction
-            // worth writing down: the head-op symbol above rides the
-            // presence-is-capability precedent and bumps nothing on its own,
-            // while the feature it belongs to DOES bump `CERULION_ABI_VERSION`
-            // 14 -> 15 — a bump earned by the `next_head` field added to
-            // `CerulionSubscriber`, which changes the LAYOUT of a type the
-            // `NodeContext` owns across the `init()` boundary. ONE bump covers
-            // the whole feature; the optional symbol rides it rather than
-            // adding a second.
-            //
-            // FFI return codes (negative = failure; the host pulls LAST_ERROR):
-            //   0  = success
-            //  -1  = NODES mutex poisoned
-            //  -2  = handle not found
-            //  -3  = name(s) not valid UTF-8 (set_snapshot_inputs +
-            //        drain_trigger_input)
-            //  -4  = panic caught by catch_unwind
-            //
-            // `cerulion_node_set_snapshot_inputs`: store (ONCE, at the host's
-            // first call) the runtime-classified non-trigger input NAMES on the
-            // node's wrapper, so the per-step `cerulion_node_snapshot_inputs`
-            // below allocates nothing.
-            #[no_mangle]
-            pub extern "C" fn cerulion_node_set_snapshot_inputs(
-                handle: u64,
-                names_ptr: *const u8,
-                names_len: usize,
-            ) -> i32 {
-                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    // Parse the `\n`-joined UTF-8 names into owned Strings. The
-                    // host marshals an EMPTY string for an empty name set, which
-                    // must become an EMPTY vec (NOT `[""]`, which `"".split('\n')`
-                    // yields), so split only the non-empty case.
-                    let names: ::std::vec::Vec<::std::string::String> = if names_len == 0 {
-                        ::std::vec::Vec::new()
-                    } else {
-                        // SAFETY: the host (DylibNodeEntry::snapshot_inputs)
-                        // passes a pointer to a live, immutable byte slice of
-                        // exactly `names_len` bytes, valid for this call; we only
-                        // read it and copy out owned Strings, never retaining the
-                        // pointer.
-                        let bytes = unsafe {
-                            ::std::slice::from_raw_parts(names_ptr, names_len)
-                        };
-                        match ::std::str::from_utf8(bytes) {
-                            ::std::result::Result::Ok(s) => s
-                                .split('\n')
-                                .map(::std::string::String::from)
-                                .collect(),
-                            ::std::result::Result::Err(_) => {
-                                __cer_set_last_error(::std::string::String::from(
-                                    "cerulion_node_set_snapshot_inputs: names were not valid UTF-8",
-                                ));
-                                return -3_i32;
-                            }
-                        }
-                    };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_set_snapshot_inputs: NODES mutex poisoned",
-                            ));
-                            return -1_i32;
-                        }
-                    };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-                        Some(node) => {
-                            node.__snapshot_input_names = names;
-                            0
-                        }
-                        None => {
-                            __cer_set_last_error(::std::format!(
-                                "cerulion_node_set_snapshot_inputs: handle {} not found", handle,
-                            ));
-                            -2
-                        }
-                    }
-                }));
-                match result {
-                    Ok(code) => code,
-                    Err(_) => {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_set_snapshot_inputs: panic caught by catch_unwind",
-                        ));
-                        -4
-                    }
-                }
-            }
-
-            // `cerulion_node_snapshot_inputs`: forward the per-step freeze to
-            // the node's NodeContext using the names stored by
-            // `set_snapshot_inputs`. The SAME call the macro's in-process
-            // `NodeEntry::snapshot_inputs` makes. Allocates nothing (the names
-            // were captured once) — safe to call every step.
-            #[no_mangle]
-            pub extern "C" fn cerulion_node_snapshot_inputs(handle: u64) -> i32 {
-                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_snapshot_inputs: NODES mutex poisoned",
-                            ));
-                            return -1_i32;
-                        }
-                    };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-                        Some(node) => {
-                            // Disjoint field borrows: bind the shared borrow of
-                            // `__snapshot_input_names` first, then take the mutable
-                            // borrow of the disjoint `context` field — NLL allows
-                            // simultaneous borrows of distinct struct fields.
-                            let names = node.__snapshot_input_names.as_slice();
-                            if let Some(ctx) = node.context.as_mut() {
-                                node.__cer_accumulators.snapshot(ctx, names);
-                            }
-                            0
-                        }
-                        None => {
-                            __cer_set_last_error(::std::format!(
-                                "cerulion_node_snapshot_inputs: handle {} not found", handle,
-                            ));
-                            -2
-                        }
-                    }
-                }));
-                match result {
-                    Ok(code) => code,
-                    Err(_) => {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_snapshot_inputs: panic caught by catch_unwind",
-                        ));
-                        -4
-                    }
-                }
-            }
-
-            // OPTIONAL unified-trigger-drain FFI. Symbol
-            // PRESENCE is the capability gate (`NodeEntry::unifies_trigger_drain`
-            // on the host's `DylibNodeEntry`) that lets the runtime elide the
-            // separate trigger-drain subscriber for a cdylib data-trigger input
-            // (one iceoryx2 receive per hop, the unified-drain win, extended across the
-            // FFI). Only MACRO-generated cdylibs export it, and their input
-            // reads are generated `try_view` — the one read path the unified
-            // drain's frozen slot serves — so the capability-by-symbol gate is
-            // also the structural READ-PATH CONTRACT enforcement for the
-            // production surface (a raw-FFI cdylib free to `try_receive` lacks
-            // the symbol and keeps the dual-subscriber path).
-            //
-            // Out-params are written ONLY on success (return 0): `out_popped` =
-            // frames drained off the body subscriber, `out_latest_ts` +
-            // `out_has_ts` (1/0) = the latest wire timestamp, if any. Zero-alloc
-            // on the happy path: the name is read as a BORROWED `&str` (no
-            // String copy — this runs on the per-step drain path) and
-            // `NodeContext::drain_trigger_input` allocates nothing.
-            #[no_mangle]
-            pub extern "C" fn cerulion_node_drain_trigger_input(
-                handle: u64,
-                name_ptr: *const u8,
-                name_len: usize,
-                out_popped: *mut u64,
-                out_latest_ts: *mut u64,
-                out_has_ts: *mut i32,
-            ) -> i32 {
-                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: the host (`DylibNodeEntry::drain_trigger_input`)
-                    // passes a pointer to a live, immutable byte slice of exactly
-                    // `name_len` bytes, valid for this call; we only borrow it
-                    // (no copy) and never retain the pointer. `from_raw_parts`
-                    // with len 0 and a dangling-but-aligned ptr is sound, and the
-                    // host always passes `str::as_ptr()` (non-null).
-                    let bytes = unsafe {
-                        ::std::slice::from_raw_parts(name_ptr, name_len)
-                    };
-                    let name = match ::std::str::from_utf8(bytes) {
-                        ::std::result::Result::Ok(s) => s,
-                        ::std::result::Result::Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_drain_trigger_input: name was not valid UTF-8",
-                            ));
-                            return -3_i32;
-                        }
-                    };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_drain_trigger_input: NODES mutex poisoned",
-                            ));
-                            return -1_i32;
-                        }
-                    };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-                        Some(node) => {
-                            let (popped, latest_ts) = match node.context.as_mut() {
-                                Some(ctx) => ctx.drain_trigger_input(name),
-                                // Not yet init'd: nothing to drain — success
-                                // with zero, mirroring `cerulion_node_snapshot_
-                                // inputs`' silent no-context arm.
-                                None => (0_u64, ::core::option::Option::None),
-                            };
-                            // SAFETY: the host passes valid, writable
-                            // out-pointers (its own stack slots) for this call.
-                            unsafe {
-                                *out_popped = popped;
-                                match latest_ts {
-                                    ::core::option::Option::Some(ts) => {
-                                        *out_latest_ts = ts;
-                                        *out_has_ts = 1;
-                                    }
-                                    ::core::option::Option::None => {
-                                        *out_latest_ts = 0;
-                                        *out_has_ts = 0;
-                                    }
-                                }
-                            }
-                            0
-                        }
-                        None => {
-                            __cer_set_last_error(::std::format!(
-                                "cerulion_node_drain_trigger_input: handle {} not found", handle,
-                            ));
-                            -2
-                        }
-                    }
-                }));
-                match result {
-                    Ok(code) => code,
-                    Err(_) => {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_drain_trigger_input: panic caught by catch_unwind",
-                        ));
-                        -4
-                    }
-                }
-            }
-
-            // The OPTIONAL between-fires REFILL export — the drain
-            // export's twin, ADDITIVE and resolved best-effort by the host, so
-            // `CERULION_ABI_VERSION` is deliberately NOT bumped and a
-            // earlier cdylib (which exports the drain and not this) keeps
-            // loading, keeps its Unified binding, and simply has its bursts
-            // served one frame per step.
-            //
-            // It cannot ride the drain export, because the two sites disagree
-            // about what an UNSERVED FROZEN HEAD means: the boundary drain
-            // RE-OFFERS it (a frame still owed a fire — Principle #6), while a
-            // refill must report "nothing new" (the fire it follows did not
-            // consume the head, so re-offering would fire the node a second
-            // time on one frame — up to the per-step cap, every step).
-            //
-            // Same contract as the drain export in every other respect: the
-            // name is BORROWED (no copy — this runs per fire of a burst),
-            // out-params are written ONLY on success (return 0), and
-            // `NodeContext::refill_trigger_input` allocates nothing.
-            #[no_mangle]
-            pub extern "C" fn cerulion_node_refill_trigger_input(
-                handle: u64,
-                name_ptr: *const u8,
-                name_len: usize,
-                out_popped: *mut u64,
-                out_latest_ts: *mut u64,
-                out_has_ts: *mut i32,
-            ) -> i32 {
-                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    // SAFETY: the host (`DylibNodeEntry::refill_trigger_input`)
-                    // passes a pointer to a live, immutable byte slice of exactly
-                    // `name_len` bytes, valid for this call; we only borrow it
-                    // (no copy) and never retain the pointer. `from_raw_parts`
-                    // with len 0 and a dangling-but-aligned ptr is sound, and the
-                    // host always passes `str::as_ptr()` (non-null).
-                    let bytes = unsafe {
-                        ::std::slice::from_raw_parts(name_ptr, name_len)
-                    };
-                    let name = match ::std::str::from_utf8(bytes) {
-                        ::std::result::Result::Ok(s) => s,
-                        ::std::result::Result::Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_refill_trigger_input: name was not valid UTF-8",
-                            ));
-                            return -3_i32;
-                        }
-                    };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_refill_trigger_input: NODES mutex poisoned",
-                            ));
-                            return -1_i32;
-                        }
-                    };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-                        Some(node) => {
-                            let (popped, latest_ts) = match node.context.as_mut() {
-                                Some(ctx) => ctx.refill_trigger_input(name),
-                                // Not yet init'd: nothing to refill — success
-                                // with zero, mirroring the drain export's
-                                // silent no-context arm.
-                                None => (0_u64, ::core::option::Option::None),
-                            };
-                            // SAFETY: the host passes valid, writable
-                            // out-pointers (its own stack slots) for this call.
-                            unsafe {
-                                *out_popped = popped;
-                                match latest_ts {
-                                    ::core::option::Option::Some(ts) => {
-                                        *out_latest_ts = ts;
-                                        *out_has_ts = 1;
-                                    }
-                                    ::core::option::Option::None => {
-                                        *out_latest_ts = 0;
-                                        *out_has_ts = 0;
-                                    }
-                                }
-                            }
-                            0
-                        }
-                        None => {
-                            __cer_set_last_error(::std::format!(
-                                "cerulion_node_refill_trigger_input: handle {} not found", handle,
-                            ));
-                            -2
-                        }
-                    }
-                }));
-                match result {
-                    Ok(code) => code,
-                    Err(_) => {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_refill_trigger_input: panic caught by catch_unwind",
-                        ));
-                        -4
-                    }
-                }
-            }
-
-            // The OPTIONAL per-set Sync HEAD-OP export. ADDITIVE and
-            // resolved best-effort by the host, so symbol PRESENCE is the
-            // capability (`NodeEntry::supports_sync_head_ops` on the host's
-            // `DylibNodeEntry`) exactly as it is for the drain symbol
-            // above — a raw-FFI or earlier cdylib keeps loading and simply
-            // reports that it cannot serve the per-set matcher, which is what
-            // lets the scheduler degrade that node rather than refuse it.
-            //
-            // Presence-as-capability is also the READ-PATH CONTRACT here, and
-            // that is the load-bearing half: the ops promote a chosen frame
-            // into the frozen slot and `Void` makes a RESTORED head read as
-            // "no frame", both of which are only true for the generated
-            // `try_view`. Only MACRO-generated cdylibs export this symbol, and
-            // their reads ARE that `try_view`; a raw-FFI cdylib free to call
-            // `try_receive` lacks the symbol and is never handed a head.
-            //
-            // WHY THE TWO FILL OPS ARE NOT HERE. `SyncHeadOp::FillBoundary`
-            // and `SyncHeadOp::FillRefill` deliberately do NOT cross this
-            // symbol: filling a head at a level boundary and filling it
-            // between two fires of one step already have a home — the
-            // `cerulion_node_drain_trigger_input` and the
-            // `cerulion_node_refill_trigger_input` exports above, which draw
-            // exactly that distinction (a boundary RE-OFFERS an unserved
-            // frozen head per Principle #6; a refill must report "nothing
-            // new"). A second crossing for the same two questions would be two
-            // FFI paths that must agree about one frozen head — a class of
-            // duplication that drifts — so this symbol carries only
-            // the four ops that have no existing crossing. An op code outside
-            // that set is an ERROR, never a silent no-op: a host that sends
-            // one is asking for something this ABI does not carry, and
-            // answering `Nothing` would let it read a missing capability as
-            // evidence of scarcity.
-            //
-            // ABI: this symbol does NOT bump `CERULION_ABI_VERSION` on its own
-            // (the symbol-presence-is-capability precedent). That is
-            // NOT the same as the feature being bump-free: this feature DOES bump
-            // 14 -> 15, and the bump is already taken by the `next_head` field
-            // added to `CerulionSubscriber`, which is a LAYOUT change to a type
-            // the `NodeContext` owns across the `init()` boundary. ONE bump
-            // covers the whole feature; this export rides it.
-            //
-            // OP CODES (`op`) and ANSWER KINDS (`*out_kind`) are the SHARED
-            // `SYNC_HEAD_OP_*` / `SYNC_OP_ANSWER_*` consts in
-            // `cerulion_core::graph::node`, reached by PATH below and never
-            // re-spelled as literals here — the host resolver decodes with the
-            // same consts, which is what makes their "the two spellings of one
-            // wire cannot drift" claim true of the emitting side as well:
-            //   op:       PROBE_NEXT (0) · PEEK_NEXT (1) · ADVANCE (2) · VOID (3)
-            //   out_kind: NOTHING (0) · PRESENT (1) · HEAD (2) · STAMP (3)
-            //
-            // `*out_ts` carries the stamp for HEAD and STAMP; for NOTHING and
-            // PRESENT the host is entitled to treat it as untouched and never
-            // reads it. We write 0 there anyway — a strict superset of the
-            // contract, so a host that neglected to initialize its own slot
-            // reads a defined value rather than whatever was on its stack.
-            //
-            // RETURN CODES. A NONZERO return means the op FAILED and the
-            // out-params were NOT written. -1..-4 are the drain export's codes
-            // with the drain export's meanings:
-            //   0  = success
-            //  -1  = NODES mutex poisoned
-            //  -2  = handle not found
-            //  -3  = name was not valid UTF-8
-            //  -4  = panic caught by catch_unwind
-            //  -5  = unknown op code (this ABI does not carry it)
-            //  -6  = the op itself answered `SyncOpAnswer::Failed`
-            //  -7  = a null out-param
-            //  -8  = the name argument is not a readable slice (null pointer,
-            //        or a length past `isize::MAX`)
-            //
-            // -6 exists because `Failed` is a FIRST-CLASS answer of
-            // `SyncOpAnswer` (a poisoned lock deeper down, an iceoryx2 error, a
-            // not-yet-init'd node) and the four answer kinds above have no room
-            // for it. It must not be smuggled in as `Nothing`: the R-Fail
-            // policy that reads it is POSITION-AWARE, and a failure laundered
-            // into `Nothing` would VOUCH FOR SCARCITY on an input nobody
-            // verified. -7 is checked UP FRONT, before the lock and before the
-            // op runs, so a caller passing null is refused deterministically
-            // rather than only on the arms that happen to write a stamp.
-            //
-            // -8 is the same rule applied to the IN-param, and it is checked
-            // FIRST — before -5's op-code match and before -7 — because the
-            // name is the only argument this function DEREFERENCES.
-            // `slice::from_raw_parts` requires a NON-NULL, aligned pointer
-            // EVEN AT LENGTH ZERO, so calling it on a null `name_ptr` is
-            // undefined behaviour outright rather than merely a bad read: a
-            // debug build ABORTS on the precondition and a release build
-            // compiles that check out and reads from address 0. Refusing it
-            // BEFORE the deref is the whole of the guard (the established
-            // precedent: validate, then answer with a dedicated code). u8's
-            // alignment is 1, so non-null IS the entire remaining
-            // precondition once this arm has run.
-            //
-            // It is its OWN code rather than -7's because the two are
-            // different caller bugs with different fixes — a null out-param
-            // means the host forgot its own stack slots, a null name means it
-            // has no port to ask about — the same argument rmw's
-            // `topic=`/`service=` split makes for keeping such distinctions in
-            // the vocabulary. It is deliberately NOT laundered into an EMPTY
-            // NAME either: rmw's hand-built empty slice exists so a caller
-            // mistake still reaches a LATCHED, COUNTED reject arm, and this
-            // export has neither a latch nor a counter — the return code is
-            // the whole diagnostic, so an empty name resolving to "no such
-            // port" (-6 `Failed`) would report a wiring desync as an ordinary
-            // transport failure and hide the caller bug behind R-Fail. A
-            // NON-NULL pointer with `name_len == 0` still takes that ordinary
-            // path: it is SOUND to borrow, and an empty name really is a
-            // lookup that finds nothing.
-            //
-            // Zero-alloc on the happy path, same as the two exports above: the
-            // name is read as a BORROWED `&str` (no String copy — this runs per
-            // alignment pass, per input) and `NodeContext::sync_head_op`
-            // allocates nothing.
-            #[no_mangle]
-            pub extern "C" fn cerulion_node_sync_head_op(
-                handle: u64,
-                name_ptr: *const u8,
-                name_len: usize,
-                op: u32,
-                out_ts: *mut u64,
-                out_kind: *mut i32,
-            ) -> i32 {
-                let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    // Refused FIRST, before the deref below: a null `name_ptr`
-                    // is UNDEFINED BEHAVIOUR to hand to `from_raw_parts` even
-                    // at length 0, so it cannot be checked afterwards.
-                    if name_ptr.is_null() {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_sync_head_op: name_ptr was null",
-                        ));
-                        return -8_i32;
-                    }
-                    // The other half of the same precondition: `from_raw_parts`
-                    // also requires the slice's total size to fit in `isize`.
-                    // Same code, because it is the same caller mistake — the
-                    // name argument is not a readable slice — and the message
-                    // says which half it was.
-                    if name_len > (::core::primitive::isize::MAX as usize) {
-                        __cer_set_last_error(::std::format!(
-                            "cerulion_node_sync_head_op: name_len {} exceeds isize::MAX",
-                            name_len,
-                        ));
-                        return -8_i32;
-                    }
-                    // SAFETY: the host (`DylibNodeEntry::sync_head_op`) passes a
-                    // pointer to a live, immutable byte slice of exactly
-                    // `name_len` bytes, valid for this call; we only borrow it
-                    // (no copy) and never retain the pointer. Non-null is
-                    // established by the refusal directly above and u8's
-                    // alignment is 1, so the `from_raw_parts` preconditions
-                    // hold for every `name_len`, including 0.
-                    let bytes = unsafe {
-                        ::std::slice::from_raw_parts(name_ptr, name_len)
-                    };
-                    let name = match ::std::str::from_utf8(bytes) {
-                        ::std::result::Result::Ok(s) => s,
-                        ::std::result::Result::Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_sync_head_op: name was not valid UTF-8",
-                            ));
-                            return -3_i32;
-                        }
-                    };
-                    // The two FILL ops are absent BY DESIGN (see above), so an
-                    // op code outside this set is refused loudly and named.
-                    //
-                    // The codes are the SHARED consts the host resolver decodes
-                    // with, reached by PATH and never re-spelled as literals —
-                    // that sharing is the only thing making
-                    // `cerulion_core::graph::node`'s "the two spellings of one
-                    // wire cannot drift" true of this side of the wall.
-                    let head_op = match op {
-                        ::cerulion_core::graph::node::SYNC_HEAD_OP_PROBE_NEXT => {
-                            ::cerulion_core::SyncHeadOp::ProbeNext
-                        }
-                        ::cerulion_core::graph::node::SYNC_HEAD_OP_PEEK_NEXT => {
-                            ::cerulion_core::SyncHeadOp::PeekNext {
-                                site: ::cerulion_core::SyncAlignSite::Boundary,
-                            }
-                        }
-                        ::cerulion_core::graph::node::SYNC_HEAD_OP_PEEK_NEXT_REFILL => {
-                            ::cerulion_core::SyncHeadOp::PeekNext {
-                                site: ::cerulion_core::SyncAlignSite::Refill,
-                            }
-                        }
-                        ::cerulion_core::graph::node::SYNC_HEAD_OP_ADVANCE => {
-                            ::cerulion_core::SyncHeadOp::Advance {
-                                site: ::cerulion_core::SyncAlignSite::Boundary,
-                            }
-                        }
-                        ::cerulion_core::graph::node::SYNC_HEAD_OP_ADVANCE_REFILL => {
-                            ::cerulion_core::SyncHeadOp::Advance {
-                                site: ::cerulion_core::SyncAlignSite::Refill,
-                            }
-                        }
-                        ::cerulion_core::graph::node::SYNC_HEAD_OP_VOID => {
-                            ::cerulion_core::SyncHeadOp::Void
-                        }
-                        other => {
-                            __cer_set_last_error(::std::format!(
-                                "cerulion_node_sync_head_op: unknown op code {} (this ABI carries \
-                                 0=ProbeNext, 1=PeekNext, 2=Advance, 3=Void, \
-                                 4=PeekNext(refill), 5=Advance(refill); the two FILL ops ride \
-                                 cerulion_node_drain_trigger_input / \
-                                 cerulion_node_refill_trigger_input)",
-                                other,
-                            ));
-                            return -5_i32;
-                        }
-                    };
-                    // Refused BEFORE the lock and before the op runs: a null
-                    // out-param is a caller bug, and a check deferred to the
-                    // write site would accept it on every answer that carries
-                    // no stamp and reject it on the ones that do.
-                    if out_ts.is_null() || out_kind.is_null() {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_sync_head_op: out_ts or out_kind pointer was null",
-                        ));
-                        return -7_i32;
-                    }
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
-                            __cer_set_last_error(::std::string::String::from(
-                                "cerulion_node_sync_head_op: NODES mutex poisoned",
-                            ));
-                            return -1_i32;
-                        }
-                    };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
-                        Some(node) => {
-                            let answer = match node.context.as_mut() {
-                                Some(ctx) => ctx.sync_head_op(name, head_op),
-                                // Not yet init'd. Deliberately NOT the drain
-                                // export's silent success-with-zero: this
-                                // return type's zero is `Nothing`, which is
-                                // positive evidence of scarcity the matcher may
-                                // descend on. A node that has observed nothing
-                                // vouches for nothing.
-                                None => ::cerulion_core::SyncOpAnswer::Failed,
-                            };
-                            let (kind, ts) = match answer {
-                                ::cerulion_core::SyncOpAnswer::Nothing => (
-                                    ::cerulion_core::graph::node::SYNC_OP_ANSWER_NOTHING,
-                                    0_u64,
-                                ),
-                                ::cerulion_core::SyncOpAnswer::Present => (
-                                    ::cerulion_core::graph::node::SYNC_OP_ANSWER_PRESENT,
-                                    0_u64,
-                                ),
-                                ::cerulion_core::SyncOpAnswer::Head(ts) => (
-                                    ::cerulion_core::graph::node::SYNC_OP_ANSWER_HEAD,
-                                    ts,
-                                ),
-                                ::cerulion_core::SyncOpAnswer::Stamp(ts) => (
-                                    ::cerulion_core::graph::node::SYNC_OP_ANSWER_STAMP,
-                                    ts,
-                                ),
-                                ::cerulion_core::SyncOpAnswer::Failed => {
-                                    __cer_set_last_error(::std::string::String::from(
-                                        "cerulion_node_sync_head_op: the op answered Failed",
-                                    ));
-                                    return -6_i32;
-                                }
-                            };
-                            // SAFETY: both pointers were null-checked above, and
-                            // the host passes writable slots it owns for the
-                            // duration of this call.
-                            unsafe {
-                                *out_ts = ts;
-                                *out_kind = kind;
-                            }
-                            0
-                        }
-                        None => {
-                            __cer_set_last_error(::std::format!(
-                                "cerulion_node_sync_head_op: handle {} not found", handle,
-                            ));
-                            -2
-                        }
-                    }
-                }));
-                match result {
-                    Ok(code) => code,
-                    Err(_) => {
-                        __cer_set_last_error(::std::string::String::from(
-                            "cerulion_node_sync_head_op: panic caught by catch_unwind",
-                        ));
-                        -4
-                    }
-                }
-            }
-
             // ================================================================
             // THE KEYSTONE: state capture/restore across the wall
             // ================================================================
             //
-            // Three OPTIONAL, ADDITIVE exports, resolved best-effort by the host
-            // exactly like the snapshot pair and the drain
-            // symbol above — symbol PRESENCE is the capability, and
+            // Three OPTIONAL, ADDITIVE state exports. Symbol PRESENCE is
+            // the capability, and
             // `CERULION_ABI_VERSION` is deliberately NOT bumped, so a raw-FFI or
             // earlier cdylib still loads and simply declares no restorable state.
             //
@@ -3029,7 +2451,7 @@ fn gen_cdylib(
             //
             // Return codes extend the set documented above:
             //   0  = success
-            //  -1  = NODES mutex poisoned
+            //  -1  = NODES or instance lock poisoned
             //  -2  = handle not found
             //  -3  = invalid argument (null sink / null payload with a length /
             //        null out-pointer)
@@ -3060,14 +2482,14 @@ fn gen_cdylib(
                 refused: bool,
             }
 
-            impl ::cerulion_core::state::StateSink for __CerFfiStateSink {
+            impl #__cer_root::state::StateSink for __CerFfiStateSink {
                 fn write(
                     &mut self,
                     bytes: &[u8],
-                ) -> ::std::result::Result<(), ::cerulion_core::state::SinkFull> {
+                ) -> ::std::result::Result<(), #__cer_root::state::SinkFull> {
                     if self.refused {
                         return ::std::result::Result::Err(
-                            ::cerulion_core::state::SinkFull,
+                            #__cer_root::state::SinkFull,
                         );
                     }
                     // The host's trampoline guards a zero length before it builds
@@ -3080,7 +2502,7 @@ fn gen_cdylib(
                     } else {
                         self.refused = true;
                         ::std::result::Result::Err(
-                            ::cerulion_core::state::SinkFull,
+                            #__cer_root::state::SinkFull,
                         )
                     }
                 }
@@ -3127,7 +2549,7 @@ fn gen_cdylib(
                     // slot it owns for the duration of this call.
                     unsafe {
                         *out_shape =
-                            <#node_name as ::cerulion_core::state::CerulionState>::STATE_SHAPE;
+                            <#node_name as #__cer_root::state::CerulionState>::STATE_SHAPE;
                     }
                     0
                 }));
@@ -3160,7 +2582,7 @@ fn gen_cdylib(
             pub extern "C" fn cerulion_node_inline_safe() -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
                     i32::from(
-                        <#node_name as ::cerulion_core::state::CerulionState>::INLINE_SAFE,
+                        <#node_name as #__cer_root::state::CerulionState>::INLINE_SAFE,
                     )
                 }));
                 match result {
@@ -3181,7 +2603,7 @@ fn gen_cdylib(
             // question about the INSTANCE: is any lock in its state graph held
             // right now?
             //
-            // `try_lock` on `NODES`, never `lock`. This runs on the node thread
+            // `try_lock` on `NODES` and on the instance, never `lock`. This runs on the node thread
             // at a step boundary, where the executor's only blocking primitive
             // must be none at all — and a probe that BLOCKED to answer "is
             // anything blocking?" would be the very stall it exists to detect.
@@ -3192,17 +2614,23 @@ fn gen_cdylib(
             #[no_mangle]
             pub extern "C" fn cerulion_node_cer_probe(handle: u64) -> i32 {
                 let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                    let guard = match NODES.try_lock() {
-                        Ok(g) => g,
+                    let instance = match NODES.try_lock() {
+                        Ok(g) => g.as_ref().and_then(|m| m.get(&handle)).cloned(),
                         Err(_) => {
                             // Contended or poisoned — either way this cdylib is
                             // not in a state to be forked from.
                             return 0_i32;
                         }
                     };
-                    match guard.as_ref().and_then(|m| m.get(&handle)) {
+                    // The same `try_lock` on the instance: a held instance
+                    // lock is a call in flight, which is not quiescent.
+                    let guard = match instance.as_deref().map(::std::sync::Mutex::try_lock) {
+                        Some(Ok(g)) => g,
+                        _ => return 0_i32,
+                    };
+                    match guard.as_ref() {
                         Some(node) => i32::from(
-                            ::cerulion_core::state::CerulionState::cer_probe(&node.inner),
+                            #__cer_root::state::CerulionState::cer_probe(&node.inner),
                         ),
                         None => 0_i32,
                     }
@@ -3238,16 +2666,26 @@ fn gen_cdylib(
                             return -3_i32;
                         }
                     };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_capture_state: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_capture_state: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             let mut out = __CerFfiStateSink {
                                 sink,
@@ -3268,16 +2706,16 @@ fn gen_cdylib(
                             // Drive the user's encoder under an
                             // INNER `catch_unwind` so a panicking
                             // `CerulionState` impl does NOT unwind through the
-                            // LIVE `NODES` MutexGuard (`guard`). The state
+                            // live instance guard (`guard`). The state
                             // contract is explicit that a capture panic escaping
                             // the guard is not a mere poisoned mutex: it kills
-                            // every SUBSEQUENT operation on every node of this
-                            // cdylib for the process lifetime, and misreports
+                            // every SUBSEQUENT operation on this node instance
+                            // for the process lifetime, and misreports
                             // the cause as a tick panic that never happened.
                             // The inline carrier wraps its own capture for
                             // exactly this reason ("the node mutex is NOT
-                            // poisoned"), and the cdylib's `NODES` is that
-                            // mutex's twin on this side of the wall. Same
+                            // poisoned"), and the cdylib's instance lock is
+                            // that mutex's twin on this side of the wall. Same
                             // containment as `cerulion_node_external_source`'s
                             // INNER `catch_unwind` above; the OUTER one stays the
                             // backstop for a panic raised outside this call.
@@ -3287,7 +2725,7 @@ fn gen_cdylib(
                             // the -4 return already tells the host to distrust.
                             let outcome = match ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(|| {
-                                    ::cerulion_core::state::CerulionState::cer_capture(
+                                    #__cer_root::state::CerulionState::cer_capture(
                                         &node.inner,
                                         &mut out,
                                     )
@@ -3319,7 +2757,7 @@ fn gen_cdylib(
                                     let full = out.refused
                                         || ::std::matches!(
                                             e,
-                                            ::cerulion_core::state::StateError::SinkFull
+                                            #__cer_root::state::StateError::SinkFull
                                         );
                                     __cer_set_last_error(::std::format!(
                                         "cerulion_node_capture_state: {}", e,
@@ -3384,23 +2822,33 @@ fn gen_cdylib(
                         // bytes, valid for this call; we only read it.
                         unsafe { ::std::slice::from_raw_parts(payload_ptr, payload_len) }
                     };
-                    let mut guard = match NODES.lock() {
-                        Ok(g) => g,
-                        Err(_) => {
+                    let slot = match __cer_instance(handle) {
+                        Ok(slot) => slot,
+                        Err(()) => {
                             __cer_set_last_error(::std::string::String::from(
                                 "cerulion_node_restore_state: NODES mutex poisoned",
                             ));
                             return -1_i32;
                         }
                     };
-                    match guard.as_mut().and_then(|m| m.get_mut(&handle)) {
+                    let mut guard = match slot.as_deref().map(::std::sync::Mutex::lock) {
+                        None => None,
+                        Some(Ok(g)) => Some(g),
+                        Some(Err(_)) => {
+                            __cer_set_last_error(::std::string::String::from(
+                                "cerulion_node_restore_state: node instance mutex poisoned",
+                            ));
+                            return -1_i32;
+                        }
+                    };
+                    match guard.as_deref_mut().and_then(Option::as_mut) {
                         Some(node) => {
                             let mut cursor =
-                                ::cerulion_core::state::StateCursor::new(payload);
+                                #__cer_root::state::StateCursor::new(payload);
                             // The same INNER `catch_unwind` as the capture
                             // export, for the same reason — a panicking
-                            // decoder must not poison `NODES` and brick every
-                            // node of this cdylib. UNLIKE the capture, a
+                            // decoder must not poison the instance lock and
+                            // brick this node instance. UNLIKE the capture, a
                             // restore MUTATES, so an unwound one leaves the
                             // node PARTIALLY restored: that is reported with
                             // the same words the `Err` arm below uses, because
@@ -3409,7 +2857,7 @@ fn gen_cdylib(
                             // that is neither the recording's nor the node's.
                             let decoded = ::std::panic::catch_unwind(
                                 ::std::panic::AssertUnwindSafe(|| {
-                                    ::cerulion_core::state::CerulionState::cer_restore(
+                                    #__cer_root::state::CerulionState::cer_restore(
                                         &mut node.inner,
                                         &mut cursor,
                                     )
@@ -3504,7 +2952,9 @@ mod advertised_attribute_parity_tests {
     //! ADVERTISE to the user, so the two halves cannot drift apart either.
 
     use super::gen_cdylib;
-    use crate::parse::{FieldInputAttr, FieldOutputAttr, NodeLevelAttrs, ParsedBackpressurePolicy};
+    use crate::parse::{
+        FieldInputAttr, FieldOutputAttr, NodeLevelAttrs, ParsedBackpressurePolicy, ParsedConsume,
+    };
     use std::collections::BTreeSet;
 
     /// Node-level attributes that are deliberately compile-time-only — they
@@ -3551,6 +3001,7 @@ mod advertised_attribute_parity_tests {
             backpressure: None,
             expect_within_ms: None,
             accumulate: None,
+            consume: None,
         }
     }
 
@@ -3581,6 +3032,29 @@ mod advertised_attribute_parity_tests {
         ts.to_string()
             .replace("\\\"", "\"")
             .replace([' ', '\n'], "")
+    }
+
+    #[test]
+    fn cdylib_defines_no_legacy_maintenance_entry_points() {
+        let expansion = expand(
+            &NodeLevelAttrs::default(),
+            &[base_input()],
+            &[base_output()],
+        );
+        for name in [
+            "cerulion_node_pump_history",
+            "cerulion_node_set_snapshot_inputs",
+            "cerulion_node_snapshot_inputs",
+            "cerulion_node_drain_trigger_input",
+            "cerulion_node_refill_trigger_input",
+            "cerulion_node_sync_head_op",
+            "cerulion_node_probes_trigger_input",
+        ] {
+            assert!(
+                !expansion.contains(&format!("fn{name}(")),
+                "obsolete maintenance entry point {name} remains defined"
+            );
+        }
     }
 
     #[test]
@@ -3744,6 +3218,16 @@ mod advertised_attribute_parity_tests {
                     ..base
                 },
                 r#""depth":51"#.to_string(),
+            ),
+            // `consume = latest` reaches the cdylib host as an additive key;
+            // the host's absent-key default is `fifo`.
+            "consume" => (
+                FieldInputAttr {
+                    trigger: true,
+                    consume: Some(ParsedConsume::Latest),
+                    ..base
+                },
+                r#""consume":"latest""#.to_string(),
             ),
             _ => return None,
         })

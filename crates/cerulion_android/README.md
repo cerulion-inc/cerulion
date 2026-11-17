@@ -10,6 +10,14 @@ initialize the runtime with the app's files directory, then start a graph,
 publish app topics, record them to an MCAP bag, read the status and stop. The
 runtime serves the app's topics to other machines through its gateway.
 
+The facade is Java source: the app adds this crate's `java/` directory to its
+Gradle sources, from the same release or commit as the crate, because its
+native method declarations must match the library. A GitHub release that
+carries this crate also attaches that directory as
+`cerulion-android-java-<version>.tar.gz`. An app copies one more thing into
+its own build: the iceoryx2 `[patch.crates-io]` block of Cerulion's root
+`Cargo.toml`, since a patch applies only in the workspace that declares it.
+
 ## Graph nodes in an app
 
 The app's runtime crate is a `cdylib` that depends on this crate and on each

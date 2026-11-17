@@ -196,3 +196,52 @@ fn the_loaned_take_drains_on_removals_only() {
         "a loaned take that removed nothing must not drain; got {after_empty}"
     );
 }
+
+/// A single-frame read made for a caller whose next wait drains the listener
+/// (`ListenerDrain::ByNextWait`) drains NOTHING, the copying and the loaned read
+/// alike, and still delivers the frame. Negative: the same reads in the default
+/// mode drain once.
+#[test]
+#[serial]
+fn a_read_left_to_the_next_wait_does_not_drain() {
+    use cerulion_core::transport::subscriber::ListenerDrain;
+    let (mut publisher, sub) = pair("by_next_wait");
+    publish(&mut publisher, 11);
+    publish(&mut publisher, 12);
+    std::thread::sleep(Duration::from_millis(20));
+
+    reset_listener_drain_count();
+    let mut seen = Vec::new();
+    let found = sub
+        .try_receive_one_with(ListenerDrain::ByNextWait, |sample| {
+            seen.push(sample.payload().len());
+        })
+        .expect("a receive");
+    let copy_drains = listener_drain_count();
+    let owned = sub
+        .try_receive_one_owned_with(ListenerDrain::ByNextWait)
+        .expect("an owned receive");
+    let owned_drains = listener_drain_count();
+
+    assert!(found, "the first frame is delivered");
+    assert_eq!(seen.len(), 1, "exactly one frame per single-frame read");
+    assert!(owned.is_some(), "the second frame is delivered owned");
+    assert_eq!(
+        (copy_drains, owned_drains),
+        (0, 0),
+        "a read left to the next wait must not drain the listener"
+    );
+    drop(owned);
+
+    publish(&mut publisher, 13);
+    std::thread::sleep(Duration::from_millis(20));
+    reset_listener_drain_count();
+    assert!(sub
+        .try_receive_one_with(ListenerDrain::AfterRemovals, |_| {})
+        .expect("a receive"));
+    assert_eq!(
+        listener_drain_count(),
+        1,
+        "the default mode still drains after a removal"
+    );
+}

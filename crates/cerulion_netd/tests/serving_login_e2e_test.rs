@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The real LISTEN binary must refuse before any peer probe or listener.
+//! The real binary must refuse before any peer probe or listener: a LISTEN
+//! start without a prior login, and a locator or TLS setting that cannot work.
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
+
+/// A saved, expired login: enough to serve the network offline.
+const SAVED_LOGIN: &[u8] = br#"{"account_id":"saved-account","session_token":"expired-session","refresh_token":"expired-refresh","expires_at_ns":1,"logged_in_ever":true}"#;
 
 #[test]
 fn listen_without_prior_login_exits_before_creating_daemon_state() {
@@ -43,6 +47,96 @@ fn listen_without_prior_login_exits_before_creating_daemon_state() {
     );
     assert!(!socket.exists());
     assert!(!home.exists());
+}
+
+/// A start whose locator or TLS setting cannot work exits 1 naming the
+/// variable, before the control socket exists: a CONNECT-only start, which
+/// needs no login, with a datagram-only locator or a `tls/` connect and no
+/// root CA, and a LISTEN start with a saved login whose listener cannot work.
+/// Every row is run before the test fails.
+#[test]
+fn a_setting_that_cannot_work_exits_before_creating_daemon_state() {
+    let mut failures = Vec::new();
+    for (saved_login, listen, connect, needle) in [
+        (
+            false,
+            None,
+            Some("udp/10.0.0.2:7684"),
+            "CERULION_NETD_CONNECT: locator 'udp/10.0.0.2:7684' is a datagram-only link",
+        ),
+        (
+            false,
+            None,
+            Some("tls/10.0.0.2:7447"),
+            "CERULION_NETD_CONNECT has a quic/ or tls/ locator but no CERULION_NETD_TLS_ROOT_CA",
+        ),
+        (
+            true,
+            Some("udp/127.0.0.1:0"),
+            None,
+            "CERULION_NETD_LISTEN: locator 'udp/127.0.0.1:0' is a datagram-only link",
+        ),
+        (
+            true,
+            Some("quic/127.0.0.1:0"),
+            None,
+            "CERULION_NETD_LISTEN has a quic/ or tls/ locator but no CERULION_NETD_TLS_CERTIFICATE",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("account");
+        if saved_login {
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("auth.json"), SAVED_LOGIN).unwrap();
+        }
+        let socket = root.path().join("netd.sock");
+        let error_path = root.path().join("stderr");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cerulion-netd"));
+        command
+            .env("CERULION_HOME", &home)
+            .env("HOME", root.path())
+            .env("CERULION_NETD_SOCK", &socket)
+            .env_remove("CERULION_NETD_NETWORK")
+            .env_remove("CERULION_NETD_TLS_ROOT_CA")
+            .env_remove("CERULION_NETD_TLS_CERTIFICATE")
+            .env_remove("CERULION_NETD_TLS_PRIVATE_KEY")
+            .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&error_path).unwrap());
+        for (var, value) in [
+            ("CERULION_NETD_LISTEN", listen),
+            ("CERULION_NETD_CONNECT", connect),
+        ] {
+            match value {
+                Some(value) => command.env(var, value),
+                None => command.env_remove(var),
+            };
+        }
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let error = std::fs::read_to_string(&error_path).unwrap();
+        let socket_made = socket.exists();
+        let ok = status.is_some_and(|s| s.code() == Some(1)) && error.contains(needle);
+        if !ok || socket_made {
+            failures.push(format!(
+                "{needle}: status {status:?} (None: still running after 5 s), control socket \
+                 created {socket_made}, stderr:\n{error}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
 }
 
 struct OwnedDaemon(std::process::Child);

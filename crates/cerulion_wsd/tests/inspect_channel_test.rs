@@ -74,9 +74,7 @@ const SLEEPER_PID_MARKER: &str = "CER_WSD_SLEEPER_PID=";
 
 /// The fixture cdylib the production arms inspect.
 const FIXTURE_CRATE: &str = "test_node_cdylib";
-/// A raw-FFI fixture whose info JSON declares a param but which exports no
-/// `cerulion_node_init_with_params` symbol: the host refuses it when its info
-/// is read, and the helper must refuse it the same way.
+/// Stable parameter and immutable metadata descriptor fixture.
 const DECLARES_WITHOUT_SYMBOL_CRATE: &str = "test_node_params_no_symbol_cdylib";
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -389,31 +387,20 @@ fn the_production_child_writes_the_whole_document_and_only_the_document() {
     );
 }
 
-/// The helper applies the host's FULL read, not only the parse: a library
-/// whose info declares params it has no symbol to receive is refused by
-/// `DylibNodeEntry::info()`, and the parent only ever sees the raw document,
-/// so the helper must refuse it too, or a daemon's `graph validate` would pass
-/// a library `graph run` refuses.
+/// Parameters are declared in immutable metadata and always delivered by the
+/// required stable create entry, without an optional Rust init symbol.
 #[test]
-fn a_library_that_declares_params_without_the_symbol_is_refused_by_the_helper() {
+fn declared_params_are_inspected_through_the_checked_stable_table() {
     let fixture = fixture_cdylib_of(DECLARES_WITHOUT_SYMBOL_CRATE);
     let out = inspect_node_output(&fixture);
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     assert!(
-        !out.status.success(),
-        "a declared param with no symbol to deliver it must not inspect cleanly (stdout: {stdout:?})"
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    assert!(
-        stderr.contains("--inspect-node")
-            && stderr.contains("declares params (gain)")
-            && stderr.contains("cerulion_node_init_with_params"),
-        "the refusal must name the symbol and the params on stderr: {stderr:?}"
-    );
-    assert!(
-        stdout.is_empty(),
-        "the document channel must stay empty when the library is refused: {stdout:?}"
-    );
+    let document: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(document["params"][0]["name"], "gain");
+    assert_eq!(document["params"][0]["default"], 1.0);
 }
 
 /// The parent parses the forwarded document again and logs its own

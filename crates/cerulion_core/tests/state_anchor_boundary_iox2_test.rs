@@ -155,6 +155,51 @@ impl PanicTally {
     }
 }
 
+/// The fire on which [`FatalTally`] returns `NodeError::Fatal`.
+const FIFO_STOP_FIRE: u32 = 8;
+
+/// A FIFO data-trigger consumer that reads each frame and returns
+/// `NodeError::Fatal` from its [`FIFO_STOP_FIRE`]th fire, after reading that
+/// fire's frame.
+#[cerulion_node]
+struct FatalTally {
+    #[input(trigger)]
+    inp: Vector3,
+    fires: u32,
+}
+
+#[cerulion_node_impl]
+impl FatalTally {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
+        self.fires += 1;
+        if self.fires == FIFO_STOP_FIRE {
+            return Err(NodeError::Fatal("tally stops".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// A host-driven sink on a latest-value input: it fires only when the test
+/// marks it, and that fire returns `NodeError::Fatal`.
+#[cerulion_node(external)]
+struct FatalSink {
+    #[input]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl FatalSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
+        Err(NodeError::Fatal("sink stops".to_string()))
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
+    }
+}
+
 // ---------------------------------------------------------------------------
 // harness
 // ---------------------------------------------------------------------------
@@ -187,7 +232,7 @@ fn graph(prefix: &str, ids: &[&str]) -> GraphConfig {
         nodes: ids
             .iter()
             .map(|id| NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
@@ -318,6 +363,7 @@ fn counter_framework_oracle(step: u64) -> cerulion_core::state_restore::NodeFram
         input_service: None,
         sync_capture_high_water: Default::default(),
         sync_epoch_floor: None,
+        stopped: false,
     }
 }
 
@@ -720,7 +766,7 @@ fn a_served_fifo_input_writes_its_service_cursor_into_the_anchor() {
         identity: "service_cursor".to_string(),
         prefix: unique("svc"),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
@@ -728,6 +774,7 @@ fn a_served_fifo_input_writes_its_service_cursor_into_the_anchor() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -861,7 +908,7 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
         identity: "reject".to_string(),
         prefix: unique("svp"),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
@@ -869,6 +916,7 @@ fn a_frame_the_tick_never_saw_does_not_advance_the_cursor() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -985,7 +1033,7 @@ fn a_per_set_sync_nodes_anchor_states_a_cursor_for_every_trigger_input() {
         identity: "trigger_cursor".to_string(),
         prefix: unique("sy2"),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fusion".to_string(),
@@ -994,10 +1042,12 @@ fn a_per_set_sync_nodes_anchor_states_a_cursor_for_every_trigger_input() {
                 InputDef {
                     name: "a".to_string(),
                     source: EXT_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: EXT_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1136,7 +1186,7 @@ fn a_skipped_member_leaves_the_two_trigger_cursors_holding_different_frames() {
         identity: "trigger_cursor_split".to_string(),
         prefix: unique("sy3"),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fusion".to_string(),
@@ -1145,10 +1195,12 @@ fn a_skipped_member_leaves_the_two_trigger_cursors_holding_different_frames() {
                 InputDef {
                     name: "a".to_string(),
                     source: EXT_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: EXT_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1446,7 +1498,7 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
         identity: "panic".to_string(),
         prefix: unique("svq"),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "tally".to_string(),
@@ -1454,6 +1506,7 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: EXT.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -1535,4 +1588,247 @@ fn a_caught_tick_panic_stops_anchoring_so_no_anchor_observes_a_post_panic_cursor
         InputServiceCursor::Served(0),
         "the newest readable cursor is the good frame's, from before the panic"
     );
+}
+
+#[test]
+fn a_stateless_plugin_does_not_veto_another_nodes_anchor() {
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let prefix = unique("statelessplugin");
+        let ids = vec!["counter".to_owned(), "stateless".to_owned()];
+        let mut config = graph(&prefix, &["counter", "stateless"]);
+        config.nodes[1].outputs.clear();
+        let plugin = cerulion_core::graph::node::DylibNodeEntry::load(
+            &cerulion_core::testing::find_fixture_cdylib("test_node_cdylib"),
+        )
+        .expect("build test_node_cdylib before running this test");
+        assert_eq!(plugin.state_shape(), None);
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert("counter".into(), Box::new(CounterEntry::new()));
+        factories.insert("stateless".into(), Box::new(plugin));
+        let mut h = harness_with_config("statelessplugin", config, factories, &ids, RING_RECORDS);
+        h.arm.arm(1, 0);
+        h.runtime.attach_state_arm(Arc::clone(&h.arm));
+        step_n(&mut h.runtime, 1);
+        let events = drain(&h.ring_name);
+        assert!(
+            !skips(&events)
+                .iter()
+                .any(|(_, _, cause)| *cause == SkipCause::Contended),
+            "a null state table must not veto the graph's quiescence probe"
+        );
+        let captured = completes(&events)
+            .into_iter()
+            .filter(|(_, idx, _)| *idx == 0)
+            .collect::<Vec<_>>();
+        let expected = (0..1)
+            .map(|step| (step, 0, counter_anchor_oracle(step + 1, step)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            captured, expected,
+            "the stateful node's complete anchor must reach the ring"
+        );
+        runs.push(captured);
+    }
+    assert_eq!(runs[0], runs[1]);
+}
+
+// ===========================================================================
+// a stopped node's anchor
+// ===========================================================================
+
+/// The step [`FatalSink`] is marked on, and stops at.
+const SINK_STOP_STEP: u64 = 3;
+/// The step [`FatalTally`] stops at: step 0 is quiet and steps 1 to 8 each
+/// serve it one frame, so its 8th fire is at step 8.
+const FIFO_STOP_STEP: u64 = 8;
+/// The last step the stop drive runs: two quiet steps after the FIFO stop.
+const STOP_LAST_STEP: u64 = 10;
+
+/// A stopped node's framework section, byte for byte: version 5, the
+/// version-1 prefix with nothing in it, the service table (one served
+/// cursor on `inp` for `Some(seq)`, else empty), an empty high-water table,
+/// the epoch floor stated absent, then the flags byte with bit 0 set.
+/// `None` is 43 bytes and `Some` 55.
+fn stopped_section_bytes(served: Option<u32>) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0x05, 0x00, 0x00, 0x00]); // version 5
+    b.push(0x00); // no next fire
+    b.extend_from_slice(&[0x00; 8]);
+    b.extend_from_slice(&[0x00; 8]); // pending data
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // no sync heads
+    match served {
+        None => b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]), // empty service table
+        Some(seq) => {
+            b.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // one service cursor
+            b.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]); // name length 3
+            b.extend_from_slice(b"inp");
+            b.push(0x01); // served
+            b.extend_from_slice(&seq.to_le_bytes());
+        }
+    }
+    b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty high-water table
+    b.push(0x00); // no epoch floor
+    b.extend_from_slice(&[0x00; 8]);
+    b.push(0x01); // flags: stopped
+    b
+}
+
+/// Run the stop drive and return every anchor event the ring holds.
+///
+/// `fifo` ([`FatalTally`]) and `sink` ([`FatalSink`]) both read one external
+/// topic, and every step from 0 to [`STOP_LAST_STEP`] anchors. Step 0 is
+/// quiet; steps 1 to 8 each publish one frame (wire sequence 0 to 7) before
+/// the step; `sink` is marked before step [`SINK_STOP_STEP`]; steps 9 and 10
+/// are quiet.
+fn drive_stops(tag: &str) -> Vec<StateAnchorEvent> {
+    let ext_topic = format!("/{tag}/ext");
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert("fifo".to_string(), Box::new(FatalTallyEntry::new()));
+    factories.insert("sink".to_string(), Box::new(FatalSinkEntry::new()));
+    let ids = vec!["fifo".to_string(), "sink".to_string()];
+    let reader = |id: &str| NodeDef {
+        isolate: None,
+        params: Default::default(),
+        ros2: None,
+        id: id.to_string(),
+        node_type: id.to_string(),
+        inputs: vec![InputDef {
+            name: "inp".to_string(),
+            source: ext_topic.clone(),
+            ..Default::default()
+        }],
+        outputs: vec![],
+    };
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "stop".to_string(),
+        prefix: unique(tag),
+        nodes: vec![reader("fifo"), reader("sink")],
+    };
+    let mut h = harness_with_config(tag, config, factories, &ids, RING_RECORDS);
+    h.arm.arm(1, 0);
+    h.runtime.attach_state_arm(Arc::clone(&h.arm));
+
+    let mgr = h.runtime.test_transport().expect("test transport parked");
+    let mut ext = mgr
+        .create_publisher(&ext_topic, MaxSliceLen::const_new(64), 0)
+        .expect("external publisher attaches");
+
+    step_n(&mut h.runtime, 1);
+    for step in 1..=FIFO_STOP_STEP {
+        let mut proxy = ext.loan_proxy::<Vector3>().expect("loan");
+        proxy.x = step as f64;
+        drop(proxy);
+        if step == SINK_STOP_STEP {
+            h.runtime
+                .trigger_external("sink")
+                .expect("sink is External");
+        }
+        step_n(&mut h.runtime, 1);
+    }
+    step_n(&mut h.runtime, (STOP_LAST_STEP - FIFO_STOP_STEP) as usize);
+    assert!(
+        h.runtime.is_node_stopped("fifo"),
+        "the FIFO consumer stopped"
+    );
+    assert!(h.runtime.is_node_stopped("sink"), "the sink stopped");
+    drain(&h.ring_name)
+}
+
+/// The hand oracle for [`drive_stops`]'s anchors.
+///
+/// `fifo` (index 0): at step 0 nothing is served, so it rides the v1 header
+/// with no section; at step `S` from 1 to 7 it has read frame `S - 1` and is
+/// running; from step 8 on it states the stop with cursor 7 (55 bytes).
+/// `sink` (index 1): it has nothing to state before step 3, so no section;
+/// from step 3 on it states the stop alone (43 bytes).
+fn assert_stop_anchors(events: &[StateAnchorEvent]) {
+    assert!(
+        skips(events).is_empty(),
+        "no anchor is skipped: {:?}",
+        skips(events)
+    );
+    let got = completes(events);
+    assert_eq!(
+        got.iter().map(|(s, i, _)| (*s, *i)).collect::<Vec<_>>(),
+        (0..=STOP_LAST_STEP)
+            .flat_map(|s| [(s, 0), (s, 1)])
+            .collect::<Vec<_>>(),
+        "both nodes anchor at every step, stopped or not"
+    );
+    for (step, idx, bytes) in &got {
+        let (step, name) = (*step, if *idx == 0 { "fifo" } else { "sink" });
+        let blob = AnchorBlob::decode(name, bytes).expect("the anchor is framed");
+        let section = blob.framework_state(name).expect("the section decodes");
+        match (name, step) {
+            ("fifo", 0) | ("sink", 0..SINK_STOP_STEP) => assert_eq!(
+                section, None,
+                "{name} at S={step}: nothing to state, so no section and no stop"
+            ),
+            ("fifo", 1..FIFO_STOP_STEP) => assert_eq!(
+                section,
+                Some(NodeFrameworkState {
+                    input_service: Some(
+                        [("inp".to_string(), Some((step - 1) as u32))]
+                            .into_iter()
+                            .collect()
+                    ),
+                    ..Default::default()
+                }),
+                "fifo at S={step}: running, with the last frame it read"
+            ),
+            ("fifo", _) => assert_eq!(
+                blob.framework,
+                stopped_section_bytes(Some(7)).as_slice(),
+                "fifo at S={step}: the stop and its cursor"
+            ),
+            _ => assert_eq!(
+                blob.framework,
+                stopped_section_bytes(None).as_slice(),
+                "sink at S={step}: the stop alone"
+            ),
+        }
+    }
+}
+
+#[test]
+fn an_anchor_states_a_fatal_nodes_stop_from_its_stop_step() {
+    assert_eq!(stopped_section_bytes(None).len(), 43);
+    assert_eq!(stopped_section_bytes(Some(7)).len(), 55);
+    assert_stop_anchors(&drive_stops("stop"));
+}
+
+#[test]
+fn two_encodes_and_two_armed_runs_give_identical_bytes() {
+    let section = NodeFrameworkState {
+        input_service: Some([("inp".to_string(), Some(7u32))].into_iter().collect()),
+        stopped: true,
+        ..Default::default()
+    };
+    let encode = || {
+        let mut sink = VecSink::new();
+        section.encode(&mut sink).expect("fits");
+        sink.into_inner()
+    };
+    let (first_encode, second_encode) = (encode(), encode());
+    assert_eq!(first_encode, second_encode, "two encodes");
+    assert_eq!(
+        first_encode,
+        stopped_section_bytes(Some(7)),
+        "and the hand vector"
+    );
+
+    let first = drive_stops("stopdet1");
+    let second = drive_stops("stopdet2");
+    assert_eq!(
+        first, second,
+        "two armed runs put identical events in the ring"
+    );
+    assert_stop_anchors(&first);
 }

@@ -96,7 +96,7 @@ pub unsafe fn is_our_identifier(id: *const c_char) -> bool {
     }
     let ours = IMPLEMENTATION_IDENTIFIER;
     for (i, &b) in ours.iter().enumerate() {
-        let c = *id.add(i) as u8;
+        let c = *id.cast::<u8>().add(i);
         if c != b {
             return false;
         }

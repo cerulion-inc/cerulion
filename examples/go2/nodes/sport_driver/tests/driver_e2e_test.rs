@@ -71,7 +71,7 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("sport_driver_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sport".to_string(),
@@ -79,6 +79,7 @@ fn build_rig(prefix: &str) -> Rig {
             inputs: vec![InputDef {
                 name: "cmd".to_string(),
                 source: cmd_topic.clone(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

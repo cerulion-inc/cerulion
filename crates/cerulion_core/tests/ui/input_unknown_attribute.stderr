@@ -1,4 +1,4 @@
-error: unknown input attribute `bogus_key`. Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`.
+error: unknown input attribute `bogus_key`. Supported: `trigger`, `depth`, `backpressure`, `expect_within_ms`, `accumulate`, `cap`, `consume`.
   --> tests/ui/input_unknown_attribute.rs:10:13
    |
 10 |     #[input(bogus_key = 5)]

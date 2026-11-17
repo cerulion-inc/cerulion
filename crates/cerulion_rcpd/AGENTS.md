@@ -5,7 +5,7 @@ HTTP) serving `robot://graph`, `robot://state/{name}` and the manifest's tools.
 User reference: docs/rcp.md.
 
 ## Invariants
-
+- Remote graph/state, journals and external eyes respect producer scope; cached private state stays private. Journal admission survives cancellation through the answer; emergency-stop operations remain independent.
 - Deny by default: the callable tools are the manifest's `tools`, `estop`, and
   `estop_clear` under `limits.estop_clear: agent`. Any other name is receipted
   `denied` and never reaches the graph. Built-in names cannot be declared.
@@ -18,16 +18,16 @@ User reference: docs/rcp.md.
 - `estop` closes the latch before anything that can await and publishes on the
   journal's urgent queue; it never waits on `call_lock`.
 - `estop_clear` reads the `engages` counter, then takes `call_lock`; inside
-  `latch_io` (a std mutex never held across an await) it refuses
-  (`estop_overtaken`) if an `estop` bumped the counter since, else writes
-  `intent`, deletes the file and opens the latch; then it journals a
-  LATCH-GATED frame, so an `estop` that lands first stays the graph's last
-  frame (`estop_overtaken`). `estop` re-closes the latch, writes its file and
-  `intent`, and queues its urgent frame inside `latch_io`, so the receipt log
-  and the calls topic order engages and clears as they took effect (the
-  journal publishes every queued urgent frame before a normal one). An
-  undeletable file leaves the latch closed (`clear_failed`); an unreadable
-  one at start counts as present.
+  `latch_io` (a std mutex held across no await and no rcpd log line, only the
+  lines cerud logs while rotating) it refuses (`estop_overtaken`) if an `estop`
+  bumped the counter since, else writes `intent`, deletes the file and opens
+  the latch; then it journals a LATCH-GATED frame, so an `estop` that lands
+  first stays the graph's last frame (`estop_overtaken`). `estop` re-closes the
+  latch, writes its file and `intent`, and queues its urgent frame inside
+  `latch_io`, so the receipt log and the calls topic order engages and clears
+  as they took effect (the journal publishes every queued urgent frame before a
+  normal one). An undeletable file leaves the latch closed (`clear_failed`); an
+  unreadable one at start counts as present.
 - The journal's `gate` reads the latch, then drops a latch-gated request whose
   caller dropped its reply (a cancelled MCP request); estop and read frames
   always publish.
@@ -39,6 +39,13 @@ User reference: docs/rcp.md.
   `(safety class: irreversible)` description suffix and `safety_class` in
   every call result. Receipt lines carry the tool name, not the class.
 - stdout carries only the MCP stream in stdio mode; logs go to stderr.
+- The Jev eye (`src/eye/`) runs on its own `rcp-eye` thread, only under
+  `eyes.jev`; a failed `EyeHost::spawn` leaves the daemon serving. Its receipts
+  share the receipt log's lock with the e-stop's intent receipt. An ask from a
+  replay node (`eye/source.rs`) is dropped first, then the ask bound
+  (`EyeCore::intake`) and `admit` run, all before any receipt or network call;
+  each answer is receipted `eye.jev` before it is published. `Look` has no
+  `Default` or `bool`; the key is sent only in the `Authorization` header.
 
 ## Testing
 
@@ -46,6 +53,8 @@ User reference: docs/rcp.md.
   tests use per-test SHM roots (`init_for_test`) and unique topics;
   `binary_smoke_test.rs` spawns the binary on the default root, so each of its
   manifests names journal topics unique to the test and process.
+- `eye_*_test.rs` run against a local stand-in route (no key, no network);
+  `eye_graph_test.rs` installs the log subscriber, so one test per binary.
 - `tools_test.rs` drives the MCP surface against a stand-in graph thread and
   asserts the exact receipt sequence of each scenario; `binary_smoke_test.rs`
   checks the manifest switches reach the shipped binary.

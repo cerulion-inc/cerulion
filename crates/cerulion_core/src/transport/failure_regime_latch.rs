@@ -304,3 +304,19 @@ pub fn lock_regime_latch(
 ) -> std::sync::MutexGuard<'_, FailureRegimeLatch> {
     latch.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+// ---------------------------------------------------------------------------
+// This module's half of the ABI LAYOUT PIN (see `crate::abi_layout`). A
+// subscriber's block probe holds a latch by value, inside its
+// `DrainClipLatch`, so its layout crosses the node library boundary.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+pub(crate) fn abi_layout_pins() -> Vec<crate::abi_layout::MeasuredStruct> {
+    use crate::abi_layout::abi_pin_struct;
+    vec![abi_pin_struct!(FailureRegimeLatch {
+        failing,
+        suppressed,
+        total_failures,
+        next_decade
+    })]
+}

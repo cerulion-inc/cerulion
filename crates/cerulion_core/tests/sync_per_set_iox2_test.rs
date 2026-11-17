@@ -171,7 +171,7 @@ fn pair_graph(
         identity: name.to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -180,10 +180,12 @@ fn pair_graph(
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -205,7 +207,7 @@ fn triple_graph(sets: Triples) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
         identity: "pss_triple".to_string(),
         prefix: "psstri".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -214,14 +216,17 @@ fn triple_graph(sets: Triples) -> (GraphConfig, IndexMap<String, Box<dyn NodeEnt
                 InputDef {
                     name: "cam".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "lidar".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "imu".to_string(),
                     source: TOPIC_C.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -928,7 +933,7 @@ fn every_fire_of_a_burst_reads_the_same_frozen_context_with_its_own_members() {
         identity: "pss_ctx".to_string(),
         prefix: "pssctx".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -937,14 +942,17 @@ fn every_fire_of_a_burst_reads_the_same_frozen_context_with_its_own_members() {
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "cfg".to_string(),
                     source: TOPIC_C.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1300,6 +1308,8 @@ fn closure_sync_graph(
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
+        consume: Default::default(),
     };
     let info = NodeInfo::with_meta(vec![meta("a"), meta("b")], vec![])
         .with_policy(MacroPolicy::Sync { window_ms: 500 });
@@ -1315,7 +1325,7 @@ fn closure_sync_graph(
         identity: format!("pss_closure_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -1324,10 +1334,12 @@ fn closure_sync_graph(
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -1535,6 +1547,8 @@ fn degraded_sync_graph(
         depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
+        consume: Default::default(),
     };
     let info = NodeInfo::with_meta(vec![meta("a"), meta("b")], vec![])
         .with_policy(MacroPolicy::Sync { window_ms: 50 });
@@ -1552,7 +1566,7 @@ fn degraded_sync_graph(
         identity: format!("pss_degraded_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "fuse".to_string(),
@@ -1561,10 +1575,12 @@ fn degraded_sync_graph(
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],

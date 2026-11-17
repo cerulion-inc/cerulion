@@ -12,6 +12,12 @@ pip install maturin
 cd crates/cerulion_py && RUSTUP_TOOLCHAIN=1.95.0 maturin develop --release
 ```
 
+A Python node also needs a `cerulion` CLI built from the same checkout:
+
+```bash
+cargo install --path crates/cerulion_cli
+```
+
 ## Writing nodes in Python
 
 Python-authored nodes are standalone node `cdylib` libraries built against the current node ABI. The CLI creates
@@ -72,11 +78,7 @@ inside `init`, `tick` or `shutdown`, resolves in that node's directory, and two
 node types in one process each keep their own, even when other code imported a
 module of the same name first. Two instances of one node type share its
 modules; a rebuilt node loads them afresh.
-Node cdylibs must be built by the same `rustc` as the `cerulion` binary:
-`node build` warns when the `rustc` on `PATH` differs, and the loader refuses a
-node whose compiler fingerprint does not match. When the default `rustc`
-differs from the one that built `cerulion`, prefix `cerulion node build` with
-`RUSTUP_TOOLCHAIN=<that toolchain>` for that command only.
+Python node libraries use the same stable boundary as Rust nodes. Build them with Rust 1.95 or newer; their compiler need not match the CLI. Existing node libraries must be rebuilt once with `cerulion node build <node>`.
 
 A Python node must declare exactly one scheduling policy: `period_ms`, one
 `trigger=True` input, or `sync_window_ms` for multiple trigger inputs. The
@@ -427,6 +429,55 @@ except cerulion.BagError as e:
 ```text
 BagError
 ```
+
+## Replay-testing a policy
+
+[`examples/policy_replay/`](../crates/cerulion_py/examples/policy_replay/)
+holds a helper and a pytest template that replay a recorded bag through a
+policy and assert its actions against the recorded ones. Copy both files next
+to your tests. `recorded_steps(bag, observation_topics, action_topic)` pairs
+each record on the action topic with the newest record on every observation
+topic logged before it, in log order. That is the observation the policy acted
+on when the robot logs a new observation only after publishing the action for
+the previous one, and the recorder logged frames in the order the policy
+received them. A frame logged while the policy was still computing pairs a
+newer observation with that action, and the replayed action can then differ
+from the recorded one (for a policy that keeps state, so can the steps after
+it). Action records logged before every observation topic has a record are
+counted in `skipped`, not replayed. `assert_replay_matches(steps, policy,
+recorded_action, *, atol=0.0, rtol=0.0, max_report=5, min_steps=1)` calls
+`policy(step)` on every step in order and compares the result with
+`recorded_action(step.action)`. With both tolerances zero the arrays must
+match in dtype, shape and bytes. Otherwise each element must equal the
+recorded one or satisfy `abs(replayed - recorded) <= atol + rtol *
+abs(recorded)`; under a tolerance, a NaN in either array is a mismatch and an
+infinity matches only an equal infinity. A failure counts every mismatching
+step and names the first `max_report` by index, sequence and timestamp; the
+check keeps only those report lines, not the steps, so a long failing replay
+does not hold its earlier camera frames. A replay of fewer than `min_steps`
+steps also fails. A policy that keeps state between calls (an action chunk
+queue, temporal ensembling) reproduces the recording only from the same
+starting state: start the recorder before the policy acts, reset the policy
+once, and replay every step in order.
+
+```python-source
+from policy_replay import assert_replay_matches, recorded_steps
+
+with cerulion.open_bag("session.mcap") as bag:
+    steps = recorded_steps(bag, ["/camera/top/image", "/arm/joint_states"], "/arm/command")
+    result = assert_replay_matches(steps, policy, recorded_action)
+```
+
+`test_policy_replay.py` loads a LeRobot checkpoint with its saved pre- and
+postprocessors and runs the check when `REPLAY_BAG` and `REPLAY_POLICY` are
+set. Byte-exact replay holds on CPU with deterministic algorithms on, when the
+replay runs the same weights, library versions, CPU model and `torch` thread
+count as the recording: set `REPLAY_THREADS` to the `torch.get_num_threads()`
+the recording ran with (default 1), and leave `REPLAY_ATOL` and `REPLAY_RTOL`
+unset. A GPU replay, or a recording made on another device type, matches
+within a tolerance (`REPLAY_ATOL`, `REPLAY_RTOL`). A policy that samples noise
+when it acts repeats its actions only if the recording seeded the same
+generator the same way (the template seeds 0 before loading the checkpoint).
 
 ## Errors
 

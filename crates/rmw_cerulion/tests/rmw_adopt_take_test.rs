@@ -681,10 +681,10 @@ unsafe fn sub_data(subscription: *const ffi::rmw_subscription_t) -> &'static Sub
 /// carries its OWN copy of that gate — a separate call site from the
 /// copying take's — so the adopted path needs its own reading of it.
 unsafe fn hash_mismatch_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
-    cerulion_core::transport::failure_regime_latch::lock_regime_latch(
-        &sub_data(subscription).hash_mismatches,
-    )
-    .total_failures()
+    sub_data(subscription)
+        .hash_mismatches
+        .read()
+        .total_failures()
 }
 
 /// The subscription's decode-failure total. The pre-write entry gate
@@ -694,8 +694,7 @@ unsafe fn hash_mismatch_count(subscription: *const ffi::rmw_subscription_t) -> u
 unsafe fn decode_failure_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
     sub_data(subscription)
         .decode_failures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
+        .read()
         .total_failures()
 }
 
@@ -854,6 +853,23 @@ fn adopted_take_serves_shm_in_place_with_exact_registered_ranges() {
         let (taken, msg1, info) = take_scan(subscription);
         assert!(taken, "a published frame must be takeable");
         assert!(info.source_timestamp > 0, "wire timestamp reaches info");
+        // The adopted take reports the sending publisher's gid, the one
+        // rmw_get_gid_for_publisher returns, never the all-zero gid.
+        let mut pub_gid: ffi::rmw_gid_t = std::mem::zeroed();
+        assert_eq!(
+            rmw_get_gid_for_publisher(publisher, &mut pub_gid),
+            RMW_RET_OK
+        );
+        assert_eq!(
+            info.publisher_gid.data[..16],
+            pub_gid.data[..16],
+            "the adopted take's publisher_gid is the publisher's gid"
+        );
+        assert_ne!(
+            info.publisher_gid.data[..16],
+            [0u8; 16],
+            "not the all-zero gid"
+        );
 
         // Pointer identity: each forged member IS a registered range.
         let segs = fake_segments();
@@ -2478,7 +2494,7 @@ unsafe fn cpp_string_of(slot: *const c_void) -> String {
     let mut data: *const c_char = std::ptr::null();
     let mut len = 0usize;
     rmw_cerulion_cppstring_view(slot, &mut data, &mut len);
-    String::from_utf8_lossy(std::slice::from_raw_parts(data as *const u8, len)).into_owned()
+    String::from_utf8_lossy(std::slice::from_raw_parts(data.cast::<u8>(), len)).into_owned()
 }
 
 /// The C++ twin of arm 1: a plain

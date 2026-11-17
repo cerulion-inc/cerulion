@@ -134,6 +134,8 @@ fn recording_consumer(seen: Arc<Mutex<Vec<u64>>>) -> ClosureNodeEntry {
             depth: CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -555,19 +557,13 @@ fn a_fire_that_did_not_consume_the_head_is_not_refilled_on_it() {
 }
 
 // ===========================================================================
-// cdylib parity: the refill crosses the FFI through its OWN export.
+// cdylib parity: host refill and plugin borrowed reads serve the same burst.
 // ===========================================================================
 
-/// The production surface. A cdylib's body subscriber lives inside the cdylib
-/// (its `NodeContext` is transferred across the FFI at `init`), so the refill
-/// can only reach it through `NodeEntry::refill_trigger_input` — which for a
-/// `DylibNodeEntry` is the `cerulion_node_refill_trigger_input` export.
-///
-/// That export is ADDITIVE (symbol presence is the capability; the ABI version
-/// is NOT bumped), so this arm is also the no-inert-shipping proof that the
-/// macro really emits it and the host really resolves it: a cdylib without it
-/// reports `refills_trigger_input() == false`, installs no hook, and serves this
-/// burst one frame per step — which is what the oracle below refuses.
+/// The host owns the body subscriber and refills it between fires through
+/// `NodeEntry::refill_trigger_input`. The stable plugin reads the borrowed
+/// shared-memory slot through the host services. This exercises a real
+/// `DylibNodeEntry` and the generated adapter rather than an in-process closure.
 ///
 /// The forwarder reads `trigger_in.x` and writes it to `cmd.x`; a closure sink
 /// records what arrives, so the oracle is the full sequence THROUGH the cdylib.
@@ -609,7 +605,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
         prefix: "fbwsCdylib".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "fwd".to_string(),
@@ -617,6 +613,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
                 inputs: vec![InputDef {
                     name: "trigger_in".to_string(),
                     source: "/fbwsc/ext".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "cmd".to_string(),
@@ -627,7 +624,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -635,6 +632,7 @@ fn a_cdylib_consumer_serves_a_queued_burst_within_one_step() {
                 inputs: vec![InputDef {
                     name: "in".to_string(),
                     source: "fwd/cmd".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1034,25 +1032,15 @@ fn a_burst_on_an_undelivered_context_fires_once_and_holds_its_head() {
     );
 }
 
-/// cdylib PARITY — the production surface.
+/// Stable cdylib parity over the production host services.
 ///
-/// A cdylib's body subscriber lives inside the cdylib (its `NodeContext` is
-/// transferred across the FFI at `init`), so the step-frozen context slot under
-/// test is reached only through the `cerulion_node_{set_,}snapshot_inputs`
-/// exports, and the burst only through the serve-many
-/// `cerulion_node_refill_trigger_input` export. This arm is therefore the
-/// no-inert-shipping proof that the decision reaches a real deployed node and not
-/// only in-process closures.
+/// The host owns the body subscribers, freezes the context slot for the step,
+/// and refills the trigger slot between fires. The generated plugin adapter
+/// borrows those shared-memory slots through the host table. The downstream
+/// pairs pin both the frozen context and the complete burst across the boundary.
 ///
-/// # SCOPE — mutating the host copy CANNOT kill this arm
-///
-/// `test_node_macro_burst_ctx_cdylib` statically links its OWN `cerulion_core`,
-/// so mutating `cerulion_core/src/transport/subscriber.rs` and running
-/// `cargo test -p cerulion_core` leaves the fixture holding the OLD, unchanged
-/// `try_view` — this arm stays green regardless of that change unless the
-/// fixture is rebuilt too. Its value is PARITY (the FFI pair really forwards the
-/// freeze, and the re-serve really survives the boundary), not mutation
-/// sensitivity; the mutation-sensitive arms are the in-process ones above.
+/// Changes to host subscriber logic reach this arm directly. Changes to the
+/// generated plugin adapter require rebuilding the fixture before loading it.
 #[test]
 #[serial]
 fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
@@ -1066,7 +1054,7 @@ fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
     );
     assert!(
         node.holds_input_snapshot(),
-        "precondition: the fixture must export the snapshot pair, or \
+        "precondition: the fixture must use the host snapshot operations, or \
          there is no frozen context slot to re-serve across the FFI"
     );
 
@@ -1077,7 +1065,7 @@ fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
         nodes: vec![
             ping_node(),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1086,10 +1074,12 @@ fn a_cdylib_burst_reads_the_same_frozen_context_on_every_fire() {
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: CTX_TOPIC.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1196,6 +1186,8 @@ fn recording_pair_consumer(seen: Arc<Mutex<Vec<(u64, u64)>>>) -> ClosureNodeEntr
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                accumulate: false,
+                consume: Default::default(),
             }],
             vec![],
         )
@@ -1219,7 +1211,7 @@ fn recording_pair_consumer(seen: Arc<Mutex<Vec<(u64, u64)>>>) -> ClosureNodeEntr
 /// The `period_ms = 1` trigger producer every chain in this file shares.
 fn ping_node() -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "ping".to_string(),
@@ -1238,7 +1230,7 @@ fn ping_node() -> NodeDef {
 /// The pair recorder wired to `consumer/out`.
 fn record_node() -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "record".to_string(),
@@ -1246,6 +1238,7 @@ fn record_node() -> NodeDef {
         inputs: vec![InputDef {
             name: "in".to_string(),
             source: "consumer/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     }
@@ -1262,7 +1255,7 @@ fn build_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRunt
         nodes: vec![
             ping_node(),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1271,10 +1264,12 @@ fn build_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -> GraphRunt
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: CTX_TOPIC.to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1317,7 +1312,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
         nodes: vec![
             ping_node(),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ctxsrc".to_string(),
@@ -1325,6 +1320,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
                 inputs: vec![InputDef {
                     name: "tick_in".to_string(),
                     source: "ping/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "ctx".to_string(),
@@ -1335,7 +1331,7 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -1344,10 +1340,12 @@ fn build_same_level_ctx_chain(prefix: &str, seen: Arc<Mutex<Vec<(u64, u64)>>>) -
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: "ctxsrc/ctx".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1435,6 +1433,8 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 depth: 32,
                 backpressure: BackpressurePolicy::DropOldest,
                 expect_within_ms: None,
+                accumulate: false,
+                consume: Default::default(),
             }],
             vec![],
         )
@@ -1458,7 +1458,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ping".to_string(),
@@ -1473,7 +1473,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "collapsed".to_string(),
@@ -1482,10 +1482,12 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                     InputDef {
                         name: "ctx_in".to_string(),
                         source: "/fbwsCollapse/ctx".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "inp".to_string(),
                         source: "ping/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![OutputDef {
@@ -1497,7 +1499,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "record".to_string(),
@@ -1505,6 +1507,7 @@ fn build_collapsed_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRunti
                 inputs: vec![InputDef {
                     name: "in".to_string(),
                     source: "collapsed/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1532,7 +1535,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ping".to_string(),
@@ -1547,7 +1550,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -1555,6 +1558,7 @@ fn build_in_graph_chain(prefix: &str, seen: Arc<Mutex<Vec<u64>>>) -> GraphRuntim
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "ping/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1582,7 +1586,7 @@ fn external_source_graph(
         identity: "fifo_burst_within_step_live".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -1590,6 +1594,7 @@ fn external_source_graph(
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/fbws/ext".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

@@ -72,6 +72,9 @@ tokio = { version = "1", default-features = false, features = [
     "signal",
     "time",
     "sync",
+    # The rcp bridge reads MCP messages from stdin and writes them to stdout.
+    "io-std",
+    "io-util",
 ] }
 # Structured logging (never println! in library code). Cap release logging at
 # info, mirroring cerulion_core / cerulion_remoted.

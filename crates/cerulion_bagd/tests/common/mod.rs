@@ -238,7 +238,7 @@ pub fn unique_ready_file(base: &str) -> PathBuf {
 ///     so the verdict a test then waits for can never come.
 ///
 /// Both are silent, and both grow more likely exactly when a runner is loaded —
-/// which is the `await_rescan_tap` lesson applied to the handshake
+/// which is the `await_discovered_tap` lesson applied to the handshake
 /// bagd already ships for this purpose.
 pub fn await_bagd_ready(ready: &std::path::Path, what: &str) {
     assert!(

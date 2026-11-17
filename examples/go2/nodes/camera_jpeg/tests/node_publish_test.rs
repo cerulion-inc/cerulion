@@ -196,7 +196,7 @@ fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphCo
         identity: format!("cam_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "camera".to_string(),
@@ -204,6 +204,7 @@ fn graph_config(prefix: &str, h264_topic: &str, max_slice_len: usize) -> GraphCo
             inputs: vec![InputDef {
                 name: "h264".to_string(),
                 source: h264_topic.to_string(),
+                ..Default::default()
             }],
             outputs: vec![OutputDef {
                 name: "jpeg".to_string(),

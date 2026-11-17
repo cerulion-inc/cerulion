@@ -1,5 +1,120 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 use super::*;
+use crate::fresh_executable::install_script;
+
+#[test]
+fn parent_stop_budget_tracks_the_remote_daemons_deadline() {
+    for value in [
+        None,
+        Some(""),
+        Some(" "),
+        Some("0"),
+        Some("1"),
+        Some("+1"),
+        Some("30000"),
+        Some(" invalid "),
+        Some("18446744073709551616"),
+    ] {
+        assert_eq!(
+            resolve_remoted_stop_grace(value),
+            cerulion_remoted::shutdown::resolve_hard_exit(value)
+                .saturating_add(Duration::from_millis(500))
+        );
+    }
+}
+
+#[test]
+fn remote_owner_waits_for_sigterm_cleanup_and_escalates_only_after_its_deadline() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("stopped");
+    let ready = dir.path().join("ready");
+    let child = Command::new("sh").arg("-c").arg("trap 'printf stopped > \"$1\"; exit 0' TERM; printf ready > \"$2\"; while :; do sleep 0.1; done").arg("stop-fixture").arg(&marker).arg(&ready).process_group(0).spawn().unwrap();
+    let owner = OwnedRemoted(OwnedChild(child), Duration::from_secs(3));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    drop(owner);
+    assert_eq!(std::fs::read(&marker).unwrap(), b"stopped");
+    std::fs::remove_file(&ready).unwrap();
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg("trap '' TERM; printf ready > \"$1\"; exec sleep 30")
+        .arg("stop-fixture")
+        .arg(&ready)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let owner = OwnedRemoted(OwnedChild(child), Duration::from_millis(100));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(POLL_INTERVAL);
+    }
+    let stopping = Instant::now();
+    drop(owner);
+    assert!(stopping.elapsed() >= Duration::from_millis(100));
+    assert!(!Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success());
+}
+
+#[test]
+#[tracing_test::traced_test]
+fn signal_errors_stay_inside_the_stop_deadline_and_invalid_ids_never_signal_groups() {
+    for pid in [0, u32::MAX] {
+        assert_eq!(
+            send_sigterm(pid).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::NotFound] {
+        let mut child = OwnedChild(Command::new("sleep").arg("30").spawn().unwrap());
+        let pid = child.0.id();
+        let started = Instant::now();
+        stop_remoted(&mut child, Duration::from_millis(100), |signalled| {
+            assert_eq!(signalled, pid);
+            Err(io::Error::from(kind))
+        });
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(child.0.try_wait().unwrap().is_none());
+        drop(child);
+        assert!(!Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success());
+    }
+    assert!(logs_contain("could not signal the owned remote server"));
+    assert!(logs_contain("exceeded its graceful stop deadline"));
+}
+
+#[test]
+fn registration_worker_stderr_is_carried_in_the_reported_failure() {
+    let mut command = Command::new("sh");
+    command.args(["-c", "printf '%s\\n' 'the robot state directory must be owner-only; run `chmod 700 /state`' >&2; exit 1"]);
+    let error = run_json::<Prepared>(
+        command,
+        "account registration",
+        Instant::now() + Duration::from_secs(5),
+        &AtomicBool::new(true),
+    )
+    .err()
+    .expect("the worker must fail");
+    assert!(
+        error.ends_with(": the robot state directory must be owner-only; run `chmod 700 /state`"),
+        "{error}"
+    );
+    assert!(!error.contains("see the child error above"));
+    assert!(!error.contains('\n'));
+}
 
 #[test]
 fn sibling_resolution_uses_the_executable_then_its_symlink_target() {
@@ -203,43 +318,15 @@ fn the_epoch_sync_period_is_read_from_the_environment() {
 }
 
 /// A stand-in worker: appends one line to `log` per run, exits with `code`.
-/// Write an executable shell script at `path` and return once it can be
-/// executed. A process forked by a concurrent test before its exec holds a copy
-/// of this write descriptor, and while it does, executing the script fails with
-/// ETXTBSY; a probe run (which exits before `body`) is retried until it starts.
-fn install_script(path: &Path, body: &str) {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::write(
-        path,
-        format!("#!/bin/sh\n[ -n \"$CERULION_TEST_PROBE\" ] && exit 0\n{body}"),
-    )
-    .unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    for _ in 0..500 {
-        match Command::new(path).env("CERULION_TEST_PROBE", "1").status() {
-            Ok(status) => {
-                assert!(
-                    status.success(),
-                    "probe run of {}: {status}",
-                    path.display()
-                );
-                return;
-            }
-            Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            Err(error) => panic!("probe run of {}: {error}", path.display()),
-        }
-    }
-    panic!("{} stayed busy for 5 s", path.display());
-}
-
 fn fake_worker(dir: &Path, code: i32) -> (PathBuf, PathBuf) {
     let log = dir.join("runs.log");
     let script = dir.join("cerulion");
     install_script(
         &script,
-        &format!("echo \"$@\" >> '{}'\nexit {code}\n", log.display()),
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nexit {code}\n",
+            log.display()
+        ),
     );
     (script, log)
 }
@@ -334,7 +421,7 @@ fn a_failing_epoch_sync_backs_off_and_keeps_trying() {
 fn an_overdue_epoch_sync_worker_is_killed_and_counts_as_a_failure() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("cerulion");
-    install_script(&script, "exec sleep 30\n");
+    install_script(&script, "#!/bin/sh\nexec sleep 30\n");
     let root = dir.path().join("state");
     let t0 = Instant::now();
     let mut sync = EpochSync::new(
@@ -361,13 +448,13 @@ fn the_server_loop_runs_the_revocation_sync_while_the_server_lives() {
     let root = dir.path().join("state");
     std::fs::create_dir_all(root.join("remoted")).unwrap();
     let mut server = OwnedChild(Command::new("sleep").arg("30").spawn().unwrap());
-    let mut sync = EpochSync::new(
+    let mut sync = Some(EpochSync::new(
         cli,
         root,
         DEFAULT_EPOCH_SYNC_PERIOD,
         DEFAULT_EPOCH_SYNC_STOP_GRACE,
         Instant::now(),
-    );
+    ));
     let running = Arc::new(AtomicBool::new(true));
     let stopper = Arc::clone(&running);
     let watched = log.clone();
@@ -422,7 +509,10 @@ fn slow_worker(dir: &Path, secs: u32) -> (PathBuf, PathBuf) {
     let script = dir.join("cerulion");
     install_script(
         &script,
-        &format!("sleep {secs}\necho \"$@\" >> '{}'\nexit 0\n", log.display()),
+        &format!(
+            "#!/bin/sh\nsleep {secs}\necho \"$@\" >> '{}'\nexit 0\n",
+            log.display()
+        ),
     );
     (script, log)
 }

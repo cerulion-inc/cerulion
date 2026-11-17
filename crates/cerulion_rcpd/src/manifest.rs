@@ -13,6 +13,8 @@
 //! limits:               # optional; these are the defaults
 //!   estop_clear: agent  # agent | operator
 //!   irreversible: allow # allow | refuse
+//! eyes:                 # optional; see crate::eye::config
+//!   jev: { frame_topic: /wrist/image, question_sets: [ ... ] }
 //! tools:                # optional; only listed tools and the built-ins exist
 //!   - name: arm.step
 //!     description: Advance the arm one control period toward a joint target.
@@ -27,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::eye::config::EyesConfig;
 use crate::RcpdError;
 
 /// The manifest as written.
@@ -51,6 +54,9 @@ pub struct RcpManifest {
     /// The tools an agent may call. Anything not listed does not exist.
     #[serde(default)]
     pub tools: Vec<ToolSpec>,
+    /// Instruments that answer the graph's asks; see [`crate::eye`].
+    #[serde(default)]
+    pub eyes: EyesConfig,
 }
 
 /// The topic pair a tool call travels on.
@@ -195,6 +201,8 @@ pub struct LoadedManifest {
     pub state: Vec<StateResource>,
     /// The declared tools, in manifest order.
     pub tools: Vec<ToolSpec>,
+    /// The `eyes` section.
+    pub eyes: EyesConfig,
 }
 
 /// A node the manifest's graph declares.
@@ -264,6 +272,7 @@ impl RcpManifest {
         let limits = manifest.limits;
         let state = manifest.state.clone();
         let tools = manifest.tools.clone();
+        let eyes = manifest.eyes.clone();
         let identity = manifest.resolve(path.parent().unwrap_or_else(|| Path::new("")))?;
         Ok(LoadedManifest {
             identity,
@@ -271,6 +280,7 @@ impl RcpManifest {
             limits,
             state,
             tools,
+            eyes,
         })
     }
 
@@ -344,6 +354,27 @@ impl RcpManifest {
             }
             if !state_names.insert(entry.name.as_str()) {
                 return Err(format!("state {:?} is declared twice", entry.name));
+            }
+        }
+        self.check_eyes()
+    }
+
+    /// Refuse an `eyes` section whose topics the journal or a state resource
+    /// already uses.
+    fn check_eyes(&self) -> Result<(), String> {
+        let Some(jev) = &self.eyes.jev else {
+            return Ok(());
+        };
+        jev.check()?;
+        let taken: Vec<&String> = [&self.journal.calls_topic, &self.journal.results_topic]
+            .into_iter()
+            .chain(self.state.iter().map(|s| &s.topic))
+            .collect();
+        for topic in [&jev.frame_topic, &jev.ask_topic, &jev.answer_topic] {
+            if taken.contains(&topic) {
+                return Err(format!(
+                    "eyes.jev topic {topic:?} is already a journal or state topic"
+                ));
             }
         }
         Ok(())

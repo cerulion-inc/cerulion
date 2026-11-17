@@ -1,5 +1,7 @@
 # Robot Context Protocol (`cerulion-rcpd`)
 
+Experimental: not in any release; build from source.
+
 `cerulion-rcpd` is an MCP server that lets an agent read the live state of a
 robot running Cerulion and call the tools its manifest declares. It identifies
 itself as `cerulion-rcp`. Every tool call is written to a hash-chained receipt
@@ -12,6 +14,8 @@ agent drives this way, with a recording that replays with no agent. Its demo
 script expects an [ASPIRE](https://github.com/NVlabs/ASPIRE) embodiment that is
 not yet published; the plant and the replay run from this repository alone.
 
+Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep their graph, state and tool journal local. Remote requests are refused before reaching those topics; configured external eye requests also respect this scope. Cached private state stays local after its producer exits. Remote graph topic diagnostics require an eligible live producer; local observations retain history. Local tool calls remain available. Emergency-stop operations remain available independently of network scope.
+
 ## Run it
 
 ```bash
@@ -21,6 +25,8 @@ CERULION_RCP_TOKEN=... cerulion-rcpd --manifest rcp.yaml --http   # 127.0.0.1:78
 CERULION_RCP_TOKEN=... cerulion-rcpd --manifest rcp.yaml --http 127.0.0.1:7900
 cerulion-rcpd --manifest rcp.yaml --receipts /var/log/rcp/receipts.jsonl
 cerulion-rcpd --verify-receipts /var/log/rcp/receipts.jsonl   # 0: chain intact, 1: missing, empty or broken
+cerulion-rcpd --verify-bag run.mcap --manifest rcp.yaml       # 0: every Jev answer has its receipt
+cerulion-rcpd jev status --manifest rcp.yaml                  # also: jev on, jev off
 ```
 
 `--receipts` defaults to `.cerulion/rcp/receipts.jsonl` beside the manifest.
@@ -34,7 +40,10 @@ Streamable HTTP is served at `/mcp`. Every request must carry
 `Authorization: Bearer <token>` matching `CERULION_RCP_TOKEN`, or it is
 answered `401`. Without the variable `--http` refuses to start. The default
 address is loopback; binding any other address logs a warning, and only
-`localhost`, `127.0.0.1` and `::1` are accepted as the `Host` header.
+`localhost`, `127.0.0.1` and `::1` are accepted as the `Host` header. A
+request may carry `x-cerulion-caller: <caller>` (1 to 200 characters from
+`[A-Za-z0-9:._@/-]`); a tool call it carries is receipted under that caller
+instead of `rcp-agent`, and a repeated or malformed value fails the call.
 
 ## The manifest
 
@@ -172,7 +181,14 @@ its `intent`, deletes the
 file and opens the latch inside the same lock. The receipt log therefore
 orders engages and clears as they took effect. An `estop` that lands while
 a clear holds that lock closes the latch at once and publishes its frame
-after the clear's receipt write.
+after the clear's receipt write. When `estop` cannot write the latch file or
+its `intent` receipt, it logs the error after its frame is queued and the
+lock is released, so writing that error line does not hold the frame. A
+receipt `estop_clear` cannot write is logged after it releases the lock,
+so that line does not hold an `estop` waiting for the lock. The error line
+for a receipt that could not be written, from any tool call or eye answer,
+is also written after the receipt log's lock is released; an `estop` takes
+that lock before it queues its frame.
 
 A latch-gated call (a motion call or `estop_clear`) whose MCP request was
 already cancelled when the journal takes it from its queue is dropped, not
@@ -226,3 +242,296 @@ each refresh.
 
 One per `state` entry: the newest frame seen on that `std_msgs/String` topic,
 as text. Reading one before any frame has arrived is an error.
+
+## Jev, the gate's second eye
+
+With an `eyes.jev` section, the daemon answers the graph's requests for a
+second look at a wrist-camera frame with Jev, TypeSafe's System One model,
+through OpenRouter by default. Jev reads; the graph's gate decides. Jev is a
+cross-check that can only veto: a reading that disagrees with the gate's own
+measurement refuses, a reading that agrees never passes a gate by itself,
+and an absent Jev is never agreement.
+
+When Jev is on, each look sends one still frame from the wrist camera, the
+question set's text and the ask's numbers to the route: by default
+OpenRouter, which passes them to TypeSafe in the US. No robot or user id is
+in the request; the route sees the robot's network address and its key.
+Nothing else from any camera leaves the robot for Jev, and a recording of
+the frames and answers stays on the robot. TypeSafe lists where it
+processes data at https://trust.typesafe.ai/subprocessors.
+
+```yaml
+eyes:
+  jev:
+    base_url: https://openrouter.ai/api/v1  # default; requests go to {base_url}/systemone
+    model: typesafe/jev-1.14                # default; a pinned name, never an alias
+    credential_file: keys/jev.key           # optional, relative to this file
+    region: US                              # optional; picks the data notice
+    frame_topic: /wrist/image               # sensor_msgs/CompressedImage, JPEG
+    ask_topic: /rcp/eye/ask                 # default
+    answer_topic: /rcp/eye/answer           # default
+    timeout_ms: 1500                        # default and maximum
+    question_sets:
+      - name: press_gate
+        state: Wrist camera frame from an arm in front of a coffee machine.
+        numbers: [jaw_gap_mm]               # optional: the numbers an ask may carry
+        questions:
+          edge_visible: { type: noul, instructions: The rim's lower edge is visible in `frame`. }
+          rim: { type: box, instructions: The chrome rim band in `frame`. }
+        visible: { question: edge_visible, threshold: 0.7 }   # optional
+```
+
+A node asks with one `std_msgs/String` frame on the ask topic:
+`{"ask_id": 7, "question_set": "press_gate", "frame": {"topic": "/wrist/image", "seq": 412}, "deadline_ms": 1500, "numbers": {"jaw_gap_mm": 3.5}}`.
+`seq` is the wire sequence number of a frame on the frame topic; the daemon
+keeps the newest 8 and waits up to 100 ms for one not yet seen. Each
+publisher numbers its own frames, so an ask whose `seq` held frames from two
+publishers carry (two cameras on the topic, or one that restarted) is
+refused (`frame_ambiguous`) and neither frame is sent. The deadline
+runs from the ask frame's wire timestamp when that stamp is at most 250 ms
+behind the host's monotonic clock, and from when the daemon reads the ask
+otherwise, so a run resumed after a pause, a graph on a virtual or external
+time source and an ask mirrored from another machine keep their whole
+deadline. It sends one
+request carrying that frame unchanged, the set's text and the numbers, and
+publishes one answer frame per ask on the answer topic with an `outcome`:
+`ok`, or one of `disabled`, `no_credential`, `unavailable`, `timeout`,
+`rate_limited`, `quota`, `throttled`, `refused`, `wrong_model`, `malformed`,
+`not_visible` and `not_recorded`, each meaning Jev is absent. A reply the
+daemon takes up at or after its deadline is receipted `late` and never
+published, and the ask is answered `timeout`. The frame records
+the questions, the state, the model asked and the model that answered, and
+the SHA-256 of the image and of the request body; never the image bytes or
+the key. Every answer frame carries `"provenance": "third_party"`, so a
+training or labelling export can leave Jev's output out. A receipt
+(`eye.jev`, caller `rcp-eye`) is written before each answer is published,
+and an answer whose receipt cannot be written is not published.
+
+A gate picks the answer frames for an ask by its `ask_id`, reads each with
+`EyeAnswer::parse(answer, ask)`, passing the exact text of the ask frame it
+published, and compares Jev's reading with its own through `Look::compare`,
+which gives `Agree`, `Disagree` or `Absent(outcome)`. An answer frame whose
+`ask_sha256` is not the SHA-256 of that text was given for another ask, such
+as another frame under a reused `ask_id`, and reads as `not_recorded`.
+A gate that holds the frame passes its JPEG bytes to
+`EyeAnswer::for_image`: an `ok` answer whose `image_sha256` is not their
+SHA-256 reads as `not_recorded`. `bag play` re-publishes a recording's
+answer frames byte for byte, and ask ids and frame sequence numbers restart
+with each run, so a recorded answer can carry a live gate's exact ask text
+while naming another frame.
+
+The daemon answers at most 20 asks at once and 10 a second after that,
+whatever the outcome; an ask over that bound gets no answer and no receipt,
+so the asking node's own deadline makes Jev absent; the first drop is
+logged, and later ones are counted, in the log and in `jev status`.
+The eye's receipts share the receipt log, and its lock, with the tools and
+the e-stop.
+
+Before any request the daemon refuses an ask that is not one of these shapes
+(`malformed`), an image that is not a JPEG of at most 640 x 480 pixels and
+200 KB with sides of at least 280 pixels (`refused`), a request over 4,000
+estimated input tokens (`refused`), more than 2 requests in flight or more
+than 5 looks a second after a burst of 10 (`throttled`), every request for
+the `Retry-After` of a 429, at most 30 s, or 1 s when the header is missing
+or gives a date (`rate_limited`), and, once the route reports a
+spend limit reached, every request until 00:00 UTC (`quota`, logged once).
+
+The key is read before every look from `CERULION_JEV_KEY_FILE`, else
+`credential_file`, else `jev.key` beside the receipt log. The file holds one
+per-robot key and must not be readable by group or others. Jev is on while a
+key is on file and the switch is not off:
+
+- `cerulion-rcpd jev off` stops requests with the next ask (`disabled`);
+  `jev on` turns it back on; `jev status` prints on or off, the route, the
+  model, today's asks, looks and asks dropped unanswered (UTC) and the last
+  outcome. A restarted daemon goes on counting the day the status file
+  records.
+- The first time Jev is on, at start or before the first request of a run
+  (a key placed while the daemon runs), the daemon logs one line saying that
+  wrist frames leave the robot and how to turn Jev off. A region whose law
+  requires more gets the line at every run (`clear`), or Jev off until
+  `jev on` (`opt_in`).
+- The ask and frame topics belong to the graph, which sets their depth when
+  it creates them. The daemon opens each once it exists, trying every
+  10 ms, and never creates it, so it can start before or after the graph.
+  It creates the answer topic.
+- An eye that cannot start (its answer topic cannot be created, or a topic
+  name is not valid) is logged and the daemon serves its tools without it;
+  an HTTPS client that cannot be built (no system root certificates)
+  answers every look `unavailable`.
+
+The answer topic has no producer inside the graph, so
+`cerulion bag play --resim all` re-injects the recorded answer frames at
+their recorded steps, whatever the re-executed graph asks, and makes no Jev
+request itself. A gate that reads them with its own ask text sees an answer
+given for another ask text as `not_recorded`, and `--resim all --verify`
+reports a changed ask as a divergence on the ask topic. A resim runs on a
+private shared-memory namespace a running daemon's eye never sees, so its
+asks and wrist frames never reach the eye: they are neither answered nor
+counted. Plain `bag play` publishes onto the topics the eye reads, from the
+transport node `cerulion_bag_play`, and the eye tells a played recording by
+that node: an ask from it gets no request, no answer and no receipt, with
+Jev on or off, and a wrist frame from it is never held, whatever their wire
+timestamps say. The eye drops an ask and a frame the same way when their
+publisher's node name begins `cerulion_replay_`, or when that node cannot
+be named. The first such ask is logged, later ones are counted, and
+`jev status` reports them. A live graph whose own node name takes one of
+those forms (a graph named `bag_play`, one whose name begins `replay_`, or
+a multi-process graph named `replay`) reads as a replay, and the log names
+the node.
+`--verify-bag` checks that every answer in a recording has its receipt,
+names an ask the recording holds and carries the SHA-256 of that ask's
+text, and, where the recording holds the frame, that the image and request
+digests recompute from it and the recorded model, state and questions; of
+several recorded frames with that number, it uses the one whose SHA-256 the
+answer records. Every `late` receipt for a request an answer in the
+recording names must follow that request's `timeout` answer. The receipt
+log is shared by every run, so a `late` receipt for a request no answer in
+the recording names is another recording's and is left out.
+
+## Reaching rcpd from a desk
+
+`cerulion-remoted` serves the robot's rcpd to desks on its access list on the
+`cerulion/rcp/1` plane. Run rcpd with `--http` on its default loopback address
+and give it the token `cerulion-remoted` uses. At startup `cerulion-remoted`
+creates `<state root>/remoted/rcp.token` when it is absent: one
+`CERULION_RCP_TOKEN=<random token>` line, mode `0600`, owned by the user
+`cerulion-remoted` runs as. When the file exists but is not a regular file,
+or gives its group or others any permission (read, write or execute),
+`cerulion-remoted` logs that at
+error and serves on: its ops and wire planes work, and every rcp request is
+answered with an error until the file is private (`chmod 600`). The file's
+format is a systemd environment file, so an rcpd systemd unit can read it
+with `EnvironmentFile=`, for example:
+
+```ini
+[Service]
+EnvironmentFile=/var/lib/cerulion/remoted/rcp.token
+ExecStart=/usr/bin/cerulion-rcpd --manifest /etc/cerulion/rcp.yaml --http
+```
+
+On the desk, `cerulion rcp <robot>` serves the robot's rcpd as a local stdio
+MCP server. While the desk's network kill-switch is engaged
+(`CERULION_NETWORK=off` or `--network off`) it is refused with exit 2 before
+anything reaches the robot, and without a sign-in. The robot admits only a
+desk on its access list and checks every message: `resources/*`,
+`subscriptions/listen` and `tools/list` need the observe capability;
+`tools/call` needs the teleop capability and the operator role, except that
+any desk on the access list may call `estop`. The robot checks an Observe or
+Act message's access again just before it sends the message to rcpd; an
+`estop` is not checked again. It sends a `notifications/cancelled` to rcpd
+after rcpd has taken the tool call it names, or once `--rcp-head-timeout-ms`
+passes. Tool calls made this way are receipted under the desk's identity,
+`iroh:<device key hex>/account:<account hex>`, and the journaled call frame
+carries the same value as `"caller"`. `cerulion-remoted --rcp-addr` (a
+loopback address) and `--rcp-token-file` change the address and the file.
+The plane's bounds and timers are flags too: `--rcp-sessions-per-connection`,
+`--rcp-connections-per-key`, `--rcp-in-flight`, `--rcp-estops-in-flight`,
+`--rcp-session-buffer-bytes`, `--rcp-revoke-check-ms`, `--rcp-head-timeout-ms`
+and `--rcp-drain-ms` (`cerulion-remoted --help` gives each default).
+
+### One e-stop for the ops and rcp planes
+
+The ops e-stop that `cerulion-remoted` holds is one latch for the ops act
+verbs, the ops verb `restart` and the rcp plane. An `estop` call from a desk engages it before the
+call reaches rcpd, then rcpd engages its own latch as for any `estop`. The
+ops plane's `engage-estop` engages the same latch, then sends an `estop` to
+rcpd until rcpd answers, so rcpd engages its own latch too. While the ops latch is engaged:
+
+- every other tool call from a desk except `estop_clear` is refused before it
+  reaches rcpd, with error `-32001` and the message `refused: the robot's
+  e-stop is engaged`;
+- `estop_clear` is refused too, with `refused: the robot's ops e-stop is
+  engaged; it clears when cerulion-remoted restarts`;
+- the ops act verbs `topic-publish` and `service-call` are refused;
+- the ops verb `restart` is refused (`unavailable: the robot's e-stop is
+  engaged, so restart is refused`) before it stops anything. It reads the
+  latch again after its stop command and before its start command, and an
+  engage in between means the start command does not run (`unavailable:
+  the robot's e-stop was engaged during the restart, so the graph was not
+  started again after its stop`). An engage after that second read
+  leaves the started graph running, as an engage leaves any running graph
+  running;
+- `estop`, `tools/list`, the resources and the session messages still work.
+
+Apart from these refusals and the calls rcpd's own latch refuses, an e-stop
+gates no topic data: a graph's nodes and other local publishers can keep
+publishing, and a graph's `ingress:` topics and the topics this machine
+mirrors keep receiving from their producers, including a paired producer
+over the remote plane and, under `CERULION_LAN_ACCESS=open`, LAN peers. Stop
+those producers where they run.
+
+The ops latch is read when a desk's message arrives and again on the open
+connection to rcpd just before the plane sends it. A tool call already sent
+to rcpd is stopped by rcpd's own latch, which closes on an `estop` (see
+[E-stop](#e-stop)): rcpd refuses each mutating call it holds when the `estop`
+reaches it and has not yet published, and the call it is running has already
+reached the graph, which receives the e-stop frame next.
+
+The `estop` that an ops `engage-estop` sends goes over the same loopback link
+and token file, on an MCP session of its own, with the `reason` `the robot's
+ops e-stop was engaged (engage-estop)`; rcpd receipts and journals it under
+the engager's identity, `iroh:<device key hex>/account:<account hex>`, or
+`iroh:<device key hex>` for a device bound to no account. `engage-estop`
+answers without waiting for it, and the ops latch stays engaged whatever
+happens to it. Each attempt waits for each response head for
+`--rcp-head-timeout-ms` or 1 s, whichever is longer, and for each answer for
+10 s after its head. The `estop` reaches rcpd once rcpd answers that its
+latch closed: while rcpd is not reachable, the token file fails its check, or
+rcpd answers with an error, `cerulion-remoted` sends it again, waiting 100 ms
+after the first failure, twice as long after each further one and at most
+2 s, on a new MCP session each time. It logs the first failure at warn with
+its reason, and the 10th, 100th, 1000th failure and so on at warn with the
+count, the others at debug, which a release build compiles out, and logs at
+warn once rcpd's latch closes. One such delivery runs at a time, under the
+identity of the first engager since rcpd last answered one: an `engage-estop`
+while one runs starts none, since the one running keeps sending, and when that
+`engage-estop` came after the attempt rcpd answers began, the delivery sends
+the `estop` once more. A delivery that ends before rcpd answers logs at error.
+One that ends after rcpd answered that its latch closed, while it deletes its
+MCP session, logs nothing, unless an `engage-estop` came after the answered
+attempt began: the `estop` it still owed that `engage-estop` was not sent, so
+it logs that at error, and the next `engage-estop` sends it. These lines go
+through the daemon's log queue, so a stderr that takes no more lines delays
+no attempt (see
+[`docs/remote_plane.md`](remote_plane.md#e-stop-does-not-wait-behind-another-session)).
+When `cerulion-remoted` stops gracefully, on Ctrl-C or SIGTERM, a delivery in
+the middle of an attempt first deletes the MCP session rcpd issued it, within
+2 s, inside the 5 s the stop waits for the delivery's task. A stop the
+hard-exit deadline or a second signal ends, a SIGKILL or a crash may end it
+with no line and no `DELETE`. A `cerulion-netd` stop sends SIGTERM, and sends
+SIGKILL only if `cerulion-remoted` has not exited within
+`CERULION_REMOTED_HARD_EXIT_MS` plus 500 ms.
+
+The ops latch holds while `cerulion-remoted` runs, and any exit of the daemon
+clears it: a crash, a stop or restart of `cerulion-netd` (which stops
+`cerulion-remoted` too) or a restart of the machine. After a crash,
+`cerulion-netd` starts `cerulion-remoted` again, after a wait of at least
+5 s, only while this machine still serves (a live export or
+`CERULION_NETD_LISTEN`); when it no longer serves, `cerulion rcp` cannot reach
+rcpd, so clear rcpd's latch locally (delete `<receipts>.estop` and restart
+rcpd, or call `estop_clear` from a local client under
+`limits.estop_clear: agent`). No verb reads the latch back, so
+while you need the e-stop engaged, engage it again after any reconnect or any
+restart you did not make to clear it. To clear both latches, restart
+`cerulion-remoted` on the robot, then clear rcpd's latch: `estop_clear` under
+`limits.estop_clear: agent` (after restarting the MCP server in your MCP
+client, since `cerulion rcp` exits when `cerulion-remoted` restarts), or
+deleting `<receipts>.estop` and restarting rcpd. rcpd's latch holds across
+rcpd restarts through that file. If rcpd cannot write the file, it logs an
+error and its e-stop may not survive an rcpd restart: after one, engage the
+e-stop again. While the ops
+latch is clear, `estop_clear` reaches rcpd like any other tool call. Clients
+that talk to rcpd directly, over stdio or its own HTTP listener, see only
+rcpd's latch.
+
+When rcpd restarts, it forgets every MCP session. The next request on a desk's
+session is answered with error `-32603` (`rcpd lost this MCP session (it
+restarted); restart this MCP server`). The robot then sends nothing more to
+rcpd on that session and reads it on until the MCP client ends it, or for
+`--rcp-drain-ms`: an `estop` still engages the ops e-stop and is answered
+`-32603` with a message that says it did not reach rcpd and the ops e-stop is
+engaged, every other request gets the same session-lost error, and
+notifications are dropped. Restarting the MCP server in the MCP client opens a
+new session; when the robot ends the session first, `cerulion rcp` exits with
+status 1.

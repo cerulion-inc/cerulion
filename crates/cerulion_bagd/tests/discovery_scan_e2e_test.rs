@@ -1,12 +1,17 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The live-topic enumeration runs OFF the recorder's drive loop.
 //!
+//! The companion file is `discovery_event_e2e_test.rs`, which pins the other
+//! half: that the worker is woken by FILESYSTEM EVENTS rather than a cadence, so
+//! a settled machine runs no walks at all. This file pins that the walk is not
+//! on the drive loop and that whatever replaced it actually works.
+//!
 //! The defect was not a decision the recorder made — every discovery verdict was
-//! correct. It was WHERE the work happened: `rescan_discovery` called
+//! correct. It was WHERE the work happened: the discovery re-scan called
 //! `TransportManager::list_topics()` inline on `drive_loop` every 250 ms, and
 //! that call costs 117.5 ms at the Go2's 86 live topics (MEASURED first-party on
 //! the Jetson). The loop therefore stopped draining for roughly a third of every
-//! rescan period, and the >= 200 Hz topics' 16-frame SHM queues overflowed inside
+//! period, and the >= 200 Hz topics' 16-frame SHM queues overflowed inside
 //! that window: 23 % frame loss with `staging_full_passes = 0` and
 //! `dropped_unwritten = 0` throughout.
 //!
@@ -53,10 +58,9 @@ const HASH: u64 = 0x0996_0996_0996_0996;
 const DEADLINE: Duration = Duration::from_secs(20);
 /// How often a condition wait asks.
 const POLL: Duration = Duration::from_millis(5);
-/// The scan cadence the scanner arms drive at. Short enough that a re-enumeration
-/// lands quickly, and orders of magnitude longer than the microseconds a burst of
-/// `next_scan` calls takes — which is what makes the once-only assertion a
-/// property of the design rather than a race.
+/// The FALLBACK cadence the scanner arms drive at. Orders of magnitude longer
+/// than the microseconds a burst of `next_scan` calls takes, which is what makes
+/// the once-only assertion a property of the design rather than a race.
 const SCAN_CADENCE: Duration = Duration::from_millis(100);
 
 /// Block until `cond` holds, or fail LOUDLY with `what`.
@@ -79,11 +83,10 @@ fn await_condition(what: &str, mut cond: impl FnMut() -> bool) {
 /// The scanner runs a WORKER, that worker really RE-enumerates, and each
 /// completed enumeration is handed to the caller EXACTLY ONCE.
 ///
-/// The once-only property is what preserves its settle semantics:
-/// `discovery_quiet_scans` counts applied scans, so a `next_scan` that re-served
-/// the same enumeration on every drive pass (~100/s) would reach
-/// `DISCOVERY_SETTLE_QUIET_SCANS` in milliseconds and collapse the window that
-/// makes discovery record anything at all.
+/// The once-only property is what keeps the recorder's enumeration count a
+/// count of enumerations: a `next_scan` that re-served the same snapshot on
+/// every drive pass (~100/s) would have the recorder re-deciding a stale
+/// snapshot a hundred times a second and reporting each of those as a scan.
 ///
 /// The second half is the RE-enumeration pin, and it is the arm that separates a
 /// working scanner from an inert one: a worker that enumerates ONCE and then

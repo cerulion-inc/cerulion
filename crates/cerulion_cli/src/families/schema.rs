@@ -15,6 +15,7 @@ use cerulion_cli_engine::error::CliResult;
 use super::VerbFamily;
 use crate::cli::VerbLogClass;
 use crate::completion;
+use crate::network_switch::{NetworkRefusal, SwitchEnv};
 
 // The family's top-level verb, declared as a one-variant `Subcommand` so the
 // derive generates the same `schema` command the `Commands` enum would.
@@ -74,6 +75,12 @@ impl VerbFamily for Schema {
     /// Every schema verb runs and exits, so all of them default quiet.
     fn log_class(&self, _matches: &ArgMatches) -> VerbLogClass {
         VerbLogClass::OneShot
+    }
+
+    /// `schema info`'s network lookup stays local under the switch, so no
+    /// schema verb is refused.
+    fn network_refusal(&self, _matches: &ArgMatches, _env: &SwitchEnv) -> Option<NetworkRefusal> {
+        None
     }
 
     fn needs_identity(&self, _matches: &ArgMatches) -> bool {

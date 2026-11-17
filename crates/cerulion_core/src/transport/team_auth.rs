@@ -554,6 +554,10 @@ pub fn check_team_locator(locator: &str) -> Result<(), String> {
             "'{locator}' is QUIC with encryption and peer authentication switched off; \
              {use_instead}"
         )),
+        Carrier::QuicDatagram => Err(format!(
+            "'{locator}' is a datagram-only QUIC link, which delivers nothing reliably; \
+             {use_instead}"
+        )),
         Carrier::Udp => Err(format!(
             "'{locator}' is raw UDP, which carries no authentication or encryption; \
              {use_instead}"

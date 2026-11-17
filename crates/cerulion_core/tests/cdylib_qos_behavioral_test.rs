@@ -235,7 +235,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
         prefix: "cqbq".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -244,7 +244,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 outputs: vec![out_def("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "qos".to_string(),
@@ -252,11 +252,12 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 inputs: vec![InputDef {
                     name: "velocity_in".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![out_def("cmd_out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
@@ -264,6 +265,7 @@ fn run_qos(producer_type: &str, step_ms: u64, steps: usize) -> QosRun {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "qos/cmd_out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -484,7 +486,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
         prefix: "cqbs".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -493,7 +495,7 @@ fn run_sample(steps: usize) -> (u64, u64) {
                 outputs: vec![out_def("out"), out_def("aux_out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -502,10 +504,12 @@ fn run_sample(steps: usize) -> (u64, u64) {
                     InputDef {
                         name: "inp".to_string(),
                         source: "prod/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "aux".to_string(),
                         source: "prod/aux_out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],

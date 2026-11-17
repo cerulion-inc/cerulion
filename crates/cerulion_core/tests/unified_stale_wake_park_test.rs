@@ -183,7 +183,7 @@ fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
         prefix: "usw".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -198,7 +198,7 @@ fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -206,6 +206,7 @@ fn build_stale_wake_runtime() -> (GraphRuntime, Arc<AtomicU64>) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

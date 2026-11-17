@@ -1,0 +1,11 @@
+error: `consume` applies only to a trigger input: write `#[input(trigger, consume = latest)]`. A non-trigger input never fires the node; it is a latest-value read that already serves the newest frame on every fire, so it has no consumption order to choose.
+ --> tests/ui/input_consume_non_trigger.rs:7:13
+  |
+7 |     #[input(consume = latest)]
+  |             ^^^^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_consume_non_trigger.rs:7:7
+  |
+7 |     #[input(consume = latest)]
+  |       ^^^^^

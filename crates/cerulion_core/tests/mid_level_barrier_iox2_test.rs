@@ -171,7 +171,7 @@ fn context_a_graph() -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
         "mlb_a",
         "mlba",
         vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "scanner".to_string(),
@@ -194,7 +194,7 @@ fn context_b_graph(
         "mlb_b",
         "mlbb",
         vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "controller".to_string(),
@@ -202,6 +202,7 @@ fn context_b_graph(
             inputs: vec![InputDef {
                 name: "scan".to_string(),
                 source: SCAN_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

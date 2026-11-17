@@ -623,12 +623,15 @@ def parse_cli_tree(src, family_srcs=(), nested_srcs=()):
     return tree
 
 
-FAMILIES_LIST_RE = re.compile(r"^pub(?:\([a-z]+\))? static FAMILIES: &\[&dyn VerbFamily\] = &\[(.*?)\];", re.S | re.M)
+# rustfmt breaks after the `=` when the declaration is wider than the line and
+# the list fits on the next one, so any whitespace, a newline included, may sit
+# between `=` and `&[`.
+FAMILIES_LIST_RE = re.compile(r"^pub(?:\([a-z]+\))? static FAMILIES: &\[&dyn VerbFamily\] =\s*&\[(.*?)\];", re.S | re.M)
 FAMILY_ENTRY_RE = re.compile(r"&\s*(\w+)::\w+")
 FAMILY_MOD_RE = re.compile(r"^(?:pub(?:\([a-z]+\))? )?mod (\w+);", re.M)
 
 
-NESTED_LIST_RE = re.compile(r"^pub(?:\([a-z]+\))? static NESTED: &\[&dyn NestedVerbs\] = &\[(.*?)\];", re.S | re.M)
+NESTED_LIST_RE = re.compile(r"^pub(?:\([a-z]+\))? static NESTED: &\[&dyn NestedVerbs\] =\s*&\[(.*?)\];", re.S | re.M)
 
 
 def registered_family_paths(mod_src, files):
@@ -1835,6 +1838,19 @@ pub(crate) static FAMILIES: &[&dyn VerbFamily] = &[&schema::Schema /* , &orphan:
 mod tests {}
 '''
 
+# A registry with three families, its list on the line after the `=` as rustfmt
+# wraps a declaration wider than the line.
+FIXTURE_FAMILIES_MOD_WRAPPED = '''mod doctor;
+mod schema;
+mod service;
+
+pub(crate) static FAMILIES: &[&dyn VerbFamily] =
+    &[&schema::Schema, &service::Service, &doctor::Doctor];
+
+#[cfg(test)]
+mod tests {}
+'''
+
 EXPECTED_TREE = {
     "graph": {"run": {}, "validate": {}, "run-worker": {}},
     "viz": {},
@@ -2357,11 +2373,22 @@ def self_test(out=sys.stdout):
     arm("families-registered-only", registered_family_paths(FIXTURE_FAMILIES_MOD, fams) == [CLI_FAMILIES_DIR + "schema.rs"],
         repr(registered_family_paths(FIXTURE_FAMILIES_MOD, fams)))
     arm("families-nested-module", registered_family_paths(FIXTURE_FAMILIES_MOD, [CLI_FAMILIES_DIR + "schema/mod.rs"]) == [CLI_FAMILIES_DIR + "schema/mod.rs"])
+    wrapped_fams = fams + [CLI_FAMILIES_DIR + "service.rs", CLI_FAMILIES_DIR + "doctor.rs"]
+    arm("families-wrapped-list", registered_family_paths(FIXTURE_FAMILIES_MOD_WRAPPED, wrapped_fams)
+        == ["crates/cerulion_cli/src/families/schema.rs", "crates/cerulion_cli/src/families/service.rs", "crates/cerulion_cli/src/families/doctor.rs"],
+        repr(registered_family_paths(FIXTURE_FAMILIES_MOD_WRAPPED, wrapped_fams)))
     arm("families-none-without-registry", registered_family_paths(None, [CLI_FILE]) == [])
     nested_mod = "mod graph_extra;\n\npub(crate) static NESTED: &[&dyn NestedVerbs] = &[&graph_extra::GraphExtra];\n"
     nested_files = [CLI_NESTED_MOD, CLI_NESTED_DIR + "graph_extra.rs", CLI_NESTED_DIR + "orphan.rs"]
     arm("nested-registered-only", registered_nested_paths(nested_mod, nested_files) == [CLI_NESTED_DIR + "graph_extra.rs"],
         repr(registered_nested_paths(nested_mod, nested_files)))
+    # The same registry with a second set, its list wrapped onto the next line by rustfmt.
+    nested_mod_wrapped = ("mod graph_extra;\nmod topic_extra;\n\npub(crate) static NESTED: &[&dyn NestedVerbs] =\n"
+                          "    &[&graph_extra::GraphExtra, &topic_extra::TopicExtra];\n")
+    wrapped_nested_files = nested_files + [CLI_NESTED_DIR + "topic_extra.rs"]
+    arm("nested-wrapped-list", registered_nested_paths(nested_mod_wrapped, wrapped_nested_files)
+        == ["crates/cerulion_cli/src/families/nested/graph_extra.rs", "crates/cerulion_cli/src/families/nested/topic_extra.rs"],
+        repr(registered_nested_paths(nested_mod_wrapped, wrapped_nested_files)))
     # A nested set is never read as a top-level family.
     arm("nested-not-a-family", registered_family_paths(FIXTURE_FAMILIES_MOD, fams + nested_files) == [CLI_FAMILIES_DIR + "schema.rs"])
     for name, mod_src in (("nested-no-registry", None), ("nested-no-list", "mod graph_extra;\n"),
@@ -2406,6 +2433,7 @@ def self_test(out=sys.stdout):
             ("families-no-registry", None, fams[1:]),
             ("families-no-list", "mod schema;\n", fams),
             ("families-two-lists", FIXTURE_FAMILIES_MOD + FIXTURE_FAMILIES_MOD.split("\n\n")[1], fams),
+            ("families-wrapped-and-flat-lists", FIXTURE_FAMILIES_MOD_WRAPPED + FIXTURE_FAMILIES_MOD.split("\n\n")[1], wrapped_fams),
             ("families-undeclared-module", FIXTURE_FAMILIES_MOD.replace("mod schema;", ""), fams),
             ("families-entry-not-a-path", FIXTURE_FAMILIES_MOD.replace("&schema::Schema", "SCHEMA"), fams),
             ("families-no-source", FIXTURE_FAMILIES_MOD, [CLI_FAMILIES_MOD]),

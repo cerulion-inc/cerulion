@@ -182,8 +182,8 @@ pub unsafe extern "C" fn rmw_deserialize(
         }
         let payload = &bytes[cerulion_core::wire::WireHeader::SIZE..];
         // A member this build's C++ typesupport gives no way to WRITE (a
-        // `bool[]` before Humble, at the top level or inside a nested
-        // message) is refused HERE, before `unflatten` writes the first
+        // `bool[]` with neither `assign` nor the shim's accessorless path, at
+        // any depth) is refused HERE, before `unflatten` writes the first
         // field: this function decodes into a CALLER-owned message, so a
         // decode that walked half of it and then failed would hand back
         // `RMW_RET_ERROR` over a message the caller must now treat as
@@ -404,12 +404,7 @@ unsafe fn publish_serialized_live(
                 // frame natively for late joiners (see rmw_publish). Drain
                 // events so a SubscriberConnected delivers it via
                 // update_connections.
-                inner.publisher.check_subscriber_events();
-                if let Err(e) = inner.publisher.notify_sent_sample() {
-                    // Best-effort wake (frame is on the wire + in history);
-                    // log at debug like the rmw_publish / loaned siblings.
-                    tracing::debug!(topic = %data.topic, error = ?e, "notify failed");
-                }
+                super::pubsub::wake_after_send(&mut inner.publisher, &data.topic);
                 RMW_RET_OK
             }
             Err(e) => {
@@ -467,15 +462,17 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         };
 
         let mut frame: Option<Vec<u8>> = None;
-        let mut info_out: Option<(u64, u64)> = None;
-        let receive = inner.subscriber.try_receive_one(|msg| {
+        let mut info_out: Option<(u64, u64, u128)> = None;
+        let sub = &inner.subscriber;
+        let receive = sub.try_receive_one_with(super::pubsub::TAKE_LISTENER_DRAIN, |msg| {
+            let origin = msg.origin();
             // Reassemble the full frame (header + payload) — "cerulion"
             // serialization format IS the wire frame.
             let header = msg.header();
             let mut buf = vec![0u8; cerulion_core::wire::WireHeader::SIZE + msg.payload().len()];
             header.write_to_buf(&mut buf[..cerulion_core::wire::WireHeader::SIZE]);
             buf[cerulion_core::wire::WireHeader::SIZE..].copy_from_slice(msg.payload());
-            info_out = Some((header.timestamp_ns, header.sequence as u64));
+            info_out = Some((header.timestamp_ns, header.sequence as u64, origin));
             frame = Some(buf);
         });
         drop(inner);
@@ -501,7 +498,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
         // like the deserializing take path does.
         if !message_info.is_null() {
             let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
-            if let Some((ts, seq)) = info_out {
+            if let Some((ts, seq, _)) = info_out {
                 info.source_timestamp = ts as i64;
                 info.received_timestamp = match crate::runtime::runtime() {
                     Ok(rt) => rt.transport.clock().now_ns() as i64,
@@ -509,7 +506,7 @@ pub unsafe extern "C" fn rmw_take_serialized_message_with_info(
                 };
                 super::stamp_sequence_numbers(&mut info, seq);
             }
-            info.publisher_gid.implementation_identifier = ffi::implementation_identifier_ptr();
+            super::stamp_publisher_gid(&mut info, info_out.map(|(_, _, origin)| origin));
             info.from_intra_process = false;
             *message_info = info;
         }

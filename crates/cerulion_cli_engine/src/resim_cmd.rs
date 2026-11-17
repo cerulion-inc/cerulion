@@ -121,6 +121,8 @@ pub struct ResimOptions {
     pub allow_param_change: bool,
     /// `--record-out PATH` (legal in both modes).
     pub record_out_path: Option<PathBuf>,
+    /// `--feed-index-budget BYTES` (requires `--verify`).
+    pub feed_index_budget: Option<u64>,
 }
 
 /// Which nodes re-execute.
@@ -185,6 +187,8 @@ pub struct PlayFlags {
     pub allow_param_change: bool,
     /// `--record-out PATH`: resim only, in EITHER mode.
     pub record_out: Option<PathBuf>,
+    /// `--feed-index-budget BYTES`: resim + `--verify` only.
+    pub feed_index_budget: Option<u64>,
 }
 
 /// What a legal `bag play` invocation resolved to.
@@ -277,6 +281,10 @@ const RESIM_ONLY: &[(&str, &str)] = &[
         "plain playback republishes the recorded frames and re-executes nothing, so \
          there is no re-executed output to write",
     ),
+    (
+        "--feed-index-budget",
+        "plain playback feeds no reads, so it builds no feed index to budget",
+    ),
 ];
 
 /// Resolve a `bag play` invocation, refusing every illegal flag combination
@@ -313,6 +321,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         strict_state,
         allow_param_change,
         record_out,
+        feed_index_budget,
     } = flags;
     // Both bounds are BAG-TIME SECONDS, so both are validated the same way and
     // before anything else: a bound nobody can act on is a usage error, not a
@@ -322,13 +331,14 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
 
     let Some(raw) = resim else {
         // Playback. Refuse every resim-only flag, in declaration order.
-        let present: [bool; 6] = [
+        let present: [bool; 7] = [
             verify,
             report.is_some(),
             tolerance.is_some(),
             strict_state,
             allow_param_change,
             record_out.is_some(),
+            feed_index_budget.is_some(),
         ];
         if let Some((flag, why)) = RESIM_ONLY
             .iter()
@@ -388,6 +398,15 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
         }
     }
 
+    if !verify && feed_index_budget.is_some() {
+        return Err(
+            "`--feed-index-budget` needs `--verify`: only a verifying resim feeds reads by \
+             recorded identity, so a bare `--resim all` builds no feed index to budget. Add \
+             `--verify` or drop the flag."
+                .to_string(),
+        );
+    }
+
     // `--record-out` shapes what the run PRODUCES, so it is legal in both modes.
     // One file cannot be both the verdict and the bag: refuse the collision by
     // name rather than let the second writer clobber the first.
@@ -411,6 +430,7 @@ pub fn resolve_play_mode(flags: PlayFlags) -> Result<PlayMode, String> {
             strict_state,
             allow_param_change,
             record_out_path: record_out,
+            feed_index_budget,
         },
     })
 }
@@ -504,22 +524,33 @@ pub struct ResimReport {
     /// say that a bounded remainder exists and where the bound is, and the
     /// per-topic breakdown is in the `--report` JSON for a reader who wants it.
     pub covered_range: Option<(u64, usize)>,
-    /// The COORDINATION PROVENANCE line, already
-    /// rendered.
+    /// The COORDINATION caveat line, already rendered, or `None` when the
+    /// contract applied needs no word on the terminal.
     ///
-    /// The rule is that the contract a replay APPLIED is always visible, and
-    /// a neutral resim is a surface like any other — it makes no verdict, but
-    /// "which contract did you re-execute this under" is not a verdict, it is
-    /// what makes the re-execution readable at all. The verify-mode verdict
-    /// prints it (`replay_engine::render_verdict`), and the neutral summary
-    /// prints it too.
+    /// A recording stamped `free_run` or `lockstep` re-executes under exactly
+    /// that contract, which a reader cannot act on, so it is `None`; the
+    /// INFERRED lockstep of a bag with no stamp is an assumption the replay
+    /// made, so it is carried and printed. The verify-mode verdict
+    /// (`replay_engine::render_verdict`) applies the same rule.
     ///
-    /// Carried as the RENDERED line rather than as the two fields: the text is
-    /// the canonical vocabulary and lives in exactly one function
+    /// Carried as the RENDERED line rather than as the two fields: the text and
+    /// the rule live in exactly one function
     /// (`replay_engine::render_coordination_line`), which is Unix-only, while
-    /// everything that consumes a `ResimReport` is not. `None` only for a
-    /// hand-built report; [`ResimReport::from_outcome`] always fills it.
+    /// everything that consumes a `ResimReport` is not.
     pub coordination: Option<String>,
+    /// The environment block, already rendered: a `WARNING:` line for each
+    /// environment variable that can change the re-execution and differs from
+    /// the recording, then at most one `NOTE:` counting the other differing
+    /// variables. Empty when the environment matches, and for a bag that
+    /// carries no `env.json`.
+    ///
+    /// Carried as rendered lines for the reason [`Self::coordination`] is: the
+    /// text and the rule that picks the variables worth a warning live in one
+    /// Unix-only function in `replay_engine`, which the verify verdict prints
+    /// from too, while everything that consumes a `ResimReport` is
+    /// platform-independent. Printed on both arms of [`render_resim_summary`],
+    /// the crash arm included, because nothing else prints these lines there.
+    pub env_lines: Vec<String>,
     /// Every bag-fed injection ANOMALY, as
     /// `(rank, topic, detail)`.
     ///
@@ -543,6 +574,17 @@ pub struct ResimReport {
     /// an observed difference would otherwise be silently attributed to the
     /// candidate.
     pub input_shortfalls: Vec<(u32, String, u64)>,
+    /// The external (driver) `NOTE:` lines, already rendered by
+    /// `replay_engine::render_driver_input_lines`, the text the verify verdict
+    /// prints: the topics drivers write, which the comparison and
+    /// [`Self::topics_checked`] leave out wholly or in part, and the driver
+    /// topics not fed or not read. Empty for a graph with no driver. Carried as
+    /// rendered lines for the reason [`Self::coordination`] is.
+    pub driver_lines: Vec<String>,
+    /// The comparison left a driver's frames out
+    /// (`DriverInputsReport::leaves_driver_frames_out`), so a match covers
+    /// less than every frame the re-executed graph published.
+    pub driver_frames_uncompared: bool,
 }
 
 impl ResimReport {
@@ -574,9 +616,8 @@ impl ResimReport {
                 .covered_range
                 .as_ref()
                 .map(|c| (c.through_ns, c.trailing_frames.values().sum())),
-            coordination: Some(crate::replay_engine::render_coordination_line(
-                &o.coordination,
-            )),
+            coordination: crate::replay_engine::render_coordination_line(&o.coordination),
+            env_lines: crate::replay_engine::render_env_divergence_lines(&o.env_divergence),
             injection_anomalies: o
                 .injection_anomalies
                 .iter()
@@ -587,6 +628,13 @@ impl ResimReport {
                 .iter()
                 .map(|s| (s.rank, s.node_id.clone(), s.count))
                 .collect(),
+            driver_lines: o.driver_inputs.as_ref().map_or_else(Vec::new, |d| {
+                crate::replay_engine::render_driver_input_lines(d, o.topics_checked)
+            }),
+            driver_frames_uncompared: o
+                .driver_inputs
+                .as_ref()
+                .is_some_and(crate::replay_engine::DriverInputsReport::leaves_driver_frames_out),
         }
     }
 }
@@ -703,6 +751,17 @@ fn push_coordination(s: &mut String, report: &ResimReport) {
     }
 }
 
+/// Push the environment block ([`ResimReport::env_lines`]), directly under the
+/// coordination line and indented like it, on EVERY path of
+/// [`render_resim_summary`], for the reason [`push_coordination`] is: the
+/// crash arm returns early, so without this call there a crashed re-execution
+/// would print no environment line at all.
+fn push_env_lines(s: &mut String, report: &ResimReport) {
+    for line in &report.env_lines {
+        s.push_str(&format!("  {line}\n"));
+    }
+}
+
 /// Render what a NEUTRAL resim did, WITHOUT a pass/fail verdict.
 ///
 /// The verify-mode renderer (`replay_engine::render_verdict`) opens with a
@@ -729,6 +788,7 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
     if !report.node_failures.is_empty() {
         s.push_str(&format!("resim FAILED: {}\n", bag.display()));
         push_coordination(&mut s, report);
+        push_env_lines(&mut s, report);
         for (node_id, reason) in &report.node_failures {
             s.push_str(&format!("  NODE FAILURE: '{node_id}' — {reason}\n"));
         }
@@ -741,10 +801,16 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
 
     s.push_str(&format!("resim (no verdict): {}\n", bag.display()));
     push_coordination(&mut s, report);
+    push_env_lines(&mut s, report);
     s.push_str(&format!(
         "  re-executed {} step(s), {} produced topic(s)\n",
         report.ticks_replayed, report.topics_checked
     ));
+    // The driver lines qualify the count above them: a topic a driver writes
+    // is a recorded input, left out of it.
+    for line in &report.driver_lines {
+        s.push_str(&format!("  {line}\n"));
+    }
 
     // A Flashback capture's COVERED RANGE, when the bag holds frames
     // beyond it.
@@ -820,7 +886,13 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
         && report.violations.is_empty()
         && report.topics_checked > 0;
 
-    if matched_everything {
+    if matched_everything && report.driver_frames_uncompared {
+        s.push_str(
+            "  observation: the re-executed frames match the recording byte-for-byte, except \
+             the external (driver) frames the NOTE lines above leave out, which were not \
+             compared\n",
+        );
+    } else if matched_everything {
         s.push_str("  observation: the re-executed frames match the recording byte-for-byte\n");
     } else {
         if differing > 0 {
@@ -859,11 +931,14 @@ pub fn render_resim_summary(report: &ResimReport, bag: &Path) -> String {
             && report.violations.is_empty()
             && !report.trace_diverged
             && !report.read_log_diverged
+            && !report.driver_frames_uncompared
         {
             // Reached only via `topics_checked == 0`, which the four conjuncts
             // above make true: without the read-log one this line printed
             // "NOTHING was compared" over a run whose read log DID compare and
-            // diverged, under a header that counts the produced topics.
+            // diverged, under a header that counts the produced topics. Where
+            // drivers wrote the frames, the driver NOTE lines already say that
+            // no topic was compared and why.
             s.push_str(
                 "  observation: no produced topic carried a frame, so NOTHING was compared \
                  against the recording\n",
@@ -913,7 +988,7 @@ pub fn run_resim(
             return EXIT_USAGE;
         }
     }
-    match replay_cmd::run_replay(bag, engine_options(options)) {
+    match replay_cmd::run_replay(bag, engine_options(options, verify)) {
         Ok(outcome) => {
             let report = ResimReport::from_outcome(&outcome);
             if verify {
@@ -948,7 +1023,7 @@ pub fn run_resim(
 /// from-start bag, so an e2e over any bag this repo's CLI tests can build would
 /// pass with it discarded.
 #[cfg(unix)]
-fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
+fn engine_options(o: ResimOptions, verify: bool) -> replay_cmd::ReplayOptions {
     let ResimOptions {
         duration_bound_ns,
         report_path,
@@ -956,14 +1031,24 @@ fn engine_options(o: ResimOptions) -> replay_cmd::ReplayOptions {
         strict_state,
         allow_param_change,
         record_out_path,
+        feed_index_budget,
     } = o;
     replay_cmd::ReplayOptions {
         duration_bound_ns,
+        feed_index_budget,
         report_path,
         tolerance_path,
         strict_state,
         allow_param_change,
         record_out_path,
+        // `--verify` feeds reads by recorded identity; a neutral resim keeps
+        // the queue re-creation, so the candidate's frames reach its in-rank
+        // consumers.
+        purpose: if verify {
+            crate::replay_engine::ReplayPurpose::Verify
+        } else {
+            crate::replay_engine::ReplayPurpose::Resim
+        },
     }
 }
 
@@ -1287,6 +1372,7 @@ mod tests {
                     strict_state: true,
                     allow_param_change: true,
                     record_out_path: None,
+                    feed_index_budget: None,
                 },
             }
         );
@@ -1553,7 +1639,7 @@ mod tests {
 
     #[test]
     fn every_resim_flag_is_refused_without_resim_with_its_own_reason() {
-        let cases: [(&str, PlayFlags); 6] = [
+        let cases: [(&str, PlayFlags); 7] = [
             (
                 "--record-out",
                 PlayFlags {
@@ -1596,6 +1682,13 @@ mod tests {
                     ..Default::default()
                 },
             ),
+            (
+                "--feed-index-budget",
+                PlayFlags {
+                    feed_index_budget: Some(1),
+                    ..Default::default()
+                },
+            ),
         ];
         for (flag, flags) in cases {
             let err = resolve_play_mode(flags).unwrap_err();
@@ -1633,6 +1726,40 @@ mod tests {
                 "must say WHY a neutral resim has no verdict to shape: {err}"
             );
         }
+    }
+
+    /// `--feed-index-budget` under a resim without `--verify` is refused by
+    /// name, naming `--verify` as the remedy: a neutral resim builds no feed
+    /// index. CONTROL: with `--verify` the same budget resolves and reaches
+    /// the engine's options.
+    #[test]
+    fn the_feed_index_budget_needs_verify_not_merely_resim() {
+        let err = resolve_play_mode(PlayFlags {
+            feed_index_budget: Some(4096),
+            ..resim("all")
+        })
+        .unwrap_err();
+        assert!(err.contains("`--feed-index-budget`"), "{err}");
+        assert!(err.contains("`--verify`"), "must name the remedy: {err}");
+        assert!(
+            err.contains("builds no feed index"),
+            "must say why a neutral resim has nothing to budget: {err}"
+        );
+        let mode = resolve_play_mode(PlayFlags {
+            feed_index_budget: Some(4096),
+            verify: true,
+            ..resim("all")
+        })
+        .expect("a verifying resim takes the budget");
+        let PlayMode::Resim {
+            verify: true,
+            options,
+            ..
+        } = mode
+        else {
+            panic!("a verifying resim: {mode:?}");
+        };
+        assert_eq!(options.feed_index_budget, Some(4096));
     }
 
     #[test]
@@ -1673,41 +1800,37 @@ mod tests {
             // did, and the covered-range line stays absent unless an arm asks
             // for it.
             covered_range: None,
-            // The provenance line, as
-            // `replay_engine::render_coordination_line` renders it for the
-            // ordinary shape — a bag carrying an explicit lockstep stamp.
-            coordination: Some("coordination: lockstep".to_string()),
+            // The ordinary shape: a bag carrying an explicit coordination
+            // stamp, which `replay_engine::render_coordination_line` renders as
+            // no line at all.
+            coordination: None,
+            // The ordinary shape: an environment that matches the recording
+            // (or a bag with no `env.json`) renders no line at all.
+            env_lines: vec![],
             // The two harness-side reports are additive and the
             // arms that are not about them keep rendering what they always did.
             injection_anomalies: vec![],
             input_shortfalls: vec![],
+            // The ordinary shape: a graph with no external (driver) node
+            // renders no driver line and leaves no frame out.
+            driver_lines: vec![],
+            driver_frames_uncompared: false,
         }
     }
 
-    /// The rule is that the contract a re-execution
-    /// APPLIED is always visible, on every surface that reports one — and a
-    /// NEUTRAL resim is one. It makes no verdict, but "which contract
-    /// did you re-execute this under" is not a verdict: without it a free-run
-    /// bag and an older, unstamped bag produce the same summary, and the operator
-    /// cannot tell an EXPLICIT lockstep stamp from an INFERRED one.
+    /// The neutral summary prints the coordination caveat the projection
+    /// carries, and nothing when it carries none.
     ///
-    /// The line is rendered upstream by
-    /// `replay_engine::render_coordination_line` and printed verbatim here, so
-    /// the neutral summary and the verify verdict speak ONE vocabulary.
+    /// The line (and the rule that only an INFERRED contract has one) is
+    /// rendered upstream by `replay_engine::render_coordination_line` and
+    /// printed verbatim here, so the neutral summary and the verify verdict
+    /// speak ONE vocabulary.
     #[test]
     fn the_neutral_summary_states_the_coordination_provenance() {
         let bag = Path::new("/tmp/x.mcap");
 
-        let mut lockstep = report(true, 0, false);
-        lockstep.coordination = Some("coordination: lockstep".to_string());
-        let out = render_resim_summary(&lockstep, bag);
-        assert!(
-            out.contains("coordination: lockstep"),
-            "the neutral summary must state which contract it re-executed under: {out}"
-        );
-
         // The INFERRED suffix is what separates "the recorder said lockstep"
-        // from "nothing said, so lockstep was assumed" — the distinction the whole
+        // from "nothing said, so lockstep was assumed": the distinction the whole
         // `Option<CoordinationMode>` stamp exists to preserve.
         let mut inferred = report(true, 0, false);
         inferred.coordination =
@@ -1718,14 +1841,13 @@ mod tests {
             "an inferred contract must be rendered as inferred: {out}"
         );
 
-        // A hand-built report with no provenance prints no line at all rather
-        // than inventing one — absence is never rendered as a claim.
-        let mut none = report(true, 0, false);
-        none.coordination = None;
-        let out = render_resim_summary(&none, bag);
+        // A stamped contract carries no line, and none is invented.
+        let mut stamped = report(true, 0, false);
+        stamped.coordination = None;
+        let out = render_resim_summary(&stamped, bag);
         assert!(
             !out.contains("coordination:"),
-            "an absent provenance must render NOTHING, never a default: {out}"
+            "a stamped contract renders NOTHING, never a default: {out}"
         );
     }
 
@@ -1994,6 +2116,61 @@ mod tests {
         assert!(!s.contains("NOTHING was compared"), "{s}");
     }
 
+    /// The neutral summary prints the external (driver) lines under the count
+    /// they qualify, and its match observation names the driver frames left
+    /// out. With nothing compared, the driver lines say so and the summary
+    /// prints no line of its own claiming no topic carried a frame. A driver
+    /// whose frames were all compared keeps the plain observation.
+    #[test]
+    fn the_neutral_summary_names_the_driver_frames_it_left_out() {
+        let bag = Path::new("/tmp/run.mcap");
+        let input = "NOTE: 1 topic(s) only external (driver) nodes write are recorded inputs \
+                     and were NOT compared (driver nodes, as the replayed build declares them: \
+                     cam): /rig/cam/image";
+        let nothing = "NOTE: no topic was compared against the recording: no node other than \
+                       an external (driver) node recorded or replayed a frame";
+        let mut compared = report(true, 0, false);
+        compared.topics_checked = 1;
+        compared.topics_passed = 1;
+        compared.driver_lines = vec![input.to_string()];
+        compared.driver_frames_uncompared = true;
+        let s = render_resim_summary(&compared, bag);
+        let head = format!(
+            "resim (no verdict): /tmp/run.mcap\n  re-executed 10 step(s), 1 produced \
+             topic(s)\n  {input}\n  observation: the re-executed frames match the recording \
+             byte-for-byte, except the external (driver) frames the NOTE lines above leave \
+             out, which were not compared\n  no verdict was made"
+        );
+        assert!(s.starts_with(&head), "{s}");
+        assert_eq!(s.matches("observation:").count(), 1, "{s}");
+
+        let mut capture_only = report(true, 0, false);
+        capture_only.topics_checked = 0;
+        capture_only.topics_passed = 0;
+        capture_only.driver_lines = vec![input.to_string(), nothing.to_string()];
+        capture_only.driver_frames_uncompared = true;
+        let s = render_resim_summary(&capture_only, bag);
+        assert!(s.contains(&format!("  {input}\n  {nothing}\n")), "{s}");
+        assert!(!s.contains("NOTHING was compared"), "{s}");
+        assert!(!s.contains("byte-for-byte"), "{s}");
+
+        let mut all_compared = report(true, 0, false);
+        all_compared.driver_lines = vec!["NOTE: a shared topic compared over every frame".into()];
+        let s = render_resim_summary(&all_compared, bag);
+        assert!(
+            s.contains("  observation: the re-executed frames match the recording byte-for-byte\n"),
+            "{s}"
+        );
+        assert!(!s.contains("except the external (driver) frames"), "{s}");
+
+        let mut crashed = compared.clone();
+        crashed.node_failures = vec![("cam".into(), "tick PANICKED".into())];
+        assert!(
+            !render_resim_summary(&crashed, bag).contains(input),
+            "a crashed run observed nothing, so it names no driver frames"
+        );
+    }
+
     /// A DIFFERING topic's violation is reported by the count, not twice. This
     /// pins that the unattributed-violation arm did not turn every ordinary
     /// divergence into a second, duplicated line.
@@ -2098,19 +2275,131 @@ mod tests {
         );
     }
 
+    /// The two environment lines a hand-built report carries in the arms below.
+    fn env_lines() -> Vec<String> {
+        vec![
+            "WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+             recording. The dynamic linker reads it to choose the libraries each node loads, so \
+             it can change the re-execution."
+                .to_string(),
+            "NOTE: 1 other environment variable differs from the recording. Cerulion does not \
+             read it to decide what the re-execution runs, so it matters only if code in one of \
+             your nodes reads it. Run with -v to list it."
+                .to_string(),
+        ]
+    }
+
+    /// The neutral summary's closing line, which every no-verdict arm ends on.
+    const NO_VERDICT_FOOTER: &str = "  no verdict was made \u{2014} divergence is the OUTPUT \
+                                     of a bare `--resim`, not a failure. Add `--verify` to \
+                                     byte-compare against the recording and get the \
+                                     pass/fail exit contract.\n";
+
+    /// The environment block sits directly under the coordination line on the
+    /// no-verdict arm, indented like it, and an empty block leaves the summary
+    /// exactly as it renders without one. Hand-written expected output.
+    #[test]
+    fn the_environment_block_sits_under_the_coordination_line_in_the_summary() {
+        let bag = Path::new("/tmp/x.mcap");
+        let mut with_env = report(true, 0, false);
+        with_env.coordination =
+            Some("coordination: lockstep (inferred: no coordination stamp)".to_string());
+        with_env.env_lines = env_lines();
+        assert_eq!(
+            render_resim_summary(&with_env, bag),
+            format!(
+                "resim (no verdict): /tmp/x.mcap\n\
+                 \x20 coordination: lockstep (inferred: no coordination stamp)\n\
+                 \x20 WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.\n\
+                 \x20 NOTE: 1 other environment variable differs from the recording. Cerulion \
+                 does not read it to decide what the re-execution runs, so it matters only if \
+                 code in one of your nodes reads it. Run with -v to list it.\n\
+                 \x20 re-executed 10 step(s), 3 produced topic(s)\n\
+                 \x20 observation: the re-executed frames match the recording byte-for-byte\n\
+                 {NO_VERDICT_FOOTER}"
+            )
+        );
+
+        let mut without_env = with_env.clone();
+        without_env.env_lines = vec![];
+        assert_eq!(
+            render_resim_summary(&without_env, bag),
+            format!(
+                "resim (no verdict): /tmp/x.mcap\n\
+                 \x20 coordination: lockstep (inferred: no coordination stamp)\n\
+                 \x20 re-executed 10 step(s), 3 produced topic(s)\n\
+                 \x20 observation: the re-executed frames match the recording byte-for-byte\n\
+                 {NO_VERDICT_FOOTER}"
+            )
+        );
+    }
+
+    /// The crash arm prints the environment block too, under the coordination
+    /// line and above the failure block; nothing else prints it on that path.
+    #[test]
+    fn a_crashed_re_execution_still_states_its_environment_block() {
+        let bag = Path::new("/tmp/crash.mcap");
+        let mut crashed = report(false, 0, false);
+        crashed.node_failures = vec![("planner".into(), "tick PANICKED".into())];
+        crashed.coordination =
+            Some("coordination: lockstep (inferred: no coordination stamp)".to_string());
+        crashed.env_lines = env_lines();
+        let crash_footer = "  the re-execution did not complete, so nothing about the recording \
+                            was observed. Fix the crash and re-run.\n";
+        assert_eq!(
+            render_resim_summary(&crashed, bag),
+            format!(
+                "resim FAILED: /tmp/crash.mcap\n\
+                 \x20 coordination: lockstep (inferred: no coordination stamp)\n\
+                 \x20 WARNING: environment variable LD_PRELOAD is set now and was not set in the \
+                 recording. The dynamic linker reads it to choose the libraries each node loads, \
+                 so it can change the re-execution.\n\
+                 \x20 NOTE: 1 other environment variable differs from the recording. Cerulion \
+                 does not read it to decide what the re-execution runs, so it matters only if \
+                 code in one of your nodes reads it. Run with -v to list it.\n\
+                 \x20 NODE FAILURE: 'planner' \u{2014} tick PANICKED\n\
+                 {crash_footer}"
+            )
+        );
+
+        let mut without_env = crashed.clone();
+        without_env.env_lines = vec![];
+        assert_eq!(
+            render_resim_summary(&without_env, bag),
+            format!(
+                "resim FAILED: /tmp/crash.mcap\n\
+                 \x20 coordination: lockstep (inferred: no coordination stamp)\n\
+                 \x20 NODE FAILURE: 'planner' \u{2014} tick PANICKED\n\
+                 {crash_footer}"
+            )
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn every_knob_survives_the_conversion_into_the_engines_options() {
         // The drop-a-knob guard. Asserted field by field rather than by struct
         // equality because `ReplayOptions` deliberately derives no `PartialEq`.
-        let got = engine_options(ResimOptions {
-            duration_bound_ns: Some(7_000_000_000),
-            report_path: Some(PathBuf::from("/tmp/r.json")),
-            tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
-            strict_state: true,
-            allow_param_change: true,
-            record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
-        });
+        let got = engine_options(
+            ResimOptions {
+                duration_bound_ns: Some(7_000_000_000),
+                report_path: Some(PathBuf::from("/tmp/r.json")),
+                tolerance_path: Some(PathBuf::from("/tmp/t.yaml")),
+                strict_state: true,
+                allow_param_change: true,
+                record_out_path: Some(PathBuf::from("/tmp/o.mcap")),
+                feed_index_budget: Some(4096),
+            },
+            true,
+        );
+        assert_eq!(got.feed_index_budget, Some(4096));
+        assert_eq!(
+            got.purpose,
+            crate::replay_engine::ReplayPurpose::Verify,
+            "`--verify` must reach the engine as the identity-fed purpose"
+        );
         assert_eq!(got.duration_bound_ns, Some(7_000_000_000));
         assert_eq!(
             got.record_out_path.as_deref(),
@@ -2134,7 +2423,12 @@ mod tests {
         );
 
         // And the negative: a knob nobody set must not be invented.
-        let none = engine_options(ResimOptions::default());
+        let none = engine_options(ResimOptions::default(), false);
+        assert_eq!(
+            none.purpose,
+            crate::replay_engine::ReplayPurpose::Resim,
+            "a neutral resim keeps the queue re-creation"
+        );
         assert_eq!(none.duration_bound_ns, None);
         assert!(none.report_path.is_none());
         assert!(none.tolerance_path.is_none());

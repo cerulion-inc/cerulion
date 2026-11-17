@@ -208,10 +208,11 @@ const LEAN_CRATES: &[LeanCrate] = &[
     },
     LeanCrate {
         package: "cerulion_ops_proto",
-        allowed: &["serde", "serde_json", "thiserror"],
-        source: "crates/cerulion_ops_proto/Cargo.toml: \"serde + serde_json + thiserror ONLY, \
-                 and no workspace crate, so a closed client that links this crate links no AGPL \
-                 code.\"",
+        allowed: &["base64", "serde", "serde_json", "thiserror"],
+        source: "crates/cerulion_ops_proto/Cargo.toml: \"No workspace crate: a closed client \
+                 links no AGPL code. Envelopes derive Serialize/Deserialize; binary session \
+                 chunks use standard padded base64.\" docs/internals/remote-access.md names \
+                 serde, serde_json, thiserror and base64 only.",
     },
     LeanCrate {
         package: "cerulion_hygiene",
@@ -293,6 +294,7 @@ const EXCLUDED_FROM_DEFAULT_MEMBERS: &[(&str, &str)] = &[
         "iroh (it links cerulion_link unconditionally)",
     ),
     ("cerulion_remoted", "iroh"),
+    ("cerulion_android_remote", "iroh (through cerulion_remoted)"),
     ("cerulion_connectd", "iroh"),
     ("cerulion_accountd", "iroh and the web stack"),
     ("cerulion_viz", "the Rerun SDK"),

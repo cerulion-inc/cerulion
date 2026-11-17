@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::config::{GraphConfig, NodeDef, OutputDef};
 use cerulion_core::graph::node::NodeEntry;
+use cerulion_core::graph::node_plugin_abi::RawIngress;
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use indexmap::IndexMap;
@@ -138,7 +139,7 @@ fn cyclone_peer_cloud_reaches_cerulion_subscriber_byte_exact() {
         identity: "dds_bridge_cyclone_e2e".to_string(),
         prefix: "cyc".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "bridge".to_string(),
@@ -384,7 +385,7 @@ fn cyclone_peer_imu_reaches_cerulion_via_the_raw_generic_route() {
     let mut pump = BridgePump::with_transport(
         bridge_cfg,
         Arc::new(Mutex::new(SampleQueue::default())), // unused by raw routes
-        Arc::clone(&mgr),
+        RawIngress::native(Arc::clone(&mgr)),
     );
     let pump_stats = pump.stats();
     let pump_thread = std::thread::spawn(move || {

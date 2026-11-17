@@ -264,7 +264,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
         prefix: "cdd".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -288,7 +288,7 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
                 ],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -297,10 +297,12 @@ fn dylib_declared_depth_provisions_topic_ceiling_e2e() {
                     InputDef {
                         name: "inp".to_string(),
                         source: "producer/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "aux".to_string(),
                         source: "producer/aux_out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],

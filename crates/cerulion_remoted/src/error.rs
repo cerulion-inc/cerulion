@@ -80,4 +80,10 @@ pub enum RemotedError {
     /// An I/O error not otherwise classified.
     #[error("i/o: {0}")]
     Io(#[from] std::io::Error),
+
+    /// One or more participants of the serving loop's shutdown stage did not
+    /// complete ([`crate::shutdown`]). On the daemon and through
+    /// [`crate::BoundPlane::serve`], the teardown after the stage still ran.
+    #[error("{0}")]
+    Shutdown(crate::shutdown::ShutdownStageError),
 }

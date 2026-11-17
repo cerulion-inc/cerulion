@@ -1822,6 +1822,58 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
     );
 }
 
+/// `--check` finds the pinned file in a listing far longer than a pipe holds.
+///
+/// The pinned name is the listing's FIRST line and the listing runs to several
+/// hundred kilobytes, so a membership test that pipes the listing into `grep -q`
+/// has grep exit on line one while the writer still holds most of the listing:
+/// the writer takes SIGPIPE, and under `pipefail` the file reads as absent. A
+/// tests directory of generated empty files builds that listing on every run,
+/// where the real listing of a few kilobytes loses the race only now and then.
+#[cfg(unix)]
+#[test]
+fn the_shard_check_finds_the_pinned_file_in_a_listing_longer_than_a_pipe_holds() {
+    let script = repo_root().join("tools/scripts/ci_test_shard.sh");
+    let package = tempfile::tempdir().expect("a package directory");
+    let tests = package.path().join("tests");
+    std::fs::create_dir(&tests).expect("the package's tests directory");
+    std::fs::write(tests.join("macro_compile_fail_test.rs"), "").expect("the pinned file");
+    // 4000 names of 207 bytes that all sort after the pinned one: about 830 KB.
+    let pad = "x".repeat(200);
+    for i in 0..4000 {
+        std::fs::write(tests.join(format!("z_{pad}_{i:04}.rs")), "").expect("a test file");
+    }
+
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .args(["--check", "cerulion_core", "4"])
+        .arg(package.path())
+        .current_dir(repo_root())
+        .output()
+        .expect("running tools/scripts/ci_test_shard.sh --check on the generated package");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "--check refused a package whose pinned file is on disk.\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The 4000 others round robin to 1000 a shard, and the pinned file joins shard 2.
+    for line in [
+        "shard 0/4: 1000 test file(s)",
+        "shard 1/4: 1000 test file(s)",
+        "shard 2/4: 1001 test file(s)",
+        "shard 3/4: 1000 test file(s)",
+        "pinned: macro_compile_fail_test -> shard 2/4",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l.starts_with(line)),
+            "the --check output lacks a line starting {line:?}; got:\n{stdout}"
+        );
+    }
+}
+
 /// Split a command tail into arguments, treating a whole `${{ ... }}`
 /// expression as ONE argument.
 ///
@@ -2015,23 +2067,94 @@ fn shard_matrices(job: &str) -> Vec<Vec<String>> {
     out
 }
 
-/// Fixture crates carry no tests, so they are correctly absent from the
-/// coverage set — and that absence is asserted, not assumed. If a fixture ever
-/// grows a `#[test]`, the gate above starts demanding a step for it, and this
-/// test is where a reader learns that is intended.
+/// Fixture crates carry no tests except explicitly covered feature-specific
+/// harnesses. A new fixture test needs its own required CI step and a reason
+/// here; it must never disappear from the package coverage checks.
 #[test]
 fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
+    let root = repo_root();
+    assert!(
+        workspace_member_dirs()
+            .iter()
+            .any(|dir| is_test_fixture(&root, dir)),
+        "is_test_fixture matched no workspace member, so an empty set below \
+         would prove nothing: the member paths are not below the repository \
+         root, or the fixtures left crates/test_fixtures/"
+    );
     let with_tests = packages_with_tests();
     let fixtures: BTreeSet<&String> = with_tests
         .iter()
-        .filter(|(_, dir)| dir.to_string_lossy().contains("test_fixtures/"))
+        .filter(|(_, dir)| is_test_fixture(&root, dir))
         .map(|(name, _)| name)
         .collect();
+    // The cdylib feature is required to compile the node context migration
+    // cases; required Linux and macOS shards run this fixture's lib harness.
+    let allowed = BTreeSet::from(["test_node_macro_cdylib"]);
+    let unexpected: Vec<_> = fixtures
+        .iter()
+        .filter(|name| !allowed.contains(name.as_str()))
+        .collect();
     assert!(
-        fixtures.is_empty(),
+        unexpected.is_empty(),
         "these test_fixtures crates now carry their own tests and so need a CI \
-         step (or an exemption): {fixtures:?}"
+         step (or an exemption): {unexpected:?}"
     );
+}
+
+/// Whether the member directory `dir` is a test fixture crate: a component of
+/// its path BELOW the repository `root` is `test_fixtures`. The components of
+/// `root` never count, so a checkout beneath a directory named
+/// `test_fixtures` classifies the same members as any other. A path outside
+/// `root` is not a member of this repository.
+fn is_test_fixture(root: &Path, dir: &Path) -> bool {
+    dir.strip_prefix(root)
+        .is_ok_and(|rel| rel.components().any(|c| c.as_os_str() == "test_fixtures"))
+}
+
+#[test]
+fn a_test_fixture_member_is_judged_below_the_checkout_root() {
+    const VECTORS: &[(&str, &str, bool)] = &[
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/test_fixtures/f",
+            true,
+        ),
+        ("/work/cerulion", "/work/cerulion/crates/x", false),
+        (
+            "/work/test_fixtures/cerulion",
+            "/work/test_fixtures/cerulion/crates/test_fixtures/f",
+            true,
+        ),
+        (
+            "/work/test_fixtures/cerulion",
+            "/work/test_fixtures/cerulion/crates/x",
+            false,
+        ),
+        // A name that only ends in `test_fixtures` is not the directory.
+        (
+            "/work/old_test_fixtures/cerulion",
+            "/work/old_test_fixtures/cerulion/crates/x",
+            false,
+        ),
+        (
+            "/work/cerulion",
+            "/work/cerulion/crates/old_test_fixtures/f",
+            false,
+        ),
+        // Outside the root, even with a `test_fixtures` component of its own.
+        (
+            "/work/cerulion",
+            "/work/other/crates/test_fixtures/f",
+            false,
+        ),
+    ];
+    for (root, dir, want) in VECTORS {
+        assert_eq!(
+            is_test_fixture(Path::new(root), Path::new(dir)),
+            *want,
+            "is_test_fixture(root = {root}, dir = {dir}) should be {want}"
+        );
+    }
 }
 
 /// The two PR-blocking classifiers, pinned on BOTH sides against hand-written
@@ -4439,7 +4562,7 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
 const REQUIRED_CONTEXTS_FILE: &str = "tools/ci/required_contexts.txt";
 
 /// How many names that export carries.
-const REQUIRED_CONTEXT_COUNT: usize = 20;
+const REQUIRED_CONTEXT_COUNT: usize = 22;
 
 /// The events a workflow that produces a required check name may trigger on.
 ///

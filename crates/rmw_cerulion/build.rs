@@ -79,6 +79,11 @@ use std::path::{Path, PathBuf};
 mod era_check;
 use era_check::{check_distro_claim, observed_era_label, DistroClaimVerdict};
 
+// Which builds carry the period-learned park: SHARED with the crate's tests
+// (`src/period_park_cfg.rs`), which pin the same rule this script emits.
+#[path = "src/period_park_cfg.rs"]
+mod period_park_cfg;
+
 /// Every doc comment bindgen lifts from the ROS headers is wrapped in a
 /// `text` code fence, so the doxygen text ships verbatim on the generated
 /// bindings while rustdoc never reads an indented line of it as a Rust
@@ -113,6 +118,7 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 /// | `message_info_sequence_numbers` | Humble | `rmw_message_info_t` growth |
 /// | `discovery_options` | Iron | embedded in `rmw_init_options_t` |
 /// | `matched_events` | Iron | matched/incompatible-type events |
+/// | `durability_best_available` | Iron | `RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE` (best-available QoS policies) |
 /// | `message_lost_event` | Galactic | `RMW_EVENT_MESSAGE_LOST` |
 /// | `event_type_max` | Lyrical | `RMW_EVENT_TYPE_MAX` sentinel |
 /// | `type_hash` | Iron | typesupport type-hash trio (RIHS) |
@@ -123,7 +129,7 @@ impl bindgen::callbacks::ParseCallbacks for DocCommentsAsText {
 ///
 /// Token-choice rule: each token appears in the bindgen output IFF the
 /// capability's type/field/constant exists in the sourced headers (all
-/// 18 verified present in the vendored rolling snapshot, and absent
+/// 19 verified present in the vendored rolling snapshot, and absent
 /// per-era in the downloaded foxy/humble/jazzy/lyrical branch headers).
 /// Substring matching is deliberate — `discovery_options` matching
 /// `rmw_discovery_options_t` AND the `rmw_init_options_s` field is the
@@ -146,6 +152,10 @@ const CAPABILITIES: &[(&str, &str)] = &[
     ),
     ("discovery_options", "discovery_options"),
     ("matched_events", "RMW_EVENT_SUBSCRIPTION_MATCHED"),
+    (
+        "durability_best_available",
+        "RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE",
+    ),
     ("message_lost_event", "RMW_EVENT_MESSAGE_LOST"),
     ("event_type_max", "RMW_EVENT_TYPE_MAX"),
     ("type_hash", "get_type_hash_func"),
@@ -263,7 +273,21 @@ fn main() {
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=src/ffi/vendored_bindings.rs");
     println!("cargo:rerun-if-changed=src/era_check.rs");
+    println!("cargo:rerun-if-changed=src/period_park_cfg.rs");
     println!("cargo:rerun-if-changed=shim/cppstring_shim.cpp");
+
+    // The period-learned park in `rmw_wait`: `cerulion_period_park` on every
+    // Linux aarch64 build, and on any other build with the `period-park`
+    // feature. Cargo reruns this script when the feature set or the target
+    // changes.
+    println!("cargo:rustc-check-cfg=cfg(cerulion_period_park)");
+    if period_park_cfg::period_park_compiled(
+        env::var_os("CARGO_FEATURE_PERIOD_PARK").is_some(),
+        &env::var("CARGO_CFG_TARGET_OS").unwrap_or_default(),
+        &env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default(),
+    ) {
+        println!("cargo:rustc-cfg=cerulion_period_park");
+    }
 
     // Declare every capability cfg up front (both paths) so the
     // `unexpected_cfgs` lint knows the names; emission below is

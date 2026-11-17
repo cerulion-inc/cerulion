@@ -285,6 +285,16 @@ fn a_data_service_at_another_wire_header_version_is_refused_by_every_opener() {
     // The count probes read it as absent rather than as a live topic.
     assert_eq!(mgr.topic_publisher_count(topic), 0);
     assert_eq!(mgr.topic_publisher_count_checked(topic), None);
+    // The retain-mark probe refuses it, naming both versions.
+    let refused = mgr
+        .topic_publisher_retain_marks(topic)
+        .expect_err("the retain-mark probe must refuse")
+        .to_string();
+    assert!(
+        refused.contains("Could not read the publishers of topic '/wirehdr/other'")
+            && refused.contains(&want),
+        "the probe error must name the topic and both versions: {refused}"
+    );
 }
 
 /// A data service that states NO wire header version (a raw iceoryx2

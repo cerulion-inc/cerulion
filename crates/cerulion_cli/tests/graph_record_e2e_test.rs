@@ -17,8 +17,10 @@
 //!    `/proc/<pid>/status` `Cpus_allowed_list` equals the requested core.
 //!
 //! Prerequisite (repo pattern, mirrors `rayon_fire_cdylib_serial_test`):
-//! `cargo build -p test_node_macro_period_cdylib` — the test PANICS with that
-//! instruction if the fixture artifact is missing.
+//! `cargo build -p test_node_macro_period_cdylib -p
+//! test_node_macro_data_trigger_cdylib` (the outside-input arm copies the
+//! second as its relay); a test PANICS with that instruction if a fixture
+//! artifact is missing.
 //!
 //! Runs on the GLOBAL iceoryx2 namespace (the production `graph run` path has
 //! no isolation seam — that is the point of an orchestration e2e); `#[serial]`
@@ -57,9 +59,8 @@ impl Drop for ChildGuard {
 /// the graph-run parent; bagd runs in its OWN process group (the production
 /// `process_group(0)`), so killing the parent on a mid-window panic ORPHANS
 /// bagd (holding the .mcap + SHM taps past tempdir teardown). On Drop this
-/// pgrep-discovers any bagd spawned by THIS file's runs — the relative
-/// `--out recordings/demo_...` cmdline form is unique to the recording
-/// driver (the sibling subprocess suite passes absolute temp paths) —
+/// pgrep-discovers bagd from this file's `demo_` recording family,
+/// accepting relative and absolute output directories,
 /// and SIGKILLs its process group (bagd is its own group leader, so
 /// `killpg(pid)` is exact). Best-effort; init reaps the orphan. Armed
 /// IMMEDIATELY after every spawn, not only in the kill variant.
@@ -67,7 +68,7 @@ struct BagdGuard;
 impl Drop for BagdGuard {
     fn drop(&mut self) {
         if let Ok(out) = Command::new("pgrep")
-            .args(["-f", "bagd --out recordings/demo_"])
+            .args(["-f", "bagd --out (/[^[:space:]]*/)?recordings/demo_"])
             .output()
         {
             for pid in String::from_utf8_lossy(&out.stdout)
@@ -180,6 +181,19 @@ const PROBE_SECRET_VALUE: &str = "cer-record-probe-secret-value";
 /// FNV-1a 64 test vectors.
 const PROBE_SECRET_FNV64: &str = "f63ebe3c0e65672d";
 
+/// The secret-NAME probe: an ALLOWLISTED name (`CERULION_*`) whose `TOKEN`
+/// segment marks it as a secret, so the default `--record-env allowlist` must
+/// hash its value even though the name is on the allowlist.
+const PROBE_TOKEN_NAME: &str = "CERULION_E2E_PROBE_TOKEN";
+
+/// The secret-name probe's value: long and distinctive, like
+/// [`PROBE_SECRET_VALUE`], so its absence from the bytes is not a coincidence.
+const PROBE_TOKEN_VALUE: &str = "cer-record-probe-token-value";
+
+/// FNV-1a 64 of [`PROBE_TOKEN_VALUE`], computed outside the tree with the
+/// same parameters as [`PROBE_SECRET_FNV64`].
+const PROBE_TOKEN_FNV64: &str = "5c2b3670b7a85a12";
+
 /// FNV-1a 64 over `bytes`, written out here rather than imported: the production
 /// renderer hashes with `cerulion_core::wire::fnv1a_hash`, and calling that same
 /// function to check its own output would assert nothing. Anchored on the
@@ -235,6 +249,9 @@ fn spawn_graph_record(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf, Path
         // `PROBE_SECRET_FNV64` there. Set in the harness (not one arm) so every
         // recording in this file is made in the presence of a secret.
         .env(PROBE_SECRET_NAME, PROBE_SECRET_VALUE)
+        // The secret-NAME probe: allowlisted by prefix, hashed by its `TOKEN`
+        // segment (`PROBE_TOKEN_FNV64` in the happy-path arm).
+        .env(PROBE_TOKEN_NAME, PROBE_TOKEN_VALUE)
         // Keep the captured log PLAIN. `cerulion_core::init_logging` builds a
         // `fmt::layer()` with tracing-subscriber's `ansi` feature on, which
         // italicises field NAMES and dims the `=`, so a field arrives as
@@ -397,6 +414,11 @@ fn record_e2e_ctrl_c_exits_zero_with_finalized_bag_and_ordered_lifecycle() {
         PROBE_SECRET_FNV64,
         "the recorded constant must be the hash of the probe value it names"
     );
+    assert_eq!(
+        format!("{:016x}", fnv1a_64(PROBE_TOKEN_VALUE.as_bytes())),
+        PROBE_TOKEN_FNV64,
+        "the recorded constant must be the hash of the token probe value it names"
+    );
 
     let env_json: serde_json::Value =
         serde_json::from_slice(&env_att.data).expect("env.json parses as JSON");
@@ -423,12 +445,32 @@ fn record_e2e_ctrl_c_exits_zero_with_finalized_bag_and_ordered_lifecycle() {
         "an ALLOWLISTED name (CERULION_*) keeps its value verbatim — this is the half that fails \
          if the default is mapped to `none` or if everything is redacted"
     );
-    // The secret itself never reaches the artifact. Checked over the RAW bytes,
-    // not the parsed value, so a second copy anywhere in the attachment (a
-    // duplicated key, a nested render) is caught too.
+    // An ALLOWLISTED name with a secret marker segment is hashed like a
+    // non-allowlisted one, while `CERULION_NETWORK` above stays verbatim.
+    let token = &env_json[PROBE_TOKEN_NAME];
+    assert_eq!(
+        token["redacted"],
+        serde_json::Value::Bool(true),
+        "a CERULION_* name with a TOKEN segment must be recorded as \
+         {{\"redacted\":true,\"fnv64\":...}} under the DEFAULT --record-env allowlist; got {token}"
+    );
+    assert_eq!(
+        token["fnv64"].as_str(),
+        Some(PROBE_TOKEN_FNV64),
+        "the secret-named value must carry its FNV-1a 64 so replay can DETECT divergence; got \
+         {token}"
+    );
+    // The secrets themselves never reach the artifact. Checked over the RAW
+    // bytes, not the parsed value, so a second copy anywhere in the attachment
+    // (a duplicated key, a nested render) is caught too.
+    let env_text = String::from_utf8_lossy(&env_att.data);
     assert!(
-        !String::from_utf8_lossy(&env_att.data).contains(PROBE_SECRET_VALUE),
+        !env_text.contains(PROBE_SECRET_VALUE),
         "the env.json attachment must not contain the secret literal"
+    );
+    assert!(
+        !env_text.contains(PROBE_TOKEN_VALUE),
+        "the env.json attachment must not contain the secret-named token literal"
     );
     // A REAL `--record` bag carries the recorder-host
     // identity attachment, stamped with THIS host's arch/os (replay warns on
@@ -457,6 +499,13 @@ fn record_e2e_ctrl_c_exits_zero_with_finalized_bag_and_ordered_lifecycle() {
     assert!(
         recorder["recorded_at_ns"].as_u64().unwrap_or(0) > 0,
         "recorder.json carries the recording start timestamp: {recorder}"
+    );
+    // Each native node's driver flag, from the loaded library: the period
+    // fixture is an ordinary node.
+    assert_eq!(
+        recorder["node_external"],
+        serde_json::json!({"ticker": false}),
+        "recorder.json names every node's driver flag: {recorder}"
     );
 
     // Ordered lifecycle in the merged child log. The lifecycle breadcrumbs are
@@ -1231,4 +1280,84 @@ fn record_e2e_channel_wire_size_comes_from_the_node_when_the_workspace_file_disa
              proves nothing about this one; line:\n{warn}"
         );
     }
+}
+
+/// Stage the OUTSIDE-INPUT workspace: `build_workspace`'s, with `demo` replaced
+/// by one `relay` node (a copy of the prebuilt
+/// `test_node_macro_data_trigger_cdylib`, which fires on `trigger_in`) whose
+/// input reads `/{prefix}/ticker/cmd`, a topic no node in `demo` publishes.
+fn build_outside_input_workspace(root: &Path, prefix: &str) {
+    build_workspace(root, prefix);
+    std::fs::create_dir_all(root.join("nodes/relay/src")).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("test_fixtures/test_node_macro_data_trigger_cdylib/src/lib.rs"),
+        root.join("nodes/relay/src/lib.rs"),
+    )
+    .expect("copy relay fixture src");
+    std::fs::copy(
+        cerulion_core::testing::find_fixture_cdylib("test_node_macro_data_trigger_cdylib"),
+        root.join("target/debug").join(dylib_file("relay")),
+    )
+    .expect("copy relay fixture cdylib");
+    std::fs::write(
+        root.join("graphs/demo.yaml"),
+        format!(
+            "name: demo\nprefix: {prefix}\nnodes:\n- id: relay\n  type: relay\n  inputs:\n  \
+             - name: trigger_in\n    source: /{prefix}/ticker/cmd\n  outputs:\n  - name: cmd\n    \
+             schema: geometry_msgs/Vector3\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// A single-process recording of a graph that reads a topic no node in it
+/// publishes is REFUSED before the run starts: exit 1, the refusal names the
+/// topic and its reader and says to record without `--single-process`, the
+/// single-process bring-up (which logs once the node libraries are loaded for
+/// the run) never began, and no bag was written.
+///
+/// Without the refusal, the same run with an outside publisher on that topic
+/// records, and `bag play --resim all --verify` on its bag exits 6 with the
+/// relay replaying none of its frames: the publisher's boot-monotonic stamps
+/// lie above every step target of this recording's clock, which starts at
+/// zero.
+#[test]
+#[serial]
+fn record_e2e_refuses_a_graph_that_reads_a_topic_no_node_in_it_publishes() {
+    let tmp = tempfile::tempdir().unwrap();
+    build_outside_input_workspace(tmp.path(), "rece2eout");
+    let (mut guard, _stdout_path, stderr_path) = spawn_graph_record(tmp.path(), &[]);
+    let _bagd_guard = BagdGuard;
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(60))
+        .expect("a refused recording returns on its own");
+    let log = strip_ansi(&read_file(&stderr_path));
+    assert_eq!(status.code(), Some(1), "the refusal exits 1; log:\n{log}");
+    for want in [
+        "graph 'demo' reads a topic that no node in it publishes: \
+         '/rece2eout/ticker/cmd' (read by relay).",
+        "Record this graph without `--single-process`",
+    ] {
+        assert!(
+            log.contains(want),
+            "the refusal must say {want:?}; log:\n{log}"
+        );
+    }
+    assert!(
+        !log.contains("the never-returning-tick alarm is not reporting"),
+        "the refusal comes before the single-process bring-up; log:\n{log}"
+    );
+    let bags: Vec<PathBuf> = std::fs::read_dir(tmp.path().join("recordings"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("mcap"))
+        .collect();
+    assert!(
+        bags.is_empty(),
+        "a refused recording writes no bag: {bags:?}"
+    );
 }

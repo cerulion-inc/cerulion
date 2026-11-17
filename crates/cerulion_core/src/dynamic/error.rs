@@ -520,6 +520,16 @@ pub enum DynamicError {
         path: String,
     },
 
+    /// The message body would pass the reader's
+    /// [`crate::dynamic::YamlDecodeOptions::max_body_bytes`] limit.
+    #[error("{path}: the message body is larger than the {max_bytes}-byte limit")]
+    YamlBodyTooLarge {
+        /// The field path being built when the limit was passed.
+        path: String,
+        /// The limit.
+        max_bytes: usize,
+    },
+
     /// The YAML form of a frame is longer than the encoder's output cap
     /// ([`crate::dynamic::MAX_YAML_BYTES`]).
     #[error("{path}: the YAML form passes the {max_bytes}-byte output cap")]

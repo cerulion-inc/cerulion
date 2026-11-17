@@ -103,7 +103,7 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("mux_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "mux".to_string(),
@@ -112,10 +112,12 @@ fn build_rig(prefix: &str) -> Rig {
                 InputDef {
                     name: "joy_cmd".to_string(),
                     source: joy_topic.clone(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "key_cmd".to_string(),
                     source: key_topic.clone(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![OutputDef {

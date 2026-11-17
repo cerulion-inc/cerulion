@@ -147,32 +147,25 @@ fn a_cdylib_without_the_symbol_loads_and_refuses_a_handoff_by_name() {
         .expect_err("a value for a cdylib with no params symbol must be refused");
     let text = err.to_string();
     assert!(
-        text.contains("cerulion_node_init_with_params") && text.contains("gain"),
+        text.contains("declares no params") && text.contains("gain"),
         "{text}"
     );
 }
 
-/// The graph build hands every node its FULL resolved map, defaults
-/// included, so a library that declares params it cannot receive would be
-/// refused on every run, with or without `params:` in the graph. It is
-/// refused once, where the library's info is read, so `graph validate`,
-/// `graph run` and `node info` all say the same thing: the load succeeds,
-/// `info()` names the missing symbol and the declared params.
+/// The stable create entry always accepts a serialized parameter map; metadata
+/// declares the schema independently of any optional legacy Rust symbol.
 #[test]
-fn a_library_that_declares_params_without_the_symbol_is_refused_when_its_info_is_read() {
-    let node = load(DECLARES_WITHOUT_SYMBOL_FIXTURE);
-    let err = node
-        .info()
-        .expect_err("a declared param with no symbol to deliver it must refuse the library");
-    let text = err.to_string();
-    assert!(
-        text.contains("declares params (gain)")
-            && text.contains("exports no cerulion_node_init_with_params symbol")
-            && text.contains("cerulion node build"),
-        "{text}"
-    );
-    // Not cached: a second read refuses again rather than serving a stale Ok.
-    assert!(node.info().is_err());
+fn declared_params_are_available_through_the_required_stable_create_entry() {
+    let mut node = load(DECLARES_WITHOUT_SYMBOL_FIXTURE);
+    let info = node.info().expect("stable metadata");
+    assert_eq!(info.params().len(), 1);
+    assert_eq!(info.params()[0].name, "gain");
+    node.set_params(&values(&[("gain", ParamValue::Float(2.5))]))
+        .unwrap();
+    node.init(NodeContext::for_tests(IndexMap::new(), IndexMap::new()))
+        .unwrap();
+    node.tick().unwrap();
+    node.shutdown().unwrap();
 }
 
 /// The four transport scenarios, in one process, transports first (see the

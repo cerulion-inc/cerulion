@@ -13,6 +13,7 @@ use quote::{format_ident, quote};
 use syn::meta::ParseNestedMeta;
 use syn::{Ident, LitInt};
 
+use crate::crate_root;
 use crate::parse::{FieldInputAttr, ParsedBackpressurePolicy};
 
 /// The keys an accumulate input accepts, quoted in every refusal.
@@ -136,12 +137,16 @@ pub fn no_policy_note(field_attrs: &crate::parse::FieldAttrs) -> &'static str {
 /// entry's `AccumulatorSet` (`self.__cer_accumulators`) before the user's
 /// `init` runs.
 pub fn register_calls(inputs: &[FieldInputAttr]) -> TokenStream {
+    register_calls_for(inputs, &quote! { self })
+}
+
+pub(crate) fn register_calls_for(inputs: &[FieldInputAttr], entry: &TokenStream) -> TokenStream {
     let calls = inputs.iter().filter_map(|i| {
         let cap = i.accumulate?;
         let name = i.field_name.to_string();
         let ty = &i.field_type;
         Some(quote! {
-            self.__cer_accumulators.register::<#ty>(&mut context, #name, #cap)?;
+            #entry.__cer_accumulators.register::<#ty>(&mut context, #name, #cap)?;
         })
     });
     quote! { #(#calls)* }
@@ -158,6 +163,7 @@ pub struct AccumulatePort<'a> {
 /// user body runs. All serves are marked first, then every view is taken
 /// as a shared borrow, so several accumulate ports can be in scope at once.
 pub fn serve_bindings(ports: &[AccumulatePort<'_>]) -> TokenStream {
+    let __cer_root = crate_root::root();
     let marks = ports.iter().map(|p| {
         let name = p.name.to_string();
         quote! { __cer_acc.mark_served(#name); }
@@ -170,7 +176,7 @@ pub fn serve_bindings(ports: &[AccumulatePort<'_>]) -> TokenStream {
         // lives to the end of the block, and no extra name can shadow
         // another port's `__cer_<port>` local.
         quote! {
-            let #local: &::cerulion_core::transport::accumulate::Accumulated<'_, #ty> =
+            let #local: &#__cer_root::transport::accumulate::Accumulated<'_, #ty> =
                 &__cer_acc.view::<#ty>(#name);
         }
     });

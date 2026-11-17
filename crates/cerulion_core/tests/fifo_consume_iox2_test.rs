@@ -79,6 +79,8 @@ fn burst_consumer_graph(
             depth,
             backpressure,
             expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -100,7 +102,7 @@ fn burst_consumer_graph(
         identity: "fifo_consume".to_string(),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -108,6 +110,7 @@ fn burst_consumer_graph(
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/fifo/ext".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -359,6 +362,8 @@ fn latest_value_context_inputs_keep_drain_to_latest() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -378,7 +383,7 @@ fn latest_value_context_inputs_keep_drain_to_latest() {
         identity: "fifo_ctx_control".to_string(),
         prefix: "fifoctx".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "reader".to_string(),
@@ -386,6 +391,7 @@ fn latest_value_context_inputs_keep_drain_to_latest() {
             inputs: vec![InputDef {
                 name: "ctx_in".to_string(),
                 source: "/fifo/ext".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -460,6 +466,8 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
             depth: DEPTH,
             backpressure: BackpressurePolicy::Block,
             expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -483,7 +491,7 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
         prefix: "fifoblk".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -498,7 +506,7 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -506,6 +514,7 @@ fn block_with_fifo_is_lossless_end_to_end_on_the_tick_path() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -584,7 +593,7 @@ fn cdylib_data_trigger_forwards_a_burst_per_message_in_order() {
         identity: "fifo_cdylib_parity".to_string(),
         prefix: "fifodyl".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "node".to_string(),
@@ -592,6 +601,7 @@ fn cdylib_data_trigger_forwards_a_burst_per_message_in_order() {
             inputs: vec![InputDef {
                 name: "trigger_in".to_string(),
                 source: IN_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![OutputDef {
                 name: "cmd".to_string(),
@@ -671,6 +681,8 @@ fn a_throttled_data_trigger_consumer_loses_no_frames() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -693,7 +705,7 @@ fn a_throttled_data_trigger_consumer_loses_no_frames() {
         identity: "fifo_throttle".to_string(),
         prefix: "fifothr".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -701,6 +713,7 @@ fn a_throttled_data_trigger_consumer_loses_no_frames() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/fifo/ext".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -762,6 +775,8 @@ fn a_collapsed_tick_does_not_wedge_the_input_and_the_backlog_survives() {
             depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
             backpressure: BackpressurePolicy::DropOldest,
             expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
         }],
         vec![],
     )
@@ -790,7 +805,7 @@ fn a_collapsed_tick_does_not_wedge_the_input_and_the_backlog_survives() {
         identity: "fifo_collapse".to_string(),
         prefix: "fifocol".to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "sink".to_string(),
@@ -798,6 +813,7 @@ fn a_collapsed_tick_does_not_wedge_the_input_and_the_backlog_survives() {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "/fifo/ext".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

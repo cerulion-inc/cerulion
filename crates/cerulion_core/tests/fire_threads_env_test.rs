@@ -127,7 +127,7 @@ fn prod_cons_graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "prod".to_string(),
@@ -142,7 +142,7 @@ fn prod_cons_graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "cons".to_string(),
@@ -150,6 +150,7 @@ fn prod_cons_graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

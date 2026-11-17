@@ -232,7 +232,7 @@ fn run_capture(
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -247,7 +247,7 @@ fn run_capture(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "portwrite".to_string(),
@@ -255,6 +255,7 @@ fn run_capture(
                 inputs: vec![InputDef {
                     name: "text_in".to_string(),
                     source: "producer/text".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![OutputDef {
                     name: "image".to_string(),
@@ -265,7 +266,7 @@ fn run_capture(
                 }],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "capture".to_string(),
@@ -273,6 +274,7 @@ fn run_capture(
                 inputs: vec![InputDef {
                     name: "image".to_string(),
                     source: "portwrite/image".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

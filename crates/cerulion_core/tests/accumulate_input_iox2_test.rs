@@ -299,7 +299,7 @@ fn writer_def(id: &str) -> NodeDef {
 
 fn writer_on(id: &str, topic: &str) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -319,12 +319,13 @@ fn input(name: &str, source: &str) -> InputDef {
     InputDef {
         name: name.to_string(),
         source: source.to_string(),
+        ..Default::default()
     }
 }
 
 fn reader_def(node_type: &str, inputs: Vec<InputDef>) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: "reader".to_string(),
@@ -384,7 +385,7 @@ fn build(prefix: &str, reader: Box<dyn NodeEntry>) -> GraphRuntime {
             writer_def("writer_a"),
             writer_def("writer_b"),
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "reader".to_string(),
@@ -392,6 +393,7 @@ fn build(prefix: &str, reader: Box<dyn NodeEntry>) -> GraphRuntime {
                 inputs: vec![InputDef {
                     name: "tf".to_string(),
                     source: TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

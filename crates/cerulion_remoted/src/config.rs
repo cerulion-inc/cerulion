@@ -53,9 +53,11 @@ pub struct RemotedConfig {
     pub receipt_file: PathBuf,
     /// The `log-tail` allow-list root.
     pub log_root: PathBuf,
-    /// The PUBLIC beacon-facts file the daemon writes at startup +
-    /// refreshes after a claim, read by the gateway for mDNS TXT enrichment.
+    /// The PUBLIC beacon-facts file the daemon writes at startup, read by the
+    /// gateway for mDNS TXT enrichment.
     pub beacon_facts_file: PathBuf,
+    /// Where the rcp plane reaches the local `cerulion-rcpd` ([`crate::rcp`]).
+    pub rcp: crate::rcp::RcpLink,
     /// The relay posture (default: n0 public relays, by design).
     pub relay: RelayConfig,
     /// Whether `--network off` / `CERULION_NETWORK=off` is engaged (R8): the
@@ -79,6 +81,7 @@ impl RemotedConfig {
             receipt_file: dir.join(RECEIPT_FILENAME),
             log_root: dir.join(LOGS_SUBDIR),
             beacon_facts_file: dir.join(BEACON_FACTS_FILENAME),
+            rcp: crate::rcp::RcpLink::under(&dir),
             relay,
             network_disabled,
         }

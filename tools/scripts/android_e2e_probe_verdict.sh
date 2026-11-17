@@ -3,7 +3,7 @@
 # direct data demand probe (crates/test_fixtures/android_e2e_demand_probe)
 # matches what the app's LAN posture must do.
 #
-#   android_e2e_probe_verdict.sh paired|open|schema-mismatch <app-identity> <probe-output>
+#   android_e2e_probe_verdict.sh paired|open|schema-mismatch|connect <app-identity> <probe-output>
 #
 # <app-identity> is the robot identity the app runs under: every counted ack
 # must come from it. <probe-output> is everything the probe printed. It must hold exactly one
@@ -19,6 +19,10 @@
 #   schema-mismatch  the probe expected a schema the topic does not carry: the
 #                    demand is granted, frames reach the ingress, and every one
 #                    is dropped on the schema hash, so none is delivered.
+#   connect          what open must do, over the link the app dialed: the
+#                    probe listened and dialed nothing (`dialer=app`). Every
+#                    other expectation reads an app the probe dialed
+#                    (`dialer=probe`).
 #
 # In every expectation the acks must come from the app alone (`ack_peers` is
 # exactly <app-identity>, or empty when no ack was counted): an ack from any
@@ -40,7 +44,7 @@ set -euo pipefail
 set -f
 
 usage() {
-    printf '%s\n' 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch <app-identity> <probe-output>' >&2
+    printf '%s\n' 'usage: android_e2e_probe_verdict.sh paired|open|schema-mismatch|connect <app-identity> <probe-output>' >&2
     exit 2
 }
 
@@ -48,7 +52,7 @@ usage() {
 expect=$1
 app=$2
 case "$expect" in
-    paired | open | schema-mismatch) ;;
+    paired | open | schema-mismatch | connect) ;;
     *) usage ;;
 esac
 # A robot identity: 1 to 63 ASCII letters, digits, '_' or '-'.
@@ -99,6 +103,11 @@ field() {
 
 # A reject inside `field` exits only its command substitution, with the
 # reason on its stdout, so each read passes that reason on and exits.
+dialer=$(raw_field dialer) || { printf '%s\n' "$dialer"; exit 1; }
+case "$dialer" in
+    probe | app) ;;
+    *) reject "field 'dialer' is not probe or app: $dialer" ;;
+esac
 passes=$(field passes) || { printf '%s\n' "$passes"; exit 1; }
 enabled=$(field enabled_acks) || { printf '%s\n' "$enabled"; exit 1; }
 refused=$(field refused_acks) || { printf '%s\n' "$refused"; exit 1; }
@@ -152,12 +161,22 @@ fi
     reject "the probe's ingress refused $lan_refused frame(s) on its own LAN posture"
 
 case "$expect" in
+    connect)
+        [ "$dialer" = app ] ||
+            reject "dialer=$dialer, but the connect case needs the app to dial the probe"
+        ;;
+    *)
+        [ "$dialer" = probe ] ||
+            reject "dialer=$dialer, but the $expect case needs the probe to dial the app"
+        ;;
+esac
+case "$expect" in
     paired)
         [ "$enabled" -eq 0 ] || reject "a paired app granted $enabled demand(s)"
         [ "$wire" -eq 0 ] || reject "a paired app sent $wire frame(s) to the probe"
         [ "$refused" -ge 1 ] || reject 'no demand was refused, so the posture was not exercised'
         ;;
-    open)
+    open | connect)
         [ "$refused" -eq 0 ] || reject "an open app refused $refused demand(s)"
         [ "$enabled" -ge 1 ] || reject 'an open app granted no demand'
         [ "$mismatch" -eq 0 ] || reject "an open app dropped $mismatch frame(s) on the schema"
@@ -173,6 +192,6 @@ case "$expect" in
         ;;
 esac
 
-printf 'passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
-    "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$mismatch" "$decode" "$reinject" \
+printf 'dialer=%s passes=%s enabled_acks=%s refused_acks=%s wire_header_refused_acks=%s ack_peers=%s schema_mismatch_drops=%s decode_errors=%s reinject_failure_drops=%s lan_refused_drops=%s wire_frames=%s frames=%s\n' \
+    "$dialer" "$passes" "$enabled" "$refused" "$wire_header" "$peers" "$mismatch" "$decode" "$reinject" \
     "$lan_refused" "$wire" "$frames"

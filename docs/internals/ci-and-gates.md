@@ -27,6 +27,28 @@ regression introduced by a shared dependency outside those paths. It is not a
 required context. Its `android-emulator` Cargo cache restores by default and
 saves only when the cache policy opts that namespace in.
 
+## Period park lanes
+
+`Period park (x86_64 Linux)` and `Period park (aarch64 Linux)` build, lint and
+test the period-learned park of `rmw_cerulion` (cfg `cerulion_period_park`),
+one on `ubuntu-latest` and one on the hosted `ubuntu-24.04-arm` runner, on every
+run of the CI workflow: pull requests, merge-queue runs, pushes to `main` and
+manual runs. Every Linux aarch64 build carries the park; on x86_64 only
+`--features period-park` does. Each leg runs clippy with `-D warnings` over all
+targets with the feature on and off, then over the bare lib with and without it
+(the only build of the lib without `test-seams`), then the crate's tests
+serially with the feature on. On the aarch64 leg the feature on and off compile
+the same park, so there those steps differ only in the cfg rule's own test. The aarch64 leg then runs the tests again with
+default features and `CERULION_RMW_PERIOD_PARK=0`, which turns the learned park
+off at run time, since no other job tests the one-rung idle park that the
+switch restores on aarch64 Linux. The steps run when the path classifier
+selects `rmw_cerulion`. This is the only job that runs clippy on Linux aarch64,
+where `c_char` is `u8` rather than `i8`, so an `as` cast between `c_char` and
+`u8` lints there and nowhere else. Both legs are required contexts (see
+`tools/ci/required_contexts.txt`). Its cache namespaces are `period-park-X64`
+and `period-park-ARM64`; the default save policy is restore-only until they are
+opted in.
+
 ## Lint job budget
 
 The `Lint` job has a 45-minute limit covering runner setup, cache restore,
@@ -287,7 +309,7 @@ enforces.
 | `the_robot_demo_workspace_is_rerun_free` | Any `examples/go2` crate takes a rerun dependency of any kind. Read from that workspace's committed manifests and lockfile, so dev edges, build edges and every platform count. |
 | `the_robot_workspace_reader_sees_normal_and_dev_packages` | The lockfile reader stops seeing `go2_tf`, or the manifest reader stops seeing `tempfile`, which `dds_bridge` declares only under `[dev-dependencies]`. A dev edge is how the Rerun SDK reached the robot the one time it did, so that is the arm worth a control of its own. |
 | `the_dds_stack_is_confined_to_cerulion_dds` | A second workspace member declares a DDS dependency, or the default build reaches the DDS stack along a route that avoids `cerulion_dds`. |
-| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, `cerulion_ops_proto` anything but serde, serde_json and thiserror, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
+| `the_lean_crates_declare_exactly_their_allowed_dependencies` | `cerulion_discovery` declares anything but serde, serde_json, dirs and tracing, `cerulion_ops_proto` anything but serde, serde_json, thiserror and base64, or `cerulion_hygiene` anything but libc and tracing. Exact in both directions: an allowance nobody removed pre-authorises the next edge. |
 | `the_confined_crates_reach_nothing_they_forbid` | `cerulion_pairing` reaches iroh or rerun, `cerud` reaches iceoryx2 or zenoh, or `cerulion_link` reaches `cerulion_core`. |
 | `the_permissive_crates_reach_no_agpl_crate` | A workspace crate licensed `MIT OR Apache-2.0` reaches an AGPL workspace crate over normal or build edges, or one of the four documented permissive crates stops declaring that license. A control requires the same check to report `cerud` under `cerulion_remoted`. |
 | `the_heavy_members_stay_out_of_default_members` | One of the eleven deliberate `default-members` exclusions is back in the default set, or a member left the default set with no row saying why. Checked in both directions, and each row names what a plain build would gain. |
@@ -370,6 +392,10 @@ so run it before pushing any `src/` doc-comment change.
 `//!` header cannot break this gate, a useful thing to know before being cautious about
 the long doc comments this repo's test files carry.
 
+The `cerulion` binary of `cerulion_cli` sets `doc = false`. The umbrella library crate has the
+same name, rustdoc writes both to `target/doc/cerulion`, and the two outputs race under
+`cargo doc --workspace` (cargo issue 6313): the gate then fails at random with missing files.
+
 ## The login gate in CI
 
 Every `cerulion` command runs under an account, in every build. CI machines have
@@ -392,6 +418,33 @@ string, the public-surface gate's own fixture) is recorded in `NOT_AN_INVOCATION
 its reason, and a line there that stops matching fails too. `cerulion --version` is not
 an invocation for this purpose: clap answers it above the gate.
 
+`CERULION_LOGIN_GATE=off` switches off the command-wide check and nothing else.
+Serving the network is a second rule the variable does not reach. These need a
+saved login on the machine (an expired one counts):
+
+- a real-clock `graph run` or `node run` that offers topics to the network: under
+  the permissive default (no `network:` block, or one with `mode: disabled` or no
+  `mode:`), any graph with a producer or a `ros2:` node; under an enabled
+  `network:` block (`mode: peer` or `mode: client`), one that lists egress topics;
+- a `ros2 attach` that is not a dry run;
+- a `cerulion-netd` started with `CERULION_NETD_LISTEN`.
+
+Without one they refuse with
+`` serving the network requires a prior login; run `cerulion login` ``. The runs
+and `ros2 attach` also accept a saved robot pairing; the netd listener does not.
+A job with no account keeps a `graph run` or `node run` on the runner with
+`--network off` (also spelled `--local`) or `CERULION_NETWORK=off`, and a
+`ros2 attach` with `CERULION_NETWORK=off` (it has no `--network` flag); a
+`graph run` under `--time-source virtual` or `external` is inert too. The release
+install smoke and the perception replay demo both pass `--network off`. The seeded
+login below satisfies the serving rule as well, and a run under it then serves for
+real. The workspace latency harness runs its real-clock legs under the permissive
+default (its backtoback leg passes `--time-source virtual` and stays inert), and the
+cross-host harness's `cerulion-tcp` and `cerulion-quic` stacks give each machine a
+`network:` block that lists egress topics. Both harnesses therefore need a
+signed-in machine for those legs, and the cross-host harness needs a login on each
+of its two machines.
+
 A job that wants a machine WITH an account instead seeds one:
 `tools/ci/seed_test_login.sh <dir>` writes the `auth.json` a real sign-in writes,
 and `CERULION_HOME=<dir>` points the gate at it. The file's shape is pinned
@@ -406,7 +459,12 @@ that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/
 the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
 the agent-docs gate; the leak guard's self-test and generic-class tree scan; the three
 crates.io script self-tests (the index wait, the publish retry, and the post-publish
-archive reader `release.yml` runs after an upload); the naming gate (pull requests only);
+archive reader `release.yml` runs after an upload); the nextest, actionlint and cargo-deny
+installer self-tests, the tool tarball cache key self-test and the tool download check
+(`tools/scripts/check_tool_downloads.py`: every curl download in a workflow or a tool
+fetcher is retried, bounded and written to a file, and every fetcher but
+`install_hooks.sh` holds one); the
+naming gate (pull requests only);
 `shellcheck` over
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
@@ -477,6 +535,25 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 
+`examples` opens with a lockfile WALK: `cargo metadata --locked` over every tracked
+`Cargo.lock` outside the root (the benches, the examples, the Python wheel, the Android sample
+runtime; floor 13), ahead of any build step that could rewrite one, so a dependency change under
+`crates/` that is not carried into those lockfiles fails there. Refresh one with
+`cargo metadata --format-version 1 --manifest-path <dir>/Cargo.toml > /dev/null`. That is not a
+minimal edit: it adds every crate the manifests now require at its newest compatible version, and
+where a path crate's dependencies changed it can re-point a dependency edge of a crate already
+locked (onto another locked major version of `syn`, for example). Read its diff: keep each added
+package and each move the new requirements force (an exact `=` pin or a raised minimum in a
+crate manifest, directly or through the moved crate's own dependencies); restore a changed line
+of an already-locked package only when its old version still satisfies every requirement (an
+edge re-pointed onto another locked version, or a newer version cargo picked on its own); then
+confirm with `cargo metadata --locked`. The
+Android sample runtime's lockfile, seeded from the root one, takes each added registry crate at
+the version the root `Cargo.lock` ships (the Python wheel's does the same for the iceoryx2
+family). `cargo update -p <crate> --precise <root version>` sets that version, but it re-resolves
+the same way and can re-point more edges, so diff the result against the stale file and the root
+`Cargo.lock` again.
+
 Five Linux jobs run on push / `workflow_dispatch` only and never
 on a `pull_request` event: `deb-smoke`, `cross-aarch64-linux`, `fuzz`, `miri` and
 `machete` each carry a job-level `if: github.event_name != 'pull_request' && github.event_name
@@ -489,7 +566,9 @@ status context on `main`, so a skipped one is simply absent from a pull request'
 They run on every merge to `main` (the push run is where their breakage
 surfaces, revert-on-red), and the coverage walk drops any job behind a job-level `if:`
 from its PR-blocking view, so none of the five can credit pull-request coverage it does not
-provide.
+provide. `tool-tarballs` runs on push and `workflow_dispatch` only as well, by an `if:` that
+lists those two events; it fills and saves the pinned tool tarball cache (below) and runs no
+test.
 
 The MSRV check (`msrv`) runs on every pull request and every push to `main`, and carries
 `if: github.event_name != 'merge_group'` alone: a compiler-floor break found after the merge
@@ -684,7 +763,7 @@ The policy is two workflow-level `env` values, each defaulting from a repository
   `actions: write`, so the prune's delete would fail the job; the clause tests
   `github.event.pull_request.head.repo.full_name == github.repository`.
 
-Before every save of a lockfile-keyed archive (the machete tool cache is exempt, below)
+Before every save of a lockfile-keyed archive (the tool caches are exempt, below)
 `tools/scripts/ci_cache_prune.sh "<the save key>"` runs: it keeps exactly that key and deletes
 every other entry of the namespace (stale lockfile generations, `pr` scoped entries, legacy
 unqualified keys), so the store never holds two archives of one namespace and a lockfile change
@@ -747,11 +826,19 @@ one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-
 `restore-keys` to `cargo-Linux-main-`, the shards' archive;
 `test-linux` shard 0 restores and saves its own key; the shards 1 to 3 restore it.
 
-Two exemptions, both narrow. The machete binary cache (`~/.cargo/bin/cargo-machete`, keyed on
-the pinned version and not on a lockfile hash) is a TOOL cache: a few MB with no lockfile
-generation for the prune to work from, so it carries no namespace gate and no prune step, only
-the cache-hit test and the merge-queue test. Gating it into a namespace the default never names
-meant the binary was never cached and `cargo install cargo-machete` ran on every push.
+Two exemptions, both narrow. The TOOL caches carry no lockfile generation for the prune to
+work from, so they carry no namespace gate and no prune step, only the cache-hit test and the
+merge-queue test. There are two. The machete binary cache (`~/.cargo/bin/cargo-machete`, keyed
+on the pinned version) is a few MB; gating it into a namespace the default never names meant the
+binary was never cached and `cargo install cargo-machete` ran on every push. The pinned tool
+tarball cache (`~/.cache/cerulion-tool-tarballs`, about 33 MB) holds the nextest tarballs for
+Linux x86_64 and macOS and the cargo-deny tarball for Linux x86_64, under the key
+`tools/scripts/tool_tarball_cache.sh key` derives from both installers' pins and the platform
+lists its `fill` fetches, so a moved pin is a new key. Only the `tool-tarballs` job saves it.
+`test-linux`, `test-macos`, `deps` and `advisories.yml` restore it and point
+`CERULION_TOOL_TARBALLS` at it; `install_nextest.sh` and `install_cargo_deny.sh` use a cached
+tarball only after the pinned checksum test a download faces, and a cached file that fails it
+is an `::error::` annotation, is deleted and is downloaded again.
 `release.yml` restores and never saves: a tag run's entry is restorable by no other ref, so
 saving one would only add to the store.
 
@@ -797,7 +884,9 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
-| `tools/scripts/test_android_e2e_probe_verdict.sh` | the oracle table for `tools/scripts/android_e2e_probe_verdict.sh`, the verdict the Android emulator e2e applies to each run of the direct data demand probe: a passing report and every failing rule for each of the three expectations (`paired`, `open`, `schema-mismatch`, where every frame on the wire must die on the schema), every rule that holds for all three (every counted ack from the app's robot identity and none named without an ack, no ack from a peer the probe did not name because its peer set was full or the name too long, no more acks than demand passes, no more frames delivered or dropped on the schema than crossed the wire, no wire-header refusal, no decode, re-injection or LAN-posture drop), a report line that is absent, repeated, missing a field, carrying a field twice or a non-number or an `ack_peers=` that is not a list of robot names, `wire_frames=` never read as `frames=`, the three usage refusals (an unknown expectation, a missing argument, an app identity that is not a robot name), and the same report giving the same bytes twice. The run ends on a case-count floor | n/a |
+| `tools/scripts/test_android_e2e_probe_verdict.sh` | the oracle table for `tools/scripts/android_e2e_probe_verdict.sh`, the verdict the Android emulator e2e applies to each run of the direct data demand probe: a passing report and every failing rule for each of the four expectations (`paired`, `open`, `schema-mismatch`, where every frame on the wire must die on the schema, and `connect`, the open rules over a link the app dialed), the `dialer=` field (missing or not `probe` or `app` is refused; `connect` needs `dialer=app`, every other expectation `dialer=probe`), every rule that holds for all four (every counted ack from the app's robot identity and none named without an ack, no ack from a peer the probe did not name because its peer set was full or the name too long, no more acks than demand passes, no more frames delivered or dropped on the schema than crossed the wire, no wire-header refusal, no decode, re-injection or LAN-posture drop), a report line that is absent, repeated, missing a field, carrying a field twice or a non-number or an `ack_peers=` that is not a list of robot names, `wire_frames=` never read as `frames=`, the three usage refusals (an unknown expectation, a missing argument, an app identity that is not a robot name), and the same report giving the same bytes twice. The run ends on a case-count floor | n/a |
+| `tools/scripts/test_android_release_docs.py` | the Android app copy step in `docs/android.md` against the root `Cargo.toml`: the app runtime example plus the root table's `iceoryx2*` entries parse as one `[patch.crates-io]` table, the same entries pasted under a second header do not parse, the root table holds entries beyond the `iceoryx2*` family (`re_grpc_server`), the family `cerulion workspace create` writes is the root table's family, and the step text says entries under the existing header and not a complete block; and the `CHANGELOG.md` entry for the empty trust-store MAC key, which appears once and names no key length | n/a |
+| `tools/scripts/test_package_android_java.py` | the oracle table for `tools/scripts/package_android_java.py`, which builds the `cerulion-android-java-<version>.tar.gz` release asset in the `android-java` job of `release-artifacts.yml`: the asset from this checkout carries exactly `CerulionRuntime.java` and the crate's `LICENSE` under its versioned directory, byte for byte; over a hand-written crate, the member order, owner, mode and time, the `sha256sum` line, a gzip header with no time and no name, and two runs byte-identical after the source times change; a prerelease identifier with a hyphen accepted; refusals for a version that is not `X.Y.Z` or `X.Y.Z-<pre>`, a crate with no `java/` tree, a tree with no `.java` file, a missing `LICENSE`, a `java/` directory or `LICENSE` that is a symbolic link, a symbolic link or a special file in the tree and missing arguments, each writing nothing | n/a |
 | `tools/scripts/test_verify_published.sh` | the oracle table for `tools/scripts/verify_published.sh`, the post-publish reader the `verify` job of `release.yml` runs: a fixture registry on PATH shims (`cargo`, `curl`, `git`, `sleep`) serves sparse-index entries, version metadata and `.crate` archives the test builds, over two crates that cover both rows of the licence table. The `git` shim answers `rev-parse` for one ref spelling and exits 128 on any other, and one arm asserts the ref it recorded, so a change to the ref the provenance check asks for reds the suite instead of downgrading it to a warning. One arm per check passing, and a failing arm for every check except `extract`: a spent index budget, version metadata that answers nothing, an archive the registry does not serve, a digest the archive does not have, the two registry surfaces disagreeing on it, a `crate_size` mismatch, an archive that is not a readable gzip tar, a member outside the archive prefix, a member name ending in a parent-directory segment, `AGENTS.md`, `CLAUDE.md`, a root `tests/` tree, a missing licence text on each row of the table, a licence expression no row knows, a metadata licence the manifest does not declare, a tracker id in the packaged description, a README link outside the archive, and a packaging commit that is not the tag's. `extract`'s own two refusals -- a listing that reads and then fails to unpack, and an archive carrying no packaged `Cargo.toml` -- have no arm. Warning rather than failure, each with an arm: docs.rs unreachable and docs.rs 404, an archive with no README, a checkout without the tag. Also `--skip-docs` asking docs.rs nothing, the bounded index poll in both directions, `--crate` and `--index-url`, and every refusal the argument parsing, the version shape and the member list raise, `--index-url` and `--wait-seconds` with no value included; the two tool-presence refusals have no arm, because the shims put every tool on PATH. The clean arm asserts the exact `PASS`/`WARN`/`FAIL` counts, and the run ends on a case-count floor | n/a |
 
 A `# doc-pin:` marker is a YAML comment in `ci.yml`, of the form

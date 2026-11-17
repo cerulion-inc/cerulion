@@ -137,7 +137,7 @@ fn run_sweep() -> SweepResult {
         prefix: "cdo".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -146,7 +146,7 @@ fn run_sweep() -> SweepResult {
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "consumer".to_string(),
@@ -154,11 +154,12 @@ fn run_sweep() -> SweepResult {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "drain".to_string(),
@@ -166,6 +167,7 @@ fn run_sweep() -> SweepResult {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "consumer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

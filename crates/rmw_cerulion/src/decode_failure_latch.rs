@@ -69,6 +69,7 @@
 //! branch returning `None`; the `error!` / `debug!` / `info!` events are
 //! constructed only on the cold failure / recovery transitions.
 
+use crate::gated_latch::GatedLatch;
 use cerulion_core::transport::failure_regime_latch::{FailureRegimeLatch, RegimeDecision};
 
 /// Level the caller should log a decode failure at, as decided by
@@ -222,18 +223,12 @@ impl DecodeSite {
     }
 }
 
-/// Recover the latch even if a previous panic poisoned its mutex.
-///
-/// A DIAGNOSTIC latch must never wedge or fail the data path it observes: the
+/// The per-entity decode latch. [`GatedLatch`] recovers a poisoned mutex: a
+/// DIAGNOSTIC latch must never wedge or fail the data path it observes, and the
 /// state it protects is three integers with no cross-field invariant a panic
-/// could tear, so the poisoned value is always usable. (Contrast the transport
-/// mutexes, where `runtime::lock_unpoisoned` deliberately fails the call —
-/// those guard torn iceoryx2 state.)
-fn lock_latch(
-    latch: &std::sync::Mutex<DecodeFailureLatch>,
-) -> std::sync::MutexGuard<'_, DecodeFailureLatch> {
-    latch.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// could tear. (Contrast the transport mutexes, where `runtime::lock_unpoisoned`
+/// deliberately fails the call, since those guard torn iceoryx2 state.)
+pub type EntityDecodeLatch = GatedLatch<DecodeFailureLatch>;
 
 /// Expand the three-way decision for a DECODE FAILURE under ONE structured
 /// field name.
@@ -412,7 +407,7 @@ macro_rules! emit_decode_recovery {
 /// operator after the wrong remedy is exactly what the second-cause wording fixed on this
 /// module once already.
 pub fn report_decode_entry_refused(
-    latch: &std::sync::Mutex<DecodeFailureLatch>,
+    latch: &EntityDecodeLatch,
     site: DecodeSite,
     name: &str,
     type_name: &str,
@@ -420,7 +415,7 @@ pub fn report_decode_entry_refused(
     var_idx: usize,
     reason: &str,
 ) {
-    let mut latch = lock_latch(latch);
+    let mut latch = latch.lock_failure();
     let level = latch.on_failure();
     let total = latch.total_failures();
     let noun = site.noun();
@@ -455,13 +450,13 @@ pub fn report_decode_entry_refused(
 }
 
 pub fn report_decode_failure(
-    latch: &std::sync::Mutex<DecodeFailureLatch>,
+    latch: &EntityDecodeLatch,
     site: DecodeSite,
     name: &str,
     type_name: &str,
     payload_len: usize,
 ) {
-    let mut latch = lock_latch(latch);
+    let mut latch = latch.lock_failure();
     let level = latch.on_failure();
     let total = latch.total_failures();
     let noun = site.noun();
@@ -477,21 +472,20 @@ pub fn report_decode_failure(
 
 /// Report a SUCCESSFUL decode, closing any open failure regime.
 /// Emits one `info!` recovery line iff the closed regime actually suppressed
-/// failures; a healthy entity pays one uncontended lock and a branch.
-pub fn report_decode_success(
-    latch: &std::sync::Mutex<DecodeFailureLatch>,
-    site: DecodeSite,
-    name: &str,
-) {
-    let mut latch = lock_latch(latch);
-    if let Some(suppressed) = latch.on_success() {
-        let total = latch.total_failures();
-        let noun = site.noun();
-        match site {
-            DecodeSite::Subscription => emit_decode_recovery!(topic, name, noun, suppressed, total),
-            DecodeSite::ServiceRequest | DecodeSite::ServiceResponse => {
-                emit_decode_recovery!(service, name, noun, suppressed, total)
-            }
+/// failures; a healthy entity pays one relaxed load and a branch.
+pub fn report_decode_success(latch: &EntityDecodeLatch, site: DecodeSite, name: &str) {
+    let Some(Some((suppressed, total))) = latch.on_success(|latch| {
+        latch
+            .on_success()
+            .map(|suppressed| (suppressed, latch.total_failures()))
+    }) else {
+        return;
+    };
+    let noun = site.noun();
+    match site {
+        DecodeSite::Subscription => emit_decode_recovery!(topic, name, noun, suppressed, total),
+        DecodeSite::ServiceRequest | DecodeSite::ServiceResponse => {
+            emit_decode_recovery!(service, name, noun, suppressed, total)
         }
     }
 }
@@ -694,14 +688,14 @@ mod tests {
 
         // A subscription regime: two failures (so recovery is not silent),
         // then a decode.
-        let sub = std::sync::Mutex::new(DecodeFailureLatch::new());
+        let sub = GatedLatch::new(DecodeFailureLatch::new());
         for _ in 0..2 {
             report_decode_failure(&sub, DecodeSite::Subscription, TOPIC, "pkg/Type", 8);
         }
         report_decode_success(&sub, DecodeSite::Subscription, TOPIC);
 
         // The same for a service server.
-        let srv = std::sync::Mutex::new(DecodeFailureLatch::new());
+        let srv = GatedLatch::new(DecodeFailureLatch::new());
         for _ in 0..2 {
             report_decode_failure(&srv, DecodeSite::ServiceRequest, SERVICE, "pkg/Srv", 8);
         }

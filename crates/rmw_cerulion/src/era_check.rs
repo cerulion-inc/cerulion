@@ -103,6 +103,7 @@ pub const CAPABILITY_MIN_ERA: &[(&str, usize)] = &[
     ("features", ERA_HUMBLE),
     ("discovery_options", ERA_IRON),
     ("matched_events", ERA_IRON),
+    ("durability_best_available", ERA_IRON),
     ("type_hash", ERA_IRON),
     ("event_members", ERA_IRON),
     ("is_key", ERA_JAZZY),
@@ -1319,6 +1320,7 @@ mod tests {
         "features",
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
     ];
@@ -1334,6 +1336,7 @@ mod tests {
         "features",
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
         "is_key",
@@ -1351,6 +1354,7 @@ mod tests {
         "features",
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
         "is_key",
@@ -1376,6 +1380,7 @@ mod tests {
     const IRON_ONLY: &[&str] = &[
         "discovery_options",
         "matched_events",
+        "durability_best_available",
         "type_hash",
         "event_members",
     ];
@@ -1576,6 +1581,7 @@ mod tests {
             &[
                 "discovery_options",
                 "matched_events",
+                "durability_best_available",
                 "type_hash",
                 "event_members",
                 "is_key",

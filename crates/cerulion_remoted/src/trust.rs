@@ -273,6 +273,12 @@ impl SharedTrust {
         (claimed, access, mapped)
     }
 
+    /// The account `device_key` is bound to in the side-map, if any. Says
+    /// nothing about access: pair it with [`SharedTrust::snapshot_for_key`].
+    pub fn account_for_key(&self, device_key: &[u8; 32]) -> Option<AccountId> {
+        self.lock().index.account_for(&PublicKey(*device_key))
+    }
+
     /// The robot's own transport key (its iroh `EndpointId`), recorded at
     /// provision time — the key a code-pairing witness must be proven against.
     pub fn robot_transport_key(&self) -> PublicKey {

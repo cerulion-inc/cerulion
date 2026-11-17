@@ -120,7 +120,9 @@ divides one quantity by another gets a meaningless number.
 ### Free run against lockstep
 
 A multi-process run free-runs by default; `CERULION_EXECUTION_MODE=lockstep`
-opts out. The table compares the two on the same build and the same machine:
+opts out into barrier lockstep. That opt-out is deprecated and outside Semantic
+Versioning, so a minor release may change or remove it. The table compares the
+two on the same build and the same machine:
 the multi-process cell (two processes), main `4ff3326d06` with the latency
 ping change from `bbf276489b` applied, on an x86-64 Linux machine (Ubuntu
 22.04, kernel 6.8, performance governor), STOCK posture, recorder ON, fixed
@@ -155,7 +157,7 @@ Package: [campaign directory](benchmarks/results/3e0b99a7a88f0f38-2026-10-20-fix
 On macOS 14.4 and later a producer's publish rings a shared-memory wake word
 that a parked consumer in another process is kernel-blocked on, so a
 two-process hop wakes on the data rather than on the park's recheck timer
-([`deployment_tuning.md`](deployment_tuning.md), "macOS data-wake doorbell").
+([`deployment_tuning.md`](deployment_tuning.md), "Data-wake doorbell").
 Measured before and after that change on one Apple M3 Max (16 cores, macOS
 26.0.1): `benches/latency` round trip, quiescent pacing, default settings, no
 pinning, five reps per cell per build with the two builds alternating within
@@ -175,10 +177,13 @@ the fixed 100 Hz of the tables above, so compare within this table only.
 The two-process median falls 6.7x at 64 B, 6.1x at 4 KiB and 5.0x at 1 MiB,
 with disjoint per-rep ranges. The single-process rows moved by one to three
 ticks of the 24 MHz timebase (41.667 ns per tick), inside overlapping per-rep
-ranges, so no change in either direction is resolved there. The Apple M4 row of the README platform chart was measured before this
-change and has not been re-measured since. Main has also changed the wake path
-since this pair (a publish now rings every topic a graph produces), and that
-build has not been re-measured on macOS. Package:
+ranges, so no change in either direction is resolved there. The Apple M4 row
+of the README platform chart is a later build, Cerulion 2.0.0 on macOS 27.2.1,
+which carries this change and later changes to the wake path, among them a
+publish that rings every topic a graph produces and a cross-process wake on a
+busy Mac that no longer waits out a yield. It is measured on another machine at
+the chart's fixed 100 Hz, so it is not a third column of this table
+([Apple M4 campaign](benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/HEADLINE.md)). Package:
 [campaign directory](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/),
 [HEADLINE.md](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/HEADLINE.md), and
 [provenance](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/PROVENANCE.txt).
@@ -292,23 +297,6 @@ payload larger than its tier is still refused.
 
 (Windows commits shared memory eagerly, so this demand-paging property is
 specific to Linux and macOS; Windows is not a supported platform.)
-
-## vs Copper Robotics (cu29)
-
-(Copper claims below are from its public documentation; check the current version
-before relying on specifics.)
-
-| Dimension | Cerulion | Copper |
-|---|---|---|
-| Transport | iceoryx2 shared memory (same- **and** cross-process, zero-copy) | CopperList (cache-line contiguous), single-process; cross-process via an iceoryx2 integration (not native) |
-| Network | native zenoh | not built-in |
-| Scheduling | runtime DAG-level, deterministic, 4 trigger policies | compile-time generated |
-| ROS 2 compat | native `.msg` codegen + `rmw_cerulion` drop-in | not documented |
-| Dynamic nodes | runtime cdylib loading | compile-time only |
-
-**Where Copper wins:** compile-time scheduling (zero runtime dispatch overhead);
-embedded/baremetal targets (Cerulion targets Linux/macOS; Windows is not
-supported).
 
 ## Determinism
 

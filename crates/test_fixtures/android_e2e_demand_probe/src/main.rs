@@ -6,7 +6,10 @@
 //! This probe skips the catalog: it boots an ingress-only gateway for ONE topic
 //! with the schema it is told to expect, connected to ONE endpoint with
 //! scouting off, and lets the gateway's demand-GET loop demand the topic for a
-//! bounded window. It reports the demand acks it counted and the robots that
+//! bounded window. With `--listen` it listens on the endpoint and dials
+//! nothing instead, so the only link is the one the app dials. It reports who
+//! dialed the link (`dialer`, `probe` or `app`), the demand acks it counted and
+//! the robots that
 //! sent them (`ack_peers`, sorted and joined by `,`, empty when no ack came),
 //! the acks from a peer it did not name because its peer set was full
 //! (`ack_peer_overflow`) or the name was too long to store (`ack_peer_overlong`),
@@ -17,20 +20,21 @@
 //! frames its local subscriber received (`frames`). The probe's own LAN access is set to open, so its ingress never
 //! drops a frame on its own posture.
 //!
-//! Usage: `android-e2e-demand-probe <connect-endpoint> <topic> <schema> <window-secs>`
+//! Usage: `android-e2e-demand-probe [--listen] <endpoint> <topic> <schema> <window-secs>`
 //!
 //! `<schema>` is `std_msgs/String` or `std_msgs/Int32`. It prints ONE fact line
 //! and exits 0 when the window completed:
 //!
 //! ```text
-//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app ack_peer_overflow=0 ack_peer_overlong=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0
+//! demand_probe topic=/app/heartbeat schema=std_msgs/String window_s=10 dialer=probe passes=5 enabled_acks=0 refused_acks=5 wire_header_refused_acks=0 ack_peers=android-app ack_peer_overflow=0 ack_peer_overlong=0 schema_mismatch_drops=0 decode_errors=0 reinject_failure_drops=0 lan_refused_drops=0 wire_frames=0 frames=0
 //! ```
 //!
 //! The verdict is the caller's (`tools/scripts/android_e2e_probe_verdict.sh`):
 //! every ack must come from the app; a paired app must answer with refused
 //! acks only and send no frame; an open one grants and delivers, and drops
-//! every frame when the expected schema is not the topic's. A bad argument or a setup failure returns an
-//! error (exit code 1) and prints no fact line.
+//! every frame when the expected schema is not the topic's; an open app that
+//! dialed the probe grants and delivers over that link. A bad argument or a
+//! setup failure returns an error (exit code 1) and prints no fact line.
 
 use std::error::Error;
 use std::time::{Duration, Instant};
@@ -57,8 +61,10 @@ const SCHEMAS: &[(&str, u64)] = &[
     ("std_msgs/Int32", Int32::SCHEMA_HASH),
 ];
 
-/// The probe's four positional arguments.
+/// The probe's arguments: `--listen` and the four positional ones.
 struct Args {
+    /// Listen on `endpoint` and dial nothing, instead of dialing it.
+    listen: bool,
     endpoint: String,
     topic: String,
     schema: &'static str,
@@ -66,8 +72,11 @@ struct Args {
     window: Duration,
 }
 
-fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
-    let usage = "usage: android-e2e-demand-probe <connect-endpoint> <topic> <schema> <window-secs>";
+fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
+    let usage =
+        "usage: android-e2e-demand-probe [--listen] <endpoint> <topic> <schema> <window-secs>";
+    let mut argv = argv.peekable();
+    let listen = argv.next_if(|arg| arg == "--listen").is_some();
     let (Some(endpoint), Some(topic), Some(schema), Some(window), None) = (
         argv.next(),
         argv.next(),
@@ -92,6 +101,7 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         return Err("window must be at least one second".to_string());
     }
     Ok(Args {
+        listen,
         endpoint,
         topic,
         schema,
@@ -107,7 +117,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manager = TransportManager::init(TransportConfig {
         node_name: "android_e2e_demand_probe".to_string(),
         network: Some(NetworkConfig {
-            connect_endpoints: vec![args.endpoint.clone()],
+            connect_endpoints: if args.listen {
+                vec![]
+            } else {
+                vec![args.endpoint.clone()]
+            },
+            listen_endpoints: if args.listen {
+                vec![args.endpoint.clone()]
+            } else {
+                vec![]
+            },
             robot_identity: Some(PROBE_IDENTITY.to_string()),
             ..Default::default()
         }),
@@ -117,9 +136,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .network()
         .ok_or("the probe's transport has no network")?;
     network.set_lan_access(LanAccess::Open);
-    // The zenoh session opens lazily, on its first use. Open it here, so a
-    // connect endpoint it cannot take fails with this message before the
-    // probe builds anything on it.
+    // The zenoh session opens lazily, on its first use. Open it here, so an
+    // endpoint it cannot take fails with this message before the probe
+    // builds anything on it.
     network
         .session()
         .map_err(|error| format!("the probe's session did not open: {error}"))?;
@@ -163,7 +182,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         + lan_refused_drops;
 
     println!(
-        "demand_probe topic={} schema={} window_s={} passes={} enabled_acks={} refused_acks={} \
+        "demand_probe topic={} schema={} window_s={} dialer={} passes={} enabled_acks={} \
+         refused_acks={} \
          wire_header_refused_acks={} ack_peers={} ack_peer_overflow={} ack_peer_overlong={} \
          schema_mismatch_drops={schema_mismatch_drops} \
          decode_errors={decode_errors} reinject_failure_drops={reinject_failure_drops} \
@@ -171,6 +191,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.topic,
         args.schema,
         args.window.as_secs(),
+        if args.listen { "app" } else { "probe" },
         gateway.demand_get_pass_count(),
         gateway.demand_enabled_ack_count(),
         gateway.demand_refused_ack_count(),

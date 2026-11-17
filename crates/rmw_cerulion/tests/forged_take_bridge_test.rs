@@ -733,7 +733,7 @@ unsafe fn cpp_string_of(slot: *const c_void) -> String {
     let mut data: *const c_char = std::ptr::null();
     let mut len = 0usize;
     rmw_cerulion_cppstring_view(slot, &mut data, &mut len);
-    String::from_utf8_lossy(std::slice::from_raw_parts(data as *const u8, len)).into_owned()
+    String::from_utf8_lossy(std::slice::from_raw_parts(data.cast::<u8>(), len)).into_owned()
 }
 
 /// Hand-built source message: REAL containers filled through the shim.

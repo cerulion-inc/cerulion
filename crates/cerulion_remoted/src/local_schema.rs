@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Read the local network daemon's current metadata without discovery or startup.
+//! Read the local network daemon's current metadata without discovery or startup,
+//! or a host's own metadata in process.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cerulion_core::transport::cerulion_q::{collect_schema_closure, SchemaDoc, SchemaReply};
@@ -14,7 +16,34 @@ use crate::wire::WireError;
 
 const QUERY_BUDGET: Duration = Duration::from_secs(5);
 
+/// A host's own schema metadata: the topics it serves and their schemas, read on
+/// each `catalog` and `schema` request. A host that runs no network daemon passes
+/// one to [`WirePlane::with_in_process_schema_provider`](crate::WirePlane::with_in_process_schema_provider).
+pub type SchemaSource = Arc<dyn Fn() -> SchemaServing + Send + Sync>;
+
+/// Where a wire plane reads its current schema metadata.
+pub(crate) enum LocalSchemaSource {
+    /// The existing local network daemon's control socket.
+    Socket(PathBuf),
+    /// The host process itself. It shares the plane's transport, so there is no
+    /// namespace to check.
+    InProcess(SchemaSource),
+}
+
+impl LocalSchemaSource {
+    pub(crate) async fn load(
+        &self,
+        expected_namespace: IceoryxShmIdentity,
+    ) -> Result<LocalSchemas, WireError> {
+        match self {
+            LocalSchemaSource::Socket(socket) => load(socket.clone(), expected_namespace).await,
+            LocalSchemaSource::InProcess(source) => Ok(LocalSchemas::from_serving(source())),
+        }
+    }
+}
+
 pub(crate) struct LocalSchemas {
+    egress_qos: BTreeMap<String, cerulion_core::EgressQos>,
     topic_types: BTreeMap<String, String>,
     hash_types: BTreeMap<u64, String>,
     docs: BTreeMap<String, SchemaDoc>,
@@ -23,10 +52,17 @@ pub(crate) struct LocalSchemas {
 impl LocalSchemas {
     fn from_serving(serving: SchemaServing) -> Self {
         let mut result = Self {
+            egress_qos: BTreeMap::new(),
             topic_types: BTreeMap::new(),
             hash_types: BTreeMap::new(),
             docs: BTreeMap::new(),
         };
+        for policy in serving.egress_qos {
+            result
+                .egress_qos
+                .entry(policy.topic.clone())
+                .or_insert(policy);
+        }
         // The egress source merges first-wins; retain that rule when indexing.
         for binding in serving.topic_schemas {
             result
@@ -53,6 +89,10 @@ impl LocalSchemas {
             .map(String::as_str)
     }
 
+    pub(crate) fn egress_qos(&self, topic: &str) -> Option<&cerulion_core::EgressQos> {
+        self.egress_qos.get(topic)
+    }
+
     pub(crate) fn reply(&self, robot: &str, topic: &str, hash: Option<u64>) -> SchemaReply {
         match self.root_type(topic, hash) {
             Some(root) => match collect_schema_closure(root, &self.docs) {
@@ -72,7 +112,7 @@ impl LocalSchemas {
     }
 }
 
-pub(crate) async fn load(
+async fn load(
     socket: PathBuf,
     expected_namespace: IceoryxShmIdentity,
 ) -> Result<LocalSchemas, WireError> {
@@ -122,6 +162,9 @@ fn client_failure(error: ClientError) -> WireError {
             failure("local schema protocol is invalid or incompatible; restart the network daemon")
         }
         ClientError::Netd { .. } => failure("local network daemon refused the schema snapshot"),
+        ClientError::MirrorLost(_) => {
+            failure("local schema connection reported a retired mirror; retry the query")
+        }
         ClientError::Spawn { .. } => {
             failure("local schema client attempted an unsupported daemon startup")
         }
@@ -137,6 +180,7 @@ mod tests {
     #[test]
     fn indexing_preserves_first_wins_and_topic_binding_precedes_hash_binding() {
         let schemas = LocalSchemas::from_serving(SchemaServing {
+            egress_qos: Vec::new(),
             served_topics: vec!["/reading".into()],
             topic_schemas: vec![
                 TopicSchema {
@@ -202,6 +246,11 @@ mod tests {
                 robot: Some(PRIVATE.into()),
                 topic: Some(PRIVATE.into()),
             },
+            ClientError::MirrorLost(cerulion_netd::MirrorLost {
+                event: "mirror_lost".into(),
+                robot: "/private/robot".into(),
+                topic: "/private/topic".into(),
+            }),
             ClientError::Spawn {
                 bin: PRIVATE.into(),
                 source: io_error(),

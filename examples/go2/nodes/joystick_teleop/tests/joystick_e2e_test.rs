@@ -76,7 +76,7 @@ fn build_rig(prefix: &str) -> Rig {
         identity: format!("joy_e2e_{prefix}"),
         prefix: prefix.to_string(),
         nodes: vec![NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id: "joystick".to_string(),

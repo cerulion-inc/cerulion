@@ -37,8 +37,17 @@ mod view;
 pub use encoder::{FrameCursor, FrameEncoder};
 pub use error::DynamicError;
 pub use message_yaml::{
-    message_to_yaml, message_to_yaml_with, yaml_to_message, YamlEncodeOptions, MAX_YAML_BYTES,
+    find_anchor_or_alias, message_to_yaml, message_to_yaml_with, yaml_to_message,
+    yaml_to_message_with, MissingFields, YamlDecodeOptions, YamlEncodeOptions, MAX_YAML_BYTES,
     MAX_YAML_DEPTH, MAX_YAML_INPUT_BYTES, YAML_TRUNCATED_TAG,
+};
+// Hidden: the scalar spellings of the YAML form (`0.3`, `.nan`, `-.inf`, a
+// double-quoted string), shared with the replay verdict's value diff in
+// `cerulion_cli_engine`, so a value reads the same in `topic echo` and in a
+// byte-mismatch line. Not part of the bindings surface above.
+#[doc(hidden)]
+pub use message_yaml::{
+    format_f32 as yaml_format_f32, format_f64 as yaml_format_f64, quote_within as yaml_quote_within,
 };
 pub use schema_set::{parse_rosmsg, SchemaSet};
 pub use schema_yaml::{

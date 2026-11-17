@@ -1014,14 +1014,7 @@ pub fn builtin_layout_resolver() -> (LayoutResolver, Vec<String>) {
 /// against. It panics loudly rather than silently degrade the registry
 /// if that codegen invariant is ever broken.
 pub fn parse_builtin_schemas() -> Vec<MessageSchema> {
-    let entries = native_ros2_messages::BUILTIN_MSGS;
-    let mut schemas = Vec::with_capacity(entries.len());
-    for &(package, name, text) in entries {
-        let schema = parse_rosmsg(text, name, Some(package))
-            .unwrap_or_else(|e| panic!("built-in registry: failed to parse {package}/{name}: {e}"));
-        schemas.push(schema);
-    }
-    schemas
+    cerulion_msgio::builtin_schemas()
 }
 
 /// Enumerate `schemas_dir`'s `*.yaml` files in sorted order (`read_dir`

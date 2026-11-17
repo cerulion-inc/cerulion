@@ -1,0 +1,452 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//! The workspace `.msg` schema store: the ament-mirror
+//! `schemas/<pkg>/msg/<Type>.msg` folder.
+//!
+//! Every `.msg` file under `schemas/<pkg>/msg/` is parsed to a
+//! [`MessageSchema`] via the SAME [`parse_rosmsg`] the built-in registry and
+//! codegen use: the package name comes FROM THE PATH (`.msg` text carries no
+//! package), so `schemas/sensor_msgs/msg/Imu.msg` parses as `sensor_msgs/Imu`.
+//!
+//! A nested type written without its package parses bare, and resolving the
+//! set ([`cerulion_core::codegen::resolve_fixed_nested`], which every walker
+//! build runs) writes the package in: a bare `Type` the set holds in the
+//! file's own package becomes `<pkg>/Type`, and a bare `Header` the package
+//! does not define becomes `std_msgs/Header`. That is the name ROS 2
+//! introspection gives the field and `rmw_cerulion` hashes it with. Any other
+//! bare reference (a workspace YAML type, a type the set lacks) keeps its
+//! spelling.
+//!
+//! The nested `<pkg>/msg/` layout is deliberate:
+//!
+//! - it mirrors an ament install prefix, so a robot-local
+//!   `share/<pkg>/msg/*.msg` byte-copy lands verbatim (the harvest
+//!   materializes here), and
+//! - it can never collide with the flat `schemas/*.yaml` files the YAML
+//!   reader handles: the store lives in per-package SUBDIRECTORIES, the YAML
+//!   schemas are FILES directly under `schemas/`.
+//!
+//! Robustness contract (mirrors `schema_cmd::workspace_yaml_files`): a
+//! missing `schemas/` dir is quiet, an unreadable dir/entry is a loud
+//! `warn!` + skip, and a `.msg` that fails to PARSE is a loud `warn!` + skip:
+//! never a silent skip, and never a hard abort (one bad file must not sink
+//! the rest). Enumeration is sorted so the store is byte-deterministic
+//! (Principle #7).
+//!
+//! Service types live beside the messages as `schemas/<pkg>/srv/<Name>.srv`;
+//! [`load_store_service`] reads one by name for `service call`. They are not
+//! part of the message set this store enumerates.
+//!
+//! Consumers of the store (the ONE resolution chain): attach's resolvability
+//! predicate (`ros_cmd::AttachSchemaChain`), `schema list`/`schema info`, and
+//! the bridge codec seed. This module is the shared reader.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use cerulion_core::codegen::{parse_rosmsg, MessageSchema};
+
+/// One parsed `.msg` file from the store: the schema IR plus its provenance
+/// path (for `schema list` and acquisition reports).
+#[derive(Debug, Clone)]
+pub struct StoredSchema {
+    /// Parsed schema IR. Its `package` is the `<pkg>` path segment, so
+    /// [`MessageSchema::qualified_name`] is `pkg/Type`.
+    pub schema: MessageSchema,
+    /// Store-relative provenance path `pkg/msg/Type.msg` (forward slashes,
+    /// deterministic): what listings and reports display.
+    pub relative_path: String,
+}
+
+/// The workspace `.msg` schema store: every `schemas/<pkg>/msg/<Type>.msg`
+/// file parsed to [`MessageSchema`], keyed by qualified name `pkg/Type`.
+#[derive(Debug, Default)]
+pub struct SchemaStore {
+    /// Keyed by qualified name `pkg/Type`. A `BTreeMap` keeps enumeration
+    /// sorted (and package-grouped: `pkg/` prefixes sort together), which
+    /// every listing consumer relies on for determinism.
+    by_name: BTreeMap<String, StoredSchema>,
+}
+
+impl SchemaStore {
+    /// The empty store: the builtins-only baseline (no `.msg` files).
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Load every `<schemas_dir>/<pkg>/msg/<Type>.msg` into the store.
+    ///
+    /// `schemas_dir` is the workspace `schemas/` directory (the store lives
+    /// in its per-package subdirs; the flat `*.yaml` files alongside are
+    /// ignored here). See the module doc for the missing/unreadable/parse-fail
+    /// robustness contract. Never fails: a store that could not read a single
+    /// file is simply empty.
+    pub fn load(schemas_dir: &Path) -> Self {
+        let mut by_name = BTreeMap::new();
+        for (pkg, msg_dir) in package_msg_dirs(schemas_dir) {
+            for msg_path in msg_files(&msg_dir) {
+                let Some(stem) = msg_path.file_stem().and_then(|s| s.to_str()) else {
+                    // A non-UTF-8 stem cannot be a valid ROS type name.
+                    tracing::warn!(
+                        file = %msg_path.display(),
+                        "schema store: .msg file has a non-UTF-8 name: skipped"
+                    );
+                    continue;
+                };
+                let text = match std::fs::read_to_string(&msg_path) {
+                    Ok(text) => text,
+                    Err(e) => {
+                        tracing::warn!(
+                            file = %msg_path.display(),
+                            error = %e,
+                            "schema store: could not read .msg file: skipped (the rest still load)"
+                        );
+                        continue;
+                    }
+                };
+                match parse_rosmsg(&text, stem, Some(pkg.as_str())) {
+                    Ok(schema) => {
+                        let qualified = format!("{pkg}/{stem}");
+                        let relative_path = format!("{pkg}/msg/{stem}.msg");
+                        // Distinct paths cannot collide on a case-sensitive
+                        // FS, so a duplicate key means a case-fold clash on
+                        // macOS/Windows: later (sorted) file wins, loudly.
+                        if let Some(prev) = by_name.insert(
+                            qualified.clone(),
+                            StoredSchema {
+                                schema,
+                                relative_path: relative_path.clone(),
+                            },
+                        ) {
+                            tracing::warn!(
+                                schema = %qualified,
+                                kept = %relative_path,
+                                dropped = %prev.relative_path,
+                                "schema store: two files map to one qualified name: later file wins"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            file = %msg_path.display(),
+                            package = %pkg,
+                            schema = %stem,
+                            error = ?e,
+                            "schema store: failed to parse .msg: skipped (the rest still load)"
+                        );
+                    }
+                }
+            }
+        }
+        Self { by_name }
+    }
+
+    /// True when a qualified `pkg/Type` name is in the store.
+    pub fn resolves(&self, qualified_name: &str) -> bool {
+        self.by_name.contains_key(qualified_name)
+    }
+
+    /// Look up one store schema by qualified name `pkg/Type`.
+    pub fn get(&self, qualified_name: &str) -> Option<&StoredSchema> {
+        self.by_name.get(qualified_name)
+    }
+
+    /// Every store entry whose BARE type name (the part after `/`) equals
+    /// `bare`: one per package that defines it, in sorted qualified-name
+    /// order. Callers resolve a unique match and treat >1 as ambiguous
+    /// (the loud-ambiguity house rule).
+    pub fn matches_bare_name(&self, bare: &str) -> Vec<&StoredSchema> {
+        self.by_name
+            .iter()
+            .filter(|(qualified, _)| {
+                qualified
+                    .rsplit_once('/')
+                    .is_some_and(|(_, type_name)| type_name == bare)
+            })
+            .map(|(_, stored)| stored)
+            .collect()
+    }
+
+    /// Enumerate every store entry as `(qualified_name, entry)` in sorted
+    /// (package-grouped) order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &StoredSchema)> {
+        self.by_name.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Clone every store schema's IR in sorted qualified-name order: the
+    /// ONE enumeration seam for consumers that fold the store into a
+    /// combined schema set (the graph-run hash-divergence map, the recorded
+    /// wire-size map, the replay field registry). Those folds must not
+    /// hand-roll their own `schemas/<pkg>/msg/` walks: the store reader is
+    /// this module (see the module doc's robustness contract).
+    pub fn schemas(&self) -> Vec<MessageSchema> {
+        self.by_name.values().map(|s| s.schema.clone()).collect()
+    }
+
+    /// Store entries whose qualified name equals a built-in ROS 2 message.
+    /// The store copy WINS in the resolution chain (the built-in shadow
+    /// semantics), so each is a loud fact for the caller to surface. Sorted
+    /// qualified names.
+    pub fn builtin_shadows(&self) -> Vec<String> {
+        self.by_name
+            .keys()
+            .filter(|qualified| builtin_has_qualified(qualified.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// Number of store entries.
+    pub fn len(&self) -> usize {
+        self.by_name.len()
+    }
+
+    /// True when the store holds no `.msg` schemas.
+    pub fn is_empty(&self) -> bool {
+        self.by_name.is_empty()
+    }
+}
+
+/// Read the service type `package/name` from the store's
+/// `<schemas_dir>/<package>/srv/<name>.srv` file.
+///
+/// The `.srv` text parses with the same [`parse_rossrv`] codegen uses, so its
+/// two parts are the messages `package/<name>_Request` and
+/// `package/<name>_Response`, the names (and therefore the schema hashes) a
+/// ROS 2 node on `rmw_cerulion` gives them. Their bare nested references are
+/// qualified when the walker's set is resolved, as a store `.msg` file's are
+/// (see the module doc). `Ok(None)` when the file does not exist; an
+/// unreadable or unparsable file is an `Err` naming it.
+///
+/// [`parse_rossrv`]: cerulion_core::codegen::parse_rossrv
+pub fn load_store_service(
+    schemas_dir: &Path,
+    package: &str,
+    name: &str,
+) -> Result<Option<cerulion_core::codegen::ServiceDefinition>, String> {
+    let relative = format!("{package}/srv/{name}.srv");
+    let path = schemas_dir
+        .join(package)
+        .join("srv")
+        .join(format!("{name}.srv"));
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("could not read {}: {e}", path.display())),
+    };
+    cerulion_core::codegen::parse_rossrv(&text, name, Some(package), &relative)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Does the built-in ROS 2 registry contain the qualified name `pkg/Type`?
+/// Shared by [`SchemaStore::builtin_shadows`] and the CLI shadow marking.
+pub fn builtin_has_qualified(qualified: &str) -> bool {
+    match qualified.split_once('/') {
+        Some((pkg, msg)) if !pkg.is_empty() && !msg.is_empty() && !msg.contains('/') => {
+            native_ros2_messages::BUILTIN_MSGS
+                .iter()
+                .any(|&(p, n, _)| p == pkg && n == msg)
+        }
+        _ => false,
+    }
+}
+
+/// Enumerate `(package_name, <schemas_dir>/<pkg>/msg)` for every package
+/// subdir that carries a `msg/` directory, in sorted package order.
+///
+/// A missing `schemas_dir` is quiet (`debug!`: legitimately absent, e.g. a
+/// pre-store workspace); an unreadable dir or dir-entry is a loud `warn!` +
+/// skip. Non-directory entries (the flat `schemas/*.yaml` files) and package
+/// dirs with no `msg/` subdir are filtered, not skips.
+fn package_msg_dirs(schemas_dir: &Path) -> Vec<(String, PathBuf)> {
+    let entries = match std::fs::read_dir(schemas_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::debug!(dir = %schemas_dir.display(), "schema store: no schemas/ directory");
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::warn!(
+                dir = %schemas_dir.display(),
+                error = %e,
+                "schema store: schemas/ present but unreadable: skipping the .msg store"
+            );
+            return Vec::new();
+        }
+    };
+    let mut dirs = Vec::new();
+    for dirent in entries {
+        let path = match dirent {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                tracing::warn!(
+                    dir = %schemas_dir.display(),
+                    error = %e,
+                    "schema store: unreadable directory entry: skipped"
+                );
+                continue;
+            }
+        };
+        // Only per-package subdirectories participate; the flat YAML
+        // schemas live directly under `schemas/` and are the YAML
+        // reader's business.
+        if !path.is_dir() {
+            continue;
+        }
+        let msg_dir = path.join("msg");
+        if !msg_dir.is_dir() {
+            continue;
+        }
+        let Some(pkg) = path.file_name().and_then(|n| n.to_str()) else {
+            tracing::warn!(dir = %path.display(), "schema store: non-UTF-8 package directory name: skipped");
+            continue;
+        };
+        dirs.push((pkg.to_string(), msg_dir));
+    }
+    dirs.sort();
+    dirs
+}
+
+/// Enumerate the `*.msg` files in one `msg/` directory, sorted. An
+/// unreadable dir/entry is a loud `warn!` + skip; non-`.msg` files are a
+/// filter, not a skip.
+fn msg_files(msg_dir: &Path) -> Vec<PathBuf> {
+    let entries = match std::fs::read_dir(msg_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                dir = %msg_dir.display(),
+                error = %e,
+                "schema store: msg/ directory unreadable: skipped"
+            );
+            return Vec::new();
+        }
+    };
+    let mut files = Vec::new();
+    for dirent in entries {
+        let path = match dirent {
+            Ok(entry) => entry.path(),
+            Err(e) => {
+                tracing::warn!(
+                    dir = %msg_dir.display(),
+                    error = %e,
+                    "schema store: unreadable msg/ entry: skipped"
+                );
+                continue;
+            }
+        };
+        if path.extension().and_then(|e| e.to_str()) == Some("msg") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::introspection::{hash, header, message, nested};
+    use cerulion_core::codegen::FieldType;
+
+    fn store(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (rel, text) in files {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_bare_nested_type_in_a_store_msg_hashes_as_ros_2_introspection_names_it() {
+        // The oracle is the schema rmw_cerulion builds from the introspection
+        // members of each type: `Level` written in demo_msgs is
+        // `demo_msgs/Level`, a bare `Header` in a package without one is
+        // `std_msgs/Header`, and a bare `Header` in a package that defines
+        // one is that package's.
+        let dir = store(&[
+            ("demo_msgs/msg/Level.msg", "uint8 value\n"),
+            (
+                "demo_msgs/msg/Reading.msg",
+                "Header header\nLevel level\nLevel[] history\ngeometry_msgs/Point at\n",
+            ),
+            ("own_msgs/msg/Header.msg", "uint32 seq\n"),
+            ("own_msgs/msg/Tagged.msg", "Header header\n"),
+        ]);
+        let walker = crate::checked_walker(crate::store_schemas(Some(dir.path()))).unwrap();
+        let float = |axis| (axis, FieldType::F64);
+        let mut reading = header();
+        reading.extend([
+            message("demo_msgs", "Level", vec![("value", FieldType::U8)]),
+            message(
+                "geometry_msgs",
+                "Point",
+                vec![float("x"), float("y"), float("z")],
+            ),
+            message(
+                "demo_msgs",
+                "Reading",
+                vec![
+                    ("header", nested("std_msgs", "Header")),
+                    ("level", nested("demo_msgs", "Level")),
+                    (
+                        "history",
+                        FieldType::DynamicArray {
+                            element_type: Box::new(nested("demo_msgs", "Level")),
+                        },
+                    ),
+                    ("at", nested("geometry_msgs", "Point")),
+                ],
+            ),
+        ]);
+        assert_eq!(
+            walker.schema_hash_for("demo_msgs/Reading"),
+            Some(hash(reading, "demo_msgs/Reading"))
+        );
+        let tagged = vec![
+            message("own_msgs", "Header", vec![("seq", FieldType::U32)]),
+            message(
+                "own_msgs",
+                "Tagged",
+                vec![("header", nested("own_msgs", "Header"))],
+            ),
+        ];
+        assert_eq!(
+            walker.schema_hash_for("own_msgs/Tagged"),
+            Some(hash(tagged, "own_msgs/Tagged"))
+        );
+    }
+
+    #[test]
+    fn resolution_qualifies_only_a_bare_reference_its_own_package_defines() {
+        let dir = store(&[
+            (
+                "geometry_msgs/msg/PoseLabel.msg",
+                "Pose pose\nstring label\n",
+            ),
+            (
+                "demo_msgs/msg/Wrap.msg",
+                "Elsewhere one\nElsewhere[] more\n",
+            ),
+        ]);
+        let walker = crate::checked_walker(crate::store_schemas(Some(dir.path()))).unwrap();
+        let reference = |qualified: &str, field: usize| {
+            let mut field_type =
+                &walker.schema_for_name(qualified).unwrap().fields[field].field_type;
+            while let FieldType::DynamicArray { element_type } = field_type {
+                field_type = element_type;
+            }
+            match field_type {
+                FieldType::Nested { package, .. } => package.clone(),
+                other => panic!("{qualified} field {field} is {other:?}"),
+            }
+        };
+        assert_eq!(
+            reference("geometry_msgs/PoseLabel", 0).as_deref(),
+            Some("geometry_msgs"),
+            "a built-in type of the file's own package"
+        );
+        assert_eq!(reference("demo_msgs/Wrap", 0), None);
+        assert_eq!(reference("demo_msgs/Wrap", 1), None);
+    }
+}

@@ -629,7 +629,7 @@ fn a_discovered_tap_on_a_window_only_recorder_is_budgeted_too() {
     await_bagd_ready(&ready, "the discovery arm");
 
     // Keep publishing until the recorder's own numbers show it observed a frame
-    // on the discovered tap — the rescan runs on the drive loop, so a single
+    // on the discovered tap - discovery applies on the drive loop, so a single
     // publish before it attaches would land in no queue.
     let mut status = mgr
         .create_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
@@ -642,7 +642,7 @@ fn a_discovered_tap_on_a_window_only_recorder_is_budgeted_too() {
             seq += 1;
             drain_status(&mut status).into_iter().any(|s| s.pinned > 0)
         }),
-        "the rescan must discover this topic and drain it"
+        "discovery must find this topic and drain it"
     );
 
     shutdown.store(true, Ordering::Relaxed);

@@ -16,6 +16,10 @@
 //! runtime records the node's first panic-class reason, and `cerulion
 //! replay` maps it to exit 3 (preempting the downstream missing-frame data
 //! violations and the thinner replayed schedule).
+//!
+//! `cerulion_android`'s `embedded_node_tick_panic_status_test` links it as a
+//! plain library (`default-features = false`, no C exports): there the panic
+//! unwinds into the host's tick callback, and status reports the node.
 
 #![deny(unused_imports)]
 // P12 (the repo's logging policy): library code never prints — it logs through
@@ -29,7 +33,7 @@ use cerulion_core::prelude::*;
 use native_ros2_messages::geometry_msgs::Vector3;
 
 #[cerulion_node(period_ms = 50)]
-struct PeriodNode {
+pub struct PeriodNode {
     #[output]
     cmd: Vector3,
     ticks: u32,

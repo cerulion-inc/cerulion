@@ -154,6 +154,9 @@ fn run_two_gateway_flow(tag: &str, suppress: bool) -> (Vec<Received>, u64) {
             root_a.clone(),
         )
         .expect("init G_prod");
+        g.network()
+            .expect("network fixture")
+            .set_lan_access(cerulion_core::LanAccess::Open);
         // Mute the subscriber's flag-flip BEFORE the watch starts, so
         // in the reconciler-only run the ONLY flag-flipper is the query.
         if suppress {
@@ -199,6 +202,10 @@ fn run_two_gateway_flow(tag: &str, suppress: bool) -> (Vec<Received>, u64) {
         cerulion_core::testing::iceoryx_test_config(),
     )
     .expect("init G_cons manager");
+    b_mgr
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     // B's local subscriber first (before the gateway's ingress re-injects).
     let b_sub = b_mgr.create_subscriber(&topic).expect("B subscriber");
     let plan_cons = GatewayPlan {

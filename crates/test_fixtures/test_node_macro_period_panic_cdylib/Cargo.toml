@@ -5,8 +5,10 @@ edition = "2021"
 # Test fixture — never publish to crates.io.
 publish = false
 
+# `rlib` too: a test links this node into its own binary with
+# `default-features = false`, the way an app runtime library links its nodes.
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 cerulion_core = { path = "../../cerulion_core" }

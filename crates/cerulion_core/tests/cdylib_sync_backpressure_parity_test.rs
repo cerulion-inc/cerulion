@@ -311,7 +311,7 @@ impl SlowFeeder {
 
 fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -321,6 +321,7 @@ fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> No
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs
@@ -361,6 +362,8 @@ fn recording_sink(fires: Fires) -> ClosureNodeEntry {
         depth: 16,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
+        consume: Default::default(),
     };
     ClosureNodeEntry::new(
         NodeInfo::with_meta(vec![meta], vec![]).with_policy(MacroPolicy::DataTrigger {

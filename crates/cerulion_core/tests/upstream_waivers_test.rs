@@ -39,7 +39,7 @@
 //! the second creation first, so a per-arm list cannot converge: two runs of the
 //! same tree with the same fixtures on one macOS host disagreed on six arms out of
 //! thirty nine in each direction while the failing BINARIES stayed the same. Those
-//! binaries are gated whole: 26, all of them in `cerulion_cli`. CI shards
+//! binaries are gated whole: 28, all of them in `cerulion_cli`. CI shards
 //! `cerulion_core` under nextest, so CI is green.
 //!
 //! A process-per-arm runner shortens that list, it does not empty it. The process
@@ -102,7 +102,7 @@ const WAIVED_2034: &[(&str, &str)] = &[
     ),
     (
         "crates/cerulion_core/tests/cdylib_block_degrade_test.rs",
-        "dylib_block_degrade_is_deterministic",
+        "dylib_block_on_a_mixed_topic_is_deterministic",
     ),
     (
         "crates/cerulion_core/tests/cdylib_collapse_no_publish_test.rs",
@@ -316,22 +316,29 @@ const REACHED_BUT_NOT_WAIVED_2034: &[(&str, &str)] = &[
 /// the failing BINARIES stayed the same, and `replay_cli_test` failed 8 of its 28
 /// arms with the one survivor decided by which arm reached the in-process load first.
 ///
-/// THE COVERAGE THIS COSTS, stated once: 26 binaries of `cerulion_cli` do not run on
-/// macOS at all. They run on Linux, where the defect does not arise. Six of the 26,
+/// THE COVERAGE THIS COSTS, stated once: 28 binaries of `cerulion_cli` do not run on
+/// macOS at all. They run on Linux, where the defect does not arise. Eight of the 28,
 /// `ros2_graph_e2e_test`, `network_gateway_e2e_test`, `mp_supervisor_box_test`,
-/// `mp_live_determinism_box_test`, `read_identity_box_test` and
-/// `slow_does_not_block_box_test`, are in the set BY THE RULE rather than by
-/// measurement: no run has observed them failing. Of those six, every arm of
-/// `mp_supervisor_box_test`, `read_identity_box_test` and
-/// `slow_does_not_block_box_test` is `#[ignore]`d, and every arm of
+/// `mp_live_determinism_box_test`, `read_identity_box_test`,
+/// `read_identity_feed_box_test`, `slow_does_not_block_box_test` and
+/// `executor_units_box_test`, are in the set BY THE RULE rather than by
+/// measurement: no run has observed them failing. Of those eight, every arm of
+/// `mp_supervisor_box_test`, `read_identity_box_test`,
+/// `read_identity_feed_box_test`, `slow_does_not_block_box_test` and
+/// `executor_units_box_test` is `#[ignore]`d, and every arm of
 /// `mp_live_determinism_box_test` but one pure check of its verdict function, so
-/// none of the four loads a plugin under `cargo test` on any platform; the other two carry no
+/// none of the six loads a plugin under `cargo test` on any platform; the other
+/// two carry no
 /// platform `cfg` and no `ignore`, so why they have not been observed failing is not
 /// established here. The cure is an upstream release carrying the fix, or the pinned
 /// fork carrying a patch for it; nothing in this repository can shorten the list.
 const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
     (
         "crates/cerulion_cli/tests/credit_death_e2e_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
+        "crates/cerulion_cli/tests/executor_units_box_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
@@ -411,6 +418,10 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
         "eclipse-iceoryx/iceoryx2#2034",
     ),
     (
+        "crates/cerulion_cli/tests/read_identity_feed_box_test.rs",
+        "eclipse-iceoryx/iceoryx2#2034",
+    ),
+    (
         "crates/cerulion_cli/tests/ros2_graph_e2e_test.rs",
         "eclipse-iceoryx/iceoryx2#2034",
     ),
@@ -437,10 +448,10 @@ const WAIVED_2034_BINARIES: &[(&str, &str)] = &[
 ];
 
 /// Binaries whose zero-allocation arms subtract the 2035 publish allocation,
-/// with the number of SUBTRACTION SITES each carries: eleven sites across
-/// ten arms in five binaries, because the wide level arm subtracts once per width.
+/// with the number of SUBTRACTION SITES each carries: thirteen sites across
+/// twelve arms in six binaries, because the wide level arm subtracts once per width.
 ///
-/// Paths are relative to the WORKSPACE root, not to this crate: the ninth arm
+/// Paths are relative to the WORKSPACE root, not to this crate: the CLI engine arm
 /// lives in `cerulion_cli_engine`, and CI found it after a core-only inventory
 /// missed it. A waiver inventory scoped to one crate is a waiver inventory that
 /// will be incomplete again.
@@ -449,6 +460,7 @@ const WAIVED_2035: &[(&str, usize)] = &[
         "crates/cerulion_core/tests/accumulate_zero_alloc_test.rs",
         1,
     ),
+    ("crates/cerulion_core/tests/node_host_abi_test.rs", 2),
     ("crates/cerulion_core/tests/step_zero_alloc_test.rs", 6),
     ("crates/cerulion_core/tests/zero_copy_hot_path_test.rs", 2),
     (
@@ -1714,8 +1726,8 @@ fn every_declared_2035_arm_subtracts_the_known_loans_and_keeps_its_bound() {
         total += uses;
     }
     assert_eq!(
-        total, 11,
-        "the 2035 waiver covers eleven subtraction sites across ten arms (the wide level arm \
+        total, 13,
+        "the 2035 waiver covers thirteen subtraction sites across twelve arms (the wide level arm \
          subtracts twice, once per width). A change in that count needs a change here and a \
          reason in the commit."
     );

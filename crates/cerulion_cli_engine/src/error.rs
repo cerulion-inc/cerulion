@@ -4,6 +4,8 @@
 /// CLI engine errors.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
+    #[error("graph ingress producer identity changed during reconnect; restart the graph to resolve the source again")]
+    GraphIngressSourceChanged,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("YAML error: {0}")]
@@ -43,6 +45,9 @@ pub enum CliError {
     CdylibNotFound { node_type: String, reason: String },
     #[error("{0}")]
     Validation(String),
+    /// More than one observable source has the requested topic name.
+    #[error("{0}")]
+    AmbiguousTopic(String),
     /// The workspace lookup could not CHECK a spelling — a
     /// `schemas/…yaml` it could not read or parse, named in the message
     /// (`schemas/Foo.yaml (file stem) could not be parsed (YAML error: …)`).
@@ -73,6 +78,12 @@ pub enum CliError {
         )).collect::<Vec<_>>().join(VERDICT_LINE_SEP)
     )]
     WorkerNodeFatal { groups: Vec<String> },
+    /// A `--single-process` run whose one worker process (the process that
+    /// hosts every executor unit) stopped a node on `NodeError::Fatal`. That
+    /// process printed the node's own `Error:` line, so the CLI prints nothing
+    /// more for this error and exits [`EXIT_NODE_FATAL`].
+    #[error("a node of this run stopped on a fatal error (the `Error:` line above names it)")]
+    WorkerNodeFatalAnnounced,
 }
 
 /// Exit status of a `graph run` in which a node was stopped by a fatal error.

@@ -406,14 +406,20 @@ fn subscription_endpoint_info_round_trips_all_fields() {
         assert_eq!(read_cstr(info.node_namespace), "/");
         assert_eq!(read_cstr(info.topic_type), format!("rmw_ep/msg/{unique}"));
         assert_eq!(info.endpoint_type, ffi::RMW_ENDPOINT_SUBSCRIPTION);
-        // No rmw_get_gid_for_subscription surface; assert the deterministic
-        // gid is present (entity counter starts at 1, so never all-zero).
+        // No rmw_get_gid_for_subscription surface; assert the gid is set and
+        // carries this process's id in bytes 4..8 (the gid layout:
+        // pid-namespace id, process id, entity counter).
         // endpoint_gid is RMW_GID_STORAGE_SIZE bytes (24 before Iron, 16 from
         // Iron on), so the zero oracle takes that size, never a literal 16.
         assert_ne!(
             info.endpoint_gid,
             [0u8; ffi::RMW_GID_STORAGE_SIZE as usize],
             "subscription gid is set"
+        );
+        assert_eq!(
+            info.endpoint_gid[4..8],
+            std::process::id().to_le_bytes(),
+            "gid bytes 4..8 are the process id"
         );
         assert_eq!(
             info.qos_profile.durability,

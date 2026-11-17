@@ -231,7 +231,7 @@ fn chain_graph(
         prefix: "pvl".to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "relay".to_string(),
@@ -239,11 +239,12 @@ fn chain_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "mid".to_string(),
@@ -251,11 +252,12 @@ fn chain_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "relay/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vector3_output("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -263,6 +265,7 @@ fn chain_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "mid/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -804,7 +807,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
         nodes: vec![
             // UNIFIED consumer (plain trigger → drop_oldest → ListenerOnly).
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "unified".to_string(),
@@ -812,12 +815,13 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
             // INELIGIBLE consumer (sample(2) → dual-subscriber → Ipc).
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sampled".to_string(),
@@ -825,6 +829,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

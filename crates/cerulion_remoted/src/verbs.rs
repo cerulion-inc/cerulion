@@ -9,7 +9,9 @@
 //! in `crate::pairing_verbs`; the authorizer classifies them as the pre-authz
 //! bootstrap + safety-floor set. `deploy` / `teleop` are FORWARD classifications
 //! (not yet registered in cerud) so a future mutating/actuation verb cannot ship
-//! unclassified (deny-by-default).
+//! unclassified (deny-by-default). `clear-estop` and `estop-status` are FORWARD
+//! classifications too: no host registers a handler for either yet, so a caller
+//! the authorizer admits gets `unknown_verb`.
 
 // ── Ops verbs (mirror cerud's registered handler `name()` strings) ──────────
 
@@ -31,6 +33,13 @@ pub const TELEOP: &str = "teleop";
 /// Engage the e-stop permission floor. Allowed for ANY paired account
 /// regardless of scope (`cerud::lease` — any paired session, always wins).
 pub const ENGAGE_ESTOP: &str = "engage-estop";
+/// Clear the e-stop latch. Role `OPERATOR` or higher, and never from a row
+/// whose principal is cloud, whatever the allow-from-cloud switch says.
+/// FORWARD (no handler yet); classified now.
+pub const CLEAR_ESTOP: &str = "clear-estop";
+/// Read the e-stop latch. `CAP_OBSERVE` and role `VIEWER` or higher. FORWARD
+/// (no handler yet); classified now.
+pub const ESTOP_STATUS: &str = "estop-status";
 
 // ── Bootstrap verbs (self-gating) ────────────────────
 

@@ -208,6 +208,7 @@ fn node_view(node: &DeclaredNode) -> NodeView {
 
 fn catalog_entry(t: TopicObservation) -> CatalogEntry {
     CatalogEntry {
+        egress_qos: None,
         topic: t.topic,
         schema_hash: None,
         schema_name: None,

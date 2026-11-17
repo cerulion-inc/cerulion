@@ -153,11 +153,12 @@ schema-acquisition rung. The residual is recorded in the manifest header.
 ## Bare nested refs: zero tolerance
 
 The vendored corpus is uniformly QUALIFIED (`pkg/Type`) for nested references. Bare
-and qualified refs hash differently, nothing in the pipeline normalizes them
-(`resolve_fixed_nested`'s rewrite mutates only the fixed flag), and `rmw_cerulion`
-always emits the qualified rosidl-introspection form, so a bare ref in the corpus
-hashes differently from what an rmw publisher produces (`UnknownSchemaHash`, silent
-no-render). `the_vendored_corpus_declares_no_bare_nested_refs` fails loudly on any
+and qualified refs hash differently, and `rmw_cerulion` always emits the qualified
+rosidl-introspection form. `resolve_fixed_nested` qualifies a bare ref that its own
+package (or `std_msgs/Header`) resolves, but a schema hashed without resolution, and a
+bare ref no such step binds, keep the bare spelling and so hash differently from what
+an rmw publisher produces (`UnknownSchemaHash`, silent no-render).
+`the_vendored_corpus_declares_no_bare_nested_refs` fails loudly on any
 bare ref with the remediation spelled out; there is deliberately NO waiver mechanism.
 
 ## Wire-hash external pin

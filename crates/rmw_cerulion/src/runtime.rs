@@ -53,9 +53,10 @@ pub struct QosSnapshot {
     /// its RETENTION, the frames it really keeps:
     ///
     ///
-    /// - PUBLISHER: the clamped history. `TRANSIENT_LOCAL` depth 1000 ⇒ 16,
-    ///   depth 5 ⇒ 5, and VOLATILE ⇒ 0 (it retains nothing for a late
-    ///   joiner). NOT the topic's `subscriber_max_buffer_size` ceiling,
+    /// - PUBLISHER: the clamped history. `TRANSIENT_LOCAL` (and
+    ///   BEST_AVAILABLE, which a publisher resolves to it) depth 1000 ⇒ 16,
+    ///   depth 5 ⇒ 5, and VOLATILE ⇒ 0 (it asks for no history of its
+    ///   own). NOT the topic's `subscriber_max_buffer_size` ceiling,
     ///   which is a subscriber-SLOT budget rather than a depth anything
     ///   retains — reporting it would make a depth-5 publisher claim 16.
     /// - SUBSCRIPTION: the transport's default subscriber buffer, which IS
@@ -82,7 +83,7 @@ pub struct EndpointRecord {
     pub node_namespace: String,
     /// The topic's ROS graph type name ("pkg/msg/Name").
     pub type_name: String,
-    /// Deterministic entity gid (== `rmw_get_gid_for_publisher`).
+    /// Entity gid (== `rmw_get_gid_for_publisher` for a publisher).
     pub endpoint_gid: [u8; 16],
     /// QoS the endpoint was created with.
     pub qos: QosSnapshot,
@@ -168,10 +169,14 @@ impl GraphRegistry {
 
 /// Global runtime singleton.
 pub struct Runtime {
+    pub topic_scope: cerulion_core::transport::egress_scope::RunTopicScope,
+    local_exclusions:
+        Mutex<BTreeMap<String, cerulion_core::transport::egress_scope::LocalOnlyTopic>>,
     pub transport: Arc<TransportManager>,
     pub graph: RwLock<GraphRegistry>,
-    /// Monotonic counter for deterministic per-process entity ids (gids,
-    /// client instance numbers). Never wall-clock, never random.
+    /// Monotonic per-process entity counter: bytes 8 to 15 of subscription
+    /// and client gids ([`crate::gid::mint_gid`]). Never wall-clock, never
+    /// random.
     pub entity_counter: AtomicU64,
     /// Every live node's graph guard condition state. Registry
     /// mutations trigger ALL of them so executors blocked in `rmw_wait`
@@ -386,6 +391,34 @@ pub(crate) fn install_tracing() {
         .try_init();
 }
 
+impl Runtime {
+    /// A process retains exclusions until its additive endpoint registrations end.
+    // hot-path-alloc-ok-fn: cold endpoint creation, never publish or take.
+    pub fn claim_topic_scope(&self, topic: &str) -> cerulion_core::TransportResult<()> {
+        self.claim_scope(topic, self.topic_scope.excludes(topic))
+    }
+
+    pub fn claim_input_scope(&self, topic: &str) -> cerulion_core::TransportResult<()> {
+        self.claim_scope(topic, self.topic_scope.excludes_input(topic))
+    }
+
+    // hot-path-alloc-ok-fn: cold endpoint creation, never publish or take.
+    fn claim_scope(&self, topic: &str, excluded: bool) -> cerulion_core::TransportResult<()> {
+        if !excluded {
+            return Ok(());
+        }
+        let mut scopes = lock_unpoisoned(&self.local_exclusions).ok_or_else(|| {
+            cerulion_core::TransportError::Internal {
+                reason: "producer scope registry is poisoned".into(),
+            }
+        })?;
+        if let std::collections::btree_map::Entry::Vacant(entry) = scopes.entry(topic.to_string()) {
+            entry.insert(self.transport.exclude_remote_topic(topic)?);
+        }
+        Ok(())
+    }
+}
+
 /// Initialize (or fetch) the process runtime. Called from `rmw_init`
 /// and every entry point that needs transport access.
 pub fn runtime() -> Result<&'static Runtime, String> {
@@ -405,7 +438,16 @@ pub fn runtime() -> Result<&'static Runtime, String> {
     .or_else(|_| TransportManager::get())
     .map_err(|e| format!("transport init failed: {e}"))?;
 
+    let topic_scope = cerulion_core::transport::egress_scope::RunTopicScope::from_values(
+        std::env::var("CERULION_NETWORK").ok().as_deref(),
+        std::env::var(cerulion_core::transport::egress_scope::RUN_SCOPE_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|error| error.to_string())?;
     let rt = Runtime {
+        topic_scope,
+        local_exclusions: Mutex::new(BTreeMap::new()),
         transport,
         graph: RwLock::new(GraphRegistry::default()),
         entity_counter: AtomicU64::new(1),
@@ -700,6 +742,8 @@ pub struct PublisherData {
     pub type_name: String,
     pub bridge: Arc<crate::bridge::AnyBridge>,
     pub inner: Mutex<PublisherInner>,
+    /// Publisher gid: the iceoryx2 port id, which every sample the port
+    /// sends carries as its origin ([`crate::gid::publisher_gid`]).
     pub gid: [u8; 16],
     pub sequence: AtomicU64,
     /// Flood-suppressed loudness + an unconditional counter for
@@ -1051,8 +1095,7 @@ pub struct SubscriptionData {
     pub type_name: String,
     pub bridge: Arc<crate::bridge::AnyBridge>,
     pub inner: Mutex<SubscriptionInner>,
-    /// Deterministic per-process entity gid (entity counter + schema
-    /// hash, never random) — the endpoint id reported by
+    /// Entity gid ([`crate::gid`]): the endpoint id reported by
     /// `rmw_get_subscriptions_info_by_topic` and the key the graph
     /// registry deregisters by on destroy.
     pub gid: [u8; 16],
@@ -1060,7 +1103,7 @@ pub struct SubscriptionData {
     /// schema-hash gate but that the bridge cannot DECODE. Without the latch
     /// such a frame would drop silently (no log, no counter),
     /// indistinguishable from an empty queue.
-    pub decode_failures: Mutex<crate::decode_failure_latch::DecodeFailureLatch>,
+    pub decode_failures: crate::decode_failure_latch::EntityDecodeLatch,
     /// Flood-suppressed loudness + an unconditional counter for
     /// frames dropped on the schema-hash gate. SEPARATE from
     /// `decode_failures` on purpose — a hash mismatch (the two ends
@@ -1068,7 +1111,9 @@ pub struct SubscriptionData {
     /// type and disagree on the framing) are different conditions with
     /// different remedies, and sharing one latch would let either
     /// condition's regime mask the other's loud head.
-    pub hash_mismatches: Mutex<cerulion_core::transport::failure_regime_latch::FailureRegimeLatch>,
+    pub hash_mismatches: crate::gated_latch::GatedLatch<
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    >,
     /// Forged loaned take: flood-suppressed loudness + an unconditional counter
     /// for loaned takes REFUSED on a budget (the shadow pool, or the
     /// transport's borrow budget) — see [`crate::loan_refusal_latch`].
@@ -1126,7 +1171,7 @@ pub struct ServiceData {
     pub server: Mutex<cerulion_core::transport::service::ServiceServer>,
     /// See [`SubscriptionData::decode_failures`] — a request the
     /// bridge cannot decode must not be dropped silently.
-    pub decode_failures: Mutex<crate::decode_failure_latch::DecodeFailureLatch>,
+    pub decode_failures: crate::decode_failure_latch::EntityDecodeLatch,
 }
 
 // No manual Send/Sync impls — the server is over
@@ -1139,10 +1184,12 @@ pub struct ClientData {
     pub request_bridge: Arc<crate::bridge::AnyBridge>,
     pub response_bridge: Arc<crate::bridge::AnyBridge>,
     pub client: Mutex<cerulion_core::transport::service::ServiceClient>,
+    /// Entity gid ([`crate::gid`]): `rmw_get_gid_for_client`, the request
+    /// header's writer guid and the client's reply topic.
     pub gid: [u8; 16],
     /// See [`SubscriptionData::decode_failures`] — a response the
     /// bridge cannot decode must not be dropped silently.
-    pub decode_failures: Mutex<crate::decode_failure_latch::DecodeFailureLatch>,
+    pub decode_failures: crate::decode_failure_latch::EntityDecodeLatch,
 }
 
 // No manual Send/Sync impls — the client is over

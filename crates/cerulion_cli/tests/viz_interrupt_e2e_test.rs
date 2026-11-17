@@ -191,9 +191,8 @@ fn wait_bounded(child: &mut Child, bound: Duration) -> Option<ExitStatus> {
     }
 }
 
-/// stdout + stderr of a finished child, concatenated (the verb writes its placement
-/// lines to stdout and its diagnostics to stderr; the assertions care about both).
-fn drain(child: &mut Child) -> String {
+/// stdout and stderr of a finished child, read in full.
+fn drain_streams(child: &mut Child) -> (String, String) {
     let mut out = String::new();
     if let Some(mut s) = child.stdout.take() {
         let _ = s.read_to_string(&mut out);
@@ -202,6 +201,13 @@ fn drain(child: &mut Child) -> String {
     if let Some(mut s) = child.stderr.take() {
         let _ = s.read_to_string(&mut err);
     }
+    (out, err)
+}
+
+/// stdout + stderr of a finished child, concatenated (the verb writes its placement
+/// lines to stdout and its diagnostics to stderr; the assertions care about both).
+fn drain(child: &mut Child) -> String {
+    let (out, err) = drain_streams(child);
     format!("{out}{err}")
 }
 
@@ -272,7 +278,9 @@ fn a_sigint_during_the_discovery_wait_exits_zero_and_claims_nothing() {
 /// Without this, every negative assertion above would pass a verb that printed nothing
 /// at all. One field differs — the plane age is reported ABOVE the shipped ceiling, so
 /// `ConvergenceWait::decide`'s first-contact cap gives up on the FIRST round trip and the
-/// control costs milliseconds instead of the ceiling.
+/// control costs milliseconds instead of the ceiling. The verb runs under
+/// `CERULION_NETWORK=off` against a daemon it did not start, so the control also pins the
+/// note `cerulion viz` prints when it reuses a daemon under the switch.
 #[test]
 fn without_an_interruption_the_same_daemon_yields_the_absence_paragraph_and_nonzero() {
     // Comfortably past `FIRST_CONTACT_CONVERGENCE_CEILING` (10 s).
@@ -283,7 +291,18 @@ fn without_an_interruption_the_same_daemon_yields_the_absence_paragraph_and_nonz
         let _ = child.kill();
         panic!("cerulion viz did not exit on its own");
     });
-    let output = drain(&mut child);
+    let (stdout, stderr) = drain_streams(&mut child);
+    let output = format!("{stdout}{stderr}");
+
+    // `spawn_viz` sets `CERULION_NETWORK=off` and the fake daemon is already
+    // listening, so the verb reuses it and says on stderr that the switch does
+    // not reach a daemon it did not start.
+    assert!(
+        stderr.contains("the cerulion-vizd daemon was already running")
+            && stderr.contains("it keeps the telemetry setting it started with")
+            && stderr.contains("`cerulion telemetry off`"),
+        "a daemon reused under the network kill switch gets the note on stderr:\n{output}"
+    );
 
     assert_eq!(
         daemon.attaches(),

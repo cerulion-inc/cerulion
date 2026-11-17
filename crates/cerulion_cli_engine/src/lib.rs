@@ -50,6 +50,9 @@ pub(crate) mod child_signals;
 // argv + the `cerulion-connectd` sibling-binary path). The CLI stays iroh-free —
 // it spawns the resolved binary.
 pub mod connect_cmd;
+// The `cerulion rcp` verb's PURE resolution: the same robot resolution as
+// `connect`, spawning `cerulion-connectd rcp` with inherited stdio.
+pub mod rcp_cmd;
 // The value sources behind shell tab-completion — live topic / node /
 // graph / schema / robot names for a TAB press. Every source is an INSTANT
 // LOCAL read under a hard wall-clock budget: no process is ever spawned (netd
@@ -80,6 +83,8 @@ pub mod hostname_peers;
 pub mod ipc_cleanup;
 // The mDNS discovery rung (pure-Rust `mdns-sd` browse — the primary rung).
 pub mod mdns_discovery;
+/// Messages as JSON or YAML text for `topic pub` and `service call`.
+pub mod message_text;
 // The LOCAL ament harvest rung — a filesystem-only
 // `SchemaAcquirer` over the host's `$AMENT_PREFIX_PATH` ROS install.
 pub mod local_harvest;
@@ -87,11 +92,15 @@ pub mod multiprocess;
 pub mod node_cmd;
 pub mod node_metadata;
 mod node_metadata_accumulate;
+mod node_metadata_consume;
 pub mod node_params_info;
-// The `cerulion pair` verb — PURE eid/name resolution ladder + the
+// The `cerulion pair` verb's engine: PURE eid/name resolution ladder + the
 // `cerulion-connectd pair` argv builder + robots.toml pinning (the CLI stays
-// iroh-free; the CPace ceremony lives in the spawned sibling).
+// iroh-free; the CPace ceremony lives in the spawned sibling). No `cerulion`
+// verb calls it while `cerulion pair` is a hidden stub.
 pub mod pair_cmd;
+/// `--robot NAME` on `topic pub`, `topic snapshot` and `service call`.
+pub mod robot_act;
 // Login-gated ownership at install: `register_robot` (`POST
 // /v1/robots`) binds the logged-in account as THIS machine's owner and returns
 // the offline-verifiable owner grant. The install-funnel entry (a robot install,
@@ -137,6 +146,11 @@ pub mod replay_cmd;
 // transport).
 #[cfg(unix)]
 pub mod replay_engine;
+// What a replay byte-mismatch line names: the first differing field of a
+// frame and its two values, in `topic echo`'s spelling. Pure; called by the
+// engine once per diverging stream after a pass. Unix-gated with its caller.
+#[cfg(unix)]
+pub(crate) mod replay_value_diff;
 // The `--record-out` sink of `bag play --resim`: the re-executed frames, written
 // to a fresh bag. Unix-gated with the engine that feeds it.
 #[cfg(unix)]
@@ -171,6 +185,11 @@ pub mod replay_rank;
 // sequences and returns a schedule, touching neither `cerulion_bag` nor the
 // transport, so it builds and tests on every platform the crate does.
 pub mod replay_inject;
+// The identity-keyed PRIVATE REPLAY FEEDS: which recorded frames each read
+// consumed, by writer and sequence, and the feed that publishes them onto a
+// read stage's private service at the gate's admission.
+#[cfg(unix)]
+pub mod replay_feed;
 // The PURE rank-local re-derivation VERIFIER. Replay fires
 // are trace-driven, so the structural "would this schedule have
 // happened?" verdict is produced here — Period / `throttle_ms` / Sync / FIFO
@@ -249,8 +268,13 @@ pub mod ros2_graph;
 // clean-git-tree refusal, ONE commit + patch file, then an automatic
 // `colcon build --packages-select` of the affected packages.
 pub mod ros2_migrate;
+// Whether a Rust 1.95 or newer is there for the verbs that build nodes, and the
+// offer to install it on a terminal. Pure decision core, injected probe.
+pub mod rust_setup;
 pub mod schema_cmd;
 pub mod schema_serve;
+/// `cerulion service call`.
+pub mod service_cmd;
 // The macOS `/tmp/*.shm_state` population — detect it, price it, and
 // reclaim only what is PROVABLY dead. `iceoryx2-pal-posix` keeps one such file
 // per SHM segment on a platform with no `/dev/shm`, a SIGKILLed owner leaks it
@@ -265,7 +289,7 @@ pub mod state_arm_attach;
 // The workspace `.msg` schema store reader
 // (`schemas/<pkg>/msg/<Type>.msg`), shared by attach's resolvability chain
 // and `schema list`/`info`. Pure (`parse_rosmsg`); no DDS, no transport.
-pub mod schema_store;
+pub use cerulion_msgio::schema_store;
 // OPTIONAL SYSTEM dependencies for node crates. A Cargo build script
 // cannot enable a feature of its own crate, so "link GStreamer if this machine
 // has it" cannot be expressed in Cargo at all — the probe lives here, and
@@ -300,6 +324,11 @@ pub mod viz_cmd;
 // `cerulion_core::wedge_page`.
 pub mod wedge_alarm;
 pub mod workspace;
+
+/// Shell scripts a test writes and runs at once, guarded against ETXTBSY. The
+/// `tests/*.rs` binaries that need it compile the same file by `#[path]`.
+#[cfg(all(test, unix))]
+mod fresh_executable;
 
 /// The ONE crate-wide lock serializing every env-mutating
 /// **lib** test in `cerulion_cli_engine`.

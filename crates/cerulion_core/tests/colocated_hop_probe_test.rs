@@ -4,7 +4,7 @@
 //!
 //! # Status
 //!
-//! A MEASUREMENT, not a gate. The two `#[ignore]`d arms print a table and
+//! A MEASUREMENT, not a gate. The three `#[ignore]`d arms print a table and
 //! assert only that every row ran to its full sample count; no CI job passes
 //! `--ignored`, so the arms run when someone runs them, on a quiet machine:
 //!
@@ -43,6 +43,30 @@
 //!   crate's publisher, to one subscriber. Batch timed. Every hop keeps it,
 //!   because a hop's frame is published whatever happens after.
 //!
+//! The third arm, `the_called_hop_and_its_parts`, runs the same graphs with
+//! `CERULION_FUSE_CHAINS=1`, so every chain member is called when its chain
+//! head's level ends, and times the parts of one such hop at 64 B:
+//!
+//! - `called-hop`, `called-chain`, `called-chain/hop`: the `queued-*` rows
+//!   with chain calls on. Each run asserts the chain-call counter: zero on a
+//!   queued row, nonzero on a called one.
+//! - `clock-pair`: two clock reads back to back, the floor under every
+//!   per-operation row below.
+//! - `publish-tail`: what follows the producer's stamp: the output's commit
+//!   and send, to a subscriber with an event listener, which also notifies.
+//! - `publish-tail/no-listener`: the same to a subscriber with no listener, so
+//!   nothing is notified. The notify is the difference.
+//! - `listener-empty`: the drain's first step, emptying the consumer's event
+//!   queue after one notify.
+//! - `dequeue`: the drain's pop of the one pending frame, which it freezes for
+//!   the tick.
+//! - `view`: the tick's typed read of the frozen frame.
+//!
+//! The call itself (QoS windows, decide, freeze, fire into the member's own
+//! trace buffer) and the cost of holding the entry are timed inside the
+//! scheduler, beside its private types: `what_a_chain_call_costs` in
+//! `src/scheduler/mod.rs`.
+//!
 //! Each row prints the median gap between distinct readings as `grain`. On a
 //! host whose clock ticks coarsely (Apple silicon: 41.667 ns), a per-operation
 //! row's grain reads that tick and its median is good to one tick and no finer;
@@ -64,15 +88,17 @@ use std::time::{Duration, Instant};
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::node::NodeEntry;
-use cerulion_core::graph::{parse_graph, validate_graph, GraphRuntime};
+use cerulion_core::graph::{parse_graph, validate_graph, GraphRuntime, FUSE_CHAINS_ENV};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
 use cerulion_core::testing::iceoryx_test_config;
 use cerulion_core::transport::publisher::CerulionPublisher;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
+use cerulion_core::OutputProxy;
 use indexmap::IndexMap;
 use native_ros2_messages::sensor_msgs::Image;
+use serial_test::serial;
 
 /// The two payload sizes every row sweeps.
 const SIZES: [usize; 2] = [64, 1024 * 1024];
@@ -369,8 +395,23 @@ fn chain_graph() -> GraphRuntime {
     build(CHAIN_GRAPH, f)
 }
 
+/// Builds `graph` with chain calls on (`true`) or off, removing the seam's
+/// variable again before returning.
+fn build_called(graph: fn() -> GraphRuntime, called: bool) -> GraphRuntime {
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            std::env::remove_var(FUSE_CHAINS_ENV);
+        }
+    }
+    let _unset = Unset;
+    std::env::set_var(FUSE_CHAINS_ENV, if called { "1" } else { "0" });
+    graph()
+}
+
 /// Step `runtime` until the sink has recorded the warm-up plus the kept
-/// samples, and return the kept ones.
+/// samples, and return the kept ones. Refuses a row whose chain calls are
+/// not what its label says.
 fn collect_graph_row(mut runtime: GraphRuntime, label: &str) -> Vec<u64> {
     HOP_NS.lock().expect("not poisoned").clear();
     let want = WARMUP + ITERATIONS;
@@ -383,6 +424,12 @@ fn collect_graph_row(mut runtime: GraphRuntime, label: &str) -> Vec<u64> {
         );
         runtime.step(Duration::from_millis(1));
         steps += 1;
+    }
+    let calls = runtime.chain_calls_made();
+    if label.starts_with("called") {
+        assert!(calls > 0, "{label}: no chain call was made");
+    } else {
+        assert_eq!(calls, 0, "{label}: a queued row made chain calls");
     }
     let mut samples = std::mem::take(&mut *HOP_NS.lock().expect("not poisoned"));
     samples.truncate(want);
@@ -429,6 +476,7 @@ fn isolated_manager() -> Arc<TransportManager> {
 
 #[test]
 #[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+#[serial]
 fn the_queued_hop_through_the_level_loop() {
     require_release();
     for size in SIZES {
@@ -437,9 +485,9 @@ fn the_queued_hop_through_the_level_loop() {
             "queued-hop",
             size,
             1,
-            collect_graph_row(hop_graph(), "queued-hop"),
+            collect_graph_row(build_called(hop_graph, false), "queued-hop"),
         );
-        let chain = collect_graph_row(chain_graph(), "queued-chain");
+        let chain = collect_graph_row(build_called(chain_graph, false), "queued-chain");
         let per_hop: Vec<u64> = chain.iter().map(|ns| ns / CHAIN_HOPS).collect();
         report("queued-chain", size, 1, chain);
         report("queued-chain/hop", size, 1, per_hop);
@@ -448,6 +496,7 @@ fn the_queued_hop_through_the_level_loop() {
 
 #[test]
 #[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+#[serial]
 fn what_a_hop_is_made_of() {
     use iceoryx2::prelude::*;
 
@@ -560,5 +609,149 @@ fn what_a_hop_is_made_of() {
             }
             report("publish", size, BATCH, kept);
         }
+    }
+}
+
+/// Time one region per sample, `WARMUP + ITERATIONS` times, after `setup`
+/// prepares the state each sample starts from; keep the last `ITERATIONS`.
+fn per_op<S>(mut setup: impl FnMut() -> S, mut timed: impl FnMut(S)) -> Vec<u64> {
+    let mut kept = Vec::with_capacity(ITERATIONS);
+    for i in 0..(WARMUP + ITERATIONS) {
+        let state = setup();
+        let start = Instant::now();
+        timed(state);
+        let elapsed = start.elapsed().as_nanos() as u64;
+        if i >= WARMUP {
+            kept.push(elapsed);
+        }
+    }
+    kept
+}
+
+/// Loan, fill and touch one frame the way the producing nodes do, and return
+/// it uncommitted: dropping the proxy commits and sends it.
+fn loaned(publisher: &mut CerulionPublisher, payload_len: usize) -> OutputProxy<'_, Image> {
+    let mut proxy = publisher.loan_proxy::<Image>().expect("a loan");
+    proxy.height = 1;
+    proxy.width = payload_len as u32;
+    proxy.is_bigendian = 0;
+    proxy.step = 1;
+    proxy.set_header_bytes(&[]).expect("header bytes");
+    proxy.set_encoding("hp").expect("an encoding");
+    let dst = proxy.loan_data(payload_len).expect("a payload loan");
+    if let Some(first) = dst.first_mut() {
+        *first = 0x80;
+    }
+    proxy
+}
+
+#[test]
+#[ignore = "a measurement, not a gate: run it with --release -- --ignored --nocapture"]
+#[serial]
+fn the_called_hop_and_its_parts() {
+    require_release();
+    let size = SIZES[0];
+    CURRENT_SIZE.store(size, Ordering::Relaxed);
+
+    report(
+        "queued-hop",
+        size,
+        1,
+        collect_graph_row(build_called(hop_graph, false), "queued-hop"),
+    );
+    report(
+        "called-hop",
+        size,
+        1,
+        collect_graph_row(build_called(hop_graph, true), "called-hop"),
+    );
+    for called in [false, true] {
+        let label = if called {
+            "called-chain"
+        } else {
+            "queued-chain"
+        };
+        let chain = collect_graph_row(build_called(chain_graph, called), label);
+        let per_hop: Vec<u64> = chain.iter().map(|ns| ns / CHAIN_HOPS).collect();
+        report(label, size, 1, chain);
+        report(&format!("{label}/hop"), size, 1, per_hop);
+    }
+
+    report("clock-pair", size, 1, per_op(|| (), |()| ()));
+
+    // The consumer side of a hop, through a graph-style subscriber: an event
+    // listener, and the pop-one discipline every data-trigger input runs.
+    for listener in [true, false] {
+        let mgr = isolated_manager();
+        let topic = if listener {
+            "probe/colocated/tail"
+        } else {
+            "probe/colocated/tail-quiet"
+        };
+        let mut publisher = mgr
+            .create_publisher_simple(topic, MaxSliceLen::const_new(slot_len_for(size)))
+            .expect("a publisher");
+        let mut sub = if listener {
+            mgr.create_subscriber(topic).expect("a subscriber")
+        } else {
+            mgr.create_subscriber_no_listener_for_test(topic)
+                .expect("a subscriber")
+        };
+        sub.mark_fifo_consume_for_test();
+        let label = if listener {
+            "publish-tail"
+        } else {
+            "publish-tail/no-listener"
+        };
+        let mut kept = Vec::with_capacity(ITERATIONS);
+        for i in 0..(WARMUP + ITERATIONS) {
+            let proxy = loaned(&mut publisher, size);
+            let start = Instant::now();
+            drop(proxy);
+            let elapsed = start.elapsed().as_nanos() as u64;
+            if listener {
+                sub.drain_event_notifications().expect("an event drain");
+            }
+            let (popped, _) = sub.snapshot_latest_for_trigger();
+            assert_eq!(popped, 1, "{label}: the frame just published must pop");
+            let seen = sub
+                .try_view::<Image, _>(|view| view.data().len())
+                .expect("a read");
+            assert_eq!(seen, Some(size), "{label}: the frozen frame must be served");
+            if i >= WARMUP {
+                kept.push(elapsed);
+            }
+        }
+        report(label, size, 1, kept);
+
+        if !listener {
+            continue;
+        }
+        let mut empty = Vec::with_capacity(ITERATIONS);
+        let mut dequeue = Vec::with_capacity(ITERATIONS);
+        let mut view = Vec::with_capacity(ITERATIONS);
+        for i in 0..(WARMUP + ITERATIONS) {
+            drop(loaned(&mut publisher, size));
+            let a = Instant::now();
+            sub.drain_event_notifications().expect("an event drain");
+            let b = Instant::now();
+            let (popped, _) = sub.snapshot_latest_for_trigger();
+            let c = Instant::now();
+            let seen = sub
+                .try_view::<Image, _>(|v| (v.height, v.width, v.data().len()))
+                .expect("a read");
+            let d = Instant::now();
+            assert_eq!(popped, 1, "the frame just published must pop");
+            assert!(seen.is_some(), "the frozen frame must be served");
+            std::hint::black_box(seen);
+            if i >= WARMUP {
+                empty.push((b - a).as_nanos() as u64);
+                dequeue.push((c - b).as_nanos() as u64);
+                view.push((d - c).as_nanos() as u64);
+            }
+        }
+        report("listener-empty", size, 1, empty);
+        report("dequeue", size, 1, dequeue);
+        report("view", size, 1, view);
     }
 }

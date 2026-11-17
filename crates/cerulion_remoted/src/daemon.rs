@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The daemon: load the device key + trust store + side-map, build the ONE iroh
-//! endpoint, and run the accept loop dispatching on the negotiated ALPN.
+//! The daemon: honor the kill switch, serve the [`crate::RemotePlane`] entry over
+//! the configured files, and run the accept loop dispatching on the negotiated ALPN.
 //!
 //! Every connection is first classified by the [`PairingAuthorizer`] (deny-by-
 //! default), then dispatched by plane:
@@ -8,19 +8,20 @@
 //!   ([`crate::ops`]) — deploy/inventory/pair/claim/e-stop;
 //! - `cerulion/wire/2` (WireAdmit) → the demand-driven SHM tap plane
 //!   ([`crate::wire`]);
+//! - `cerulion/rcp/1` (RcpAdmit) → the MCP proxy to the local `cerulion-rcpd`
+//!   ([`crate::rcp`]);
 //! - everything else (Refuse / unknown ALPN, or a plane not wired) → a
 //!   deadline-bounded skeleton control-frame report that surfaces the
 //!   [`AcceptDecision`] so the classification stays observable end-to-end.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
-use cerud::lease::ControlLease;
 use cerulion_core::TransportManager;
 use cerulion_link::{
-    accept_frame_stream, accept_one, build_endpoint, read_frame, write_frame, Accepted, Connection,
-    Endpoint, EndpointConfig, LinkError,
+    accept_frame_stream, read_frame, write_frame, Accepted, Connection, Endpoint, EndpointId,
+    IncomingAddr, LinkError, RelayUrl,
 };
 use cerulion_pairing::format::PublicKey;
 use cerulion_pairing::verify::TrustStore;
@@ -31,15 +32,17 @@ use crate::config::RemotedConfig;
 use crate::device_index::DeviceAccountIndex;
 use crate::epoch_pull::EpochPull;
 use crate::error::RemotedError;
+use crate::host::{OpsHost, PlaneFiles, DAEMON_SERVER_NAME};
 use crate::ops::OpsServing;
 use crate::pairing_verbs::SharedCodePairSessions;
+use crate::rcp::{RcpLink, RcpPlane};
 use crate::trust::SharedTrust;
 use crate::wire::WirePlane;
 
 /// Cap on the skeleton control-frame handshake (hello + reply are tiny).
 const MAX_HELLO_LEN: usize = 4096;
 
-/// Per-connection deadline for the whole skeleton control-frame handshake
+/// Deadline for incoming TLS and, separately, the skeleton control-frame handshake
 /// (accept the bidi stream + read the hello + write the decision + drain to
 /// EOF). A peer that completes the QUIC handshake then STALLS must not hold the
 /// spawned task + connection indefinitely (an unauthenticated resource-hold DoS
@@ -47,33 +50,277 @@ const MAX_HELLO_LEN: usize = 4096;
 /// generous for a hello+reply even over a relay; the ops and wire planes' protocols
 /// carry their own tighter budgets.
 ///
-/// NOTE: this bounds each connection's HANDSHAKE, not the
-/// GLOBAL number of concurrent connections. A global concurrency cap (a bounded
-/// semaphore acquired before `spawn`, released on the handler's completion) is a
-/// defensible additional guard and is not implemented.
+/// At most 32 TLS handshakes are pending, and arrivals other than paired relay
+/// keys fill at most 24 of them. Unvalidated addresses are retried from half
+/// capacity. A paired relay key answers one Retry, which travels over the relay
+/// to the key's holder, before it takes a slot. Validated IPs and paired relay
+/// keys hold at most four slots each, unpaired relay arrivals share eight per
+/// URL and custom transports share four. Established connections have their own
+/// protocol deadlines.
 const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// The loaded robot state the daemon serves from.
-struct RemotedState {
-    device_key: [u8; 32],
-    trust_store: TrustStore,
-    device_index: DeviceAccountIndex,
-    /// The firmware secure-storage MAC key that authenticates the trust store AND
-    /// the side-map — retained so the pairing verbs can PERSIST a mutation
-    /// (claim/pair/code-pair write both artifacts back to disk).
-    mac_key: Vec<u8>,
+/// Bound unauthenticated work without serializing one peer ahead of safety ops.
+const MAX_PENDING_HANDSHAKES: usize = 32;
+/// Slots an arrival that is not a paired relay key may fill. The slots above
+/// it, up to [`MAX_PENDING_HANDSHAKES`], are a reserve only paired relay keys
+/// can take.
+const UNPAIRED_PENDING: usize = 24;
+const PER_SOURCE_PENDING: usize = 4;
+const PER_UNPAIRED_RELAY_PENDING: usize = 8;
+
+/// The admission cap that refused an arrival. Each cap has its own failure
+/// regime ([`AdmissionLatches`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cap {
+    Global,
+    UnpairedShare,
+    Ip,
+    UnpairedRelay,
+    PairedRelay,
+    Custom,
+}
+
+impl Cap {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::UnpairedShare => "unpaired_share",
+            Self::Ip => "ip",
+            Self::UnpairedRelay => "unpaired_relay",
+            Self::PairedRelay => "paired_relay",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    Admit,
+    /// Address validation under pressure: an unvalidated arrival once half the
+    /// slots are pending, below the unpaired share.
+    Retry,
+    /// An unvalidated arrival under a paired relay key. iroh reads that key from
+    /// the source address, which an IP datagram can forge, so the arrival takes
+    /// no slot until it returns the Retry token. The Retry goes out over the
+    /// relay, so only the key's holder receives it.
+    KeyRetry,
+    Refuse(Cap),
+}
+
+// Retry must engage before the unpaired share fills, and the share must leave
+// a reserve below the global cap.
+const _: () = assert!(
+    MAX_PENDING_HANDSHAKES / 2 < UNPAIRED_PENDING && UNPAIRED_PENDING < MAX_PENDING_HANDSHAKES
+);
+
+/// The global cap, the paired key Retry, the unpaired share (paired relay keys
+/// exempt), address Retry, then the per-IP cap. `ip_pending` is the count of
+/// the arrival's validated IP, zero for every other source.
+fn handshake_admission(
+    pending: usize,
+    ip_pending: usize,
+    validated: bool,
+    paired: bool,
+) -> Admission {
+    if pending >= MAX_PENDING_HANDSHAKES {
+        Admission::Refuse(Cap::Global)
+    } else if paired && !validated {
+        Admission::KeyRetry
+    } else if !paired && pending >= UNPAIRED_PENDING {
+        Admission::Refuse(Cap::UnpairedShare)
+    } else if !validated && pending >= MAX_PENDING_HANDSHAKES / 2 {
+        Admission::Retry
+    } else if validated && ip_pending >= PER_SOURCE_PENDING {
+        Admission::Refuse(Cap::Ip)
+    } else {
+        Admission::Admit
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum SourceKey {
+    Ip(std::net::IpAddr),
+    UnpairedRelay(RelayUrl),
+    PairedRelay(EndpointId),
+    Custom,
+}
+
+fn handshake_source(
+    address: IncomingAddr,
+    validated: bool,
+    paired: impl Fn(&EndpointId) -> bool,
+) -> Option<SourceKey> {
+    match address {
+        IncomingAddr::Ip(address) => validated.then_some(SourceKey::Ip(address.ip())),
+        IncomingAddr::Relay { url, endpoint_id } => Some(if paired(&endpoint_id) {
+            SourceKey::PairedRelay(endpoint_id)
+        } else {
+            SourceKey::UnpairedRelay(url)
+        }),
+        IncomingAddr::Custom(_) => Some(SourceKey::Custom),
+        _ => Some(SourceKey::Custom),
+    }
+}
+
+impl SourceKey {
+    fn cap(&self) -> Cap {
+        match self {
+            Self::Ip(_) => Cap::Ip,
+            Self::UnpairedRelay(_) => Cap::UnpairedRelay,
+            Self::PairedRelay(_) => Cap::PairedRelay,
+            Self::Custom => Cap::Custom,
+        }
+    }
+
+    /// Pending handshakes this source may hold.
+    fn limit(&self) -> usize {
+        match self {
+            Self::UnpairedRelay(_) => PER_UNPAIRED_RELAY_PENDING,
+            Self::Ip(_) | Self::PairedRelay(_) | Self::Custom => PER_SOURCE_PENDING,
+        }
+    }
+}
+
+/// Pending handshakes already held by `source`. A paired relay key never reads
+/// the count of its relay URL.
+fn pending_from(sources: &indexmap::IndexMap<SourceKey, u8>, source: Option<&SourceKey>) -> usize {
+    source
+        .and_then(|key| sources.get(key))
+        .map_or(0, |count| usize::from(*count))
+}
+
+fn source_admission(
+    pending: usize,
+    pending_from_source: usize,
+    validated: bool,
+    source: Option<&SourceKey>,
+) -> Admission {
+    let ip_pending = if matches!(source, Some(SourceKey::Ip(_))) {
+        pending_from_source
+    } else {
+        0
+    };
+    let paired = matches!(source, Some(SourceKey::PairedRelay(_)));
+    match handshake_admission(pending, ip_pending, validated, paired) {
+        Admission::Admit => match source {
+            Some(
+                source @ (SourceKey::UnpairedRelay(_)
+                | SourceKey::PairedRelay(_)
+                | SourceKey::Custom),
+            ) if pending_from_source >= source.limit() => Admission::Refuse(source.cap()),
+            _ => Admission::Admit,
+        },
+        admission => admission,
+    }
+}
+
+/// Whether an admission or completion at `pending` closes the global,
+/// unpaired-share, address-retry and handshake-failure regimes: only below half
+/// capacity.
+fn shared_regimes_close(pending: usize) -> bool {
+    pending < MAX_PENDING_HANDSHAKES / 2
+}
+
+/// The refusal regimes an admitted arrival closes, given the pending counts
+/// before it. The shared regimes close only below half capacity, and the
+/// arrival's source-class regime only while every source of that class holds
+/// less than half its own limit, so arrivals that refill full buckets, from one
+/// source or several, never close the regime those buckets hold open.
+fn closed_regimes(
+    pending: usize,
+    source: Option<&SourceKey>,
+    sources: &indexmap::IndexMap<SourceKey, u8>,
+) -> [Option<Cap>; 3] {
+    let shared = shared_regimes_close(pending);
+    let class = source.map(SourceKey::cap).filter(|cap| {
+        sources
+            .iter()
+            .filter(|(key, _)| key.cap() == *cap)
+            .all(|(key, count)| usize::from(*count) < key.limit() / 2)
+    });
+    [
+        shared.then_some(Cap::Global),
+        shared.then_some(Cap::UnpairedShare),
+        class,
+    ]
+}
+
+/// One failure regime per admission cap, so one cap's refusals never close or
+/// swallow another's.
+#[derive(Default)]
+struct AdmissionLatches {
+    global: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    unpaired_share: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    ip: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    unpaired_relay: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    paired_relay: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+    custom: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+}
+
+impl AdmissionLatches {
+    fn latch(
+        &mut self,
+        cap: Cap,
+    ) -> &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch {
+        match cap {
+            Cap::Global => &mut self.global,
+            Cap::UnpairedShare => &mut self.unpaired_share,
+            Cap::Ip => &mut self.ip,
+            Cap::UnpairedRelay => &mut self.unpaired_relay,
+            Cap::PairedRelay => &mut self.paired_relay,
+            Cap::Custom => &mut self.custom,
+        }
+    }
+
+    fn refused(
+        &mut self,
+        cap: Cap,
+    ) -> cerulion_core::transport::failure_regime_latch::RegimeDecision {
+        self.latch(cap).on_failure()
+    }
+
+    fn admitted(&mut self, cap: Cap) -> Option<u64> {
+        self.latch(cap).on_success()
+    }
+
+    fn total(&mut self, cap: Cap) -> u64 {
+        self.latch(cap).total_failures()
+    }
+}
+
+fn release_handshake_source(
+    id: tokio::task::Id,
+    task_sources: &mut indexmap::IndexMap<tokio::task::Id, SourceKey>,
+    sources: &mut indexmap::IndexMap<SourceKey, u8>,
+) {
+    if let Some(source) = task_sources.shift_remove(&id) {
+        if let Some(count) = sources.get_mut(&source) {
+            *count -= 1;
+            if *count == 0 {
+                sources.shift_remove(&source);
+            }
+        }
+    }
 }
 
 /// Build the daemon from config and serve until `shutdown` resolves (or the
-/// endpoint closes).
+/// endpoint closes). `shutdown` is dropped as soon as the accept loop stops,
+/// before anything is logged and before the shutdown stage runs, or before the
+/// kill-switch line when `run` will not serve.
 ///
 /// Honors the `--network off` / `CERULION_NETWORK=off` kill-switch: if
 /// engaged, it logs loudly and exits cleanly WITHOUT binding an endpoint.
+/// Otherwise it serves the same library entry a host embeds
+/// ([`RemotedConfig::daemon_plane`] with the [`RemotedConfig::key_files`]
+/// provider), which keeps `restart`, `engage-estop` and the rcp plane.
 pub async fn run(
     config: RemotedConfig,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     if config.network_disabled {
+        // Dropped before the line below, as `serve_planes` drops it before it
+        // logs: a host that watches it learns serving will not start.
+        drop(shutdown);
         tracing::warn!(
             "cerulion_remoted: network kill-switch engaged (--network off / \
              CERULION_NETWORK=off) — refusing to serve the remote plane; exiting \
@@ -82,71 +329,29 @@ pub async fn run(
         return Ok(());
     }
 
-    let state = load_state(&config)?;
-    let endpoint =
-        build_endpoint(EndpointConfig::new(state.device_key).with_relay(config.relay.clone()))
-            .await?;
-
-    // Bind the trust store to THIS device: the endpoint id (== the device key's
-    // public half, the identity peers TLS-authenticate against) MUST equal the
-    // store's recorded `robot_transport_key`. A transplanted / restored / fleet-
-    // misprovisioned store would otherwise boot cleanly and serve THIS robot
-    // under a DIFFERENT robot's owner + access list. LOUD refusal, never a silent
-    // wrong-robot boot.
-    if let Err(e) = check_store_device_binding(
-        endpoint.id().as_bytes(),
-        &state.trust_store.robot_transport_key(),
-    ) {
-        tracing::error!(error = %e, "cerulion_remoted: refusing to serve — trust store is not bound to this device");
-        endpoint.close().await;
-        return Err(e);
-    }
-
-    // Publish the PUBLIC beacon facts (eid / iroh_port / claimable) for the
-    // gateway's mDNS TXT enrichment. Best-effort + additive — a write
-    // failure warns, never fails the daemon. Read ownership BEFORE the store moves
-    // into the shared trust state; the claim / pair handlers refresh it after a
-    // successful claim.
-    crate::beacon_facts::write_at_startup(
-        &config.beacon_facts_file,
-        &endpoint,
-        state.trust_store.ownership(),
-    );
-
-    // Build the live trust state + the ops/wire planes and serve until shutdown. The
-    // access-check clock is the robot's own WALL clock and the wire plane uses its default
-    // revocation-sweep cadence; the `serve_endpoint` seam parameterizes both so a
-    // daemon-level test can drive a mid-session revoke deterministically through the SAME
-    // wiring.
-    let result = serve_endpoint(
-        &config,
-        state.trust_store,
-        state.device_index,
-        state.mac_key,
-        &endpoint,
-        RemotedClock::wall(),
-        None,
-        None,
-        shutdown,
-    )
-    .await;
-    endpoint.close().await;
-    result
+    // The store↔device binding check, the beacon facts and the endpoint close
+    // live in the entry: `bind` refuses a store bound to another device, `serve`
+    // closes the endpoint however serving ends.
+    config
+        .daemon_plane()
+        .bind(&config.key_files())
+        .await?
+        .serve(shutdown)
+        .await
 }
 
-/// The serving core `run` delegates to (its endpoint already built + device-bound): build
-/// the LIVE shared trust state (accept gate reads it, pairing verbs mutate it — a
-/// claim/pair takes effect at the next accept with no restart), the ops plane, and the
-/// authorizer-wired wire plane, then serve until `shutdown`.
+/// The daemon's serving core over an endpoint a test built and device-bound itself:
+/// [`serve_core`] with every ops verb and the daemon's wire plane.
 ///
 /// `access_clock` is the trusted clock every access check reads (production: the robot
 /// wall clock); `sweep_interval` overrides the wire plane's mid-session revocation-sweep
 /// cadence (`None` = the production default); `manager` overrides the wire plane's SHM
-/// transport (`None` = the production lazy singleton, `Some` = a per-test root). All three
-/// are parameters ONLY so a daemon-level test can inject a fixed, advanceable clock + a
-/// short sweep + an isolated SHM root and observe a mid-session revoke EVICT through the
-/// SAME `.with_demand_authorizer(classify)` wiring `run` uses — `#[doc(hidden)]`, not a
-/// public API.
+/// transport (`None` = the production lazy singleton reading metadata through the default
+/// control socket, `Some` = a per-test root with no metadata source). All three are
+/// parameters ONLY so a daemon-level test can inject a fixed, advanceable clock + a short
+/// sweep + an isolated SHM root and observe a mid-session revoke EVICT through the SAME
+/// `.with_demand_authorizer(classify)` wiring `run` uses. `#[doc(hidden)]`, not a public
+/// API. A host embeds [`crate::RemotePlane`] instead.
 #[doc(hidden)]
 #[allow(clippy::too_many_arguments)]
 pub async fn serve_endpoint(
@@ -158,6 +363,57 @@ pub async fn serve_endpoint(
     access_clock: RemotedClock,
     sweep_interval: Option<Duration>,
     manager: Option<Arc<TransportManager>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
+    // Robot identity resolves through `robot_identity_from_env`, the SAME
+    // override-aware resolver the LAN gateway uses (`CERULION_ROBOT_IDENTITY` override →
+    // else the hostname; by design the hostname is the default robot identity). The
+    // transport manager is LAZY: a `remoted` that never serves a wire peer never
+    // touches iceoryx2.
+    let robot = cerulion_core::graph::robot_identity_from_env();
+    let base = match manager {
+        Some(m) => WirePlane::with_manager(robot, m),
+        None => WirePlane::lazy(robot)
+            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
+    };
+    serve_core(
+        &PlaneFiles::of(config),
+        OpsHost::daemon(),
+        DAEMON_SERVER_NAME,
+        trust_store,
+        device_index,
+        mac_key,
+        endpoint,
+        access_clock,
+        sweep_interval,
+        base,
+        Some(config.rcp.clone()),
+        shutdown,
+    )
+    .await
+}
+
+/// The serving core every entry shares (its endpoint already built + device-bound):
+/// build the LIVE shared trust state (accept gate reads it, pairing verbs mutate it, so a
+/// claim/pair takes effect at the next accept with no restart), the ops plane with the
+/// `ops_host` verb set announcing `server_name`, the authorizer-wired wire plane over
+/// `base`, and, when `rcp` names the robot's rcpd, the rcp plane, then serve until
+/// `shutdown`. When [`serve_planes`] returns, after its shutdown stage, it ends
+/// the rcpd e-stop delivery in flight and stops the epoch poller, then returns
+/// what `serve_planes` returned.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn serve_core(
+    files: &PlaneFiles,
+    ops_host: OpsHost,
+    server_name: &str,
+    trust_store: TrustStore,
+    device_index: DeviceAccountIndex,
+    mac_key: Vec<u8>,
+    endpoint: &Endpoint,
+    access_clock: RemotedClock,
+    sweep_interval: Option<Duration>,
+    base: WirePlane,
+    rcp: Option<RcpLink>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
     let shared =
@@ -173,24 +429,57 @@ pub async fn serve_endpoint(
     // The ops plane over `cerulion/ops/1`: cerud's mechanical verbs + the pairing
     // bootstrap/safety verbs, gated by the same live trust state and receipted by
     // cerud's hash-chained audit log. Built once; reused (serialized) per session.
-    let lease = Arc::new(Mutex::new(ControlLease::with_default_window()));
     let sessions = SharedCodePairSessions::new();
-    let ops = Arc::new(OpsServing::new(
-        shared,
-        lease,
-        sessions,
-        access_clock.clone(),
-        &config.receipt_file,
-        config.log_root.clone(),
-        "cerulion-remoted",
-    )?);
+    // The daemon's e-stop lease, for the rcp plane below: the same instance the
+    // `engage-estop` and act verbs use, so its latch and its engage count are
+    // shared. A library host has none, and serves no rcp plane.
+    let estop_lease = ops_host.estop_lease();
+    // On the daemon, `engage-estop` also sends an `estop` to the rcpd the rcp
+    // plane forwards to, over the same link, until rcpd answers; the delivery
+    // in flight ends when the planes stop.
+    let ops_host = ops_host.with_rcpd_estop(rcp.as_ref(), &shared);
+    let rcpd_estop = ops_host.rcpd_estop();
+    let serving_holds = if server_name == DAEMON_SERVER_NAME {
+        let root = files
+            .beacon_facts_file
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| RemotedError::Config("remote state has no parent directory".into()))?;
+        let path = crate::serving_hold::fence_path(root);
+        let holds = crate::serving_hold::ServingHolds::open(&path)
+            .map_err(|error| RemotedError::Ops(format!("opening remote serving hold: {error}")))?;
+        {
+            let lease = estop_lease.clone().ok_or_else(|| {
+                RemotedError::Config("owned daemon is missing its e-stop idle hold source".into())
+            })?;
+            holds
+                .register_source(Arc::new(move || lease.holds()))
+                .map_err(|error| RemotedError::Ops(format!("registering e-stop hold: {error}")))?;
+        }
+        if let Some(rcpd) = rcpd_estop.clone() {
+            holds
+                .register_source(Arc::new(move || rcpd.is_owing()))
+                .map_err(|error| {
+                    RemotedError::Ops(format!("registering owed delivery hold: {error}"))
+                })?;
+        }
+        Some(holds)
+    } else {
+        None
+    };
+    let ops = Arc::new(
+        OpsServing::for_host(
+            ops_host,
+            shared,
+            sessions,
+            access_clock.clone(),
+            &files.receipt_file,
+            files.log_root.clone(),
+            server_name,
+        )?
+        .with_serving_holds(serving_holds),
+    );
 
-    // The production wire plane. Robot identity resolves through
-    // `robot_identity_from_env` — the SAME override-aware resolver the LAN gateway uses
-    // (`CERULION_ROBOT_IDENTITY` override → else the hostname; by design the hostname is the
-    // default robot identity). The transport manager is LAZY — a `remoted` that never
-    // serves a wire peer never touches iceoryx2.
-    //
     // Install the SAME `PairingAuthorizer` as the wire plane's per-demand
     // authorization gate (this line is the wiring a daemon-level test pins). The serving
     // plane then (a) authorizes each `demand` per topic and (b) sweeps established taps
@@ -198,12 +487,6 @@ pub async fn serve_endpoint(
     // admission EVICTS the already-streaming demander — both read the LIVE `SharedTrust`
     // the accept gate reads (no re-plumbing). `classify` is an `Arc<PairingAuthorizer>`; it
     // unsize-coerces to `Arc<dyn DemandAuthorizer>` here.
-    let robot = cerulion_core::graph::robot_identity_from_env();
-    let base = match manager {
-        Some(m) => WirePlane::with_manager(robot, m),
-        None => WirePlane::lazy(robot)
-            .with_local_schema_provider(cerulion_netd::hygiene::default_socket_path()),
-    };
     //
     // Install the epoch-sync sink on the SAME plane (this line is the wiring
     // a daemon-level test pins). A desk that carries a newer revocation epoch delivers
@@ -217,27 +500,60 @@ pub async fn serve_endpoint(
         wire_plane = wire_plane.with_revocation_sweep_interval(interval);
     }
     let wire = Arc::new(wire_plane);
+    // The rcp plane authorizes each MCP message against the SAME live handle,
+    // under the SAME e-stop lease as the ops verbs.
+    let rcpd = rcp.as_ref().map(|link| link.addr);
+    let rcp = match (rcp, estop_lease) {
+        (Some(link), Some(lease)) => Some(Arc::new(RcpPlane::new(
+            link,
+            classify.shared().clone(),
+            lease,
+        ))),
+        _ => None,
+    };
     tracing::info!(
         endpoint_id = %endpoint.id(),
         robot = %wire.robot(),
-        "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops; always-on)"
+        rcpd = ?rcpd,
+        "cerulion_remoted: listening (ONE endpoint; ALPNs wire+ops, plus rcp on the daemon; \
+         always-on)"
     );
+    #[cfg(feature = "test-seam")]
+    crate::log_writer::shrink_queue_for_test();
+    #[cfg(feature = "test-seam")]
+    crate::shutdown::close_endpoint_for_test(endpoint);
 
     // The robot's own revocation fetch: the supervisor's sync worker leaves
     // fetched epochs in the state directory, applied here on a poll. Started
     // only after every fallible plane is built, and owned by a guard that
     // aborts it however this future ends (an error, a cancelled future, a
     // normal return).
-    let pull = config.store_file.parent().map(|dir| {
+    let pull = files.store_file.parent().map(|dir| {
         let recheck = crate::epoch_pull::key_recheck_from_env();
         Arc::new(
             EpochPull::new(dir, shared_for_pull.clone(), pull_clock.clone()).with_recheck(recheck),
         )
     });
     let poller = AbortOnDrop(pull.clone().map(|pull| tokio::spawn(pull.run())));
-    let served =
-        serve_with_epoch_pull(endpoint, classify, Some(ops), Some(wire), pull, shutdown).await;
+    let served = serve_planes(
+        endpoint,
+        classify,
+        Some(Arc::clone(&ops)),
+        Some(wire),
+        pull,
+        rcp,
+        shutdown,
+    )
+    .await;
+    // `serve_planes` ran the ops plane's shutdown stage before it returned,
+    // failed or not; the teardown below runs either way.
+    if let Some(rcpd_estop) = rcpd_estop {
+        rcpd_estop.shut_down().await;
+    }
     poller.stop().await;
+    tracing::info!("cerulion_remoted: the rcpd e-stop sender and the epoch poller are stopped");
+    // The ops plane and its receipt sink stay alive until the teardown ends.
+    drop(ops);
     served
 }
 
@@ -270,7 +586,7 @@ impl Drop for AbortOnDrop {
 /// device key's public half) must equal the store's `robot_transport_key`.
 /// A mismatch is a LOUD [`RemotedError::ProvisioningMismatch`] (a transplanted
 /// store governing the wrong robot). Pure so it is oracle-testable.
-fn check_store_device_binding(
+pub(crate) fn check_store_device_binding(
     endpoint_key: &[u8; 32],
     store_key: &PublicKey,
 ) -> Result<(), RemotedError> {
@@ -334,51 +650,230 @@ pub async fn serve_with_epoch_pull(
     pull: Option<Arc<EpochPull>>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), RemotedError> {
-    tokio::pin!(shutdown);
-    loop {
+    serve_planes(endpoint, classify, ops, wire, pull, None, shutdown).await
+}
+
+/// [`serve_with_epoch_pull`], plus the rcp plane: when `rcp` is `Some`, an
+/// admitted `cerulion/rcp/1` connection is served by
+/// [`crate::rcp::serve_rcp_connection`].
+///
+/// Once the accept loop stops, it drops `shutdown` before it logs anything,
+/// then runs the
+/// [`ShutdownStage`](crate::shutdown::ShutdownStage) of `ops` while the ops
+/// receipt sink is alive, and returns [`RemotedError::Shutdown`] when a
+/// participant did not complete. The endpoint and its connections are alive
+/// during the stage after a stop request, and already gone when the endpoint
+/// closed on its own.
+pub async fn serve_planes(
+    endpoint: &Endpoint,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    pull: Option<Arc<EpochPull>>,
+    rcp: Option<Arc<RcpPlane>>,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<(), RemotedError> {
+    let mut shutdown = Box::pin(shutdown);
+    let holds = ops.as_ref().and_then(|ops| ops.serving_holds()).cloned();
+    let mut refresh = tokio::time::interval(Duration::from_millis(100));
+    let mut refresh_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut admission_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut handshakes = tokio::task::JoinSet::<Result<Accepted, LinkError>>::new();
+    let mut handshake_admission_failures = AdmissionLatches::default();
+    let mut handshake_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut retry_unavailable =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut handshake_retry_failures =
+        cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::default();
+    let mut sources = indexmap::IndexMap::<SourceKey, u8>::new();
+    let mut task_sources = indexmap::IndexMap::<tokio::task::Id, SourceKey>::new();
+    let closed_on_its_own = loop {
         tokio::select! {
-            _ = &mut shutdown => {
-                tracing::info!("cerulion_remoted: shutdown signalled; stopping accept loop");
-                break;
-            }
-            accepted = accept_one(endpoint) => {
-                match accepted {
-                    // The endpoint's accept stream ended → the daemon is closing.
-                    // This is the ONLY per-accept signal that terminates the loop.
-                    Ok(None) => {
-                        tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
-                        break;
+            biased;
+            _ = &mut shutdown => break false,
+            _ = refresh.tick() => {
+                if let Some(holds) = &holds {
+                    match holds.refresh() {
+                        Ok(()) => if let Some(suppressed) = refresh_failures.on_success() { tracing::info!(suppressed, "remote serving hold refresh recovered"); },
+                        Err(error) => {
+                            use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                            match refresh_failures.on_failure() {
+                                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::error!(error = %error, total_failures = refresh_failures.total_failures(), "remote serving hold refresh failed"),
+                                RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = refresh_failures.total_failures(), "remote serving hold refresh failed"),
+                            }
+                        }
                     }
-                    Ok(Some(a)) => {
+                }
+            },
+            // join_next is cancellation-safe; a tick cannot lose a completed
+            // handshake. Deliver it before consuming another new arrival.
+            completed = handshakes.join_next_with_id(), if !handshakes.is_empty() => {
+                let accepted = match completed {
+                    Some(Ok((id, accepted))) => {
+                        release_handshake_source(id, &mut task_sources, &mut sources);
+                        accepted
+                    }
+                    Some(Err(error)) => {
+                        release_handshake_source(error.id(), &mut task_sources, &mut sources);
+                        tracing::error!(error = %error, "remote handshake worker failed; continuing to serve");
+                        continue;
+                    }
+                    None => continue,
+                };
+                match accepted {
+                    Ok(a) => {
+                        // Below half capacity only, so completions interleaved
+                        // with a flood of failures cannot re-arm its loud line.
+                        if shared_regimes_close(handshakes.len()) {
+                            if let Some(suppressed) = handshake_failures.on_success() {
+                                tracing::info!(suppressed, "remote TLS handshake completion recovered");
+                            }
+                        }
+                        let hold = if matches!(a.alpn.as_slice(), cerulion_link::alpn::OPS | cerulion_link::alpn::RCP) {
+                            match holds.as_ref().map(|holds| holds.acquire(crate::serving_hold::HoldReason::Session)).transpose() {
+                                Ok(hold) => {
+                                    if let Some(suppressed) = admission_failures.on_success() {
+                                        tracing::info!(suppressed, "remote serving admission recovered");
+                                    }
+                                    hold
+                                },
+                                Err(error) => {
+                                    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                                    match admission_failures.on_failure() {
+                                        RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
+                                        RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, total_failures = admission_failures.total_failures(), "remote serving admission refused during idle stop"),
+                                    }
+                                    a.connection.close(0u32.into(), b"remote server is stopping");
+                                    continue;
+                                }
+                            }
+                        } else { None };
                         if let Some(pull) = &pull {
                             pull.note_accept(a.remote_id.as_bytes());
                         }
                         let classify = classify.clone();
                         let ops = ops.clone();
                         let wire = wire.clone();
+                        let rcp = rcp.clone();
                         tokio::spawn(async move {
-                            handle_accepted_with_wire(a, classify, ops, wire).await;
+                            let _hold = hold;
+                            handle_accepted_planes(a, classify, ops, wire, rcp).await;
                         });
                     }
                     // A SINGLE inbound connection failed its handshake (a scanner
                     // sending a bogus ALPN, a TLS failure, a peer aborting
                     // mid-handshake). This is per-connection, NOT the endpoint
                     // closing — an unauthenticated peer must NEVER be able to
-                    // terminate the robot's always-on remote plane. Log loudly and
-                    // keep serving. `accept_one` returns `Ok(None)` (handled above)
-                    // when the endpoint itself is gone, so this arm never hot-loops.
+                    // terminate the robot's always-on remote plane. Log through the
+                    // handshake failure latch and keep serving. Only the endpoint
+                    // accept stream ending below terminates serving; one failed
+                    // handshake cannot do that.
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "cerulion_remoted: an inbound connection failed to complete its \
-                             handshake; dropping it and continuing to serve (the accept loop is \
-                             NOT terminated by one bad/unauthenticated peer)"
-                        );
+                        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                        match handshake_failures.on_failure() {
+                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %e, total_failures = handshake_failures.total_failures(), "remote TLS handshake failed; continuing to serve"),
+                            RegimeDecision::Suppressed { .. } => tracing::debug!(error = %e, total_failures = handshake_failures.total_failures(), "remote TLS handshake failed; continuing to serve"),
+                        }
                         continue;
                     }
                 }
             }
+            // Endpoint::accept has not consumed an Incoming until it resolves;
+            // cancelling this wait on a refresh tick is safe. TLS completes in
+            // bounded independent workers so a stalled peer cannot block ops.
+            incoming = endpoint.accept() => {
+                let Some(incoming) = incoming else { break true; };
+                let validated = incoming.remote_addr_validated();
+                let source = handshake_source(incoming.remote_addr(), validated, |id| {
+                    classify.is_paired_and_allowed(id.as_bytes())
+                });
+                let pending_from_source = pending_from(&sources, source.as_ref());
+                use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+                let admission = source_admission(handshakes.len(), pending_from_source, validated, source.as_ref());
+                match admission {
+                    Admission::Refuse(cap) => {
+                        match handshake_admission_failures.refused(cap) {
+                            RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(pending = handshakes.len(), cap = cap.as_str(), total_failures = handshake_admission_failures.total(cap), "remote handshake refused at its admission cap"),
+                            RegimeDecision::Suppressed { .. } => tracing::debug!(pending = handshakes.len(), cap = cap.as_str(), total_failures = handshake_admission_failures.total(cap), "remote handshake refused at its admission cap"),
+                        }
+                        incoming.refuse();
+                        continue;
+                    }
+                    Admission::Retry | Admission::KeyRetry => {
+                        // A paired key's Retry is its normal path, not pressure,
+                        // so only address retry feeds the retry latch.
+                        if admission == Admission::Retry {
+                            match handshake_retry_failures.on_failure() {
+                                RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::debug!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
+                                RegimeDecision::Suppressed { .. } => tracing::trace!(pending = handshakes.len(), total_failures = handshake_retry_failures.total_failures(), "remote unvalidated handshake requires address retry"),
+                            }
+                        }
+                        match incoming.retry() {
+                            Ok(()) => {
+                                if let Some(suppressed) = retry_unavailable.on_success() {
+                                    tracing::info!(suppressed, "remote handshake address retry became available");
+                                }
+                            }
+                            Err(error) => {
+                                match retry_unavailable.on_failure() {
+                                    RegimeDecision::Loud | RegimeDecision::StillFailing { .. } => tracing::warn!(error = %error, pending = handshakes.len(), total_failures = retry_unavailable.total_failures(), "remote handshake retry unavailable; refusing incoming connection"),
+                                    RegimeDecision::Suppressed { .. } => tracing::debug!(error = %error, pending = handshakes.len(), total_failures = retry_unavailable.total_failures(), "remote handshake retry unavailable; refusing incoming connection"),
+                                }
+                                error.into_incoming().refuse();
+                            }
+                        }
+                        continue;
+                    }
+                    Admission::Admit => {}
+                }
+                for cap in closed_regimes(handshakes.len(), source.as_ref(), &sources).into_iter().flatten() {
+                    if let Some(suppressed) = handshake_admission_failures.admitted(cap) {
+                        tracing::info!(suppressed, cap = cap.as_str(), "remote handshake admission recovered");
+                    }
+                }
+                if shared_regimes_close(handshakes.len()) {
+                    if let Some(suppressed) = handshake_retry_failures.on_success() {
+                        tracing::debug!(suppressed, "remote handshake address retry recovered");
+                    }
+                }
+                let task = handshakes.spawn(async move {
+                    let connection = tokio::time::timeout(HANDSHAKE_DEADLINE, async { incoming.await })
+                        .await
+                        .map_err(|error| LinkError::Accept(Box::new(error)))?
+                        .map_err(|error| LinkError::Accept(Box::new(error)))?;
+                    Ok(Accepted {
+                        remote_id: connection.remote_id(),
+                        alpn: connection.alpn().to_vec(),
+                        connection,
+                    })
+                });
+                if let Some(source) = source {
+                    *sources.entry(source.clone()).or_insert(0) += 1;
+                    task_sources.insert(task.id(), source);
+                }
+            }
         }
+    };
+    // Dropped before anything is logged or awaited, so a host that watches it
+    // learns the accept loop stopped even when a log write blocks; the binary
+    // arms its hard-exit deadline then.
+    drop(shutdown);
+    handshakes.shutdown().await;
+    if closed_on_its_own {
+        tracing::info!("cerulion_remoted: endpoint closed; stopping accept loop");
+    } else {
+        tracing::info!("cerulion_remoted: shutdown signalled; stopping accept loop");
+    }
+    // The ops receipt sink is alive here; the endpoint and its connections are
+    // too, unless the endpoint closed on its own.
+    if let Some(ops) = &ops {
+        ops.shutdown_stage()
+            .run()
+            .await
+            .map_err(RemotedError::Shutdown)?;
     }
     Ok(())
 }
@@ -418,6 +913,19 @@ pub async fn handle_accepted_with_wire(
     ops: Option<Arc<OpsServing>>,
     wire: Option<Arc<WirePlane>>,
 ) {
+    handle_accepted_planes(accepted, classify, ops, wire, None).await
+}
+
+/// [`handle_accepted_with_wire`], plus the rcp arm: an `RcpAdmit` connection
+/// is handed to [`crate::rcp::serve_rcp_connection`] as a long-lived session
+/// when `rcp` is `Some`; with `None` it falls through to the skeleton report.
+pub async fn handle_accepted_planes(
+    accepted: Accepted,
+    classify: Arc<PairingAuthorizer>,
+    ops: Option<Arc<OpsServing>>,
+    wire: Option<Arc<WirePlane>>,
+    rcp: Option<Arc<RcpPlane>>,
+) {
     let (decision, unpaired) = classify
         .classify_accept_with_enrollment_hint(&accepted.alpn, accepted.remote_id.as_bytes());
     tracing::info!(
@@ -450,6 +958,15 @@ pub async fn handle_accepted_with_wire(
         }
         // WireAdmit but no wire plane wired (ops-only builds + the
         // accept-classification tests): fall through to the skeleton report.
+    }
+
+    // ── The rcp-ALPN dispatch arm ───────────────────────────
+    if matches!(decision, AcceptDecision::RcpAdmit) {
+        if let Some(plane) = rcp {
+            let key = *accepted.remote_id.as_bytes();
+            crate::rcp::serve_rcp_connection(accepted.connection, key, plane).await;
+            return;
+        }
     }
 
     // A refused key on the ops ALPN (a cloud row while the allow-from-cloud
@@ -613,45 +1130,12 @@ mod admission_reply_tests {
     }
 }
 
-/// Load the device key, trust store, and device→account side-map from disk.
-fn load_state(config: &RemotedConfig) -> Result<RemotedState, RemotedError> {
-    let device_key = load_device_key(&config.key_file)?;
-    // The trust-store MAC key authenticates BOTH the trust store AND the
-    // device→account side-map. It is REQUIRED whenever either MAC'd artifact is
-    // already on disk: a present store/index whose verification key is gone or
-    // unreadable is a PROVISIONING-class / potential-tamper failure (the secret
-    // that authenticates this robot's trust state is missing), NOT a config slip.
-    // On a genuinely-fresh robot (neither artifact present) the key is required by
-    // nothing — its absence is benign, and the absent trust store surfaces its OWN
-    // provisioning-gap error (`RemotedError::Store`) downstream (never fabricated
-    // into an empty store — see the `RemotedError::Store` docs).
-    let mac_required = config.store_file.exists() || config.index_file.exists();
-    let mac_key = load_mac_key(&config.store_mac_key_file, mac_required)?;
-    let trust_store =
-        TrustStore::load(&config.store_file, &mac_key).map_err(RemotedError::Store)?;
-    // The device→account side-map is MAC-authenticated with the SAME secure-
-    // storage key as the trust store: it is the sole device_key→
-    // account binding the accept gate trusts.
-    let device_index = DeviceAccountIndex::load(&config.index_file, &mac_key)?;
-    tracing::info!(
-        claimed = trust_store.is_claimed(),
-        bound_devices = device_index.len(),
-        "cerulion_remoted: state loaded"
-    );
-    Ok(RemotedState {
-        device_key,
-        trust_store,
-        device_index,
-        mac_key,
-    })
-}
-
 /// Load the 32-byte ed25519 device secret (raw bytes). An absent / wrong-size
 /// key is a provisioning gap, never fabricated. On Unix, when `path` itself is a
 /// regular file with a single link, its group and other permission bits are
 /// cleared before it is read; a symbolic link at `path` is read through
 /// unchanged.
-fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
+pub(crate) fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
     let bytes = crate::private_file::read_private(path, "device key").map_err(|e| {
         RemotedError::DeviceKey(format!(
             "{}: {e} (provision the robot's 32-byte device key)",
@@ -686,11 +1170,23 @@ fn load_device_key(path: &Path) -> Result<[u8; 32], RemotedError> {
 ///   [`RemotedError::MacKey`]: a broken secure-storage secret is never silently
 ///   swallowed, even when no artifact currently requires it.
 ///
+/// A present but EMPTY file loads as an empty key when not `expected` (a fresh
+/// install's placeholder). When `expected` it is refused here with
+/// [`RemotedError::MacKey`] naming the file: an empty key verifies nothing and
+/// cannot persist a mutation. [`crate::RemotePlane::bind`] repeats the refusal
+/// for a [`crate::KeyProvider`] that has no file to name.
+///
 /// On Unix, when `path` itself is a regular file with a single link, its group
 /// and other permission bits are cleared before it is read; a symbolic link at
 /// `path` is read through unchanged.
-fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
+pub(crate) fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
     match crate::private_file::read_private(path, "trust-store MAC key") {
+        Ok(bytes) if bytes.is_empty() && expected => Err(RemotedError::MacKey(format!(
+            "empty trust-store MAC key file {}: a trust store or device index exists and \
+             must be verified with it. An empty key file is only a fresh install's \
+             placeholder; restore this device's own MAC key into it (mode 0600)",
+            path.display()
+        ))),
         Ok(bytes) => Ok(bytes),
         // Genuinely-fresh robot: nothing on disk needs this key and it is simply
         // absent. Defer to the absent store's own `Store` provisioning gap.
@@ -720,6 +1216,445 @@ fn load_mac_key(path: &Path, expected: bool) -> Result<Vec<u8>, RemotedError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn handshake_admission_reserves_capacity_at_every_boundary() {
+        for (pending, from_source, validated, paired, expected) in [
+            (0, 0, false, false, Admission::Admit),
+            (15, 0, false, false, Admission::Admit),
+            (16, 0, false, false, Admission::Retry),
+            (17, 0, false, false, Admission::Retry),
+            (23, 4, false, false, Admission::Retry),
+            (24, 0, false, false, Admission::Refuse(Cap::UnpairedShare)),
+            (31, 4, false, false, Admission::Refuse(Cap::UnpairedShare)),
+            (32, 0, false, false, Admission::Refuse(Cap::Global)),
+            (33, 0, false, false, Admission::Refuse(Cap::Global)),
+            (15, 4, false, false, Admission::Admit),
+            (0, 3, true, false, Admission::Admit),
+            (0, 4, true, false, Admission::Refuse(Cap::Ip)),
+            (0, 5, true, false, Admission::Refuse(Cap::Ip)),
+            (16, 3, true, false, Admission::Admit),
+            (23, 3, true, false, Admission::Admit),
+            (24, 0, true, false, Admission::Refuse(Cap::UnpairedShare)),
+            (31, 3, true, false, Admission::Refuse(Cap::UnpairedShare)),
+            (32, 0, true, false, Admission::Refuse(Cap::Global)),
+            (33, 0, true, false, Admission::Refuse(Cap::Global)),
+            (32, 4, true, false, Admission::Refuse(Cap::Global)),
+            (0, 0, false, true, Admission::KeyRetry),
+            (15, 0, false, true, Admission::KeyRetry),
+            (16, 0, false, true, Admission::KeyRetry),
+            (24, 0, false, true, Admission::KeyRetry),
+            (31, 0, false, true, Admission::KeyRetry),
+            (0, 0, true, true, Admission::Admit),
+            (15, 0, true, true, Admission::Admit),
+            (23, 0, true, true, Admission::Admit),
+            (24, 0, true, true, Admission::Admit),
+            (31, 0, true, true, Admission::Admit),
+            (32, 0, true, true, Admission::Refuse(Cap::Global)),
+            (32, 0, false, true, Admission::Refuse(Cap::Global)),
+            (33, 0, true, true, Admission::Refuse(Cap::Global)),
+        ] {
+            assert_eq!(
+                handshake_admission(pending, from_source, validated, paired),
+                expected,
+                "pending {pending}, from source {from_source}, validated {validated}, paired {paired}"
+            );
+        }
+    }
+
+    #[test]
+    fn validated_sources_cannot_claim_another_ips_bucket() {
+        let address = "127.0.0.1:1234".parse().unwrap();
+        assert_eq!(
+            handshake_source(IncomingAddr::Ip(address), false, |_| false),
+            None
+        );
+        let ip = handshake_source(IncomingAddr::Ip(address), true, |_| false).unwrap();
+        assert_eq!(ip, SourceKey::Ip("127.0.0.1".parse().unwrap()));
+        let relay = SourceKey::UnpairedRelay("https://relay.example.invalid".parse().unwrap());
+        for (source, bound, cap) in [
+            (&relay, 8, Cap::UnpairedRelay),
+            (&SourceKey::Custom, 4, Cap::Custom),
+            (&ip, 4, Cap::Ip),
+        ] {
+            assert_eq!(
+                source_admission(15, bound - 1, true, Some(source)),
+                Admission::Admit
+            );
+            assert_eq!(
+                source_admission(15, bound, true, Some(source)),
+                Admission::Refuse(cap)
+            );
+            assert_eq!(
+                source_admission(15, bound + 1, true, Some(source)),
+                Admission::Refuse(cap)
+            );
+        }
+        assert_eq!(source_admission(15, 100, false, None), Admission::Admit);
+        assert_eq!(source_admission(16, 0, false, None), Admission::Retry);
+        // The shared caps and Retry precede every per-source bucket.
+        for (pending, from_source, validated, source, expected) in [
+            (16, 8, false, &relay, Admission::Retry),
+            (24, 8, true, &relay, Admission::Refuse(Cap::UnpairedShare)),
+            (16, 4, true, &ip, Admission::Refuse(Cap::Ip)),
+            (23, 4, true, &ip, Admission::Refuse(Cap::Ip)),
+            (24, 4, true, &ip, Admission::Refuse(Cap::UnpairedShare)),
+            (32, 4, true, &ip, Admission::Refuse(Cap::Global)),
+            (
+                24,
+                4,
+                true,
+                &SourceKey::Custom,
+                Admission::Refuse(Cap::UnpairedShare),
+            ),
+        ] {
+            assert_eq!(
+                source_admission(pending, from_source, validated, Some(source)),
+                expected,
+                "pending {pending}, from source {from_source}, validated {validated}, {source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn paired_relay_keys_are_independent_of_the_unpaired_url_bucket() {
+        let url: RelayUrl = "http://127.0.0.1:1234".parse().unwrap();
+        let key = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let address = IncomingAddr::Relay {
+            url: url.clone(),
+            endpoint_id: key,
+        };
+        let paired = handshake_source(address.clone(), false, |id| *id == key).unwrap();
+        assert_eq!(paired, SourceKey::PairedRelay(key));
+        let unpaired = handshake_source(address, false, |_| false).unwrap();
+        assert_eq!(unpaired, SourceKey::UnpairedRelay(url));
+        // Eight stranger handshakes fill the URL bucket: the next stranger is
+        // refused, and the paired key on the same relay still reads zero.
+        let mut sources = indexmap::IndexMap::new();
+        sources.insert(unpaired.clone(), 8u8);
+        assert_eq!(pending_from(&sources, Some(&unpaired)), 8);
+        assert_eq!(pending_from(&sources, Some(&paired)), 0);
+        assert_eq!(pending_from(&sources, None), 0);
+        assert_eq!(
+            source_admission(
+                8,
+                pending_from(&sources, Some(&unpaired)),
+                false,
+                Some(&unpaired)
+            ),
+            Admission::Refuse(Cap::UnpairedRelay)
+        );
+        assert_eq!(
+            source_admission(
+                8,
+                pending_from(&sources, Some(&paired)),
+                true,
+                Some(&paired)
+            ),
+            Admission::Admit
+        );
+        // The reserve: at 24 pending every other source is refused, while a
+        // paired key is admitted until the global cap.
+        let ip = SourceKey::Ip("127.0.0.1".parse().unwrap());
+        for source in [&unpaired, &ip, &SourceKey::Custom] {
+            assert_eq!(
+                source_admission(24, 0, true, Some(source)),
+                Admission::Refuse(Cap::UnpairedShare)
+            );
+            assert_eq!(
+                source_admission(32, 0, true, Some(source)),
+                Admission::Refuse(Cap::Global)
+            );
+        }
+        assert_eq!(
+            source_admission(24, 0, false, None),
+            Admission::Refuse(Cap::UnpairedShare)
+        );
+        assert_eq!(
+            source_admission(24, 0, true, Some(&paired)),
+            Admission::Admit
+        );
+        assert_eq!(
+            source_admission(31, 3, true, Some(&paired)),
+            Admission::Admit
+        );
+        assert_eq!(
+            source_admission(31, 4, true, Some(&paired)),
+            Admission::Refuse(Cap::PairedRelay)
+        );
+        for (source, count, validated, expected) in [
+            (&unpaired, 7, false, Admission::Admit),
+            (&unpaired, 8, false, Admission::Refuse(Cap::UnpairedRelay)),
+            (&unpaired, 9, false, Admission::Refuse(Cap::UnpairedRelay)),
+            (&paired, 0, true, Admission::Admit),
+            (&paired, 3, true, Admission::Admit),
+            (&paired, 4, true, Admission::Refuse(Cap::PairedRelay)),
+            (&paired, 5, true, Admission::Refuse(Cap::PairedRelay)),
+            (&paired, 0, false, Admission::KeyRetry),
+            (&paired, 4, false, Admission::KeyRetry),
+        ] {
+            assert_eq!(
+                source_admission(8, count, validated, Some(source)),
+                expected,
+                "{source:?} at {count}, validated {validated}"
+            );
+        }
+        assert_eq!(
+            source_admission(16, 0, false, Some(&paired)),
+            Admission::KeyRetry
+        );
+        assert_eq!(
+            source_admission(16, 4, false, Some(&paired)),
+            Admission::KeyRetry
+        );
+        assert_eq!(
+            source_admission(32, 4, true, Some(&paired)),
+            Admission::Refuse(Cap::Global)
+        );
+        assert_eq!(
+            source_admission(16, 0, true, Some(&paired)),
+            Admission::Admit
+        );
+        assert_eq!(
+            source_admission(32, 0, true, Some(&paired)),
+            Admission::Refuse(Cap::Global)
+        );
+    }
+
+    /// An IP datagram whose source is a relay-mapped address reads as an
+    /// unvalidated relay arrival under the key that address maps to. However many such
+    /// arrivals come, at any pending count and any bucket count, none takes a
+    /// slot: each gets a Retry that only the key's holder receives.
+    #[test]
+    fn a_forged_relay_source_never_takes_a_paired_key_slot() {
+        let key = iroh::SecretKey::from_bytes(&[7; 32]).public();
+        let forged = IncomingAddr::Relay {
+            url: "https://relay.example.invalid".parse().unwrap(),
+            endpoint_id: key,
+        };
+        let source = handshake_source(forged, false, |id| *id == key).unwrap();
+        assert_eq!(source, SourceKey::PairedRelay(key));
+        for pending in 0..=33 {
+            for from_source in 0..=5 {
+                let expected = if pending >= 32 {
+                    Admission::Refuse(Cap::Global)
+                } else {
+                    Admission::KeyRetry
+                };
+                assert_eq!(
+                    source_admission(pending, from_source, false, Some(&source)),
+                    expected,
+                    "pending {pending}, from source {from_source}"
+                );
+            }
+        }
+        // The same key, validated by the returned token, takes its bucket.
+        assert_eq!(
+            source_admission(0, 0, true, Some(&source)),
+            Admission::Admit
+        );
+        assert_eq!(
+            source_admission(0, 3, true, Some(&source)),
+            Admission::Admit
+        );
+        assert_eq!(
+            source_admission(0, 4, true, Some(&source)),
+            Admission::Refuse(Cap::PairedRelay)
+        );
+    }
+
+    #[test]
+    fn an_admission_closes_only_the_regimes_it_ends() {
+        let relay = SourceKey::UnpairedRelay("https://relay.example.invalid".parse().unwrap());
+        let other_relay =
+            SourceKey::UnpairedRelay("https://other.example.invalid".parse().unwrap());
+        let paired = SourceKey::PairedRelay(iroh::SecretKey::from_bytes(&[7; 32]).public());
+        let other_paired = SourceKey::PairedRelay(iroh::SecretKey::from_bytes(&[8; 32]).public());
+        let ip = SourceKey::Ip("127.0.0.1".parse().unwrap());
+        let other_ip = SourceKey::Ip("127.0.0.2".parse().unwrap());
+        let both = [Some(Cap::Global), Some(Cap::UnpairedShare)];
+        type Held<'a> = &'a [(&'a SourceKey, u8)];
+        type Row<'a> = (usize, Option<&'a SourceKey>, Held<'a>, [Option<Cap>; 3]);
+        let none: Held = &[];
+        let rows: &[Row] = &[
+            (0, None, none, [both[0], both[1], None]),
+            (15, None, none, [both[0], both[1], None]),
+            (16, None, none, [None, None, None]),
+            (
+                15,
+                Some(&relay),
+                &[(&relay, 3)],
+                [both[0], both[1], Some(Cap::UnpairedRelay)],
+            ),
+            (15, Some(&relay), &[(&relay, 4)], [both[0], both[1], None]),
+            (20, Some(&relay), &[(&relay, 7)], [None, None, None]),
+            (
+                20,
+                Some(&relay),
+                none,
+                [None, None, Some(Cap::UnpairedRelay)],
+            ),
+            (20, Some(&relay), &[(&other_relay, 4)], [None, None, None]),
+            (
+                20,
+                Some(&relay),
+                &[(&other_relay, 3)],
+                [None, None, Some(Cap::UnpairedRelay)],
+            ),
+            (
+                20,
+                Some(&paired),
+                &[(&paired, 1)],
+                [None, None, Some(Cap::PairedRelay)],
+            ),
+            (20, Some(&paired), &[(&paired, 2)], [None, None, None]),
+            (20, Some(&paired), &[(&other_paired, 2)], [None, None, None]),
+            (
+                20,
+                Some(&paired),
+                &[(&other_paired, 1)],
+                [None, None, Some(Cap::PairedRelay)],
+            ),
+            (0, Some(&ip), &[(&ip, 1)], [both[0], both[1], Some(Cap::Ip)]),
+            (0, Some(&ip), &[(&ip, 2)], [both[0], both[1], None]),
+            (0, Some(&ip), &[(&ip, 3)], [both[0], both[1], None]),
+            // Another IP still holding a full bucket keeps the IP regime open.
+            (0, Some(&ip), &[(&other_ip, 4)], [both[0], both[1], None]),
+            (
+                0,
+                Some(&ip),
+                &[(&other_ip, 1)],
+                [both[0], both[1], Some(Cap::Ip)],
+            ),
+            // Other classes never hold a class regime open.
+            (
+                0,
+                Some(&ip),
+                &[(&relay, 8), (&paired, 4)],
+                [both[0], both[1], Some(Cap::Ip)],
+            ),
+            (
+                0,
+                Some(&SourceKey::Custom),
+                &[(&SourceKey::Custom, 1)],
+                [both[0], both[1], Some(Cap::Custom)],
+            ),
+            (
+                0,
+                Some(&SourceKey::Custom),
+                &[(&SourceKey::Custom, 2)],
+                [both[0], both[1], None],
+            ),
+        ];
+        for (pending, source, held, expected) in rows {
+            let sources: indexmap::IndexMap<SourceKey, u8> = held
+                .iter()
+                .map(|(key, count)| ((*key).clone(), *count))
+                .collect();
+            assert_eq!(
+                closed_regimes(*pending, *source, &sources),
+                *expected,
+                "pending {pending}, source {source:?}, held {held:?}"
+            );
+        }
+        assert!(shared_regimes_close(15));
+        assert!(!shared_regimes_close(16));
+    }
+
+    #[test]
+    fn an_admitted_source_only_recovers_its_own_cap_regime() {
+        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+        let mut latches = AdmissionLatches::default();
+        // An admission with no open regime recovers nothing.
+        assert_eq!(latches.admitted(Cap::Global), None);
+        assert_eq!(latches.admitted(Cap::UnpairedShare), None);
+        for (cap, name) in [
+            (Cap::Global, "global"),
+            (Cap::UnpairedShare, "unpaired_share"),
+            (Cap::Ip, "ip"),
+            (Cap::UnpairedRelay, "unpaired_relay"),
+            (Cap::PairedRelay, "paired_relay"),
+            (Cap::Custom, "custom"),
+        ] {
+            assert_eq!(cap.as_str(), name);
+            assert_eq!(latches.refused(cap), RegimeDecision::Loud);
+            assert_eq!(
+                latches.refused(cap),
+                RegimeDecision::Suppressed { suppressed: 1 }
+            );
+        }
+        assert_eq!(latches.admitted(Cap::PairedRelay), Some(1));
+        assert_eq!(
+            latches.refused(Cap::UnpairedRelay),
+            RegimeDecision::Suppressed { suppressed: 2 }
+        );
+        assert_eq!(
+            latches.refused(Cap::Ip),
+            RegimeDecision::Suppressed { suppressed: 2 }
+        );
+        assert_eq!(
+            latches.refused(Cap::Global),
+            RegimeDecision::Suppressed { suppressed: 2 }
+        );
+        assert_eq!(
+            latches.refused(Cap::UnpairedShare),
+            RegimeDecision::Suppressed { suppressed: 2 }
+        );
+        assert_eq!(latches.admitted(Cap::UnpairedRelay), Some(2));
+        assert_eq!(latches.refused(Cap::UnpairedRelay), RegimeDecision::Loud);
+        assert_eq!(latches.refused(Cap::PairedRelay), RegimeDecision::Loud);
+        assert_eq!(latches.admitted(Cap::Global), Some(2));
+        assert_eq!(latches.admitted(Cap::Custom), Some(1));
+        for (cap, total) in [
+            (Cap::Global, 3),
+            (Cap::UnpairedShare, 3),
+            (Cap::Ip, 3),
+            (Cap::UnpairedRelay, 4),
+            (Cap::PairedRelay, 3),
+            (Cap::Custom, 2),
+        ] {
+            assert_eq!(latches.total(cap), total, "{cap:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_and_failed_handshakes_release_source_counts() {
+        let source = SourceKey::Custom;
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut ids = indexmap::IndexMap::new();
+        let mut counts = indexmap::IndexMap::new();
+        let success = tasks.spawn(async { 1 });
+        let failure = tasks.spawn(async { panic!("handshake task failed") });
+        let pending = tasks.spawn(std::future::pending::<i32>());
+        for task in [&success, &failure, &pending] {
+            ids.insert(task.id(), source.clone());
+        }
+        counts.insert(source.clone(), 3);
+        pending.abort();
+        let mut successes = 0;
+        let mut failures = 0;
+        while let Some(result) = tasks.join_next_with_id().await {
+            let id = match result {
+                Ok((id, 1)) => {
+                    successes += 1;
+                    id
+                }
+                Ok(_) => panic!("unexpected handshake value"),
+                Err(error) => {
+                    failures += 1;
+                    error.id()
+                }
+            };
+            release_handshake_source(id, &mut ids, &mut counts);
+            assert_eq!(ids.len(), tasks.len());
+            assert_eq!(
+                counts.values().map(|n| usize::from(*n)).sum::<usize>(),
+                tasks.len()
+            );
+        }
+        assert_eq!((successes, failures), (1, 2));
+        assert!(ids.is_empty() && counts.is_empty());
+    }
 
     #[test]
     fn matching_store_device_key_is_accepted() {
@@ -792,6 +1727,22 @@ mod tests {
         let key = load_mac_key(&missing, /*expected=*/ false)
             .expect("an unrequired absent MAC key is benign, not an error");
         assert!(key.is_empty(), "the placeholder must be empty, got {key:?}");
+    }
+
+    #[test]
+    fn empty_mac_key_file_is_refused_by_name_only_when_required() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trust_store.mac_key");
+        std::fs::write(&path, b"").unwrap();
+        let err = load_mac_key(&path, /*expected=*/ true).unwrap_err();
+        assert!(matches!(err, RemotedError::MacKey(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains(&path.display().to_string()),
+            "the error names the key file: {err}"
+        );
+        // A fresh install's empty placeholder stays benign.
+        let key = load_mac_key(&path, /*expected=*/ false).unwrap();
+        assert!(key.is_empty());
     }
 
     #[test]

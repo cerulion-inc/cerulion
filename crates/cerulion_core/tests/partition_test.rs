@@ -22,7 +22,7 @@ const PREFIX: &str = "p";
 /// One node: id, (input_name, source) pairs, output names.
 fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id: id.to_string(),
@@ -32,6 +32,7 @@ fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs

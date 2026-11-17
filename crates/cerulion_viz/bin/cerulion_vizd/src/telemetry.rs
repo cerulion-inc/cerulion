@@ -5,15 +5,20 @@
 //! Only the production entry (`main.rs`) starts this, so the in-process
 //! daemons the tests drive never send anything. Nothing is sent unless a
 //! PostHog key is set (`POSTHOG_API_KEY`) and consent resolves enabled (see
-//! `cerulion_telemetry`); events carry no topic, host, path or payload data,
-//! only the platform and whole minutes of uptime.
+//! `cerulion_telemetry`), and a daemon started while the network kill switch
+//! is engaged in its environment (`CERULION_NETWORK`, or this daemon's own
+//! `CERULION_VIZD_NETWORK`, set to a value that is not blank) sends nothing:
+//! the switch is read once, at start. Events carry no topic, host, path or
+//! payload data, only the platform and whole minutes of uptime.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use cerulion_telemetry::{consent, Client, Common, EventSpec, Props, DEFAULT_SHUTDOWN_BUDGET};
+use cerulion_telemetry::{
+    consent, kill_switch, Client, Common, EventSpec, Props, DEFAULT_SHUTDOWN_BUDGET,
+};
 
 /// How often a running daemon reports that it is still up.
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -30,11 +35,13 @@ pub const VIZD_HEARTBEAT: EventSpec = EventSpec {
     allowlist: &["uptime_minutes"],
 };
 
-/// The client, or `None` until the CLI has shown its first-run notice on
+/// The client, or `None` while the network kill switch is engaged
+/// ([`switch_engaged`]) or until the CLI has shown its first-run notice on
 /// this machine: the daemon prints no notice of its own, so it sends nothing
 /// before the CLI has shown one. A CI run needs no notice.
 fn client_after_notice() -> Option<Client> {
-    notice_cleared(
+    may_send(
+        switch_engaged(),
         cerulion_telemetry::ci::detected(),
         consent::notice_shown().ok(),
     )
@@ -42,7 +49,24 @@ fn client_after_notice() -> Option<Client> {
     .flatten()
 }
 
-/// Whether the daemon may send: under CI, or once the notice was shown.
+/// Whether the network kill switch is engaged for the daemon's telemetry:
+/// `CERULION_NETWORK` or `CERULION_VIZD_NETWORK` set to a value that is not
+/// blank, under the CLI's fail-closed parse ([`kill_switch::engaged`]). The
+/// daemon's own network plane reads `CERULION_VIZD_NETWORK` byte for byte
+/// ([`crate::net`]); its telemetry reads it as the switch.
+fn switch_engaged() -> bool {
+    kill_switch::engaged_in_env(kill_switch::NETWORK_ENV)
+        || kill_switch::engaged_in_env(crate::net::NETWORK_ENV)
+}
+
+/// Whether the daemon may send: never under the switch; otherwise under
+/// CI, or once the notice was shown.
+fn may_send(switch_engaged: bool, ci: bool, notice_shown: Option<bool>) -> bool {
+    !switch_engaged && notice_cleared(ci, notice_shown)
+}
+
+/// Whether the notice no longer holds the daemon back: under CI, or once it
+/// was shown.
 fn notice_cleared(ci: bool, notice_shown: Option<bool>) -> bool {
     ci || notice_shown == Some(true)
 }
@@ -266,6 +290,13 @@ impl Telemetry {
         Starting::spawn(client_after_notice, HEARTBEAT_INTERVAL)
     }
 
+    /// [`Telemetry::start_in_background`] with a heartbeat every `interval`;
+    /// the client comes from the environment as in production (tests).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn start_in_background_every(interval: Duration) -> Starting {
+        Starting::spawn(client_after_notice, interval)
+    }
+
     /// Stop the heartbeat and flush, both within one
     /// [`DEFAULT_SHUTDOWN_BUDGET`].
     pub fn shutdown(self) {
@@ -396,7 +427,19 @@ impl Starting {
 
 #[cfg(test)]
 mod tests {
-    use super::notice_cleared;
+    use super::{may_send, notice_cleared};
+
+    #[test]
+    fn the_daemon_never_sends_under_the_network_kill_switch() {
+        for (ci, notice) in [(true, None), (false, Some(true)), (true, Some(true))] {
+            assert!(may_send(false, ci, notice), "ci={ci} notice={notice:?}");
+            assert!(
+                !may_send(true, ci, notice),
+                "the switch wins over ci={ci} notice={notice:?}"
+            );
+        }
+        assert!(!may_send(false, false, Some(false)));
+    }
 
     #[test]
     fn the_daemon_sends_under_ci_or_once_the_notice_was_shown() {

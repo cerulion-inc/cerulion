@@ -108,6 +108,7 @@ the slots. All little-endian.
 | 5 | `decimated` | The last ACCEPTED sequence (or the sentinel) | > 0: popped and deliberately dropped by a `sample(N)` gate |
 | 6 | `truncated` | sentinel | REINTERPRETED: records dropped IN THIS MERGE WINDOW. **A MARKED HOLE**, see below |
 | 7 | `producer` | REPEATS the annotated read's sequence (a redundant join key) | unused (0); the payload is the 64-bit token in the aux slot |
+| 8 | `batch_frame` | One frame the NEXT read of the same stage and read site consumed besides the one it served (`trace_format` 9) | 0: the read that follows carries the count |
 
 **`popped` is a QUEUE count, not a served count**, and the difference is the
 useful signal: a `served` record with `popped = 4` means the drain took four
@@ -119,10 +120,36 @@ than taking new record kinds, which is what kept them from moving the format at
 all; a reader that predates them decodes every field to the value the writer
 meant and renders the kind as `unknown(6)` / `unknown(7)`. (They are defined
 from format 3 on. A bag stamps 5 for the read-site role, 6 for folded runs and 7
-for the every-consult record, each a WIRE change rather than a diagnostic, so a
-bag recorded with the defaults carries these annotations under a 7, folding on or
-off: `CERULION_READ_LOG_FOLD=off` moves no stamp, because the every-consult
-record is written either way.)
+for the every-consult record, each a WIRE change rather than a diagnostic, and
+8 for read identity and 9 for batch frames, so a bag recorded with the
+defaults carries these annotations under a 9, folding on or off:
+`CERULION_READ_LOG_FOLD=off` moves no stamp, because the every-consult record,
+the annotations and the batch frames are written either way.)
+
+From `trace_format` 9 on, a read that popped more than one frame is preceded,
+on its own stage and read site, by one `batch_frame` record per frame it
+consumed besides the one it served, in pop order, each with that frame's
+sequence, when all of them and the read fit in the stage's window (otherwise
+none is written, and the read names only its newest frame). On a multi-writer
+edge each batch frame carries a `producer` annotation of its own; on any other
+edge it is attributed to the writer of its run, as a read is, with an
+annotation only where the writer changes. With
+them the log names every frame such a read consumed, which need not be a
+contiguous run: a writer can refill and overflow a `drop_oldest` queue while
+the node's callback runs between two receives of one batch.
+
+From `trace_format` 8 on, every edge carries `producer` annotations, not only
+a `multi_publisher_topics` or producer-less external topic. A multi-writer edge
+still carries one before every read. On every other edge each annotation opens
+a WRITER RUN: it names the writer (the token) of the read right after it and of
+every later read of the same read stage and read site up to the next
+annotation. A read site is the node body (`body`), or the scheduler (`drain`
+and `peek` together). A single-writer edge therefore shows one annotation per
+read site in the whole log. With the wire sequence
+on every read record, the log names the writer and the sequence of every frame
+a read served. That is what lets `bag play --resim all --verify` feed each read
+its recorded frames (see "Read identity" in [`docs/bag.md`](bag.md)). Below
+format 8 only multi-writer edges carry annotations, one before every read.
 
 ### The read-site role (`trace_format` 5)
 

@@ -6,6 +6,7 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
 
 ## Invariants
 
+- Exclude `/bagd/status` until reap; conflict: `--status-period-ms 0`. Display: no I/O.
 - bagd NEVER evicts: both `room == 0` arms in the tap drain WAIT. The loss
   boundary is the topic's own provisioned SHM queue depth, not recorder policy.
 - ONE write mode: payloads are copied into the MCAP chunk arena at drain, so
@@ -24,37 +25,35 @@ firehose-rate losslessness - the firehose benches are `#[ignore]`d measurements.
   over `connect_existing`) and verifies every served doc by recomputing its
   hash against the wire before naming a channel - a mismatch records
   `Unresolved`, never a wrong name.
-- A message emitted from code that cannot know which verb invoked it
-  (`cerulion bag record` vs `cerulion bagd`) names NO flag - the two verbs
-  spell their schema-wait/settle levers differently.
+- Code that cannot distinguish `cerulion bag record` from `cerulion bagd`
+  names NO flag: their schema-wait/settle flags differ.
 
 ## Testing
 
 - `cargo test -p cerulion_bagd -- --test-threads=1` - serial for a process-GLOBAL panic
   hook, not SHM (each test builds an isolated transport).
-- Rendezvous with a rescan-attached tap via `await_rescan_tap` (condition poll), never
-  `sleep(...)` - data-only taps have no back-fill, so earlier frames are simply gone.
+- Rendezvous on `topic_subscriber_count`, never `sleep(...)`: a data-only tap has no back-fill.
 - No wall-clock assertion bands: verdicts and frame-set relations only; every wait is a condition under a seconds-scale ceiling.
 
 ## Gotchas
 
-- Topic ENUMERATION stays OFF the drive loop (`discovery_scan::DiscoveryScanner` walks on
-  its own thread; the loop takes an O(1) snapshot). An inline walk starves the drain and
-  loses frames the writer never saw. Both failures are loud: unspawnable degrades to inline
-  with a `warn!`, spawned-but-silent rides `ScanSilenceLatch`.
+- Topic ENUMERATION stays OFF the drive loop (`discovery_scan::DiscoveryScanner`; the loop
+  takes an O(1) snapshot) and is EVENT-driven, never timed: the worker blocks on a kernel
+  watch of the iceoryx2 service directory (`service_dir_watch`, inotify/kqueue) and walks
+  only on a change, so an idle machine runs ZERO walks. An inline walk starves the drain;
+  a cadence burns a core. Degradations are loud (`warn!`; the recorder does not store the
+  engine); a dead worker is caught by its HEARTBEAT (`ScanSilenceLatch`), not by silence.
 - Live discovery defaults ON only for `--topics-json` and `--run`; OFF for
   `--topic`/`--all`/`--regex` and `BagdConfig::new`. `graph run --record` builds bagd's argv
   itself: retune with `CERULION_RECORD_DISCOVERY=off` / `CERULION_RECORD_DISCOVERY_SETTLE_MS`.
-- Even a quiet graph pays the settle floor (`DISCOVERY_SETTLE_MIN`); the
-  arm-time scan does NOT count as a quiet scan.
+- The settle window is a WALL, not a scan count: creation is held until `DISCOVERY_SETTLE_MIN` passes with nothing new found, AND the worker owes no walk (`walk_pending`: baseline, a change's walk and tail, a broken watch's hand-over); an arm-time find does NOT start it.
 - Bag creation is held for max(discovery settle, schema wait) - measure it from
   `BagdSummary::channel_set_closed_after`, never the bag file's appearance (reads short).
 - Both record paths run on the default `iox2_` namespace: discovery also taps
   co-tenant topics; the only bounds are `DISCOVERY_MAX_TAPS` + the env switch.
 - MULTI-PROCESS trace rings ride `!no_rings`, not `record` (single-process ones ride
   `--record`); either way read `run.json`/`trace_rings`, never infer one from the run shape.
-- Mid-run ring attach MUST use `open_at_live`; plain `open` refuses a lapped
-  ring. A departure ring (`rank == u32::MAX`) is passthrough, never head-gated.
-
+- Mid-run attach MUST use `open_at_live` (`open` refuses a lapped ring); a from-start recorder
+  opens EVERY state ring with `open`. A departure ring (`rank == u32::MAX`) is passthrough, never head-gated.
 Deep reference: docs/internals/recording.md - read before touching drain
 pacing, discovery/settle, coverage fields, or run binding.

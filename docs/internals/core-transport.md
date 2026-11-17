@@ -5,6 +5,38 @@ anything under `src/transport/`, `src/wire.rs`, `src/wake.rs`, or the network/ga
 code. Companion: `core-scheduler-graph.md` (execution side), `core-testing.md` (full test
 map). Code on `main` beats this document; when they disagree, fix the document.
 
+## Host-owned node leases
+
+`transport/plugin_lease.rs` provisions fixed lease rows before execution. Tokens
+use process-wide lease generations that wrap and skip zero; context identities
+remain nonwrapping. Each active row checks its generation, owner and direction
+before a token can change a port or consume a frame. A row is claimed before
+loan or receive, so budget refusal has no transport effect. Native sample owners
+stay in the host and are returned exactly once.
+
+`graph/node_host_abi.rs` validates cached schema layout facts before lending the
+native mapping address. Accepted publish and receive calls borrow wire bytes in
+place. Adaptive variable outputs may explicitly submit a node-owned spill payload
+for a synchronous host copy. Submission retains the original loan on every result
+until the writer is destroyed and `SPILL_RELEASE` returns its storage. A normal
+finish consumes its admitted lease; malformed frames never publish or consume a sequence.
+After any spill submission, only `SPILL_RELEASE` may terminate the lease. Malformed
+submissions and releases without an attempt count one invariant failure; teardown
+reclaims each leaked owner once. `INVALID_STATE` admission refusal preserves leases.
+Read leases exclude snapshot, head mutation and restore of their port. Native
+replay suppression returns output storage before writer validation or discard
+accounting, preserving the existing sequence and replay-discard signal behavior.
+
+Raw accumulation uses `AccumulatorSet`'s existing gather, order, loss, event and
+state machinery. A fire offers one repeatable batch; indexed immutable frame
+leases retain it until release. Per-port capture omits the outer input count and
+restore preflights the entire canonical record before applying native restore.
+Unwired declarations still bind: plain reads are empty, accumulation reports zero
+frames, and an output loan refuses with its declaration name. Unbound output
+bindings carry zero capacity; no native port or lease is created for them.
+`node_host_abi_test` asserts downstream wire bytes, discard/sequence behavior,
+spill lifetime, repeat views, state refusal and allocation-detector controls.
+
 ## Transport model
 
 - ONE LONG-LIVED iceoryx2 node per process, owned by the `TransportManager`
@@ -87,6 +119,26 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   re-implement it. The recipe identifier is the `HASH_RECIPE` constant
   (`src/trace/bag.rs`); an artifact with an absent recipe field means the original
   recipe.
+- A data service created with a history floor (`TopicServiceConfig::create_history_floor`,
+  set by every `rmw_cerulion` endpoint) also carries the attribute `cerulion.history_floor`.
+  Its history then holds what every publisher sent, VOLATILE ones included, so a subscriber
+  port that asks for no particular history (a graph input, a Python subscriber, `topic echo`
+  and `hz`) takes none from it; on any other service it takes the service history, capped at
+  its buffer. An rmw subscription asks for its own: 0 when VOLATILE, its depth when
+  TRANSIENT_LOCAL. The attribute marks the whole service, so on a topic an rmw endpoint
+  created, a native publisher's declared history does not reach native subscribers either.
+  Data-only taps (`bag record`, the viz daemon) do not read the attribute and take the
+  service history either way.
+- A data publisher whose own history request is above 0 is created with the iceoryx2 port
+  name `cerulion.retains` (`transport::RETAINING_PUBLISHER_NAME`, set in `finish_publisher`,
+  the one place every data publisher is built); a publisher that asks for none keeps the
+  default empty name. The name lives in the service's dynamic config, so
+  `TransportManager::topic_publisher_retain_marks` reads one flag per live publisher from
+  any process, and the publisher's drop (or iceoryx2's dead-node cleanup, for a crashed
+  process) removes it. It exists because the service history cannot say which publisher
+  retains: every publisher's ring is sized from the service. `rmw_cerulion` resolves a
+  BEST_AVAILABLE subscription from these flags. A publisher from a build without the
+  name reads as one that retains nothing.
 - Writer cursor contract (for anyone writing an independent frame reader): the
   variable-payload write cursor starts at `wire_fixed_size + 8·N` and only advances
   forward; a re-written variable field is appended at the tail, leaving interior dead
@@ -171,6 +223,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   `info!` only when something was suppressed (`OutputDiscardLatch`). The unconditional
   `total_discards` / `CerulionPublisher::output_discard_count()` counter never resets on
   recovery and is readable off-thread via `NodeHandle::output_discard_count(output)`.
+  Native and stable nodes share the exact `OutputProxy` log messages and that same
+  per-output latch: missing variable writes and nested flush failures retain their
+  distinct messages, including schema, nested error detail and suppressed count.
+  Stable nested detail is copied from an output-port diagnostic before its terminal
+  discard; staging emits no log and changes no discard counter. The terminal logs
+  once and clears its own detail. Admission refusals retain both lease and detail.
+  A complete normal or adaptive-spill publish reports the native recovery line.
 
 ## Provisioning
 
@@ -265,6 +324,16 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   recovery never buys a still-broken peer a fresh quota.
 - A diagnostic latch never wedges the path it observes and never silently resets its
   regime on a poisoned mutex (`lock_regime_latch` arm).
+- `transport/drain_clip_latch.rs` (`DrainClipLatch`) builds on `FailureRegimeLatch` for a
+  `block` input's drains that remove more frames than its credit word has queued. An outside
+  writer's clipped drains interleave with the counted producer's clean ones, so a regime
+  closes after a run of consecutive clean drains: 1 for the input's first regime, so its
+  first clean drain closes it, and every close doubles the run the next regime needs, up to
+  `CLOSE_AFTER_MAX` (65_536). An interleaved writer whose frames are `G < 65_536` clean
+  drains apart opens at most `floor(log2(G)) + 2` regimes, and the first clip after 65_536
+  clean drains in a row is loud again however many regimes closed before. Pinned by its unit
+  vectors, a seeded fault for the cap under `oracle-mutants`, and
+  `credit_block_iox2_test::an_interleaved_outside_writer_does_not_repeat_the_loud_line_per_frame`.
 - The two demand wire header latch tables (`KeyedLatches` in `transport/network.rs`) are
   bounded in key COUNT (`KEYED_LATCHES_CAP`, 256) and key part LENGTH
   (`LATCH_KEY_PART_MAX_LEN`, 256 bytes, the ack peer set's limit). A key the table will not
@@ -472,11 +541,46 @@ map). Code on `main` beats this document; when they disagree, fix the document.
   Listeners alone do not classify a topic REMOTE. Automatic local reads acquire
   no lease. The lease and private CLI wrapper add no publisher/subscriber FFI
   fields, wire changes, or data delivery work.
+- A policy marker (`transport/egress_scope`) or mirror marker whose last holder
+  is dropping it reads as `IsMarkedForDestruction` until iceoryx2 removes its
+  files. Every caller of the open-only checks
+  (`TransportManager::remote_topic_allowed`, `is_network_mirror`,
+  `network_mirror_topics`, `retain_local_topic_scope`) names a `TeardownWait`.
+  `Bounded`, for a request on its own thread or task (remoted act verbs, its
+  wire-plane demand and schema reads, CLI commands), opens the marker again
+  within `transport/marker_teardown`'s budget, 20 opens 25 ms apart, counted
+  rather than timed, and refuses naming that budget only when the state
+  outlasts it. `Never`, for a check on the process's zenoh session callback
+  (the demand authorizer, catalog and schema GETs, the permissive demand
+  probe), a listing filter (remoted's catalog and peek, rcpd's graph feed) or a
+  loop that serves other work (raw port creation on a node's executor thread,
+  rcpd's journal refresh), opens once and refuses at once naming the teardown, so a marker whose holder died
+  mid-removal never stalls unrelated traffic. The open-or-create paths keep
+  iceoryx2's own wait for that state, which ends with the node's creation
+  window; a refusal at its end names the window. Every other open error
+  refuses as before. Oracle tests: the `marker_teardown`, `egress_scope` and
+  `mirror_origin` unit tests, which inject the teardown through the open seam
+  and pin one open for `Never`.
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
   misses it; consumers read it with the long-lived `RunWatcher`, never a one-shot
   gather.
+- Hosted runs (`transport/hosted_runs.rs`): an embedded host has no registry record and
+  no run directory, so it serves its run from memory.
+  `NetworkManager::hosted_runs().host(run_id, run)` lists a `HostedRun` (its entry and
+  its `live` flag) and returns a `#[must_use]` `HostedRunGuard`; dropping the guard
+  withdraws it. Hosting the same `run_id` again replaces the run, and the old guard then
+  withdraws nothing. The served state comes from `live` at serve time: `Live` while set,
+  `Ending` once the host clears it, until the guard drops. The entry is checked again through `RunEntry::new`
+  and is always served under `run_id`; one that fails the checks is named in
+  `undescribable` with its reason, which demotes a `settled` verdict. The `runs` verb
+  keeps its order (access gate, registry gather, run directories) and folds the hosted
+  entries into the same reply through the one `run_id` dedup (the later start survives;
+  on a tie, the gathered entry). A refused GET never reads the slot; a failed gather
+  still serves the hosted runs, with `not_established`. Only a declared query surface
+  serves them (`NetworkManager::has_query_surface`): a deny-all, ingress-only gateway
+  declares none, so a run hosted there gets no reply.
 - Cross-machine data-plane diagnosis: `crates/cerulion_core/tests/cross_machine_data_plane_harness.rs` is the
   standing two-machine A/B harness (env-driven robot/desk roles; ignored, never run in
   CI; run per its module docs on a live machine pair). It models the shipping asymmetric
@@ -603,3 +707,13 @@ map). Code on `main` beats this document; when they disagree, fix the document.
 | `failure_regime_latch_test.rs` | shared latch decisions, decade ladder, frame-drop reporting layer |
 | `network_ingress_test.rs` / `network_ingress_e2e_test.rs` | byte-identical re-inject; loop exclusion; cross-session hop |
 | `iceoryx2_version_lockstep_test.rs` | exact-pin + single-version workspace resolution |
+
+### Raw node ingress services
+
+Host contexts provision 128 raw publisher rows at construction. The host can set a different fixed budget with `with_raw_publisher_budget` before registration. Raw rows are never reused during the context lifetime; destroy drops the native publisher after its leases return and retains topic storage until context teardown. Each raw publisher provisions its own fixed sample arena, with disjoint token indices and the context's configured ordinary lease budget. Exhausted raw or sample budgets return FAILED before transport effects. Raw creation uses the context-carried transport manager, never a second session.
+
+Raw and injected-clock callbacks are callable from any thread, independently of the node-call gate. Raw operations synchronize on a short per-publisher mutex; clock reads use the same injected Clock object directly. Retained ordinary or raw leases do not prevent a fire. Each retains its mapping, row and port exclusion until its own release; loan budgets and all other admission guards remain active. Runtime drain, refill and sync helpers exclude only their named borrowed input; publisher history and immutable stamp reads do not mutate input mappings. Unscoped mutable native access conservatively excludes all borrowed inputs. Ordinary port, state and sync callbacks require the admitted node-call thread; outside or concurrent calls return INVALID_STATE, count a violation, and preserve all borrowed leases. BUSY means only destruction while leases remain outstanding. The host serializes NodeApi, StateApi and ExternalApi entries on each node handle.
+
+`create_raw_publisher` accepts native ConfigDefault (0) and Discard (1); reserved Block (2) and unknown tags are refused. `loan_output` on a raw handle takes the schema hash, fixed size/count zero, frame alignment, and exact complete frame size as minimum capacity. Its slot has a 40-byte initialized header prefix; the caller initializes the complete frame. `finish_raw_output` consumes the lease, validates header/schema/length and offset bounds, preserves original wire stamps, and returns actual recipient count. Every writable recipient output is zero on refusal. Raw sends share native raw publish trace, promise and structural notify effects. `register_raw_egress` uses the existing dynamic registration channel; a refusal preserves the local publisher. Native and plugin raw creation retain an existing local-only exclusion before opening the port, keep it until every loan and the port are retired, and skip private egress registration.
+
+Host lease tests: `cargo test -p cerulion_core --test node_host_abi_test -- --test-threads=1`, parallel-safe on isolated SHM roots, without fixture prerequisites. Pure host filters are `graph::node_host_abi::tests` and `transport::plugin_lease::tests`; adapter oracles use `graph::node_plugin_abi`. The loader brackets each foreign entry with `begin_node_call()` and `end_node_call()`, calls `begin_fire()` once before tick, releases the context mutex across foreign execution, and returns all helper/accessor borrows before removing a context. Raw accumulator hooks share the typed gather/drop/event/state path.

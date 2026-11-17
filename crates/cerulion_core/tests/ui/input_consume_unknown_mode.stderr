@@ -1,0 +1,11 @@
+error: unknown consume mode `lifo`, expected `consume = fifo` (the default) or `consume = latest`.
+ --> tests/ui/input_consume_unknown_mode.rs:7:32
+  |
+7 |     #[input(trigger, consume = lifo)]
+  |                                ^^^^
+
+error: cannot find attribute `input` in this scope
+ --> tests/ui/input_consume_unknown_mode.rs:7:7
+  |
+7 |     #[input(trigger, consume = lifo)]
+  |       ^^^^^

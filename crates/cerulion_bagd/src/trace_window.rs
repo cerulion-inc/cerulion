@@ -719,6 +719,59 @@ impl Keep {
     }
 }
 
+/// Capture-side mutant the writer-carry test must catch, compiled only with the
+/// `oracle-mutants` feature. Thread-local, so it cannot leak into a parallel test.
+#[cfg(all(feature = "oracle-mutants", test))]
+pub(crate) mod mutants {
+    use std::cell::Cell;
+
+    thread_local! { static DROP_CARRY: Cell<bool> = const { Cell::new(false) }; }
+
+    /// Arms the mutant until dropped: the trim stops re-stating dropped writer notes.
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DROP_CARRY.with(|c| c.set(false));
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn drop_writer_carry() -> Guard {
+        DROP_CARRY.with(|c| c.set(true));
+        Guard
+    }
+
+    pub(crate) fn armed() -> bool {
+        DROP_CARRY.with(Cell::get)
+    }
+}
+
+#[cfg(all(feature = "oracle-mutants", test))]
+fn carry_dropped() -> bool {
+    mutants::armed()
+}
+
+#[cfg(not(all(feature = "oracle-mutants", test)))]
+fn carry_dropped() -> bool {
+    false
+}
+
+/// One read stream of one consumer: (rank, node index, input index, read site).
+type WriterKey = (u32, u32, u16, usize);
+
+/// The writer-run key and outcome kind of a read-outcome record, `None` for any
+/// other record type.
+fn writer_key(rec: &TraceRingRecord) -> Option<(WriterKey, u16)> {
+    if rec.record_type != cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME {
+        return None;
+    }
+    let (input, kind, role) =
+        cerulion_core::trace_ring::unpack_read_outcome_meta_full(rec.global_level);
+    let site = cerulion_core::read_outcome::writer_run_site(role);
+    Some(((rec.rank(), rec.node_idx, input, site), kind))
+}
+
 /// The one walk both entry points share — `None` means keep everything.
 ///
 /// # One walk, k cuts
@@ -740,6 +793,13 @@ fn walk(
     node_ids: &BTreeMap<u32, Vec<String>>,
 ) -> TrimmedTrace {
     let mut out = TrimmedTrace::default();
+    // The latest writer note the trim dropped, per (rank, consumer node, input,
+    // read site), and the keys whose first kept record has been seen. A kept
+    // read whose key still holds a dropped note and whose first kept record is
+    // not itself a note gets that note re-stated directly before it, so the
+    // capture names the writer of its first reads without the cut-off history.
+    let mut dropped_writer: BTreeMap<WriterKey, u64> = BTreeMap::new();
+    let mut first_seen: std::collections::BTreeSet<WriterKey> = std::collections::BTreeSet::new();
     for rec in records {
         let rank = rec.rank();
         let anchor_step = anchor_steps.and_then(|m| m.get(&rank).copied());
@@ -770,9 +830,36 @@ fn walk(
                     out.anchor_target_ns = Some(rec.fire_time_ns);
                 }
             }
+            if let Some((key, kind)) = writer_key(&rec) {
+                if kind == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER {
+                    dropped_writer.insert(key, rec.duration_ns);
+                }
+            }
             out.per_rank.entry(rank).or_default().discarded += 1;
             out.discarded += 1;
             continue;
+        }
+        if let Some((key, kind)) = writer_key(&rec) {
+            if kind != cerulion_core::trace_ring::READ_OUTCOME_TRUNCATED
+                && first_seen.insert(key)
+                && kind != cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+                && !carry_dropped()
+            {
+                if let Some(token) = dropped_writer.remove(&key) {
+                    let (_, _, role) =
+                        cerulion_core::trace_ring::unpack_read_outcome_meta_full(rec.global_level);
+                    let mut note = TraceRingRecord::read_outcome_producer(
+                        rec.step,
+                        rec.node_idx,
+                        key.2,
+                        u32::try_from(rec.fire_time_ns).ok(),
+                        token,
+                        role,
+                    );
+                    note.reserved = rec.reserved;
+                    out.records.push(note);
+                }
+            }
         }
         if rec.is_departure_boundary() {
             out.departures += 1;
@@ -1955,5 +2042,135 @@ mod tests {
         );
         trimmed.record_end_cut(out.cut, out.steps_cut, &out.bounded_ranks);
         assert_eq!(trimmed.ranks_without_a_kept_step, vec![1]);
+    }
+
+    // ------------------------------------------------------- writer carry
+
+    fn note(
+        step: u64,
+        node: u32,
+        input: u16,
+        seq: u32,
+        token: u64,
+        role: cerulion_core::read_outcome::ReadSiteRole,
+    ) -> TraceRingRecord {
+        TraceRingRecord::read_outcome_producer(step, node, input, Some(seq), token, role)
+    }
+
+    fn served(
+        step: u64,
+        node: u32,
+        input: u16,
+        seq: u32,
+        role: cerulion_core::read_outcome::ReadSiteRole,
+    ) -> TraceRingRecord {
+        TraceRingRecord::read_outcome(
+            step,
+            node,
+            input,
+            cerulion_core::read_outcome::ReadOutcomeKind::Served,
+            Some(seq),
+            cerulion_core::trace_ring::ReadRun::once(1),
+            role,
+        )
+    }
+
+    /// A capture cut at step 5 drops the writer notes of steps 3 and 4. The
+    /// trim must re-state, directly before the first kept read of each edge
+    /// and site, the LATEST dropped writer for it, repeating that read's
+    /// served sequence, and must not add a second note where the kept read is
+    /// already annotated (a multi-writer edge).
+    #[test]
+    fn a_trim_carries_each_edges_latest_writer_note_to_its_first_kept_read() {
+        use cerulion_core::read_outcome::ReadSiteRole::{Body, Drain};
+        use cerulion_core::trace_ring::{unpack_read_outcome_meta_full, READ_OUTCOME_PRODUCER};
+        let mut records = Vec::new();
+        records.extend([
+            boundary(3, 3_000),
+            note(3, 1, 0, 30, 0xA, Body),
+            served(3, 1, 0, 30, Body),
+        ]);
+        records.extend([note(3, 1, 0, 31, 0xE, Drain), served(3, 1, 0, 31, Drain)]);
+        // The body writer changes twice before the cut: A, then B, then C.
+        records.extend([
+            boundary(4, 4_000),
+            note(4, 1, 0, 40, 0xB, Body),
+            served(4, 1, 0, 40, Body),
+        ]);
+        records.extend([note(4, 1, 0, 41, 0xC, Body), served(4, 1, 0, 41, Body)]);
+        // A multi-writer edge annotates every read, kept ones included.
+        records.extend([note(4, 1, 1, 42, 0xF, Body), served(4, 1, 1, 42, Body)]);
+        records.extend([
+            boundary(5, 5_000),
+            served(5, 1, 0, 50, Body),
+            served(5, 1, 0, 51, Drain),
+        ]);
+        records.extend([note(5, 1, 1, 52, 0xD, Body), served(5, 1, 1, 52, Body)]);
+        let out = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
+        let kept = &out.records;
+        let find = |node: u32, input: u16, role, seq: u64| {
+            kept.iter()
+                .position(|r| {
+                    r.record_type == cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+                        && r.node_idx == node
+                        && unpack_read_outcome_meta_full(r.global_level).0 == input
+                        && unpack_read_outcome_meta_full(r.global_level).1 != READ_OUTCOME_PRODUCER
+                        && cerulion_core::trace_ring::read_site_role(r.global_level) == role
+                        && r.fire_time_ns == seq
+                })
+                .expect("the read is kept")
+        };
+        let token_before = |i: usize| {
+            let r = &kept[i - 1];
+            assert_eq!(
+                unpack_read_outcome_meta_full(r.global_level).1,
+                READ_OUTCOME_PRODUCER
+            );
+            assert_eq!(
+                r.step, 5,
+                "the carried note sits at the capture's first step"
+            );
+            (r.duration_ns, r.fire_time_ns)
+        };
+        assert_eq!(token_before(find(1, 0, Body, 50)), (0xC, 50));
+        assert_eq!(token_before(find(1, 0, Drain, 51)), (0xE, 51));
+        // The multi-writer edge keeps exactly its own note.
+        let mw = find(1, 1, Body, 52);
+        assert_eq!(token_before(mw), (0xD, 52));
+        let producers = kept
+            .iter()
+            .filter(|r| {
+                r.record_type == cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+                    && unpack_read_outcome_meta_full(r.global_level).1 == READ_OUTCOME_PRODUCER
+            })
+            .count();
+        assert_eq!(
+            producers, 3,
+            "two carried notes plus the multi-writer edge's own"
+        );
+    }
+
+    /// The mutant that drops the carry must make the carry test's premise fail:
+    /// only the multi-writer edge's own note survives the trim.
+    #[cfg(all(feature = "oracle-mutants", test))]
+    #[test]
+    fn the_drop_carry_mutant_is_caught() {
+        use cerulion_core::read_outcome::ReadSiteRole::Body;
+        let records = vec![
+            boundary(4, 4_000),
+            note(4, 1, 0, 40, 0xB, Body),
+            served(4, 1, 0, 40, Body),
+            boundary(5, 5_000),
+            served(5, 1, 0, 50, Body),
+        ];
+        let with = trim_to_anchor(records.clone().into_iter(), &cut(4), &nodes());
+        assert_eq!(with.records.len(), 3, "carried note, boundary, read");
+        let _armed = mutants::drop_writer_carry();
+        let without = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
+        assert_eq!(
+            without.records.len(),
+            2,
+            "the mutant leaves the first read unattributed"
+        );
     }
 }

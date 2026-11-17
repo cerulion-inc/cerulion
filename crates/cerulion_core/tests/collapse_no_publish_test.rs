@@ -193,7 +193,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -202,7 +202,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
@@ -210,11 +210,12 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -222,6 +223,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -267,7 +269,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer".to_string(),
@@ -276,7 +278,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
@@ -284,11 +286,12 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -296,6 +299,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -586,7 +590,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
         prefix: prefix.to_string(),
         nodes: vec![
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer_a".to_string(),
@@ -595,7 +599,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "producer_b".to_string(),
@@ -604,7 +608,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "dut".to_string(),
@@ -613,16 +617,18 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                     InputDef {
                         name: "a".to_string(),
                         source: "producer_a/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "b".to_string(),
                         source: "producer_b/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![vec3_out("out")],
             },
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "sink".to_string(),
@@ -630,6 +636,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

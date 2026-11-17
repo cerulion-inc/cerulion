@@ -12,7 +12,11 @@
 //! the encoder always quotes strings.
 
 /// The 1-based `(line, column)` of the first anchor or alias in `text`.
-pub(super) fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
+///
+/// [`super::yaml_to_message`] refuses text where this finds one. A caller
+/// that parses message YAML with `serde_yaml` itself runs it first: the
+/// parser replays an alias's whole value at every reference.
+pub fn find_anchor_or_alias(text: &str) -> Option<(usize, usize)> {
     let mut flow_depth = 0usize;
     let mut quote: Option<char> = None;
     // Column of the node that owns an open block scalar (the key of

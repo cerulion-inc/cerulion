@@ -12,6 +12,9 @@ use cerulion_core::DylibNodeEntry;
 
 use crate::error::{CliError, CliResult};
 use crate::workspace_lock::WorkspaceLock;
+
+#[cfg(unix)]
+mod authenticated_ingress;
 // The shared surgical-splice scanner `node stage` appends
 // through (the same one `partition_emit` rewrites `process_groups:` with).
 use crate::yaml_splice::{
@@ -117,17 +120,20 @@ pub enum CpuDmaLockMode {
 }
 
 /// How the live-loop CPU monitor-wait park is selected. Auto-ON for a
-/// LIVE graph when a real CPU monitor-wait primitive exists on this target
-/// (Linux x86_64 WAITPKG / Linux aarch64 WFE); `--no-monitor-wait` is the hard
-/// opt-out. Env overrides `CERULION_MONITOR_WAIT` / `CERULION_DOORBELL` (`"1"`
-/// force-on / `"0"` disable) resolve through `Auto`. The park is LIVE-only (it
+/// LIVE graph on every target: a real shallow CPU monitor-wait where the CPU
+/// has a primitive (Linux x86_64 WAITPKG / Linux aarch64 WFE), the degraded
+/// sleep-recheck park elsewhere; `--no-monitor-wait` is the hard opt-out. Env
+/// overrides `CERULION_MONITOR_WAIT` / `CERULION_DOORBELL` (`"1"` force-on /
+/// `"0"` disable) resolve through `Auto`; an explicit `CERULION_MONITOR_WAIT=0`
+/// is a real off on every target, which only an explicit `CERULION_DOORBELL=1`
+/// overrides, and only where a primitive exists. The park is LIVE-only (it
 /// replaces the WaitSet block) — the deterministic virtual poll loop never parks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum MonitorWaitMode {
     /// Resolve the park from the live/availability + the `CERULION_MONITOR_WAIT`
     /// / `CERULION_DOORBELL` env overrides (see the type-level docs): auto-ON on
-    /// the live path when a real CPU monitor-wait primitive exists, off under the
-    /// virtual poll loop or when the primitive is unavailable.
+    /// the live path (the degraded sleep-recheck park where no CPU monitor-wait
+    /// primitive exists), off under the virtual poll loop.
     #[default]
     Auto,
     /// Hard opt-out from `--no-monitor-wait`: never park, regardless of env.
@@ -136,13 +142,19 @@ pub enum MonitorWaitMode {
 
 /// Env var that overrides the live-loop monitor-wait park under
 /// [`MonitorWaitMode::Auto`]: `"1"` force-arms the timer-deadline park, `"0"`
-/// disables it (exact match only — any other non-empty value warns and is
-/// ignored, see [`resolve_monitor_wait_policy`]).
+/// disables it, and an unset `CERULION_DOORBELL` follows it off; only an
+/// explicit `CERULION_DOORBELL=1` turns it back on, and only where a CPU
+/// monitor-wait primitive exists (exact match only; any other non-empty value
+/// warns and is ignored, see [`resolve_monitor_wait_policy`]).
 const MONITOR_WAIT_ENV: &str = "CERULION_MONITOR_WAIT";
 
 /// Env var that overrides the data-doorbell arm of the park under
-/// [`MonitorWaitMode::Auto`]: `"1"` force-arms the doorbell (which IMPLIES the
-/// park), `"0"` disables it (timer-only park). Exact match only — any other
+/// [`MonitorWaitMode::Auto`]: `"1"` requests the doorbell. Where a CPU
+/// monitor-wait primitive exists it also turns the park on, even over an
+/// explicit `CERULION_MONITOR_WAIT=0`, with a warning; without one it is forced
+/// off, with a warning, when the park is off or no wake word can hear a ring.
+/// `"0"` disables it (timer-only park). Unset, it is on for a live run while
+/// the park is on and the host can arm it. Exact match only; any other
 /// non-empty value warns and is ignored, see [`resolve_monitor_wait_policy`].
 const DOORBELL_ENV: &str = "CERULION_DOORBELL";
 
@@ -529,8 +541,9 @@ struct MonitorWaitInputs<'a> {
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
     /// consumer KERNEL-BLOCK on a doorbell's wake word on this host? True on
-    /// macOS with the Apple os_sync family resolved, false on every other target
-    /// and wherever that family is absent, latched or killed. A SECOND,
+    /// Linux and Android (a shared futex) and on macOS with the Apple os_sync
+    /// family resolved; false on other targets and on macOS wherever that family
+    /// is absent, latched or killed. A SECOND,
     /// INDEPENDENT fact from `primitive_available`, read only by arm 2 (on arm 3
     /// the CPU monitor-wait primitive already hears the ring on the same line).
     data_wake_available: bool,
@@ -548,7 +561,9 @@ struct MonitorWaitInputs<'a> {
 /// — asserted by the `#[traced_test]` tests. See [`MonitorWaitMode`] for the
 /// env overrides and
 /// [`cerulion_core::MonitorWaitPolicy`] for the returned shape (whose `::new`
-/// coerces the `doorbell ⇒ monitor_wait` invariant).
+/// enforces the `doorbell ⇒ monitor_wait` invariant by dropping a doorbell that
+/// has no park, so arm 3 passes `monitor_wait = true` itself when an explicit
+/// doorbell request turns the park on).
 ///
 /// Precedence ladder (first match wins):
 /// 1. [`MonitorWaitMode::Disabled`] (`--no-monitor-wait`) →
@@ -569,33 +584,39 @@ struct MonitorWaitInputs<'a> {
 ///    `monitor_wait` and with
 ///    `cerulion_core::doorbell::wake_word_block_primitive_available`, the host
 ///    fact that a consumer can kernel-block on a doorbell wake word: true on
-///    macOS with the Apple os_sync family resolved, false on every other target
-///    and wherever that family is absent, latched or killed. Where it is false a
+///    Linux and Android (a shared futex) and on macOS with the Apple os_sync
+///    family resolved; false on other targets and on macOS wherever that family
+///    is absent, latched or killed. Where it is false a
 ///    ring is still observed, but only by the recheck poll that already polls the
 ///    listener, so an armed doorbell buys nothing and is FORCED OFF.
 ///    A near-miss `CERULION_DOORBELL` value warns via the shared ladder and
 ///    then falls to the auto default like any other flag.
 ///    The doorbell never implies the park on this tier:
 ///    `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` is park-OFF here
-///    (unlike arm 3's `doorbell ⇒ monitor_wait` coercion) and the
-///    downgrade warn says so. When the park resolves ON, ONE loud
+///    (unlike arm 3, where an explicit doorbell request turns the park back
+///    on) and the downgrade warn says so. When the park resolves ON, ONE loud
 ///    `tracing::info!` names the degraded tier (loud over silent inference —
 ///    it is the intended default, not an error, hence info not warn), naming
-///    whether the wake word armed; an explicit `CERULION_DOORBELL=1` that was
-///    REFUSED additionally warns about the downgrade and says which of the two
-///    reasons applied. The runtime side wakes on the doorbell where the wake
+///    whether the wake word armed. An explicit `CERULION_DOORBELL=1` that was
+///    REFUSED warns once about the downgrade: it names the park-off reason when
+///    the park resolved off, whatever the wake-word fact (carried as the
+///    `wake_word_available` field), and the missing wake word otherwise. The
+///    runtime side wakes on the doorbell where the wake
 ///    word armed, and otherwise on the chunked ~100µs
 ///    bounded sleep-recheck park, which can NEVER busy-spin
 ///    (`GraphRuntime::monitor_wait_block`).
-/// 3. (available) resolve EACH flag independently from its env — exact `"1"`
-///    (on) / `"0"` (off) match; a non-empty near-miss warns + uses the auto
-///    default; an unset/empty value uses the auto default (`= is_live`):
-///    `monitor_wait = resolve_flag(env_monitor_wait)`,
-///    `doorbell = resolve_flag(env_doorbell)`. The returned
-///    [`cerulion_core::MonitorWaitPolicy::new`] then COERCES
-///    `doorbell ⇒ monitor_wait`, so e.g. `CERULION_MONITOR_WAIT=0` with the
-///    doorbell still auto-on under live parks anyway (the doorbell ring wakes
-///    the same park).
+/// 3. (available) `monitor_wait` resolves on the shared flag ladder (exact
+///    `"1"` on / `"0"` off; a non-empty near-miss warns + uses the auto
+///    default; unset/empty uses the auto default `is_live`). `doorbell`
+///    resolves on the same ladder, but its auto default FOLLOWS THE PARK
+///    (`is_live && monitor_wait`), so an explicit `CERULION_MONITOR_WAIT=0`
+///    with the doorbell unset (or a near-miss) is a real off, as on arm 2 and
+///    in `rmw_cerulion`. Only an EXPLICIT `CERULION_DOORBELL=1` can still turn
+///    the park on (a ring wakes the same park, so arming the doorbell arms the
+///    park):
+///    the resolver then passes `monitor_wait = true` itself, and when that
+///    overrides an explicit `CERULION_MONITOR_WAIT=0` it warns once, naming
+///    both variables.
 fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::MonitorWaitPolicy {
     let MonitorWaitInputs {
         mode,
@@ -607,11 +628,13 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
         ns,
     } = inputs;
     // The shared per-flag env ladder (every arm): exact "1"/"0" match, a
-    // non-empty near-miss warns + falls to the live-only auto default.
+    // non-empty near-miss warns + falls to the flag's auto default, which the
+    // caller passes (the live-only `is_live` for the park; on arm 3 the
+    // doorbell's follows the resolved park).
     // The classification is SHARED with the rmw wait's park resolution
     // (`cerulion_core::monitor_wait::classify_env_flag`) so the two cannot
     // drift; the warn keeps this resolver's context.
-    let resolve_flag = |env: Option<&str>, env_name: &str| -> bool {
+    let resolve_flag = |env: Option<&str>, env_name: &str, auto: bool| -> bool {
         use cerulion_core::monitor_wait::EnvFlag;
         match cerulion_core::monitor_wait::classify_env_flag(env) {
             EnvFlag::ForceOff => false,
@@ -620,11 +643,12 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
                 tracing::warn!(
                     env = env_name,
                     value = %env.unwrap_or(""),
+                    auto_default = auto,
                     "ignoring unrecognized monitor-wait env value — only \"1\" (force on) and \"0\" (disable) are honored; using the auto default"
                 );
-                is_live
+                auto
             }
-            EnvFlag::Auto => is_live,
+            EnvFlag::Auto => auto,
         }
     };
     // 1. The `--no-monitor-wait` flag wins over every env override.
@@ -635,8 +659,8 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     // things that cannot both hold; returning in silence tells them nothing
     // about which one the run kept.
     if matches!(mode, MonitorWaitMode::Disabled) {
-        let _ = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
-        let _ = resolve_flag(env_doorbell, DOORBELL_ENV);
+        let _ = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV, is_live);
+        let _ = resolve_flag(env_doorbell, DOORBELL_ENV, is_live);
         if env_monitor_wait == Some("1") {
             tracing::warn!(
                 env_monitor_wait = MONITOR_WAIT_ENV,
@@ -660,27 +684,28 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
     // STABLE (~8.5-11.5µs p50) where the epoll-block baseline was unstable
     // (15-54µs p50). `monitor_wait` rides the SAME flag ladder as arm 3;
     // `doorbell` rides it too and is then ANDed with `monitor_wait` and with the
-    // host's wake-word fact, so on this tier a doorbell never coerces the park
-    // ON. It arms where a consumer can kernel-block on a doorbell (macOS with the
-    // os_sync family resolved, which is what
+    // host's wake-word fact, so on this tier a doorbell never turns the park
+    // ON. It arms where a consumer can kernel-block on a doorbell (Linux and
+    // Android, and macOS with the os_sync family resolved, which is what
     // `wake_word_block_primitive_available` reports) and is FORCED OFF elsewhere,
     // where a ring would be seen no sooner than the recheck poll already sees the
     // listener.
     if !primitive_available {
-        let monitor_wait = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
+        let monitor_wait = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV, is_live);
         // Whether the doorbell can arm here is a SECOND, INDEPENDENT fact from
         // the CPU monitor-wait primitive: can a consumer KERNEL-BLOCK on a
         // doorbell's wake word on this host? Where the answer is no, a ring is
         // still observed, but by the park's own recheck poll, which the listener
         // poll beside it already runs at the same cadence: an armed doorbell would
-        // buy nothing and it stays FORCED OFF. Where the answer is yes (macOS with
-        // the os_sync family resolved) the park BLOCKS on the wake word instead of
-        // pacing and a producer's publish wakes the consumer directly.
+        // buy nothing and it stays FORCED OFF. Where the answer is yes (Linux and
+        // Android, and macOS with the os_sync family resolved) the park BLOCKS on
+        // the wake word instead of pacing and a producer's publish wakes the
+        // consumer directly.
         //
-        // The doorbell is ANDed with `monitor_wait`, which is arm 2's
-        // long-standing difference from arm 3: arm 3 lets `doorbell ⇒
-        // monitor_wait` coerce the park ON, while on this tier an explicit
-        // `CERULION_MONITOR_WAIT=0` stays a real opt-out. With the park off the
+        // The doorbell is ANDed with `monitor_wait`, unlike arm 3: arm 3 lets
+        // an EXPLICIT `CERULION_DOORBELL=1` turn the park back ON over
+        // `CERULION_MONITOR_WAIT=0`, while on this tier the explicit opt-out
+        // stands even then. With the park off the
         // runtime never enters `monitor_wait_block` at all, so there is no rung,
         // no poll-all and no ring observation for an armed doorbell to reach.
         //
@@ -688,24 +713,27 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
         // operand of the AND: `&&` short-circuits, and docs/user-api.md promises
         // "near-misses warn" with no qualifier, so a `CERULION_DOORBELL=yes`
         // beside `CERULION_MONITOR_WAIT=0` must still reach the near-miss warn.
-        let requested = resolve_flag(env_doorbell, DOORBELL_ENV);
+        let requested = resolve_flag(env_doorbell, DOORBELL_ENV, is_live);
         let doorbell = monitor_wait && requested && data_wake_available;
         if env_doorbell == Some("1") && !doorbell {
             // An EXPLICIT doorbell request must not be silently ignored
             // (loud-once): warn about the downgrade, naming WHICH of the two
-            // reasons applied.
-            if !data_wake_available {
-                tracing::warn!(
-                    env_doorbell = DOORBELL_ENV,
-                    doorbell_forced_off = true,
-                    "CERULION_DOORBELL=1 requested but nothing on this run can kernel-block on a doorbell wake word - doorbell FORCED OFF. With no CPU monitor-wait primitive and no wake word, a ring reaches a parked consumer no sooner than its recheck poll already does, so the park wakes on its recheck timer and listener poll alone. Causes: this target has no wake word at all, or macOS is older than 14.4, or the shared os_sync family has latched, or CERULION_DOORBELL_OS_SYNC=0"
-                );
-            } else {
+            // reasons applied. The park-off reason is checked FIRST: with the
+            // park off the doorbell has nothing to wake whatever the wake-word
+            // fact says, and the wake-word line describes a park that runs.
+            if !monitor_wait {
                 tracing::warn!(
                     env_doorbell = DOORBELL_ENV,
                     env_monitor_wait = MONITOR_WAIT_ENV,
                     doorbell_forced_off = true,
-                    "CERULION_DOORBELL=1 requested but the live-loop park is OFF on this run - doorbell FORCED OFF; a doorbell wakes the park, so with no park it has nothing to wake. Drop CERULION_MONITOR_WAIT=0 / --no-monitor-wait to get both"
+                    wake_word_available = data_wake_available,
+                    "CERULION_DOORBELL=1 requested but the live-loop park is OFF on this run - doorbell FORCED OFF; a doorbell wakes the park, so with no park it has nothing to wake, and with no CPU monitor-wait primitive on this host CERULION_DOORBELL=1 does not turn the park back on. Drop CERULION_MONITOR_WAIT=0 to get the park, with the doorbell where this host has a wake word"
+                );
+            } else {
+                tracing::warn!(
+                    env_doorbell = DOORBELL_ENV,
+                    doorbell_forced_off = true,
+                    "CERULION_DOORBELL=1 requested but nothing on this run can kernel-block on a doorbell wake word - doorbell FORCED OFF. With no CPU monitor-wait primitive and no wake word, a ring reaches a parked consumer no sooner than its recheck poll already does, so the park wakes on its recheck timer and listener poll alone. Causes: this target has no wake word at all, or macOS is older than 14.4, or the shared os_sync family has latched, or CERULION_DOORBELL_OS_SYNC=0"
                 );
             }
         }
@@ -730,12 +758,29 @@ fn resolve_monitor_wait_policy(inputs: MonitorWaitInputs<'_>) -> cerulion_core::
         }
         return cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns);
     }
-    // 3. Available: resolve each flag from its env, defaulting to the live-only
-    // auto (`is_live`). `MonitorWaitPolicy::new` coerces `doorbell ⇒
-    // monitor_wait` below, so the two flags are resolved independently here.
-    let monitor_wait = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV);
-    let doorbell = resolve_flag(env_doorbell, DOORBELL_ENV);
-    cerulion_core::MonitorWaitPolicy::new(monitor_wait, doorbell, ns)
+    // 3. Available. The park resolves on the live-only auto (`is_live`). The
+    // doorbell's auto FOLLOWS the park, so an unset (or near-miss)
+    // `CERULION_DOORBELL` beside an explicit `CERULION_MONITOR_WAIT=0` leaves
+    // the park off: the explicit `0` is a real off, as on arm 2 and in
+    // `rmw_cerulion`.
+    let monitor_wait = resolve_flag(env_monitor_wait, MONITOR_WAIT_ENV, is_live);
+    let doorbell = resolve_flag(env_doorbell, DOORBELL_ENV, is_live && monitor_wait);
+    // With the doorbell's auto bound to the park, `doorbell && !monitor_wait`
+    // holds only for an EXPLICIT `CERULION_DOORBELL=1`: the one request that
+    // turns the park on over a park-off resolution (a ring wakes the same
+    // park, so arming the doorbell arms the park). The resolver passes the park
+    // flag itself, because `MonitorWaitPolicy::new` drops a doorbell that has
+    // no park rather than turning the park on.
+    let park = monitor_wait || doorbell;
+    if env_monitor_wait == Some("0") && doorbell {
+        tracing::warn!(
+            env_monitor_wait = MONITOR_WAIT_ENV,
+            env_doorbell = DOORBELL_ENV,
+            park_forced_on = true,
+            "CERULION_DOORBELL=1 turns the live-loop park back on over CERULION_MONITOR_WAIT=0 - park ON with the data doorbell armed, because a doorbell ring wakes the park. Unset CERULION_DOORBELL or set it to 0 to keep the park off"
+        );
+    }
+    cerulion_core::MonitorWaitPolicy::new(park, doorbell, ns)
 }
 
 /// Resolve the default live-loop monitor-wait policy for embedded graph runtimes.
@@ -1376,14 +1421,8 @@ pub fn graph_create(graphs_dir: &Path, name: &str, prefix: Option<&str>) -> CliR
 /// leaves no byte either: the bytes are a function of `prefix` alone.
 ///
 /// ONE renderer, two callers: `graph_create` writes this verbatim, and
-/// [`node_stage`] renders it again to recognise a file that is STILL exactly
-/// this ([`is_pristine_scaffold`]). A second template would let the two drift
-/// and turn the README's `graph create` → `node stage` pair back into a
-/// warning.
-///
-/// The pristine check MUST render this for `default_prefix(graph_name)` — the
-/// create-time input — not for a prefix parsed back out of the file: see
-/// [`is_pristine_scaffold`].
+/// [`node_stage`] renders it again as the base of [`is_cli_written_graph`],
+/// which recognises a file holding only what the CLI wrote.
 fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     let config = GraphConfig {
         level_assignments: None,
@@ -1399,26 +1438,34 @@ fn render_graph_scaffold(prefix: &str) -> CliResult<String> {
     Ok(serde_yaml::to_string(&config)?)
 }
 
-/// Is `existing` — a graph file's exact bytes — still the untouched
-/// [`render_graph_scaffold`] output?
+/// Is `existing`, a graph file's exact bytes, exactly what the CLI's own
+/// writes produce: [`render_graph_scaffold`] for `prefix`, then each of
+/// `prior_nodes` appended in order through [`append_node_to_nodes_block`]?
 ///
-/// `scaffold` MUST be rendered from a CREATE-TIME input the caller can trust —
-/// `render_graph_scaffold(default_prefix(graph_name))`, the graph name — and
-/// NEVER from a prefix parsed back out of `existing`. Rendering it from the
-/// file's own parsed prefix would let a user who edited ONLY the `prefix:`
-/// value produce bytes that match their own edited scaffold, silently skipping
-/// the backup of a genuine hand edit. Because
-/// the create-time default is the only prefix
-/// that can be reconstructed without reading editable file content, an explicit
-/// `graph create -n <prefix>` conservatively fails this check and backs up.
-///
-/// Byte equality, deliberately: no trimming, no comment stripping, no YAML
-/// re-parse. A trailing comment, a blank line, a re-quoted prefix or a legacy
-/// `name:` line is a hand edit, and a hand edit is exactly what the
-/// backup-and-warn arm of [`write_yaml_atomically`] exists to keep. Only a
-/// file that provably holds nothing of the user's may skip it.
-fn is_pristine_scaffold(existing: &str, scaffold: &str) -> bool {
-    existing == scaffold
+/// `prefix` is the value parsed from `existing`, so a file `graph create`
+/// wrote with the default prefix and one written with `-n <prefix>` are both
+/// recognised. Byte equality: no trimming, no comment stripping, no YAML
+/// re-parse. A comment, a blank line, a re-quoted prefix, a `name:` line, a
+/// `network:` block or a node in any spelling [`render_node_entry`] does not
+/// produce fails it, and [`node_stage`] then takes the backup-and-warn arm of
+/// [`write_yaml_atomically`]. A re-render whose append is refused matches
+/// nothing.
+fn is_cli_written_graph(existing: &str, prefix: &str, prior_nodes: &[NodeDef]) -> CliResult<bool> {
+    let mut rendered = render_graph_scaffold(prefix)?;
+    for node in prior_nodes {
+        rendered = match append_node_to_nodes_block(&rendered, node, "re-rendered graph") {
+            Ok(next) => next,
+            Err(e) => {
+                tracing::debug!(
+                    node_id = %node.id,
+                    error = %e,
+                    "re-rendering the graph file as the CLI writes it was refused; staging keeps a backup"
+                );
+                return Ok(false);
+            }
+        };
+    }
+    Ok(rendered == existing)
 }
 
 /// Read and parse a graph YAML file.
@@ -2006,55 +2053,38 @@ pub fn node_stage(
         .last()
         .expect("a node was just pushed onto the config");
     let rewritten = append_node_to_nodes_block(&raw, staged, &graph_path.display().to_string())?;
-    // A file that is STILL the untouched `graph create` scaffold holds nothing
-    // of the user's, so the README's `graph create` → `node stage` pair gets
-    // no "hand edits were backed up" warning and no `.bak` on every first run.
+    // The splice above copies every byte of the prior file into `rewritten`
+    // (the one rewrite is an empty `nodes: []` becoming `nodes:`), so neither
+    // arm below loses a byte. The `.bak` and its warning mark a prior
+    // file the re-render below does not reproduce byte for byte.
     //
-    // The expected scaffold is rendered from the SAME create-time input
-    // `graph create` derives its default from — the graph NAME, fed through
-    // `default_prefix` — NEVER from the file's parsed `config.prefix`. That
-    // distinction is the whole safety check:
-    // `config.prefix` is parsed FROM the current file,
-    // so a user who edits ONLY the `prefix:` value would make the file match a
-    // scaffold rendered for that same edited prefix — silently suppressing the
-    // backup of a real hand edit. Rendering from `default_prefix(graph_name)`
-    // instead means an edited prefix no longer matches, and the backup+warn
-    // correctly fire.
+    // `is_cli_written_graph` re-renders what the CLI's own writes produce: the
+    // `graph create` scaffold for the file's own `prefix:` value (the default
+    // prefix or a `-n <prefix>` alike), then each node already in the file
+    // appended in file order through `append_node_to_nodes_block`. A file
+    // byte-identical to that render takes `PriorFile::Discard`: no `.bak`, no
+    // warning, one INFO line. Any other
+    // byte (a comment, a `name:` line, a `network:` block, a blank line, a
+    // node in any spelling `render_node_entry` does not produce) breaks the
+    // equality and takes `PriorFile::BackUp` with the warning.
     //
-    // Consequence, deliberately conservative: `graph create -n <prefix>` (an
-    // explicit prefix that differs from the create-time default) is NOT skipped
-    // — its pristineness could only be proven from the file's editable
-    // `prefix:` line, which is exactly what we refuse to trust. We skip the
-    // backup ONLY when pristineness is provable from the immutable graph name;
-    // any other byte — a comment, a `name:` line, an earlier staged node, or an
-    // edited/explicit prefix — takes the backup arm.
-    // Skipping the `.bak` is a COURTESY, not a correctness lever: the write
-    // above is a surgical append that copies every pre-existing byte
-    // — comments, key order, a `network:` block, an edited `prefix:` — verbatim,
-    // so `node stage` never loses a hand edit whichever arm we take here. The
-    // `.bak` is only a rollback convenience, so we skip it exactly when there is
-    // nothing worth a rollback copy: a graph that (a) has NO staged nodes yet
-    // (this stage is adding the first one — `config` holds only the node we just
-    // pushed) AND (b) is byte-identical to the freshly-rendered scaffold. That
-    // is the README `graph create` → `node stage` pair, which then gets no
-    // "hand edits were backed up" warning and no `.bak` on every first run.
-    //
-    // The moment a graph carries a prior staged node it takes the backup arm —
-    // extending a real graph is where a rollback copy actually matters, and
-    // "no prior nodes" is an immutable fact about the file, independent of the
-    // hostname or the editable `prefix:` line.
-    // `default_prefix` is hostname-derived, so a scaffold created on
-    // another host no longer matches and conservatively backs up; and a
-    // `prefix:` edited to the current host that slips through loses nothing,
-    // because the append preserved it.
-    let is_first_node = config.nodes.len() == 1;
-    let default_scaffold =
-        render_graph_scaffold(&cerulion_core::graph::default_prefix(graph_name))?;
-    let prior_file = if is_first_node && is_pristine_scaffold(&raw, &default_scaffold) {
-        tracing::info!(
-            graph = %graph_name,
-            "graph file is the untouched `graph create` scaffold with no staged nodes; staging the first node without a backup"
-        );
+    // A value edited, or a node field added, by hand in the spelling
+    // `render_node_entry` writes (a `prefix:` value, a `schema:`, a `topic:`
+    // under an output) renders the same bytes and takes the discard arm; the
+    // splice keeps it in the new file verbatim.
+    let prior_nodes = &config.nodes[..config.nodes.len() - 1];
+    let prior_file = if is_cli_written_graph(&raw, &config.prefix, prior_nodes)? {
+        if prior_nodes.is_empty() {
+            tracing::info!(
+                graph = %graph_name,
+                "graph file is the untouched `graph create` scaffold with no staged nodes; staging the first node without a backup"
+            );
+        } else {
+            tracing::info!(
+                graph = %graph_name,
+                "graph file holds only what `graph create` and `node stage` wrote; staging the node without a backup"
+            );
+        }
         PriorFile::Discard
     } else {
         PriorFile::BackUp
@@ -2108,12 +2138,13 @@ pub fn build_node_def(
             cerulion_core::graph::config::InputDef {
                 name: name.clone(),
                 source: resolved_source,
+                ..Default::default()
             }
         })
         .collect();
 
     NodeDef {
-        fuse: None,
+        isolate: None,
         params: Default::default(),
         ros2: None,
         id,
@@ -2291,8 +2322,9 @@ pub fn graph_validate(
 /// [`graph_validate`] with the node-library reader chosen by the caller: a
 /// one-shot CLI loads libraries in-process, a standing daemon MUST NOT (a
 /// library that aborts on load would take it down — see
-/// [`crate::node_inspector`]). Only the network-ingress gate reads libraries;
-/// every other check is source- and path-based.
+/// [`crate::node_inspector`]). The input backpressure check, the network-ingress
+/// gate and the params check read libraries; the other checks are source- and
+/// path-based.
 pub fn graph_validate_with_inspector(
     workspace_root: &Path,
     graph_name: &str,
@@ -2331,30 +2363,22 @@ pub fn graph_validate_with_inspector(
     // the same cache and threads it back in so a validated run walks
     // each `src/` tree exactly once total.
     let cdylib_cache = resolve_cdylib_cache(workspace_root, &config, prefer_release);
-    // Both checks that read a node library (the ingress gate and the params
-    // check) go through ONE memo, so each library's static initialization
-    // and teardown run once per validation, not once per check and node.
+    // Every check that reads a node library (the input backpressure check, the
+    // ingress gate and the params check) goes through ONE memo, so each
+    // library's static initialization and teardown run once per validation,
+    // not once per check and node.
     let inspector = crate::graph_params_check::OncePerLibrary::new(inspector);
     Ok(graph_validate_with_cache(
         workspace_root,
         graph_name,
         &config,
         &cdylib_cache,
-        true,
+        ReportFor::ValidateVerb,
         &inspector,
         &launch_arg_sources,
     ))
 }
 
-/// Inner validation that borrows a pre-resolved cdylib cache instead
-/// of building its own. `graph_validate` builds the cache and
-/// delegates here; `graph_run` builds the cache once and reuses it
-/// for both validation and node loading.
-///
-/// `check_network_ingress` enables the ingress schema gate at the
-/// end, which must LOAD the node cdylibs to see input schema hashes. `true` for
-/// the user-facing `graph validate` verb; `false` for `graph run`'s pre-run
-/// pass, which is about to load them for real.
 /// The report label for `cerulion_core`'s `validate_graph`. Named once because
 /// the refusal above keys its remedy on it: this is one of the checks
 /// `--no-validate` cannot skip, since `graph_run` itself re-runs
@@ -2362,6 +2386,11 @@ pub fn graph_validate_with_inspector(
 /// re-runs it again. (The others are the cdylib and trigger-wiring checks —
 /// `failing_check_blocks_the_run` is the full list.)
 const TOPOLOGY_CHECK_LABEL: &str = "graph topology";
+
+/// The report label for the input queue check ([`input_backpressure_check`]):
+/// the graph's per-input keys applied to the loaded node metadata, then the
+/// topology built and validated, as `GraphRuntime::build` does on every start.
+const INPUT_BACKPRESSURE_CHECK_LABEL: &str = "input backpressure";
 
 /// Label prefix for the per-node-type crate check.
 const NODE_CRATE_CHECK_PREFIX: &str = "node crate '";
@@ -2380,6 +2409,8 @@ const SYNC_TRIGGER_CHECK_PREFIX: &str = "sync trigger binding '";
 ///
 /// * `graph topology` IS `cerulion_core`'s `validate_graph`, which
 ///   `GraphRuntime::build` calls. Always blocking.
+/// * `input backpressure` applies the graph's input keys and validates the
+///   topology, which `GraphRuntime::build` does again. Always blocking.
 /// * `cdylib '<type>'` is re-asked by `load_node_factories_from_cache`, off
 ///   the SAME cache the report used. Always blocking — and this is the common
 ///   case: a staged-but-never-BUILT node was told to re-run with
@@ -2401,6 +2432,7 @@ const SYNC_TRIGGER_CHECK_PREFIX: &str = "sync trigger binding '";
 /// not "is this check re-run?" but "does the library it would load resolve?".
 fn failing_check_blocks_the_run(label: &str, cdylib_cache: &ResolvedCdylibCache) -> bool {
     if label == TOPOLOGY_CHECK_LABEL
+        || label == INPUT_BACKPRESSURE_CHECK_LABEL
         || label.starts_with(CDYLIB_CHECK_PREFIX)
         // The graph BUILD re-runs the macro trigger-wiring resolution itself,
         // so an unwired `#[input(trigger)]` refuses again under the flag —
@@ -2845,12 +2877,32 @@ fn cfg_decided_schema_warning(node_type: &str, port: &str, declared: &str) -> St
     )
 }
 
+/// Which run of the validation report this is. The `network ingress` gate
+/// judges what `graph run` judges again on its own path, once it computes its
+/// gateway plan, so only the `graph validate` verb makes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportFor {
+    /// `cerulion graph validate`: every check, including the `network
+    /// ingress` gate.
+    ValidateVerb,
+    /// `graph run`'s pre-run report. The run computes the same gateway plan
+    /// later, through the same resolver, and refuses with the same words.
+    RunPreflight,
+}
+
+/// Inner validation that borrows a pre-resolved cdylib cache instead
+/// of building its own. `graph_validate` builds the cache and
+/// delegates here; `graph_run` builds the cache once and reuses it
+/// for both validation and node loading.
+///
+/// `report_for` decides the check [`ReportFor::ValidateVerb`] alone makes:
+/// the ingress schema gate over the infos the queue check reads.
 fn graph_validate_with_cache(
     workspace_root: &Path,
     graph_name: &str,
     config: &GraphConfig,
     cdylib_cache: &ResolvedCdylibCache,
-    check_network_ingress: bool,
+    report_for: ReportFor,
     inspector: &dyn crate::node_inspector::NodeInspector,
     launch_arg_sources: &cerulion_core::graph::ArgProvenance,
 ) -> ValidationReport {
@@ -2858,20 +2910,22 @@ fn graph_validate_with_cache(
     let mut checks = Vec::new();
 
     // Run core graph validation (topology, references, policy bounds)
-    match validate_graph(config) {
+    let topology_valid = match validate_graph(config) {
         Ok(()) => {
             checks.push(ValidationCheck::pass(
                 TOPOLOGY_CHECK_LABEL,
                 "all references and policies valid",
             ));
+            true
         }
         Err(e) => {
             checks.push(ValidationCheck::fail(
                 TOPOLOGY_CHECK_LABEL,
                 format!("{}", e),
             ));
+            false
         }
-    }
+    };
 
     // Build a map of resolved output TOPIC -> schema.
     // Keyed by the RESOLVED topic (override-aware), and
@@ -3450,35 +3504,52 @@ fn graph_validate_with_cache(
         }
     }
 
+    // Every native node's library info, read through the caller's inspector.
+    // Both callers hand in one `OncePerLibrary` memo, so the params check below
+    // reads no library a second time. `Err` when a library does not resolve or
+    // does not read; the node crate, cdylib or params check then fails the
+    // report for that node.
+    let loaded_infos = collect_entry_infos_from_cache(config, cdylib_cache, inspector);
+
+    // The input queues, judged as the graph build judges them. Only with every
+    // node's metadata: without one node's, its declared `block` would read as
+    // the default `drop_oldest` and the check could refuse a graph the build
+    // accepts. Not after a `validate_graph` failure: the build judges the
+    // topology only of a graph that passes it, and a fault both see would be
+    // reported twice.
+    if topology_valid {
+        if let Ok(entry_infos) = &loaded_infos {
+            checks.extend(input_backpressure_check(config, entry_infos));
+        }
+    }
+
     // The network `ingress:` gate, run HERE instead of only inside
-    // `graph run`. Every check above reads YAML or syn-parses `src/lib.rs`;
-    // none of them can see an input's schema hash, because that value only
-    // exists on the far side of the cdylib FFI boundary. Without this gate both halves of a
+    // `graph run`. None of the checks above judges an input's schema hash, a
+    // value that only exists on the far side of the cdylib FFI boundary.
+    // Without this gate both halves of a
     // two-host graph can pass validate with every check green and then die at
     // `graph run` with "no consumer with a declared schema" — the preflight an
     // operator trusts before a run could not fail on the
     // cross-machine legs the run depends on.
     //
-    // Gated on an enabled block with a non-empty ingress list, so ONLY graphs
-    // that actually import a topic pay the `dlopen` — a single-host graph
-    // validates exactly as cheaply as before.
+    // Gated on an enabled block with a non-empty ingress list. It judges the
+    // infos read above as the libraries declare them: it reads each consuming
+    // input's schema hash, which the graph's input keys do not change.
     //
     // Only the explicit `cerulion graph validate` verb runs it. `graph run`'s
-    // pre-run validation passes `false`: it is about to load these libraries for
-    // real, and loading + dropping them first would run each node's static
-    // init/teardown an extra time before the run's own load. No coverage is
-    // lost — the run computes the same gateway plan seconds later, through the
-    // same resolver, and refuses with the same words.
-    if check_network_ingress
+    // pre-run validation passes `ReportFor::RunPreflight`: the run computes the
+    // same gateway plan seconds later, through the same resolver, and refuses
+    // with the same words.
+    if report_for == ReportFor::ValidateVerb
         && config
             .network
             .as_ref()
             .is_some_and(|n| n.is_enabled() && !n.ingress.is_empty())
     {
         let ingress_count = config.network.as_ref().map_or(0, |n| n.ingress.len());
-        match collect_entry_infos_from_cache(config, cdylib_cache, inspector) {
+        match &loaded_infos {
             Ok(entry_infos) => {
-                match cerulion_core::graph::validate_network_ingress(config, &entry_infos) {
+                match cerulion_core::graph::validate_network_ingress(config, entry_infos) {
                     Ok(()) => checks.push(ValidationCheck::pass(
                         "network ingress",
                         format!(
@@ -3535,7 +3606,9 @@ fn graph_validate_with_cache(
 
 /// Load every node's cdylib from the already-resolved cache and
 /// collect its `NodeInfo` — the same map `graph run` derives from its loaded
-/// factories, which is the only place an input's schema hash exists.
+/// factories, which is the only place an input's schema hash exists. The
+/// infos are as the libraries declare them: [`input_backpressure_check`]
+/// applies the graph's input keys to a copy of its own.
 ///
 /// Deliberately NOT [`load_node_factories_from_cache`]: that function owns the
 /// stale-build log line, and calling it here would make a `graph run`
@@ -3546,9 +3619,9 @@ fn graph_validate_with_cache(
 /// treats a node missing from the map as "declares no schema", so handing it a
 /// partial map would manufacture a false failure on a graph that runs fine.
 /// Any load error therefore aborts with an `Err` rather than yielding a partial
-/// map — and the caller renders that `Err` as a FAILING check, never an
+/// map. The ingress gate renders that `Err` as a FAILING check, never an
 /// advisory: every way it is reached means `graph run` cannot run this graph.
-/// See the call site's `Err` arm, pinned by
+/// See the gate's `Err` arm, pinned by
 /// `graph_validate_fails_when_the_ingress_gate_cannot_load_the_libraries`.
 fn collect_entry_infos_from_cache(
     config: &GraphConfig,
@@ -3581,14 +3654,127 @@ fn collect_entry_infos_from_cache(
     Ok(entry_infos)
 }
 
+/// The `input backpressure` line: every input's queue judged as
+/// `GraphRuntime::build` judges it. The graph's per-input `backpressure:` and
+/// `depth:` keys are written into a copy of the loaded metadata with
+/// [`MissingInputMeta::Refuse`](cerulion_core::graph::topology::MissingInputMeta::Refuse),
+/// as the build writes them, then the topology is built and validated with its
+/// `block_timeout_ms` keys. A refusal fails the line in the build's own words:
+/// a depth outside 1 to 64, `block` with no in-graph producer or on a
+/// `network.ingress` topic, a `block_timeout_ms` the build refuses, a ring of
+/// `block` edges, `backpressure: block` or `depth:` on an
+/// `#[input(accumulate)]` input, `backpressure:` or `depth:` on a port the
+/// node declares no metadata for, or a queue deeper than the shared buffer
+/// ceiling on a `multi_publisher_topics:` topic the graph publishes
+/// ([`refuse_a_queue_over_the_multi_publisher_ceiling`]). The subscriber slots
+/// such a topic's consumers take are counted only by the build: the count
+/// depends on drain capabilities a library exports beside its node info.
+///
+/// `None` when every queue passes and no input sets one of the three keys, so a
+/// graph that sets none gets no line.
+fn input_backpressure_check(
+    config: &GraphConfig,
+    entry_infos: &indexmap::IndexMap<String, cerulion_core::NodeInfo>,
+) -> Option<ValidationCheck> {
+    let mut infos = entry_infos.clone();
+    let verdict = cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut infos,
+        cerulion_core::graph::topology::MissingInputMeta::Refuse,
+    )
+    .and_then(|()| cerulion_core::graph::GraphTopology::build(config, &infos))
+    .and_then(|topology| {
+        topology.validate()?;
+        refuse_a_queue_over_the_multi_publisher_ceiling(config, &topology)
+    });
+    if let Err(e) = verdict {
+        return Some(ValidationCheck::fail(
+            INPUT_BACKPRESSURE_CHECK_LABEL,
+            e.to_string(),
+        ));
+    }
+    let keyed = config
+        .native_nodes()
+        .flat_map(|node| &node.inputs)
+        .filter(|input| {
+            input.backpressure.is_some()
+                || input.depth.is_some()
+                || input.block_timeout_ms.is_some()
+        })
+        .count();
+    (keyed > 0).then(|| {
+        ValidationCheck::pass(
+            INPUT_BACKPRESSURE_CHECK_LABEL,
+            format!(
+                "{keyed} input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every \
+                 input's queue is one the graph build accepts"
+            ),
+        )
+    })
+}
+
+/// `GraphRuntime::build`'s refusal of a queue deeper than
+/// [`MULTI_TOPIC_BUFFER_CEILING`](cerulion_core::transport::MULTI_TOPIC_BUFFER_CEILING)
+/// on a topic listed in `multi_publisher_topics:` that a node in the graph
+/// publishes, in the build's words. Every graph that opens such a topic
+/// provisions the same buffer ceiling, so the build refuses a consumer depth
+/// above it, an `#[input(accumulate, cap = N)]` input's cap included. A listed
+/// topic no node in the graph publishes is an external topic, and the build
+/// does not refuse a deep queue on it. Topics are walked in graph order, as
+/// the build walks them, and the first refused one is named.
+fn refuse_a_queue_over_the_multi_publisher_ceiling(
+    config: &GraphConfig,
+    topology: &cerulion_core::graph::GraphTopology,
+) -> cerulion_core::TransportResult<()> {
+    let ceiling = cerulion_core::transport::MULTI_TOPIC_BUFFER_CEILING;
+    for flow in topology.topics() {
+        if flow.producers.is_empty() || !config.is_multi_publisher(&flow.topic) {
+            continue;
+        }
+        let deepest = flow.consumers.iter().map(|c| c.depth).max().unwrap_or(0);
+        if deepest > ceiling {
+            // The build's sentence byte for byte, its one dash spelled by code
+            // point.
+            return Err(cerulion_core::TransportError::GraphError {
+                reason: format!(
+                    "multi-publisher topic '{}': a consumer declares depth {} \
+                     but the shared multi-publisher buffer ceiling is {} \
+                     (cross-graph topics provision a graph-independent \
+                     ceiling; every unit of it commits SHM on EVERY \
+                     publisher's pool) \u{2014} use a shallower depth or an \
+                     unlisted single-writer topic (an \
+                     `#[input(accumulate, cap = N)]` input's cap is its \
+                     depth, so its cap is held to the same ceiling)",
+                    flow.topic, deepest, ceiling
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The text of [`KILL_SWITCH_SCOPE`], for `concat!`.
+macro_rules! kill_switch_scope {
+    () => {
+        "the network kill switch keeps Cerulion service traffic off (robots, relays, hosted \
+         Cerulion services and telemetry); signing in to your account still works"
+    };
+}
+
+/// What the network kill switch covers, in every notice it prints: Cerulion
+/// service traffic, not account sign-in. `pub` so tests pin the exact text.
+pub const KILL_SWITCH_SCOPE: &str = kill_switch_scope!();
+
 /// Kill-switch, blockless arm: under the permissive default,
 /// `--network off` on a blockless REAL-clock graph is not inert — it
 /// SUPPRESSES the open-by-default network exposure. This notice confirms the
 /// kill-switch ACTED (warn-level — the docs promise a loud kill-switch
 /// notice). `pub` so tests pin the exact text.
-pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str =
-    "local execution selected: this run is LOCAL-ONLY; the permissive open-by-default network exposure \
-     is suppressed; no gateway is spawned and no zenoh session opens";
+pub const NETWORK_OFF_LOCAL_ONLY_NOTICE: &str = concat!(
+    "local execution selected: this run is LOCAL-ONLY; its topics, schemas and run metadata are \
+     unavailable to other machines through every Cerulion daemon; no gateway is spawned and no zenoh session opens; ",
+    kill_switch_scope!()
+);
 
 /// Kill-switch, replay-class arm: the one arm where `--network off`
 /// is GENUINELY redundant — a virtual/external-clock run is network-inert by
@@ -3607,7 +3793,7 @@ pub const NETWORK_OFF_REDUNDANT_NOTICE: &str =
 /// as `off` (an operator who set the kill-switch env at all intended
 /// local-only; failing open on a typo is the wrong direction for a security
 /// default). Empty/unset ⇒ no effect. Read inside [`resolve_run_network`].
-const NETWORK_ENV: &str = "CERULION_NETWORK";
+pub const NETWORK_ENV: &str = "CERULION_NETWORK";
 
 /// Resolve the robot's network
 /// IDENTITY — the value stamped identically into the announce keys' robot chunk,
@@ -3677,8 +3863,11 @@ impl NetworkEnvKill {
 
 /// Parse the `CERULION_NETWORK` kill-switch env var ONCE.
 ///
-/// The single source of truth for the kill-switch parse (trimmed, ASCII
-/// case-insensitive `off`; fails CLOSED on any other non-empty value). Pure
+/// The CLI's one kill-switch parse (trimmed, ASCII case-insensitive `off`;
+/// fails CLOSED on any other non-empty value).
+/// `cerulion_telemetry::kill_switch::engaged` is a copy of its blank decision
+/// for `cerulion-vizd`'s telemetry, and a `cerulion_cli` unit test holds the
+/// two equal. Pure
 /// over the environment — it emits NO log; each caller emits its own
 /// context-appropriate notice ([`resolve_run_network`] a graph-scoped warn,
 /// [`remote_network_suppressed`] the discovery-side warn). Oracle-tested.
@@ -3795,7 +3984,8 @@ pub fn remote_network_suppressed() -> bool {
                 value = %v,
                 "CERULION_NETWORK is set to an unrecognized value — the only accepted value is \
                  `off`; failing CLOSED and treating it as `off` (this remote query is \
-                 LOCAL-ONLY). Unset the variable to restore the default network behavior"
+                 LOCAL-ONLY). Unset the variable to restore the default network behavior; \
+                 {KILL_SWITCH_SCOPE}"
             );
             true
         }
@@ -3820,17 +4010,16 @@ const GATEWAY_PORT_ENV: &str = "CERULION_GATEWAY_PORT";
 /// its base before giving up (the AddrInUse ladder in `graph_run_gateway`).
 pub const GATEWAY_BIND_RETRIES: u16 = 8;
 
-/// Permissive-egress breadcrumb — fired EXACTLY ONCE at the CLI/supervisor gateway
-/// spawn site (never per worker): permissive-default egress is open. `pub`
-/// so tests pin the exact text.
-pub const PERMISSIVE_EGRESS_NOTICE: &str = "network egress OPEN BY DEFAULT: no `network:` block, so every produced topic is network-viewable by any peer on the LAN, with no pairing required. Restrict with a `network:` block, or run `--network off` for local-only.";
+/// Open-LAN breadcrumb, fired once at the CLI/supervisor gateway spawn site,
+/// never per worker. Public so tests pin the operator-facing text.
+pub const PERMISSIVE_EGRESS_NOTICE: &str = "LAN access OPEN by explicit selection: unpaired peers may read exported topics and publish into declared ingress topics. Unset CERULION_LAN_ACCESS to restore paired access, or run --network off for local-only.";
 
-fn permissive_egress_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
+fn lan_access_breadcrumb(graph_name: &str, access: Option<cerulion_core::LanAccess>) {
     match access {
         Some(cerulion_core::LanAccess::Open) => {
             tracing::warn!(graph = %graph_name, "{PERMISSIVE_EGRESS_NOTICE}");
         }
-        Some(cerulion_core::LanAccess::Paired) => tracing::info!(
+        Some(cerulion_core::LanAccess::Paired) => tracing::debug!(
             graph = %graph_name,
             lan_access = "paired",
             "LAN access is paired-only: the gateway refuses every LAN peer"
@@ -3900,8 +4089,7 @@ impl RunNetwork {
         }
     }
 
-    /// True for the permissive default arm — drives the one-shot
-    /// [`PERMISSIVE_EGRESS_NOTICE`] breadcrumb at the gateway spawn site.
+    /// True when every produced topic is eligible for export.
     pub fn is_permissive(&self) -> bool {
         matches!(self, RunNetwork::Permissive(_))
     }
@@ -3963,7 +4151,8 @@ pub fn resolve_run_network(
             value = %v,
             "CERULION_NETWORK is set to an unrecognized value — the only accepted \
              value is `off`; failing CLOSED and treating it as `off` (this run is \
-             LOCAL-ONLY). Unset the variable to restore the default network behavior"
+             LOCAL-ONLY). Unset the variable to restore the default network behavior; \
+             {KILL_SWITCH_SCOPE}"
         );
     }
     let env_off = env_kill.is_off();
@@ -3976,7 +4165,7 @@ pub fn resolve_run_network(
                 egress = net.egress.len(),
                 ingress = net.ingress.len(),
                 "local execution selected: the graph's declared egress/ingress \
-                 topics will NOT cross the machine boundary for this run"
+                 topics will NOT cross the machine boundary for this run; {KILL_SWITCH_SCOPE}"
             );
         } else if time_source == TimeSource::Real {
             // (b) blockless + real clock: the kill-switch ACTED — it
@@ -4485,6 +4674,92 @@ fn build_gateway_plan(
     )?)
 }
 
+/// Resolve excluded topics from the full topology, before any data service opens.
+fn excluded_run_topics(
+    network: &RunNetwork,
+    config: &GraphConfig,
+    factories: &indexmap::IndexMap<String, Box<dyn cerulion_core::NodeEntry>>,
+    bridge_config: Option<&Path>,
+) -> CliResult<Vec<String>> {
+    let mut infos = indexmap::IndexMap::new();
+    for (id, entry) in factories {
+        infos.insert(id.clone(), entry.info()?);
+    }
+    let topology = cerulion_core::graph::GraphTopology::build(config, &infos)?;
+    let mut excluded: Vec<_> = topology
+        .topics()
+        .filter(|flow| match network {
+            RunNetwork::Off | RunNetwork::Inert => true,
+            RunNetwork::Strict(_) => {
+                !flow.producers.is_empty()
+                    && !config
+                        .network
+                        .as_ref()
+                        .is_some_and(|net| net.egress_topics().any(|topic| topic == flow.topic))
+            }
+            RunNetwork::Permissive(_) => false,
+        })
+        .map(|flow| flow.topic.clone())
+        .collect();
+    if !matches!(network, RunNetwork::Permissive(_)) {
+        if let Some(path) = bridge_config {
+            for topic in crate::schema_serve::bridge_scope_topics(path)? {
+                let private = matches!(network, RunNetwork::Off | RunNetwork::Inert)
+                    || !config
+                        .network
+                        .as_ref()
+                        .is_some_and(|net| net.egress_topics().any(|egress| egress == topic));
+                if private && !excluded.contains(&topic) {
+                    excluded.push(topic);
+                }
+            }
+        }
+    }
+    Ok(excluded)
+}
+
+fn producer_scope_for_run(
+    run_network: &RunNetwork,
+    config: &GraphConfig,
+) -> cerulion_core::transport::egress_scope::RunTopicScope {
+    match run_network {
+        RunNetwork::Off | RunNetwork::Inert => {
+            cerulion_core::transport::egress_scope::RunTopicScope::LocalOnly
+        }
+        RunNetwork::Permissive(_) => {
+            cerulion_core::transport::egress_scope::RunTopicScope::Unrestricted
+        }
+        RunNetwork::Strict(_) => cerulion_core::transport::egress_scope::RunTopicScope::Declared {
+            topics: config
+                .network
+                .as_ref()
+                .into_iter()
+                .flat_map(|network| network.egress_topics())
+                .map(str::to_string)
+                .collect(),
+            ingress: config
+                .network
+                .as_ref()
+                .map(|network| network.ingress.clone())
+                .unwrap_or_default(),
+        },
+    }
+}
+
+fn exclude_run_topics(
+    transport: &cerulion_core::TransportManager,
+    topics: &[String],
+) -> CliResult<Vec<cerulion_core::transport::egress_scope::LocalOnlyTopic>> {
+    topics
+        .iter()
+        .map(|topic| {
+            transport
+                .exclude_remote_topic(topic)
+                .map_err(CliError::from)
+        })
+        .collect()
+}
+
 /// Derive a [`GatewayLaunch`] from the resolved [`RunNetwork`] +
 /// the FULL graph, or `None` for a LOCAL-ONLY run (`Off`/`Inert`) or a plan
 /// that resolves to nothing. Shared by the monolith and supervisor arms.
@@ -4517,11 +4792,55 @@ fn resolve_gateway_launch(
     // checkbox flow) dead-ends on exactly the robots the automagic bar targets.
     let bridge_config_path =
         crate::schema_serve::resolve_bridge_config_path(graphs_dir, graph_name);
-    let schema_serving = crate::schema_serve::build_schema_serving(
+    let mut schema_serving = crate::schema_serve::build_schema_serving(
         config,
         &workspace_root.join("schemas"),
         bridge_config_path.as_deref(),
     );
+    if matches!(run_network, RunNetwork::Strict(_)) {
+        schema_serving
+            .topic_schemas
+            .retain(|binding| plan.announce.contains(&binding.topic));
+        schema_serving.served_topics.clone_from(&plan.announce);
+        let docs = schema_serving
+            .schema_docs
+            .iter()
+            .map(|doc| (doc.qualified.clone(), doc.clone()))
+            .collect();
+        let mut allowed = std::collections::BTreeSet::new();
+        for binding in &schema_serving.topic_schemas {
+            allowed.insert(binding.schema_name.clone());
+            if let Some(closure) = cerulion_core::transport::cerulion_q::collect_schema_closure(
+                &binding.schema_name,
+                &docs,
+            ) {
+                allowed.extend(closure.into_iter().map(|doc| doc.qualified));
+            }
+        }
+        schema_serving
+            .schema_docs
+            .retain(|doc| allowed.contains(&doc.qualified));
+        schema_serving
+            .schema_hashes
+            .retain(|binding| allowed.contains(&binding.qualified));
+    }
+    // Carry an explicit policy for every announced topic, including default
+    // reliable topics. An omitted policy is unknown to an authenticated consumer.
+    schema_serving.egress_qos = plan
+        .announce
+        .iter()
+        .map(|topic| {
+            net.egress_qos
+                .iter()
+                .find(|policy| policy.topic == *topic)
+                .cloned()
+                .unwrap_or_else(|| cerulion_core::EgressQos {
+                    topic: topic.clone(),
+                    reliability: cerulion_core::EgressReliability::Reliable,
+                    send_queue: None,
+                })
+        })
+        .collect();
     // Mint the robot identity for
     // the discovery surface (the mDNS beacon + the announce keys' robot chunk +
     // the `cerulion_q/{robot}/**` query surface — ALL from this ONE value, so
@@ -4541,8 +4860,8 @@ fn resolve_gateway_launch(
 /// Spawn ONE gateway child (`cerulion graph run-gateway --handoff
 /// <file>`) for `launch`. Writes the serde handoff to a unique temp file
 /// (removed on the returned guard's `Drop`), execs the current binary with
-/// cwd = the workspace root, and for a permissive run reports the LAN posture
-/// through [`permissive_egress_breadcrumb`]. `ix_config_json` is `None` for the
+/// cwd = the workspace root, and reports the LAN posture through
+/// [`lan_access_breadcrumb`]. `ix_config_json` is `None` for the
 /// monolith (default namespace) or the supervisor's minted deployment Config
 /// JSON.
 fn spawn_gateway(
@@ -4616,12 +4935,9 @@ fn spawn_gateway(
         permissive = launch.permissive,
         "spawned the network gateway process (owns the robot's network plane; the graph/worker processes stay network-free)"
     );
-    // The ONE permissive breadcrumb per run — fired here at the CLI/supervisor
-    // spawn site, never in a worker. A paired LAN access posture (the gateway child
-    // inherits this env) refuses every LAN peer, so the egress is not open.
-    if launch.permissive {
-        permissive_egress_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
-    }
+    // Report explicit open access for both strict and permissive plans. The
+    // gateway child inherits this environment; a paired start is quiet.
+    lan_access_breadcrumb(graph_name, Some(cerulion_core::LanAccess::from_env()));
     let guard = GatewayChild {
         child: Arc::new(std::sync::Mutex::new(child)),
         reaped: Arc::new(AtomicBool::new(false)),
@@ -4712,7 +5028,8 @@ fn classify_netd_peek(ret: libc::ssize_t, errno: i32) -> NetdConnLiveness {
 /// the owning [`NetdEgressGuard`] drops its client, so the watcher never touches the fd
 /// after the client closes it (and never fires a spurious crash warn for OUR OWN
 /// teardown — the `stop` flag wins that handshake, exactly like the gateway's `reaped`).
-/// Explicitly NO reconnect: recovery is not this watch's job.
+/// The held egress connection never reconnects. Status polls may open another
+/// local control connection, but never restart netd or restore an egress plan.
 #[cfg(unix)]
 struct NetdLivenessWatch {
     /// Set by `Drop` (intentional teardown) or by the watcher itself (detected death);
@@ -4748,11 +5065,32 @@ fn spawn_netd_liveness_watch(
     let stop_thread = Arc::clone(&stop);
     let spawned = std::thread::Builder::new()
         .name("cer-netd-watch".to_string())
-        .spawn(move || loop {
+        .spawn(move || {
+            let mut registration_failures = cerulion_core::transport::failure_regime_latch::FailureRegimeLatch::new();
+            let mut status_client = None;
+            let mut next_status = std::time::Instant::now();
+            loop {
             // Teardown handshake: `Drop` flips `stop` before the client fd closes, so
             // the watcher exits without a spurious crash warn (mirrors GatewayChild).
             if stop_thread.load(Ordering::Acquire) {
                 break;
+            }
+            if std::time::Instant::now() >= next_status {
+                let deadline = std::time::Instant::now() + Duration::from_millis(300);
+                if status_client.is_none() {
+                    status_client = cerulion_netd::NetdClient::connect_existing_until(deadline).ok();
+                }
+                if let Some(client) = &mut status_client {
+                    match client.status_until(deadline) {
+                        Ok(status) => report_robot_registration_status(
+                            &graph_name,
+                            status.robot_startup_error.as_deref(),
+                            &mut registration_failures,
+                        ),
+                        Err(_) => status_client = None,
+                    }
+                }
+                next_status = std::time::Instant::now() + Duration::from_secs(1);
             }
             let mut byte = [0u8; 1];
             // SAFETY: a non-blocking, non-consuming PEEK of a single byte on the
@@ -4787,6 +5125,7 @@ fn spawn_netd_liveness_watch(
                     break;
                 }
             }
+            }
         });
     let handle = match spawned {
         Ok(h) => Some(h),
@@ -4799,6 +5138,33 @@ fn spawn_netd_liveness_watch(
         }
     };
     NetdLivenessWatch { stop, handle }
+}
+
+#[cfg(unix)]
+fn report_robot_registration_status(
+    graph_name: &str,
+    error: Option<&str>,
+    failures: &mut cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
+) {
+    use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+    if let Some(error) = error {
+        match failures.on_failure() {
+            RegimeDecision::Loud => tracing::warn!(
+                graph = %graph_name, error = %error, total_failures = failures.total_failures(),
+                "automatic robot registration failed; remote access is unavailable; correct the reported cause"
+            ),
+            RegimeDecision::Suppressed { suppressed } => tracing::debug!(
+                graph = %graph_name, error = %error, suppressed, total_failures = failures.total_failures(),
+                "automatic robot registration remains unavailable"
+            ),
+            RegimeDecision::StillFailing { total, suppressed } => tracing::info!(
+                graph = %graph_name, error = %error, total_failures = total, suppressed,
+                "automatic robot registration remains unavailable"
+            ),
+        }
+    } else if let Some(suppressed) = failures.on_success() {
+        tracing::info!(graph = %graph_name, suppressed, "automatic robot registration recovered");
+    }
 }
 
 /// Unix only: a held egress registration on the shared `cerulion-netd`
@@ -4830,6 +5196,8 @@ struct NetdEgressGuard {
 enum NetworkEgressHandle {
     /// A spawned per-run gateway child (robot / degrade-fallback path).
     Child(GatewayChild),
+    #[cfg(unix)]
+    Paired(authenticated_ingress::PairedGraphNetwork),
     /// An egress registration held on the shared netd daemon (desk path). The guard is
     /// held ONLY for its Drop (connection-close = release), so its field is never read
     /// (Drop is not a read to the dead-code lint) — the `Netd(_)` arm in
@@ -4840,6 +5208,14 @@ enum NetworkEgressHandle {
 }
 
 impl NetworkEgressHandle {
+    fn check(&self) -> CliResult<()> {
+        #[cfg(unix)]
+        if let Self::Paired(network) = self {
+            return network.check();
+        }
+        Ok(())
+    }
+
     /// Forward a graceful teardown once the run loop has exited. For a
     /// gateway CHILD this forwards a SIGINT + bounded grace before its Drop SIGKILL
     /// backstop (closing the directed-kill gap). For the NETD path there is no child to
@@ -4849,6 +5225,8 @@ impl NetworkEgressHandle {
     fn forward_shutdown(&self, graph_name: &str) {
         match self {
             NetworkEgressHandle::Child(child) => child.forward_shutdown(graph_name),
+            #[cfg(unix)]
+            NetworkEgressHandle::Paired(_) => {}
             #[cfg(unix)]
             NetworkEgressHandle::Netd(_) => {
                 tracing::debug!(
@@ -4907,11 +5285,9 @@ fn register_egress_with_netd(
         announce = launch.plan.announce.len(),
         "pushed this desk graph's egress plan into the shared cerulion-netd daemon (ONE session for the machine — the per-run gateway child is retired on the desk)"
     );
-    // The ONE permissive breadcrumb per run, using the posture reported by netd.
+    // The LAN breadcrumb uses the posture reported by netd.
     // Missing posture is UNKNOWN (an older daemon) - never assume open.
-    if launch.permissive {
-        permissive_egress_breadcrumb(graph_name, resp.lan_access);
-    }
+    lan_access_breadcrumb(graph_name, resp.lan_access);
     // Watch the held control connection so a MID-RUN
     // netd death is warned once (run continues LOCAL-ONLY), mirroring the gateway-child
     // death-watch. The watch borrows the client's control fd; the guard's field order
@@ -4942,7 +5318,7 @@ fn netd_posture_refusal(reported: Option<cerulion_core::LanAccess>) -> cerulion_
 /// reports no posture (an older daemon) may. An open run accepts any netd,
 /// because a paired netd is only stricter.
 #[cfg(unix)]
-fn netd_posture_acceptable(
+pub(crate) fn netd_posture_acceptable(
     reported: Option<cerulion_core::LanAccess>,
     requested: cerulion_core::LanAccess,
 ) -> bool {
@@ -4950,47 +5326,42 @@ fn netd_posture_acceptable(
         || reported == Some(cerulion_core::LanAccess::Paired)
 }
 
-/// Establish the network-egress overlay for a real-clock live run. `None`
-/// launch ⇒ `None` (LOCAL-ONLY).
-///
-/// **netd is THE desk egress path BY DEFAULT.** A producing graph's egress converges
-/// onto the machine's ONE shared `cerulion-netd` session (Principle #8), spawning netd
-/// detached + refcounting exactly like the ingress consumers — so a desk producing +
-/// consuming remote topics runs ONE zenoh session, not a per-run gateway per graph. The
-/// per-run gateway CHILD remains for exactly two cases:
-///
-/// 1. **STRICT posture (a permanent routing rule, NOT a TODO).** An explicit `network:`
-///    block resolves to [`RunNetwork::Strict`] — VERBATIM zenoh locators + an egress
-///    ALLOW-LIST + declared ingress. netd's shared session has ITS OWN locator config
-///    and boots its embedded gateway PERMISSIVE (`AllowAll`), and — as documented in
-///    `cerulion_netd::egress` — constraining that shared gateway to a per-registration
-///    allow-list is structurally infeasible in the current `GatewayRuntime`. So a
-///    Strict run's two defining properties are un-representable on the shared session;
-///    it is routed to a per-run gateway child that honors the block VERBATIM. **Strict
-///    ⇒ child; Permissive ⇒ netd** is the standing routing rule.
-/// 2. **netd UNREACHABLE / a namespace MISMATCH.** A netd registration failure (netd
-///    unspawnable, or the run resolved a DIFFERENT iceoryx2 namespace than netd — netd
-///    verifies the forwarded `ix_config_json`) degrades LOUDLY to the per-run child
-///    (never silently networkless — the same warn-but-run posture as
-///    `spawn_gateway_or_warn`), which runs on the run's OWN namespace.
-///
-/// `ix_config_json` is the run's resolved iceoryx2 namespace — `Some` for a
-/// multi-process deployment (forwarded to netd for verification), `None` for a monolith
-/// (it shares netd's default namespace by construction). It is threaded to BOTH the
-/// netd registration (verification) AND the child gateway (which taps SHM on it).
+/// Paired runs hold authenticated egress registrations and canonical ingress
+/// demands on netd. Explicit open compatibility retains the locator-based path.
+/// Call after full-topology data services exist; every paired failure is loud.
 fn establish_network_egress(
     launch: Option<&GatewayLaunch>,
     graph_name: &str,
     workspace_root: &Path,
     ix_config_json: Option<String>,
-) -> Option<NetworkEgressHandle> {
-    let launch = launch?;
+    running: Arc<AtomicBool>,
+) -> CliResult<Option<NetworkEgressHandle>> {
+    #[cfg(not(unix))]
+    let _ = &running;
+    let Some(launch) = launch else {
+        return Ok(None);
+    };
+    if cerulion_core::LanAccess::from_env() == cerulion_core::LanAccess::Paired {
+        if launch.plan.announce.is_empty() && launch.plan.ingress.is_empty() {
+            return Ok(None);
+        }
+        #[cfg(unix)]
+        return authenticated_ingress::PairedGraphNetwork::start(
+            launch,
+            ix_config_json.as_deref(),
+            graph_name,
+            running,
+        )
+        .map(|guard| Some(NetworkEgressHandle::Paired(guard)));
+        #[cfg(not(unix))]
+        return Err(CliError::Validation("authenticated graph networking requires the local netd control service on this platform".into()));
+    }
     // Permissive egress converges onto the shared cerulion-netd session (Unix only —
-    // netd is a Unix daemon). Strict is a permanent child-routing rule; non-Unix has no
+    // netd is a Unix daemon). Explicit Open strict uses its locator-based child; non-Unix has no
     // netd, so both fall through to the per-run gateway child below.
     #[cfg(unix)]
     if launch.posture == cerulion_core::NetworkPosture::Strict {
-        // Strict = child, by design (routing rule, not a degrade — see the doc above).
+        // Explicit Open strict preserves the declared locator-based path.
         tracing::debug!(
             graph = %graph_name,
             "STRICT egress posture (explicit `network:` block) is routed to a per-run gateway child, which honors the verbatim locators + egress allow-list — netd's shared permissive session cannot represent Strict"
@@ -5003,7 +5374,7 @@ fn establish_network_egress(
                     crate::tcp_idle_warning::EgressRoute::Netd,
                     &launch.plan,
                 );
-                return Some(NetworkEgressHandle::Netd(guard));
+                return Ok(Some(NetworkEgressHandle::Netd(guard)));
             }
             Err(e) => {
                 tracing::warn!(
@@ -5015,13 +5386,17 @@ fn establish_network_egress(
             }
         }
     }
-    let child = spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)?;
+    let Some(child) =
+        spawn_gateway_or_warn(Some(launch), graph_name, workspace_root, ix_config_json)
+    else {
+        return Ok(None);
+    };
     crate::tcp_idle_warning::warn_if_tcp_egress_idle_resets(
         graph_name,
         crate::tcp_idle_warning::EgressRoute::Child(&launch.network),
         &launch.plan,
     );
-    Some(NetworkEgressHandle::Child(child))
+    Ok(Some(NetworkEgressHandle::Child(child)))
 }
 
 /// An AddrInUse-class session-open failure — the ONLY class the
@@ -5092,7 +5467,8 @@ pub fn graph_run_gateway(handoff_path: &Path, running: Arc<AtomicBool>) -> CliRe
             handoff_path.display()
         ))
     })?;
-    crate::login_cmd::require_serving_login()?;
+    cerulion_netd::serving_login::require_serving_authority()
+        .map_err(|error| CliError::Validation(error.into()))?;
     let graph_name = handoff.graph_name.clone();
     let permissive = handoff.posture == GatewayPostureCarrier::PermissiveDefault;
 
@@ -5354,7 +5730,7 @@ mod open_file_limit_verdict_tests {
     /// per chain.
     fn graph_of(chains: usize) -> GraphConfig {
         let node = |id: String, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
-            fuse: None,
+            isolate: None,
             params: Default::default(),
             ros2: None,
             id,
@@ -5380,6 +5756,7 @@ mod open_file_limit_verdict_tests {
                 vec![InputDef {
                     name: "in".to_string(),
                     source: format!("src{i}/out"),
+                    ..Default::default()
                 }],
                 vec![],
             ));
@@ -5555,10 +5932,11 @@ fn refuse_ambiguous_output_schemas(workspace_root: &Path, config: &GraphConfig) 
 /// When `skip_validate` is false, runs the pre-flight validation report
 /// before starting the graph. A FAILING check REFUSES the run
 /// (warnings stay advisory). `skip_validate` skips only that report — the
-/// graph topology, the macro trigger wiring and the node libraries are
-/// re-checked unconditionally below and by `GraphRuntime::build`, so the
-/// flag's real reach is the `schema:` family of checks, which nothing else
-/// in the system performs. See `failing_check_blocks_the_run`.
+/// graph topology, the input queues, the node params, the macro trigger
+/// wiring and the node libraries are re-checked unconditionally below and by
+/// `GraphRuntime::build`, so the flag's real reach is the `schema:` family of
+/// checks, which nothing else in the system performs. See
+/// `failing_check_blocks_the_run`.
 ///
 /// `prefer_release` selects the cdylib lookup mode for node loading:
 /// when false (default), the *freshest* built
@@ -5615,8 +5993,9 @@ pub fn graph_run(
     // cumulative timing AND re-advanceable in replay for the graph's
     // OWN topics. `None` ⇒ a normal run (zero behavior change).
     record: Option<String>,
-    // The env.json capture policy (`--record-env`).
-    // Only consulted when `record` is `Some`.
+    // The env.json capture policy (`--record-env`). Renders the bag's
+    // env.json AND the run directory's env.json, which every run writes,
+    // recorded or not.
     record_env: RecordEnvMode,
     // bagd CPU placement (`--record-cpu`). Only
     // consulted when `record` is `Some`.
@@ -5837,7 +6216,7 @@ pub fn graph_run(
             graph_name,
             report_config,
             &cdylib_cache,
-            false,
+            ReportFor::RunPreflight,
             &params_inspector,
             &launch_arg_sources,
         );
@@ -5861,8 +6240,9 @@ pub fn graph_run(
                 .any(|c| !c.passed && failing_check_blocks_the_run(&c.label, &cdylib_cache))
             {
                 "fix the failing check(s) — `--no-validate` skips this report, but not \
-                 the checks the runtime repeats on every start (graph topology, the \
-                 macro trigger wiring, and the node libraries it loads)"
+                 the checks the runtime repeats on every start (graph topology, the input \
+                 queues, the node params, the macro trigger wiring, and the node libraries \
+                 it loads)"
             } else {
                 "fix the failing check(s), or re-run with `--no-validate` to run anyway"
             };
@@ -5962,29 +6342,45 @@ pub fn graph_run(
         )));
     }
 
-    // Resolve the network DECISION EARLY, before the auto-partition
-    // pre-flight can write the graph file (the rule: a refused run leaves
-    // the file byte-untouched). Networked multi-process is FIRST-CLASS,
-    // so run SHAPE is NOT an input; the ONE
-    // decision drives both run shapes. Recording with a declared `ingress:`
-    // network block, and serving with no prior login, both refuse before any
-    // file mutation. The graph/worker processes
-    // stay network-free (`network: None`); the separate GATEWAY process owns
-    // the network plane. The `network:` block is unaffected by partitioning, so
-    // deciding on the pre-preflight config is stable.
+    // Resolve recording and producer authority before partitioning mutates files.
+    // Local workers share SHM; paired networking is held on netd, and explicit
+    // open compatibility uses its locator-based gateway.
     let run_network = resolve_run_network(&config, network_off, time_source, record.is_some())?;
-    if run_network.network_config().is_some() {
-        crate::login_cmd::require_serving_login()?;
+    let will_serve = match &run_network {
+        RunNetwork::Strict(_) => config
+            .network
+            .as_ref()
+            .is_some_and(|network| !network.egress.is_empty()),
+        RunNetwork::Permissive(_) => {
+            config.nodes.iter().any(|node| !node.outputs.is_empty()) || config.has_ros2_nodes()
+        }
+        RunNetwork::Off | RunNetwork::Inert => false,
+    };
+    if will_serve {
+        cerulion_netd::serving_login::require_serving_authority()
+            .map_err(|error| CliError::Validation(error.into()))?;
     }
     // The permissive default applies to every normal
     // real-clock live run reaching this function — `graph run`, `node run`'s
     // temp single-node graph, AND `ros2 attach` (the flagship automagic surface:
     // attach a robot and it is network-viewable with zero config). Serving
-    // requires a saved prior login; network suppressors are `--network off` /
+    // requires saved local authority for producers; producer-free runs skip
+    // that gate. Network suppressors are `--network off` /
     // `CERULION_NETWORK=off`, the virtual/external clocks, and the
     // record+declared-ingress refusal — all already folded into `run_network`
     // above. (`graph profile` never routes through this function — see the
     // explicit local-only profile arm in `resolve_run_network`'s docs.)
+
+    // The execution mode is read from the environment exactly once per run,
+    // HERE, and the result threaded to every reader below.
+    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
+    // value to "unset" and skips the garbage warn every other unrecognised
+    // value gets. The lossy form is never a recognised
+    // spelling, so it takes the garbage arm and is printed under `got=`.
+    let raw_execution_mode =
+        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
+    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
+    let keep_linear_chains = run_keeps_linear_chains(time_source, execution_mode_request);
 
     // The auto-partition PRE-FLIGHT — derive the partition
     // and persist only with `--yes`. The run proceeds with the
@@ -6005,7 +6401,7 @@ pub fn graph_run(
         // that already carries exactly the derived partition needs no
         // write, so that run proceeds.
         let refuse_save = consent.assume_yes && wiring_overridden;
-        let pre = crate::partition_emit::run_auto_partition_preflight(
+        let pre = crate::partition_emit::run_auto_partition_preflight_with(
             workspace_root,
             graph_name,
             config,
@@ -6017,6 +6413,7 @@ pub fn graph_run(
                 lenient_costs: !consent.auto_partition,
                 assume_yes: consent.assume_yes && !refuse_save,
             },
+            cerulion_core::graph::AutoPartitionOptions { keep_linear_chains },
         )?;
         if refuse_save && pre.outcome != crate::partition_emit::RunPartitionOutcome::AlreadyCurrent
         {
@@ -6045,6 +6442,18 @@ pub fn graph_run(
     // (b) An INVALID deployment is a pre-run rejection, and a rejected run must
     //     not first create a directory and announce itself LIVE. Resolving
     //     before the descriptor keeps that arm ahead of any side effect.
+    // `--single-process` on the real clock keeps every node in one process,
+    // and that process runs its nodes in executor units: when they split, the
+    // run goes through the supervisor with ONE process group holding every
+    // node, so one worker process hosts all the units.
+    let single_process_in_units = single_process
+        && single_process_hosts_units(
+            workspace_root,
+            &mut config,
+            time_source,
+            execution_mode_request,
+        )?;
+    let single_process = single_process && !single_process_in_units;
     let deployment = resolve_deployment(
         config.has_process_groups(),
         single_process,
@@ -6058,9 +6467,9 @@ pub fn graph_run(
         )));
     }
     let executes_process_groups = matches!(deployment, Ok(Deployment::Supervisor));
-    // The execution mode is RESOLVED here, once, from the same
-    // deployment fact — the environment is read exactly one time per run and
-    // the RESULT is threaded to the run-directory descriptor, the supervisor
+    // The execution mode is RESOLVED here, once, from the deployment fact and
+    // the request read above (the environment's one read per run); the RESULT
+    // is threaded to the run-directory descriptor, the supervisor
     // (which stamps it into every worker plan) and the recording paths, so no
     // two of them can disagree about the contract the run executed under.
     // A supervisor run FREE-RUNS by default;
@@ -6068,13 +6477,6 @@ pub fn graph_run(
     // a run with no ranks is the one-rank lockstep timeline whatever is
     // asked. An explicit `free_run` the route cannot honour warns loudly
     // rather than silently doing nothing.
-    // `var_os` + a lossy render, NOT `var(..).ok()`: the latter maps a non-UTF-8
-    // value to "unset" and skips the garbage warn every other unrecognised
-    // value gets. The lossy form is never a recognised
-    // spelling, so it takes the garbage arm and is printed under `got=`.
-    let raw_execution_mode =
-        std::env::var_os(EXECUTION_MODE_ENV).map(|v| v.to_string_lossy().into_owned());
-    let execution_mode_request = resolve_execution_mode_request(raw_execution_mode.as_deref());
     let execution_mode =
         resolve_run_execution_mode(executes_process_groups, execution_mode_request);
     note_inert_execution_mode_request(executes_process_groups, execution_mode_request);
@@ -6130,6 +6532,16 @@ pub fn graph_run(
     );
     let embed_config = config.clone();
     let ros2_entries = crate::ros2_graph::take_ros2_entries(&mut config);
+    // A single-process recording (on Unix the only `--record` run the monolith
+    // takes) of a graph that reads a topic no node in it publishes is refused
+    // HERE, on the native graph the run would build, before the `ros2:`
+    // entries are spawned, the run directory is written or a recorder starts:
+    // that recording's clock cannot place an outside writer's frames (see the
+    // fn).
+    #[cfg(unix)]
+    if record.is_some() && matches!(deployment, Ok(Deployment::Monolith)) {
+        refuse_outside_inputs_in_single_process_recording(&config, graph_name)?;
+    }
 
     let _exit_hygiene = crate::ipc_cleanup::ExitHygieneGuard::armed();
 
@@ -6141,12 +6553,14 @@ pub fn graph_run(
     // nodes by name. `finish` folds their teardown (SIGINT, bounded grace,
     // SIGKILL backstop) and a `--peer-loss fail` death into each exit below;
     // `Drop` is the never-orphan floor for the `?` paths in between.
-    let ros2_children = crate::ros2_graph::Ros2Children::spawn(
+    let ros2_scope = producer_scope_for_run(&run_network, &config);
+    let ros2_children = crate::ros2_graph::Ros2Children::spawn_with_scope(
         &ros2_entries,
         workspace_root,
         config.identity(),
         running.clone(),
         resolve_peer_loss(peer_loss),
+        &ros2_scope,
     )?;
 
     // Write THIS RUN's directory and announce it on
@@ -6207,6 +6621,27 @@ pub fn graph_run(
     let state_arm = crate::state_arm_attach::state_arm_tag_for_process(Some(run_id));
     #[cfg(not(unix))]
     let state_arm: Option<(String, crate::state_arm_attach::ArmTagSource)> = None;
+    // The executor units this run's processes split into, so the recorded
+    // census judges every edge against the threads it will run on: a fused
+    // chain never leaves a unit.
+    #[cfg(unix)]
+    let unit_groups: Option<indexmap::IndexMap<String, Vec<String>>> = executes_process_groups
+        .then(|| {
+            run_unit_groups(
+                workspace_root,
+                &config,
+                execution_mode,
+                time_source == TimeSource::Real,
+            )
+        })
+        .flatten();
+    // The run directory's `recorder.json` timestamp, read HERE, beside the rest
+    // of the description, and threaded to the one write each route makes once
+    // its nodes have loaded (the file carries each node's driver flag, which
+    // only the loaded metadata can say).
+    let run_recorded_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     #[cfg(unix)]
     let _run_descriptor = {
         match render_effective_graph_yaml(&embed_config) {
@@ -6222,10 +6657,14 @@ pub fn graph_run(
                     chains: run_chain_summary(
                         workspace_root,
                         &config,
-                        if executes_process_groups {
-                            cerulion_core::graph::Colocation::ProcessGroups(&config.process_groups)
-                        } else {
-                            cerulion_core::graph::Colocation::SingleProcess
+                        match (executes_process_groups, unit_groups.as_ref()) {
+                            (true, Some(units)) => {
+                                cerulion_core::graph::Colocation::ProcessGroups(units)
+                            }
+                            (true, None) => cerulion_core::graph::Colocation::ProcessGroups(
+                                &config.process_groups,
+                            ),
+                            (false, _) => cerulion_core::graph::Colocation::SingleProcess,
                         },
                     ),
                     run_id,
@@ -6281,20 +6720,11 @@ pub fn graph_run(
                     // Rendered by the SAME pure functions that produce a
                     // `--record` bag's attachments, which is what makes the run
                     // directory and the bag agree by construction rather than
-                    // by two writers being trusted to.
+                    // by two writers being trusted to. `recorder.json` is not
+                    // here: it carries each node's driver flag, so it is
+                    // written once the nodes load (`write_run_recorder_best_effort`).
                     graph_yaml,
                     env_json: render_env_json(record_env, std::env::vars()),
-                    recorder_json: render_recorder_json(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default(),
-                        // The SAME resolved mode the
-                        // recording paths and the worker plans carry — so a
-                        // bag recorded of this run and the run's own directory
-                        // cannot disagree about the contract it ran under
-                        // (`bag_cmd --run` COPIES these bytes verbatim).
-                        resolve_run_coordination(execution_mode),
-                    ),
                 })
             }
             Err(e) => {
@@ -6386,7 +6816,16 @@ pub fn graph_run(
                     )
                 })
                 .flatten();
-            return ros2_children.finish(graph_run_supervisor(
+            // A `--single-process` run in executor units is one worker
+            // process, which prints a fatal node's own `Error:` line; the
+            // verdict then adds no line naming the process.
+            let announce = |result: CliResult<()>| match result {
+                Err(CliError::WorkerNodeFatal { .. }) if single_process_in_units => {
+                    Err(CliError::WorkerNodeFatalAnnounced)
+                }
+                other => other,
+            };
+            return ros2_children.finish(announce(graph_run_supervisor(
                 workspace_root,
                 graphs_dir,
                 config,
@@ -6414,6 +6853,10 @@ pub fn graph_run(
                     .map(crate::run_dir::RunDescriptor::path),
                 #[cfg(not(unix))]
                 None,
+                // The run directory's `recorder.json` timestamp, read with the
+                // rest of the description; the supervisor writes the file once
+                // its nodes load.
+                run_recorded_at,
                 // ONE resolved tag for the whole deployment, so
                 // every rank opens the SAME word (onset agreement is
                 // arithmetic only if the word is shared).
@@ -6438,7 +6881,7 @@ pub fn graph_run(
                 #[cfg(not(unix))]
                 None,
                 &embed_config,
-            ));
+            )));
         }
         Ok(Deployment::MonolithFallback { reason }) => {
             tracing::warn!(graph = %config.identity(), "{reason}");
@@ -6488,6 +6931,29 @@ pub fn graph_run(
     // arms are mutually exclusive).
     let factories =
         load_node_factories_from_cache(workspace_root, &config, prefer_release, &cdylib_cache)?;
+    // The run directory's `recorder.json`, now that the nodes have loaded: it
+    // carries each node's driver flag from the LOADED metadata. Written before
+    // either monolith arm declares a trace ring or spawns the window recorder,
+    // so a recorder that finds a ring in `run.json` finds this file unless
+    // the write failed, and then embeds no graph.
+    #[cfg(unix)]
+    if let Some(descriptor) = _run_descriptor.as_ref() {
+        let mut infos: indexmap::IndexMap<String, cerulion_core::graph::NodeInfo> =
+            indexmap::IndexMap::new();
+        for (id, entry) in &factories {
+            infos.insert(id.clone(), entry.info()?);
+        }
+        write_run_recorder_best_effort(
+            Some(descriptor.path()),
+            run_recorded_at,
+            // The SAME resolved mode the recording paths and the worker plans
+            // carry, so a bag recorded of this run and the run's own directory
+            // cannot disagree about the contract it ran under (`bag_cmd --run`
+            // COPIES these bytes verbatim).
+            resolve_run_coordination(execution_mode),
+            &crate::replay_engine::node_external_flags(&infos),
+        );
+    }
 
     // Workspace schema-name → recipe-3 hash map for the
     // YAML-`schema:`-vs-macro-output divergence warn. Advisory only;
@@ -6510,6 +6976,10 @@ pub fn graph_run(
         graphs_dir,
         graph_name,
     )?;
+
+    let bridge_config = crate::schema_serve::resolve_bridge_config_path(graphs_dir, graph_name);
+    let excluded_topics =
+        excluded_run_topics(&run_network, &config, &factories, bridge_config.as_deref())?;
 
     // Wedge alarm: EVERY path below this point is a monolith (the supervisor arm
     // returned above), and a monolith has no supervisor — so the per-node
@@ -6536,26 +7006,17 @@ pub fn graph_run(
     // transport for the deterministic-live gating clock + the ordered bagd
     // handshake/teardown), so it fully replaces the `match time_source` below.
     if let Some(record_dir) = record {
-        // `--record` KEEPS the network — announces + egress stay ON
-        // while recording (the robot stays visible). The GATEWAY runs as a
-        // separate process tapping the recording graph's SHM, so the recording
-        // transport itself stays `network: None` (graph process is
-        // network-free). A record+declared-ingress run was already refused at
-        // `resolve_run_network`, so any `gateway_launch` here is
-        // egress-only or permissive. The guard's `Drop` reaps the gateway when
-        // the recording run returns (its network never bleeds into the bag).
-        // This arm still relies on the Drop SIGKILL backstop
-        // (no graceful `forward_shutdown` call on teardown, unlike the non-record
-        // monolith arm); a graceful forward here — so a directed
-        // `kill <graph-pid>` / SIGTERM also reaches the gateway cleanly — is not
-        // implemented. No orphan either way (Drop reaps on every exit path).
+        // Recording retains egress on the authenticated registration or explicit
+        // open gateway. Declared ingress was refused by resolve_run_network;
+        // graph data stays network-free and teardown releases the held handle.
         let _gateway = establish_network_egress(
             gateway_launch.as_ref(),
             config.identity(),
             workspace_root,
             None,
-        );
-        return ros2_children.finish(run_graph_recording(RecordingRun {
+            running.clone(),
+        )?;
+        let recorded = run_graph_recording(RecordingRun {
             embed_config: &embed_config,
             workspace_root,
             graphs_dir,
@@ -6563,6 +7024,8 @@ pub fn graph_run(
             config,
             factories,
             schema_hashes: &schema_hashes,
+            excluded_topics: &excluded_topics,
+            producer_scope: ros2_scope.clone(),
             record_dir: Path::new(&record_dir),
             record_env,
             record_cpu,
@@ -6586,7 +7049,11 @@ pub fn graph_run(
                 !ros2_entries.is_empty(),
                 _run_descriptor.is_some(),
             ),
-        }));
+        });
+        if let Some(network) = &_gateway {
+            network.check()?;
+        }
+        return ros2_children.finish(recorded);
     }
 
     // Inputs to the graph-aware CPU C-state cap, read once.
@@ -6621,6 +7088,7 @@ pub fn graph_run(
                     // Virtual/replay arm; `run_network` is `Inert` here anyway.)
                     network: None,
                 })?;
+            let _exclusions = exclude_run_topics(&transport, &excluded_topics)?;
             let mut runtime = cerulion_core::GraphRuntime::build_with_schema_hashes(
                 config,
                 factories,
@@ -6658,6 +7126,7 @@ pub fn graph_run(
                 monitor_wait_active: false,
             }));
             tracing::info!(graph = %graph_name, time_source = ?time_source, "graph running (deterministic VirtualClock) — press Ctrl+C to stop");
+            announce_running(&running_line(graph_name, RunStatus::OneProcess));
             while running.load(Ordering::Relaxed) {
                 if runtime.shutdown_requested() {
                     tracing::info!(graph = %graph_name, "node requested graph shutdown");
@@ -6725,25 +7194,9 @@ pub fn graph_run(
                     // the network plane and taps this graph's SHM for egress.
                     network: None,
                 })?;
-            // Spawn the network GATEWAY process (monolith arm). `None`
-            // ⇒ LOCAL-ONLY (Off/Inert). The guard is held across `run_live`
-            // and its `Drop` SIGKILLs + reaps the gateway on every exit path
-            // (clean, Ctrl+C, error). The gateway joins the DEFAULT iceoryx2
-            // namespace (this graph's `init` uses it too), so `ix_config_json =
-            // None`. `run_live` blocks this thread, so mid-run death detection
-            // is the guard's own watcher thread: a
-            // gateway crash warns once ("run continues LOCAL-ONLY") + reaps —
-            // no zombie, no silent drop off the network.
-            //
-            // The guard is actively used (not just held for Drop):
-            // once `run_live` returns (the run loop exited), the graph process
-            // FORWARDS a graceful SIGINT to it before the Drop SIGKILL backstop.
-            let gateway_child = establish_network_egress(
-                gateway_launch.as_ref(),
-                config.identity(),
-                workspace_root,
-                None,
-            );
+            let _exclusions = exclude_run_topics(&transport, &excluded_topics)?;
+            // Build canonical services at their full consumer capacity before
+            // any authenticated remote injector acquires the single writer.
             // Resolve the live-loop monitor-wait park policy BEFORE
             // building the runtime (the policy is threaded into the
             // policy-aware live builder). The env reads are bound to owned
@@ -6771,7 +7224,7 @@ pub fn graph_run(
             // are alternative shallow-idle mitigations: when the park is active
             // it suppresses the AUTO graph-derived cap below (an EXPLICIT env cap
             // still wins inside `resolve_cpu_dma_lock_cap`).
-            // `doorbell ⇒ monitor_wait` is coerced by `MonitorWaitPolicy::new`,
+            // `doorbell ⇒ monitor_wait` is enforced by `MonitorWaitPolicy::new`,
             // so `monitor_wait()` alone covers both flags. Captured here (the
             // policy moves into the builder); the EFFECTIVE verdict fed to the
             // cap resolver is computed AFTER the build via
@@ -6790,6 +7243,13 @@ pub fn graph_run(
                     Some(&schema_hashes),
                     mw_policy,
                 )?;
+            let gateway_child = establish_network_egress(
+                gateway_launch.as_ref(),
+                graph_name,
+                workspace_root,
+                None,
+                running.clone(),
+            )?;
             // The effective park verdict (see
             // `effective_park_for_cap` — plan-time external-node predicate via
             // `external_policy_node_ids`; safe over-approximation of the runtime
@@ -6928,13 +7388,6 @@ pub fn graph_run(
                 .then(|| {
                     let dir = begin_flashback_plane(workspace_root, graph_name, runtime.config());
                     let topics = write_flashback_topics(&dir, graph_name)?;
-                    // Resolved INSIDE the closure so a run with
-                    // Flashback switched off reads nothing at all.
-                    let handoff = resolve_flashback_handoff(
-                        _run_descriptor
-                            .as_ref()
-                            .map(crate::run_dir::RunDescriptor::path),
-                    );
                     spawn_flashback_recorder(FlashbackSpawnSpec {
                         graph_name,
                         record_cpu,
@@ -6968,7 +7421,12 @@ pub fn graph_run(
                             .as_ref()
                             .and(capture_plane.as_ref())
                             .map(|(tag, _)| tag.as_str()),
-                        handoff: &handoff,
+                        // The spawn reads this directory inside this closure,
+                        // so a run with Flashback switched off reads nothing
+                        // at all.
+                        run_dir: _run_descriptor
+                            .as_ref()
+                            .map(crate::run_dir::RunDescriptor::path),
                         // By design, the monolith arms mint
                         // no trace ring. Their gating clock is
                         // WALL-driven (`live_gating_quantum: None`), so a trace
@@ -7036,6 +7494,7 @@ pub fn graph_run(
                 ),
             );
             tracing::info!(graph = %graph_name, time_source = ?time_source, "starting graph (live) — press Ctrl+C to stop");
+            announce_running(&running_line(graph_name, RunStatus::OneProcessStarting));
             // `run_live` REFUSES the live run (returns
             // Err) if ANY external node is provably inert at launch — the full
             // `InertReason` class (host-driven / no-source / invalid-or-duplicate
@@ -7056,6 +7515,7 @@ pub fn graph_run(
             // path above this is skipped — Drop's SIGKILL is the backstop there.
             if let Some(gw) = gateway_child.as_ref() {
                 gw.forward_shutdown(graph_name);
+                gw.check()?;
             }
             tracing::info!(graph = %graph_name, "shutting down");
             fatal_nodes = runtime.node_fatal_errors();
@@ -7065,6 +7525,155 @@ pub fn graph_run(
     // Both monolith arms end here: stop the `ros2:` children gracefully and
     // fold a `--peer-loss fail` death and any fatal node into the verdict.
     ros2_children.finish(crate::error::node_fatal_verdict(fatal_nodes))
+}
+
+/// The transport one worker plan runs on, on the run's shared iceoryx2
+/// config.
+///
+/// A plan that is its own process initializes the process's transport
+/// singleton. A plan hosted with other executor units in one process
+/// ([`WorkerPlan::host`](crate::multiprocess::WorkerPlan::host)) gets a
+/// detached transport of its own: its own iceoryx2 node on the same config,
+/// carrying its own clock, because the singleton carries one clock and each
+/// unit's runtime is refused a transport built with another unit's.
+///
+/// Mp workers are always network-free: the separate gateway process owns the
+/// robot's whole network plane.
+fn worker_transport(
+    plan: &crate::multiprocess::WorkerPlan,
+    clock: Arc<dyn cerulion_core::clock::Clock>,
+    ix_config: iceoryx2::config::Config,
+) -> CliResult<Arc<cerulion_core::TransportManager>> {
+    let config = cerulion_core::TransportConfig {
+        node_name: plan.node_name.clone(),
+        clock,
+        subscriber_buffer_size: 16,
+        network: None,
+    };
+    let transport = if plan.host.is_some() {
+        cerulion_core::TransportManager::detached_with_config(config, ix_config)?
+    } else {
+        cerulion_core::TransportManager::init_with_config(config, ix_config)?
+    };
+    Ok(transport)
+}
+
+/// Under the `oracle-mutants` feature, setting this variable makes a process
+/// that hosts several executor units skip sizing its descriptor table.
+#[cfg(feature = "oracle-mutants")]
+pub const DESCRIPTOR_PRESIZE_MUTANT_ENV: &str = "CERULION_DESCRIPTOR_PRESIZE_MUTANT";
+
+fn descriptor_presize_skipped_by_mutant() -> bool {
+    #[cfg(feature = "oracle-mutants")]
+    {
+        if std::env::var_os(DESCRIPTOR_PRESIZE_MUTANT_ENV).is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Run the worker plans of one process: one plan runs on this thread exactly
+/// as [`graph_run_worker`]; several plans (the executor units one process
+/// group was split into) run one per thread.
+///
+/// Each thread builds and runs its own runtime from its own plan: its own
+/// transport node, step counter, gating clock, trace ring and READY sentinel,
+/// so the supervisor sees each unit as it sees a worker process. The units of
+/// one process share its fate: the first one to return, with an error or
+/// without, clears `running`, which stops the others at their next step
+/// boundary, and the process reports the worst outcome: an error, then a
+/// node-fatal verdict, then success.
+pub fn graph_run_worker_host(
+    workspace_root: &Path,
+    plan_paths: &[std::path::PathBuf],
+    running: Arc<AtomicBool>,
+) -> CliResult<()> {
+    match plan_paths {
+        [] => {
+            return Err(CliError::Validation(
+                "graph run-worker: no `--plan` given".to_string(),
+            ))
+        }
+        [one] => return graph_run_worker(workspace_root, one, running),
+        _ => {}
+    }
+    tracing::info!(
+        units = plan_paths.len(),
+        "worker process hosts several executor units, one thread each"
+    );
+    // The unit threads below share this process's descriptor table, and an
+    // open that grows a shared table waits for an RCU grace period. The table
+    // is sized here, before those threads start.
+    #[cfg(unix)]
+    {
+        let _ = cerulion_core::fd_limit::raise_open_file_limit();
+        if !descriptor_presize_skipped_by_mutant() {
+            let _ = cerulion_core::fd_limit::presize_descriptor_table();
+        }
+    }
+    /// Clears `running` when its unit's thread leaves `graph_run_worker`, by
+    /// return or by unwind, so a panicking unit stops its siblings and the
+    /// process exits instead of running on without it.
+    struct StopSiblingsOnExit(Arc<AtomicBool>);
+    impl Drop for StopSiblingsOnExit {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Relaxed);
+        }
+    }
+    let outcomes: Vec<CliResult<()>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(plan_paths.len());
+        for (i, path) in plan_paths.iter().enumerate() {
+            let unit_running = Arc::clone(&running);
+            let spawned = std::thread::Builder::new()
+                .name(format!("cerulion-unit-{i}"))
+                .spawn_scoped(scope, move || {
+                    let _stop = StopSiblingsOnExit(Arc::clone(&unit_running));
+                    graph_run_worker(workspace_root, path, unit_running)
+                });
+            match spawned {
+                Ok(handle) => handles.push(Ok(handle)),
+                Err(e) => {
+                    running.store(false, Ordering::Relaxed);
+                    handles.push(Err(CliError::Validation(format!(
+                        "graph run-worker: cannot start the thread for plan `{}`: {e}",
+                        path.display()
+                    ))));
+                }
+            }
+        }
+        handles
+            .into_iter()
+            .zip(plan_paths)
+            .map(|(handle, path)| match handle {
+                Ok(handle) => handle.join().unwrap_or_else(|_| {
+                    Err(CliError::Validation(format!(
+                        "graph run-worker: the executor thread for plan `{}` panicked",
+                        path.display()
+                    )))
+                }),
+                Err(refused) => Err(refused),
+            })
+            .collect()
+    });
+    let mut node_fatal: Vec<(String, String)> = Vec::new();
+    let mut first_error: Option<CliError> = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(()) => {}
+            Err(CliError::NodeFatal { nodes }) => node_fatal.extend(nodes),
+            Err(e) => {
+                tracing::error!(error = %e, "an executor unit of this worker process failed");
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => crate::error::node_fatal_verdict(node_fatal),
+    }
 }
 
 /// Run ONE worker process of a multi-process deployment from
@@ -7276,22 +7885,10 @@ pub fn graph_run_worker(
         None => Arc::new(cerulion_core::clock::RealClock),
     };
 
-    // (4) init the process transport singleton on the shared, supervisor-minted
-    // iceoryx2 Config so every co-resident worker lands on ONE SHM namespace and
-    // their cross-group pub/sub connect.
-    let transport = cerulion_core::TransportManager::init_with_config(
-        cerulion_core::TransportConfig {
-            node_name: plan.node_name.clone(),
-            clock: Arc::clone(&clock_dyn),
-            subscriber_buffer_size: 16,
-            // Mp workers are ALWAYS network-free — the separate
-            // GATEWAY process (spawned by the supervisor) owns the robot's
-            // whole network plane (one robot = one peer). Networked
-            // multi-process is first-class and never refused.
-            network: None,
-        },
-        ix_config,
-    )?;
+    // (4) the transport on the shared, supervisor-minted iceoryx2 Config, so
+    // every co-resident worker lands on ONE SHM namespace and their
+    // cross-group pub/sub connect.
+    let transport = worker_transport(&plan, Arc::clone(&clock_dyn), ix_config)?;
 
     // (5) OPEN (not create) the shared barrier the supervisor OWNS. Bounded retry:
     // exec startup races the supervisor's `create_owned`, so the segment may be
@@ -7346,8 +7943,8 @@ pub fn graph_run_worker(
                 // is the asymmetry that makes this worth a check. A plan whose
                 // `producer_ranks` names the wrong rank leaves the REAL
                 // producing rank here: it skips, and its local flow then has
-                // producers and NO consumers, so `is_all_block()` (which needs
-                // a non-empty consumer list) is false and the block-wiring
+                // producers and NO consumers, so `has_block_consumer()` is
+                // false and the block-wiring
                 // branch `continue`s too — no defer edge, no publisher mirror,
                 // no credit record, no warn. The producer publishes
                 // UNTHROTTLED while the consumer rank, whose own rank number IS
@@ -7401,6 +7998,7 @@ pub fn graph_run_worker(
                 // read — `None` for a pure consumer, which is exactly the role
                 // that never parks.
                 producer_slot: crate::multiprocess::producer_slot_of(e, plan.rank),
+                producer_nodes: e.producer_nodes.clone(),
             });
         }
         bindings
@@ -7426,7 +8024,8 @@ pub fn graph_run_worker(
         &credit_bindings,
     )
     .with_sibling_topics(&plan.sibling_topics)
-    .with_sibling_consumed_topics(&plan.sibling_consumed_topics);
+    .with_sibling_consumed_topics(&plan.sibling_consumed_topics)
+    .with_paced_topic_warnings(&plan.paced_topic_warnings);
 
     // (6) resolve the subgraph's node cdylibs. The plan's subgraph already holds
     // ONLY this worker's nodes, so this shares `graph_run`'s loader filtered to
@@ -7481,8 +8080,8 @@ pub fn graph_run_worker(
     // epoll-blocks between steps and a cross-process publish pays a
     // wake-latency backstop; with the doorbell the producer's ring wakes the
     // shallow park at near-spin latency). Rebuilt via the pure, unit-tested
-    // `worker_park_policy` seam (ns re-derivation + doorbell⇒monitor_wait
-    // coercion + old-plan serde-default back-compat — see its doc).
+    // `worker_park_policy` seam (ns re-derivation + the doorbell⇒monitor_wait
+    // invariant + old-plan serde-default back-compat; see its doc).
     let mw_policy = worker_park_policy(&plan);
     // Captured before the policy moves into the builder; the EFFECTIVE verdict
     // feeding the (8.7) cap resolver is computed after the build (see
@@ -7599,12 +8198,11 @@ pub fn graph_run_worker(
 
     // Park the worker's shared-config TransportManager so a
     // tier-2 `Blocking` external-source doorbell mints on THIS manager — the
-    // same explicit wiring as the monolith live arm. Belt-and-suspenders here:
-    // `init_with_config` above primed the process-global singleton with this
-    // SAME manager (`INSTANCE.get_or_init` in `transport/mod.rs`), so the
-    // doorbell fallback chain (`resolve_doorbell_transport`: parked handle →
-    // `TransportManager::get()` singleton) already resolves to it; parking makes
-    // the wiring explicit and immune to a future non-singleton worker transport.
+    // same explicit wiring as the monolith live arm. A plan that is its own
+    // process also primed the process-global singleton with this SAME manager,
+    // so the doorbell fallback chain (`resolve_doorbell_transport`: parked
+    // handle → `TransportManager::get()` singleton) resolves to it either way;
+    // a hosted unit's detached manager is reachable only through this parking.
     runtime.set_live_transport(Arc::clone(&transport));
     // Let `graph pause` hold this rank at a step boundary.
     #[cfg(unix)]
@@ -9314,10 +9912,18 @@ fn sweep_additional_deaths(guards: &mut [ChildGuard]) -> DeathSweep {
                 }
             }
             ChildPoll::Exited(status) => {
-                deaths.push((g.group.clone(), format!("exited {status}")));
+                deaths.extend(
+                    g.units()
+                        .into_iter()
+                        .map(|u| (u, format!("exited {status}"))),
+                );
             }
             ChildPoll::Lost => {
-                deaths.push((g.group.clone(), "unpollable (Lost)".to_string()));
+                deaths.extend(
+                    g.units()
+                        .into_iter()
+                        .map(|u| (u, "unpollable (Lost)".to_string())),
+                );
             }
         }
     }
@@ -9470,9 +10076,29 @@ pub(crate) struct ChildGuard {
     /// and the grace loop, and one loud line plus `debug!` repeats is the
     /// flood discipline every latch in this repo follows.
     peek_warned: bool,
+    /// The executor units this process runs when it runs more than one (a
+    /// worker host); empty for a process that is one unit, named `group`.
+    hosted: Vec<String>,
 }
 
 impl ChildGuard {
+    /// Record the executor units this worker process runs, so its exit is
+    /// reported as the departure of each of them.
+    pub(crate) fn hosting(mut self, units: Vec<String>) -> Self {
+        self.hosted = units;
+        self
+    }
+
+    /// The units this process's exit takes down: its hosted units, or its own
+    /// group.
+    pub(crate) fn units(&self) -> Vec<String> {
+        if self.hosted.is_empty() {
+            vec![self.group.clone()]
+        } else {
+            self.hosted.clone()
+        }
+    }
+
     /// A guard that makes no group promise (the multi-process workers; the
     /// recorders, which are group leaders that never need the group
     /// family). The group-kill methods are not for this guard.
@@ -9483,6 +10109,7 @@ impl ChildGuard {
             group,
             leads_group: false,
             peek_warned: false,
+            hosted: Vec::new(),
         }
     }
 
@@ -9496,6 +10123,7 @@ impl ChildGuard {
             group,
             leads_group: true,
             peek_warned: false,
+            hosted: Vec::new(),
         }
     }
 
@@ -10154,6 +10782,30 @@ fn stamp_credit_edges(
     }
 }
 
+/// Stamp into each worker plan the paced-topic warnings whose producer node is
+/// in that worker's subgraph. A single-producer topic's producer node is in
+/// exactly one plan, and a multi-producer `block` topic's producers share one
+/// plan because its split is refused, so one worker logs each warning. Pure
+/// (plan in, plan out).
+fn stamp_paced_topic_warnings(
+    plan: &mut crate::multiprocess::DeploymentPlan,
+    warnings: &[cerulion_core::graph::PacedTopicWarning],
+) {
+    for w in &mut plan.workers {
+        let members: std::collections::HashSet<&str> =
+            w.subgraph.nodes.iter().map(|n| n.id.as_str()).collect();
+        w.paced_topic_warnings = warnings
+            .iter()
+            .filter(|p| {
+                p.producer_nodes
+                    .iter()
+                    .any(|n| members.contains(n.as_str()))
+            })
+            .cloned()
+            .collect();
+    }
+}
+
 /// Stamp the user's `--no-cpu-dma-lock` opt-out into EVERY
 /// worker plan — if `graph_run_worker`'s (8.7) cap block hardcoded
 /// `CpuDmaLockMode::Auto`, an explicit opt-out would be silently ignored by
@@ -10346,7 +10998,9 @@ fn resolve_worker_build_path(
 /// bools. The `ns` is re-derived here: `default_namespace()` is $USER-stable,
 /// and every worker of a deployment runs as the same user on the same machine, so
 /// producer + consumer derive the SAME doorbell SHM names.
-/// `MonitorWaitPolicy::new` re-coerces `doorbell ⇒ monitor_wait`. On a plan
+/// `MonitorWaitPolicy::new` re-enforces `doorbell ⇒ monitor_wait` by dropping
+/// a doorbell stamped without the park, so a plan's `monitor_wait = false` is
+/// park off whatever its `doorbell` says. On a plan
 /// from an OLD supervisor both fields serde-default to false → park off. Pure
 /// (plan in, policy out), so the seam is unit-testable without a live worker.
 fn worker_park_policy(plan: &crate::multiprocess::WorkerPlan) -> cerulion_core::MonitorWaitPolicy {
@@ -10410,6 +11064,209 @@ fn supervisor_precreate_error(
          shared memory — stop that deployment, or run `cerulion clean` to remove \
          stale iceoryx2 artifacts. Deployment aborted BEFORE any worker spawned."
     ))
+}
+
+/// For `--single-process`: put every native node in one process group when
+/// that process splits into more than one executor unit, and say so, with what
+/// the flag opts out of (the auto-partition default, or the declared
+/// `process_groups:`). Returns whether it did. A non-real time source, the lockstep execution mode, a
+/// non-Unix host or a graph that is one unit keeps the single-process
+/// monolith (one level loop).
+fn single_process_hosts_units(
+    workspace_root: &Path,
+    config: &mut GraphConfig,
+    time_source: TimeSource,
+    execution_mode_request: Option<crate::multiprocess::ExecutionMode>,
+) -> CliResult<bool> {
+    let lockstep = matches!(
+        execution_mode_request,
+        Some(crate::multiprocess::ExecutionMode::Lockstep)
+    );
+    if time_source != TimeSource::Real || lockstep || !cfg!(unix) {
+        return Ok(false);
+    }
+    let mut one = config.clone();
+    let host = config.identity().to_string();
+    one.process_groups = [(
+        host.clone(),
+        one.native_nodes().map(|n| n.id.clone()).collect(),
+    )]
+    .into_iter()
+    .collect();
+    one.process_group_order = Vec::new();
+    let profile = load_unit_profile(workspace_root, config.identity());
+    let units = source_entry_infos(
+        &workspace_root.join("nodes"),
+        &one,
+        "--single-process splits the process into executor units by each node's declared \
+         trigger policy",
+    )
+    .and_then(|entry_infos| {
+        crate::multiprocess::plan_executor_units(
+            &one,
+            &entry_infos,
+            crate::multiprocess::ExecutionMode::FreeRun,
+            true,
+            profile
+                .as_ref()
+                .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                    costs,
+                    label: label.as_str(),
+                }),
+        )
+        .map_err(CliError::from)
+    });
+    let units = match units {
+        Ok(units) => units,
+        Err(e) => {
+            tracing::warn!(
+                graph = %config.identity(),
+                error = %e,
+                "--single-process: the executor units could not be derived from the nodes' \
+                 source, so the process runs every node on one level loop"
+            );
+            return Ok(false);
+        }
+    };
+    if !units.plan.splits_any() {
+        return Ok(false);
+    }
+    // A graph that splits never reaches the monolith arm of the deployment
+    // match, which announces the opt-out, so this line carries it.
+    let unit_count = units.plan.units.get(&host).map_or(0, Vec::len);
+    if config.has_process_groups() {
+        tracing::info!(
+            graph = %config.identity(),
+            units = unit_count,
+            "--single-process: every node runs in one worker process, on its executor units, \
+             despite `process_groups:` (the declared groups are not executed)"
+        );
+    } else {
+        tracing::info!(
+            graph = %config.identity(),
+            units = unit_count,
+            "--single-process: every node runs in one worker process, on its executor units (no \
+             `process_groups:` in the graph; the multi-process auto-partition default is skipped)"
+        );
+    }
+    *config = one;
+    Ok(true)
+}
+
+/// The executor-unit groups a run of `config` executes, from the nodes' source
+/// declarations and the graph's profile; `None` (with a warn) when the source
+/// cannot be read, which the census reports on its own.
+fn run_unit_groups(
+    workspace_root: &Path,
+    config: &GraphConfig,
+    execution_mode: crate::multiprocess::ExecutionMode,
+    real_clock: bool,
+) -> Option<indexmap::IndexMap<String, Vec<String>>> {
+    let entry_infos = source_entry_infos(
+        &workspace_root.join("nodes"),
+        config,
+        "a run records the chain census of its executor units",
+    )
+    .ok()?;
+    let profile = load_unit_profile(workspace_root, config.identity());
+    match crate::multiprocess::plan_executor_units(
+        config,
+        &entry_infos,
+        execution_mode,
+        real_clock,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    ) {
+        Ok(units) => Some(units.plan.groups),
+        Err(e) => {
+            tracing::warn!(
+                graph = %config.identity(),
+                error = %e,
+                "this run's executor units could not be derived for its recorded chain census; \
+                 the census is judged against the process groups instead"
+            );
+            None
+        }
+    }
+}
+
+/// The graph's profile for the executor tick budget: the cost snapshot at
+/// [`default_artifact_path`], when one is present and usable.
+pub(crate) fn load_unit_profile(
+    workspace_root: &Path,
+    graph_name: &str,
+) -> Option<(cerulion_core::graph::PartitionCosts, String)> {
+    let path = default_artifact_path(workspace_root, graph_name);
+    let text = std::fs::read_to_string(&path).ok()?;
+    match parse_profile_artifact(&text).and_then(|a| a.to_costs()) {
+        Ok((costs, _isolated)) => Some((costs, path.display().to_string())),
+        Err(e) => {
+            tracing::warn!(
+                graph = %graph_name,
+                profile = %path.display(),
+                error = %e,
+                "the graph's profile is present but unusable; each process runs as one \
+                 executor unit, except a node that declares `isolate: true`"
+            );
+            None
+        }
+    }
+}
+
+/// Derive the deployment's executor units and log them: one line per unit of
+/// a process that hosts more than one, naming its nodes and why it starts.
+fn plan_supervisor_units(
+    workspace_root: &Path,
+    config: &GraphConfig,
+    loaded_entry_infos: &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
+    execution_mode: crate::multiprocess::ExecutionMode,
+    real_clock: bool,
+) -> CliResult<crate::multiprocess::DeploymentUnits> {
+    let profile = load_unit_profile(workspace_root, config.identity());
+    let units = crate::multiprocess::plan_executor_units(
+        config,
+        loaded_entry_infos,
+        execution_mode,
+        real_clock,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    )
+    .map_err(CliError::from)?;
+    for (host, reason) in &units.kept_whole {
+        tracing::info!(
+            graph = %config.identity(),
+            host = %host,
+            reason = %reason,
+            "executor units: this process group runs as one unit (one level loop)"
+        );
+    }
+    for (host, host_units) in units.plan.split_hosts() {
+        for unit in host_units {
+            let starts: Vec<String> = unit
+                .boundaries
+                .iter()
+                .map(|(node, b)| format!("{node}: {}", b.describe()))
+                .collect();
+            tracing::info!(
+                graph = %config.identity(),
+                host = %host,
+                unit = %unit.name,
+                nodes = ?unit.nodes,
+                starts = ?starts,
+                block_topics = ?unit.block_topics,
+                "executor unit: these nodes share one thread; the unit runs on its own executor"
+            );
+        }
+    }
+    Ok(units)
 }
 
 /// The multi-process SUPERVISOR — the path `graph_run` dispatches
@@ -10477,6 +11334,10 @@ fn graph_run_supervisor(
     // manifest an attaching `cerulion bag record --run` reads to find the
     // scheduler trace. `None` on a non-Unix host or a degraded run-directory write.
     run_dir: Option<&Path>,
+    // The run directory's `recorder.json` timestamp, read by `graph_run` with
+    // the rest of the description. The file is written HERE, once the nodes
+    // load, because it carries each node's driver flag.
+    run_recorded_at: Duration,
     // The deployment's checkpoint arm tag, RESOLVED by `graph_run`
     // (explicit env, else derived from this run's `run_id`) and stamped from
     // here into every worker plan.
@@ -10621,6 +11482,14 @@ fn graph_run_supervisor(
         graphs_dir,
         config.identity(),
     )?;
+    let bridge_config =
+        crate::schema_serve::resolve_bridge_config_path(graphs_dir, config.identity());
+    let excluded_topics = excluded_run_topics(
+        &run_network,
+        &config,
+        &planning_factories,
+        bridge_config.as_deref(),
+    )?;
     // The AUTHORITATIVE per-node metadata: each planning factory's OWN
     // `NodeEntry::info()` — i.e. what the BUILT cdylib declares, which is
     // exactly what `GraphRuntime::build_*` below levelizes with. Harvested here
@@ -10647,8 +11516,30 @@ fn graph_run_supervisor(
         for (id, entry) in &planning_factories {
             infos.insert(id.clone(), entry.info()?);
         }
+        cerulion_core::graph::topology::apply_input_backpressure_overrides(
+            &config,
+            &mut infos,
+            cerulion_core::graph::topology::MissingInputMeta::Refuse,
+        )?;
         infos
     };
+    // Each native node's driver flag, from the same LOADED metadata: the
+    // `node_external` key of this run's `recorder.json`, in the run directory
+    // and in any bag `--record` writes. The run directory's copy is written
+    // HERE, before any trace ring is declared in `run.json` and before the
+    // window recorder spawns, so a recorder that finds a ring finds this file
+    // unless the write failed, and then embeds no graph.
+    #[cfg(unix)]
+    let node_external = crate::replay_engine::node_external_flags(&loaded_entry_infos);
+    #[cfg(unix)]
+    write_run_recorder_best_effort(
+        run_dir,
+        run_recorded_at,
+        resolve_run_coordination(execution_mode),
+        &node_external,
+    );
+    #[cfg(not(unix))]
+    let _ = run_recorded_at;
     #[cfg(unix)]
     let record_entry_infos: Option<
         &indexmap::IndexMap<String, cerulion_core::graph::NodeInfo>,
@@ -10729,8 +11620,20 @@ fn graph_run_supervisor(
 
     // (5) PURE PLAN — one WorkerPlan per group (rank order): participant maps,
     // handed quantum, barrier/ready identifiers, subgraphs.
+    // Executor units: split every process group into units (chains on one
+    // thread each) before planning, so each unit gets its own worker plan and
+    // every edge between units the wiring of an edge between processes.
+    let units = plan_supervisor_units(
+        workspace_root,
+        &config,
+        &loaded_entry_infos,
+        execution_mode,
+        time_source == TimeSource::Real,
+    )?;
+    let config = units.config.clone();
     let mut plan = crate::multiprocess::plan_deployment(&config, &levels, tightest, &nonce)
         .map_err(CliError::from)?;
+    crate::multiprocess::stamp_hosts(&mut plan, &units.plan.hosts);
 
     // Run the FULL partition validator (contiguity + BRIDGE) at PLAN
     // time — PRE-SPAWN — so every surface (`graph partition`, `graph levels`,
@@ -10830,13 +11733,25 @@ fn graph_run_supervisor(
         // down reports what was actually created; this one reports what the
         // plan-time check allowed, and the two being separate is deliberate:
         // if they ever disagree, the reconciliation below refuses and the
-        // operator has both halves of the evidence in the log.
+        // operator has both halves of the evidence in the log. An edge whose
+        // input sets `block_timeout_ms` is not announced: `credit_edges_for`
+        // below mints it a word like any other creditable split edge, and
+        // `refuse_split_edge_timeouts` then refuses the run over the minted
+        // edges, through the same check, before any word is stamped into a
+        // worker's plan or any worker spawns.
+        let source_topology = cerulion_core::graph::GraphTopology::build(&config, &entry_infos)
+            .map_err(CliError::from)?;
         for edge in cerulion_core::graph::creditable_split_block_edges(
             &config.process_groups,
             &config,
             &entry_infos,
             &trigger_edges,
         ) {
+            if crate::multiprocess::split_edge_timeout_refusal_in_groups(&source_topology, &edge)
+                .is_some()
+            {
+                continue;
+            }
             tracing::info!(
                 graph = %config.identity(),
                 topic = %edge.topic,
@@ -11017,14 +11932,15 @@ fn graph_run_supervisor(
     // ONE rank map, built from the workers that will actually be spawned, so
     // the mint, the reconciliation and the spawn cannot disagree about who owns
     // what.
-    let credit_node_rank: std::collections::HashMap<&str, usize> = plan
-        .workers
-        .iter()
-        .flat_map(|w| w.subgraph.nodes.iter().map(|n| (n.id.as_str(), w.rank)))
-        .collect();
+    let credit_node_rank = crate::multiprocess::node_ranks(&plan);
     let loaded_topology_for_reconcile =
         cerulion_core::graph::GraphTopology::build(&config, &loaded_entry_infos)
             .map_err(CliError::from)?;
+    // A ring of `block` edges can span workers, and each worker sees only its
+    // own subgraph, so the whole graph is checked here, before any spawn.
+    loaded_topology_for_reconcile
+        .refuse_block_cycles()
+        .map_err(CliError::from)?;
     // The SOURCE view the plan-time acceptance was judged on. Read here rather
     // than threaded from the validation block above because that block is
     // `has_process_groups()`-gated while this runs on every multi-process
@@ -11053,6 +11969,20 @@ fn graph_run_supervisor(
             config.identity()
         ))
             })?;
+    // Every minted edge counts on a credit word shared across threads, where a
+    // `block_timeout_ms` release cannot keep the count exact: refuse the key on
+    // it before anything is stamped or spawned.
+    crate::multiprocess::refuse_split_edge_timeouts(
+        &loaded_topology_for_reconcile,
+        &credit_edges,
+        &plan,
+    )
+    .map_err(|e| {
+        CliError::Validation(format!(
+            "graph run (multi-process): graph '{}': {e}",
+            config.identity()
+        ))
+    })?;
     // RECONCILE what the plan-time check ACCEPTED
     // with what the supervisor actually MINTED, and refuse pre-spawn if they
     // differ.
@@ -11094,6 +12024,13 @@ fn graph_run_supervisor(
         return Err(CliError::Validation(reason));
     }
     stamp_credit_edges(&mut plan, &credit_edges);
+    // Each worker logs the paced-topic warnings of the topics whose producer
+    // node it builds, derived here from the whole graph so a `drop_oldest` or
+    // `sample(N)` consumer in another process group is named too.
+    stamp_paced_topic_warnings(
+        &mut plan,
+        &loaded_topology_for_reconcile.paced_topic_warnings(),
+    );
     if !credit_edges.is_empty() {
         // Name the EDGES, not just a count. An
         // operator asking "did my split `block` edge really get a word?" is
@@ -11152,6 +12089,22 @@ fn graph_run_supervisor(
     let mut _capture_plane: Option<std::sync::Arc<cerulion_core::state_arm::MappedStateArm>> = None;
     #[cfg(unix)]
     let armed_tag: Option<String> = {
+        // An anchor forks the rank's process; a fork copies only the forking
+        // thread and every lock another thread holds at that instant, so a
+        // process running several units cannot be anchored by a fork.
+        let state_arm_tag = match (state_arm_tag.as_deref(), units.plan.splits_any()) {
+            (Some(_), true) => {
+                tracing::warn!(
+                    graph = %config.identity(),
+                    hosts = ?units.plan.split_hosts().map(|(h, _)| h).collect::<Vec<_>>(),
+                    "flashback checkpoints are OFF for this run: at least one process hosts \
+                     more than one executor unit, and a checkpoint forks its process, which \
+                     copies one thread, so this run takes none"
+                );
+                None
+            }
+            (tag, _) => tag.map(str::to_string),
+        };
         let armed = state_arm_tag.as_deref().and_then(|tag| {
             // Every worker plan carries the SAME `handed_quantum_ns` by
             // construction (multiprocess.rs: it is the min over the full graph),
@@ -11655,6 +12608,7 @@ fn graph_run_supervisor(
             deployment_prefix
         ))
     })?;
+    let _exclusions = exclude_run_topics(&data_plane_transport, &excluded_topics)?;
     // Held for the WHOLE run: declared BEFORE `guards` below, so reverse local
     // drop-order releases these service handles AFTER every worker is reaped
     // (mirrors the monolith's `_precreated_services` field contract — iceoryx2
@@ -11713,52 +12667,65 @@ fn graph_run_supervisor(
     // — which is what made `deferred_producer_groups` render a constant.
     let rank_groups: std::collections::HashMap<u32, String> =
         group_ranks.iter().map(|(g, r)| (*r, g.clone())).collect();
-    for idx in crate::multiprocess::spawn_order(&plan) {
-        let w = &plan.workers[idx];
-        let plan_path = &plan_paths[idx];
-        let child = std::process::Command::new(&self_exe)
-            .args(["graph", "run-worker", "--plan"])
-            .arg(plan_path)
-            .current_dir(workspace_root)
-            .spawn()
-            .map_err(|e| {
-                CliError::Validation(format!(
-                    "graph run (multi-process): failed to spawn worker process for group '{}': {e}",
-                    w.group
-                ))
-            })?;
+    // One process per host: a plan without a host is its own process, and the
+    // plans of one host run as threads of one `graph run-worker` process.
+    'spawn: for (host, idxs) in crate::multiprocess::host_spawn_order(&plan) {
+        let mut command = std::process::Command::new(&self_exe);
+        command.args(["graph", "run-worker"]);
+        for &idx in &idxs {
+            command.arg("--plan").arg(&plan_paths[idx]);
+        }
+        let child = command.current_dir(workspace_root).spawn().map_err(|e| {
+            CliError::Validation(format!(
+                "graph run (multi-process): failed to spawn worker process for group '{host}': {e}"
+            ))
+        })?;
         let pid = child.id();
         tracing::info!(
-            group = %w.group,
+            group = %host,
             pid,
-            nodes = w.subgraph.nodes.len(),
+            nodes = idxs
+                .iter()
+                .map(|&i| plan.workers[i].subgraph.nodes.len())
+                .sum::<usize>(),
+            units = idxs.len(),
             "spawned worker process"
         );
-        let mut guard = ChildGuard::new(child, w.group.clone());
-        // Block until READY / Ctrl-C, the child dies first, or the deadline
-        // elapses. On an `Err`, `guards` (already-spawned siblings) + `guard`
-        // drop → all children SIGKILLed + reaped.
-        match wait_for_ready_or_exit(
-            &mut guard,
-            Path::new(&w.ready_path),
-            &w.group,
-            &running,
-            READY_DEADLINE,
-        )? {
-            ReadyWait::Ready => guards.push(guard),
-            ReadyWait::CtrlC => {
-                // Stop spawning further workers; drain the ones already up (NOT
-                // a fail-loud — user-initiated). The JOIN loop below flips to
-                // Draining on its first pass (`running` is false) and
-                // SIGINTs every spawned worker, flipping each one's own
-                // `running` so its `wait_for_go` returns early and `run_live`
-                // exits at once (a directed kill to the supervisor pid never
-                // reached them; the process-group SIGINT covers only a real
-                // terminal Ctrl-C).
-                guards.push(guard);
-                break;
+        let mut guard = ChildGuard::new(child, host.clone());
+        if idxs.len() > 1 {
+            guard = guard.hosting(
+                idxs.iter()
+                    .map(|&i| plan.workers[i].group.clone())
+                    .collect(),
+            );
+        }
+        // Block until every plan of this process is READY, Ctrl-C, the child
+        // dies first, or the deadline elapses. On an `Err`, `guards`
+        // (already-spawned siblings) + `guard` drop → all children SIGKILLed +
+        // reaped.
+        for &idx in &idxs {
+            let w = &plan.workers[idx];
+            match wait_for_ready_or_exit(
+                &mut guard,
+                Path::new(&w.ready_path),
+                &w.group,
+                &running,
+                READY_DEADLINE,
+            )? {
+                ReadyWait::Ready => {}
+                ReadyWait::CtrlC => {
+                    // Stop spawning further workers; drain the ones already up
+                    // (NOT a fail-loud: user-initiated). The JOIN loop below
+                    // flips to Draining on its first pass (`running` is false)
+                    // and SIGINTs every spawned worker, flipping each one's own
+                    // `running` so its `wait_for_go` returns early and
+                    // `run_live` exits at once.
+                    guards.push(guard);
+                    break 'spawn;
+                }
             }
         }
+        guards.push(guard);
     }
 
     // (10.35) **DECLARE what this run's trace plane really is** —
@@ -11893,6 +12860,8 @@ fn graph_run_supervisor(
     if let (Some(record_dir), Some(recorded)) = (record, recorded_topics.as_deref()) {
         if running.load(Ordering::Relaxed) {
             recording = start_supervisor_recording(SupervisorRecordingStart {
+                transport: &data_plane_transport,
+                producer_scope: &producer_scope_for_run(&run_network, &config),
                 embed_config,
                 record_dir: Path::new(record_dir),
                 workspace_root,
@@ -11915,6 +12884,7 @@ fn graph_run_supervisor(
                 // The mode stamped into every worker plan above:
                 // the bag's `coordination` stamp is its pure map.
                 execution_mode,
+                node_external: &node_external,
                 // The always-on plane's departure ring is what the
                 // recorder's `--ring` set is completed from. `None` (declined or
                 // refused) is unreachable under `--record`: `--no-rings`
@@ -11928,12 +12898,23 @@ fn graph_run_supervisor(
                 })?,
             })?;
         } else {
-            tracing::info!(
-                graph = %config.identity(),
-                "Ctrl-C during spawn phase — recording not started (no data was recorded)"
-            );
+            warn_recording_not_started(config.identity(), RecordingNotStarted::DuringSpawn);
         }
     }
+
+    // Resolve authenticated ingress only after full-topology precreation and
+    // READY, before workers execute. A refusal tears down every waiting worker.
+    let _gateway_child = if running.load(Ordering::Relaxed) {
+        establish_network_egress(
+            gateway_launch.as_ref(),
+            config.identity(),
+            workspace_root,
+            Some(deploy_cfg_json.clone()),
+            running.clone(),
+        )?
+    } else {
+        None
+    };
 
     // (10.5) GO — every worker is built + READY (all publishers attached, all
     // subscribers connected) AND, when recording, bagd is armed (10.4), so
@@ -11969,6 +12950,13 @@ fn graph_run_supervisor(
             mode = "multi-process",
             "graph running - GO signaled; deployment live; press Ctrl+C to stop"
         );
+        announce_running(&running_line(
+            config.identity(),
+            RunStatus::Deployed {
+                nodes: embed_config.nodes.len(),
+                processes: guards.len(),
+            },
+        ));
     } else {
         tracing::info!(
             graph = %config.identity(),
@@ -12038,10 +13026,6 @@ fn graph_run_supervisor(
             // the file-stem rule is exactly `config.identity()`.
             let dir = begin_flashback_plane(workspace_root, config.identity(), &config);
             let topics = write_flashback_topics(&dir, config.identity())?;
-            // The same handoff the monolith arm makes. `run_dir`
-            // is this deployment's run directory, threaded in by
-            // `graph_run` (`None` on a degraded run-directory write).
-            let handoff = resolve_flashback_handoff(run_dir);
             spawn_flashback_recorder(FlashbackSpawnSpec {
                 graph_name: config.identity(),
                 record_cpu,
@@ -12080,7 +13064,10 @@ fn graph_run_supervisor(
                 // and a monolith run under a tag whose earlier run was
                 // multi-process.
                 state_tag: armed_tag.as_deref(),
-                handoff: &handoff,
+                // The same run context the monolith arm hands over. `run_dir`
+                // is this deployment's run directory, threaded in by
+                // `graph_run` (`None` on a degraded run-directory write).
+                run_dir,
                 // Only the rings a worker CONFIRMED it created, plus
                 // the departure ring.
                 ring_names: &flashback_ring_names,
@@ -12137,35 +13124,6 @@ fn graph_run_supervisor(
         &classify_state_ring_consumer(window_outcome, armed_tag.is_some()),
     );
 
-    // (10.6) spawn the network GATEWAY beside the workers — ONE per
-    // running graph, joining the SAME supervisor-minted deployment iceoryx2
-    // namespace (`deploy_cfg_json`) so it taps the workers' produced topics for
-    // egress. The gateway is NOT a DAG worker: it is held in a SEPARATE guard
-    // (its `Drop` SIGKILLs + reaps at every supervisor exit path), never in
-    // `guards`, so its death never trips the JOIN loop's `--peer-loss`
-    // semantics. Mid-run death detection is the guard's own watcher thread
-    // (the same once-loud LOCAL-ONLY warn as the monolith
-    // arms), so the JOIN loop carries no gateway polling. Spawned AFTER GO
-    // (services exist) and only while `running` (a Ctrl-C'd spawn phase skips
-    // it). `None` gateway ⇒ LOCAL-ONLY run.
-    //
-    // Like the `--record` monolith arm, the supervisor still
-    // relies on the guard's Drop SIGKILL backstop for the gateway (no graceful
-    // `forward_shutdown` on the directed-kill path — only the non-record
-    // monolith arm forwards a graceful SIGINT). The graceful forward is not wired into
-    // the supervisor teardown — no orphan either way (Drop reaps
-    // at every supervisor exit path).
-    let _gateway_child = if running.load(Ordering::Relaxed) {
-        establish_network_egress(
-            gateway_launch.as_ref(),
-            config.identity(),
-            workspace_root,
-            Some(deploy_cfg_json.clone()),
-        )
-    } else {
-        None
-    };
-
     // (11) JOIN loop — the multi-process lifecycle contract.
     //
     // States:
@@ -12211,12 +13169,16 @@ fn graph_run_supervisor(
     // `crashed_groups` is the degraded-run ledger — the groups lost under
     // peer-loss=continue (used for the all-crashed→Err edge + the degraded summary).
     let drop_stall_grace = drop_stall_grace_from_env();
-    let total_workers = guards.len();
+    let total_workers: usize = guards.iter().map(|g| g.units().len()).sum();
     let mut crashed_groups: Vec<String> = Vec::new();
     // The groups whose worker exited `EXIT_NODE_FATAL`: a clean exit after a
     // node stopped on `NodeError::Fatal`. Folded into the verdict below (exit 3).
     let mut node_fatal_groups: Vec<String> = Vec::new();
     loop {
+        if let Some(network) = &_gateway_child {
+            network.check()?;
+        }
+
         // Ctrl-C → enter Draining AND SIGINT every remaining worker.
         // Sending NOTHING here would assume the workers "received the same
         // process-group SIGINT" — true only when the signal source targets the
@@ -12260,13 +13222,16 @@ fn graph_run_supervisor(
 
         if let Some((i, poll)) = event {
             let group = guards[i].group.clone();
+            let units = guards[i].units();
             // Wedge alarm: this rank's worker is gone (exited, died, or became
             // unpollable) — stop watching its page. A dead worker's seq pairs
             // freeze by definition, so without this the alarm would fire on every
             // normal shutdown, naming nodes whose process no longer exists as
             // wedged. The departure itself is already reported by the arms below.
             #[cfg(unix)]
-            wedge_observer.retire(&group);
+            for unit in &units {
+                wedge_observer.retire(unit);
+            }
             let normal = state == JoinState::Normal && running.load(Ordering::Relaxed);
             match poll {
                 // Never stored as an event — the poll loop counts Running as alive.
@@ -12332,7 +13297,12 @@ fn graph_run_supervisor(
                                 // publish on a detached thread).
                                 publish_process_faults(
                                     config.identity(),
-                                    &[(group.clone(), format!("worker process died ({status})"))],
+                                    &units
+                                        .iter()
+                                        .map(|u| {
+                                            (u.clone(), format!("worker process died ({status})"))
+                                        })
+                                        .collect::<Vec<_>>(),
                                     worker_iox2_config.as_ref(),
                                 );
                                 // Write the DEPARTURE record FIRST, then
@@ -12343,7 +13313,9 @@ fn graph_run_supervisor(
                                 // bagd outcome is logged inside `finalize`.
                                 #[cfg(unix)]
                                 if let Some(plane) = trace_plane.as_mut() {
-                                    plane.record_departure(&group);
+                                    for unit in &units {
+                                        plane.record_departure(unit);
+                                    }
                                 }
                                 #[cfg(unix)]
                                 if let Some(rec) = recording.take() {
@@ -12362,7 +13334,10 @@ fn graph_run_supervisor(
                                 // (serial per-death graces would exceed the
                                 // survivors' ~5s boundary timeout at k >= 5 deaths
                                 // and cascade a partial loss into all-crashed).
-                                let mut batch = vec![(group.clone(), format!("exited {status}"))];
+                                let mut batch: Vec<(String, String)> = units
+                                    .iter()
+                                    .map(|u| (u.clone(), format!("exited {status}")))
+                                    .collect();
                                 let sweep = sweep_additional_deaths(&mut guards);
                                 batch.extend(sweep.deaths);
                                 // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -12384,7 +13359,11 @@ fn graph_run_supervisor(
                                     &rank_groups,
                                     &mut credit_death_watch,
                                 );
-                                let survivors = guards.iter().filter(|g| !g.reaped()).count();
+                                let survivors: usize = guards
+                                    .iter()
+                                    .filter(|g| !g.reaped())
+                                    .map(|g| g.units().len())
+                                    .sum();
                                 match &barrier_owner {
                                     Some(barrier) => drop_dead_peers_batch(
                                         barrier,
@@ -12488,10 +13467,15 @@ fn graph_run_supervisor(
                             // for.
                             publish_process_faults(
                                 config.identity(),
-                                &[(
-                                    group.clone(),
-                                    "worker process became unpollable (Lost)".to_string(),
-                                )],
+                                &units
+                                    .iter()
+                                    .map(|u| {
+                                        (
+                                            u.clone(),
+                                            "worker process became unpollable (Lost)".to_string(),
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(),
                                 worker_iox2_config.as_ref(),
                             );
                             // Departure record FIRST, then finalize the
@@ -12500,7 +13484,9 @@ fn graph_run_supervisor(
                             // stays diagnosable; the deployment Err wins).
                             #[cfg(unix)]
                             if let Some(plane) = trace_plane.as_mut() {
-                                plane.record_departure(&group);
+                                for unit in &units {
+                                    plane.record_departure(unit);
+                                }
                             }
                             #[cfg(unix)]
                             if let Some(rec) = recording.take() {
@@ -12515,7 +13501,10 @@ fn graph_run_supervisor(
                         PeerLossPolicy::Continue => {
                             // The same batched sweep as the Exited(nonzero)
                             // arm — see the comment there.
-                            let mut batch = vec![(group.clone(), "unpollable (Lost)".to_string())];
+                            let mut batch: Vec<(String, String)> = units
+                                .iter()
+                                .map(|u| (u.clone(), "unpollable (Lost)".to_string()))
+                                .collect();
                             let sweep = sweep_additional_deaths(&mut guards);
                             batch.extend(sweep.deaths);
                             // Wedge alarm: the sweep found FURTHER dead workers in this
@@ -12537,7 +13526,11 @@ fn graph_run_supervisor(
                                 &rank_groups,
                                 &mut credit_death_watch,
                             );
-                            let survivors = guards.iter().filter(|g| !g.reaped()).count();
+                            let survivors: usize = guards
+                                .iter()
+                                .filter(|g| !g.reaped())
+                                .map(|g| g.units().len())
+                                .sum();
                             match &barrier_owner {
                                 Some(barrier) => drop_dead_peers_batch(
                                     barrier,
@@ -12896,7 +13889,9 @@ pub fn graph_list(graphs_dir: &Path) -> CliResult<Vec<String>> {
 /// `validate_partition` diagnostic (naming the bridge node) for the binary to
 /// map to a nonzero exit AFTER printing — `graph levels` is CI-gateable on
 /// partition validity, matching `graph run`'s enforcement. A valid or absent
-/// `process_groups:` exits 0.
+/// `process_groups:` exits 0. A partition that splits a `block` edge whose
+/// input sets `block_timeout_ms` is INVALID the same way, with the refusal
+/// `graph run` gives that edge before any worker spawns.
 pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphLevelsReport> {
     let graphs_dir = workspace_root.join("graphs");
     let nodes_dir = workspace_root.join("nodes");
@@ -12946,6 +13941,138 @@ pub fn graph_levels(workspace_root: &Path, graph_name: &str) -> CliResult<GraphL
     Ok(report)
 }
 
+/// `cerulion graph plan <name>`: the processes a free run of the graph starts
+/// and the executor units inside each, with the reason every unit starts.
+///
+/// The groups are the graph's `process_groups:`, or, when it declares none,
+/// the partition `graph run` derives in memory (process per node, or the
+/// cost-fused groups when the graph has a profile). Each group is split into
+/// units by the same derivation the run uses: with the graph's profile (its
+/// `graphs/<name>.costs.yaml`) the link rules and the tick budget; without
+/// one, one unit per process and one per node declaring `isolate: true`, and
+/// a node past an isolated node's level joins the earliest unit of the other
+/// nodes that starts at its level or feeds it at the level below, and
+/// otherwise starts a later unit.
+/// `--single-process` and the lockstep execution mode are not modelled: the
+/// view is the default free run.
+pub fn graph_plan(workspace_root: &Path, graph_name: &str) -> CliResult<String> {
+    let graphs_dir = workspace_root.join("graphs");
+    let (mut config, raw) = graph_read_raw(&graphs_dir, graph_name)?;
+    if config.prefix.is_empty() {
+        config.prefix = cerulion_core::graph::default_prefix(config.identity());
+    }
+    validate_graph(&config)?;
+    let entry_infos = source_entry_infos(
+        &workspace_root.join("nodes"),
+        &config,
+        "graph plan splits the graph by each node's declared trigger policy",
+    )?;
+    let derived = !config.has_process_groups();
+    let config = if derived {
+        crate::partition_emit::run_auto_partition_preflight_with(
+            workspace_root,
+            graph_name,
+            config,
+            &raw,
+            &crate::partition_emit::PreflightOptions {
+                lenient_costs: true,
+                assume_yes: false,
+            },
+            // `graph plan` shows a free run, whose processes run units.
+            cerulion_core::graph::AutoPartitionOptions {
+                keep_linear_chains: true,
+            },
+        )?
+        .config
+    } else {
+        config
+    };
+    let profile = load_unit_profile(workspace_root, graph_name);
+    let units = crate::multiprocess::plan_executor_units(
+        &config,
+        &entry_infos,
+        crate::multiprocess::ExecutionMode::FreeRun,
+        true,
+        profile
+            .as_ref()
+            .map(|(costs, label)| cerulion_core::graph::UnitProfile {
+                costs,
+                label: label.as_str(),
+            }),
+    )
+    .map_err(CliError::from)?;
+    Ok(render_unit_plan(
+        graph_name,
+        derived,
+        profile.as_ref().map(|(_, label)| label.as_str()),
+        &units,
+    ))
+}
+
+/// The text of [`graph_plan`].
+pub(crate) fn render_unit_plan(
+    graph_name: &str,
+    derived: bool,
+    profile: Option<&str>,
+    units: &crate::multiprocess::DeploymentUnits,
+) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let unit_count: usize = units.plan.units.values().map(Vec::len).sum();
+    let _ = writeln!(
+        out,
+        "graph {graph_name}: {} process(es), {unit_count} executor unit(s)",
+        units.plan.units.len()
+    );
+    let _ = writeln!(
+        out,
+        "  groups: {}",
+        if derived {
+            "derived by graph run (no process_groups: in the graph)"
+        } else {
+            "the graph's process_groups:"
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  units: {}",
+        match profile {
+            Some(label) => format!(
+                "from profile {label}: every node starts a unit, and a chain link merges where \
+                 the tick budget holds"
+            ),
+            None => "no profile, so each process runs as one unit; a node that declares \
+                     `isolate: true` runs in a unit of its own, and a node past an isolated \
+                     node's level joins the earliest unit of the other nodes that starts at its \
+                     level or feeds it at the level below, or else starts a later unit (a unit \
+                     runs a contiguous band of levels)"
+                .to_string(),
+        }
+    );
+    let whole: indexmap::IndexMap<&str, &str> = units
+        .kept_whole
+        .iter()
+        .map(|(h, r)| (h.as_str(), r.as_str()))
+        .collect();
+    for (host, host_units) in &units.plan.units {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "process {host}: {} unit(s)", host_units.len());
+        if let Some(reason) = whole.get(host.as_str()) {
+            let _ = writeln!(out, "  one unit: {reason}");
+        }
+        for unit in host_units {
+            let _ = writeln!(out, "  unit {}: {}", unit.name, unit.nodes.join(", "));
+            for (node, boundary) in &unit.boundaries {
+                let _ = writeln!(out, "    starts at {node}: {}", boundary.describe());
+            }
+            for topic in &unit.block_topics {
+                let _ = writeln!(out, "    kept together by the block edge on {topic}");
+            }
+        }
+    }
+    out
+}
+
 /// Derive per-INSTANCE `NodeInfo` from each node TYPE's
 /// source metadata — `parse_node_metadata` walks `nodes/<type>/src/lib.rs`
 /// once per type (memoized; K instances of one type parse once). Source is
@@ -12986,6 +14113,11 @@ pub(crate) fn source_entry_infos(
     // its own fire, and it runs before any node library is loaded, so a
     // discarded value would leave that rule decidable and never decided.
     //
+    // The node-level `tick_within_ms` deadline rides it too: executor-unit
+    // planning from source (`graph plan`, `--single-process`, a run's recorded
+    // census) refuses a merge whose summed p50 ticks reach a quarter of a
+    // member's deadline, as the planner over the loaded libraries does.
+    //
     // The REMAINING `InputMeta` fields are still the topology-safe defaults —
     // the CLI's `PortDef` knows nothing about depth or `expect_within_ms` — and
     // `schema_hash: 0` + `DEFAULT_CONSUMER_DEPTH` + no `expect_within_ms` are
@@ -12995,6 +14127,7 @@ pub(crate) fn source_entry_infos(
     type TypeInput = (String, bool, cerulion_core::graph::node::BackpressurePolicy);
     type TypeMeta = (
         Option<cerulion_core::MacroPolicy>,
+        Option<u64>,
         Option<u64>,
         Vec<TypeInput>,
     );
@@ -13032,10 +14165,15 @@ pub(crate) fn source_entry_infos(
                 .collect();
             type_meta.insert(
                 node_type.clone(),
-                (metadata.policy, metadata.throttle_ms, inputs),
+                (
+                    metadata.policy,
+                    metadata.throttle_ms,
+                    metadata.tick_within_ms,
+                    inputs,
+                ),
             );
         }
-        let (policy, throttle_ms, inputs) = &type_meta[&node_type];
+        let (policy, throttle_ms, tick_within_ms, inputs) = &type_meta[&node_type];
         let input_meta: Vec<cerulion_core::graph::node::InputMeta> = inputs
             .iter()
             .map(
@@ -13046,6 +14184,8 @@ pub(crate) fn source_entry_infos(
                     depth: cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
                     backpressure: *backpressure,
                     expect_within_ms: None,
+                    accumulate: false,
+                    consume: Default::default(),
                 },
             )
             .collect();
@@ -13056,8 +14196,16 @@ pub(crate) fn source_entry_infos(
         if let Some(throttle_ms) = *throttle_ms {
             info = info.with_throttle_ms(throttle_ms);
         }
+        if let Some(tick_within_ms) = *tick_within_ms {
+            info = info.with_tick_within_ms(tick_within_ms);
+        }
         entry_infos.insert(node_def.id.clone(), info);
     }
+    cerulion_core::graph::topology::apply_input_backpressure_overrides(
+        config,
+        &mut entry_infos,
+        cerulion_core::graph::topology::MissingInputMeta::Skip,
+    )?;
     Ok(entry_infos)
 }
 
@@ -13072,8 +14220,9 @@ pub struct GraphLevelsReport {
     pub rendered: String,
     /// `Some(diagnostic)` when the declared `process_groups:` partition fails
     /// the `validate_partition` spawner-consumability check (the
-    /// diagnostic names the bridge node); `None` for a valid or absent
-    /// partition.
+    /// diagnostic names the bridge node), or splits a `block` edge whose input
+    /// sets `block_timeout_ms` (the refusal `graph run` gives that edge);
+    /// `None` for a valid or absent partition.
     pub partition_error: Option<String>,
 }
 
@@ -13217,24 +14366,37 @@ pub(crate) fn render_levels_report(
                 group.rank, group.name, band, members
             );
         }
-        match cerulion_core::graph::validate_partition(
+        // A creditable split edge whose input sets `block_timeout_ms` is the
+        // edge `graph run` refuses before any worker spawns, through the same
+        // check, so the verdict is that refusal.
+        let verdict = cerulion_core::graph::validate_partition(
             &config.process_groups,
             config,
             entry_infos,
             trigger_edges,
-        ) {
-            Ok(()) => {
+        )
+        .map_err(|e| e.to_string())
+        .and_then(|()| {
+            let creditable = cerulion_core::graph::creditable_split_block_edges(
+                &config.process_groups,
+                config,
+                entry_infos,
+                trigger_edges,
+            );
+            match creditable.iter().find_map(|edge| {
+                crate::multiprocess::split_edge_timeout_refusal_in_groups(topology, edge)
+            }) {
+                Some(refusal) => Err(refusal),
+                None => Ok(creditable),
+            }
+        });
+        match verdict {
+            Ok(creditable) => {
                 // A credited split and an ordinary
                 // co-located flow must not render the SAME line, or the verb an
                 // operator runs to ask "will my hand-written split work?"
                 // answers yes without saying that the answer depends on N
                 // supervisor-minted credit words.
-                let creditable = cerulion_core::graph::creditable_split_block_edges(
-                    &config.process_groups,
-                    config,
-                    entry_infos,
-                    trigger_edges,
-                );
                 if creditable.is_empty() {
                     let _ = writeln!(out, "  partition: spawner-consumable");
                 } else {
@@ -13252,8 +14414,7 @@ pub(crate) fn render_levels_report(
                     );
                 }
             }
-            Err(e) => {
-                let diagnostic = e.to_string();
+            Err(diagnostic) => {
                 let _ = writeln!(out, "  partition: INVALID — {}", diagnostic);
                 partition_error = Some(diagnostic);
             }
@@ -14788,8 +15949,9 @@ pub enum ExpectedPrior<'a> {
 ///   both paths (`file_kind` labels what was overwritten). The backup path is
 ///   returned (`Some`) so the CLI stanza can surface it; `None` = fresh write,
 ///   no backup. ONE exception, reachable only inside this module: `node stage`
-///   over the untouched `graph create` scaffold (`is_pristine_scaffold`) has
-///   nothing of the user's to keep and takes neither the backup nor the warn.
+///   over a file byte-identical to the CLI's own `graph create` and
+///   `node stage` writes (`is_cli_written_graph`) takes neither the backup nor
+///   the warn.
 /// * **Never clobber a CONCURRENT writer** — a caller that
 ///   passes [`ExpectedPrior::Contents`] has its precondition checked twice:
 ///   once before anything is staged, and again immediately before the rename.
@@ -14815,7 +15977,7 @@ pub enum ExpectedPrior<'a> {
 /// Parent directories are created as needed. Pinned by the pure tests in
 /// `tests/graph_profile_test.rs` (fresh-write shape, backup+warn arm, no stray
 /// temp files) and `tests/partition_emit_test.rs` (the graph-rewrite caller,
-/// the concurrent-change refusal, and `node stage`'s pristine-scaffold arm).
+/// the concurrent-change refusal, and `node stage`'s CLI-written-file arm).
 pub fn write_yaml_atomically(
     dest: &Path,
     contents: &str,
@@ -14830,9 +15992,11 @@ pub(crate) enum PriorFile {
     /// Copy them to `<path>.bak` and `warn!` — the contract every hand-edit
     /// surface gets through [`write_yaml_atomically`].
     BackUp,
-    /// Drop them, silently. Only for a file the caller has PROVED holds
-    /// nothing a user wrote: [`node_stage`] over the untouched `graph create`
-    /// scaffold ([`is_pristine_scaffold`]). Everything else backs up.
+    /// Drop them, silently. Only for a write whose new contents keep every
+    /// byte of the prior file except the ` []` of an empty `nodes: []`, over
+    /// a file the caller has PROVED is
+    /// byte-identical to what the CLI's own writes produce: [`node_stage`]
+    /// ([`is_cli_written_graph`]). Everything else backs up.
     Discard,
 }
 
@@ -15912,8 +17076,10 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
 pub enum RecordEnvMode {
     /// The DEFAULT: record every variable NAME; record VALUES only for names
     /// on the documented allowlist ([`ENV_VALUE_ALLOWLIST_DOC`]: `CERULION_*`,
-    /// `RUST_LOG`, `IOX2_*`). Every other value is replaced by
-    /// `{"redacted": true, "fnv64": "<hex of the value's FNV-1a 64 hash>"}` —
+    /// `RUST_LOG`, `IOX2_*`) that carry no secret marker segment
+    /// ([`ENV_SECRET_NAME_MARKERS`], so `CERULION_RCP_TOKEN` is hashed). Every
+    /// other value is replaced by
+    /// `{"redacted": true, "fnv64": "<hex of the value's FNV-1a 64 hash>"}`:
     /// replay can DETECT divergence (hash mismatch) without the bag leaking the
     /// secret itself.
     #[default]
@@ -15927,8 +17093,22 @@ pub enum RecordEnvMode {
 }
 
 /// The documented `--record-env allowlist` value-allowlist (names whose VALUES
-/// are recorded verbatim under the default mode).
+/// are recorded verbatim under the default mode, unless the name carries a
+/// secret marker segment from [`ENV_SECRET_NAME_MARKERS`]).
 pub const ENV_VALUE_ALLOWLIST_DOC: &str = "CERULION_*, RUST_LOG, IOX2_*";
+
+/// The name segments that mark a variable as a SECRET under
+/// [`RecordEnvMode::Allowlist`]: its value is hashed like a non-allowlisted
+/// one even when the name is on [`ENV_VALUE_ALLOWLIST_DOC`].
+///
+/// A name is split into segments at every character that is not an ASCII
+/// letter or digit. A segment marks a secret when, compared
+/// case-insensitively and with any trailing digits removed, it equals one of
+/// these markers or the marker followed by `S` (`CERULION_API_KEY`,
+/// `CERULION_KEY2`, `CERULION_SECRETS`, `CERULION_DB-PASSWORD`). A marker
+/// inside a longer segment does not count (`CERULION_KEYBOARD_LAYOUT`,
+/// `CERULION_TOKENIZER`, `CERULION_APIKEY`), and `CERT` is not a marker.
+pub const ENV_SECRET_NAME_MARKERS: [&str; 5] = ["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"];
 
 /// Where the spawned `bagd` recorder child runs
 /// (`graph run --record-cpu <CORE|none>`).
@@ -16084,11 +17264,31 @@ fn permitted_core_count() -> std::num::NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
 }
 
+/// Whether `name` carries a secret marker segment (the rule on
+/// [`ENV_SECRET_NAME_MARKERS`]). Pure: it reads the name only, never the value.
+///
+/// Crate-visible because the replay's environment comparison applies the same
+/// rule: a secret-marked name is never one of the variables it warns about.
+#[cfg(unix)]
+pub(crate) fn env_name_marks_a_secret(name: &str) -> bool {
+    name.split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|segment| {
+            let word = segment.trim_end_matches(|c: char| c.is_ascii_digit());
+            let plural_stem = word.strip_suffix(|c: char| c.eq_ignore_ascii_case(&'S'));
+            ENV_SECRET_NAME_MARKERS.iter().any(|marker| {
+                word.eq_ignore_ascii_case(marker)
+                    || plural_stem.is_some_and(|stem| stem.eq_ignore_ascii_case(marker))
+            })
+        })
+}
+
 /// Whether `name`'s VALUE is recorded verbatim under
-/// [`RecordEnvMode::Allowlist`] (see [`ENV_VALUE_ALLOWLIST_DOC`]).
+/// [`RecordEnvMode::Allowlist`]: the name is on [`ENV_VALUE_ALLOWLIST_DOC`]
+/// and [`env_name_marks_a_secret`] does not mark it.
 #[cfg(unix)]
 fn env_value_allowlisted(name: &str) -> bool {
-    name.starts_with("CERULION_") || name == "RUST_LOG" || name.starts_with("IOX2_")
+    (name.starts_with("CERULION_") || name == "RUST_LOG" || name.starts_with("IOX2_"))
+        && !env_name_marks_a_secret(name)
 }
 
 /// Render the `env.json` attachment bytes for `mode`
@@ -16167,9 +17367,10 @@ fn warn_record_env_mode(mode: RecordEnvMode) {
         ),
         RecordEnvMode::Allowlist => tracing::info!(
             allowlist = ENV_VALUE_ALLOWLIST_DOC,
+            secret_name_markers = %ENV_SECRET_NAME_MARKERS.join(", "),
             "recording env snapshot in allowlist mode: values recorded for allowlisted names \
-             only; all other values redacted to an FNV-1a 64 hash (divergence-detectable, \
-             secret-free)"
+             only, except a name with a secret marker segment; all other values redacted to an \
+             FNV-1a 64 hash (divergence-detectable, secret-free)"
         ),
     }
 }
@@ -16322,9 +17523,21 @@ fn run_dir_partition_provenance(
 /// when a bag crosses architectures or operating systems (float/libm results
 /// may differ in ULPs across arches, so a byte-mismatch on
 /// transcendental-heavy nodes may be arch skew rather than a regression).
-/// FLAT + minimal by design (a sacred user-facing format): `arch`, `os`,
+/// Minimal by design (a sacred user-facing format): `arch`, `os`,
 /// `cerulion_version`, `recorded_at_ns` (the recording's start timestamp —
-/// the same `now` that stamps the bag filename; no second clock read).
+/// the same `now` that stamps the bag filename; no second clock read), and
+/// three CONTRACT keys a replay applies: `trace_format`, `coordination` and
+/// `node_external`.
+///
+/// `node_external` is each native node's driver flag (`true` where the LOADED
+/// node declares the `external` policy), from
+/// [`crate::replay_engine::node_external_flags`]. A replay judges drivers by
+/// it rather than by the build it replays, and refuses a build whose drivers
+/// differ. The argument is REQUIRED, so no render can leave the key out: an
+/// ABSENT key means exactly "a recording made before the stamp". Every caller
+/// therefore renders AFTER the node libraries load, since the flags come from
+/// the loaded metadata (a source parse would describe the tree, not the build
+/// that runs). The map is a `BTreeMap`, so the key order is the id order.
 ///
 /// `coordination` is stamped EXPLICITLY on every bag this binary
 /// describes — monolith and lockstep routes included — so an ABSENT key means
@@ -16337,9 +17550,10 @@ fn run_dir_partition_provenance(
 ///
 /// ONE function, three callers (`prepare_recording_inputs`, the run
 /// directory, and `bag_cmd`'s `--run` attach, which copies the run directory's
-/// bytes) — the anti-drift contract `run_dir.rs` states. The mode is threaded
-/// in from the caller rather than resolved here, because only the caller knows
-/// which route the run took.
+/// bytes): the anti-drift contract `run_dir.rs` states. The mode and the
+/// driver flags are threaded in from the caller rather than resolved here,
+/// because only the caller knows which route the run took and holds the
+/// loaded nodes.
 ///
 /// `pub` for a fourth caller with the same anti-drift stake: the test suite's
 /// crafted format-4 bags. A
@@ -16351,6 +17565,7 @@ fn run_dir_partition_provenance(
 pub fn render_recorder_json(
     now: Duration,
     coordination: crate::replay_engine::CoordinationMode,
+    node_external: &std::collections::BTreeMap<String, bool>,
 ) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "arch": std::env::consts::ARCH,
@@ -16365,7 +17580,11 @@ pub fn render_recorder_json(
         // records carry READ-SITE ROLES; v6 marks a stream whose kind-6 aux
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
-        // binary writes. A replaying binary that supports a LOWER version
+        // binary writes; v8 marks a stream in which every edge names its frames'
+        // writers by run, and v9 one in which every multi-frame read whose batch
+        // fits its read stage's window names each frame it consumed, both also
+        // every bag this binary writes.
+        // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
         // v1 (back-compat).
@@ -16382,11 +17601,18 @@ pub fn render_recorder_json(
             // makes: it does, at every consult that found its queue empty but
             // the ones a POST-FIRE REFILL align pass made (a pass a plan-driven
             // replay never runs, so no replay re-derives those consults), so
-            // every bag it writes stamps 7.
+            // every bag it writes stamps at least 7.
             crate::replay_engine::recorder_stamps_consult_records(),
+            // Whether every edge carries its frames' writers, one annotation per
+            // writer run, and every multi-frame read whose batch fits its read
+            // stage's window names each frame it consumed: it does, so every bag
+            // this binary writes stamps 9.
+            crate::replay_engine::recorder_records_read_identity(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
+        // Each native node's driver flag, from the loaded metadata.
+        "node_external": node_external,
     }))
     .expect("recorder.json is a static-shape object; serialization cannot fail")
 }
@@ -16430,6 +17656,189 @@ fn parse_execution_mode_env(
         Some("lockstep") => (Some(crate::multiprocess::ExecutionMode::Lockstep), false),
         Some("free_run") => (Some(crate::multiprocess::ExecutionMode::FreeRun), false),
         Some(_) => (None, true),
+    }
+}
+
+/// Whether the partitioner keeps every linear chain in one group for this run:
+/// a run on the real clock, on unix, outside the lockstep mode, whose
+/// processes execute their nodes in executor units.
+fn run_keeps_linear_chains(
+    time_source: TimeSource,
+    execution_mode_request: Option<crate::multiprocess::ExecutionMode>,
+) -> bool {
+    time_source == TimeSource::Real
+        && cfg!(unix)
+        && !matches!(
+            execution_mode_request,
+            Some(crate::multiprocess::ExecutionMode::Lockstep)
+        )
+}
+
+#[cfg(test)]
+mod chain_keeping_tests {
+    use super::*;
+    use crate::multiprocess::ExecutionMode;
+    use cerulion_core::graph::config::{InputDef, OutputDef};
+    use cerulion_core::graph::node::{BackpressurePolicy, InputMeta};
+    use cerulion_core::graph::topology::{TriggerEdges, DEFAULT_CONSUMER_DEPTH};
+    use cerulion_core::graph::{
+        auto_partition, auto_partition_with_options, AutoPartition, AutoPartitionOptions, HopCosts,
+        PartitionCosts,
+    };
+    use cerulion_core::NodeInfo;
+    use indexmap::IndexMap;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// `src` fans out to `mid` and `side`, so `mid -> tail` is the one linear
+    /// chain; every node costs 1000 ns and every edge has rate 0, so the cost
+    /// model alone fuses nothing, and chain keeping makes `mid -> tail` one
+    /// group.
+    fn chain_partition(options: AutoPartitionOptions) -> (AutoPartition, AutoPartition) {
+        let node = |id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: id.to_string(),
+            node_type: id.to_string(),
+            inputs,
+            outputs,
+        };
+        let out = |name: &str| OutputDef {
+            name: name.to_string(),
+            schema: "Vector3".to_string(),
+            max_slice_len: None,
+            history_size: 0,
+            topic: None,
+        };
+        let inp = |name: &str, source: &str| InputDef {
+            name: name.to_string(),
+            source: source.to_string(),
+            ..Default::default()
+        };
+        let config = GraphConfig {
+            level_assignments: None,
+            network: None,
+            name: None,
+            identity: "chain".to_string(),
+            prefix: "p".to_string(),
+            nodes: vec![
+                node("src", vec![], vec![out("a"), out("b")]),
+                node("mid", vec![inp("inp", "src/a")], vec![out("m")]),
+                node("tail", vec![inp("inp", "mid/m")], vec![]),
+                node("side", vec![inp("inp", "src/b")], vec![]),
+            ],
+            multi_publisher_topics: Vec::new(),
+            process_groups: IndexMap::new(),
+            process_group_order: Vec::new(),
+        };
+        let meta = InputMeta {
+            name: "inp".to_string(),
+            schema_hash: 0,
+            trigger: true,
+            depth: DEFAULT_CONSUMER_DEPTH,
+            backpressure: BackpressurePolicy::DropOldest,
+            expect_within_ms: None,
+            consume: cerulion_core::graph::node::InputConsume::Fifo,
+            accumulate: false,
+        };
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert("src".to_string(), NodeInfo::with_meta(vec![], vec![]));
+        for id in ["mid", "tail", "side"] {
+            infos.insert(
+                id.to_string(),
+                NodeInfo::with_meta(vec![meta.clone()], vec![]),
+            );
+        }
+        let mut edges = TriggerEdges::new();
+        edges.insert("mid", "/p/src/a");
+        edges.insert("tail", "/p/mid/m");
+        edges.insert("side", "/p/src/b");
+        let costs = PartitionCosts {
+            node_p50_ns: ["src", "mid", "tail", "side"]
+                .into_iter()
+                .map(|id| (id.to_string(), 1_000u64))
+                .collect(),
+            edge_rate_mhz: BTreeMap::new(),
+            hop: HopCosts::platform_default(),
+        };
+        let isolated = BTreeSet::new();
+        let with = auto_partition_with_options(
+            &config, &infos, &edges, &costs, &isolated, 1_000_000, options,
+        )
+        .expect("derive");
+        let main =
+            auto_partition(&config, &infos, &edges, &costs, &isolated, 1_000_000).expect("derive");
+        (with, main)
+    }
+
+    /// The partition a run in `time_source` and `mode` takes, against
+    /// `auto_partition`'s own.
+    fn run_partition(
+        time_source: TimeSource,
+        mode: Option<ExecutionMode>,
+    ) -> (AutoPartition, AutoPartition) {
+        chain_partition(AutoPartitionOptions {
+            keep_linear_chains: run_keeps_linear_chains(time_source, mode),
+        })
+    }
+
+    /// A lockstep run takes `auto_partition`'s result byte for byte.
+    #[test]
+    fn a_lockstep_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::Real, Some(ExecutionMode::Lockstep));
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// A run on the virtual (simulated) clock takes `auto_partition`'s result
+    /// byte for byte.
+    #[test]
+    fn a_virtual_clock_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::Virtual, None);
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// A run on an external clock takes `auto_partition`'s result byte for
+    /// byte.
+    #[test]
+    fn an_external_clock_run_takes_mains_partition() {
+        let (run, main) = run_partition(TimeSource::External, None);
+        assert_eq!(format!("{run:?}"), format!("{main:?}"));
+    }
+
+    /// The control: a free run on the real clock keeps the chain, so the
+    /// fixture does tell the two apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_free_run_on_the_real_clock_keeps_the_chain() {
+        let (run, main) = run_partition(TimeSource::Real, None);
+        assert_ne!(run.groups, main.groups);
+        let group_of = |p: &AutoPartition, id: &str| {
+            p.groups
+                .iter()
+                .find(|(_, members)| members.iter().any(|m| m == id))
+                .map(|(g, _)| g.clone())
+                .expect("every node is in a group")
+        };
+        assert_eq!(group_of(&run, "mid"), group_of(&run, "tail"));
+        assert_ne!(group_of(&main, "mid"), group_of(&main, "tail"));
+    }
+
+    /// Chains are kept whole only for a run whose processes run executor
+    /// units: the real clock outside the lockstep mode.
+    #[test]
+    fn only_a_free_run_on_the_real_clock_keeps_linear_chains() {
+        use crate::multiprocess::ExecutionMode;
+        assert_eq!(run_keeps_linear_chains(TimeSource::Real, None), cfg!(unix));
+        assert_eq!(
+            run_keeps_linear_chains(TimeSource::Real, Some(ExecutionMode::FreeRun)),
+            cfg!(unix)
+        );
+        assert!(!run_keeps_linear_chains(
+            TimeSource::Real,
+            Some(ExecutionMode::Lockstep)
+        ));
+        assert!(!run_keeps_linear_chains(TimeSource::Virtual, None));
+        assert!(!run_keeps_linear_chains(TimeSource::External, None));
     }
 }
 
@@ -16574,6 +17983,8 @@ impl Drop for ScratchGuard {
 /// The prepared bagd input surface — [`prepare_recording_inputs`]'s result.
 #[cfg(unix)]
 struct RecordingInputs {
+    /// The bag path using the caller's directory spelling, for output and status.
+    display_out_path: std::path::PathBuf,
     /// Bag/ready/topics-json/env-json paths (see [`RecordingPaths`]).
     paths: RecordingPaths,
     /// RAII over the scratch files (ready/topics/env) — best-effort removed on
@@ -16650,6 +18061,10 @@ struct RecordingInputSpec<'a> {
     /// the ONE resolution point ([`resolve_run_coordination`]). Stamped into
     /// the bag's `recorder.json`, and through it into the bag's `trace_format`.
     coordination: crate::replay_engine::CoordinationMode,
+    /// Each native node's driver flag, from the LOADED node metadata
+    /// ([`crate::replay_engine::node_external_flags`]). Stamped into the bag's
+    /// `recorder.json` as `node_external`, the record a replay judges drivers by.
+    node_external: &'a std::collections::BTreeMap<String, bool>,
     /// The effective config cloned BEFORE the ros2 split — rendered VERBATIM
     /// as the `graph.yaml` attachment (the bag carries the WHOLE run in
     /// authored node order).
@@ -16666,6 +18081,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         recorded,
         record_env,
         coordination,
+        node_external,
         embed_config,
     } = spec;
     // Wall-clock filename is fine at the CLI layer (NOT the deterministic
@@ -16679,10 +18095,28 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
             record_dir.display()
         ))
     })?;
+    // Resolve a relative directory once, before passing paths to the recorder.
+    // File arguments are absolute; presentation retains the caller's spelling.
+    let absolute_record_dir = if record_dir.is_absolute() {
+        std::borrow::Cow::Borrowed(record_dir)
+    } else {
+        std::borrow::Cow::Owned(std::path::absolute(record_dir).map_err(|error| {
+            CliError::Validation(format!(
+                "recording: cannot resolve recording dir `{}`: {error}",
+                record_dir.display()
+            ))
+        })?)
+    };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let paths = resolve_recording_paths(record_dir, graph_name, now);
+    let paths = resolve_recording_paths(&absolute_record_dir, graph_name, now);
+    let display_out_path = record_dir.join(
+        paths
+            .out
+            .strip_prefix(absolute_record_dir.as_ref())
+            .map_err(|_| CliError::Validation("recording: output escaped its directory".into()))?,
+    );
     let scratch = ScratchGuard {
         paths: vec![
             paths.ready.clone(),
@@ -16708,11 +18142,11 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         .map_err(|e| CliError::Validation(format!("recording: write env.json: {e}")))?;
     // recorder.json: the recording host's arch/os/
     // version + the recording's own stamp (`now` reused — no second clock
-    // read). Shared here so single-process AND multi-process recordings both
-    // carry the attachment.
+    // read) + each node's driver flag. Shared here so single-process AND
+    // multi-process recordings both carry the attachment.
     std::fs::write(
         &paths.recorder_json,
-        render_recorder_json(now, coordination),
+        render_recorder_json(now, coordination, node_external),
     )
     .map_err(|e| CliError::Validation(format!("recording: write recorder.json: {e}")))?;
     // graph.yaml: the EFFECTIVE config this run executes, rendered to
@@ -16789,6 +18223,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
         }
     };
     Ok(RecordingInputs {
+        display_out_path,
         paths,
         scratch,
         graph_yaml,
@@ -16901,6 +18336,8 @@ fn report_record_schema_coverage(
 /// Bundled inputs for [`spawn_bagd_recorder`] (>7 independent args).
 #[cfg(unix)]
 struct BagdSpawnSpec<'a> {
+    display_out_path: Option<&'a Path>,
+    status_off: bool,
     graph_name: &'a str,
     out_path: &'a Path,
     topics_json_path: &'a Path,
@@ -17053,7 +18490,38 @@ fn bagd_argv(spec: &BagdSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
         argv.push("--schema-catalog".into());
         argv.push(catalog_path.into());
     }
+    if spec.status_off {
+        argv.push("--status-period-ms".into());
+        argv.push("0".into());
+    }
+    if let Some(directory) = spec.display_out_path.and_then(Path::parent) {
+        argv.push("--status-display-dir".into());
+        argv.push(directory.into());
+    }
     argv
+}
+
+/// Exclude recorder metadata before startup, or disable it when the shared topic is leased.
+#[cfg(unix)]
+fn prepare_bagd_status(
+    transport: &cerulion_core::TransportManager,
+    scope: &cerulion_core::transport::egress_scope::RunTopicScope,
+    graph_name: &str,
+) -> (
+    Option<cerulion_core::transport::egress_scope::LocalOnlyTopic>,
+    bool,
+) {
+    if !scope.excludes(cerulion_bagd::STATUS_TOPIC) {
+        return (None, false);
+    }
+    match transport.exclude_remote_topic(cerulion_bagd::STATUS_TOPIC) {
+        Ok(guard) => (Some(guard), false),
+        Err(error) => {
+            tracing::warn!(graph = %graph_name, topic = cerulion_bagd::STATUS_TOPIC, error = %error,
+                "recorder status disabled: the shared status topic cannot be excluded from remote access");
+            (None, true)
+        }
+    }
 }
 
 /// Extracted for reuse: spawn
@@ -17503,7 +18971,9 @@ fn flashback_switched_off() -> bool {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct FlashbackHandoff {
     /// The effective `graph.yaml` the run executes — what makes a capture
-    /// RE-EXECUTABLE rather than merely viewable.
+    /// RE-EXECUTABLE rather than merely viewable. Not handed over beside the
+    /// run's trace rings when `recorder.json` is missing
+    /// ([`resolve_flashback_handoff`]).
     graph_yaml: Option<std::path::PathBuf>,
     /// The run's environment snapshot.
     env_json: Option<std::path::PathBuf>,
@@ -17530,8 +19000,15 @@ struct FlashbackHandoff {
 /// and bagd would then fail to start. The window is the recorder's own exec, and
 /// the only way to reach it is for the run to end inside it — at which point the
 /// spawn guard is killing the recorder anyway.
+///
+/// `carries_trace` says whether the recorder is handed this run's scheduler
+/// trace rings; [`FlashbackSpawnSpec::handoff`] derives it from the rings the
+/// spawn hands over. Where it is and the directory holds no readable
+/// `recorder.json`, no `graph.yaml` is handed over either
+/// ([`crate::bag_cmd::RunArtifacts::graph_yaml_to_embed`]), so a capture is
+/// viewed rather than re-executed under assumed contract keys.
 #[cfg(unix)]
-fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
+fn resolve_flashback_handoff(run_dir: Option<&Path>, carries_trace: bool) -> FlashbackHandoff {
     let Some(dir) = run_dir else {
         // Not a degradation to report per-file: the run-directory write already logged ONE
         // loud line naming what an undescribed run loses, and repeating it per
@@ -17539,10 +19016,11 @@ fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
         return FlashbackHandoff::default();
     };
     let artifacts = crate::bag_cmd::read_run_artifacts(dir);
-    if !artifacts.unreadable.is_empty() {
+    let unreadable = artifacts.unreadable_for_bag(carries_trace);
+    if !unreadable.is_empty() {
         tracing::warn!(
             dir = %dir.display(),
-            unreadable = ?artifacts.unreadable,
+            unreadable = ?unreadable,
             "flashback: this run's directory is missing artifacts, so a capture of it \
              will carry less than it could — a capture with no graph.yaml can be VIEWED but not \
              re-executed (`cerulion bag play --resim`). `__cerulion/flashback.json` records which \
@@ -17552,7 +19030,7 @@ fn resolve_flashback_handoff(run_dir: Option<&Path>) -> FlashbackHandoff {
     let path = |present: bool, name: &str| present.then(|| dir.join(name));
     FlashbackHandoff {
         graph_yaml: path(
-            artifacts.graph_yaml.is_some(),
+            artifacts.graph_yaml_to_embed(carries_trace).is_some(),
             crate::run_dir::RUN_GRAPH_FILE,
         ),
         env_json: path(artifacts.env_json.is_some(), crate::run_dir::RUN_ENV_FILE),
@@ -17596,12 +19074,15 @@ struct FlashbackSpawnSpec<'a> {
     /// in which case there is no ring to find and the recorder is not sent
     /// sweeping for one.
     state_tag: Option<&'a str>,
-    /// **The run context, so a capture describes the run it came
-    /// from.** See [`FlashbackHandoff`] — the recorder expects
-    /// these (`cerulion_bagd::capture::CaptureJob::attachments` is documented as
-    /// "the same attachments the continuous bag carries, so a flashback is as
-    /// self-describing as a recording").
-    handoff: &'a FlashbackHandoff,
+    /// **The run directory a capture's run context is read from, so a capture
+    /// describes the run it came from.** [`FlashbackSpawnSpec::handoff`]
+    /// resolves it into a [`FlashbackHandoff`] against
+    /// [`ring_names`](Self::ring_names); the recorder expects those artifacts
+    /// (`cerulion_bagd::capture::CaptureJob::attachments` is documented as "the
+    /// same attachments the continuous bag carries, so a flashback is as
+    /// self-describing as a recording"). `None` when no run directory was
+    /// written, which already logged its own line.
+    run_dir: Option<&'a Path>,
     /// **The run's SCHEDULER-TRACE rings, by resolved SHM name.**
     ///
     /// This is what makes a capture of a plain `graph run` RE-EXECUTABLE — the
@@ -17640,6 +19121,162 @@ struct FlashbackSpawnSpec<'a> {
     record_cpu: RecordCpu,
 }
 
+#[cfg(unix)]
+impl FlashbackSpawnSpec<'_> {
+    /// What this recorder is handed out of [`run_dir`](Self::run_dir).
+    ///
+    /// Whether the recorder carries this run's trace is read off the same
+    /// [`ring_names`](Self::ring_names) its argv hands over, so the graph is
+    /// withheld beside a trace with no `recorder.json`
+    /// ([`resolve_flashback_handoff`]) on every spawn, from the one slice
+    /// that decides both.
+    fn handoff(&self) -> FlashbackHandoff {
+        resolve_flashback_handoff(self.run_dir, !self.ring_names.is_empty())
+    }
+}
+
+/// What `graph run` can truthfully say about its run when it prints its
+/// status line ([`running_line`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RunStatus {
+    /// A multi-process deployment: every worker is READY and GO is signalled.
+    Deployed {
+        /// Nodes in the deployed graph.
+        nodes: usize,
+        /// Worker processes running them.
+        processes: usize,
+    },
+    /// A one-process run whose loop is stepping (`--time-source virtual`,
+    /// after its launch refusal check).
+    OneProcess,
+    /// A one-process LIVE run about to enter `run_live`, which can still
+    /// refuse it at launch (an inert external node), so the line says
+    /// "starting", never "running".
+    OneProcessStarting,
+}
+
+/// The line `graph run` prints on stderr when its graph starts: which graph,
+/// in how many processes when it is split, and how to stop it.
+///
+/// It is the run's own output, printed at every filter: `graph run` defaults to
+/// `warn`, which hides the `info` lifecycle line logged beside it, and a run
+/// that prints nothing between its start and Ctrl+C reads as a hang.
+fn running_line(graph: &str, status: RunStatus) -> String {
+    match status {
+        RunStatus::Deployed { nodes, processes } => format!(
+            "graph '{graph}' running: {nodes} node(s) in {processes} process(es); press Ctrl+C to \
+             stop"
+        ),
+        RunStatus::OneProcess => {
+            format!("graph '{graph}' running in one process; press Ctrl+C to stop")
+        }
+        RunStatus::OneProcessStarting => {
+            format!("graph '{graph}' starting in one process; press Ctrl+C to stop")
+        }
+    }
+}
+
+/// Print [`running_line`]'s line on stderr.
+// `print_stderr` exception: this is CLI output (the run's status line), the
+// stderr twin of `recording written to <path>`'s stdout line, and it must
+// print under the quiet default that filters the `info` line beside it.
+#[allow(clippy::print_stderr)]
+fn announce_running(line: &str) {
+    eprintln!("{line}");
+}
+
+#[cfg(test)]
+mod running_line_tests {
+    use super::{running_line, RunStatus};
+
+    /// Hand-written oracles for every status: the multi-process line names the
+    /// node and process counts, the one-process lines name neither, and a live
+    /// one-process run that can still refuse says it is starting.
+    #[test]
+    fn the_running_line_names_the_graph_its_processes_and_how_to_stop() {
+        assert_eq!(
+            running_line(
+                "obstacle_avoidance",
+                RunStatus::Deployed {
+                    nodes: 2,
+                    processes: 2
+                }
+            ),
+            "graph 'obstacle_avoidance' running: 2 node(s) in 2 process(es); press Ctrl+C to stop"
+        );
+        assert_eq!(
+            running_line("demo", RunStatus::OneProcess),
+            "graph 'demo' running in one process; press Ctrl+C to stop"
+        );
+        assert_eq!(
+            running_line("demo", RunStatus::OneProcessStarting),
+            "graph 'demo' starting in one process; press Ctrl+C to stop"
+        );
+    }
+}
+
+/// Where a `--record` run was when Ctrl+C stopped it before its recorder was
+/// armed ([`warn_recording_not_started`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordingNotStarted {
+    /// The multi-process supervisor was still spawning its workers, so the
+    /// recorder was never spawned.
+    DuringSpawn,
+    /// The recorder was spawned and had not reported ready.
+    DuringRecorderStartup,
+}
+
+/// Say that a `--record` run wrote no bag because Ctrl+C arrived before its
+/// recorder was armed.
+///
+/// A `warn`: the run was asked to record and ends with no
+/// `recording written to <path>` line, and `graph run`'s quiet default hides
+/// `info`, so this is the line that says no bag exists.
+#[cfg(unix)]
+fn warn_recording_not_started(graph_name: &str, when: RecordingNotStarted) {
+    match when {
+        RecordingNotStarted::DuringSpawn => tracing::warn!(
+            graph = %graph_name,
+            "Ctrl-C during spawn phase: recording not started (no data was recorded)"
+        ),
+        RecordingNotStarted::DuringRecorderStartup => tracing::warn!(
+            graph = %graph_name,
+            "recording cancelled before start (Ctrl-C during recorder startup): no data \
+             was recorded"
+        ),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod recording_not_started_tests {
+    use super::{warn_recording_not_started, RecordingNotStarted};
+
+    /// Both cancel points say at `warn`, which `graph run`'s quiet default
+    /// prints, that no bag was written; an `info` twin would be hidden.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_recording_stopped_before_its_recorder_is_armed_warns_that_nothing_was_recorded() {
+        warn_recording_not_started("demo", RecordingNotStarted::DuringSpawn);
+        warn_recording_not_started("demo", RecordingNotStarted::DuringRecorderStartup);
+        logs_assert(|lines: &[&str]| {
+            let at =
+                |level: &str, marker: &str| cerulion_core::testing::count_at(lines, level, marker);
+            match (
+                at("WARN", "recording not started (no data was recorded)"),
+                at("WARN", "recording cancelled before start"),
+                at("INFO", "no data"),
+            ) {
+                (1, 1, 0) => Ok(()),
+                (spawn, startup, infos) => Err(format!(
+                    "expected one WARN per cancel point and no INFO twin, got {spawn} and \
+                     {startup} WARN, {infos} INFO"
+                )),
+            }
+        });
+    }
+}
+
 /// PURE — the argv an always-on recorder is spawned with.
 ///
 /// Split out and pinned for the same reason `bagd_argv` is: it is the whole
@@ -17650,8 +19287,14 @@ struct FlashbackSpawnSpec<'a> {
 /// continuous bag) but is still REQUIRED by `BagdArgs`; it is placed inside the
 /// flashback directory so that if the mode were ever lost the bag would still
 /// land somewhere deliberate rather than in the operator's CWD.
+///
+/// `handoff` is the run context the spawn resolved for this spec
+/// ([`FlashbackSpawnSpec::handoff`]).
 #[cfg(unix)]
-fn flashback_argv(spec: &FlashbackSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
+fn flashback_argv(
+    spec: &FlashbackSpawnSpec<'_>,
+    handoff: &FlashbackHandoff,
+) -> Vec<std::ffi::OsString> {
     use std::ffi::OsString;
 
     let mut argv: Vec<OsString> = vec!["bagd".into()];
@@ -17683,18 +19326,18 @@ fn flashback_argv(spec: &FlashbackSpawnSpec<'_>) -> Vec<std::ffi::OsString> {
     // Each is passed only when it was READABLE (see `resolve_flashback_handoff`):
     // bagd reads every `--attach` at startup and a missing file is a LOUD startup
     // failure, so an unconditional path would trade a THIN capture for NO WINDOW.
-    if let Some(p) = spec.handoff.graph_yaml.as_deref() {
+    if let Some(p) = handoff.graph_yaml.as_deref() {
         argv.push("--attach".into());
         argv.push(format!("{GRAPH_YAML_ATTACHMENT}:{}", p.display()).into());
     }
-    if let Some(p) = spec.handoff.env_json.as_deref() {
+    if let Some(p) = handoff.env_json.as_deref() {
         argv.push("--attach".into());
         argv.push(format!("{ENV_JSON_ATTACHMENT}:{}", p.display()).into());
     }
     // The host identity rides its OWN path-only flag, exactly as on the
     // `--record` path — the `__cerulion/` attachment namespace is reserved at
     // bagd's `--attach`, and bagd supplies the name.
-    if let Some(p) = spec.handoff.recorder_json.as_deref() {
+    if let Some(p) = handoff.recorder_json.as_deref() {
         argv.push("--recorder-json".into());
         argv.push(p.into());
     }
@@ -17824,7 +19467,7 @@ fn write_flashback_topics(dir: &Path, graph_name: &str) -> Option<std::path::Pat
 fn spawn_flashback_recorder(spec: FlashbackSpawnSpec<'_>) -> Option<ChildGuard> {
     use std::os::unix::process::CommandExt;
 
-    let argv = flashback_argv(&spec);
+    let argv = flashback_argv(&spec, &spec.handoff());
     let self_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -18295,6 +19938,7 @@ fn spawn_bagd_recorder(spec: BagdSpawnSpec<'_>) -> CliResult<ChildGuard> {
     let BagdSpawnSpec {
         graph_name,
         out_path,
+        display_out_path,
         record_cpu,
         ..
     } = spec;
@@ -18380,7 +20024,7 @@ fn spawn_bagd_recorder(spec: BagdSpawnSpec<'_>) -> CliResult<ChildGuard> {
     })?;
     let pid = child.id();
     let guard = ChildGuard::new(child, format!("bagd[{graph_name}]"));
-    tracing::info!(graph = %graph_name, pid, bag = %out_path.display(), "spawned bagd recorder");
+    tracing::info!(graph = %graph_name, pid, bag = %display_out_path.unwrap_or(out_path).display(), "spawned bagd recorder");
     Ok(guard)
 }
 
@@ -18397,6 +20041,8 @@ struct RecordingRun<'a> {
     config: GraphConfig,
     factories: indexmap::IndexMap<String, Box<dyn cerulion_core::NodeEntry>>,
     schema_hashes: &'a std::collections::HashMap<String, u64>,
+    excluded_topics: &'a [String],
+    producer_scope: cerulion_core::transport::egress_scope::RunTopicScope,
     record_dir: &'a Path,
     record_env: RecordEnvMode,
     record_cpu: RecordCpu,
@@ -18449,6 +20095,8 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         config: _config,
         factories: _factories,
         schema_hashes: _schema_hashes,
+        excluded_topics: _excluded_topics,
+        producer_scope: _producer_scope,
         record_dir: _record_dir,
         record_env: _record_env,
         record_cpu: _record_cpu,
@@ -18721,6 +20369,41 @@ fn worker_recording_ring_tag(graph: &str, sup_pid: u32, rank: usize) -> String {
 #[cfg(unix)]
 fn departure_ring_tag(graph: &str, sup_pid: u32) -> String {
     format!("cer_rec_{graph}_{sup_pid}_dep")
+}
+
+/// Write this run's `recorder.json` into its directory, BEST-EFFORT: one warn on
+/// failure, and the run continues.
+///
+/// Called once per run, after the node libraries load (the file carries each
+/// node's driver flag, `node_external`, from the loaded metadata) and before
+/// the run declares any trace ring in `run.json` or spawns its window
+/// recorder. A recorder reads `run.json` first, so one that finds a ring
+/// there finds this file unless this write failed, and then the bag or
+/// capture it takes embeds no graph
+/// (`bag_cmd::RunArtifacts::graph_yaml_to_embed`). `run_dir` is `None` when
+/// no directory was written, which already logged its own line.
+#[cfg(unix)]
+fn write_run_recorder_best_effort(
+    run_dir: Option<&Path>,
+    recorded_at: Duration,
+    coordination: crate::replay_engine::CoordinationMode,
+    node_external: &std::collections::BTreeMap<String, bool>,
+) {
+    let Some(dir) = run_dir else {
+        return;
+    };
+    let bytes = render_recorder_json(recorded_at, coordination, node_external);
+    if let Err(e) = crate::run_dir::write_run_recorder(dir, &bytes) {
+        tracing::warn!(
+            dir = %dir.display(),
+            error = %e,
+            "could not write this run's recorder.json, which holds the trace format, \
+             coordination and driver flags a resim judges this run's trace by. The graph runs \
+             normally, but a bag `cerulion bag record --run` or the window recorder takes of \
+             this run that carries its trace carries neither that file nor the graph, so it \
+             can be viewed and not re-executed"
+        );
+    }
 }
 
 /// Declare this run's trace rings into its `run.json`, DEGRADING
@@ -19872,6 +21555,22 @@ impl CreditDeathWatch {
                 .unwrap_or_else(|| format!("<rank {rank}>"))
         };
         for action in actions {
+            // Release the dead consumer's slot: THIS edge's word only. Every
+            // other edge (another consumer of the same topic included) keeps
+            // its own word and its own count.
+            let mut slot_released = false;
+            if matches!(
+                action.role,
+                crate::multiprocess::CreditDeathRole::Consumer { .. }
+            ) {
+                if cerulion_core::oracle_mutant::active("block_shared_release") {
+                    for w in &self.watched {
+                        slot_released |= w.word.release_slot();
+                    }
+                } else if let Some(row) = self.watched.get(action.edge_idx) {
+                    slot_released = row.word.release_slot();
+                }
+            }
             let Some(row) = self.watched.get_mut(action.edge_idx) else {
                 // A diagnostic must never wedge the path it observes (the
                 // `lock_regime_latch` precedent). `credit_death_actions`
@@ -19905,22 +21604,25 @@ impl CreditDeathWatch {
                     for r in &deferred_producers {
                         row.named_alive.insert(*r as u32);
                     }
+                    let producer_field = row.edge.producer_nodes.join(",");
                     match row.latch.on_failure() {
                         RegimeDecision::Loud => tracing::warn!(
                             group = %dead_group,
                             node_id = %row.edge.consumer_node,
                             topic = %row.edge.topic,
                             consumer_input = %row.edge.consumer_input,
+                            producer = %producer_field,
+                            reason = cerulion_core::scheduler::block::ReleaseReason::ConsumerDied
+                                .as_str(),
+                            slot_released,
                             dead_rank = action.dead_rank,
                             deferred_producer_ranks = %ranks_field,
                             deferred_producer_groups = %groups_field,
                             total_failures = row.latch.total_failures(),
-                            "a cross-process `block` edge lost its CONSUMER — its credit \
-                             word will never be drained again, so the producer rank(s) \
-                             above are PERMANENTLY deferred at the credit gate on this \
-                             topic. They are not known dead, and will publish nothing more \
-                             here. The wedge alarm cannot see this: a producer deferred at \
-                             the credit gate never entered a tick"
+                            "a cross-process `block` edge lost its CONSUMER: its credit slot \
+                             is RELEASED, so the producer no longer waits on that consumer and \
+                             resumes publishing. Frames published to the dead consumer are \
+                             lost with it; the topic's other consumers keep their own slots"
                         ),
                         // The re-announcement exists for the operator who
                         // MISSED the head (the latch's decade ladder), so it
@@ -20523,8 +22225,9 @@ struct SupervisorRecording {
     /// never reached — a pre-JOIN supervisor error abandons the bag
     /// un-finalized, the same class as the single-process pre-run error paths.
     bagd: ChildGuard,
+    _status_scope: Option<cerulion_core::transport::egress_scope::LocalOnlyTopic>,
     /// The bag path (the deliverable — reported by `finalize`).
-    out_path: std::path::PathBuf,
+    display_out_path: std::path::PathBuf,
     /// RAII over the scratch files (ready/topics/env + bagd's iox2-config).
     _scratch: ScratchGuard,
 }
@@ -20542,13 +22245,15 @@ impl SupervisorRecording {
     fn finalize(mut self, graph_name: &str) -> CliResult<()> {
         self.bagd.signal_term();
         let outcome = wait_for_child_bounded(&mut self.bagd, RECORDING_FINALIZE_DEADLINE);
-        report_bagd_outcome(graph_name, &self.out_path, outcome, &mut self.bagd)
+        report_bagd_outcome(graph_name, &self.display_out_path, outcome, &mut self.bagd)
     }
 }
 
 /// Bundled inputs for [`start_supervisor_recording`] (>7 independent args).
 #[cfg(unix)]
 struct SupervisorRecordingStart<'a> {
+    transport: &'a cerulion_core::TransportManager,
+    producer_scope: &'a cerulion_core::transport::egress_scope::RunTopicScope,
     record_dir: &'a Path,
     /// Resolves the `schemas/` corpus whose custom-type text becomes
     /// the bag's schema provenance — the SAME input the single-process path
@@ -20592,6 +22297,10 @@ struct SupervisorRecordingStart<'a> {
     /// pure map (`resolve_run_coordination`), so the recording describes
     /// exactly the coordination the workers ran under.
     execution_mode: crate::multiprocess::ExecutionMode,
+    /// Each native node's driver flag, from the supervisor's LOADED planning
+    /// metadata (`loaded_entry_infos`), the same metadata the bag's schema
+    /// hashes come from.
+    node_external: &'a std::collections::BTreeMap<String, bool>,
 }
 
 /// Bring the multi-process recording session up, BETWEEN
@@ -20620,6 +22329,8 @@ fn start_supervisor_recording(
     start: SupervisorRecordingStart<'_>,
 ) -> CliResult<Option<SupervisorRecording>> {
     let SupervisorRecordingStart {
+        transport,
+        producer_scope,
         embed_config,
         record_dir,
         workspace_root,
@@ -20636,6 +22347,7 @@ fn start_supervisor_recording(
         state_tag,
         trace_plane,
         execution_mode,
+        node_external,
     } = start;
 
     // (1) the shared input prep (bag path, ready sentinel, topics-json,
@@ -20646,6 +22358,7 @@ fn start_supervisor_recording(
     // from), not read from `graphs/<file>.yaml`, so the bag's graph and its
     // per-rank manifests cannot describe different runs.
     let RecordingInputs {
+        display_out_path,
         paths,
         mut scratch,
         graph_yaml,
@@ -20664,6 +22377,7 @@ fn start_supervisor_recording(
         // free-ran (same value, same stamp), the default; `Lockstep` means
         // the run opted out with `CERULION_EXECUTION_MODE=lockstep`.
         coordination: resolve_run_coordination(execution_mode),
+        node_external,
     })?;
 
     // (2) bagd's iceoryx2 Config file (the DEFAULT `iox2_` data-plane
@@ -20716,8 +22430,11 @@ fn start_supervisor_recording(
     // two are one string.
     let flashback_uniform_dir = (!flashback_switched_off())
         .then(|| begin_flashback_plane(workspace_root, graph_name, effective_config));
+    let (status_scope, status_off) = prepare_bagd_status(transport, producer_scope, graph_name);
     let mut bagd = spawn_bagd_recorder(BagdSpawnSpec {
+        display_out_path: Some(&display_out_path),
         graph_name,
+        status_off,
         out_path: &paths.out,
         topics_json_path: &paths.topics_json,
         ready_path: &paths.ready,
@@ -20740,7 +22457,7 @@ fn start_supervisor_recording(
         if paths.out.exists() {
             CliError::Validation(format!(
                 "{e} A partial bag may exist at `{}` (un-finalized — replay will refuse it).",
-                paths.out.display()
+                display_out_path.display()
             ))
         } else {
             e
@@ -20753,24 +22470,21 @@ fn start_supervisor_recording(
             bagd.signal_term();
             let _ = wait_for_child_bounded(&mut bagd, RECORDING_FINALIZE_DEADLINE);
             bagd.kill_and_reap();
-            tracing::info!(
-                graph = %graph_name,
-                "recording cancelled before start (Ctrl-C during recorder startup) — no data \
-                 was recorded"
-            );
+            warn_recording_not_started(graph_name, RecordingNotStarted::DuringRecorderStartup);
             return Ok(None);
         }
     }
     tracing::info!(
         graph = %graph_name,
         rings = ring_names.len(),
-        bag = %paths.out.display(),
+        bag = %display_out_path.display(),
         "bagd ready — multi-process recording armed (every worker ring + the departure ring)"
     );
 
     Ok(Some(SupervisorRecording {
         bagd,
-        out_path: paths.out.clone(),
+        _status_scope: status_scope,
+        display_out_path,
         _scratch: scratch,
     }))
 }
@@ -20784,6 +22498,8 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         config,
         factories,
         schema_hashes,
+        excluded_topics,
+        producer_scope,
         record_dir,
         record_env,
         record_cpu,
@@ -20809,6 +22525,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     for (id, entry) in &factories {
         entry_infos.insert(id.clone(), entry.info()?);
     }
+    // Each node's driver flag for the bag's `recorder.json`, from the same
+    // loaded metadata the runtime is built with.
+    let node_external = crate::replay_engine::node_external_flags(&entry_infos);
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
     let recorded = resolve_recorded_topics(workspace_root, &config, &entry_infos, None)?;
     if recorded.is_empty() {
@@ -20852,6 +22571,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         // inert-network info breadcrumb).
         network: None,
     })?;
+    let _exclusions = exclude_run_topics(&transport, excluded_topics)?;
     // Resolve the live-loop monitor-wait park policy (mirrors the live arm) —
     // recording runs the live WaitSet loop, so the park/cap knobs apply.
     let env_monitor_wait = std::env::var(MONITOR_WAIT_ENV).ok();
@@ -20987,6 +22707,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // (also used by the multi-process supervisor recording, so the two
     // paths can never drift on the bagd handshake surface).
     let RecordingInputs {
+        display_out_path,
         paths,
         scratch: _scratch,
         graph_yaml: graph_yaml_path,
@@ -21006,6 +22727,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         // execution-mode variable says (`resolve_run_execution_mode` answers the same
         // for a monolith; the pin asserts the two agree).
         coordination: resolve_run_coordination(MONOLITH_EXECUTION_MODE),
+        // From the metadata this run's runtime was built with (`entry_infos`,
+        // harvested before the build consumed the factories).
+        node_external: &node_external,
     })?;
     let RecordingPaths {
         out: out_path,
@@ -21033,8 +22757,12 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // snapshot's key.
     let flashback_uniform_dir = (!flashback_switched_off())
         .then(|| begin_flashback_plane(workspace_root, graph_name, &effective_config));
+    let (_bagd_status_scope, status_off) =
+        prepare_bagd_status(&transport, &producer_scope, graph_name);
     let mut guard = spawn_bagd_recorder(BagdSpawnSpec {
+        display_out_path: Some(&display_out_path),
         graph_name,
+        status_off,
         out_path: &out_path,
         topics_json_path: &topics_json_path,
         ready_path: &ready_path,
@@ -21063,7 +22791,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
         if out_path.exists() {
             CliError::Validation(format!(
                 "{e} A partial bag may exist at `{}` (un-finalized — replay will refuse it).",
-                out_path.display()
+                display_out_path.display()
             ))
         } else {
             e
@@ -21078,15 +22806,14 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
             guard.signal_term();
             let _ = wait_for_child_bounded(&mut guard, RECORDING_FINALIZE_DEADLINE);
             guard.kill_and_reap();
-            tracing::info!(
-                graph = %graph_name,
-                "recording cancelled before start (Ctrl-C during recorder startup) — no data \
-                 was recorded"
-            );
+            warn_recording_not_started(graph_name, RecordingNotStarted::DuringRecorderStartup);
             return Ok(());
         }
     }
     tracing::info!(graph = %graph_name, "bagd ready — starting recorded graph run (press Ctrl+C to stop)");
+    // `run_live` below can still refuse the run at launch, as on the
+    // unrecorded live arm.
+    announce_running(&running_line(graph_name, RunStatus::OneProcessStarting));
 
     // ---- (8) C-state cap (mirrors the live arm) + the live wall-following loop.
     let env_lock = std::env::var(CPU_DMA_LOCK_ENV).ok();
@@ -21265,7 +22992,7 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
     // Report the bagd outcome UNCONDITIONALLY (logs) BEFORE the
     // run-error early return — the operator must learn the state of the
     // deliverable (.mcap on disk) even when the live run itself failed.
-    let bagd_result = report_bagd_outcome(graph_name, &out_path, bagd_outcome, &mut guard);
+    let bagd_result = report_bagd_outcome(graph_name, &display_out_path, bagd_outcome, &mut guard);
 
     // Propagate a live-run failure first (e.g. an inert external node refused at
     // launch) — the bag may be short but the run itself failed. The bagd outcome
@@ -21614,15 +23341,10 @@ pub fn resolve_recorded_topics(
     // wins; multi-publisher producers share a schema).
     let mut out: indexmap::IndexMap<String, cerulion_bagd::RecordedTopic> =
         indexmap::IndexMap::new();
-    // Every graph-produced topic, selected or not: the external-consumer
-    // classification below is about who PRODUCES a topic, not what this
-    // recording selects.
-    let mut produced: std::collections::HashSet<String> = std::collections::HashSet::new();
     for node_def in &config.nodes {
         for output in &node_def.outputs {
             let topic =
                 cerulion_core::graph::resolve_output_topic(&config.prefix, &node_def.id, output);
-            produced.insert(topic.clone());
             // The selection applies BEFORE the metadata lookup: a names-only
             // output the recording does not select must not fail startup.
             if selected.is_some_and(|set| !set.contains(&topic)) {
@@ -21749,13 +23471,15 @@ pub fn resolve_recorded_topics(
     // replay engine injects external topics FROM the bag; an unrecorded one
     // injects nothing, so its downstream consumers never fire). This is the
     // SHARED record-time seam: both the single-process path and the
-    // mp supervisor resolve their recorded set through this fn, so both warn
-    // identically at bring-up. Once per topic (consumers deduped, config
-    // order); graph-produced and consumer-less topics never warn. Mirrors the
-    // consumed∧¬produced classification `replay_engine::classify_topics`
-    // applies at replay time.
+    // mp supervisor resolve their recorded set through this fn, but the
+    // single-process path refuses a graph with such a topic before it gets
+    // here (`refuse_outside_inputs_in_single_process_recording`), so on
+    // `graph_run`'s routes only the mp supervisor reaches this warn with one.
+    // Once per topic (consumers deduped, config order); graph-produced and
+    // consumer-less topics never warn. Mirrors the consumed∧¬produced
+    // classification `replay_engine::classify_topics` applies at replay time.
     {
-        let unrecorded = external_consumers(config, &produced);
+        let unrecorded = external_consumers(config);
         for (topic, consumers) in &unrecorded {
             tracing::warn!(
                 topic = %topic,
@@ -21775,10 +23499,11 @@ pub fn resolve_recorded_topics(
 /// even when a recording's topic selection leaves it out of the bag: replay
 /// re-runs its producer and regenerates it.
 #[cfg(unix)]
-fn external_consumers(
-    config: &GraphConfig,
-    produced: &std::collections::HashSet<String>,
-) -> indexmap::IndexMap<String, Vec<String>> {
+fn external_consumers(config: &GraphConfig) -> indexmap::IndexMap<String, Vec<String>> {
+    // Every graph-produced topic, whatever a recording selects (the
+    // classification is about who PRODUCES a topic), by the derivation the
+    // replay's own topic classification uses.
+    let produced = crate::replay_engine::graph_produced_topics(config);
     let mut unrecorded: indexmap::IndexMap<String, Vec<String>> = indexmap::IndexMap::new();
     for node_def in &config.nodes {
         for input in &node_def.inputs {
@@ -21793,6 +23518,64 @@ fn external_consumers(
         }
     }
     unrecorded
+}
+
+/// Refuse a single-process recording of a graph that reads a topic no node in
+/// it publishes, naming every such topic with its readers (config order).
+///
+/// The recording runs on a controlled gating clock that starts at 0 and
+/// follows measured wall time from the live loop's start, and every frame the
+/// graph publishes carries that clock in its wire `timestamp_ns`. A live
+/// process outside the graph (a plain `graph run`, a driver,
+/// `cerulion-rcpd`) stamps boot-monotonic time: `real_ns()`, or a clock
+/// placed at it when its loop starts. The resim re-advances this recording's
+/// clock from 0 and injects a recorded outside frame before the first step
+/// whose clock target is above the frame's stamp, or equal to it on a step
+/// that did not advance the clock (`replay_engine`'s `InjectionWindow`). A
+/// stamp that counts from boot lies above targets that count from the run's
+/// start, so the frame is injected late or not at all and `--verify` reports
+/// a divergence.
+///
+/// Placing this clock at its live anchor, as a free-run worker does
+/// (`GraphRuntime::place_gating_epoch_at_live_anchor`), puts both writers in
+/// one domain live, but the replay cannot follow it: the bag carries no epoch,
+/// and the replay of this lockstep-stamped bag starts its clock at 0 with each
+/// `Period` deadline one interval later, so its first step would advance by
+/// the whole epoch and every `Period` node would owe a catch-up fire for each
+/// interval since 0. The stamps are not the only gap: the runtime subscribes
+/// when it is built, before the recorder is spawned and taps an outside topic
+/// by discovery, so frames the graph reads in its first steps can be missing
+/// from the bag. `graph_run` calls this for a single-process recording right
+/// after it lifts the `ros2:` entries out of the graph, before it spawns them,
+/// writes the run directory, loads the node factories or builds the runtime.
+#[cfg(unix)]
+fn refuse_outside_inputs_in_single_process_recording(
+    config: &GraphConfig,
+    graph_name: &str,
+) -> CliResult<()> {
+    let outside = external_consumers(config);
+    if outside.is_empty() {
+        return Ok(());
+    }
+    let listed: Vec<String> = outside
+        .iter()
+        .map(|(topic, readers)| format!("'{topic}' (read by {})", readers.join(", ")))
+        .collect();
+    let what = if outside.len() == 1 {
+        "a topic"
+    } else {
+        "topics"
+    };
+    Err(CliError::Validation(format!(
+        "`graph run --record --single-process`: graph '{graph_name}' reads {what} that no node \
+         in it publishes: {}. A single-process recording stamps its own frames from a clock \
+         that starts at zero when the run starts, while a process outside the graph stamps \
+         boot-monotonic time, so `cerulion bag play --resim` could not inject the outside frames \
+         at the steps that read them. Record this graph without `--single-process`: the default \
+         multi-process run places each process's clock at boot-monotonic time when its loop \
+         starts.",
+        listed.join(", ")
+    )))
 }
 
 /// Parse every workspace `schemas/*.yaml` PLUS every
@@ -22096,6 +23879,73 @@ const RECORDING_FINALIZE_DEADLINE: Duration = Duration::from_secs(30);
 mod tests {
     use super::*;
 
+    #[test]
+    #[tracing_test::traced_test]
+    fn paired_lan_start_has_no_open_access_warning() {
+        lan_access_breadcrumb("paired_graph", Some(cerulion_core::LanAccess::Paired));
+        assert!(!logs_contain("WARN"));
+        assert!(!logs_contain(PERMISSIVE_EGRESS_NOTICE));
+    }
+
+    #[test]
+    fn getting_started_step_five_output_matches_the_quiet_paired_default() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../docs/tutorials/01-getting-started.md");
+        let tutorial = std::fs::read_to_string(path).expect("getting-started tutorial must exist");
+        let step = tutorial
+            .split_once("## Step 5: Build and Run")
+            .expect("tutorial must contain Step 5")
+            .1
+            .split_once("## Step 6: Inspect Topics")
+            .expect("Step 5 must end at Step 6")
+            .0;
+        let output = step
+            .split_once("**Expected output:**")
+            .expect("Step 5 must show its output")
+            .1
+            .split_once("```\n")
+            .expect("expected output must be fenced")
+            .1
+            .split_once("\n```")
+            .expect("expected output fence must close")
+            .0;
+        assert_eq!(
+            cerulion_core::LanAccess::platform_default(),
+            cerulion_core::LanAccess::Paired
+        );
+        assert!(output.contains("graph 'obstacle_avoidance' running: 3 node(s) in 3 process(es)"));
+        assert!(output.contains("INFO safety_controller: emergency stop"));
+        assert!(
+            !tutorial.contains("OPEN BY DEFAULT"),
+            "the tutorial must not claim unauthenticated LAN access is the default"
+        );
+        assert!(
+            !output.lines().any(|line| line.starts_with("WARN ")),
+            "the paired first run must not show an open-access warning"
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn explicit_open_lan_start_names_unpaired_access_and_the_default_remedy() {
+        lan_access_breadcrumb("open_graph", Some(cerulion_core::LanAccess::Open));
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain(PERMISSIVE_EGRESS_NOTICE));
+        assert!(logs_contain("unpaired peers"));
+        assert!(logs_contain(
+            "Unset CERULION_LAN_ACCESS to restore paired access"
+        ));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn unknown_lan_posture_warns_without_claiming_open_access() {
+        lan_access_breadcrumb("unknown_graph", None);
+        assert!(logs_contain("WARN"));
+        assert!(logs_contain("did not report a LAN-access posture"));
+        assert!(!logs_contain(PERMISSIVE_EGRESS_NOTICE));
+    }
+
     /// A paired run rides only a netd that reports paired: an open or an
     /// unknown posture is refused. An open run accepts every netd. Hand
     /// oracle over all six (reported, requested) pairs.
@@ -22373,18 +24223,58 @@ mod tests {
         assert_eq!(on_disk, "prefix: robot1\nnodes: []\n");
     }
 
-    #[test]
-    fn a_byte_identical_scaffold_is_pristine() {
-        let scaffold = "prefix: robot1\nnodes: []\n";
-        assert!(is_pristine_scaffold(scaffold, scaffold));
+    /// `sensor` with one output, as `node stage` builds it.
+    fn sensor_node() -> NodeDef {
+        build_node_def(
+            "sensor",
+            None,
+            &[("image".to_string(), Some("sensor_msgs/Image".to_string()))],
+            &[],
+        )
     }
 
-    /// Every hand edit a user plausibly makes to a fresh file — and every
-    /// "harmless" difference a looser check (trim, re-parse, comment strip)
-    /// would forgive — is NOT pristine: each of these takes the backup arm.
+    /// The `robot1` scaffold with `sensor` staged into it. Hand-written; the
+    /// shape `append_node_to_nodes_block` gives a `nodes: []`.
+    const ROBOT1_WITH_SENSOR: &str = "prefix: robot1\nnodes:\n  - id: sensor\n    type: sensor\n    \
+                                      outputs:\n      - name: image\n        schema: sensor_msgs/Image\n";
+
+    #[test]
+    fn a_byte_identical_scaffold_is_cli_written() {
+        let scaffold = "prefix: robot1\nnodes: []\n";
+        assert!(is_cli_written_graph(scaffold, "robot1", &[]).unwrap());
+        // `graph create -n ""` drops the prefix line.
+        assert!(is_cli_written_graph("nodes: []\n", "", &[]).unwrap());
+    }
+
+    /// The scaffold is rendered for the prefix handed in and no other.
+    #[test]
+    fn a_scaffold_matches_only_its_own_prefix() {
+        let scaffold = "prefix: robot1\nnodes: []\n";
+        assert!(!is_cli_written_graph(scaffold, "robot2", &[]).unwrap());
+        assert!(!is_cli_written_graph(scaffold, "", &[]).unwrap());
+    }
+
+    /// A file holding the scaffold plus a node the CLI staged is CLI-written
+    /// when that node is the prior node, and only then.
+    #[test]
+    fn a_staged_node_in_cli_spelling_is_cli_written() {
+        let sensor = sensor_node();
+        assert!(
+            is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", std::slice::from_ref(&sensor))
+                .unwrap()
+        );
+        // The same bytes with no prior node to explain them are a hand edit.
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", &[]).unwrap());
+        // A prior node the file does not hold matches nothing.
+        let other = build_node_def("camera", None, &[], &[]);
+        assert!(!is_cli_written_graph(ROBOT1_WITH_SENSOR, "robot1", &[other]).unwrap());
+    }
+
+    /// Each edit below, a byte `graph create` never writes or a difference a
+    /// looser check (trim, re-parse, comment strip) would forgive, is NOT
+    /// CLI-written: each of these takes the backup arm.
     #[test]
     fn any_byte_beyond_the_scaffold_is_a_hand_edit() {
-        let scaffold = "prefix: robot1\nnodes: []\n";
         for edited in [
             "# perception\nprefix: robot1\nnodes: []\n",
             "prefix: robot1\nnodes: []\n\n",
@@ -22392,11 +24282,46 @@ mod tests {
             "prefix: 'robot1'\nnodes: []\n",
             "name: perception\nprefix: robot1\nnodes: []\n",
             "prefix: robot1\nnodes:\n  - id: a\n    type: a\n",
+            "prefix: robot1\r\nnodes: []\r\n",
+            "nodes: []\nprefix: robot1\n",
+            "args:\n  ns: robot1\nprefix: ${ns}\nnodes: []\n",
             "",
         ] {
             assert!(
-                !is_pristine_scaffold(edited, scaffold),
-                "must not count as pristine: {edited:?}"
+                !is_cli_written_graph(edited, "robot1", &[]).unwrap(),
+                "must not count as CLI-written: {edited:?}"
+            );
+        }
+    }
+
+    /// The same hand-edit classes on a file that already holds a staged node:
+    /// each byte the CLI did not write breaks the match.
+    #[test]
+    fn any_byte_beyond_the_staged_nodes_is_a_hand_edit() {
+        let sensor = vec![sensor_node()];
+        for edited in [
+            format!("# perception\n{ROBOT1_WITH_SENSOR}"),
+            format!("{ROBOT1_WITH_SENSOR}\n"),
+            format!("{ROBOT1_WITH_SENSOR}    # the front camera\n"),
+            format!("name: perception\n{ROBOT1_WITH_SENSOR}"),
+            format!("{ROBOT1_WITH_SENSOR}network:\n  zenoh: {{}}\n"),
+            ROBOT1_WITH_SENSOR.replace("schema: sensor_msgs/Image", "schema: sensor_msgs::Image"),
+            ROBOT1_WITH_SENSOR.replace("  - id: sensor", "- id: sensor"),
+            ROBOT1_WITH_SENSOR.replace("prefix: robot1", "prefix: 'robot1'"),
+            ROBOT1_WITH_SENSOR.replace('\n', "\r\n"),
+            ROBOT1_WITH_SENSOR.replace("  - id: sensor", "\t- id: sensor"),
+            ROBOT1_WITH_SENSOR.replace(
+                "    type: sensor\n",
+                "    type: sensor\n    isolate: true\n",
+            ),
+            ROBOT1_WITH_SENSOR.replace(
+                "  - id: sensor\n    type: sensor\n",
+                "  - type: sensor\n    id: sensor\n",
+            ),
+        ] {
+            assert!(
+                !is_cli_written_graph(&edited, "robot1", &sensor).unwrap(),
+                "must not count as CLI-written: {edited:?}"
             );
         }
     }
@@ -22654,6 +24579,1260 @@ nodes:
         );
     }
 
+    /// Without a profile and without `isolate: true`, the nodes of a process
+    /// are ONE executor unit, as a process ran its nodes before units existed,
+    /// and `graph plan` says why. The case: one process group holding a 10 ms
+    /// producer, a relay it feeds and a join of both. With `isolate: true` on
+    /// the join, the join alone gets a unit of its own and the plan names the
+    /// key; on the relay, which alone feeds the join at the level below it,
+    /// the join also starts a unit past the relay's level, the first unit says
+    /// it does not hold every node, and the partition validator accepts every
+    /// unit.
+    #[test]
+    fn graph_plan_shows_one_unit_per_process_without_a_profile_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "upj_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: upj
+prefix: upj
+nodes:
+  - id: src
+    type: producer
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: mid
+    type: relay
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: join
+    type: joiner
+    inputs:
+      - name: a
+        source: src/out
+      - name: b
+        source: mid/out
+process_groups:
+  p0: [src, mid, join]
+";
+        let graph_file = ws.root.join("graphs").join("upj.yaml");
+        std::fs::write(&graph_file, yaml).unwrap();
+        assert!(
+            !default_artifact_path(&ws.root, "upj").exists(),
+            "precondition: the graph has no profile"
+        );
+
+        let plan = graph_plan(&ws.root, "upj").unwrap();
+        eprintln!("plan without isolate:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 1 executor unit(s)",
+            "  units: no profile, so each process runs as one unit; a node that declares \
+             `isolate: true` runs in a unit of its own, and a node past an isolated node's level \
+             joins the earliest unit of the other nodes that starts at its level or feeds it at \
+             the level below, or else starts a later unit (a unit runs a contiguous band of \
+             levels)",
+            "process p0: 1 unit(s)",
+            "  unit p0: src, mid, join",
+            "    starts at src: no profile: every node of this process that does not declare \
+             `isolate: true` runs in this unit",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+
+        let no_profile = "    starts at src: no profile: every node of this process that does not \
+                          declare `isolate: true` runs in this unit";
+        let isolating = |node_type: &str| {
+            let entry = format!("    type: {node_type}\n");
+            std::fs::write(
+                &graph_file,
+                yaml.replace(&entry, &format!("{entry}    isolate: true\n")),
+            )
+            .unwrap();
+            graph_plan(&ws.root, "upj").unwrap()
+        };
+
+        // The join, at the last level, isolated: it alone leaves the unit.
+        let plan = isolating("joiner");
+        eprintln!("plan with the join isolated:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 2 executor unit(s)",
+            "process p0: 2 unit(s)",
+            "  unit p0.src: src, mid",
+            no_profile,
+            "  unit p0.join: join",
+            "    starts at join: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+
+        // The relay, between the source and the join, isolated: a unit runs a
+        // contiguous band of levels, so the join starts a unit past it.
+        let plan = isolating("relay");
+        eprintln!("plan with the relay isolated:\n{plan}");
+        for line in [
+            "graph upj: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "    starts at src: no profile: the nodes of this process that do not declare \
+             `isolate: true` run in this unit, apart from those in a unit that starts past an \
+             isolated node's level (a unit runs a contiguous band of levels)",
+            "  unit p0.mid: mid",
+            "    starts at mid: isolate: true",
+            "  unit p0.join: join",
+            "    starts at join: no profile: past level 1 of mid, which declares isolate: true, \
+             and no node of an earlier unit that does not declare isolate: true feeds it at the \
+             level below (a unit runs a contiguous band of levels)",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("every node of this process that does not declare"),
+            "a cut process does not say every node runs in one unit; plan was:\n{plan}"
+        );
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// Without a profile, `isolate: true` takes out of the process's one unit
+    /// only the isolated node and the nodes a contiguous band of levels cannot
+    /// keep with the rest, and the partition validator accepts the split. Two
+    /// one-process graphs, each with one node isolated: a 10 ms source feeding
+    /// `fast` and `slow` (`slow` isolated) with `fast` feeding `sink`, where
+    /// `sink` is past slow's level but fed by `fast` at the level below; and
+    /// two sources `cam` and `lidar` (`lidar` isolated) feeding a join, which
+    /// `cam` feeds at the level below.
+    #[test]
+    fn graph_plan_keeps_in_the_one_unit_every_node_an_isolated_node_does_not_cut_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "keep_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let relay = |id: &str, source: &str, isolate: bool| {
+            format!(
+                "  - id: {id}\n    type: relay\n{}    inputs:\n      - name: inp\n        \
+                 source: {source}/out\n    outputs:\n      - name: out\n        schema: \
+                 geometry_msgs/Vector3\n",
+                if isolate { "    isolate: true\n" } else { "" }
+            )
+        };
+        let producer = |id: &str, isolate: bool| {
+            format!(
+                "  - id: {id}\n    type: producer\n{}    outputs:\n      - name: out\n        \
+                 schema: geometry_msgs/Vector3\n",
+                if isolate { "    isolate: true\n" } else { "" }
+            )
+        };
+        let fan = format!(
+            "name: fan\nprefix: fan\nnodes:\n{}{}{}{}process_groups:\n  p0: [src, fast, slow, \
+             sink]\n",
+            producer("src", false),
+            relay("fast", "src", false),
+            relay("slow", "src", true),
+            relay("sink", "fast", false),
+        );
+        std::fs::write(ws.root.join("graphs").join("fan.yaml"), fan).unwrap();
+        let fuse = format!(
+            "name: fuse\nprefix: fuse\nnodes:\n{}{}  - id: join\n    type: joiner\n    \
+             inputs:\n      - name: a\n        source: cam/out\n      - name: b\n        \
+             source: lidar/out\nprocess_groups:\n  p0: [cam, lidar, join]\n",
+            producer("cam", false),
+            producer("lidar", true),
+        );
+        std::fs::write(ws.root.join("graphs").join("fuse.yaml"), fuse).unwrap();
+
+        let no_profile = "    starts at src: no profile: every node of this process that does not \
+                          declare `isolate: true` runs in this unit";
+        let plan = graph_plan(&ws.root, "fan").unwrap();
+        eprintln!("fan plan:\n{plan}");
+        for line in [
+            "graph fan: 1 process(es), 2 executor unit(s)",
+            "  unit p0.src: src, fast, sink",
+            no_profile,
+            "  unit p0.slow: slow",
+            "    starts at slow: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+
+        let cam_heads = no_profile.replace("at src:", "at cam:");
+        let plan = graph_plan(&ws.root, "fuse").unwrap();
+        eprintln!("fuse plan:\n{plan}");
+        for line in [
+            "graph fuse: 1 process(es), 2 executor unit(s)",
+            "  unit p0.cam: cam, join",
+            cam_heads.as_str(),
+            "  unit p0.lidar: lidar",
+            "    starts at lidar: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// A `tick_within_ms` declared in node SOURCE reaches every path that
+    /// derives executor units from source: `graph plan`, `--single-process`
+    /// and the run's recorded census, as it reaches the planner that reads the
+    /// loaded libraries.
+    ///
+    /// The case: a 100 ms source feeding a sink, both profiled at 1 ms a tick,
+    /// the sink declaring `tick_within_ms = 4`. Merged, the unit's ticks sum to
+    /// 2 ms. Two ms times the budget divisor (4) stays under the 100 ms period
+    /// and reaches the 4 ms deadline, so the deadline alone keeps the sink in a
+    /// unit of its own.
+    #[test]
+    fn a_tick_deadline_in_node_source_splits_the_units_on_every_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "td_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "deadline_sink",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(tick_within_ms = 4)]
+#[derive(Default)]
+struct DeadlineSinkNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: td
+prefix: td
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: deadline_sink
+    inputs:
+      - name: inp
+        source: src/out
+process_groups:
+  p0: [src, sink]
+";
+        std::fs::write(ws.root.join("graphs").join("td.yaml"), yaml).unwrap();
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "td".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000_000u64),
+                ("sink".to_string(), 1_000_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![ProfileEdge {
+                producer: "src".to_string(),
+                consumer: "sink".to_string(),
+                rate_mhz: 10_000,
+            }],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "td"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let config = cerulion_core::graph::parse_graph_raw(yaml).unwrap();
+
+        let infos = source_entry_infos(&ws.nodes_dir, &config, "a unit oracle").unwrap();
+        let deadlines = (
+            infos["src"].tick_within_ms(),
+            infos["sink"].tick_within_ms(),
+        );
+        let plan = graph_plan(&ws.root, "td").unwrap();
+        let groups: Vec<String> = run_unit_groups(
+            &ws.root,
+            &config,
+            crate::multiprocess::ExecutionMode::FreeRun,
+            true,
+        )
+        .expect("the run's units derive from source")
+        .into_keys()
+        .collect();
+        let single_process_splits = cfg!(unix).then(|| {
+            let mut single = config.clone();
+            single_process_hosts_units(&ws.root, &mut single, TimeSource::Real, None).unwrap()
+        });
+        eprintln!(
+            "deadlines {deadlines:?}; census units {groups:?}; --single-process splits \
+             {single_process_splits:?}; plan:\n{plan}"
+        );
+
+        assert_eq!(
+            deadlines,
+            (None, Some(4)),
+            "the source metadata carries each node's declared tick deadline"
+        );
+        assert!(
+            plan.contains("graph td: 1 process(es), 2 executor unit(s)"),
+            "graph plan shows two units; plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains(
+                "starts at sink: tick budget: the unit's p50 ticks would sum to 2000000 ns >= \
+                 1000000 ns, 1/4 of sink's 4000000 ns tick_within"
+            ),
+            "the sink starts its own unit on its deadline; plan was:\n{plan}"
+        );
+        assert_eq!(
+            groups,
+            vec!["p0.src", "p0.sink"],
+            "the run's census is judged against two units"
+        );
+        if let Some(splits) = single_process_splits {
+            assert!(
+                splits,
+                "--single-process runs the two units rather than one level loop"
+            );
+        }
+    }
+
+    /// `--single-process` on a graph that splits into executor units leaves
+    /// the monolith arm of the deployment match, so the opt-out that arm
+    /// announces (the auto-partition default skipped, or the declared groups
+    /// not executed) is announced where the units are hosted instead.
+    ///
+    /// The case: a 100 ms source feeding a data-triggered sink that declares
+    /// `isolate: true`, so two units. Written with no `process_groups:`, then
+    /// with a declared split the run does not execute, then without the key
+    /// (no profile: one unit, which stays the monolith and says nothing here),
+    /// and with `isolate: false` in its place (still one unit).
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_single_process_run_of_several_units_announces_what_it_opts_out_of() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "spu_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 100)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "sink",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct SinkNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: spu
+prefix: spu
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: sink
+    isolate: true
+    inputs:
+      - name: inp
+        source: src/out
+";
+        let host_all = |config: &GraphConfig| -> Vec<(String, Vec<String>)> {
+            config
+                .process_groups
+                .iter()
+                .map(|(g, ns)| (g.clone(), ns.clone()))
+                .collect()
+        };
+        let one_process = vec![(
+            "spu".to_string(),
+            vec!["src".to_string(), "sink".to_string()],
+        )];
+
+        let mut unpartitioned = cerulion_core::graph::parse_graph_raw(yaml).unwrap();
+        let split =
+            single_process_hosts_units(&ws.root, &mut unpartitioned, TimeSource::Real, None)
+                .unwrap();
+        assert!(split, "two units: the run hosts them in one worker process");
+        assert_eq!(host_all(&unpartitioned), one_process);
+        assert!(
+            logs_contain(
+                "on its executor units (no `process_groups:` in the graph; the multi-process \
+                 auto-partition default is skipped)"
+            ),
+            "an unpartitioned graph's opt-out names the skipped auto-partition default"
+        );
+
+        let mut declared = cerulion_core::graph::parse_graph_raw(&format!(
+            "{yaml}process_groups:\n  a: [src]\n  b: [sink]\n"
+        ))
+        .unwrap();
+        assert!(
+            single_process_hosts_units(&ws.root, &mut declared, TimeSource::Real, None).unwrap()
+        );
+        assert_eq!(host_all(&declared), one_process);
+        assert!(
+            logs_contain(
+                "on its executor units, despite `process_groups:` (the declared groups are not \
+                 executed)"
+            ),
+            "a declared split the run does not execute is named"
+        );
+
+        for (label, isolate) in [("no isolate key", ""), ("isolate: false", "false")] {
+            let line = if isolate.is_empty() {
+                String::new()
+            } else {
+                format!("    isolate: {isolate}\n")
+            };
+            let mut one_unit =
+                cerulion_core::graph::parse_graph_raw(&yaml.replace("    isolate: true\n", &line))
+                    .unwrap();
+            assert!(
+                !single_process_hosts_units(&ws.root, &mut one_unit, TimeSource::Real, None)
+                    .unwrap(),
+                "{label}: one unit, so the monolith arm runs it and announces the opt-out itself"
+            );
+            assert!(
+                one_unit.process_groups.is_empty(),
+                "{label}: the monolith keeps the graph as written"
+            );
+        }
+    }
+
+    /// A workspace whose graph `lb` holds one process group `p0`: `src`, a
+    /// 10 ms source, feeds `sink`, and `beacon`, a 10 ms period node, sits at
+    /// level 1 between them under `level_assignments:` (`src` 0, `beacon` 1,
+    /// `sink` 2). `sink_type` is `follower`, whose input is a chain link, or
+    /// `blocker`, whose input is a `block` edge that keeps `sink` with `src`;
+    /// `beacon` declares `isolate: true` when `beacon_isolated`. The profile
+    /// holds 1 us a tick for each and 100 Hz on the edge, so the tick budget
+    /// holds every merge.
+    fn level_band_workspace(
+        sink_type: &str,
+        beacon_isolated: bool,
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "lb_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "ticker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct TickerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "follower",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct FollowerNode {
+    #[input(trigger)]
+    inp: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "blocker",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct BlockerNode {
+    #[input(trigger, backpressure = block, depth = 4)]
+    inp: Vector3,
+}
+"#,
+        );
+        let beacon_isolate = if beacon_isolated {
+            "    isolate: true\n"
+        } else {
+            ""
+        };
+        let yaml = format!(
+            "\
+name: lb
+prefix: lb
+level_assignments:
+  src: 0
+  beacon: 1
+  sink: 2
+nodes:
+  - id: src
+    type: ticker
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: sink
+    type: {sink_type}
+    inputs:
+      - name: inp
+        source: src/out
+  - id: beacon
+    type: ticker
+{beacon_isolate}    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+process_groups:
+  p0: [src, sink, beacon]
+"
+        );
+        std::fs::write(ws.root.join("graphs").join("lb.yaml"), yaml).unwrap();
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "lb".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000u64),
+                ("sink".to_string(), 1_000u64),
+                ("beacon".to_string(), 1_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![ProfileEdge {
+                producer: "src".to_string(),
+                consumer: "sink".to_string(),
+                rate_mhz: 100_000,
+            }],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "lb"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let root = ws.root.clone();
+        (tmp, root)
+    }
+
+    /// With a profile, a chain link whose merged unit would skip the level of
+    /// a node that declares `isolate: true` stays split, and `graph plan`
+    /// names why; the isolated node keeps its unit and the validator accepts
+    /// every unit, so the process is not kept whole.
+    #[test]
+    fn graph_plan_keeps_a_profiled_link_split_across_an_isolated_nodes_level() {
+        let (_tmp, root) = level_band_workspace("follower", true);
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        for line in [
+            "graph lb: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "  unit p0.sink: sink",
+            "    starts at sink: joining src's unit would leave level 1 out of the unit while it \
+             runs levels below and above it (a unit runs a contiguous band of levels)",
+            "  unit p0.beacon: beacon",
+            "    starts at beacon: isolate: true",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+    }
+
+    /// A split the partition validator refuses keeps the process as one unit,
+    /// and says so at WARN, naming the process, the refusal and each node of
+    /// it that declares `isolate: true`. The case: the graph above with a
+    /// `block` edge from `src` to `sink`, which keeps them in one unit
+    /// whatever the other rules say, so their unit skips level 1.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_unit_split_keeps_the_process_whole_and_warns() {
+        let (_tmp, root) = level_band_workspace("blocker", true);
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        assert!(
+            plan.contains("process p0: 1 unit(s)"),
+            "the refused split keeps p0 whole; plan was:\n{plan}"
+        );
+        assert!(
+            plan.contains(
+                "  one unit: its split is refused: Graph validation error: process group \
+                 'p0.src': owns non-adjacent global DAG levels [0, 2]"
+            ),
+            "graph plan names the refusal; plan was:\n{plan}"
+        );
+        logs_assert(|lines: &[&str]| {
+            let hits = cerulion_core::testing::count_at(
+                lines,
+                "WARN",
+                "executor units: the partition validator refuses this process's split",
+            );
+            let named = lines.iter().any(|l| {
+                l.contains("executor units: the partition validator refuses this process's split")
+                    && l.contains("process=p0")
+                    && l.contains("owns non-adjacent")
+                    && l.contains("its nodes that declare `isolate: true` included")
+                    && l.contains("isolated=[\"beacon\"]")
+            });
+            if hits == 1 && named {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected exactly 1 WARN-level refusal line naming p0, the refusal and \
+                     beacon, got {hits} (named: {named})"
+                ))
+            }
+        });
+    }
+
+    /// The refused split of a process in which no node declares
+    /// `isolate: true` warns without claiming one does.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_refused_split_with_no_isolated_node_warns_without_naming_one() {
+        let (_tmp, root) = level_band_workspace("blocker", false);
+        let plan = graph_plan(&root, "lb").unwrap();
+        eprintln!("plan:\n{plan}");
+        assert!(
+            plan.contains("process p0: 1 unit(s)"),
+            "the refused split keeps p0 whole; plan was:\n{plan}"
+        );
+        logs_assert(|lines: &[&str]| {
+            let refusals: Vec<&&str> = lines
+                .iter()
+                .filter(|l| {
+                    l.contains(
+                        "executor units: the partition validator refuses this process's split",
+                    )
+                })
+                .collect();
+            let hits = cerulion_core::testing::count_at(
+                lines,
+                "WARN",
+                "executor units: the partition validator refuses this process's split",
+            );
+            let named = refusals.iter().all(|l| {
+                l.contains("process=p0")
+                    && !l.contains("`isolate: true`")
+                    && !l.contains("isolated=")
+            });
+            if hits == 1 && refusals.len() == 1 && named {
+                Ok(())
+            } else {
+                Err(format!(
+                    "expected exactly 1 WARN-level refusal line naming p0 and no isolated \
+                     node, got {hits}: {refusals:?}"
+                ))
+            }
+        });
+    }
+
+    /// A workspace whose graph `ij` holds one process group `p0`: `src`, a
+    /// 10 ms source, feeds `mid`, which declares `isolate: true`, and the
+    /// join `join`, which `mid` also feeds and which declares
+    /// `isolate: false`. Derived levels: `src` 0, `mid` 1, `join` 2. The
+    /// profile holds 1 us a tick for each node and 100 Hz on each edge.
+    fn isolated_middle_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = crate::workspace::workspace_create(tmp.path(), "ij_ws").unwrap();
+        write_node_source(
+            &ws.nodes_dir,
+            "producer",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct ProducerNode {
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "relay",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node]
+#[derive(Default)]
+struct RelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+"#,
+        );
+        write_node_source(
+            &ws.nodes_dir,
+            "joiner",
+            r#"
+use cerulion_core::prelude::*;
+use native_ros2_messages::geometry_msgs::Vector3;
+
+#[cerulion_node(sync_window_ms = 25)]
+#[derive(Default)]
+struct JoinerNode {
+    #[input(trigger)]
+    a: Vector3,
+    #[input(trigger)]
+    b: Vector3,
+}
+"#,
+        );
+        let yaml = "\
+name: ij
+prefix: ij
+nodes:
+  - id: src
+    type: producer
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: mid
+    type: relay
+    isolate: true
+    inputs:
+      - name: inp
+        source: src/out
+    outputs:
+      - name: out
+        schema: geometry_msgs/Vector3
+  - id: join
+    type: joiner
+    isolate: false
+    inputs:
+      - name: a
+        source: src/out
+      - name: b
+        source: mid/out
+process_groups:
+  p0: [src, mid, join]
+";
+        std::fs::write(ws.root.join("graphs").join("ij.yaml"), yaml).unwrap();
+        let edge = |producer: &str, consumer: &str| ProfileEdge {
+            producer: producer.to_string(),
+            consumer: consumer.to_string(),
+            rate_mhz: 100_000,
+        };
+        let artifact = ProfileArtifact {
+            version: PROFILE_ARTIFACT_VERSION,
+            graph: "ij".to_string(),
+            window_ns: 1_000_000_000,
+            nodes: [
+                ("src".to_string(), 1_000u64),
+                ("mid".to_string(), 1_000u64),
+                ("join".to_string(), 1_000u64),
+            ]
+            .into_iter()
+            .collect(),
+            edges: vec![edge("src", "mid"), edge("src", "join"), edge("mid", "join")],
+            isolated: Vec::new(),
+            hop: None,
+            derived_budget_ns: None,
+            profile_cores: None,
+        };
+        std::fs::write(
+            default_artifact_path(&ws.root, "ij"),
+            serde_yaml::to_string(&artifact).expect("serialize"),
+        )
+        .expect("write artifact");
+        let root = ws.root.clone();
+        (tmp, root)
+    }
+
+    /// With a profile, a join that declares `isolate: false` is not joined to
+    /// a producer whose unit would leave the level of a node that declares
+    /// `isolate: true` out of the joined unit: it keeps a unit of its own and
+    /// `graph plan` names why, and the isolated node keeps its unit.
+    #[test]
+    #[tracing_test::traced_test]
+    fn graph_plan_keeps_an_isolate_false_join_apart_from_a_producer_past_an_isolated_level() {
+        let (_tmp, root) = isolated_middle_workspace();
+        let plan = graph_plan(&root, "ij").unwrap();
+        eprintln!("plan:\n{plan}");
+        for line in [
+            "graph ij: 1 process(es), 3 executor unit(s)",
+            "process p0: 3 unit(s)",
+            "  unit p0.src: src",
+            "  unit p0.mid: mid",
+            "    starts at mid: isolate: true",
+            "  unit p0.join: join",
+            "    starts at join: joining src's unit would leave level 1 out of the unit while it \
+             runs levels below and above it (a unit runs a contiguous band of levels)",
+        ] {
+            assert!(
+                plan.lines().any(|l| l == line),
+                "graph plan prints `{line}`; plan was:\n{plan}"
+            );
+        }
+        assert!(
+            !plan.contains("its split is refused"),
+            "the partition validator accepts the split; plan was:\n{plan}"
+        );
+        assert!(
+            !logs_contain("executor units: the partition validator refuses"),
+            "no split is refused"
+        );
+    }
+
+    /// Every sentence of the user-facing pages that calls a `--single-process`
+    /// run the monolith, or says it mints no ring, stamps `lockstep` or has no
+    /// ranks, names the executor-unit condition it holds under. On the real
+    /// clock `single_process_hosts_units` runs a graph whose nodes split into
+    /// several units through the supervisor as one process group, so that run
+    /// mints the trace rings, free-runs and records one rank per unit; a graph
+    /// that is one unit stays the monolith.
+    ///
+    /// Each page is read as prose blocks (a paragraph, a table row or a
+    /// heading, whitespace-normalized, fenced code skipped), and each block is
+    /// split into sentences after a `.`, `!` or `?` followed by a space, so the
+    /// condition has to sit in the sentence that makes the claim.
+    #[test]
+    fn the_docs_tie_every_single_process_monolith_claim_to_the_executor_units() {
+        const PAGES: [&str; 5] = [
+            "multi_process.md",
+            "bag.md",
+            "flashback.md",
+            "replay_determinism_footguns.md",
+            "user-api.md",
+        ];
+        const SUBJECTS: [&str; 2] = ["--single-process", "single-process run"];
+        const CLAIMS: [&str; 10] = [
+            "monolith",
+            "mint no ring",
+            "mints no ring",
+            "mint none",
+            "no trace ring",
+            "no ranks",
+            "frames-only",
+            "cannot be re-run",
+            "one-rank lockstep",
+            "stamps `lockstep`",
+        ];
+        const CONDITIONS: [&str; 2] = ["executor unit", "one unit"];
+
+        fn prose_blocks(text: &str) -> Vec<String> {
+            let mut blocks: Vec<String> = Vec::new();
+            let mut paragraph: Vec<&str> = Vec::new();
+            let mut fenced = false;
+            for line in text.lines() {
+                let trimmed = line.trim();
+                let breaks = fenced
+                    || trimmed.is_empty()
+                    || trimmed.starts_with("```")
+                    || trimmed.starts_with('|')
+                    || trimmed.starts_with('#');
+                if breaks && !paragraph.is_empty() {
+                    blocks.push(paragraph.join(" "));
+                    paragraph.clear();
+                }
+                if trimmed.starts_with("```") {
+                    fenced = !fenced;
+                } else if !fenced && !trimmed.is_empty() {
+                    if breaks {
+                        blocks.push(trimmed.to_string());
+                    } else {
+                        paragraph.push(trimmed);
+                    }
+                }
+            }
+            if !paragraph.is_empty() {
+                blocks.push(paragraph.join(" "));
+            }
+            blocks
+                .iter()
+                .map(|b| b.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect()
+        }
+
+        fn sentences(block: &str) -> Vec<&str> {
+            let mut out = Vec::new();
+            let mut start = 0;
+            for (i, c) in block.char_indices() {
+                if matches!(c, '.' | '!' | '?') && block.as_bytes().get(i + 1) == Some(&b' ') {
+                    out.push(block[start..=i].trim());
+                    start = i + 1;
+                }
+            }
+            out.push(block[start..].trim());
+            out.retain(|s| !s.is_empty());
+            out
+        }
+
+        let docs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+        let mut unqualified = Vec::new();
+        for page in PAGES {
+            let path = docs.join(page);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            let mut claims = 0;
+            for block in prose_blocks(&text) {
+                for sentence in sentences(&block) {
+                    let lower = sentence.to_lowercase();
+                    if !SUBJECTS.iter().any(|s| lower.contains(s))
+                        || !CLAIMS.iter().any(|c| lower.contains(c))
+                    {
+                        continue;
+                    }
+                    claims += 1;
+                    if !CONDITIONS.iter().any(|c| lower.contains(c)) {
+                        unqualified.push(format!("docs/{page}: {sentence}"));
+                    }
+                }
+            }
+            assert!(
+                claims > 0,
+                "docs/{page} carries no sentence that says what a --single-process run is \
+                 not, so this test reads nothing there; update PAGES or CLAIMS"
+            );
+        }
+        assert!(
+            unqualified.is_empty(),
+            "these sentences say a --single-process run is the monolith without the condition \
+             that makes it one (a graph that is one executor unit); on the real clock a graph \
+             whose nodes split into several units runs them in one worker process, which mints \
+             the rings and records one rank per unit:\n\n{}",
+            unqualified.join("\n\n")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_recorder_with_disabled_status_passes_the_existing_zero_period_flag() {
+        let mut spec = BagdSpawnSpec {
+            display_out_path: None,
+            graph_name: "scope",
+            status_off: false,
+            out_path: Path::new("recordings/scope.mcap"),
+            topics_json_path: Path::new("topics.json"),
+            ready_path: Path::new("ready"),
+            env_json_path: Path::new("env.json"),
+            recorder_json_path: Path::new("recorder.json"),
+            graph_yaml_path: Path::new("graph.yaml"),
+            ring_names: &[],
+            record_cpu: RecordCpu::None,
+            iox2_config_path: None,
+            schema_catalog_path: None,
+            state_tag: None,
+            flashback_dir: None,
+        };
+        let normal = bagd_argv(&spec);
+        assert!(!normal.iter().any(|arg| arg == "--status-period-ms"));
+        spec.status_off = true;
+        let private = bagd_argv(&spec);
+        let mut expected = normal;
+        expected.extend([std::ffi::OsString::from("--status-period-ms"), "0".into()]);
+        assert_eq!(private, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn recorder_status_scope_refuses_remote_metadata_and_keeps_local_delivery() {
+        use cerulion_core::transport::egress_scope::RunTopicScope;
+        use cerulion_core::{
+            GatewayEgressPolicy, GatewayPlan, GatewayRuntime, NetworkConfig, TransportConfig,
+            TransportManager,
+        };
+        const BODY: &[u8] = br#"{"state":"recording","bag_path":"recordings/scope.mcap","messages":1,"bytes":8,"chunks":1,"per_topic":{"/scope/private":1}}"#;
+        let mut header = cerulion_core::wire::WireHeader::new(0xBA6D_5747_5541_5553, 0, 0);
+        header.total_size = (cerulion_core::wire::WireHeader::SIZE + BODY.len()) as u32;
+        let mut frame = vec![0; cerulion_core::wire::WireHeader::SIZE];
+        header.write_to_buf(&mut frame);
+        frame.extend_from_slice(BODY);
+        for scope in [
+            RunTopicScope::LocalOnly,
+            RunTopicScope::Declared {
+                topics: vec![],
+                ingress: vec![],
+            },
+            RunTopicScope::Unrestricted,
+            RunTopicScope::Declared {
+                topics: vec![cerulion_bagd::STATUS_TOPIC.into()],
+                ingress: vec![],
+            },
+        ] {
+            for _ in 0..2 {
+                let manager = TransportManager::init_for_test(
+                    TransportConfig {
+                        network: Some(NetworkConfig {
+                            robot_identity: Some("scope".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    cerulion_core::testing::iceoryx_test_config(),
+                )
+                .unwrap();
+                let (guard, status_off) = prepare_bagd_status(&manager, &scope, "scope");
+                assert!(!status_off);
+                let private = scope.excludes(cerulion_bagd::STATUS_TOPIC);
+                assert_eq!(guard.is_some(), private);
+                let mut publisher = manager
+                    .create_publisher(
+                        cerulion_bagd::STATUS_TOPIC,
+                        cerulion_core::wire::MaxSliceLen::const_new(4096),
+                        0,
+                    )
+                    .unwrap();
+                let mut local = manager
+                    .create_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
+                    .unwrap();
+                let gateway = GatewayRuntime::new(
+                    manager.clone(),
+                    GatewayPlan {
+                        egress_policy: GatewayEgressPolicy::AllowAll,
+                        announce: vec![],
+                        ingress: vec![],
+                    },
+                )
+                .unwrap();
+                manager
+                    .network()
+                    .unwrap()
+                    .set_lan_access(cerulion_core::LanAccess::Open);
+                if private {
+                    assert!(gateway.catalog_serve_for_test("scope").entries.is_empty());
+                    let refusals = gateway.demand_refusal_count();
+                    assert!(!gateway.demand_query_grants_for_test(cerulion_bagd::STATUS_TOPIC));
+                    assert_eq!(gateway.demand_refusal_count(), refusals + 1);
+                    assert!(matches!(
+                        manager.acquire_remote_topic_lease(cerulion_bagd::STATUS_TOPIC),
+                        Err(cerulion_core::TransportError::EgressScope { .. })
+                    ));
+                } else {
+                    assert!(gateway.demand_query_grants_for_test(cerulion_bagd::STATUS_TOPIC));
+                }
+                let mut remote = (!private).then(|| {
+                    manager
+                        .create_remote_data_only_subscriber(cerulion_bagd::STATUS_TOPIC)
+                        .unwrap()
+                });
+                publisher.publish_raw(&frame).unwrap();
+                let mut local_frames = Vec::new();
+                local.drain_owned(1, &mut local_frames).unwrap();
+                assert_eq!(local_frames.len(), 1);
+                assert_eq!(local_frames[0].payload(), frame.as_slice());
+                if let Some(remote) = &mut remote {
+                    let mut frames = Vec::new();
+                    remote.drain_owned(1, &mut frames).unwrap();
+                    assert_eq!(frames.len(), 1);
+                    assert_eq!(frames[0].payload(), frame.as_slice());
+                }
+                drop(local_frames);
+                drop(publisher);
+                drop(local);
+                drop(remote);
+                drop(gateway);
+                drop(guard);
+            }
+        }
+        let manager = TransportManager::init_for_test(
+            TransportConfig::default(),
+            cerulion_core::testing::iceoryx_test_config(),
+        )
+        .unwrap();
+        let _remote = manager
+            .acquire_remote_topic_lease(cerulion_bagd::STATUS_TOPIC)
+            .unwrap();
+        let (guard, status_off) = prepare_bagd_status(&manager, &RunTopicScope::LocalOnly, "scope");
+        assert!(guard.is_none());
+        assert!(status_off);
+        for scope in [
+            RunTopicScope::Unrestricted,
+            RunTopicScope::Declared {
+                topics: vec![cerulion_bagd::STATUS_TOPIC.into()],
+                ingress: vec![],
+            },
+        ] {
+            let (guard, status_off) = prepare_bagd_status(&manager, &scope, "scope");
+            assert!(guard.is_none());
+            assert!(
+                !status_off,
+                "a public recording never excludes a leased status topic"
+            );
+        }
+    }
+
     /// What `graph run --record` hands the recorder is what
     /// arms live-topic discovery, and nothing pinned it.
     ///
@@ -22687,6 +25866,8 @@ nodes:
         let rings = vec!["cer_rec_0".to_string()];
         let argv = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            display_out_path: None,
+            status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
             topics_json_path: Path::new("/rec/.demo.topics.json"),
             ready_path: Path::new("/rec/.demo.ready"),
@@ -22782,7 +25963,9 @@ nodes:
         // And the same two hold when the optional args are absent, which is the
         // single-process shape.
         let lean = bagd_argv(&BagdSpawnSpec {
+            display_out_path: None,
             graph_name: "demo",
+            status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
             topics_json_path: Path::new("/rec/.demo.topics.json"),
             ready_path: Path::new("/rec/.demo.ready"),
@@ -22853,6 +26036,8 @@ nodes:
         let rings = vec!["cer_rec_0".to_string()];
         let argv = bagd_argv(&BagdSpawnSpec {
             graph_name: "demo",
+            display_out_path: Some(Path::new("recordings/demo.mcap")),
+            status_off: false,
             out_path: &out,
             topics_json_path: &topics_json,
             ready_path: &ready,
@@ -22876,6 +26061,11 @@ nodes:
             .unwrap_or_else(|e| panic!("the recorder must PARSE the argv built for it: {e}"));
         let args = cerulion_bagd::BagdArgs::from_arg_matches(&matches)
             .expect("BagdArgs::from_arg_matches over its own derive");
+        assert_eq!(args.out, out);
+        assert_eq!(
+            args.status_display_dir.as_deref(),
+            Some(Path::new("recordings"))
+        );
 
         // …and its startup validator must ACCEPT every `--attach` value. This is
         // the assertion that fails when an `--attach` value is malformed, with bagd's own refusal
@@ -22940,23 +26130,26 @@ nodes:
                 "/home/u/.cerulion/runs/demo-2a/recorder.json",
             )),
         };
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: Some("cer_run_0000000000000000000000000000002a"),
-            handoff: &handoff,
-            // The run's scheduler-trace rings — one worker ring the
-            // rank CONFIRMED it created, plus the departure ring.
-            ring_names: &[
-                "/cer_rg_0123456789abcdef".to_string(),
-                "/cer_rg_fedcba9876543210".to_string(),
-            ],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: Some("cer_run_0000000000000000000000000000002a"),
+                run_dir: None,
+                // The run's scheduler-trace rings: one worker ring the
+                // rank CONFIRMED it created, plus the departure ring.
+                ring_names: &[
+                    "/cer_rg_0123456789abcdef".to_string(),
+                    "/cer_rg_fedcba9876543210".to_string(),
+                ],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         let expected: Vec<OsString> = [
             "bagd",
@@ -23075,19 +26268,22 @@ nodes:
     fn the_flashback_argv_passes_no_flag_for_an_artifact_it_was_not_handed() {
         use std::path::Path;
 
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: None,
-            handoff: &FlashbackHandoff::default(),
-            // A run that declined rings, or a shape that mints none.
-            ring_names: &[],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: None,
+                run_dir: None,
+                // A run that declined rings, or a shape that mints none.
+                ring_names: &[],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &FlashbackHandoff::default(),
+        );
         assert!(
             !argv.iter().any(|a| a == "--attach"),
             "a path bagd cannot read is a LOUD startup failure, so an absent artifact must pass \
@@ -23141,7 +26337,9 @@ nodes:
 
         let rings = vec!["cer_rec_0".to_string()];
         let record = bagd_argv(&BagdSpawnSpec {
+            display_out_path: None,
             graph_name: "demo",
+            status_off: false,
             out_path: Path::new("/rec/demo.mcap"),
             topics_json_path: Path::new("/rec/.demo.topics.json"),
             ready_path: Path::new("/rec/.demo.ready"),
@@ -23160,18 +26358,21 @@ nodes:
             env_json: Some(PathBuf::from("/run/env.json")),
             recorder_json: Some(PathBuf::from("/run/recorder.json")),
         };
-        let window = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: Path::new("/ws/recordings/flashbacks"),
-            topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
-            iox2_config_path: None,
-            state_tag: Some(&tag),
-            handoff: &handoff,
-            ring_names: &[],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let window = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.demo.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: Some(&tag),
+                run_dir: None,
+                ring_names: &[],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         // The `--attach` VALUES are `name:path` pairs; taking the name half of
         // each is what compares the two builders' spellings rather than their
@@ -23252,21 +26453,24 @@ nodes:
             env_json: Some(write("env.json", "{}")),
             recorder_json: Some(write("recorder.json", r#"{"arch":"aarch64","os":"macos"}"#)),
         };
-        let argv = flashback_argv(&FlashbackSpawnSpec {
-            graph_name: "demo",
-            record_cpu: RecordCpu::Auto,
-            dir: dir.path(),
-            topics_json_path: &topics_json,
-            iox2_config_path: None,
-            state_tag: Some("cer_run_0000000000000000000000000000002a"),
-            handoff: &handoff,
-            // The recorder must PARSE `--ring` on this path too — the
-            // always-on spawn hands them over, so a `--ring` the window-only
-            // mode rejected would fail the spawn rather than the trace.
-            ring_names: &["/cer_rg_0123456789abcdef".to_string()],
-            // The run BINDING this argv must carry.
-            run_id: Some(0x2a),
-        });
+        let argv = flashback_argv(
+            &FlashbackSpawnSpec {
+                graph_name: "demo",
+                record_cpu: RecordCpu::Auto,
+                dir: dir.path(),
+                topics_json_path: &topics_json,
+                iox2_config_path: None,
+                state_tag: Some("cer_run_0000000000000000000000000000002a"),
+                run_dir: None,
+                // The recorder must PARSE `--ring` on this path too: the
+                // always-on spawn hands them over, so a `--ring` the window-only
+                // mode rejected would fail the spawn rather than the trace.
+                ring_names: &["/cer_rg_0123456789abcdef".to_string()],
+                // The run BINDING this argv must carry.
+                run_id: Some(0x2a),
+            },
+            &handoff,
+        );
 
         let cmd = cerulion_bagd::BagdArgs::augment_args(clap::Command::new("bagd"));
         let matches = cmd.try_get_matches_from(&argv).unwrap_or_else(|e| {
@@ -23365,7 +26569,7 @@ nodes:
         put(crate::run_dir::RUN_ENV_FILE);
         put(crate::run_dir::RUN_RECORDER_FILE);
 
-        let full = resolve_flashback_handoff(Some(&run));
+        let full = resolve_flashback_handoff(Some(&run), false);
         assert_eq!(
             full,
             FlashbackHandoff {
@@ -23378,7 +26582,7 @@ nodes:
         // One artifact gone: the other two still travel. A capture with no host
         // identity is worth strictly more than no capture.
         std::fs::remove_file(run.join(crate::run_dir::RUN_RECORDER_FILE)).expect("remove");
-        let partial = resolve_flashback_handoff(Some(&run));
+        let partial = resolve_flashback_handoff(Some(&run), false);
         assert!(partial.graph_yaml.is_some(), "{partial:?}");
         assert!(partial.env_json.is_some(), "{partial:?}");
         assert!(
@@ -23391,10 +26595,120 @@ nodes:
         // directory, and therefore nothing to hand over. The window is still
         // spawned — that is the caller's business, and this returns the empty
         // handoff rather than refusing.
-        assert_eq!(resolve_flashback_handoff(None), FlashbackHandoff::default());
         assert_eq!(
-            resolve_flashback_handoff(Some(&dir.path().join("no-such-run"))),
+            resolve_flashback_handoff(None, false),
             FlashbackHandoff::default()
+        );
+        assert_eq!(
+            resolve_flashback_handoff(Some(&dir.path().join("no-such-run")), false),
+            FlashbackHandoff::default()
+        );
+    }
+
+    /// A recorder handed this run's trace rings is handed its graph only beside
+    /// its `recorder.json`. The directory is the one a failed recorder write
+    /// leaves: `graph.yaml` and `env.json`, no `recorder.json`. A capture of it
+    /// would hold a graph and a trace with none of the contract keys a resim
+    /// judges them by, so the graph is not handed over and the capture can be
+    /// viewed but not re-executed. Handed no ring, the recorder still gets the
+    /// graph, and with `recorder.json` present it gets all three.
+    ///
+    /// Driven through the spec both spawns build, so whether the trace rides
+    /// is read off the `ring_names` the argv carries, and the argv the spawn
+    /// builds from that handoff is what is asserted.
+    #[cfg(unix)]
+    #[test]
+    fn a_recorder_handed_the_trace_gets_no_graph_without_the_recorder_identity() {
+        use std::path::Path;
+
+        fn spec<'a>(run: &'a Path, ring_names: &'a [String]) -> FlashbackSpawnSpec<'a> {
+            FlashbackSpawnSpec {
+                graph_name: "cam",
+                record_cpu: RecordCpu::Auto,
+                dir: Path::new("/ws/recordings/flashbacks"),
+                topics_json_path: Path::new("/ws/recordings/flashbacks/.cam.window-topics.json"),
+                iox2_config_path: None,
+                state_tag: None,
+                run_dir: Some(run),
+                ring_names,
+                run_id: Some(0x2a),
+            }
+        }
+        // The run context and trace rings the argv hands over, as
+        // `(flag, value)` pairs.
+        let context = |argv: &[std::ffi::OsString]| -> Vec<(String, String)> {
+            argv.windows(2)
+                .filter(|w| w[0] == "--attach" || w[0] == "--recorder-json" || w[0] == "--ring")
+                .map(|w| {
+                    (
+                        w[0].to_string_lossy().into_owned(),
+                        w[1].to_string_lossy().into_owned(),
+                    )
+                })
+                .collect()
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = dir.path().join("cam-2a");
+        std::fs::create_dir_all(&run).expect("run dir");
+        let put = |name: &str| std::fs::write(run.join(name), b"{}").expect("write artifact");
+        put("graph.yaml");
+        put("env.json");
+        let rings = vec![
+            "/cer_rg_0123456789abcdef".to_string(),
+            "/cer_rg_fedcba9876543210".to_string(),
+        ];
+        let graph = format!("graph.yaml:{}", run.join("graph.yaml").display());
+        let env = format!("env.json:{}", run.join("env.json").display());
+
+        let traced = spec(&run, &rings);
+        let handoff = traced.handoff();
+        assert_eq!(
+            handoff,
+            FlashbackHandoff {
+                graph_yaml: None,
+                env_json: Some(run.join("env.json")),
+                recorder_json: None,
+            },
+            "the trace rides, recorder.json does not: no graph"
+        );
+        assert_eq!(
+            context(&flashback_argv(&traced, &handoff)),
+            vec![
+                ("--attach".to_string(), env.clone()),
+                ("--ring".to_string(), rings[0].clone()),
+                ("--ring".to_string(), rings[1].clone()),
+            ],
+            "the argv carries the rings and the env, and no graph"
+        );
+
+        let untraced = spec(&run, &[]);
+        let handoff = untraced.handoff();
+        assert_eq!(
+            context(&flashback_argv(&untraced, &handoff)),
+            vec![
+                ("--attach".to_string(), graph.clone()),
+                ("--attach".to_string(), env.clone()),
+            ],
+            "no trace rides: the graph is viewable and travels"
+        );
+
+        crate::run_dir::write_run_recorder(&run, b"{}").expect("recorder.json");
+        let traced = spec(&run, &rings);
+        let handoff = traced.handoff();
+        assert_eq!(
+            context(&flashback_argv(&traced, &handoff)),
+            vec![
+                ("--attach".to_string(), graph),
+                ("--attach".to_string(), env),
+                (
+                    "--recorder-json".to_string(),
+                    run.join("recorder.json").display().to_string()
+                ),
+                ("--ring".to_string(), rings[0].clone()),
+                ("--ring".to_string(), rings[1].clone()),
+            ],
+            "with recorder.json the trace and its graph travel together"
         );
     }
 
@@ -23407,6 +26721,7 @@ nodes:
     #[test]
     fn gateway_handoff_round_trips_schema_serving_and_tolerates_absent_field() {
         let serving = cerulion_core::SchemaServing {
+            egress_qos: Vec::new(),
             topic_schemas: vec![cerulion_core::TopicSchema {
                 topic: "/t".to_string(),
                 schema_name: "pkg/Type".to_string(),
@@ -24319,6 +27634,184 @@ nodes:
         assert!(pa < pm && pm < pz, "keys must serialize SORTED: {text}");
     }
 
+    /// The secret-name rule over hand-written names: a marker counts only as
+    /// its own segment (split at every character that is not an ASCII letter or digit),
+    /// case-insensitively, with trailing digits removed, singular or plural.
+    #[cfg(unix)]
+    #[test]
+    fn env_name_marks_a_secret_matches_whole_marker_segments_only() {
+        let secret = [
+            "CERULION_RCP_TOKEN",
+            "CERULION_API_KEY",
+            "cerulion_api_key",
+            "CERULION_Rcp_Token",
+            "CERULION_KEY2",
+            "CERULION_KEYS2",
+            "CERULION_SECRET",
+            "CERULION_SECRETS",
+            "CERULION_TOKENS",
+            "CERULION_KEYS",
+            "cerulion_api_keys",
+            "CERULION_PASSWORDS",
+            "CERULION_CREDENTIALS",
+            "CERULION_DB-PASSWORD",
+            "CERULION_DB.PASSWORD",
+            "CERULION_CREDENTIAL_FILE",
+            "CERULION__KEY",
+            "IOX2_SECRET",
+            "TOKEN",
+        ];
+        for name in secret {
+            assert!(
+                env_name_marks_a_secret(name),
+                "{name} has a secret marker segment and must be marked"
+            );
+        }
+        let plain = [
+            "CERULION_EXECUTION_MODE",
+            "RUST_LOG",
+            "IOX2_X",
+            "CERULION_KEYBOARD_LAYOUT",
+            "KEYBOARD_LAYOUT",
+            "CERULION_MONKEY",
+            "CERULION_TOKENIZER",
+            "CERULION_SECRETARY",
+            "CERULION_NETD_DEVICE_CERT",
+            "CERULION_NETD_TLS_CERTIFICATE",
+            "CERULION_APIKEY",
+            "CERULION_PASSWD",
+            "CERULION_AUTHTOKEN",
+            "CERULION_2KEY",
+            "CERULION_KEYSS",
+            "",
+        ];
+        for name in plain {
+            assert!(
+                !env_name_marks_a_secret(name),
+                "{name} has no secret marker segment and must stay unmarked"
+            );
+        }
+    }
+
+    /// The allowlist decision: allowlisted names stay verbatim unless the
+    /// name marks a secret; a name off the allowlist is never verbatim.
+    #[cfg(unix)]
+    #[test]
+    fn env_value_allowlisted_refuses_a_secret_named_allowlisted_variable() {
+        let verbatim = [
+            "CERULION_EXECUTION_MODE",
+            "RUST_LOG",
+            "IOX2_X",
+            "CERULION_KEYBOARD_LAYOUT",
+            "CERULION_MONKEY",
+            "CERULION_TOKENIZER",
+            "CERULION_NETD_DEVICE_CERT",
+        ];
+        for name in verbatim {
+            assert!(env_value_allowlisted(name), "{name} must stay verbatim");
+        }
+        let hashed = [
+            "CERULION_RCP_TOKEN",
+            "CERULION_API_KEY",
+            "cerulion_api_key",
+            "CERULION_KEY2",
+            "CERULION_SECRETS",
+            "CERULION_DB-PASSWORD",
+            "CERULION_CREDENTIAL_FILE",
+            "IOX2_SECRET",
+            "KEYBOARD_LAYOUT",
+            "AWS_SECRET",
+        ];
+        for name in hashed {
+            assert!(!env_value_allowlisted(name), "{name} must be hashed");
+        }
+    }
+
+    /// The exact `env.json` bytes the default mode writes for a small fixed
+    /// environment. The `fnv64` values are hand oracles: FNV-1a 64 (offset
+    /// basis `0xcbf29ce484222325`, prime `0x100000001b3`) computed outside the
+    /// tree, of `rcp-token-value` and `hunter2`. Both secret-named values are
+    /// hashed even though their names are allowlisted, the plain names keep
+    /// their values, and neither secret appears anywhere in the bytes.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_allowlist_hashes_secret_named_values_to_exact_bytes() {
+        let vars = || {
+            vec![
+                ("RUST_LOG".to_string(), "debug".to_string()),
+                (
+                    "CERULION_RCP_TOKEN".to_string(),
+                    "rcp-token-value".to_string(),
+                ),
+                ("CERULION_KEYBOARD_LAYOUT".to_string(), "us".to_string()),
+                ("CERULION_DB-PASSWORD".to_string(), "hunter2".to_string()),
+                (
+                    "CERULION_EXECUTION_MODE".to_string(),
+                    "lockstep".to_string(),
+                ),
+            ]
+        };
+        let want = "{\n  \
+             \"CERULION_DB-PASSWORD\": {\n    \
+               \"fnv64\": \"4db147a54908e973\",\n    \
+               \"redacted\": true\n  \
+             },\n  \
+             \"CERULION_EXECUTION_MODE\": \"lockstep\",\n  \
+             \"CERULION_KEYBOARD_LAYOUT\": \"us\",\n  \
+             \"CERULION_RCP_TOKEN\": {\n    \
+               \"fnv64\": \"02c98bc82087034e\",\n    \
+               \"redacted\": true\n  \
+             },\n  \
+             \"RUST_LOG\": \"debug\"\n\
+             }";
+        let first = render_env_json(RecordEnvMode::Allowlist, vars());
+        assert_eq!(
+            String::from_utf8(first.clone()).unwrap(),
+            want,
+            "the default mode's env.json bytes"
+        );
+        let text = String::from_utf8_lossy(&first);
+        assert!(!text.contains("rcp-token-value"), "no plaintext token");
+        assert!(!text.contains("hunter2"), "no plaintext password");
+
+        // Determinism: a second render and a reversed input order give the
+        // same bytes.
+        assert_eq!(
+            render_env_json(RecordEnvMode::Allowlist, vars()),
+            first,
+            "two renders are byte-identical"
+        );
+        let reversed: Vec<_> = vars().into_iter().rev().collect();
+        assert_eq!(
+            render_env_json(RecordEnvMode::Allowlist, reversed),
+            first,
+            "input order does not change the bytes"
+        );
+    }
+
+    /// The secret-name rule belongs to the default mode only: `all` keeps a
+    /// secret-named value verbatim and `none` keeps its name with a `null`.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_all_keeps_a_secret_named_value_and_none_keeps_its_name() {
+        let vars = || {
+            vec![(
+                "CERULION_RCP_TOKEN".to_string(),
+                "rcp-token-value".to_string(),
+            )]
+        };
+        assert_eq!(
+            String::from_utf8(render_env_json(RecordEnvMode::All, vars())).unwrap(),
+            "{\n  \"CERULION_RCP_TOKEN\": \"rcp-token-value\"\n}",
+            "all mode is verbatim for a secret-named variable"
+        );
+        assert_eq!(
+            String::from_utf8(render_env_json(RecordEnvMode::None, vars())).unwrap(),
+            "{\n  \"CERULION_RCP_TOKEN\": null\n}",
+            "none mode records the name only"
+        );
+    }
+
     // =======================================================================
     // The UTC bag-filename stamp formatter (hand-rolled
     // epoch→civil; oracle epochs, incl. a stamp observed on a live run).
@@ -24368,19 +27861,133 @@ nodes:
                     - id: b\n    type: b\n    inputs:\n      - name: i\n        \
                     source: a/o\n      - name: j\n        source: /outside\n";
         let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
-        let produced: std::collections::HashSet<String> = config
-            .nodes
-            .iter()
-            .flat_map(|node| {
-                node.outputs.iter().map(|output| {
-                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
-                })
-            })
-            .collect();
-        let external = external_consumers(&config, &produced);
+        let external = external_consumers(&config);
         assert_eq!(
             external.into_iter().collect::<Vec<_>>(),
             vec![("/outside".to_string(), vec!["b".to_string()])]
+        );
+    }
+
+    /// The refusal names every topic no node publishes, each with its readers
+    /// in config order, and says why and what to run instead. A topic the
+    /// graph publishes is never named, whether a reader spells it relative or
+    /// absolute.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_process_recording_refuses_a_graph_that_reads_an_outside_topic() {
+        let yaml = "name: ext\nprefix: ext\nnodes:\n  - id: a\n    type: a\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+                    - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+                    source: a/o\n      - name: j\n        source: /outside\n  \
+                    - id: c\n    type: c\n    inputs:\n      - name: k\n        \
+                    source: /outside\n      - name: l\n        source: /other\n      \
+                    - name: m\n        source: /ext/a/o\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let msg = match refuse_outside_inputs_in_single_process_recording(&config, "ext") {
+            Err(CliError::Validation(msg)) => msg,
+            other => panic!("expected the validation refusal, got {other:?}"),
+        };
+        let expected = "`graph run --record --single-process`: graph 'ext' reads topics that \
+                        no node in it publishes: '/outside' (read by b, c), '/other' (read by \
+                        c). A single-process recording stamps its own frames from a clock that \
+                        starts at zero when the run starts, while a process outside the graph \
+                        stamps boot-monotonic time, so `cerulion bag play --resim` could not \
+                        inject the outside frames at the steps that read them. Record this \
+                        graph without `--single-process`: the default multi-process run places \
+                        each process's clock at boot-monotonic time when its loop starts.";
+        assert_eq!(msg, expected);
+    }
+
+    /// One outside topic reads in the singular; the same input refuses with
+    /// the same text every time.
+    #[cfg(unix)]
+    #[test]
+    fn the_refusal_of_one_outside_topic_is_singular_and_stable() {
+        let yaml = "name: one\nprefix: one\nnodes:\n  - id: r\n    type: r\n    \
+                    inputs:\n      - name: i\n        source: /feed/cmd\n    \
+                    outputs:\n      - name: o\n        schema: std_msgs/String\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+        let render = || match refuse_outside_inputs_in_single_process_recording(&config, "one") {
+            Err(CliError::Validation(msg)) => msg,
+            other => panic!("expected the validation refusal, got {other:?}"),
+        };
+        let first = render();
+        assert!(
+            first.starts_with(
+                "`graph run --record --single-process`: graph 'one' reads a topic that no \
+                 node in it publishes: '/feed/cmd' (read by r). "
+            ),
+            "{first}"
+        );
+        assert_eq!(first, render());
+    }
+
+    /// A graph whose every input is one of its own outputs, relative or
+    /// absolute, and a graph with no inputs at all, record as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_single_process_recording_accepts_a_graph_that_reads_only_its_own_topics() {
+        for yaml in [
+            "name: own\nprefix: own\nnodes:\n  - id: a\n    type: a\n    \
+             outputs:\n      - name: o\n        schema: std_msgs/String\n  \
+             - id: b\n    type: b\n    inputs:\n      - name: i\n        \
+             source: a/o\n      - name: j\n        source: /own/a/o\n",
+            "name: solo\nprefix: solo\nnodes:\n  - id: a\n    type: a\n    \
+             outputs:\n      - name: o\n        schema: std_msgs/String\n",
+        ] {
+            let config = cerulion_core::graph::parse_graph(yaml).expect("valid graph");
+            assert!(
+                refuse_outside_inputs_in_single_process_recording(&config, "g").is_ok(),
+                "{yaml}"
+            );
+        }
+    }
+
+    /// The outside-input refusal precedes every side effect of a recording run:
+    /// in `graph_run` it sits on the native graph after the `ros2:` split and
+    /// before the `ros2:` spawn, the run directory, the node factory load and
+    /// the recording dispatch, and `run_graph_recording` no longer makes it.
+    /// The e2e arm sees only that the single-process bring-up never logged;
+    /// this walk pins the order against each earlier side effect.
+    #[cfg(unix)]
+    #[test]
+    fn the_outside_input_refusal_precedes_every_side_effect_of_a_recording_run() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        let refusal = body
+            .find("refuse_outside_inputs_in_single_process_recording(")
+            .expect("graph_run makes the outside-input refusal");
+        let split = body
+            .find("take_ros2_entries(")
+            .expect("graph_run lifts the `ros2:` entries out");
+        assert!(
+            split < refusal,
+            "the refusal must read the native graph, after the `ros2:` split"
+        );
+        for later in [
+            "Ros2Children::spawn_with_scope(",
+            "begin_run_descriptor(",
+            "load_node_factories_from_cache(",
+            "run_graph_recording(RecordingRun",
+        ] {
+            let at = body
+                .find(later)
+                .unwrap_or_else(|| panic!("graph_run must still call `{later}`"));
+            assert!(
+                refusal < at,
+                "the refusal must come before `{later}`, or a refused run has already \
+                 started part of itself"
+            );
+        }
+        let recording = fn_body(
+            &src,
+            "fn run_graph_recording(run: RecordingRun) -> CliResult<()> {\n    let \
+             RecordingRun {\n        workspace_root,",
+        )
+        .expect("the Unix run_graph_recording must exist");
+        assert!(
+            !recording.contains("refuse_outside_inputs_in_single_process_recording("),
+            "the refusal has one call site, in graph_run"
         );
     }
 
@@ -25067,7 +28674,7 @@ nodes:
             prefix: "rr".to_string(),
             nodes: vec![
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "cam".to_string(),
@@ -25077,6 +28684,7 @@ nodes:
                     inputs: vec![cerulion_core::graph::InputDef {
                         name: "ext".to_string(),
                         source: "/external/imu".to_string(),
+                        ..Default::default()
                     }],
                     outputs: vec![
                         OutputDef {
@@ -25098,7 +28706,7 @@ nodes:
                     ],
                 },
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "cam2".to_string(),
@@ -25421,7 +29029,7 @@ nodes:
             identity: "rec_cfg_pin".to_string(),
             prefix: "rcp".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -25499,7 +29107,7 @@ nodes:
             identity: "rec_cfg_mp_pin".to_string(),
             prefix: "rcmp".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -25582,7 +29190,7 @@ nodes:
             identity: "rec_cfg_fr_pin".to_string(),
             prefix: "rcfr".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "n".to_string(),
@@ -26156,6 +29764,11 @@ nodes:
             logs_contain("allowlist mode") && logs_contain(ENV_VALUE_ALLOWLIST_DOC),
             "the default mode's info must name the documented allowlist"
         );
+        assert!(
+            logs_contain("except a name with a secret marker segment")
+                && logs_contain("secret_name_markers=TOKEN, KEY, SECRET, PASSWORD, CREDENTIAL"),
+            "the default mode's info must state the secret-name rule and name every marker"
+        );
     }
 
     // =======================================================================
@@ -26268,6 +29881,7 @@ nodes:
             ],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -26360,6 +29974,7 @@ nodes:
             recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -26421,6 +30036,88 @@ nodes:
 
     #[cfg(unix)]
     #[test]
+    fn relative_recording_directory_hands_absolute_paths_to_bagd() {
+        for _ in 0..2 {
+            let workspace = tempfile::tempdir_in(".").unwrap();
+            let directory = Path::new(workspace.path().file_name().unwrap()).join("recordings");
+            assert!(directory.is_relative());
+            let expected_directory = std::env::current_dir().unwrap().join(&directory);
+            let inputs = prepare_recording_inputs(RecordingInputSpec {
+                embed_config: &recorded_topics_config(),
+                record_dir: &directory,
+                workspace_root: workspace.path(),
+                graphs_dir: &workspace.path().join("graphs"),
+                graph_name: "status",
+                recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
+                record_env: RecordEnvMode::None,
+                coordination: crate::replay_engine::CoordinationMode::Lockstep,
+                node_external: &std::collections::BTreeMap::new(),
+            })
+            .unwrap();
+            assert_eq!(inputs.display_out_path.parent(), Some(directory.as_path()));
+            assert!(inputs.display_out_path.is_relative());
+            for path in [
+                &inputs.paths.out,
+                &inputs.paths.ready,
+                &inputs.paths.topics_json,
+                &inputs.paths.env_json,
+                &inputs.paths.recorder_json,
+                &inputs.paths.schema_catalog,
+                &inputs.paths.graph_yaml,
+            ] {
+                assert!(path.is_absolute());
+                assert_eq!(path.parent(), Some(expected_directory.as_path()));
+            }
+            let argv = bagd_argv(&BagdSpawnSpec {
+                display_out_path: Some(&inputs.display_out_path),
+                graph_name: "status",
+                status_off: false,
+                out_path: &inputs.paths.out,
+                topics_json_path: &inputs.paths.topics_json,
+                ready_path: &inputs.paths.ready,
+                env_json_path: &inputs.paths.env_json,
+                recorder_json_path: &inputs.paths.recorder_json,
+                graph_yaml_path: &inputs.paths.graph_yaml,
+                ring_names: &[],
+                record_cpu: RecordCpu::None,
+                iox2_config_path: None,
+                schema_catalog_path: inputs.schema_catalog.as_deref(),
+                state_tag: None,
+                flashback_dir: None,
+            });
+            assert_eq!(argv[1], "--out");
+            assert_eq!(argv[2], inputs.paths.out.as_os_str());
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair[0] == "--status-display-dir" && pair[1] == directory.as_os_str()));
+            assert!(!argv.iter().any(|arg| arg == "--status-period-ms"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recording_output_cannot_escape_the_selected_directory() {
+        let workspace = tempfile::tempdir().unwrap();
+        let directory = workspace.path().join("recordings");
+        let result = prepare_recording_inputs(RecordingInputSpec {
+            embed_config: &recorded_topics_config(),
+            record_dir: &directory,
+            workspace_root: workspace.path(),
+            graphs_dir: &workspace.path().join("graphs"),
+            graph_name: "/escaping",
+            recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
+            record_env: RecordEnvMode::None,
+            coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
+        });
+        assert!(
+            matches!(result, Err(CliError::Validation(message)) if message == "recording: output escaped its directory")
+        );
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn recording_inputs_write_the_workspace_schema_catalog_verbatim() {
         let ws = tempfile::tempdir().unwrap();
         workspace(ws.path());
@@ -26443,6 +30140,7 @@ nodes:
             recorded: &[],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
 
@@ -26540,6 +30238,7 @@ nodes:
             recorded: &[],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.schema_catalog.clone().expect("built-in bindings");
@@ -26595,6 +30294,7 @@ nodes:
             recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let text = std::fs::read_to_string(&inputs.graph_yaml)
@@ -26778,6 +30478,7 @@ nodes:
             recorded: &[recorded_topic("/cmd", VECTOR3_WIRE_HASH)],
             record_env: RecordEnvMode::None,
             coordination: crate::replay_engine::CoordinationMode::Lockstep,
+            node_external: &std::collections::BTreeMap::new(),
         })
         .expect("prepare");
         let path = inputs.graph_yaml.clone();
@@ -26846,28 +30547,42 @@ nodes:
     }
 
     /// `render_recorder_json` carries EXACTLY
-    /// the five flat fields (a sacred user-facing format — a speculative SIXTH
+    /// seven fields (a sacred user-facing format: a speculative EIGHTH
     /// field fails the count pin), with `arch`/`os` from the compile-time consts,
     /// `recorded_at_ns` equal to the filename-stamp `now` (no second clock), and
     /// `trace_format` = the INTENTIONAL scheduler-trace format version this binary
     /// writes. `trace_format` is the fifth field (the discard-bit-
     /// aware v2) so replay refuses a bag from a newer binary instead of mis-
-    /// decoding the discard bit — the exact-count assert stays (no-speculative-
-    /// extras spirit is preserved; the count moves 4 → 5 for one intentional add).
+    /// decoding the discard bit; `node_external` is the seventh, each node's
+    /// driver flag exactly as the caller handed it. The exact-count assert stays
+    /// (no speculative extras; each count move is one intentional add).
     #[cfg(unix)]
     #[test]
-    fn recorder_json_carries_exactly_the_six_host_fields() {
+    fn recorder_json_carries_exactly_the_seven_fields() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(1_783_092_278_948_123_456);
-        let v: serde_json::Value =
-            serde_json::from_slice(&render_recorder_json(now, CoordinationMode::Lockstep))
-                .expect("valid JSON");
-        let obj = v.as_object().expect("flat object");
+        let flags = std::collections::BTreeMap::from([
+            ("meter".to_string(), false),
+            ("cam".to_string(), true),
+        ]);
+        let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
+            now,
+            CoordinationMode::Lockstep,
+            &flags,
+        ))
+        .expect("valid JSON");
+        let obj = v.as_object().expect("an object");
         assert_eq!(
             obj.len(),
-            6,
-            "exactly six fields (arch/os/cerulion_version/recorded_at_ns + the \
-             trace_format + the coordination stamp) — no speculative extras"
+            7,
+            "exactly seven fields (arch/os/cerulion_version/recorded_at_ns + the \
+             trace_format + the coordination stamp + the driver flags), no speculative extras"
+        );
+        // The seventh field: each native node's driver flag, as a map of node id
+        // to a bool, the key a replay judges drivers by.
+        assert_eq!(
+            v["node_external"],
+            serde_json::json!({"cam": true, "meter": false})
         );
         assert_eq!(v["arch"], std::env::consts::ARCH);
         assert_eq!(v["os"], std::env::consts::OS);
@@ -26893,16 +30608,17 @@ nodes:
                 crate::replay_engine::recorder_stream_needs_v4(),
                 crate::replay_engine::recorder_stamps_read_site_roles(),
                 cerulion_core::read_outcome::fold_enabled(),
-                crate::replay_engine::recorder_stamps_consult_records()
+                crate::replay_engine::recorder_stamps_consult_records(),
+                crate::replay_engine::recorder_records_read_identity()
             )
         );
         assert_eq!(
-            v["trace_format"], 7,
-            "every bag this binary writes carries read-site roles, folds runs \
-             AND records an empty consult a replay also makes, and the consult \
-             record is the strongest claim: a reader below 7 convicts the empty \
-             drain's NoFrame record as an impossible shape and plans no position \
-             for it"
+            v["trace_format"], 9,
+            "every bag this binary writes carries read-site roles, folds runs, \
+             records an empty consult a replay also makes AND names the writer and \
+             sequence of every frame each read consumed when its batch fits the \
+             read stage's window: a reader below 9 does not know the per-frame \
+             record, so the stamp makes it refuse the bag"
         );
     }
 
@@ -26912,23 +30628,66 @@ nodes:
     /// contract to a stream built to violate it).
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
-    /// it to 5, folding to 6, and the consult record to the 7 asserted here.
+    /// it to 5, folding to 6, the consult record to 7, read identity to 8 and
+    /// per-frame batch identity to the 9 asserted here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_seven() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
-        let v: serde_json::Value =
-            serde_json::from_slice(&render_recorder_json(now, CoordinationMode::FreeRun))
-                .expect("valid JSON");
+        let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
+            now,
+            CoordinationMode::FreeRun,
+            &std::collections::BTreeMap::new(),
+        ))
+        .expect("valid JSON");
         assert_eq!(v["coordination"], "free_run");
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
-        // folding overrides both. 7, not 6: the consult record is tested
-        // first of all (`stamp_trace_format`'s hand table pins the whole
-        // matrix).
-        assert_eq!(v["trace_format"], 7);
+        // folding overrides both. 7, not 6: the consult record overrides
+        // folding. 8, not 7: read identity rides the consult record. 9, not 8:
+        // every consumed frame of a batch is named (`stamp_trace_format`'s
+        // hand table pins the whole matrix).
+        assert_eq!(v["trace_format"], 9);
+    }
+
+    /// The driver flags render in id order whatever order the nodes arrive in,
+    /// so the same graph and builds give the same bytes (Replay = Live: the
+    /// attachment a recording carries is a pure function of the run).
+    #[cfg(unix)]
+    #[test]
+    fn the_driver_stamp_is_byte_identical_whatever_the_node_order() {
+        use crate::replay_engine::{node_external_flags, CoordinationMode};
+        use cerulion_core::graph::node::MacroPolicy;
+        use cerulion_core::graph::NodeInfo;
+        let cam = NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::External);
+        let meter =
+            NodeInfo::from_names(vec![], vec![]).with_policy(MacroPolicy::Period { period_ms: 5 });
+        let mut forward: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
+        forward.insert("cam".into(), cam.clone());
+        forward.insert("meter".into(), meter.clone());
+        let mut backward: indexmap::IndexMap<String, NodeInfo> = indexmap::IndexMap::new();
+        backward.insert("meter".into(), meter);
+        backward.insert("cam".into(), cam);
+        let now = Duration::from_nanos(7);
+        let render = |infos: &indexmap::IndexMap<String, NodeInfo>| {
+            render_recorder_json(now, CoordinationMode::FreeRun, &node_external_flags(infos))
+        };
+        let a = render(&forward);
+        let b = render(&backward);
+        assert_eq!(a, b, "the node order must not reach the bytes");
+        let expected = format!(
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
+            std::env::consts::ARCH,
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+        );
+        assert_eq!(
+            String::from_utf8(a).expect("UTF-8"),
+            expected,
+            "the flags render in id order"
+        );
     }
 
     /// The ONE resolution point, and the rule it decides: a
@@ -28665,7 +32424,7 @@ nodes:
             identity: "vext".to_string(),
             prefix: "vext_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "driver".to_string(),
@@ -28734,7 +32493,7 @@ nodes:
             identity: "vok".to_string(),
             prefix: "vok_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -29394,12 +33153,17 @@ nodes:
     #[cfg(unix)]
     #[derive(Default)]
     struct DeskSpyEgress {
+        startup_error: Mutex<Option<String>>,
         register_calls: std::sync::atomic::AtomicUsize,
         announced: Mutex<Vec<String>>,
         configs: Mutex<Vec<Option<String>>>,
     }
     #[cfg(unix)]
     impl cerulion_netd::egress::EgressPlane for DeskSpyEgress {
+        fn robot_startup_error(&self) -> Option<String> {
+            self.startup_error.lock().unwrap().clone()
+        }
+
         fn register_egress(
             &self,
             _id: cerulion_netd::egress::EgressId,
@@ -29420,6 +33184,9 @@ nodes:
             Ok(true)
         }
         fn release_egress(&self, _id: cerulion_netd::egress::EgressId) {}
+        fn lan_access(&self) -> Option<cerulion_core::LanAccess> {
+            Some(cerulion_core::LanAccess::Paired)
+        }
     }
 
     /// An unused mirror plane — the daemon requires one, but this egress-only test
@@ -29446,6 +33213,68 @@ nodes:
         ) -> cerulion_netd::mirror::MirrorRelease {
             cerulion_netd::mirror::MirrorRelease::Retired
         }
+    }
+
+    #[test]
+    fn run_topic_exclusions_follow_network_scope_and_declared_egress_only() {
+        use cerulion_core::{ClosureNodeEntry, NodeEntry, NodeInfo};
+        let config: GraphConfig = serde_yaml::from_str("name: scope\nprefix: scope\nnodes:\n  - id: source\n    type: source\n    outputs:\n      - name: public\n        schema: u8\n      - name: private\n        schema: u8\nnetwork:\n  mode: peer\n  egress: [/scope/source/public]\n").unwrap();
+        let mut factories: indexmap::IndexMap<String, Box<dyn NodeEntry>> =
+            indexmap::IndexMap::new();
+        factories.insert(
+            "source".into(),
+            Box::new(ClosureNodeEntry::new(
+                NodeInfo::from_names(vec![], vec!["public".into(), "private".into()]),
+                |_ctx| Ok(()),
+            )),
+        );
+        let strict = RunNetwork::Strict(cerulion_core::NetworkConfig::default());
+        let open = RunNetwork::Permissive(cerulion_core::NetworkConfig::default());
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = dir.path().join("bridge.yaml");
+        std::fs::write(
+            &bridge,
+            "mappings:\n  - cerulion_topic: /raw/private\n    ros_type: geometry_msgs/Vector3\n",
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                excluded_run_topics(&strict, &config, &factories, None).unwrap(),
+                vec!["/scope/source/private"]
+            );
+            assert_eq!(
+                excluded_run_topics(&RunNetwork::Off, &config, &factories, None).unwrap(),
+                vec!["/scope/source/public", "/scope/source/private"]
+            );
+            assert_eq!(
+                excluded_run_topics(&RunNetwork::Inert, &config, &factories, None).unwrap(),
+                vec!["/scope/source/public", "/scope/source/private"]
+            );
+            assert!(excluded_run_topics(&open, &config, &factories, None)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                excluded_run_topics(&strict, &config, &factories, Some(&bridge)).unwrap(),
+                vec!["/scope/source/private", "/raw/private"]
+            );
+            assert_eq!(
+                excluded_run_topics(&RunNetwork::Off, &config, &factories, Some(&bridge)).unwrap(),
+                vec![
+                    "/scope/source/public",
+                    "/scope/source/private",
+                    "/raw/private"
+                ]
+            );
+        }
+        std::fs::write(&bridge, "[").unwrap();
+        assert!(excluded_run_topics(&RunNetwork::Off, &config, &factories, Some(&bridge)).is_err());
+        std::fs::remove_file(&bridge).unwrap();
+        assert!(excluded_run_topics(&strict, &config, &factories, Some(&bridge)).is_err());
+        assert!(
+            excluded_run_topics(&open, &config, &factories, Some(&bridge))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A one-topic AllowAll `GatewayLaunch` (the desk egress overlay input) at the
@@ -29505,6 +33334,7 @@ nodes:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // netd is THE desk egress path BY DEFAULT — no knob. A PERMISSIVE run with
         // a reachable netd routes through it, spawning NO per-run gateway child.
         let (netd, dir, egress) = start_spy_netd();
@@ -29519,8 +33349,15 @@ nodes:
         );
         let ws = tempfile::tempdir().unwrap();
         // A MONOLITH run (ix_config_json None — it shares netd's default namespace).
-        let handle = establish_network_egress(Some(&launch), "deskgraph", ws.path(), None)
-            .expect("establish returns a handle on the reachable-netd path");
+        let handle = establish_network_egress(
+            Some(&launch),
+            "deskgraph",
+            ws.path(),
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap()
+        .expect("establish returns a handle on the reachable-netd path");
 
         // The DESK default: the netd variant — NO gateway child was spawned (the Child
         // variant is the ONLY spawning arm).
@@ -29559,6 +33396,7 @@ nodes:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // A MULTI-PROCESS permissive run forwards its resolved namespace
         // (ix_config_json Some) THROUGH netd for verification. Against the accepting spy
         // plane it routes through netd (Netd handle, no child) AND the forwarded config
@@ -29576,9 +33414,15 @@ nodes:
         );
         let ws = tempfile::tempdir().unwrap();
         let cfg = r#"{"global":{"prefix":"iox2_"}}"#.to_string();
-        let handle =
-            establish_network_egress(Some(&launch), "mpgraph", ws.path(), Some(cfg.clone()))
-                .expect("mp permissive run routes through netd");
+        let handle = establish_network_egress(
+            Some(&launch),
+            "mpgraph",
+            ws.path(),
+            Some(cfg.clone()),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap()
+        .expect("mp permissive run routes through netd");
 
         assert!(
             matches!(handle, NetworkEgressHandle::Netd(_)),
@@ -29603,6 +33447,7 @@ nodes:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // A permissive run, but netd is unreachable (no daemon on the socket) AND
         // unspawnable (a nonexistent binary) → `register_egress_with_netd` Errs →
         // establish DEGRADES LOUDLY to the per-run gateway CHILD path (never silently
@@ -29638,7 +33483,14 @@ nodes:
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&missing_ws);
-        let handle = establish_network_egress(Some(&launch), "deskgraph", &missing_ws, None);
+        let handle = establish_network_egress(
+            Some(&launch),
+            "deskgraph",
+            &missing_ws,
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
         assert!(
             handle.is_none(),
             "netd unreachable AND the fallback child spawn also failing → LOCAL-ONLY (no handle)"
@@ -29664,6 +33516,7 @@ nodes:
         // `#[serial]` is a DIFFERENT mutex; on its own it would let these race the
         // `CARGO_TARGET_DIR` / `HOME` / `MP_*` tests that hold only this one.
         let _env_lk = mp_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _open_g = NamedEnvGuard::set("CERULION_LAN_ACCESS", Some("open"));
         // STRICT posture (an explicit `network:` block) is a PERMANENT routing rule
         // — it goes to a per-run gateway child (which honors the verbatim locators +
         // egress allow-list), NOT netd, EVEN when netd is reachable. netd's shared
@@ -29693,7 +33546,14 @@ nodes:
                 .as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&missing_ws);
-        let handle = establish_network_egress(Some(&launch), "deskgraph", &missing_ws, None);
+        let handle = establish_network_egress(
+            Some(&launch),
+            "deskgraph",
+            &missing_ws,
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .unwrap();
 
         // The netd path was NOT taken — the reachable daemon's egress plane was never
         // called.
@@ -29800,6 +33660,87 @@ nodes:
         // `local`'s fd closes, so the watcher never touches a closed/recycled fd. No hang.
         drop(watch);
         drop(local);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial_test::serial]
+    fn owner_only_registration_failure_reaches_the_runs_stderr_once() {
+        const CHILD: &str = "CERULION_REGISTRATION_WARN_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["graph_cmd::tests::owner_only_registration_failure_reaches_the_runs_stderr_once", "--exact", "--nocapture"])
+                .env(CHILD, "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stderr
+                    .matches("automatic robot registration failed; remote access is unavailable")
+                    .count(),
+                1,
+                "{stderr}"
+            );
+            assert!(
+                stderr.contains("the robot state directory must be owner-only; run `chmod 700 "),
+                "{stderr}"
+            );
+            assert!(stderr.contains("robot-state'`"), "{stderr}");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().canonicalize().unwrap();
+        let _home = NamedEnvGuard::set("CERULION_HOME", home.to_str());
+        let socket = home.join("netd.sock");
+        let _socket = NamedEnvGuard::set(cerulion_netd::hygiene::SOCKET_ENV, socket.to_str());
+        let _network = NamedEnvGuard::set("CERULION_NETWORK", None);
+        let state = crate::auth::AuthState {
+            account_id: "00112233-4455-4677-8899-aabbccddeeff".into(),
+            session_token: "test-session".into(),
+            refresh_token: "test-refresh".into(),
+            expires_at_ns: u64::MAX,
+            logged_in_ever: true,
+            role: None,
+        };
+        crate::auth::write_to(&home.join("auth.json"), &state).unwrap();
+        crate::auth::atomic_write_secret(&home.join("desk.key"), &[7; 32]).unwrap();
+        let root = home.join("robot-state");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = crate::robot_bootstrap::prepare(&root)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(error, format!("automatic robot registration: the robot state directory must be owner-only; run `chmod 700 '{}'`", root.display()));
+        assert_eq!(
+            std::fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        let egress = Arc::new(DeskSpyEgress::default());
+        *egress.startup_error.lock().unwrap() = Some(error);
+        let mut daemon = cerulion_netd::daemon::start_with_egress(
+            socket,
+            Arc::new(DeskUnusedMirror),
+            egress,
+            cerulion_netd::daemon::NetdConfig {
+                idle_grace: Duration::from_secs(60),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        cerulion_core::init_logging(false, true);
+        let (local, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let watch = spawn_netd_liveness_watch(local.as_raw_fd(), "arm".into());
+        // Repeated real status round trips exercise suppression on the worker
+        // thread; the subprocess captures the same stderr writer a run uses.
+        std::thread::sleep(Duration::from_millis(2400));
+        drop(watch);
+        daemon.shutdown();
     }
 
     /// The env-seam tests route through the PUBLIC
@@ -30165,10 +34106,6 @@ nodes:
             ),
             graph_yaml: render_effective_graph_yaml(&pre.config).expect("render"),
             env_json: render_env_json(RecordEnvMode::Allowlist, std::env::vars()),
-            recorder_json: render_recorder_json(
-                Duration::from_nanos(42),
-                crate::replay_engine::CoordinationMode::Lockstep,
-            ),
         })
         .expect("run dir");
 
@@ -30677,7 +34614,7 @@ nodes:
             .find("let refuse_save = consent.assume_yes && wiring_overridden;")
             .expect("the save gate must be computed from --yes and the wiring judgement");
         let preflight = body
-            .find("run_auto_partition_preflight(")
+            .find("run_auto_partition_preflight_with(")
             .expect("the pre-flight must still be there");
         assert!(
             gate < preflight,
@@ -31237,6 +35174,31 @@ nodes:
         }
     }
 
+    /// The supervisor refuses `block_timeout_ms` on the edges it mints a
+    /// cross-process credit word for, over the mint's own result and before it
+    /// stamps any of them into a plan: one call, ahead of the one stamp.
+    #[test]
+    fn the_supervisor_refuses_split_edge_timeouts_on_the_minted_edges_before_stamping() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let body =
+            fn_body(&src, "fn graph_run_supervisor(").expect("the supervisor fn must still exist");
+        assert_eq!(body.matches("refuse_split_edge_timeouts(").count(), 1);
+        assert_eq!(body.matches("stamp_credit_edges(").count(), 1);
+        let refuse = body
+            .find("refuse_split_edge_timeouts(")
+            .expect("the refusal");
+        let mint = body.find("credit_edges_for(").expect("the mint");
+        let stamp = body.find("stamp_credit_edges(").expect("the stamp");
+        assert!(
+            mint < refuse && refuse < stamp,
+            "the refusal reads the mint's result and runs before the stamp"
+        );
+        assert!(
+            body[refuse..stamp].contains("&credit_edges"),
+            "the refusal is handed the minted edges"
+        );
+    }
+
     /// THE HEADLINE PIN: the supervisor stamps trace rings without
     /// asking whether it records.**
     ///
@@ -31331,6 +35293,75 @@ nodes:
             "…and never from the flag: `!no_rings` is the pre-dispatch intent this write \
              exists to replace, so a correction spelled that way writes back what is \
              already there:\n{helper}"
+        );
+    }
+
+    /// The run directory's `recorder.json` is written AFTER the nodes load (it
+    /// carries each node's driver flag from the loaded metadata) and BEFORE the
+    /// run names any trace ring in `run.json` or spawns its window recorder, on
+    /// both routes.
+    ///
+    /// STRUCTURAL because the hazard is an ordering no behavioural test can
+    /// reach on demand: an attach that reads `run.json` between a ring
+    /// declaration and a later `recorder.json` write copies the rings with no
+    /// driver stamp, and the replay of that bag falls back to the build's own
+    /// declaration. `bag_cmd::read_run_artifacts` reads `run.json` first, so
+    /// this order is what makes a ring imply the stamp wherever the write
+    /// succeeded; a failed write embeds no graph
+    /// (`a_bag_that_carries_the_trace_embeds_no_graph_without_the_recorder_identity`).
+    #[cfg(unix)]
+    #[test]
+    fn the_run_directory_recorder_lands_after_the_nodes_load_and_before_any_ring() {
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let pos = |body: &str, needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("`{needle}` must still be in the body"))
+        };
+
+        let sup = fn_body(&src, "fn graph_run_supervisor(")
+            .expect("the supervisor fn must still exist; this walk moved with it");
+        assert_eq!(
+            sup.matches("write_run_recorder_best_effort(").count(),
+            1,
+            "exactly ONE run-directory recorder write on the supervisor route"
+        );
+        let write = pos(sup, "write_run_recorder_best_effort(");
+        assert!(
+            pos(sup, "let loaded_entry_infos") < write,
+            "the supervisor stamps from the LOADED metadata, so it writes after the load"
+        );
+        assert!(
+            write < pos(sup, "declare_run_rings_best_effort("),
+            "the supervisor writes recorder.json before it names a ring in run.json"
+        );
+        assert!(
+            write < pos(sup, "spawn_flashback_recorder("),
+            "…and before its window recorder reads the directory"
+        );
+
+        let mono = fn_body(&src, "pub fn graph_run(").expect("graph_run must exist");
+        assert_eq!(
+            mono.matches("write_run_recorder_best_effort(").count(),
+            1,
+            "exactly ONE run-directory recorder write on the monolith route"
+        );
+        let write = pos(mono, "write_run_recorder_best_effort(");
+        assert!(
+            pos(mono, "load_node_factories_from_cache(") < write,
+            "the monolith stamps from the LOADED factories, so it writes after the load"
+        );
+        assert!(
+            write < pos(mono, "run_graph_recording(RecordingRun"),
+            "the monolith writes recorder.json before its recording declares the ring"
+        );
+        assert!(
+            write < pos(mono, "spawn_flashback_recorder("),
+            "…and before its window recorder reads the directory"
+        );
+        assert!(
+            !mono.contains("recorder_json:"),
+            "the description no longer carries recorder.json: it is written once the \
+             nodes load"
         );
     }
 
@@ -32556,7 +36587,7 @@ struct CameraNode {
         std::fs::create_dir_all(&src_dir).unwrap();
         std::fs::write(
             src_dir.join("lib.rs"),
-            // The port is named `inp` to match `test_node_snapshot_fail_cdylib`,
+            // The port is named `inp` to match `test_node_unknown_schema_cdylib`,
             // which one of these tests stages as this node's real cdylib. With
             // matching names the ingress gate fails for the RIGHT reason (the
             // consumer's schema hash is the 0 sentinel) rather than incidentally,
@@ -32634,13 +36665,13 @@ network:
     /// a REAL loaded cdylib whose consumer declares no schema is REFUSED at
     /// preflight.
     ///
-    /// This is the failure shape the gate exists for. `test_node_snapshot_fail_cdylib` is
+    /// This is the failure shape the gate exists for. `test_node_unknown_schema_cdylib` is
     /// a raw-FFI fixture whose legacy `{"inputs":["inp"]}` info JSON carries no
     /// per-input hash, so it parses to the `0` sentinel — the same value every
     /// cdylib consumer built from that legacy info shape carries.
     /// Without this gate the report is clean and `graph run` dies seconds later.
     ///
-    /// Needs the fixture built (`cargo build -p test_node_snapshot_fail_cdylib`);
+    /// Needs the fixture built (`cargo build -p test_node_unknown_schema_cdylib`);
     /// `cargo build --workspace` covers it.
     #[test]
     fn graph_validate_refuses_an_ingress_consumer_without_a_declared_schema() {
@@ -32652,7 +36683,8 @@ network:
         // a hand-built `NodeInfo`. That distinction is the entire bug: the macro's
         // in-process `info()` always carried a hash, and only the cdylib parse
         // path lost it.
-        let fixture = cerulion_core::testing::find_fixture_cdylib("test_node_snapshot_fail_cdylib");
+        let fixture =
+            cerulion_core::testing::find_fixture_cdylib("test_node_unknown_schema_cdylib");
         let placed = touch_cdylib(&ws_root, "camera", "debug");
         std::fs::copy(&fixture, &placed).expect("stage the raw-FFI fixture as the camera cdylib");
 
@@ -32701,7 +36733,7 @@ network:
     /// The ingress topic is built from `default_prefix` rather than hardcoded,
     /// because that value is derived from the host's name at runtime.
     ///
-    /// Needs the fixture built (`cargo build -p test_node_snapshot_fail_cdylib`).
+    /// Needs the fixture built (`cargo build -p test_node_unknown_schema_cdylib`).
     #[test]
     fn graph_validate_resolves_the_default_prefix_before_running_the_ingress_gate() {
         let _env = unset_target_dir_for_test();
@@ -32746,7 +36778,8 @@ network:
         )
         .unwrap();
 
-        let fixture = cerulion_core::testing::find_fixture_cdylib("test_node_snapshot_fail_cdylib");
+        let fixture =
+            cerulion_core::testing::find_fixture_cdylib("test_node_unknown_schema_cdylib");
         let placed = touch_cdylib(&ws_root, "camera", "debug");
         std::fs::copy(&fixture, &placed).expect("stage the raw-FFI fixture as the camera cdylib");
 
@@ -32769,9 +36802,614 @@ network:
         );
     }
 
-    /// A graph with no `network:` block gets no ingress check at all.
-    /// The single-host shape — the one that has always worked — validates exactly
-    /// as cheaply as before, loading no libraries.
+    // ─── `input backpressure`: the graph build's queue refusals, at validate ─
+
+    /// Answers each node TYPE with the info a hand-written table declares for
+    /// it, as a loaded library answers `cerulion_node_info()`. A type missing
+    /// from the table reads as a library that will not load.
+    struct DeclaredInfos(Vec<(&'static str, cerulion_core::NodeInfo)>);
+
+    impl crate::node_inspector::NodeInspector for DeclaredInfos {
+        fn inspect(&self, _cdylib: &Path, label: &str) -> CliResult<cerulion_core::NodeInfo> {
+            self.0
+                .iter()
+                .find(|(node_type, _)| *node_type == label)
+                .map(|(_, info)| info.clone())
+                .ok_or_else(|| CliError::Validation(format!("'{label}' will not load")))
+        }
+    }
+
+    /// Each listed node type declares exactly the given `#[input]` ports.
+    fn declaring(
+        types: &[(&'static str, Vec<cerulion_core::graph::node::InputMeta>)],
+    ) -> DeclaredInfos {
+        DeclaredInfos(
+            types
+                .iter()
+                .map(|(node_type, inputs)| {
+                    (
+                        *node_type,
+                        cerulion_core::NodeInfo::with_meta(inputs.clone(), Vec::new()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    /// One declared `#[input]` port with the attribute's `backpressure`,
+    /// `depth` and `accumulate`, and a non-zero schema hash so the ingress
+    /// gate finds a declared schema on it.
+    fn declared_input(
+        name: &str,
+        backpressure: cerulion_core::graph::node::BackpressurePolicy,
+        depth: usize,
+        accumulate: bool,
+    ) -> cerulion_core::graph::node::InputMeta {
+        cerulion_core::graph::node::InputMeta {
+            name: name.to_string(),
+            schema_hash: 0x5eed,
+            trigger: false,
+            depth,
+            backpressure,
+            expect_within_ms: None,
+            accumulate,
+            consume: Default::default(),
+        }
+    }
+
+    /// `planner` publishes `cmd` and declares no input; `follower` declares
+    /// `cmd` as `follower_cmd` says (no port at all for `None`).
+    fn chain_infos(follower_cmd: Option<cerulion_core::graph::node::InputMeta>) -> DeclaredInfos {
+        declaring(&[
+            ("planner", Vec::new()),
+            ("follower", follower_cmd.into_iter().collect()),
+        ])
+    }
+
+    /// `planner` declares `state` and `follower` declares `cmd`, both with
+    /// `policy` at depth 4: the two inputs of [`ring_graph`].
+    fn ring_infos(policy: cerulion_core::graph::node::BackpressurePolicy) -> DeclaredInfos {
+        declaring(&[
+            ("planner", vec![declared_input("state", policy, 4, false)]),
+            ("follower", vec![declared_input("cmd", policy, 4, false)]),
+        ])
+    }
+
+    /// `planner` publishes `cmd`; `follower` reads `source` with `keys` (YAML
+    /// lines at the input's key indent) on that input. `top` adds top-level
+    /// keys.
+    fn chain_graph(top: &str, source: &str, keys: &str) -> String {
+        format!(
+            r#"prefix: p
+{top}nodes:
+  - id: planner
+    type: planner
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Vector3
+  - id: follower
+    type: follower
+    inputs:
+      - name: cmd
+        source: {source}
+{keys}"#
+        )
+    }
+
+    /// `planner` reads `follower/state` and `follower` reads `planner/cmd`,
+    /// with `planner_keys` and `follower_keys` on those inputs.
+    fn ring_graph(planner_keys: &str, follower_keys: &str) -> String {
+        format!(
+            r#"prefix: p
+nodes:
+  - id: planner
+    type: planner
+    outputs:
+      - name: cmd
+        schema: geometry_msgs/Vector3
+    inputs:
+      - name: state
+        source: follower/state
+{planner_keys}  - id: follower
+    type: follower
+    outputs:
+      - name: state
+        schema: geometry_msgs/Vector3
+    inputs:
+      - name: cmd
+        source: planner/cmd
+{follower_keys}"#
+        )
+    }
+
+    const INGRESS_EXT_CMD: &str = "network:\n  mode: peer\n  listen:\n    - tcp/127.0.0.1:0\n  \
+                                   ingress:\n    - /ext/cmd\n";
+
+    /// `process_groups:` that put `planner` and `follower` of [`chain_graph`]
+    /// in two groups, so the `cmd` edge crosses between them.
+    const SPLIT_GROUPS: &str = "process_groups:\n  front: [planner]\n  back: [follower]\n";
+
+    /// A workspace with node types `planner` and `follower` (an empty
+    /// `src/lib.rs` each, and a placeholder library `find_cdylib` resolves)
+    /// and `yaml` as graph `bp`.
+    fn queue_workspace(yaml: &str) -> (tempfile::TempDir, PathBuf) {
+        let (tmp, graphs_dir) = setup_workspace();
+        let ws_root = graphs_dir.parent().unwrap().to_path_buf();
+        for node_type in ["planner", "follower"] {
+            let src = ws_root.join("nodes").join(node_type).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("lib.rs"), "").unwrap();
+            touch_cdylib(&ws_root, node_type, "debug");
+        }
+        std::fs::write(graphs_dir.join("bp.yaml"), yaml).unwrap();
+        (tmp, ws_root)
+    }
+
+    /// `graph validate` of `yaml` (graph `bp` in a [`queue_workspace`]), with
+    /// node libraries read through `inspector`.
+    fn validate_queues(yaml: &str, inspector: &DeclaredInfos) -> ValidationReport {
+        let (_tmp, ws_root) = queue_workspace(yaml);
+        graph_validate_with_inspector(&ws_root, "bp", false, inspector).unwrap()
+    }
+
+    /// The report's `input backpressure` line; a report carries at most one.
+    fn queue_line(report: &ValidationReport) -> Option<&ValidationCheck> {
+        let lines: Vec<&ValidationCheck> = report
+            .checks
+            .iter()
+            .filter(|c| c.label == "input backpressure")
+            .collect();
+        assert!(lines.len() <= 1, "more than one queue line:\n{report}");
+        lines.first().copied()
+    }
+
+    /// Every queue the graph build refuses, `graph validate` refuses on one
+    /// failing `input backpressure` line in the build's own words, with the
+    /// graph's keys applied over the node's declaration. A failing line also
+    /// blocks the run under `--no-validate`, since the build refuses again.
+    #[test]
+    fn graph_validate_refuses_every_queue_the_graph_build_refuses() {
+        use cerulion_core::graph::node::BackpressurePolicy::{Block, DropOldest};
+        let _env = unset_target_dir_for_test();
+        let drop_oldest_4 = || chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let accumulate = || chain_infos(Some(declared_input("cmd", DropOldest, 4, true)));
+        let multi = "multi_publisher_topics:\n  - /p/planner/cmd\n";
+        let over_the_shared_ceiling = "Graph validation error: multi-publisher topic \
+             '/p/planner/cmd': a consumer declares depth 17 but the shared multi-publisher \
+             buffer ceiling is 16 (cross-graph topics provision a graph-independent ceiling; \
+             every unit of it commits SHM on EVERY publisher's pool) \u{2014} use a shallower \
+             depth or an unlisted single-writer topic (an `#[input(accumulate, cap = N)]` \
+             input's cap is its depth, so its cap is held to the same ceiling)";
+        let rows: Vec<(&str, String, DeclaredInfos, &str)> = vec![
+            (
+                "depth 65 over a declared 4",
+                chain_graph("", "planner/cmd", "        depth: 65\n"),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' \
+                 declares depth = 65; the maximum queue depth is 64 ",
+            ),
+            (
+                "depth 0",
+                chain_graph("", "planner/cmd", "        depth: 0\n"),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' \
+                 declares depth = 0; queue depth must be >= 1",
+            ),
+            (
+                "block on a source no node publishes",
+                chain_graph("", "/ext/cmd", "        backpressure: block\n"),
+                drop_oldest_4(),
+                "Graph validation error: block input 'follower.cmd' reads topic '/ext/cmd', \
+                 which has no in-graph producer;",
+            ),
+            (
+                "block on a network.ingress topic",
+                chain_graph(INGRESS_EXT_CMD, "/ext/cmd", "        backpressure: block\n"),
+                drop_oldest_4(),
+                "Graph validation error: `block` input 'follower.cmd' reads topic '/ext/cmd', \
+                 which `network.ingress` brings in from another host.",
+            ),
+            (
+                "block_timeout_ms on an input the graph leaves drop_oldest",
+                chain_graph("", "planner/cmd", "        block_timeout_ms: 40\n"),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' sets \
+                 `block_timeout_ms` but its backpressure is DropOldest, not `block`",
+            ),
+            (
+                "block_timeout_ms: 0",
+                chain_graph(
+                    "",
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 0\n",
+                ),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' sets \
+                 `block_timeout_ms: 0`, which would release the slot on every full reading",
+            ),
+            (
+                "block_timeout_ms on a listed multi-publisher topic",
+                chain_graph(
+                    multi,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+                drop_oldest_4(),
+                "Graph validation error: input 'follower.cmd' on topic '/p/planner/cmd' sets \
+                 `block_timeout_ms`, but the topic has 1 in-graph producer ('planner') and is \
+                 listed in `multi_publisher_topics:`, which lets publishers outside the graph \
+                 write it.",
+            ),
+            (
+                "depth 17 on a listed multi-publisher topic the graph publishes",
+                chain_graph(multi, "planner/cmd", "        depth: 17\n"),
+                drop_oldest_4(),
+                over_the_shared_ceiling,
+            ),
+            (
+                "an accumulate cap of 17 on a listed multi-publisher topic, with no key set",
+                chain_graph(multi, "planner/cmd", ""),
+                chain_infos(Some(declared_input("cmd", DropOldest, 17, true))),
+                over_the_shared_ceiling,
+            ),
+            (
+                "a ring the graph's keys make",
+                ring_graph(
+                    "        backpressure: block\n",
+                    "        backpressure: block\n",
+                ),
+                ring_infos(DropOldest),
+                "Graph validation error: a ring of `block` edges: planner -> follower.cmd \
+                 (topic '/p/planner/cmd'), follower -> planner.state (topic \
+                 '/p/follower/state').",
+            ),
+            (
+                "a ring the attributes make, with no key set",
+                ring_graph("", ""),
+                ring_infos(Block),
+                "Graph validation error: a ring of `block` edges: planner -> follower.cmd \
+                 (topic '/p/planner/cmd'), follower -> planner.state (topic \
+                 '/p/follower/state').",
+            ),
+            (
+                "block on an accumulate input",
+                chain_graph("", "planner/cmd", "        backpressure: block\n"),
+                accumulate(),
+                "Graph validation error: input 'follower.cmd' sets `backpressure: block` in the \
+                 graph, but the node declares it `#[input(accumulate)]`.",
+            ),
+            (
+                "depth on an accumulate input",
+                chain_graph("", "planner/cmd", "        depth: 8\n"),
+                accumulate(),
+                "Graph validation error: input 'follower.cmd' sets `depth:` in the graph, but \
+                 the node declares it `#[input(accumulate)]`.",
+            ),
+            (
+                "a key on a port the node does not declare",
+                chain_graph("", "planner/cmd", "        depth: 8\n"),
+                chain_infos(None),
+                "Graph validation error: input 'follower.cmd' sets `backpressure:` or `depth:` \
+                 in the graph, but node 'follower' declares no input metadata for 'cmd'",
+            ),
+        ];
+        for (case, yaml, inspector, head) in rows {
+            let report = validate_queues(&yaml, &inspector);
+            let line = queue_line(&report)
+                .unwrap_or_else(|| panic!("{case}: no input backpressure line in\n{report}"));
+            assert!(!line.passed, "{case}: {}", line.detail);
+            assert!(
+                line.detail.starts_with(head),
+                "{case}: expected the build's refusal\n  {head}\ngot\n  {}",
+                line.detail
+            );
+            assert!(!report.all_passed(), "{case}");
+            assert!(
+                failing_check_blocks_the_run(&line.label, &ResolvedCdylibCache::new()),
+                "{case}: the build refuses this again under --no-validate"
+            );
+        }
+    }
+
+    /// The graph's keys win over the node's declaration in the verdict: a key
+    /// that makes a declared queue valid passes, and the passing line counts
+    /// the inputs that set a key.
+    #[test]
+    fn graph_validate_accepts_the_queues_the_graph_keys_make_valid() {
+        use cerulion_core::graph::node::BackpressurePolicy::{Block, DropOldest};
+        let _env = unset_target_dir_for_test();
+        let drop_oldest_4 = || chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let block_4 = || chain_infos(Some(declared_input("cmd", Block, 4, false)));
+        let accumulate = || chain_infos(Some(declared_input("cmd", DropOldest, 4, true)));
+        let one = "1 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every input's \
+                   queue is one the graph build accepts";
+        let rows: Vec<(&str, String, DeclaredInfos, &str)> = vec![
+            (
+                "block at depth 8 over a declared drop_oldest at 4",
+                chain_graph(
+                    "",
+                    "planner/cmd",
+                    "        backpressure: block\n        depth: 8\n",
+                ),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 64, the maximum",
+                chain_graph("", "planner/cmd", "        depth: 64\n"),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 1, the minimum",
+                chain_graph("", "planner/cmd", "        depth: 1\n"),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 16 on a listed multi-publisher topic the graph publishes, the shared \
+                 ceiling",
+                chain_graph(
+                    "multi_publisher_topics:\n  - /p/planner/cmd\n",
+                    "planner/cmd",
+                    "        depth: 16\n",
+                ),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "depth 32 on a listed topic no node in the graph publishes",
+                chain_graph(
+                    "multi_publisher_topics:\n  - /ext/cmd\n",
+                    "/ext/cmd",
+                    "        depth: 32\n",
+                ),
+                drop_oldest_4(),
+                one,
+            ),
+            (
+                "drop_oldest over a declared block on a source no node publishes",
+                chain_graph("", "/ext/cmd", "        backpressure: drop_oldest\n"),
+                block_4(),
+                one,
+            ),
+            (
+                "block_timeout_ms on a declared block with one producer",
+                chain_graph("", "planner/cmd", "        block_timeout_ms: 40\n"),
+                block_4(),
+                one,
+            ),
+            (
+                "drop_oldest on one edge of a ring the attributes make",
+                ring_graph("        backpressure: drop_oldest\n", ""),
+                ring_infos(Block),
+                one,
+            ),
+            (
+                "drop_oldest on an accumulate input",
+                chain_graph("", "planner/cmd", "        backpressure: drop_oldest\n"),
+                accumulate(),
+                one,
+            ),
+            (
+                "keys on both inputs of a ring that stays broken",
+                ring_graph(
+                    "        backpressure: drop_oldest\n",
+                    "        backpressure: block\n        depth: 2\n",
+                ),
+                ring_infos(DropOldest),
+                "2 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every \
+                 input's queue is one the graph build accepts",
+            ),
+        ];
+        for (case, yaml, inspector, detail) in rows {
+            let report = validate_queues(&yaml, &inspector);
+            let line = queue_line(&report)
+                .unwrap_or_else(|| panic!("{case}: no input backpressure line in\n{report}"));
+            assert!(line.passed, "{case}: {}", line.detail);
+            assert_eq!(line.detail, detail, "{case}");
+            assert!(report.all_passed(), "{case}:\n{report}");
+        }
+    }
+
+    /// A graph that sets no key and whose declared queues the build accepts
+    /// gets no `input backpressure` line, as a node with no `params:` gets no
+    /// params line.
+    #[test]
+    fn graph_validate_writes_no_queue_line_when_no_input_sets_a_key() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        for (case, inspector) in [
+            (
+                "a declared port",
+                chain_infos(Some(declared_input("cmd", DropOldest, 4, false))),
+            ),
+            ("no declared port", chain_infos(None)),
+        ] {
+            let report = validate_queues(&chain_graph("", "planner/cmd", ""), &inspector);
+            assert!(queue_line(&report).is_none(), "{case}:\n{report}");
+            assert!(report.all_passed(), "{case}:\n{report}");
+        }
+    }
+
+    /// With a node library that does not read, the queue check writes no line:
+    /// the params check already fails the report for that library, and queues
+    /// judged without that node's declaration could refuse a graph the build
+    /// accepts.
+    #[test]
+    fn graph_validate_writes_no_queue_line_when_a_library_does_not_read() {
+        let _env = unset_target_dir_for_test();
+        let inspector = declaring(&[("planner", Vec::new())]);
+        let report = validate_queues(
+            &chain_graph("", "planner/cmd", "        depth: 65\n"),
+            &inspector,
+        );
+        assert!(queue_line(&report).is_none(), "{report}");
+        let unread: Vec<&ValidationCheck> = report
+            .checks
+            .iter()
+            .filter(|c| c.label == "params 'follower'")
+            .collect();
+        assert_eq!(unread.len(), 1, "{report}");
+        assert!(!unread[0].passed, "{report}");
+        assert_eq!(
+            unread[0].detail,
+            "not checked: the node library could not be read: 'follower' will not load"
+        );
+    }
+
+    /// A fault `validate_graph` reports on the `graph topology` line is not
+    /// reported a second time on the queue line.
+    #[test]
+    fn graph_validate_reports_a_topology_fault_only_on_the_topology_line() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let report = validate_queues(
+            &chain_graph("", "nobody/cmd", "        depth: 0\n"),
+            &chain_infos(Some(declared_input("cmd", DropOldest, 4, false))),
+        );
+        let topology = report
+            .checks
+            .iter()
+            .find(|c| c.label == "graph topology")
+            .expect("a graph topology line");
+        assert!(!topology.passed, "{report}");
+        assert!(queue_line(&report).is_none(), "{report}");
+    }
+
+    /// A key the graph build refuses on an ingress graph is reported on the
+    /// queue line, and the `network ingress` line still judges the loaded
+    /// libraries' schemas instead of reporting libraries that will not load.
+    #[test]
+    fn graph_validate_keeps_a_refused_key_off_the_ingress_line() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let report = validate_queues(
+            &chain_graph(INGRESS_EXT_CMD, "/ext/cmd", "        depth: 8\n"),
+            &chain_infos(Some(declared_input("cmd", DropOldest, 4, true))),
+        );
+        let ingress = ingress_check(&report).expect("the ingress check runs");
+        assert!(ingress.passed, "{}", ingress.detail);
+        assert_eq!(
+            ingress.detail,
+            "1 topic(s) resolve to a consuming input with a declared schema"
+        );
+        let line = queue_line(&report).expect("a queue line");
+        assert!(
+            line.detail.starts_with(
+                "Graph validation error: input 'follower.cmd' sets `depth:` in the graph, but \
+                 the node declares it `#[input(accumulate)]`."
+            ),
+            "{}",
+            line.detail
+        );
+    }
+
+    /// Two validations of one workspace write the same report, byte for byte.
+    #[test]
+    fn graph_validate_writes_the_same_queue_verdict_on_every_run() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let (_tmp, ws_root) = queue_workspace(&ring_graph(
+            "        backpressure: block\n",
+            "        backpressure: block\n",
+        ));
+        let inspector = ring_infos(DropOldest);
+        let first = graph_validate_with_inspector(&ws_root, "bp", false, &inspector)
+            .unwrap()
+            .to_string();
+        let second = graph_validate_with_inspector(&ws_root, "bp", false, &inspector)
+            .unwrap()
+            .to_string();
+        assert!(
+            first.contains("input backpressure: Graph validation error: a ring"),
+            "{first}"
+        );
+        assert_eq!(first, second);
+    }
+
+    /// `planner` and `second` (both of type `planner`) publish the listed
+    /// multi-publisher topic `/p/shared`, which `follower` reads with
+    /// `backpressure: block`; group `front` holds both producers and group
+    /// `back` holds `follower`.
+    const SPLIT_MULTI_PRODUCER_GRAPH: &str = "prefix: p
+multi_publisher_topics:
+  - /p/shared
+process_groups:
+  front: [planner, second]
+  back: [follower]
+nodes:
+  - id: planner
+    type: planner
+    outputs:
+      - name: cmd
+        topic: /p/shared
+        schema: geometry_msgs/Vector3
+  - id: second
+    type: planner
+    outputs:
+      - name: cmd
+        topic: /p/shared
+        schema: geometry_msgs/Vector3
+  - id: follower
+    type: follower
+    inputs:
+      - name: cmd
+        source: /p/shared
+        backpressure: block
+";
+
+    /// The `input backpressure` line judges only what the graph build judges.
+    /// On a graph whose declared partition `graph run` refuses before any
+    /// worker starts, `graph validate` and `graph run`'s pre-run report write
+    /// the same passing queue line, and the pre-run report passes: a
+    /// `--single-process` run deploys no partition.
+    #[test]
+    fn graph_runs_report_writes_the_verbs_queue_line_over_a_declared_partition() {
+        use cerulion_core::graph::node::BackpressurePolicy::DropOldest;
+        let _env = unset_target_dir_for_test();
+        let inspector = chain_infos(Some(declared_input("cmd", DropOldest, 4, false)));
+        let one = "1 input(s) set `backpressure:`, `depth:` or `block_timeout_ms`; every input's \
+                   queue is one the graph build accepts";
+        for (case, yaml) in [
+            (
+                "a split multi-producer block edge",
+                SPLIT_MULTI_PRODUCER_GRAPH.to_string(),
+            ),
+            (
+                "block_timeout_ms on a split block edge",
+                chain_graph(
+                    SPLIT_GROUPS,
+                    "planner/cmd",
+                    "        backpressure: block\n        block_timeout_ms: 40\n",
+                ),
+            ),
+        ] {
+            let (_tmp, ws_root) = queue_workspace(&yaml);
+            let config = graph_read(&ws_root.join("graphs"), "bp").unwrap();
+            let cache = resolve_cdylib_cache(&ws_root, &config, false);
+            for report_for in [ReportFor::ValidateVerb, ReportFor::RunPreflight] {
+                let report = graph_validate_with_cache(
+                    &ws_root,
+                    "bp",
+                    &config,
+                    &cache,
+                    report_for,
+                    &inspector,
+                    &cerulion_core::graph::ArgProvenance::default(),
+                );
+                let queue = queue_line(&report)
+                    .unwrap_or_else(|| panic!("{case}: no input backpressure line in\n{report}"));
+                assert!(queue.passed, "{case} {report_for:?}: {}", queue.detail);
+                assert_eq!(queue.detail, one, "{case} {report_for:?}");
+                if report_for == ReportFor::RunPreflight {
+                    assert!(report.all_passed(), "{case}:\n{report}");
+                }
+            }
+        }
+    }
+
+    /// A graph with no `network:` block gets no `network ingress` line.
     #[test]
     fn graph_validate_skips_the_ingress_gate_without_a_network_block() {
         let _env = unset_target_dir_for_test();
@@ -32781,7 +37419,7 @@ network:
         let report = graph_validate(&ws_root, "test", false).unwrap();
         assert!(
             ingress_check(&report).is_none(),
-            "a graph with no network block must not run the ingress gate (and must not dlopen)"
+            "a graph with no network block must not run the ingress gate"
         );
     }
 
@@ -33109,7 +37747,7 @@ network:
             prefix: "p".to_string(),
             nodes: (0..n)
                 .map(|i| NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: format!("{}_{}", node_type, i),
@@ -37291,7 +41929,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             identity: "period".to_string(),
             prefix: "period_test".to_string(),
             nodes: vec![NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: "ticker".to_string(),
@@ -37350,7 +41988,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             prefix: "period_multi_test".to_string(),
             nodes: vec![
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "fast".to_string(),
@@ -37365,7 +42003,7 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
                     }],
                 },
                 NodeDef {
-                    fuse: None,
+                    isolate: None,
                     params: Default::default(),
                     ros2: None,
                     id: "slow".to_string(),
@@ -38240,12 +42878,15 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     // `resolve_monitor_wait_policy` oracle-vector tests. PURE —
     // mode, both env values, is_live, primitive availability, and ns are all
     // injected, so these are hermetic (hand-written expected policies asserted
-    // via the accessors, never self-compares). `MonitorWaitPolicy::new` coerces
-    // `doorbell ⇒ monitor_wait`, which several arms below pin explicitly. Note:
+    // via the accessors, never self-compares). On the primitive arm an unset
+    // doorbell follows the park and only an explicit `CERULION_DOORBELL=1`
+    // turns the park on over `CERULION_MONITOR_WAIT=0`, which several arms
+    // below pin explicitly; the full
+    // grid is `resolve_mw_every_env_cell_matches_the_hand_written_table`. Note:
     // the resolver early-returns the literal `off()` (empty ns) ONLY for
-    // `Disabled` / unavailable; the available path always returns
-    // `new(mw, db, ns)`, so a functionally-off available result keeps its ns and
-    // is asserted via the boolean accessors, not `== off()`.
+    // `Disabled`; both host arms return `new(mw, db, ns)`, so a functionally-off
+    // result there keeps its ns and is asserted via the boolean accessors, not
+    // `== off()`.
 
     /// A representative non-empty doorbell namespace for the available arms.
     const TEST_NS: &str = "testns";
@@ -38619,13 +43260,16 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         assert_eq!(p, cerulion_core::MonitorWaitPolicy::off());
     }
 
-    /// No primitive + `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1`: the
-    /// doorbell is inert on this tier so it does NOT coerce the park back on
-    /// (UNLIKE arm 3's `doorbell ⇒ monitor_wait`) — park OFF — and the
-    /// downgrade warn fires for the ignored explicit doorbell request.
+    /// No primitive + `CERULION_MONITOR_WAIT=0` + `CERULION_DOORBELL=1` + no
+    /// wake word: the doorbell does NOT turn the park back on on this tier
+    /// (UNLIKE arm 3, where the explicit request does), so the park is OFF, and
+    /// exactly one downgrade warn fires. It names the PARK-OFF reason even
+    /// though the wake word is missing too: the wake-word line describes a park
+    /// that runs, which this one does not. Arm 3's override line must not
+    /// appear, since nothing was turned back on.
     #[test]
     #[tracing_test::traced_test]
-    fn resolve_mw_unavailable_inert_doorbell_does_not_coerce_park_on() {
+    fn resolve_mw_unavailable_zero_with_an_explicit_doorbell_stays_off_and_names_the_park_reason() {
         let p = resolve_monitor_wait_policy(MonitorWaitInputs {
             mode: MonitorWaitMode::Auto,
             env_monitor_wait: Some("0"),
@@ -38637,13 +43281,32 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         });
         assert!(
             !p.monitor_wait() && !p.doorbell(),
-            "an inert (forced-off) doorbell must NOT coerce the park on over an \
-             explicit CERULION_MONITOR_WAIT=0 opt-out"
+            "without a CPU monitor-wait primitive an explicit CERULION_DOORBELL=1 must NOT \
+             turn the park back on over an explicit CERULION_MONITOR_WAIT=0"
         );
-        assert!(
-            logs_contain("doorbell FORCED OFF"),
-            "the ignored explicit doorbell request must warn about the downgrade"
-        );
+        logs_assert(|lines: &[&str]| {
+            let at = |marker: &str| cerulion_core::testing::count_at(lines, "WARN", marker);
+            match (
+                at(""),
+                at("doorbell FORCED OFF"),
+                at("the live-loop park is OFF on this run"),
+                at("does not turn the park back on"),
+                at("wake_word_available=false"),
+                at("nothing on this run can kernel-block on a doorbell wake word"),
+                at("turns the live-loop park back on"),
+                at("--no-monitor-wait"),
+            ) {
+                (1, 1, 1, 1, 1, 0, 0, 0) => Ok(()),
+                (all, forced_off, park_off, no_turn_on, field, wake_word, override_line, flag) => {
+                    Err(format!(
+                        "expected exactly one WARN, the park-off reason with the wake-word \
+                         field: {all} WARN, {forced_off} forced-off, {park_off} park-off, \
+                         {no_turn_on} no-turn-on, {field} field, {wake_word} wake-word, \
+                         {override_line} override, {flag} naming the flag"
+                    ))
+                }
+            }
+        });
         assert!(
             !logs_contain("DEGRADED sleep-recheck tier"),
             "no tier info line when the park resolves off"
@@ -38812,11 +43475,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     }
 
     /// Available + `CERULION_MONITOR_WAIT=0` + doorbell unset under live: the
-    /// monitor_wait flag is forced off, BUT the doorbell auto-defaults ON
-    /// (live), and `MonitorWaitPolicy::new` COERCES `doorbell ⇒ monitor_wait` —
-    /// so the park is on after all. Pins the coercion.
+    /// explicit `0` is a REAL OFF. The unset doorbell follows the park, so it
+    /// is off too, and nothing warns: the run is exactly what was asked for.
+    /// The same cell is off on a host without a primitive and in
+    /// `rmw_cerulion`, so all three agree.
     #[test]
-    fn resolve_mw_env_mw_zero_doorbell_auto_coerces_park_on() {
+    #[tracing_test::traced_test]
+    fn resolve_mw_env_mw_zero_with_the_doorbell_unset_is_a_real_off() {
         let p = resolve_monitor_wait_policy(MonitorWaitInputs {
             mode: MonitorWaitMode::Auto,
             env_monitor_wait: Some("0"),
@@ -38826,10 +43491,104 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             data_wake_available: false,
             ns: TEST_NS.to_string(),
         });
-        assert!(p.doorbell(), "doorbell auto-defaults on under live");
         assert!(
-            p.monitor_wait(),
-            "doorbell => monitor_wait coercion must re-arm the park even though CERULION_MONITOR_WAIT=0"
+            !p.monitor_wait(),
+            "CERULION_MONITOR_WAIT=0 must turn the park off on a host with a primitive"
+        );
+        assert!(
+            !p.doorbell(),
+            "an unset CERULION_DOORBELL follows the park, so it is off too"
+        );
+        assert_eq!(p.ns(), TEST_NS, "the namespace is still threaded through");
+        assert!(
+            !logs_contain("turns the live-loop park back on"),
+            "nothing was turned back on, so the override line must not appear"
+        );
+        logs_assert(
+            |lines: &[&str]| match cerulion_core::testing::count_at(lines, "WARN", "") {
+                0 => Ok(()),
+                n => Err(format!(
+                    "an honoured opt-out has nothing to warn about, got {n} WARN lines: {lines:?}"
+                )),
+            },
+        );
+    }
+
+    /// Available + `CERULION_MONITOR_WAIT=0` + an EXPLICIT `CERULION_DOORBELL=1`
+    /// under live: the one request that turns the park back on over the
+    /// explicit `0` (a doorbell ring wakes the park, so arming the doorbell arms
+    /// the park). It is never silent: ONE warn, naming both variables and both
+    /// ways to keep the park off.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_env_mw_zero_with_an_explicit_doorbell_turns_the_park_on_and_warns_once() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("0"),
+            env_doorbell: Some("1"),
+            is_live: true,
+            primitive_available: true,
+            data_wake_available: false,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            p.monitor_wait() && p.doorbell(),
+            "an explicit CERULION_DOORBELL=1 turns the park back on, doorbell armed"
+        );
+        logs_assert(|lines: &[&str]| {
+            let warns = cerulion_core::testing::count_at(lines, "WARN", "");
+            let named = cerulion_core::testing::count_at(
+                lines,
+                "WARN",
+                "CERULION_DOORBELL=1 turns the live-loop park back on over CERULION_MONITOR_WAIT=0",
+            );
+            match (warns, named) {
+                (1, 1) => Ok(()),
+                (warns, named) => Err(format!(
+                    "expected exactly one WARN and it naming both variables, got {warns} WARN \
+                     lines, {named} of them the override line: {lines:?}"
+                )),
+            }
+        });
+        assert!(
+            logs_contain("Unset CERULION_DOORBELL or set it to 0 to keep the park off"),
+            "the warn must say how to keep the park off with the env, which \
+             works for every caller"
+        );
+        assert!(
+            !logs_contain("--no-monitor-wait"),
+            "graph profile and the embedded resolver have no --no-monitor-wait, \
+             so the warn must not name it"
+        );
+    }
+
+    /// Available + `CERULION_MONITOR_WAIT=0` + a NEAR-MISS doorbell (`"yes"`):
+    /// the near-miss warns and falls to the doorbell's auto default, which
+    /// follows the park, so the explicit `0` still stands. A typo must never
+    /// turn the park back on; only an exact `1` can.
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_mw_env_mw_zero_with_a_near_miss_doorbell_stays_off() {
+        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+            mode: MonitorWaitMode::Auto,
+            env_monitor_wait: Some("0"),
+            env_doorbell: Some("yes"),
+            is_live: true,
+            primitive_available: true,
+            data_wake_available: false,
+            ns: TEST_NS.to_string(),
+        });
+        assert!(
+            !p.monitor_wait() && !p.doorbell(),
+            "a near-miss doorbell follows the park, which CERULION_MONITOR_WAIT=0 turned off"
+        );
+        assert!(
+            logs_contain("ignoring unrecognized monitor-wait env value"),
+            "the near-miss still warns"
+        );
+        assert!(
+            !logs_contain("turns the live-loop park back on"),
+            "the park stayed off, so the override warn must not fire"
         );
     }
 
@@ -38940,13 +43699,14 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
 
     /// Available + `CERULION_DOORBELL=1` (explicit force-on) + monitor_wait
     /// unset + NOT live (virtual): the doorbell env forces the doorbell on even
-    /// on the non-live auto, and `MonitorWaitPolicy::new` COERCES
-    /// `doorbell ⇒ monitor_wait` — so the park arms despite the virtual
-    /// auto-off. Pins the doorbell explicit-force arm DISTINCTLY (the
-    /// `monitor_wait`-only force-on arm is `resolve_mw_env_mw_one_overrides_virtual_auto`)
-    /// + the coercion.
+    /// on the non-live auto, and the resolver turns the park on with it (a
+    /// ring wakes the same park), so the park arms despite the virtual
+    /// auto-off. No override warn: nothing explicit was overridden. Pins the
+    /// doorbell explicit-force arm DISTINCTLY (the `monitor_wait`-only force-on
+    /// arm is `resolve_mw_env_mw_one_overrides_virtual_auto`).
     #[test]
-    fn resolve_mw_env_doorbell_one_on_virtual_coerces_park_on() {
+    #[tracing_test::traced_test]
+    fn resolve_mw_env_doorbell_one_on_virtual_turns_the_park_on() {
         let p = resolve_monitor_wait_policy(MonitorWaitInputs {
             mode: MonitorWaitMode::Auto,
             env_monitor_wait: None,
@@ -38962,7 +43722,11 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
         );
         assert!(
             p.monitor_wait(),
-            "doorbell => monitor_wait coercion arms the park even on the virtual auto"
+            "the explicit doorbell request arms the park even on the virtual auto"
+        );
+        assert!(
+            !logs_contain("turns the live-loop park back on"),
+            "CERULION_MONITOR_WAIT was not set, so no explicit off was overridden"
         );
     }
 
@@ -39063,10 +43827,23 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             "the missing-wake-word reason did NOT apply, so its wording must \
              not appear: it points at a remedy that would not help"
         );
+        assert!(
+            !logs_contain("turns the live-loop park back on"),
+            "without a primitive the park stays off, so arm 3's override line must not appear"
+        );
+        assert!(
+            logs_contain("wake_word_available=true"),
+            "the park-off warn carries the wake-word fact as a field"
+        );
+        assert!(
+            !logs_contain("--no-monitor-wait"),
+            "the flag cannot be set on this path, so no line may name it as a remedy"
+        );
     }
 
     /// Available (arm 3) + a wake word present → the wake-word fact changes
-    /// NOTHING: arm 3's doorbell rides its env ladder alone, because the CPU
+    /// NOTHING: arm 3's doorbell rides its env ladder and the resolved park,
+    /// never the wake-word fact, because the CPU
     /// monitor-wait primitive already hears the ring on the same line. The
     /// REACH pin for the injected fact: a resolver that consulted it on arm 3
     /// would silently gate the Linux doorbell on a macOS-only tier.
@@ -39125,6 +43902,167 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
             !logs_contain("ignoring unrecognized"),
             "an empty (unset) value must NOT trip the unrecognized-value warn"
         );
+    }
+
+    /// The host shape a resolver cell is evaluated on: the two injected host
+    /// facts, named so a table row reads as a host rather than two bools.
+    #[derive(Clone, Copy, Debug)]
+    enum MwHost {
+        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
+        /// aarch64): arm 3. The wake-word fact is run both ways for every row,
+        /// because arm 3 must not read it.
+        Primitive,
+        /// No primitive, but a consumer can kernel-block on a doorbell wake
+        /// word (Linux without WAITPKG, macOS 14.4 and later): arm 2.
+        WakeWord,
+        /// Neither (macOS before 14.4, other targets): arm 2, doorbell inert.
+        Neither,
+    }
+
+    /// EVERY cell of the resolver under `MonitorWaitMode::Auto`:
+    /// `CERULION_MONITOR_WAIT` unset/0/1 x `CERULION_DOORBELL` unset/0/1 x the
+    /// three host shapes x live/virtual, against a HAND-WRITTEN expected
+    /// `(park, doorbell)`. The cells the rule turns on:
+    /// - an explicit `CERULION_MONITOR_WAIT=0` with the doorbell unset or `0` is
+    ///   OFF on every host and clock;
+    /// - an explicit `CERULION_DOORBELL=1` turns the park back on over it only
+    ///   where a primitive exists (arm 3); without one the opt-out stands;
+    /// - an unset doorbell follows the park (`CERULION_MONITOR_WAIT=1` under
+    ///   virtual is a timer-only park, not a doorbell one).
+    #[test]
+    fn resolve_mw_every_env_cell_matches_the_hand_written_table() {
+        use MwHost::{Neither, Primitive, WakeWord};
+        /// `(park, doorbell)`, as `monitor_wait()` and `doorbell()` read.
+        type ParkBell = (bool, bool);
+        /// (host, is_live, CERULION_MONITOR_WAIT, CERULION_DOORBELL) -> (park, doorbell)
+        type GridRow = (
+            MwHost,
+            bool,
+            Option<&'static str>,
+            Option<&'static str>,
+            ParkBell,
+        );
+        const OFF: ParkBell = (false, false);
+        const TIMER: ParkBell = (true, false);
+        const BELL: ParkBell = (true, true);
+        const LIVE: bool = true;
+        const VIRTUAL: bool = false;
+        #[rustfmt::skip]
+        let table: [GridRow; 54] = [
+            (Primitive, LIVE,    None,      None,      BELL),
+            (Primitive, LIVE,    None,      Some("0"), TIMER),
+            (Primitive, LIVE,    None,      Some("1"), BELL),
+            (Primitive, LIVE,    Some("0"), None,      OFF),
+            (Primitive, LIVE,    Some("0"), Some("0"), OFF),
+            (Primitive, LIVE,    Some("0"), Some("1"), BELL),
+            (Primitive, LIVE,    Some("1"), None,      BELL),
+            (Primitive, LIVE,    Some("1"), Some("0"), TIMER),
+            (Primitive, LIVE,    Some("1"), Some("1"), BELL),
+            (Primitive, VIRTUAL, None,      None,      OFF),
+            (Primitive, VIRTUAL, None,      Some("0"), OFF),
+            (Primitive, VIRTUAL, None,      Some("1"), BELL),
+            (Primitive, VIRTUAL, Some("0"), None,      OFF),
+            (Primitive, VIRTUAL, Some("0"), Some("0"), OFF),
+            (Primitive, VIRTUAL, Some("0"), Some("1"), BELL),
+            (Primitive, VIRTUAL, Some("1"), None,      TIMER),
+            (Primitive, VIRTUAL, Some("1"), Some("0"), TIMER),
+            (Primitive, VIRTUAL, Some("1"), Some("1"), BELL),
+            (WakeWord,  LIVE,    None,      None,      BELL),
+            (WakeWord,  LIVE,    None,      Some("0"), TIMER),
+            (WakeWord,  LIVE,    None,      Some("1"), BELL),
+            (WakeWord,  LIVE,    Some("0"), None,      OFF),
+            (WakeWord,  LIVE,    Some("0"), Some("0"), OFF),
+            (WakeWord,  LIVE,    Some("0"), Some("1"), OFF),
+            (WakeWord,  LIVE,    Some("1"), None,      BELL),
+            (WakeWord,  LIVE,    Some("1"), Some("0"), TIMER),
+            (WakeWord,  LIVE,    Some("1"), Some("1"), BELL),
+            (WakeWord,  VIRTUAL, None,      None,      OFF),
+            (WakeWord,  VIRTUAL, None,      Some("0"), OFF),
+            (WakeWord,  VIRTUAL, None,      Some("1"), OFF),
+            (WakeWord,  VIRTUAL, Some("0"), None,      OFF),
+            (WakeWord,  VIRTUAL, Some("0"), Some("0"), OFF),
+            (WakeWord,  VIRTUAL, Some("0"), Some("1"), OFF),
+            (WakeWord,  VIRTUAL, Some("1"), None,      TIMER),
+            (WakeWord,  VIRTUAL, Some("1"), Some("0"), TIMER),
+            (WakeWord,  VIRTUAL, Some("1"), Some("1"), BELL),
+            (Neither,   LIVE,    None,      None,      TIMER),
+            (Neither,   LIVE,    None,      Some("0"), TIMER),
+            (Neither,   LIVE,    None,      Some("1"), TIMER),
+            (Neither,   LIVE,    Some("0"), None,      OFF),
+            (Neither,   LIVE,    Some("0"), Some("0"), OFF),
+            (Neither,   LIVE,    Some("0"), Some("1"), OFF),
+            (Neither,   LIVE,    Some("1"), None,      TIMER),
+            (Neither,   LIVE,    Some("1"), Some("0"), TIMER),
+            (Neither,   LIVE,    Some("1"), Some("1"), TIMER),
+            (Neither,   VIRTUAL, None,      None,      OFF),
+            (Neither,   VIRTUAL, None,      Some("0"), OFF),
+            (Neither,   VIRTUAL, None,      Some("1"), OFF),
+            (Neither,   VIRTUAL, Some("0"), None,      OFF),
+            (Neither,   VIRTUAL, Some("0"), Some("0"), OFF),
+            (Neither,   VIRTUAL, Some("0"), Some("1"), OFF),
+            (Neither,   VIRTUAL, Some("1"), None,      TIMER),
+            (Neither,   VIRTUAL, Some("1"), Some("0"), TIMER),
+            (Neither,   VIRTUAL, Some("1"), Some("1"), TIMER),
+        ];
+        for (host, is_live, env_monitor_wait, env_doorbell, want) in table {
+            let facts: &[(bool, bool)] = match host {
+                Primitive => &[(true, false), (true, true)],
+                WakeWord => &[(false, true)],
+                Neither => &[(false, false)],
+            };
+            for &(primitive_available, data_wake_available) in facts {
+                let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+                    mode: MonitorWaitMode::Auto,
+                    env_monitor_wait,
+                    env_doorbell,
+                    is_live,
+                    primitive_available,
+                    data_wake_available,
+                    ns: TEST_NS.to_string(),
+                });
+                assert_eq!(
+                    (p.monitor_wait(), p.doorbell()),
+                    want,
+                    "{host:?} live={is_live} data_wake={data_wake_available} \
+                     CERULION_MONITOR_WAIT={env_monitor_wait:?} \
+                     CERULION_DOORBELL={env_doorbell:?}: (park, doorbell)"
+                );
+                assert_eq!(p.ns(), TEST_NS, "Auto threads the namespace on every cell");
+            }
+        }
+    }
+
+    /// `--no-monitor-wait` (`Disabled`) is OFF on every cell of the same grid:
+    /// no env value, host shape or clock gets past the flag.
+    #[test]
+    fn resolve_mw_disabled_is_off_on_every_env_cell() {
+        let envs = [None, Some("0"), Some("1")];
+        let hosts = [(true, false), (true, true), (false, true), (false, false)];
+        for env_monitor_wait in envs {
+            for env_doorbell in envs {
+                for (primitive_available, data_wake_available) in hosts {
+                    for is_live in [true, false] {
+                        let p = resolve_monitor_wait_policy(MonitorWaitInputs {
+                            mode: MonitorWaitMode::Disabled,
+                            env_monitor_wait,
+                            env_doorbell,
+                            is_live,
+                            primitive_available,
+                            data_wake_available,
+                            ns: TEST_NS.to_string(),
+                        });
+                        assert_eq!(
+                            p,
+                            cerulion_core::MonitorWaitPolicy::off(),
+                            "--no-monitor-wait must be off: primitive={primitive_available} \
+                             data_wake={data_wake_available} live={is_live} \
+                             CERULION_MONITOR_WAIT={env_monitor_wait:?} \
+                             CERULION_DOORBELL={env_doorbell:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     // The monitor-wait park suppresses the AUTO
@@ -40172,6 +45110,7 @@ mod worker_tests {
             sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             // No credit-backed cross-process `block` edge.
             credit_edges: Vec::new(),
+            paced_topic_warnings: Vec::new(),
             // Not recording (every case fails before the ring seam).
             recording_ring: None,
             trace_ring: None,
@@ -40179,6 +45118,7 @@ mod worker_tests {
             run_dir: None,
             wedge_page: None,
             pause_tag: None,
+            host: None,
         }
     }
 
@@ -40412,7 +45352,7 @@ mod worker_tests {
         }
         fn nd(id: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
             NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: id.to_string(),
@@ -40428,6 +45368,7 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
 
         // (1) the CONSUMER node is local.
@@ -40436,6 +45377,7 @@ mod worker_tests {
             vec![InputDef {
                 name: "gate".to_string(),
                 source: "/p/cam/out".to_string(),
+                ..Default::default()
             }],
             vec![],
         )]);
@@ -40486,6 +45428,7 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         check_credit_edges_unique("the worker", &[e("gate"), e("other")])
             .expect("two DISTINCT edges on one topic are ordinary");
@@ -40567,6 +45510,7 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         assert_eq!(credit_role_for(&edge, 0), Some(CreditRole::Producer));
         assert_eq!(credit_role_for(&edge, 1), Some(CreditRole::Consumer));
@@ -40597,6 +45541,7 @@ mod worker_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         check_credit_producer_ranks("p1", &one).expect("exactly one producer rank is the shape");
         for ranks in [vec![], vec![0, 2]] {
@@ -40656,6 +45601,117 @@ mod worker_tests {
             err.to_string().contains("unparseable `ix_config_json`"),
             "expected the unparseable-config rejection, got: {err}"
         );
+    }
+
+    /// Every executor unit of a worker host runs on a transport carrying its
+    /// OWN clock: a unit's runtime refuses a transport built with another
+    /// clock, so two units in one process that shared the process singleton
+    /// could not both build.
+    #[test]
+    #[serial_test::serial]
+    fn each_unit_of_a_worker_host_gets_a_transport_with_its_own_clock() {
+        let ix = crate::multiprocess::planning_ix_config(
+            "unit_transport",
+            &format!("{}", std::process::id()),
+        )
+        .expect("ix config");
+        let mut clocks = Vec::new();
+        let mut transports = Vec::new();
+        for (i, group) in ["g.a", "g.b"].into_iter().enumerate() {
+            let mut plan = minimal_plan("");
+            plan.group = group.to_string();
+            plan.node_name = format!("unit_transport_{i}");
+            plan.host = Some("g".to_string());
+            let clock: Arc<dyn cerulion_core::clock::Clock> =
+                Arc::new(cerulion_core::VirtualClock::new());
+            let transport =
+                worker_transport(&plan, Arc::clone(&clock), ix.clone()).expect("transport");
+            clocks.push(clock);
+            transports.push(transport);
+        }
+        for (i, (t, c)) in transports.iter().zip(&clocks).enumerate() {
+            assert!(
+                Arc::ptr_eq(&t.clock_arc(), c),
+                "unit {i}'s transport carries another unit's clock"
+            );
+        }
+    }
+
+    /// The plans of one host are one spawn entry, in spawn order; a plan
+    /// without a host is its own.
+    #[test]
+    fn host_spawn_order_puts_the_plans_of_one_host_in_one_process() {
+        let mut plan = crate::multiprocess::DeploymentPlan {
+            workers: Vec::new(),
+            barrier_ns: "ns".to_string(),
+            barrier_id: "id".to_string(),
+            expected: 3,
+        };
+        for (rank, (group, host)) in [
+            ("cam", None),
+            ("work.pace", Some("work")),
+            ("work.fast", Some("work")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut w = minimal_plan("{}");
+            w.group = group.to_string();
+            w.rank = rank;
+            w.host = host.map(str::to_string);
+            plan.workers.push(w);
+        }
+        let order = crate::multiprocess::host_spawn_order(&plan);
+        let mut flat: Vec<(String, Vec<String>)> = order
+            .iter()
+            .map(|(host, idxs)| {
+                (
+                    host.clone(),
+                    idxs.iter()
+                        .map(|&i| plan.workers[i].group.clone())
+                        .collect(),
+                )
+            })
+            .collect();
+        flat.sort();
+        assert_eq!(
+            flat,
+            vec![
+                ("cam".to_string(), vec!["cam".to_string()]),
+                (
+                    "work".to_string(),
+                    vec!["work.pace".to_string(), "work.fast".to_string()]
+                ),
+            ]
+        );
+    }
+
+    /// A host with several plans runs each one, and the first to stop clears
+    /// `running` for the others; an empty plan list is refused.
+    #[test]
+    fn a_worker_host_runs_every_plan_and_stops_them_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let mut paths = Vec::new();
+        for name in ["a", "b"] {
+            let mut w = minimal_plan("");
+            w.group = name.to_string();
+            let path = dir.join(format!("plan_{name}.json"));
+            std::fs::write(&path, serde_json::to_string(&w).expect("json")).expect("write");
+            paths.push(path);
+        }
+        let running = Arc::new(AtomicBool::new(true));
+        let err = graph_run_worker_host(&dir, &paths, Arc::clone(&running))
+            .expect_err("a plan with no iceoryx2 config must fail");
+        assert!(
+            err.to_string().contains("empty `ix_config_json`"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !running.load(Ordering::Relaxed),
+            "a unit that stopped must clear `running` for its siblings"
+        );
+        assert!(graph_run_worker_host(&dir, &[], Arc::new(AtomicBool::new(true))).is_err());
     }
 }
 
@@ -40717,6 +45773,7 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: producers.to_vec(),
             consumer_rank,
+            producer_nodes: Vec::new(),
         }
     }
 
@@ -40748,6 +45805,63 @@ mod supervisor_tests {
     fn credit_watch(ns: &str, edges: Vec<crate::multiprocess::CreditEdgePlan>) -> CreditDeathWatch {
         let words = edges.iter().map(|e| credit_word(ns, e)).collect();
         CreditDeathWatch::arm(edges, words)
+    }
+
+    /// A dead consumer's slot is released, and ONLY that slot: a second
+    /// `block` consumer of the same topic, on a live rank, keeps its full
+    /// count and stays armed. The head line names the producer, the consumer,
+    /// the edge and the reason.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_dead_consumer_releases_its_own_slot_and_no_other() {
+        let ns = credit_ns("perslot");
+        let mut dead_edge = credit_edge("/cmd", &[0], 1);
+        dead_edge.producer_nodes = vec!["planner".to_string()];
+        let mut live_edge = credit_edge("/cmd", &[0], 2);
+        live_edge.consumer_node = "logger".to_string();
+        live_edge.producer_nodes = vec!["planner".to_string()];
+        let mut watch = credit_watch(&ns, vec![dead_edge, live_edge]);
+        for row in &watch.watched {
+            row.word.record_published_n(4);
+            assert!(row.word.is_full());
+        }
+        watch.report_deaths(
+            &[("p1".to_string(), 1)],
+            &credit_groups(&[(0, "p0"), (1, "p1"), (2, "p2")]),
+        );
+        let dead = &watch.watched[0].word;
+        assert!(dead.is_released(), "the dead consumer's slot is released");
+        assert_eq!(dead.outstanding(), 0);
+        assert!(!dead.is_full(), "so its producer no longer defers on it");
+        let live = &watch.watched[1].word;
+        assert!(
+            !live.is_released(),
+            "the live consumer's slot is not released"
+        );
+        assert_eq!(live.outstanding(), 4, "and its count is untouched");
+        assert!(live.is_full(), "so it still defers the producer");
+        // Reporting the same death again releases nothing more.
+        assert!(!dead.release_slot());
+
+        logs_assert(|lines: &[&str]| {
+            let heads = credit_lines_at(lines, "WARN", C6_HEAD);
+            let [head] = heads.as_slice() else {
+                return Err(format!("expected exactly 1 WARN head, got {}", heads.len()));
+            };
+            for (k, v) in [
+                ("producer", "planner"),
+                ("node_id", "sink"),
+                ("consumer_input", "gate"),
+                ("topic", "/cmd"),
+                ("reason", "\"consumer_died\""),
+                ("slot_released", "true"),
+            ] {
+                if !credit_has_field(head, k, v) {
+                    return Err(format!("head lacks {k}={v}: {head}"));
+                }
+            }
+            Ok(())
+        });
     }
 
     /// The CONSUMER-death line is LOUD exactly once, at WARN, carrying the
@@ -41323,6 +46437,7 @@ mod supervisor_tests {
             sibling_topics: cerulion_core::graph::SiblingProducedTopics::default(),
             sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
             credit_edges: Vec::new(),
+            paced_topic_warnings: Vec::new(),
             // Not recording (the stamping tests never touch the ring).
             recording_ring: None,
             trace_ring: None,
@@ -41330,6 +46445,7 @@ mod supervisor_tests {
             run_dir: None,
             wedge_page: None,
             pause_tag: None,
+            host: None,
         };
         DeploymentPlan {
             workers: vec![worker("a", 0), worker("b", 1)],
@@ -41344,7 +46460,8 @@ mod supervisor_tests {
     /// doesn't ring would silently regress the consumer's park to the
     /// epoll-block wake latency). Pure-fn pin: an ON policy stamps both bools
     /// on all workers; `off()` stamps both false; the doorbell⇒monitor_wait
-    /// coercion arrives pre-applied via `MonitorWaitPolicy::new`.
+    /// invariant arrives pre-applied via `MonitorWaitPolicy::new`, so a
+    /// doorbell asked for without the park stamps both bools false.
     #[test]
     fn stamp_park_policy_writes_resolved_bools_into_every_worker() {
         let mut plan = bare_plan();
@@ -41356,17 +46473,30 @@ mod supervisor_tests {
             );
         }
 
-        // Doorbell-on: `new` coerces monitor_wait true as well.
-        let on = cerulion_core::MonitorWaitPolicy::new(false, true, "ns".to_string());
+        // Park + doorbell on: both bools stamped on every worker.
+        let on = cerulion_core::MonitorWaitPolicy::new(true, true, "ns".to_string());
         stamp_park_policy(&mut plan, &on);
         for w in &plan.workers {
             assert!(
                 w.monitor_wait && w.doorbell,
-                "every worker must carry the resolved ON policy (doorbell ⇒ monitor_wait coerced)"
+                "every worker must carry the resolved ON policy"
             );
         }
 
-        // Off: both false again (the stamp is authoritative, not sticky).
+        // A doorbell asked for without the park: `new` drops it, so the
+        // stamp is park-off on every worker. The doorbell never turns the park
+        // on by itself.
+        let parkless = cerulion_core::MonitorWaitPolicy::new(false, true, "ns".to_string());
+        stamp_park_policy(&mut plan, &parkless);
+        for w in &plan.workers {
+            assert!(
+                !w.monitor_wait && !w.doorbell,
+                "a doorbell with no park must stamp park-off, not turn the park on"
+            );
+        }
+
+        // Off over ON: both false again (the stamp is authoritative, not sticky).
+        stamp_park_policy(&mut plan, &on);
         let off = cerulion_core::MonitorWaitPolicy::off();
         stamp_park_policy(&mut plan, &off);
         for w in &plan.workers {
@@ -41817,6 +46947,7 @@ mod supervisor_tests {
                 depth: 4,
                 producer_ranks: vec![0],
                 consumer_rank: 1,
+                producer_nodes: Vec::new(),
             },
             CreditEdgePlan {
                 topic: "/b".to_string(),
@@ -41825,6 +46956,7 @@ mod supervisor_tests {
                 depth: 2,
                 producer_ranks: vec![1],
                 consumer_rank: 0,
+                producer_nodes: Vec::new(),
             },
         ];
         stamp_credit_edges(&mut plan, &edges);
@@ -41845,6 +46977,57 @@ mod supervisor_tests {
         assert!(empty.workers.is_empty());
     }
 
+    /// `stamp_paced_topic_warnings` hands each worker the warnings of the
+    /// topics whose producer node it builds, and no others, and the stamped
+    /// list survives the plan file.
+    #[test]
+    fn stamp_paced_topic_warnings_goes_to_the_producers_worker() {
+        use cerulion_core::graph::PacedTopicWarning;
+        let mut plan = bare_plan();
+        let node = |id: &str| cerulion_core::graph::config::NodeDef {
+            isolate: None,
+            params: Default::default(),
+            ros2: None,
+            id: id.to_string(),
+            node_type: id.to_string(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+        };
+        plan.workers[0].subgraph.nodes = vec![node("cam"), node("slow")];
+        plan.workers[1].subgraph.nodes = vec![node("lidar"), node("viz")];
+        let warning = |topic: &str, producer: &str| PacedTopicWarning {
+            topic: topic.to_string(),
+            producer_nodes: vec![producer.to_string()],
+            block_consumers: vec!["slow.inp (depth 2)".to_string()],
+            paced_consumers: vec!["viz.inp (drop_oldest)".to_string()],
+        };
+        let warnings = vec![
+            warning("/g/cam/out", "cam"),
+            warning("/g/lidar/out", "lidar"),
+        ];
+        stamp_paced_topic_warnings(&mut plan, &warnings);
+        assert_eq!(
+            plan.workers[0].paced_topic_warnings,
+            vec![warnings[0].clone()]
+        );
+        assert_eq!(
+            plan.workers[1].paced_topic_warnings,
+            vec![warnings[1].clone()]
+        );
+        let json = serde_json::to_string(&plan.workers[0]).expect("serialize the plan");
+        let back: WorkerPlan = serde_json::from_str(&json).expect("parse the plan");
+        assert_eq!(
+            back.paced_topic_warnings,
+            plan.workers[0].paced_topic_warnings
+        );
+        // A topic none of a worker's nodes produce stamps nothing on it.
+        stamp_paced_topic_warnings(&mut plan, &[warning("/g/far/out", "far")]);
+        assert!(plan
+            .workers
+            .iter()
+            .all(|w| w.paced_topic_warnings.is_empty()));
+    }
+
     /// The ONE-RECIPE depth cross-check accepts an agreeing pair
     /// and refuses a disagreeing one, naming BOTH numbers and the edge.
     ///
@@ -41861,6 +47044,7 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         check_credit_depth("p1", "cerdep_x", &edge, 4).expect("an agreeing pair is accepted");
         let err = check_credit_depth("p1", "cerdep_x", &edge, 7)
@@ -41927,6 +47111,7 @@ mod supervisor_tests {
             depth: 4,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         // PermissionDenied: the directory is refusing this user.
         let denied = credit_create_failure_message(
@@ -42065,6 +47250,7 @@ mod supervisor_tests {
             depth: 7,
             producer_ranks: vec![0],
             consumer_rank: 1,
+            producer_nodes: Vec::new(),
         };
         stamped.workers[1].credit_edges = vec![edge.clone()];
         let round: crate::multiprocess::WorkerPlan =
@@ -42143,7 +47329,7 @@ mod supervisor_tests {
         cfg.nodes = ids
             .iter()
             .map(|id| cerulion_core::graph::config::NodeDef {
-                fuse: None,
+                isolate: None,
                 params: Default::default(),
                 ros2: None,
                 id: (*id).to_string(),
@@ -43014,8 +48200,9 @@ mod supervisor_tests {
     /// the supervisor-stamped plan bools — the worker-side seam of the (7a)
     /// handoff. Stamped-ON → both `monitor_wait()` and `doorbell()`;
     /// planner-default (false/false, also the OLD-plan serde default) →
-    /// off-equivalent. Doorbell-only stamping re-coerces monitor_wait via
-    /// `MonitorWaitPolicy::new` (the doorbell⇒monitor_wait invariant).
+    /// off-equivalent. Doorbell-only stamping is park-off too:
+    /// `MonitorWaitPolicy::new` drops a doorbell that has no park (the
+    /// doorbell⇒monitor_wait invariant, enforced in the park-off direction).
     #[test]
     fn worker_park_policy_rebuilds_stamped_plan_bools() {
         let mut plan = bare_plan();
@@ -43036,12 +48223,13 @@ mod supervisor_tests {
             "a stamped-ON plan must yield an active park + doorbell policy"
         );
 
-        // Doorbell-only (a hand-edited plan): `new` coerces monitor_wait true.
+        // Doorbell-only (a hand-edited plan): `new` drops the doorbell, so the
+        // worker parks off. `monitor_wait = false` is a real off at the worker.
         plan.workers[0].monitor_wait = false;
         let policy = worker_park_policy(&plan.workers[0]);
         assert!(
-            policy.monitor_wait() && policy.doorbell(),
-            "doorbell ⇒ monitor_wait must be re-coerced at the worker"
+            !policy.monitor_wait() && !policy.doorbell(),
+            "a doorbell stamped without the park must not turn the park on at the worker"
         );
     }
 

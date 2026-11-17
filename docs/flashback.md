@@ -52,10 +52,13 @@ provisions the scheduler-trace rings**, whether or not you asked it to record.
 Requiring `--record` in advance would be exactly backwards, because the runs
 you most want to re-run are the ones nobody expected to go wrong.
 
-Some run shapes mint no ring: a single-process run, `cerulion ros2 attach`,
-`cerulion node run`, or a virtual or external time source. They still take
-captures, and those captures are frames-only. Each capture records which of the
-two it is; see [Limitations](#limitations).
+Some run shapes mint no ring: a single-process run of a graph that is one
+executor unit, `cerulion ros2 attach`, `cerulion node run`, or a virtual or
+external time source. They still take captures, and those captures are
+frames-only. A `--single-process` run of a graph whose nodes split into several
+units runs them in one worker process, which mints the rings like any
+multi-process run and takes no checkpoints, since it hosts several units. Each
+capture records which of the two it is; see [Limitations](#limitations).
 
 ---
 
@@ -108,7 +111,7 @@ set to `on` or `off`:
 | `WORKER_DEATH` | A worker process exits without being asked to. | on |
 | `PANIC_DISABLE` | A node is disabled after consecutive panics, or a panic poisons its entry mutex. The process stays alive and one node has stopped. | on |
 | `RUN_VANISHED` | The run this recorder is bound to disappears without announcing anything: a hard crash such as a segfault, an OOM kill or an abort. | on |
-| `ESTOP` | A human engages the e-stop over the Cerulion ops plane. A hardwired stop that never reaches the middleware fires nothing. | on |
+| `ESTOP` | A human engages the e-stop with `engage-estop` over the Cerulion ops plane; an rcp `estop` tool call does not ask for a capture. To capture a hardwired stop too, have the robot-side process that senses it, such as a safety PLC reader, declare an incident (`DECLARED`). | on |
 | `DECLARED` | A robot-side process declares an incident on `/__cerulion/flashback`, for example a bumper, a safety PLC, a domain e-stop topic or a grasp-failure detector. | on |
 | `STALL` | A topic that was streaming goes idle or reports no data, confirmed. Topics slower than the monitors' minimum rate are not judged. | on |
 | `RATE` | A topic's rate leaves the band around its learned baseline: below half of it or above double it. | on |
@@ -134,7 +137,7 @@ Open one with `cerulion bag info`. Beyond the frames, a capture carries:
 | `__cerulion/flashback.json` | What the capture was ABOUT: `causes[]` (each with the `detail` your `--note` became), the window it claimed (`span_ms`) against the window it achieved (`achieved_span_ms`), a `handoff` object saying what this recorder was given, and `anchor.resimmable`, whether `bag play --resim` will accept this bag. |
 | `__cerulion/state_coverage.json` | The node-state side: which nodes have an anchor, and which were skipped and why. Absent when the recorder had nothing to say about the state plane. |
 | `graph.yaml`, `env.json` | The graph as executed and the environment it ran in. Bare names, not `__cerulion/`-prefixed: that namespace is reserved for manifests the recorder mints itself. |
-| `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew. |
+| `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew, and the replay contract its trace is judged under (`trace_format`, `coordination`, `node_external`). A run that could not write it into its run directory warns, and a capture of it that carries the trace carries no `graph.yaml` either, so `anchor.resimmable` is false. |
 | `__cerulion/trace_manifest_rank<N>.json` | Which node ids the rank's trace records refer to. `bag play --resim` needs it to resolve a FIRE to a node. |
 
 `anchor.resimmable` is the field to read first: a plain `true`/`false`, always
@@ -249,10 +252,11 @@ things, and neither is a spelling of the other.
 recording carries the scheduler trace that makes it re-executable.
 
 On the shapes that mint no ring anyway it is **not** a no-op, and the launch
-line says which it is. On `--single-process`, `ros2 attach`, `node run` and
-`--time-source external` it still stops the window recorder, so the run takes
-no captures. Two shapes are true no-ops. A `--time-source virtual` MONOLITH
-starts no recorder either way (though a `virtual` run of a `process_groups:`
+line says which it is. On a `--single-process` run of a graph that is one
+executor unit, `ros2 attach`, `node run` and `--time-source external` it still
+stops the window recorder, so the run takes no captures. Two shapes are true
+no-ops. A `--time-source virtual` MONOLITH starts no recorder either way
+(though a `virtual` run of a `process_groups:`
 graph still goes multi-process, and the supervisor's recorder gate has no clock
 term, so there the flag bites like anywhere else). And on a NON-UNIX build the
 recorder and the run directory are compiled out and `cerulion flashback` refuses
@@ -315,17 +319,21 @@ treat the convergence *rate* as unmeasured.
 
 ## Limitations
 
-**Single-process runs take captures that cannot be re-run.** A monolith shape
-(`--single-process`, `cerulion ros2 attach`, `cerulion node run`, or
-`--time-source external`) mints no trace ring, deliberately: its gating clock
-is wall-driven, so a trace taken there would carry step boundaries a resim
+**A single-process monolith takes captures that cannot be re-run.** A monolith
+shape (`--single-process` on a graph that is one executor unit,
+`cerulion ros2 attach`, `cerulion node run`, or `--time-source external`) mints
+no trace ring, deliberately: its gating clock is wall-driven, so a trace taken
+there would carry step boundaries a resim
 cannot re-advance to, and the capture would claim to be re-runnable when it is
 not. Such a capture says, in its own words, that it holds no trace.
 (A `--time-source virtual` MONOLITH is different again: it starts
 no window recorder, so it takes no captures rather than un-runnable ones. A
 partitioned graph under `virtual` still routes to the supervisor and does take
-them.) A `--single-process --record` run is the one monolith exception that DOES
-create a rank-0 ring: its recorder is handed both the ring and the window.
+them.) A `--single-process --record` run of a graph that is one executor unit
+is the one monolith exception that DOES create a rank-0 ring: its recorder is
+handed both the ring and the window. A `--single-process` run of a graph whose
+nodes split into several executor units is not a monolith: its one worker
+process mints the rings like any multi-process run.
 
 **A capture taken on a machine with other live topics may be refused by
 `--resim`.** A capture records what is LIVE, and it does not

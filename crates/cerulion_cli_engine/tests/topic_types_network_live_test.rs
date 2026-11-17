@@ -34,6 +34,7 @@ fn isolated_runs_source() -> RunSource {
     RunSource {
         iox_config: Arc::new(cerulion_core::testing::iceoryx_test_config()),
         gather_window: cerulion_core::transport::run_registry::RUN_GATHER_WINDOW,
+        hosted: cerulion_core::transport::hosted_runs::HostedRuns::default(),
     }
 }
 
@@ -47,6 +48,7 @@ fn bind_listening_robot(robot: &str, base: u16) -> (NetworkManager, u16) {
             robot_identity: Some(robot.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             return (mgr, port);
         }

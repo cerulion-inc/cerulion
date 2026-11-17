@@ -44,6 +44,12 @@ fn membership_refresh_preserves_unchanged_readers_and_retires_changed_peers() {
     assert_eq!(plane.connection_count(), 2);
     assert_eq!(plane.reader_count(), 2);
 
+    // Refreshing path hints does not change the authenticated endpoint binding.
+    let mut hints_only = HashMap::from([("a".into(), peer(&a)), ("b".into(), peer(&b))]);
+    hints_only.get_mut("a").unwrap().direct_addrs.clear();
+    assert!(plane.update_membership(hints_only).unwrap().is_empty());
+    assert_oracle_and_gap_free(&collect_frames(&desk, &topic_a, 3));
+    assert_oracle_and_gap_free(&collect_frames(&desk, &topic_b, 3));
     let updated = HashMap::from([("a".into(), peer(&replacement_a)), ("b".into(), peer(&b))]);
     assert_eq!(
         plane.update_membership(updated).unwrap(),

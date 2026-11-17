@@ -7,3 +7,14 @@ not yet published to crates.io
 closed alpha
 Rust 1.88
 waitlist
+Run robots. Understand failures. Test every change.
+Give Claude, Codex, or Cursor your robot recordings
+Fastest deterministic robot runtime, agent-ready
+recorded robot evidence to investigate and tools to re-execute
+Robot-run evidence for AI coding agents
+Robots fail. Ask your agent why.
+Open source operating system for robots
+Find out why a robot failed, and check the fix against the same recorded run
+Debug robots with your AI agent
+robotics middleware
+CI/CD for autonomy

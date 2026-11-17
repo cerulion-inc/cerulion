@@ -107,6 +107,7 @@ fn test_tui_node_list_renders() {
     app.nodes = vec![
         NodeMetadata {
             throttle_ms: None,
+            tick_within_ms: None,
             node_type: "camera".to_string(),
             policy: None,
             inputs: vec![],
@@ -120,6 +121,7 @@ fn test_tui_node_list_renders() {
         },
         NodeMetadata {
             throttle_ms: None,
+            tick_within_ms: None,
             node_type: "detector".to_string(),
             policy: None,
             inputs: vec![PortDef {

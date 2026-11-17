@@ -2714,10 +2714,7 @@ fn c_abi_destroy_subscription_with_outstanding_loan_releases() {
 /// `subscription` must be a live subscription created by this implementation.
 unsafe fn decode_failure_count(subscription: *const ffi::rmw_subscription_t) -> u64 {
     let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
-    data.decode_failures
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .total_failures()
+    data.decode_failures.read().total_failures()
 }
 
 /// Serialize `msg` through the REAL `rmw_serialize` into a malloc-backed
