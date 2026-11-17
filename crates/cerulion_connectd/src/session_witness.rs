@@ -107,7 +107,7 @@ impl WitnessStore {
     }
 }
 
-fn safe_id(id: &str) -> bool {
+pub(crate) fn safe_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 128
         && id
