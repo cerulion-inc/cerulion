@@ -3810,7 +3810,7 @@ impl Scheduler {
     /// The capture carrier calls this at a due step boundary, where "right
     /// now" is the state AFTER the step completed, which is what an anchor at
     /// `S` means. Nothing here reads a clock or mutates anything: the
-    /// three fields are copied out and the caller owns what happens next.
+    /// scheduler's fields are copied out and the caller owns what happens next.
     ///
     /// `None` for an id this scheduler does not hold — a carrier walking a
     /// recording's node list against a live graph is the ordinary reason, and
@@ -3825,15 +3825,22 @@ impl Scheduler {
     /// scheduler itself was holding. This states the second, because the second
     /// is the one a rebuilt `Scheduler` cannot recover.
     ///
-    /// # This fills THREE of the section's four fields
+    /// # This fills the scheduler's fields of the section
     ///
     /// `NodeFrameworkState` is the CARRIER's composite view (see its own doc).
-    /// The fourth, `input_service`, is a TRANSPORT fact: the wire `sequence` of
-    /// the last frame each per-message FIFO input's tick actually read — which
-    /// the scheduler does not hold and cannot invent, so this leaves it `None`
-    /// and the graph runtime's capture site fills it in from the ports. A
-    /// caller that uses this value verbatim therefore states "no cursor", which
-    /// is the accurate reading of a scheduler asked on its own.
+    /// This fills `next_fire_ns`, `pending_data_count`,
+    /// `sync_input_timestamps` and `stopped` (`disabled`: a `NodeError::Fatal`
+    /// return, the consecutive-panic breaker or [`Self::restore_stopped_nodes`]
+    /// stopped the node).
+    ///
+    /// `input_service` is a TRANSPORT fact: the wire `sequence` of the last
+    /// frame each per-message FIFO input's tick actually read, which the
+    /// scheduler does not hold and cannot invent, so this leaves it `None` and
+    /// the graph runtime's capture site fills it in from the ports. A caller
+    /// that uses this value verbatim therefore states "no cursor", which is
+    /// the accurate reading of a scheduler asked on its own. The capture-time
+    /// Sync tail (`sync_capture_high_water`, `sync_epoch_floor`) is left empty
+    /// the same way; the runtime fills it for a capture-time Sync node.
     // hot-path-alloc-ok-fn: cold: introspection read for the state-capture plane
     pub fn node_framework_state(
         &self,
@@ -3877,6 +3884,7 @@ impl Scheduler {
             input_service: None,
             sync_capture_high_water: Default::default(),
             sync_epoch_floor: None,
+            stopped: node.disabled,
         })
     }
 
@@ -4002,6 +4010,46 @@ impl Scheduler {
         if matches!(node.policy, TriggerPolicy::Sync { .. }) {
             node.sync_epoch_floor = Some(ts);
         }
+    }
+
+    /// Stop each node in `ids` on a resumed run, as a recording's framework
+    /// sections state it
+    /// ([`crate::state_restore::NodeFrameworkState::stopped`]).
+    ///
+    /// Sets `disabled` and nothing else, so the node fires no more: a decided
+    /// fire, a planned replay fire and an `External` trigger mark all skip it,
+    /// as after the live stop. It does not set the fatal-stop flag, change the
+    /// consecutive-panic count or write the node-death ledger, so this run
+    /// records no failure for the node. [`Self::reset_node`] lifts the stop
+    /// like any other.
+    ///
+    /// Every id is checked before any node changes: the first id, in the
+    /// set's order, that this scheduler does not hold is refused as
+    /// [`TransportError::NodeNotFound`] and no node is stopped.
+    ///
+    /// Must be called after the build and BEFORE the first `step()`, like
+    /// every other restore seam.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    pub fn restore_stopped_nodes(
+        &mut self,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> TransportResult<()> {
+        let indices = ids
+            .iter()
+            .map(|id| {
+                self.nodes
+                    .get_index_of(id.as_str())
+                    .ok_or_else(|| TransportError::NodeNotFound {
+                        node_id: id.clone(),
+                    })
+            })
+            .collect::<TransportResult<Vec<usize>>>()?;
+        for idx in indices {
+            if let Some((_, node)) = self.nodes.get_index_mut(idx) {
+                node.disabled = true;
+            }
+        }
+        Ok(())
     }
 
     /// Configure a per-input expected interval
@@ -4819,11 +4867,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return or by the
-    /// consecutive-panic breaker? A disabled node never fires until
-    /// [`Self::reset_node`] re-enables it. `false` for an unknown id. One map
-    /// lookup, no allocation: the live loop reads it per external binding per
-    /// wait.
+    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return, by the
+    /// consecutive-panic breaker or by [`Self::restore_stopped_nodes`]? A
+    /// disabled node never fires until [`Self::reset_node`] re-enables it.
+    /// `false` for an unknown id. One map lookup, no allocation: the live loop
+    /// reads it per external binding per wait.
     pub fn is_node_disabled(&self, node_id: &str) -> bool {
         self.nodes.get(node_id).is_some_and(|n| n.disabled)
     }
