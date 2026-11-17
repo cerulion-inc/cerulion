@@ -10,19 +10,19 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   explicit SIGTERM still runs shutdown participants.
 - `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
   verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
-- Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
+- Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness); pairing subject = TLS device key, never client arg; validity/rollback: RemotedClock; code window/rate: MonotonicClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
   key, owner, chain, scope, clocks and revocation, preserve the owner row, persist
-  before binding, and refuse a narrower cert: permissions are per-account.
+  before binding, refuse a narrower cert: permissions are per-account.
 - `code-pair-finish` binds the SELF-account derived from the authenticated transport
-  key and refuses any other value; a cloud account needs the roots-verified chain
+  key, refusing any other; a cloud account needs the roots-verified chain
   whose device key equals the peer key. The owner row is never preserved for a guest.
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so no session starves it (`estop_starvation_test.rs`).
   TLS: docs/remote_plane.md; paired keys Retry first.
-  Trust persistence is fail-closed: store-BEFORE-index, the live binding published
-  only after the durable write succeeds. Never reorder (`trust.rs`).
+  Trust persistence is fail-closed: store-BEFORE-index, live binding published
+  only after the durable write. Never reorder (`trust.rs`).
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
@@ -30,7 +30,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
   task per stream. connectd mirrors the robot protocol (no production remoted dep);
   `protocol_parity_test.rs` gates parity: change both.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Desk key files are 32 raw bytes, created 0600 with `create_new`, NEVER
+- Desk key files: exactly 32 raw bytes, 0600 `create_new`, NEVER
   overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
