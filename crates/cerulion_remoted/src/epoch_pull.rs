@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use cerulion_pairing::verify::{EpochOutcome, EpochSyncWire};
 
 use crate::clock::RemotedClock;
-use crate::owner_only::read_owner_only;
+use crate::owner_only::{read_owner_only, ExpectedOwner};
 use crate::trust::SharedTrust;
 
 /// The fetched epoch the sync worker leaves for remoted to apply.
@@ -147,7 +147,12 @@ impl EpochPull {
                 return PullOutcome::Rejected { reason };
             }
         }
-        let outcome = match read_owner_only(&claimed, MAX_PENDING_BYTES, "the fetched epoch") {
+        let outcome = match read_owner_only(
+            &claimed,
+            MAX_PENDING_BYTES,
+            "the fetched epoch",
+            ExpectedOwner::Directory,
+        ) {
             Ok(None) => PullOutcome::Nothing,
             Ok(Some(bytes)) => self.apply(&bytes),
             Err(reason) => PullOutcome::Rejected { reason },

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Reading a file another process on the robot leaves in the remoted state
-//! directory for the daemon: the fetched revocation epoch.
+//! directory for the daemon: the fetched revocation epoch and the pair-code
+//! request.
 //!
 //! [`read_owner_only`] opens the directory without following a symbolic link at
 //! its last component and inspects it through that handle, then opens the file
@@ -11,6 +12,15 @@
 use std::io::Read as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
+
+/// Whose files [`read_owner_only`] accepts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpectedOwner {
+    /// The user that owns the directory, who must own the file too.
+    Directory,
+    /// This user, who must own both the directory and the file.
+    Uid(u32),
+}
 
 /// What [`read_owner_only`] learned about the directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,10 +59,12 @@ pub(crate) enum OwnerOnlyRefusal {
     /// The directory is not a directory, or gives its group or others a
     /// permission bit.
     DirectoryNotOwnerOnly,
+    /// The directory is not the expected owner's.
+    DirectoryNotOwned,
     /// The file is not a regular file with a single link.
     NotRegularSingleLink,
     /// The file gives its group or others a permission bit, or is not the
-    /// directory owner's.
+    /// expected owner's.
     NotOwnerOnly,
     /// The file is longer than the bound.
     TooLarge {
@@ -71,6 +83,9 @@ impl OwnerOnlyRefusal {
             OwnerOnlyRefusal::DirectoryNotOwnerOnly => {
                 "the state directory is not owner-only".into()
             }
+            OwnerOnlyRefusal::DirectoryNotOwned => {
+                "the state directory is not owned by the user this daemon runs as".into()
+            }
             OwnerOnlyRefusal::NotRegularSingleLink => {
                 format!("{what} is not a regular single-link file")
             }
@@ -84,25 +99,33 @@ impl OwnerOnlyRefusal {
     }
 }
 
-/// Accept a file when the directory is unchanged, a directory with no group or
-/// other permission bits, and the file is a regular single-link file of at most
-/// `max_bytes` bytes owned by the directory's owner with no group or other
-/// permission bits.
+/// Accept a file when the directory is unchanged, a directory owned by the
+/// expected owner with no group or other permission bits, and the file is a
+/// regular single-link file of at most `max_bytes` bytes owned by the expected
+/// owner with no group or other permission bits.
 pub(crate) fn owner_only_verdict(
     dir: &DirFacts,
     file: &FileFacts,
+    owner: ExpectedOwner,
     max_bytes: u64,
 ) -> Result<(), OwnerOnlyRefusal> {
+    let owner = match owner {
+        ExpectedOwner::Directory => dir.uid,
+        ExpectedOwner::Uid(uid) => uid,
+    };
     if !dir.unchanged {
         return Err(OwnerOnlyRefusal::DirectoryReplaced);
     }
     if !dir.is_dir || dir.mode & 0o077 != 0 {
         return Err(OwnerOnlyRefusal::DirectoryNotOwnerOnly);
     }
+    if dir.uid != owner {
+        return Err(OwnerOnlyRefusal::DirectoryNotOwned);
+    }
     if !file.is_file || file.nlink != 1 {
         return Err(OwnerOnlyRefusal::NotRegularSingleLink);
     }
-    if file.uid != dir.uid || file.mode & 0o077 != 0 {
+    if file.uid != owner || file.mode & 0o077 != 0 {
         return Err(OwnerOnlyRefusal::NotOwnerOnly);
     }
     if file.len > max_bytes {
@@ -120,6 +143,7 @@ pub(crate) fn read_owner_only(
     path: &Path,
     max_bytes: u64,
     what: &str,
+    owner: ExpectedOwner,
 ) -> Result<Option<Vec<u8>>, String> {
     let dir_path = path
         .parent()
@@ -168,7 +192,7 @@ pub(crate) fn read_owner_only(
         len: meta.len(),
     };
     let verdict = |file_facts: &FileFacts| {
-        owner_only_verdict(&dir_facts, file_facts, max_bytes)
+        owner_only_verdict(&dir_facts, file_facts, owner, max_bytes)
             .map_err(|refusal| refusal.describe(what, max_bytes))
     };
     verdict(&file_facts)?;
@@ -214,14 +238,18 @@ mod tests {
     #[test]
     fn owner_only_verdict_matches_the_oracle_cases() {
         use OwnerOnlyRefusal as R;
-        let cases: Vec<(DirFacts, FileFacts, Result<(), R>)> = vec![
-            (dir(), file(), Ok(())),
+        let by_dir = ExpectedOwner::Directory;
+        let by_uid = ExpectedOwner::Uid(OWNER);
+        let cases: Vec<(DirFacts, FileFacts, ExpectedOwner, Result<(), R>)> = vec![
+            (dir(), file(), by_dir, Ok(())),
+            (dir(), file(), by_uid, Ok(())),
             (
                 dir(),
                 FileFacts {
                     mode: 0o100400,
                     ..file()
                 },
+                by_uid,
                 Ok(()),
             ),
             (
@@ -230,6 +258,7 @@ mod tests {
                     ..dir()
                 },
                 file(),
+                by_uid,
                 Err(R::DirectoryReplaced),
             ),
             (
@@ -238,6 +267,7 @@ mod tests {
                     ..dir()
                 },
                 file(),
+                by_uid,
                 Err(R::DirectoryNotOwnerOnly),
             ),
             (
@@ -246,6 +276,7 @@ mod tests {
                     ..dir()
                 },
                 file(),
+                by_uid,
                 Err(R::DirectoryNotOwnerOnly),
             ),
             (
@@ -254,20 +285,10 @@ mod tests {
                     ..dir()
                 },
                 file(),
+                by_dir,
                 Err(R::DirectoryNotOwnerOnly),
             ),
-            // A directory that is not owner-only is refused for its mode before
-            // the file's owner is compared with the directory's.
-            (
-                DirFacts {
-                    uid: OTHER,
-                    mode: 0o40750,
-                    ..dir()
-                },
-                file(),
-                Err(R::DirectoryNotOwnerOnly),
-            ),
-            // The file's owner is the directory's.
+            // A directory owned by someone else than the daemon's user.
             (
                 DirFacts {
                     uid: OTHER,
@@ -277,6 +298,32 @@ mod tests {
                     uid: OTHER,
                     ..file()
                 },
+                by_uid,
+                Err(R::DirectoryNotOwned),
+            ),
+            // A directory that is neither owner-only nor the daemon's user's
+            // is refused for its mode.
+            (
+                DirFacts {
+                    uid: OTHER,
+                    mode: 0o40750,
+                    ..dir()
+                },
+                file(),
+                by_uid,
+                Err(R::DirectoryNotOwnerOnly),
+            ),
+            // The same pair is accepted when the directory's owner is the rule.
+            (
+                DirFacts {
+                    uid: OTHER,
+                    ..dir()
+                },
+                FileFacts {
+                    uid: OTHER,
+                    ..file()
+                },
+                by_dir,
                 Ok(()),
             ),
             (
@@ -285,25 +332,38 @@ mod tests {
                     is_file: false,
                     ..file()
                 },
+                by_uid,
                 Err(R::NotRegularSingleLink),
             ),
             (
                 dir(),
                 FileFacts { nlink: 2, ..file() },
+                by_uid,
                 Err(R::NotRegularSingleLink),
             ),
             (
                 dir(),
                 FileFacts { nlink: 0, ..file() },
+                by_uid,
                 Err(R::NotRegularSingleLink),
             ),
-            // A file owned by another user than the directory's.
+            // A file owned by another user than the directory's and the daemon's.
             (
                 dir(),
                 FileFacts {
                     uid: OTHER,
                     ..file()
                 },
+                by_uid,
+                Err(R::NotOwnerOnly),
+            ),
+            (
+                dir(),
+                FileFacts {
+                    uid: OTHER,
+                    ..file()
+                },
+                by_dir,
                 Err(R::NotOwnerOnly),
             ),
             (
@@ -312,6 +372,7 @@ mod tests {
                     mode: 0o100640,
                     ..file()
                 },
+                by_uid,
                 Err(R::NotOwnerOnly),
             ),
             (
@@ -320,6 +381,7 @@ mod tests {
                     mode: 0o100604,
                     ..file()
                 },
+                by_uid,
                 Err(R::NotOwnerOnly),
             ),
             (
@@ -328,14 +390,15 @@ mod tests {
                     len: MAX + 1,
                     ..file()
                 },
+                by_uid,
                 Err(R::TooLarge { len: MAX + 1 }),
             ),
         ];
-        for (dir, file, want) in cases {
+        for (dir, file, owner, want) in cases {
             assert_eq!(
-                owner_only_verdict(&dir, &file, MAX),
+                owner_only_verdict(&dir, &file, owner, MAX),
                 want,
-                "{dir:?} {file:?}"
+                "{dir:?} {file:?} {owner:?}"
             );
         }
     }
@@ -351,6 +414,10 @@ mod tests {
             (
                 OwnerOnlyRefusal::DirectoryNotOwnerOnly,
                 "the state directory is not owner-only",
+            ),
+            (
+                OwnerOnlyRefusal::DirectoryNotOwned,
+                "the state directory is not owned by the user this daemon runs as",
             ),
             (
                 OwnerOnlyRefusal::NotRegularSingleLink,
@@ -387,12 +454,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = private_dir(root.path());
         let path = dir.join("f");
-        assert_eq!(read_owner_only(&path, MAX, "the file"), Ok(None));
-        write_mode(&path, b"payload", 0o600);
         assert_eq!(
-            read_owner_only(&path, MAX, "the file"),
-            Ok(Some(b"payload".to_vec()))
+            read_owner_only(&path, MAX, "the file", ExpectedOwner::Directory),
+            Ok(None)
         );
+        write_mode(&path, b"payload", 0o600);
+        let uid = std::fs::metadata(&dir).unwrap().uid();
+        for owner in [ExpectedOwner::Directory, ExpectedOwner::Uid(uid)] {
+            assert_eq!(
+                read_owner_only(&path, MAX, "the file", owner),
+                Ok(Some(b"payload".to_vec()))
+            );
+        }
     }
 
     #[test]
@@ -403,11 +476,16 @@ mod tests {
         let link = root.path().join("link");
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert_eq!(
-            read_owner_only(&link.join("f"), MAX, "the file"),
+            read_owner_only(&link.join("f"), MAX, "the file", ExpectedOwner::Directory),
             Err("the state directory is not owner-only".to_string())
         );
-        let missing =
-            read_owner_only(&root.path().join("absent").join("f"), MAX, "the file").unwrap_err();
+        let missing = read_owner_only(
+            &root.path().join("absent").join("f"),
+            MAX,
+            "the file",
+            ExpectedOwner::Directory,
+        )
+        .unwrap_err();
         assert!(
             missing.starts_with("could not inspect the state directory: "),
             "{missing}"
@@ -420,7 +498,8 @@ mod tests {
         let dir = private_dir(root.path());
         write_mode(&dir.join("target"), b"payload", 0o600);
         std::os::unix::fs::symlink(dir.join("target"), dir.join("f")).unwrap();
-        let refused = read_owner_only(&dir.join("f"), MAX, "the file").unwrap_err();
+        let refused =
+            read_owner_only(&dir.join("f"), MAX, "the file", ExpectedOwner::Directory).unwrap_err();
         assert!(
             refused.starts_with("could not open the file: "),
             "{refused}"
@@ -434,14 +513,14 @@ mod tests {
         let path = dir.join("f");
         write_mode(&path, &[b'x'; MAX as usize], 0o600);
         assert_eq!(
-            read_owner_only(&path, MAX, "the file")
+            read_owner_only(&path, MAX, "the file", ExpectedOwner::Directory)
                 .unwrap()
                 .map(|b| b.len()),
             Some(MAX as usize)
         );
         write_mode(&path, &[b'x'; MAX as usize + 1], 0o600);
         assert_eq!(
-            read_owner_only(&path, MAX, "the file"),
+            read_owner_only(&path, MAX, "the file", ExpectedOwner::Directory),
             Err("the file is 257 bytes, above the 256-byte bound".to_string())
         );
     }
