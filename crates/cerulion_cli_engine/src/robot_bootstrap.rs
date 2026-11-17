@@ -227,8 +227,7 @@ pub fn sync_epoch(
                     ))
                 }
             }
-            let pending = remoted.join(EPOCH_PENDING_FILE);
-            auth::atomic_write_secret(&pending, &pending_epoch_text(&postcard)?)?;
+            write_pending_epoch(&remoted, &postcard)?;
             Some(access.epoch)
         }
     };
@@ -254,9 +253,10 @@ fn is_stopping(stopping: &std::sync::atomic::AtomicBool) -> bool {
     stopping.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// The epoch file text for an epoch's `postcard`: its hex, refused above
-/// [`MAX_EPOCH_PENDING_BYTES`], which the remote-plane daemon discards unread.
-fn pending_epoch_text(postcard: &[u8]) -> CliResult<Vec<u8>> {
+/// Write an epoch's `postcard` as the epoch file in `remoted`, as hex. Above
+/// [`MAX_EPOCH_PENDING_BYTES`], which the remote-plane daemon discards unread, it
+/// is refused and nothing is written.
+fn write_pending_epoch(remoted: &Path, postcard: &[u8]) -> CliResult<()> {
     let text = hex::encode(postcard).into_bytes();
     if text.len() > MAX_EPOCH_PENDING_BYTES {
         return Err(refused(&format!(
@@ -265,7 +265,8 @@ fn pending_epoch_text(postcard: &[u8]) -> CliResult<Vec<u8>> {
             text.len()
         )));
     }
-    Ok(text)
+    auth::atomic_write_secret(&remoted.join(EPOCH_PENDING_FILE), &text)?;
+    Ok(())
 }
 
 /// The session fallback of [`sync_epoch`]: the robot's access state over this
@@ -507,11 +508,8 @@ fn fetch_access_by_robot_proof(
         }))
         .send()
         .map_err(|e| refused(&format!("the robot access request failed: {e}")))?;
-    let access = match read_answer::<account_cmd::RobotAccess>(
-        response,
-        "robot access",
-        MAX_ROBOT_ACCESS_RESPONSE_BYTES,
-    )? {
+    let status = response.status();
+    let access = match access_answer_from(status, response)? {
         Answer::Body(access) => access,
         Answer::NotFound => return Ok(ProofFetch::NoRoute),
         Answer::RateLimited => return Ok(ProofFetch::RateLimited),
@@ -552,6 +550,20 @@ fn read_answer<T: serde::de::DeserializeOwned>(
 ) -> CliResult<Answer<T>> {
     let status = response.status();
     answer_from(status, response, what, limit)
+}
+
+/// The robot access answer from a response's `status` and `body`, read up to
+/// [`MAX_ROBOT_ACCESS_RESPONSE_BYTES`].
+fn access_answer_from(
+    status: reqwest::StatusCode,
+    body: impl Read,
+) -> CliResult<Answer<account_cmd::RobotAccess>> {
+    answer_from(
+        status,
+        body,
+        "robot access",
+        MAX_ROBOT_ACCESS_RESPONSE_BYTES,
+    )
 }
 
 /// [`read_answer`] over a response's `status` and `body`.
@@ -950,11 +962,9 @@ mod tests {
     }
 
     fn read_access(body: &str) -> CliResult<Answer<account_cmd::RobotAccess>> {
-        answer_from(
+        access_answer_from(
             reqwest::StatusCode::OK,
             std::io::Cursor::new(body.as_bytes()),
-            "robot access",
-            MAX_ROBOT_ACCESS_RESPONSE_BYTES,
         )
     }
 
@@ -1052,32 +1062,41 @@ mod tests {
         )
     }
 
-    /// The largest epoch the remote-plane daemon applies is the one whose file
-    /// fits its bound; one more revoked key is refused before it is written.
-    /// The access response for that epoch is larger than the file and fits the
-    /// access bound, under 1.4 times the file.
+    /// The largest epoch the remote-plane daemon applies has 16,375 revoked keys,
+    /// the most whose file fits its 1 MiB bound; it is written, and one key more
+    /// is refused with nothing written. The access response for that epoch is
+    /// larger than the file and fits the access bound, under 1.4 times the file.
     #[test]
     fn the_response_for_the_largest_epoch_the_daemon_applies_fits_its_bound() {
+        // An envelope with its intermediate and an epoch with no keys: 277 bytes.
+        // Each key adds 32, and from 128 keys up to 16,383 the count takes two
+        // bytes instead of one: 277 + 1 + 32 * 16,375 = 524,278 bytes, 1,048,556
+        // as hex; one key more is 1,048,620.
         let (_, empty) = epoch_parts(0);
-        // 32 bytes per key, and a count that takes two bytes from 128 keys.
-        let largest = ((MAX_EPOCH_PENDING_BYTES / 2 - empty.len() - 1) / 32) as u32;
-        let (response, postcard) = epoch_parts(largest);
-        assert_eq!(postcard.len(), empty.len() + 1 + 32 * largest as usize);
-        assert!(pending_epoch_text(&postcard).is_ok());
+        assert_eq!(empty.len(), 277);
+        let (response, postcard) = epoch_parts(16_375);
+        assert_eq!(postcard.len(), 524_278);
+        let remoted = tempfile::tempdir().unwrap();
+        write_pending_epoch(remoted.path(), &postcard).unwrap();
+        assert_eq!(
+            std::fs::read(remoted.path().join(EPOCH_PENDING_FILE)).unwrap(),
+            hex::encode(&postcard).into_bytes()
+        );
         assert!(response.len() > MAX_EPOCH_PENDING_BYTES);
         assert!(response.len() * 5 < MAX_EPOCH_PENDING_BYTES * 7);
         assert!(matches!(read_access(&response), Ok(Answer::Body(_))));
 
-        let (_, one_more) = epoch_parts(largest + 1);
-        let err = pending_epoch_text(&one_more).unwrap_err();
+        let (_, one_more) = epoch_parts(16_376);
+        let refused_dir = tempfile::tempdir().unwrap();
+        let err = write_pending_epoch(refused_dir.path(), &one_more).unwrap_err();
         assert!(
-            err.to_string().ends_with(&format!(
-                "the fetched epoch is {} bytes as hex, above the 1048576-byte bound the \
-                 remote-plane daemon applies; revocations were not synced",
-                2 * one_more.len()
-            )),
+            err.to_string().ends_with(
+                "the fetched epoch is 1048620 bytes as hex, above the 1048576-byte bound the \
+                 remote-plane daemon applies; revocations were not synced"
+            ),
             "{err}"
         );
+        assert!(!refused_dir.path().join(EPOCH_PENDING_FILE).exists());
     }
 
     #[test]
