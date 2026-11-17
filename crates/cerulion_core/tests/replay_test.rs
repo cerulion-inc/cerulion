@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use cerulion_core::clock::VirtualClock;
+use cerulion_core::clock::{Clock, VirtualClock};
 use cerulion_core::scheduler::{NodeConfig, Scheduler, TraceEntry, TriggerPolicy};
 use cerulion_core::testing::TestTransport;
 use cerulion_core::wire::WireHeader;
@@ -119,6 +119,114 @@ fn test_replay_equivalence_complex() {
     for (i, (a, b)) in trace1.iter().zip(trace2.iter()).enumerate() {
         assert_eq!(a, b, "trace entry {} differs: {:?} vs {:?}", i, a, b);
     }
+}
+
+/// One live-loop-shaped run of a 1 kHz Period node: each step costs `STEP_COST`
+/// of wall time, each wait is sized by `wait_for`, and each wake lands
+/// `WAKE_LATE` after the wait ends. Returns the step deltas (what a recording
+/// keeps), the trace, and how many steps fired the node more than once.
+fn live_shaped_run(
+    wait_for: impl Fn(&Scheduler, u64) -> Duration,
+) -> (Vec<Duration>, Vec<TraceEntry>, u64) {
+    const STEP_COST: Duration = Duration::from_micros(300);
+    const WAKE_LATE: Duration = Duration::from_micros(37);
+    let clock = Arc::new(VirtualClock::new());
+    let mut scheduler = Scheduler::with_virtual_clock(Arc::clone(&clock));
+    let (cb, fires) = counting_callback();
+    scheduler
+        .add_node(NodeConfig {
+            id: "tick".to_string(),
+            policy: TriggerPolicy::Period {
+                interval: Duration::from_millis(1),
+                max_catchup: None,
+            },
+            callback: cb,
+        })
+        .unwrap();
+    let mut deltas = Vec::new();
+    let mut doubles = 0;
+    let mut since_last_step = Duration::ZERO;
+    for _ in 0..600 {
+        // The step just ran and cost STEP_COST; the loop sizes its wait now.
+        let now_ns = clock.now_ns() + STEP_COST.as_nanos() as u64;
+        let wait = wait_for(&scheduler, now_ns);
+        since_last_step += STEP_COST + wait + WAKE_LATE;
+        let before = fires.load(Ordering::Relaxed);
+        scheduler.step(since_last_step);
+        deltas.push(since_last_step);
+        since_last_step = Duration::ZERO;
+        if fires.load(Ordering::Relaxed) - before > 1 {
+            doubles += 1;
+        }
+    }
+    (deltas, scheduler.trace().to_vec(), doubles)
+}
+
+/// Re-execute recorded step deltas on a fresh scheduler.
+fn replay_deltas(deltas: &[Duration]) -> Vec<TraceEntry> {
+    let clock = Arc::new(VirtualClock::new());
+    let mut scheduler = Scheduler::with_virtual_clock(clock);
+    let (cb, _) = counting_callback();
+    scheduler
+        .add_node(NodeConfig {
+            id: "tick".to_string(),
+            policy: TriggerPolicy::Period {
+                interval: Duration::from_millis(1),
+                max_catchup: None,
+            },
+            callback: cb,
+        })
+        .unwrap();
+    for d in deltas {
+        scheduler.step(*d);
+    }
+    scheduler.trace().to_vec()
+}
+
+/// The live loop's wait decides only WHEN a step runs. Driven by the live
+/// loop's own wait sizing (the exact Period deadline), a 1 kHz node whose steps
+/// cost 300 us and whose wakes land 37 us late never fires twice in one step,
+/// and its recorded step deltas re-execute into the identical trace. Driven by
+/// a wait floored at 1 ms the same node double-fires, and that run re-executes
+/// identically too: the wait changes when fires land, never what a replay of
+/// the recording reproduces.
+#[test]
+fn test_replay_equivalence_under_the_live_loops_exact_deadline_wait() {
+    let exact =
+        |s: &Scheduler, now_ns: u64| cerulion_core::graph::runtime::live_wait_for_test(s, now_ns);
+    let floored = |s: &Scheduler, now_ns: u64| {
+        Duration::from_nanos(
+            s.ns_until_next_fire(now_ns)
+                .unwrap_or(250_000_000)
+                .clamp(1_000_000, 250_000_000),
+        )
+    };
+    let (deltas, trace, doubles) = live_shaped_run(exact);
+    assert_eq!(
+        doubles, 0,
+        "the exact deadline wait never fires the node twice in one step"
+    );
+    assert_eq!(
+        trace,
+        replay_deltas(&deltas),
+        "the recorded deltas re-execute identically"
+    );
+    assert_eq!(
+        trace,
+        live_shaped_run(exact).1,
+        "two runs are bit-identical"
+    );
+
+    let (deltas, trace, doubles) = live_shaped_run(floored);
+    assert!(
+        doubles > 0,
+        "a 1 ms floor double-fires this node (the run the exact wait fixes)"
+    );
+    assert_eq!(
+        trace,
+        replay_deltas(&deltas),
+        "and its deltas re-execute identically too"
+    );
 }
 
 #[test]

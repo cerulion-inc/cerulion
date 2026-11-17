@@ -2977,6 +2977,15 @@ pub(crate) fn live_wait_ns(
     .min(LIVE_WAIT_CAP_NS)
 }
 
+/// Test-only: the wait the live loop sizes from `scheduler`'s pending fires at
+/// `now_ns`, with no fixed-quantum boundary: [`live_wait_ns`] over the
+/// scheduler's split read, the decision `live_timeout` takes. For a test that
+/// drives a bare [`Scheduler`] the way the live loop would.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn live_wait_for_test(scheduler: &Scheduler, now_ns: u64) -> Duration {
+    Duration::from_nanos(live_wait_ns(scheduler.next_fire_split(now_ns), None))
+}
+
 #[cfg(test)]
 mod live_wait_tests {
     use super::{live_wait_ns, LIVE_DEADLINE_FLOOR_NS, LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS};
