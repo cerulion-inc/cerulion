@@ -74,7 +74,10 @@ env:
   CACHE_SAVE_ON_PULL_REQUEST: ${{ vars.CACHE_SAVE_ON_PULL_REQUEST }}
   # The demo runs the `cerulion` binary directly, not through cargo, so it does
   # not pick up the workspace cargo configuration. The login gate is on in every
-  # build; this is how this repository's own runs pass it without an account.
+  # build; this switches off its command-wide check so this repository's own
+  # runs pass it without an account. Serving the network is a separate rule this
+  # does not cover; the demo's `graph run` passes `--network off`, which keeps it
+  # clear of that rule.
   CERULION_LOGIN_GATE: "off"
 
 jobs:

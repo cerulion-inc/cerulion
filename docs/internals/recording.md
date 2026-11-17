@@ -15,7 +15,9 @@ User-facing recording docs live in `docs/bag.md`.
   (`cerulion trace inspect`).
 - Bags carry attachments under the reserved `__cerulion/` prefix:
   `recorder.json` (host identity: arch/os/version, used by replay's
-  cross-host advisory), `record_health.json` (per-topic drain health),
+  cross-host advisory, plus the contract keys `trace_format`, `coordination`
+  and `node_external`, each native node's driver flag from its loaded
+  metadata), `record_health.json` (per-topic drain health),
   `record_coverage.json` (what was and was not recorded, and why), plus
   `graph.yaml` and `env.json` for replay.
 - The bag's `graph.yaml` attachment is the **effective in-memory graph config
@@ -304,7 +306,9 @@ still reports its zero count).
 - **Every `graph run`** (recorded or not) writes a run directory
   `~/.cerulion/runs/<sanitized-graph>-<run_id>/` (`run.json` plus
   `graph.yaml`/`env.json`/`recorder.json`; directory 0700, files 0600) and
-  announces itself on the `/__cerulion/runs` registry topic. Run-dir
+  announces itself on the `/__cerulion/runs` registry topic. `recorder.json`
+  lands once the nodes load (`run_dir::write_run_recorder`, atomic), before
+  any ring is named in `run.json`; an attach reads `run.json` first. Run-dir
   bookkeeping is never fatal to the run: any failure is exactly one `warn!`;
   on Drop the run announces `Ending` and removes the directory.
 - The run-registry record is one-per-run for its whole life: no
@@ -331,6 +335,13 @@ still reports its zero count).
   departure ring (header `rank == u32::MAX`, the multi-process departure
   sentinel) gets passthrough, never the head-step gate; that decision lives in
   `bagd::ring_head_gate`, deliberately not in the core ring layer.
+- **State rings follow the recorder, declared or discovered**: a recorder
+  present from the run's start (`attached_mid_run == false`, every
+  `graph run --record`) opens each node-state ring with `open`, from record 0,
+  so the step-0 anchor a rank publishes before the first discovery sweep is in
+  the bag; only a mid-run attach uses `open_at_live` and the head-discarding
+  ledger. A backpressure ring cannot lap before its first consumer (the
+  producer checks `free_records` before every anchor).
 - **Two recorders on one run is allowed** and mechanically safe: ring
   consumers keep local read cursors and the producer never reads consumer
   state. One bag = one run; one run may have several bags. A restarted run is

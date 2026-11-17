@@ -2085,3 +2085,24 @@ fn fixed_length_validation_reaches_inside_a_dynamic_array() {
     assert!(validate_fixed_lengths("A", "a", &at_cap).is_ok());
     assert!(FieldType::parse("uint8[18446744073709551615][]").is_err());
 }
+
+/// The hidden scalar spellings the replay verdict prints values with are the
+/// YAML form's own: shortest round-trip decimals, the non-finite words, and
+/// double-quoted strings with the YAML escapes.
+#[test]
+fn the_hidden_scalar_spellings_are_the_yaml_forms() {
+    assert_eq!(yaml_format_f64(0.3), "0.3");
+    assert_eq!(yaml_format_f64(103.00000000000362), "103.00000000000362");
+    assert_eq!(yaml_format_f64(-0.0), "-0.0");
+    assert_eq!(yaml_format_f64(1e-7), "1e-7");
+    assert_eq!(yaml_format_f64(5e-324), "5e-324");
+    assert_eq!(yaml_format_f64(f64::NAN), ".nan");
+    assert_eq!(yaml_format_f64(f64::NEG_INFINITY), "-.inf");
+    assert_eq!(yaml_format_f32(0.1), "0.1");
+    assert_eq!(yaml_format_f32(f32::INFINITY), ".inf");
+    assert_eq!(
+        yaml_quote_within("a\nb\"", 64).as_deref(),
+        Some("\"a\\nb\\\"\"")
+    );
+    assert_eq!(yaml_quote_within("abcdef", 4), None);
+}

@@ -150,19 +150,32 @@ is unsupported.
 ### Attribution
 
 - All four topic surfaces (`discover`, `list`, `status`, and the `attach`
-  reply) read ONE map: `Ctx::attribution_snapshot` = the live
+  reply) read ONE map: `Ctx::attribution_snapshot` = the stored or refreshed
   mirror-provenance snapshot ∪ each held tap's own recorded `origin_robot`,
-  live winning. The fold must not be hand-inlined into one surface: two copies
-  can diverge, and a diverging copy makes a remote-attached topic double-list
-  under a phantom local section beside its own robot row.
+  the mirror snapshot winning. The fold must not be hand-inlined into one
+  surface: two copies can diverge, and a diverging copy makes a remote-attached
+  topic double-list under a phantom local section beside its own robot row.
 - The per-tap `origin_robot` record (not the name-keyed provenance tombstone,
   which is routing memory only) is what stops a desk producer that later
   reuses a detached remote topic's NAME from being attributed to the
   historical robot.
-- Attribution after `attach` is NOT synchronous: the snapshot unions a CACHED
-  provenance gather (refreshed on miss, aged by `PROVENANCE_CACHE_TTL`), so a
-  missed gather is served stale for the TTL. Tests poll attribution to a
-  deadline; reading `list` once right after `attach` is a known flake shape.
+- Only `discover` and the local `attach` reply refresh the snapshot, on a miss
+  (never filled, invalidated, or older than `PROVENANCE_CACHE_TTL`). `list` and
+  `status` serve the last stored snapshot at any age and never gather, so a slow
+  mirror registry cannot hold their reply. A client that polls only `status`
+  (a diagnostics view, for example) sees a locally attached mirror's attribution
+  only as fresh as the last `discover` or local `attach` from any client; a
+  remote-attached topic's robot is its own authoritative record and always
+  current.
+- Attribution after `attach` is NOT synchronous: a missed gather is served
+  stale until the next refreshing read after the TTL. Tests poll `discover`
+  then `list` to a deadline; reading `list` once right after `attach` is a
+  known flake shape.
+- A `detach` or remote `attach` drops its own topic from the cached snapshot
+  and moves its generation. A gather that started before the mutation and
+  stores after it is refused, so later reads cannot get the old robot back
+  from it (the request that ran it still answers from its own gather); one
+  that stored before it loses that topic with the invalidation.
 - `runs` lists ONE row per `run_id`. A desk whose own netd announces sees each
   local graph twice: from the registry gather (`robot` absent) and echoed back
   over the LAN under its own hostname; `runs.rs::fold_runs` keeps the first row
@@ -749,7 +762,8 @@ the build boundary from §1, with controls that fail loudly if a rule stops prob
   drive/drain interleaving is not a property to depend on. Fix a flaky oracle
   by strengthening the stimulus, never by loosening the assertion.
 - Cached surfaces (attribution, provenance) are polled to a deadline, never
-  read once.
+  read once. An attribution poll includes a `discover`: `list` and `status`
+  never refresh the snapshot.
 
 ## 5. Test map
 

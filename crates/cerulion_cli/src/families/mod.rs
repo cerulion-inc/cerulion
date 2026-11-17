@@ -396,6 +396,27 @@ mod tests {
     use clap::{FromArgMatches, Subcommand};
     use clap_complete::engine::ArgValueCandidates;
 
+    #[test]
+    fn run_and_listing_help_pin_paired_access_without_open_default_promises() {
+        for args in [
+            ["cerulion", "node", "run", "--help"],
+            ["cerulion", "topic", "list", "--help"],
+        ] {
+            let help = || {
+                let error = cli_command()
+                    .try_get_matches_from(args)
+                    .expect_err("help exits before command execution");
+                assert_eq!(error.kind(), clap::error::ErrorKind::DisplayHelp);
+                error.to_string()
+            };
+            let first = help();
+            assert!(first.contains("paired"), "{first}");
+            assert!(!first.contains("without pairing"), "{first}");
+            assert!(!first.contains("no pairing"), "{first}");
+            assert_eq!(first, help(), "help is deterministic");
+        }
+    }
+
     /// The values the dummy family's `echo` verb was run with.
     static DUMMY_RUNS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 

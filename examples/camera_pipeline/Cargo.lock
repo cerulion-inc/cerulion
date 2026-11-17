@@ -235,6 +235,7 @@ version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
+ "cerulion_node_abi",
  "cerulion_pairing",
  "dirs",
  "ed25519-dalek",
@@ -288,6 +289,15 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "toml_edit",
+]
+
+[[package]]
+name = "cerulion_node_abi"
+version = "2.0.0"
+dependencies = [
+ "libloading",
+ "stabby",
+ "thiserror",
 ]
 
 [[package]]
@@ -2818,19 +2828,20 @@ dependencies = [
 
 [[package]]
 name = "stabby"
-version = "72.1.8"
+version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7b834ec7ced12095fea1e4b07dcb7e8cf2b59b18afa3eac52494d835965a5ec"
+checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
+ "libloading",
  "rustversion",
  "stabby-abi",
 ]
 
 [[package]]
 name = "stabby-abi"
-version = "72.1.8"
+version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff1a4f477858a5bdf927c9fab7f579899de9b13e39f8b3b3b300c89fbab632f4"
+checksum = "f375eae680bb54203ee5e47d4cd2ae7b79c0a79ed90919279f38f500ad53f190"
 dependencies = [
  "rustc_version",
  "rustversion",
@@ -2840,9 +2851,9 @@ dependencies = [
 
 [[package]]
 name = "stabby-macros"
-version = "72.1.8"
+version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b31c4b2434980b67ad83f300a58088ba14d59454dcd79ba3d87419bbd924d31e"
+checksum = "ea664671a576c5f7e32fee291ac123d82af5e92b0689beb3555347c00c76eef1"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",

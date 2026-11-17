@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! The CLI's domain events: one per finished workflow (a graph run, a node
-//! build, a recording, a replay, a resimulation, a connect session, a
-//! pairing) and one when `ros2 attach` starts its bridge graph. Every
+//! build, a recording, a replay, a resimulation, a connect session) and one
+//! when `ros2 attach` starts its bridge graph. Every
 //! property is a flag, a count or a coarse bucket; none names anything the
 //! user created. The public list is `docs/telemetry.md`.
 
@@ -52,10 +52,6 @@ pub const CONNECT_SESSION_COMPLETED: EventSpec = EventSpec {
     name: "connect_session_completed",
     allowlist: &["duration_bucket", "exit_code"],
 };
-pub const PAIR_COMPLETED: EventSpec = EventSpec {
-    name: "pair_completed",
-    allowlist: &["is_success"],
-};
 
 /// Every domain event, for the contract tests.
 #[cfg(test)]
@@ -69,7 +65,6 @@ pub const ALL: &[EventSpec] = &[
     RESIM_COMPLETED,
     ROS2_BRIDGE_STARTED,
     CONNECT_SESSION_COMPLETED,
-    PAIR_COMPLETED,
 ];
 
 fn bucket(elapsed: Duration) -> (String, cerulion_telemetry::Value) {
@@ -132,10 +127,6 @@ pub fn connect_session_completed(elapsed: Duration, exit_code: i64) -> Props {
     vec![bucket(elapsed), ("exit_code".into(), exit_code.into())]
 }
 
-pub fn pair_completed(is_success: bool) -> Props {
-    vec![flag("is_success", is_success)]
-}
-
 /// A coarse bag size.
 pub fn size_bucket(bytes: u64) -> &'static str {
     const MB: u64 = 1 << 20;
@@ -172,7 +163,6 @@ mod tests {
         assert_exact(RESIM_COMPLETED, resim_completed(d, 6));
         assert_exact(ROS2_BRIDGE_STARTED, Vec::new());
         assert_exact(CONNECT_SESSION_COMPLETED, connect_session_completed(d, 0));
-        assert_exact(PAIR_COMPLETED, pair_completed(false));
         for spec in ALL {
             guard::check_event_name(spec.name).expect(spec.name);
         }

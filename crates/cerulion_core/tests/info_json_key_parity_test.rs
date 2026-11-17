@@ -209,6 +209,7 @@ fn parsed_names(node_src: &str) -> BTreeSet<String> {
 /// A THIRD parser must not arrive unclassified, which is what the walk below
 /// enforces.
 const INFO_JSON_PARSERS: &[(&str, &str)] = &[
+    ("crates/cerulion_core/src/graph/node_dylib_abi.rs", "reads frozen internal facts then delegates author unknown-key reporting to the canonical node.rs parser"),
     (
         "crates/cerulion_core/src/graph/node.rs",
         "the runtime loader (`DylibNodeEntry::parse_info_json_labeled`) — warns per unknown \
@@ -400,6 +401,11 @@ fn every_info_json_parser_in_the_repo_is_classified() {
     // precisely the defect the classification exists to rule out.
     let mut silent: Vec<String> = Vec::new();
     for (file, what) in INFO_JSON_PARSERS {
+        if *file == "crates/cerulion_core/src/graph/node_dylib_abi.rs" {
+            let src = fs::read_to_string(root.join(file)).unwrap();
+            assert!(src.contains("Self::parse_info_json_labeled(&author_metadata, &label)"));
+            continue;
+        }
         let src = fs::read_to_string(root.join(file))
             .unwrap_or_else(|e| panic!("declared parser {file} is unreadable: {e}"));
         if !warn_span_matches(

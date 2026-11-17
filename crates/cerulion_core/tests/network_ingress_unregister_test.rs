@@ -62,6 +62,10 @@ fn setup_with_network(base: &str) -> (Arc<TransportManager>, String) {
         ix,
     )
     .expect("init_for_test with network");
+    transport
+        .network()
+        .expect("network fixture")
+        .set_lan_access(cerulion_core::LanAccess::Open);
     (transport, format!("/unreg/{base}/{id}"))
 }
 

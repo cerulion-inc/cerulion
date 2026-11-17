@@ -145,6 +145,7 @@ pub enum AttachOutcome {
 /// One attached tap: the listener-less SHM subscriber, the resolved render route
 /// key, and a reusable drain scratch buffer.
 struct AttachedTap {
+    source_channel: String,
     /// The listener-less data-only SHM reader.
     sub: DataOnlySubscriber,
     /// The [`route_key_for_topic`] result — the [`InputFrames::name`] this tap's
@@ -247,6 +248,26 @@ impl TapManager {
         entity_override: Option<&str>,
         wake: WakeMode,
     ) -> TransportResult<AttachOutcome> {
+        self.attach_source(manager, topic, topic, entity_override, wake)
+    }
+
+    /// Tap a private observer channel while retaining the canonical topic in
+    /// schema, routing and UI state. A different source requires an explicit detach.
+    pub fn attach_source(
+        &mut self,
+        manager: &TransportManager,
+        topic: &str,
+        source_channel: &str,
+        entity_override: Option<&str>,
+        wake: WakeMode,
+    ) -> TransportResult<AttachOutcome> {
+        if self
+            .taps
+            .get(topic)
+            .is_some_and(|tap| tap.source_channel != source_channel)
+        {
+            return Err(cerulion_core::TransportError::InvalidTransportConfig { reason: format!("topic '{topic}' is already attached to another source; detach it before selecting a robot") });
+        }
         // Idempotent: never open a second tap for one topic (the introspection
         // slot budget is scarce). Checked BEFORE the fallible open, so a repeat
         // attach never even touches the transport.
@@ -257,13 +278,13 @@ impl TapManager {
         }
         // The fallible open. On Err the map is untouched (checked above, inserted
         // below only on success) — no phantom entry, the topic stays re-attachable.
-        let sub = manager.create_data_only_subscriber(topic)?;
+        let sub = manager.create_data_only_subscriber(source_channel)?;
         let route_key = route_key_for_topic(topic, entity_override);
         // The wake is opened AFTER the tap, so a failed tap never mints a
         // listener, and a failed WAKE never costs the tap (see the doc above).
         let wake_source = match wake {
             WakeMode::Timer => None,
-            WakeMode::Listener => match manager.create_wake_listener(topic) {
+            WakeMode::Listener => match manager.create_wake_listener(source_channel) {
                 Ok(source) => Some(Arc::new(source)),
                 Err(e) => {
                     tracing::warn!(
@@ -286,6 +307,7 @@ impl TapManager {
         self.taps.insert(
             topic.to_string(),
             AttachedTap {
+                source_channel: source_channel.into(),
                 sub,
                 route_key: route_key.clone(),
                 scratch: Vec::new(),
