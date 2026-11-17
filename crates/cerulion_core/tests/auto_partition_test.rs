@@ -64,6 +64,7 @@ fn node(id: &str, inputs: &[(&str, &str)], outputs: &[&str]) -> NodeDef {
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs
@@ -228,6 +229,7 @@ fn chain(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: src,
+                    ..Default::default()
                 }],
                 outputs: if i + 1 < k {
                     vec![OutputDef {
@@ -713,6 +715,7 @@ fn gen_dag(
             .map(|(j, &p)| InputDef {
                 name: format!("in{j}"),
                 source: format!("v{p}/out"),
+                ..Default::default()
             })
             .collect();
         let outputs = if has_consumer[i] {

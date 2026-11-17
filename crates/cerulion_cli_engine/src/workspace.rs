@@ -7,7 +7,6 @@
 //! - `nodes/` directory for node crate sources
 //! - `schemas/` directory for schema YAML files
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use crate::error::{CliError, CliResult};
@@ -321,12 +320,6 @@ pub(crate) fn scaffold_workspace(root: &Path) -> CliResult<CerulionWorkspace> {
     };
     let cargo_toml = workspace_manifest(base.as_deref(), env!("CARGO_PKG_VERSION"));
     std::fs::write(root.join("Cargo.toml"), cargo_toml)?;
-    write_workspace_toolchain(
-        root,
-        cerulion_core::RUSTC_RELEASE,
-        cerulion_core::RUSTC_FINGERPRINT,
-        installed_rustup_compiler,
-    )?;
 
     // .cargo/config.toml
     let cargo_dir = root.join(".cargo");
@@ -351,156 +344,6 @@ RUST_LOG = {{ value = "warn", force = false }}
         schemas_dir,
         dependency_source: Some(dependency_source),
     })
-}
-
-/// Select a locally verified stable compiler without changing rustup defaults or
-/// replacing an explicit project choice. A release name alone cannot identify a
-/// custom compiler, and nightly releases lack their toolchain's date.
-fn write_workspace_toolchain(
-    root: &Path,
-    release: &str,
-    fingerprint: &str,
-    probe: impl FnOnce(&str) -> Result<String, String>,
-) -> CliResult<()> {
-    for name in ["rust-toolchain", "rust-toolchain.toml"] {
-        match std::fs::symlink_metadata(root.join(name)) {
-            Ok(_) => {
-                tracing::debug!(
-                    rustc = release,
-                    file = name,
-                    "existing workspace Rust toolchain retained"
-                );
-                return Ok(());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    let Some(manifest) = stable_toolchain_manifest(release) else {
-        tracing::debug!(
-            rustc = release,
-            "compiler has no reproducible stable toolchain pin; ambient selection retained"
-        );
-        return Ok(());
-    };
-    let compiler = match probe(release) {
-        Ok(compiler) => compiler,
-        Err(error) => {
-            tracing::debug!(
-                rustc = release,
-                error = %error,
-                "could not verify an optional reproducible toolchain pin; ambient selection retained"
-            );
-            return Ok(());
-        }
-    };
-    if !toolchain_fingerprint_matches(release, fingerprint, &compiler) {
-        tracing::debug!(
-            rustc = release,
-            fingerprint,
-            "installed compiler does not match the optional reproducible toolchain pin; ambient selection retained"
-        );
-        return Ok(());
-    }
-    let path = root.join("rust-toolchain.toml");
-    if !publish_toolchain_manifest(&path, |file| file.write_all(manifest.as_bytes()))? {
-        tracing::warn!(
-            path = %path.display(),
-            rustc = release,
-            "workspace Rust toolchain appeared during creation; existing choice retained"
-        );
-    }
-    Ok(())
-}
-
-/// Publish complete bytes without replacing a concurrently created choice.
-/// A failed write leaves only the sibling staging file to remove, never a
-/// partial toolchain file that rustup or a later invocation could select.
-fn publish_toolchain_manifest(
-    path: &Path,
-    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
-) -> std::io::Result<bool> {
-    let mut nonce = [0_u8; 16];
-    getrandom::fill(&mut nonce).map_err(|error| std::io::Error::other(error.to_string()))?;
-    let staging = path.with_file_name(format!(
-        ".rust-toolchain-{:032x}.tmp",
-        u128::from_le_bytes(nonce)
-    ));
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&staging)?;
-    let written = write(&mut file).and_then(|()| file.sync_all());
-    drop(file);
-    // A sibling is on the same filesystem. Unlike rename, hard_link atomically
-    // refuses existing files, directories, and symlinks. Unsupported filesystems
-    // return an error rather than falling back to an overwriting publication.
-    let published = written.and_then(|()| match std::fs::hard_link(&staging, path) {
-        Ok(()) => Ok(true),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
-        Err(error) => Err(error),
-    });
-    if let Err(error) = std::fs::remove_file(&staging) {
-        if published.is_ok() {
-            return Err(error);
-        }
-        tracing::warn!(
-            path = %staging.display(),
-            error = %error,
-            "failed to remove toolchain staging file after publication failed"
-        );
-    }
-    published
-}
-
-fn installed_rustup_compiler(release: &str) -> Result<String, String> {
-    // `rustup run` never installs a missing toolchain without `--install`.
-    // Workspace creation must remain offline and preserve installed defaults.
-    let output = std::process::Command::new("rustup")
-        .args(["run", release, "rustc", "-vV"])
-        .output()
-        .map_err(|error| error.to_string())?;
-    if !output.status.success() {
-        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
-    }
-    String::from_utf8(output.stdout).map_err(|error| error.to_string())
-}
-
-fn toolchain_fingerprint_matches(release: &str, fingerprint: &str, compiler: &str) -> bool {
-    let mut actual_release = None;
-    let mut actual_commit = None;
-    for line in compiler.lines() {
-        if let Some(value) = line.strip_prefix("release: ") {
-            if actual_release.replace(value).is_some() {
-                return false;
-            }
-        } else if let Some(value) = line.strip_prefix("commit-hash: ") {
-            if actual_commit.replace(value).is_some() {
-                return false;
-            }
-        }
-    }
-    let Some(commit) = actual_commit else {
-        return false;
-    };
-    actual_release == Some(release)
-        && commit.len() == 40
-        && commit.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && fingerprint == format!("{release} ({commit})")
-}
-
-fn stable_toolchain_manifest(release: &str) -> Option<String> {
-    let parts: Vec<_> = release.split('.').collect();
-    if parts.len() != 3
-        || parts
-            .iter()
-            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-        return None;
-    }
-    Some(format!(
-        "[toolchain]\nchannel = \"{release}\"\nprofile = \"minimal\"\n"
-    ))
 }
 
 fn workspace_manifest(base: Option<&Path>, version: &str) -> String {
@@ -561,218 +404,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-
-    const OFFICIAL_FINGERPRINT: &str = "1.93.0 (1111111111111111111111111111111111111111)";
-    const OFFICIAL_COMPILER: &str =
-        "release: 1.93.0\ncommit-hash: 1111111111111111111111111111111111111111\n";
-
-    fn write_verified_toolchain(root: &Path, release: &str) -> CliResult<()> {
-        write_workspace_toolchain(root, release, OFFICIAL_FINGERPRINT, |_| {
-            Ok(OFFICIAL_COMPILER.to_owned())
-        })
-    }
-
-    #[test]
-    fn custom_stable_compiler_does_not_select_the_official_compiler() {
-        let root = tempfile::tempdir().unwrap();
-        write_workspace_toolchain(
-            root.path(),
-            "1.93.0",
-            "1.93.0 (2222222222222222222222222222222222222222)",
-            |_| Ok(OFFICIAL_COMPILER.to_owned()),
-        )
-        .unwrap();
-        assert!(!root.path().join("rust-toolchain.toml").exists());
-    }
-
-    #[test]
-    fn unavailable_or_malformed_rustup_compilers_preserve_ambient_selection() {
-        for compiler in [
-            Err("rustup is unavailable".to_owned()),
-            Ok(String::new()),
-            Ok("release: 1.93.0\ncommit-hash: unknown\n".to_owned()),
-            Ok("release: 1.93.0\ncommit-hash: 11111111\n".to_owned()),
-            Ok(OFFICIAL_COMPILER.replace("1.93.0", "1.94.0")),
-            Ok(format!("{OFFICIAL_COMPILER}release: 1.93.0\n")),
-            Ok(format!(
-                "{OFFICIAL_COMPILER}commit-hash: 1111111111111111111111111111111111111111\n"
-            )),
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            write_workspace_toolchain(root.path(), "1.93.0", OFFICIAL_FINGERPRINT, |_| compiler)
-                .unwrap();
-            assert!(!root.path().join("rust-toolchain.toml").exists());
-        }
-    }
-
-    #[test]
-    fn hashless_host_compiler_is_not_pinned() {
-        let root = tempfile::tempdir().unwrap();
-        write_workspace_toolchain(root.path(), "1.93.0", "1.93.0 (unknown)", |_| {
-            Ok(OFFICIAL_COMPILER.to_owned())
-        })
-        .unwrap();
-        assert!(!root.path().join("rust-toolchain.toml").exists());
-    }
-
-    #[test]
-    fn stable_workspace_toolchain_is_exact_and_deterministic() {
-        let expected = "[toolchain]\nchannel = \"1.93.0\"\nprofile = \"minimal\"\n";
-        for _ in 0..2 {
-            let root = tempfile::tempdir().unwrap();
-            write_verified_toolchain(root.path(), "1.93.0").unwrap();
-            assert_eq!(
-                std::fs::read_to_string(root.path().join("rust-toolchain.toml")).unwrap(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn explicit_workspace_toolchain_choices_are_preserved() {
-        for name in ["rust-toolchain", "rust-toolchain.toml"] {
-            let root = tempfile::tempdir().unwrap();
-            let original = "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"complete\"\n";
-            std::fs::write(root.path().join(name), original).unwrap();
-            write_workspace_toolchain(root.path(), "1.93.0", OFFICIAL_FINGERPRINT, |_| {
-                panic!("existing choice must be preserved without probing rustup")
-            })
-            .unwrap();
-            assert_eq!(
-                std::fs::read_to_string(root.path().join(name)).unwrap(),
-                original
-            );
-            if name == "rust-toolchain" {
-                assert!(!root.path().join("rust-toolchain.toml").exists());
-            }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn dangling_workspace_toolchain_symlink_is_not_replaced() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("rust-toolchain.toml");
-        std::os::unix::fs::symlink("missing-toolchain", &path).unwrap();
-        write_workspace_toolchain(root.path(), "1.93.0", OFFICIAL_FINGERPRINT, |_| {
-            panic!("existing symlink must be preserved without probing rustup")
-        })
-        .unwrap();
-        assert_eq!(
-            std::fs::read_link(path).unwrap(),
-            Path::new("missing-toolchain")
-        );
-    }
-
-    #[test]
-    fn ambiguous_or_malformed_compiler_releases_do_not_create_overrides() {
-        for release in [
-            "1.99.0-nightly",
-            "1.99.0-beta.1",
-            "stable",
-            "",
-            "1.93",
-            "1..0",
-            "1.93.0\n",
-            "1.93.0\"",
-            "1.93.0.1",
-        ] {
-            let root = tempfile::tempdir().unwrap();
-            write_workspace_toolchain(root.path(), release, OFFICIAL_FINGERPRINT, |_| {
-                panic!("invalid release must not probe rustup")
-            })
-            .unwrap();
-            assert!(
-                !root.path().join("rust-toolchain.toml").exists(),
-                "{release:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_toolchain_write_errors_propagate() {
-        let root = tempfile::tempdir().unwrap();
-        let missing = root.path().join("missing");
-        assert!(write_verified_toolchain(&missing, "1.93.0").is_err());
-        let file = root.path().join("file");
-        std::fs::write(&file, "not a directory").unwrap();
-        assert!(write_verified_toolchain(&file, "1.93.0").is_err());
-    }
-
-    #[test]
-    fn failed_toolchain_writes_leave_no_manifest_and_can_be_retried() {
-        for prefix in ["", "[toolchain]\nchannel = \""] {
-            let root = tempfile::tempdir().unwrap();
-            let path = root.path().join("rust-toolchain.toml");
-            let error = publish_toolchain_manifest(&path, |file| {
-                file.write_all(prefix.as_bytes())?;
-                assert!(!path.exists(), "incomplete toolchain must stay unpublished");
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "injected toolchain write failure",
-                ))
-            })
-            .unwrap_err();
-            assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
-            assert!(!path.exists());
-            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-
-            // Retry the pin writer, not whole-workspace creation: that operation
-            // separately refuses an already existing root or Cargo manifest.
-            write_verified_toolchain(root.path(), "1.93.0").unwrap();
-            assert_eq!(
-                std::fs::read_to_string(path).unwrap(),
-                "[toolchain]\nchannel = \"1.93.0\"\nprofile = \"minimal\"\n"
-            );
-            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
-        }
-    }
-
-    #[test]
-    fn concurrent_toolchain_choice_survives_successful_and_failed_staging() {
-        for fail_write in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let path = root.path().join("rust-toolchain.toml");
-            let winner = "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"complete\"\n";
-            let result = publish_toolchain_manifest(&path, |file| {
-                file.write_all(b"[toolchain]\nchannel = \"")?;
-                assert!(!path.exists(), "incomplete toolchain must stay unpublished");
-                std::fs::write(&path, winner)?;
-                if fail_write {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::WriteZero,
-                        "injected toolchain write failure",
-                    ));
-                }
-                file.write_all(b"1.93.0\"\nprofile = \"minimal\"\n")
-            });
-            if fail_write {
-                assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::WriteZero);
-            } else {
-                assert!(!result.unwrap(), "a concurrent choice must win publication");
-            }
-            assert_eq!(std::fs::read_to_string(path).unwrap(), winner);
-            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn concurrent_dangling_toolchain_symlink_is_not_replaced() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("rust-toolchain.toml");
-        let published = publish_toolchain_manifest(&path, |file| {
-            std::os::unix::fs::symlink("chosen-toolchain", &path)?;
-            file.write_all(b"[toolchain]\nchannel = \"1.93.0\"\nprofile = \"minimal\"\n")
-        })
-        .unwrap();
-        assert!(!published);
-        assert_eq!(
-            std::fs::read_link(path).unwrap(),
-            Path::new("chosen-toolchain")
-        );
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
-    }
 
     #[test]
     fn test_workspace_create_structure() {
@@ -856,6 +487,49 @@ mod tests {
         assert!(ws.graphs_dir.is_dir());
         assert!(ws.nodes_dir.is_dir());
         assert!(ws.schemas_dir.is_dir());
+    }
+
+    /// Any Rust 1.95 or newer builds loadable nodes, so a new workspace names
+    /// no compiler: Cargo and rustup select one as they would anywhere else.
+    #[test]
+    fn workspace_create_and_init_write_no_rust_toolchain_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let created = workspace_create(tmp.path(), "created").unwrap();
+        let initialized = workspace_init(&tmp.path().join("initialized")).unwrap();
+        let in_place = tmp.path().join("in_place");
+        std::fs::create_dir(&in_place).unwrap();
+        let in_place = workspace_init(&in_place).unwrap();
+        for ws in [created, initialized, in_place] {
+            for name in ["rust-toolchain", "rust-toolchain.toml"] {
+                assert!(
+                    std::fs::symlink_metadata(ws.root.join(name)).is_err(),
+                    "{} wrote {name}",
+                    ws.root.display()
+                );
+            }
+        }
+    }
+
+    /// `workspace init` in a directory that already chose a compiler leaves
+    /// that choice byte for byte, in either file name.
+    #[test]
+    fn workspace_init_leaves_an_existing_rust_toolchain_file_untouched() {
+        let original = "[toolchain]\nchannel = \"1.97.1\"\nprofile = \"complete\"\n";
+        for name in ["rust-toolchain", "rust-toolchain.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(name), original).unwrap();
+            workspace_init(tmp.path()).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join(name)).unwrap(),
+                original
+            );
+            let other = if name == "rust-toolchain" {
+                "rust-toolchain.toml"
+            } else {
+                "rust-toolchain"
+            };
+            assert!(std::fs::symlink_metadata(tmp.path().join(other)).is_err());
+        }
     }
 
     #[test]

@@ -36,6 +36,7 @@ use cerulion_link::{
     DEFAULT_MAX_FRAME_LEN,
 };
 use std::future::Future;
+use std::task::Poll;
 
 use crate::config::{ConnectConfig, DemandSet};
 use crate::error::{ConnectError, ConnectResult};
@@ -311,21 +312,29 @@ where
         });
     }
 
+    // 8. Run until shutdown OR the robot connection drops. `shutdown` is polled
+    //    once before the line below says how to stop the session: the binary's
+    //    shutdown future sets up its Ctrl-C handler, and on a piped stdin its
+    //    stdin watcher, on its first poll, so they are in place when the line is
+    //    logged.
+    tokio::pin!(shutdown);
+    let mut signalled =
+        std::future::poll_fn(|cx| Poll::Ready(shutdown.as_mut().poll(cx).is_ready())).await;
     tracing::info!(
         streaming = readers.len(),
         "cerulion connect: re-injecting into desk-local SHM (remote = local); Ctrl-C or robot \
          disconnect to stop"
     );
-
-    // 8. Run until shutdown OR the robot connection drops.
-    tokio::pin!(shutdown);
-    tokio::select! {
-        _ = &mut shutdown => {
-            tracing::info!("cerulion connect: shutdown signalled; tearing down");
+    if !signalled {
+        tokio::select! {
+            _ = &mut shutdown => signalled = true,
+            reason = connection.closed() => {
+                tracing::warn!(%reason, "cerulion connect: robot connection closed; tearing down");
+            }
         }
-        reason = connection.closed() => {
-            tracing::warn!(%reason, "cerulion connect: robot connection closed; tearing down");
-        }
+    }
+    if signalled {
+        tracing::info!("cerulion connect: shutdown signalled; tearing down");
     }
 
     // 9. Teardown: abort every reader (dropping its stream + injector — releases

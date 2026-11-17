@@ -3679,15 +3679,24 @@ for library in librmw_cerulion.so libcerulion_heaphook.so; do
     fi
 done
 
-# Older archives contain binaries only. New releases bundle the provisioning
-# helper and the compiler metadata of the build inside the verified archive, so
-# an explicit --version never selects today's release compiler by accident.
+# The archive's own provisioning helper runs, inside the verified archive.
+# From 2.0.0 it is install_rust.sh alone, which installs current stable Rust.
+# A 1.x archive pairs it with rustc-version.txt, the compiler metadata its
+# helper takes as an argument, so an explicit --version keeps that release's
+# compiler. Older archives contain binaries only.
 rust_setup=0
-if [ -e "$archive_dir/install_rust.sh" ] || [ -e "$archive_dir/rustc-version.txt" ]; then
-    if [ ! -f "$archive_dir/install_rust.sh" ] || [ ! -f "$archive_dir/rustc-version.txt" ]; then
+rust_metadata=
+if [ -e "$archive_dir/install_rust.sh" ]; then
+    [ -f "$archive_dir/install_rust.sh" ] ||
         die "archive is missing part of its Rust/Cargo setup"
+    if [ -e "$archive_dir/rustc-version.txt" ]; then
+        [ -f "$archive_dir/rustc-version.txt" ] ||
+            die "archive is missing part of its Rust/Cargo setup"
+        rust_metadata=$archive_dir/rustc-version.txt
     fi
     rust_setup=1
+elif [ -e "$archive_dir/rustc-version.txt" ]; then
+    die "archive is missing part of its Rust/Cargo setup"
 else
     printf '%s\n' 'warning: this older release archive does not include automatic Rust/Cargo setup' >&2
 fi
@@ -3785,12 +3794,12 @@ if [ "$rust_setup" -eq 1 ]; then
     # rustup fetches its own installer and one minimal toolchain here, which is
     # several times the size of the Cerulion archive and the slow part of the
     # install on a metered or tethered link. Say so before it starts. The
-    # helper this step runs fetches nothing when the exact compiler is already
+    # helper this step runs fetches nothing when a Rust it accepts is already
     # installed, which a returning user usually has, so the size is stated as
     # the case it applies to rather than as a promise.
     printf '%s\n' \
-        'Setting up Rust and Cargo for building nodes; where that compiler is not already installed this downloads about 140 MB'
-    run_foreground sh "$archive_dir/install_rust.sh" "$archive_dir/rustc-version.txt" ||
+        'Setting up Rust and Cargo for building nodes; where the Rust it needs is not already installed this downloads about 140 MB'
+    run_foreground sh "$archive_dir/install_rust.sh" ${rust_metadata:+"$rust_metadata"} ||
         die "Rust/Cargo setup failed; Cerulion binaries have not been replaced"
 fi
 transaction_dir=""

@@ -188,9 +188,9 @@ mod tests {
         let recovered: Covariance = serde_json::from_str(&json).expect("deserialize");
 
         assert_eq!(recovered.matrix.len(), 36);
-        for index in 0..36 {
+        for (index, value) in recovered.matrix.iter().enumerate() {
             assert_eq!(
-                recovered.matrix[index],
+                *value,
                 (index as f64) * 1.5 - 7.25,
                 "element {index} did not survive the round trip"
             );
@@ -221,8 +221,8 @@ mod tests {
         let json = serde_json::to_string(&original).expect("serialize");
         let recovered: Names = serde_json::from_str(&json).expect("deserialize");
 
-        for index in 0..40 {
-            assert_eq!(recovered.names[index], format!("link_{index}"));
+        for (index, name) in recovered.names.iter().enumerate() {
+            assert_eq!(*name, format!("link_{index}"));
         }
         assert_eq!(recovered, original);
     }

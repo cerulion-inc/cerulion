@@ -79,6 +79,7 @@ fn build_rig(prefix: &str) -> Rig {
             inputs: vec![InputDef {
                 name: "cmd".to_string(),
                 source: cmd_topic.clone(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

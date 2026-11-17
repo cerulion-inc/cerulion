@@ -262,6 +262,7 @@ version = "2.0.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
+ "cerulion_node_abi",
  "cerulion_pairing",
  "dirs",
  "iceoryx2",
@@ -313,6 +314,15 @@ dependencies = [
  "quote",
  "syn",
  "toml_edit",
+]
+
+[[package]]
+name = "cerulion_node_abi"
+version = "2.0.0"
+dependencies = [
+ "libloading",
+ "stabby",
+ "thiserror",
 ]
 
 [[package]]
@@ -2288,9 +2298,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-udp"
-version = "0.5.15"
+version = "0.5.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35a133f956daabe89a61a685c2649f13d82d5aa4bd5d12d1277e1072a21c0694"
+checksum = "af66907df18639dcf4db56ca65490cabc4b27a97dbadd96f2926cca73298f016"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -2994,6 +3004,7 @@ version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
+ "libloading",
  "rustversion",
  "stabby-abi",
 ]

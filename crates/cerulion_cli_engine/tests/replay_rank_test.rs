@@ -433,6 +433,7 @@ fn a_typod_source_still_warns_with_the_sibling_set() {
     sink.inputs.push(cerulion_core::graph::config::InputDef {
         name: "typo".into(),
         source: "/mp/mid/otu".into(),
+        ..Default::default()
     });
     let plans = plan_ranks(&config, &two_rank_manifests(), &two_rank_boundaries())
         .expect("the two-rank fixture plans");

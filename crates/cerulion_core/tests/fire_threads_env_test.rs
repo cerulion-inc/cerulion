@@ -150,6 +150,7 @@ fn prod_cons_graph(prefix: &str) -> (GraphConfig, IndexMap<String, Box<dyn NodeE
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
