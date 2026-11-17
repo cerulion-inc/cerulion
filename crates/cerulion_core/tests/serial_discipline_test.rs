@@ -696,6 +696,12 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
         "release-only per-hop decomposition bench",
     ),
     (
+        "period_park_iox2_test",
+        "bounds how long after its write a frame is read across a kernel nap \
+         and judges a 1 kHz grid against wall time; DEBUG-OK, so it gates every \
+         PR, and a loaded runner stretches both",
+    ),
+    (
         "streaming_latency_bench_test",
         "release-only spin-then-block bench",
     ),
