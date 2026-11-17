@@ -881,7 +881,8 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
     }
 }
 
-/// The line `cerulion-connectd pair` logs once `run_pair` returned.
+/// The line `cerulion-connectd pair` logs once `run_pair` returned, and
+/// whether it then leaves the outcome token ([`PairEnd::outcome`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PairEnd {
     /// Paired: no line here, as `run_pair` printed its `paired:` line.
@@ -974,8 +975,9 @@ fn write_outcome(path: &Path, token: &str) {
 
 /// Create `path` new (an existing entry, a symlink included, is never
 /// followed or overwritten), mode 0600 on Unix, and write `token`. A write
-/// that fails removes the file it created before the error returns, so no
-/// part of a token is left for `cerulion pair` to read.
+/// that fails removes the file it created before the error returns. If that
+/// removal fails too, what stays holds fewer bytes than the token, and
+/// `cerulion pair` accepts nothing but the whole token.
 ///
 /// No sync: the reader is `cerulion pair` on the same host, which reads the
 /// file after it reaped this process, and the page cache already holds the

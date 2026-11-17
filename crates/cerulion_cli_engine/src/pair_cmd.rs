@@ -8,7 +8,8 @@
 //! no flags (an eid, by `--eid` or as `<robot>`, pins nothing). Like `cerulion
 //! connect`, the `cerulion` CLI stays iroh-free: it RESOLVES the robot eid + the
 //! desk key path, builds the exact `cerulion-connectd pair` argv, and SPAWNS that
-//! iroh-linking sibling (which owns the dial + the ceremony).
+//! iroh-linking sibling (which owns the dial + the ceremony), appending the
+//! hidden `--outcome-file <path>` it reads back once the helper exits.
 //!
 //! The code the desk types is made on the robot by `cerulion pair --start`
 //! ([`crate::pair_start_cmd`]), which prints it with the robot's endpoint id.
@@ -107,7 +108,8 @@ pub struct PairTarget {
 pub struct PairPlan {
     /// The resolved `cerulion-connectd` binary path.
     pub bin: PathBuf,
-    /// The argv (after the binary) to pass to it (leads with `pair`).
+    /// The argv (after the binary) to pass to it (leads with `pair`);
+    /// `spawn_and_pair` appends `--outcome-file <path>` to it.
     pub argv: Vec<String>,
     /// The name to pin on success (`None` for a raw-eid target).
     pub name: Option<String>,
@@ -256,6 +258,7 @@ fn resolve_desk_key_path(explicit: Option<PathBuf>) -> CliResult<PathBuf> {
 
 /// Build the exact `cerulion-connectd pair` argv (after the binary) for a resolved
 /// target + key path + label + the flags. PURE — the byte-exact argv oracle-tested.
+/// `spawn_and_pair` appends `--outcome-file <path>` when it spawns the helper.
 ///
 /// The argv leads with the `pair` SUBCOMMAND. `--label` is always passed (the
 /// resolved default or the user override); `--robot-name` is passed only when a

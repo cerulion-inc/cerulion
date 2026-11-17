@@ -6,7 +6,7 @@
 //! (the documented `interrupted` code) within [`EXIT_CEILING`] of the signal,
 //! well inside the 5 s grace after which `cerulion` kills the helper (exit
 //! 137), with nothing on stdout (no ceremony began). `cerulion` then closes
-//! with its plain NOT complete line, exactly once, and never says the robot
+//! with its plain `did NOT complete` line, exactly once, and never says the robot
 //! may have paired: the helper reported no unconfirmed end.
 //!
 //! The signal is sent once stderr carries the helper's desk key line, which

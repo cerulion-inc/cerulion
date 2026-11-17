@@ -78,7 +78,7 @@ pub const EXIT_USAGE: u8 = 1;
 pub const EXIT_REFUSED: u8 = 2;
 /// The robot could not be reached — the dial failed, the stream dropped, or the
 /// ceremony timed out. Retry (check the robot is on, reachable, running remoted).
-/// Exit 3 is also the robot that did not answer after it was asked to save this
+/// Exit 3 also covers a robot that did not answer after it was asked to save this
 /// desk ([`PairError::TimedOutUnconfirmed`]): the robot may have paired this
 /// desk, so read stderr before you retry.
 pub const EXIT_UNREACHABLE: u8 = 3;

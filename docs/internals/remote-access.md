@@ -876,21 +876,25 @@ every slot is taken.
   `cerulion pair` and this helper, absent from `--help` and from the user API
   page: `cerulion pair` creates a new private directory (0700) under the
   system temp directory, passes a path in it, and its drop guard
-  (`OutcomeDir`) removes the directory on every way out, a failed spawn and a
-  panic included. When it cannot create the directory it warns, with the
+  (`OutcomeDir`) removes the directory on every return and unwind, a failed
+  spawn and a panic included; a SIGKILL of `cerulion` itself leaves the empty
+  directory behind. When it cannot create the directory it warns, with the
   remedy of a writable `TMPDIR`, and runs the helper without the flag. The
   helper logs its end line first and then writes the token `unconfirmed`
   there (`record_end`) on exactly the two unconfirmed ends
   (`PairEnd::outcome`) and nothing on any other, so a helper killed between
   the two leaves no token. The file is created new, 0600, and removed again
-  when the write fails; it is not synced, as `cerulion pair` reads it on the
+  when the write fails (no test reaches that arm); it is not synced, as `cerulion pair` reads it on the
   same host after it reaped the helper. A write failure is a warn and changes
   no exit code. Once the helper exits, `cerulion pair` reads the file
   (`read_outcome`): only the exact token makes its closing line say the
   robot may have paired, and a missing, unreadable or other file closes as a
   plain end. The pins of this channel are unit and process tests:
   the `record_end` table in the helper's `main.rs` (every end, what it
-  leaves at the path and that the line is logged before the token), the
+  leaves at the path and that the line is logged before the token),
+  `the_outcome_file_is_created_new_with_the_token_and_never_follows_an_entry`
+  (created new, 0600, never through an existing entry),
+  `the_outcome_file_flag_parses_and_is_hidden_from_pair_help`, the
   `read_outcome` and `OutcomeDir` tests and the scripted helper tests of
   `spawn_and_pair_in` in `pair_cmd` (an unconfirmed 3 and 130, a plain 3,
   other content, a failed spawn, a temporary directory that cannot be
