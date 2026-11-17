@@ -38,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cerulion_cli_engine::multiprocess::CreditEdgePlan` gains `producer_nodes` and `multiprocess::WorkerPlan` gains `paced_topic_warnings`, so a struct literal of either names the new field. A plan file without the key reads as empty.
 
 ### Fixed
+- Final session witnesses preserve simultaneous maximum-length and case-distinct robot/session identifiers. Store creation accepts searchable higher ancestors while syncing the new directory and its prepared immediate parent.
 - When a `block` consumer's process dies, the supervisor releases that consumer's slot and the producer resumes; the topic's other `block` consumers keep their slots. The "lost its CONSUMER" warning now says the slot was released and names the producer node. A consumer node that stops with a fatal error releases its own slots the same way, whichever process its producer runs in. A tick panic in a node library leaves the slots armed, because the library catches the panic and the node keeps running. A released slot counts nothing, so a drain of it logs no `block credit drain removed frames its word never counted` warning. Before, the producer stayed deferred for the rest of the run.
 
 ### Added

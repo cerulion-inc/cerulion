@@ -203,9 +203,17 @@ Load-bearing boundary contracts:
   timeout or `abort`. Dropping the handle closes input but cannot promise a save.
 
 - **Client final witnesses**: Unix `cerulion_connectd::session_witness::WitnessStore`
-  holds a private directory descriptor. Its blocking `persist` checks filename
+  opens its store relative to an existing durable parent that the caller supplies.
+  The immediate parent must be readable for syncing; higher ancestors need only
+  be searchable. It syncs each directory it creates and the parent entry it
+  modifies, with no read or sync requirement on pre-existing higher ancestors.
+  Its blocking `persist` checks filename
   components and requires the witness count/head to match a valid Exit before
-  creating a file. Exclusive 0600 creation and descriptor-relative access refuse
+  creating a file at `final-<encoded robot>/<encoded session>.json`. Each ID uses
+  lowercase, unpadded RFC 4648 base32, preserving all bytes even on filesystems
+  that ignore filename case. Components are bounded to 211 and 210 bytes.
+  Empty identifiers, separators, NUL, dots and traversal components are refused.
+  Exclusive 0600 creation under a private 0700 robot directory refuses
   collisions and final-component symlinks. Success syncs the file and directory;
   an I/O failure may retain partial bytes, which a later call never overwrites.
   The caller authenticates the robot and keeps filesystem work off async tasks.
