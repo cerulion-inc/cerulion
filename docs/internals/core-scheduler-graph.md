@@ -343,9 +343,11 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
 - Period-park (`CERULION_PERIOD_PARK=1`, `graph/period_park.rs`): inside `monitor_wait_block`, a
   plan fixed at entry naps in the kernel (100 us, doorbell wake word on the armed line, a plain
   sleep without one) until a learned lead before the deadline or a predicted data window, then
-  runs the normal park. `period_park::admits` is the pure gate (no barrier, credit word or fd
-  source; a real primitive; `ENGAGES_ON_THIS_TARGET`, x86_64 only: on aarch64 no arrival was
-  ever predicted on a Jetson, so the switch warns once there and stays off). Record-only like every park path; pins in `period_park_iox2_test`.
+  runs the normal park. `period_park::refusal` is the pure gate: the first failing term in a
+  fixed order (`target_not_validated`, x86_64 only as on aarch64 no arrival was ever predicted
+  on a Jetson; `no_monitor_wait_primitive`; `park_off`; `barrier`; `credit_edge`; `fd_source`;
+  `no_data_wake`), and `announce` logs it once per runtime as `period park requested but not
+  engaged`. Record-only like every park path; pins in `period_park_iox2_test`.
 - iceoryx2 events cannot be monitor-waited (they are sockets; see the transport
   dossier), hence the SHM DOORBELL: a cache-line-aligned atomic per topic; the publisher
   rings AFTER the iceoryx2 send; where the CPU carries a monitor-wait primitive the
