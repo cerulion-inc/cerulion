@@ -1,4 +1,6 @@
 #[cfg(unix)]
+use std::ffi::{OsStr, OsString};
+#[cfg(unix)]
 use std::process::ExitCode;
 
 #[cfg(unix)]
@@ -49,7 +51,7 @@ enum Action {
 #[tokio::main]
 async fn main() -> ExitCode {
     init_tracing();
-    let socket_path = match parse_args(std::env::args().skip(1)) {
+    let socket_path = match parse_args(std::env::args_os().skip(1)) {
         Ok(Action::Start(path)) => path,
         Ok(Action::InspectNode(lib)) => return inspect_node(&lib),
         Ok(Action::Help) => {
@@ -231,46 +233,70 @@ fn report_isolation_refusal(
     ExitCode::FAILURE
 }
 
+/// The value after `--socket` or `--inspect-node`: a path, kept as the bytes
+/// given, UTF-8 or not, and the last argument.
 #[cfg(unix)]
 fn path_arg(
     flag: &str,
-    args: &mut impl Iterator<Item = String>,
+    args: &mut impl Iterator<Item = (usize, OsString)>,
 ) -> Result<std::path::PathBuf, String> {
     let path = args
         .next()
-        .map(std::path::PathBuf::from)
+        .map(|(_, path)| std::path::PathBuf::from(path))
         .ok_or_else(|| format!("{flag} requires a path"))?;
-    if path.to_str().is_some_and(|path| path.starts_with('-')) {
+    if path.as_os_str().as_encoded_bytes().starts_with(b"-") {
         return Err(format!("{flag} path cannot start with `-`"));
     }
-    if let Some(arg) = args.next() {
-        return Err(format!("unexpected argument `{arg}`"));
+    if let Some((position, arg)) = args.next() {
+        return Err(match arg.into_string() {
+            Ok(arg) => format!("unexpected argument `{arg}`"),
+            Err(arg) => not_utf8(position, &arg),
+        });
     }
     Ok(path)
 }
 
+/// The refusal of an argument that is not valid UTF-8 where no path is taken.
 #[cfg(unix)]
-fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Action, String> {
-    match args.next().as_deref() {
-        None => Ok(Action::Start(cerulion_wsd::hygiene::default_socket_path())),
+fn not_utf8(position: usize, arg: &OsStr) -> String {
+    format!("argument {position} is not valid UTF-8: {arg:?}")
+}
+
+/// Parse `cerulion-wsd`'s argv (already past argv[0]); a position counts from
+/// 1 after the program name. With no argument, the socket comes from the
+/// default ladder, which reads the environment.
+#[cfg(unix)]
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Action, String> {
+    let mut args = args.into_iter().enumerate().map(|(i, arg)| (i + 1, arg));
+    let Some((position, first)) = args.next() else {
+        return Ok(Action::Start(cerulion_wsd::hygiene::default_socket_path()));
+    };
+    match first.to_str() {
         Some("--help") | Some("-h") => Ok(Action::Help),
         Some("--socket") => path_arg("--socket", &mut args).map(Action::Start),
         Some(flag) if flag == cerulion_wsd::daemon::INSPECT_NODE_FLAG => {
             path_arg(flag, &mut args).map(Action::InspectNode)
         }
         Some(arg) => Err(format!("unrecognized argument `{arg}`")),
+        None => Err(not_utf8(position, &first)),
     }
 }
 
 #[cfg(all(test, unix))]
 mod tests {
     use super::{parse_args, Action, USAGE};
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt as _;
+
+    fn raw(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
 
     #[test]
     fn socket_parser_rejects_trailing_arguments() {
         let args = ["--socket", "/tmp/wsd.sock", "--help"]
             .into_iter()
-            .map(str::to_owned);
+            .map(OsString::from);
         assert_eq!(
             parse_args(args)
                 .err()
@@ -281,7 +307,7 @@ mod tests {
 
     #[test]
     fn socket_parser_rejects_option_like_path() {
-        let args = ["--socket", "--help"].into_iter().map(str::to_owned);
+        let args = ["--socket", "--help"].into_iter().map(OsString::from);
         assert_eq!(
             parse_args(args)
                 .err()
@@ -294,7 +320,7 @@ mod tests {
     fn help_flags_ask_for_usage_and_usage_names_every_knob() {
         for flag in ["--help", "-h"] {
             assert!(matches!(
-                parse_args([flag.to_owned()].into_iter()),
+                parse_args([OsString::from(flag)]),
                 Ok(Action::Help)
             ));
         }
@@ -311,11 +337,11 @@ mod tests {
     #[test]
     fn inspect_node_takes_exactly_one_path() {
         assert!(matches!(
-            parse_args(["--inspect-node", "/x/libcam.so"].into_iter().map(str::to_owned)),
+            parse_args(["--inspect-node", "/x/libcam.so"].into_iter().map(OsString::from)),
             Ok(Action::InspectNode(p)) if p == std::path::Path::new("/x/libcam.so")
         ));
         assert_eq!(
-            parse_args(["--inspect-node"].into_iter().map(str::to_owned))
+            parse_args(["--inspect-node"].into_iter().map(OsString::from))
                 .err()
                 .unwrap(),
             "--inspect-node requires a path"
@@ -324,13 +350,51 @@ mod tests {
             parse_args(
                 ["--inspect-node", "/x/a.so", "extra"]
                     .into_iter()
-                    .map(str::to_owned)
+                    .map(OsString::from)
             )
             .err()
             .unwrap(),
             "unexpected argument `extra`"
         );
         assert!(USAGE.contains(cerulion_wsd::daemon::INSPECT_NODE_FLAG));
+    }
+
+    /// A path keeps the bytes it was given, UTF-8 or not, after either flag.
+    #[test]
+    fn a_path_that_is_not_utf8_is_taken_as_given() {
+        let path = raw(b"/x/caf\xE9/lib.so");
+        assert!(matches!(
+            parse_args([raw(b"--inspect-node"), path.clone()]),
+            Ok(Action::InspectNode(p)) if p.as_os_str() == path
+        ));
+        assert!(matches!(
+            parse_args([raw(b"--socket"), path.clone()]),
+            Ok(Action::Start(p)) if p.as_os_str() == path
+        ));
+        assert_eq!(
+            parse_args([raw(b"--socket"), raw(b"-\xFF")]).err().unwrap(),
+            "--socket path cannot start with `-`"
+        );
+    }
+
+    /// Anywhere a path is not taken, an argument that is not valid UTF-8 is
+    /// refused by its position, counted from 1 after the program name.
+    #[test]
+    fn an_arg_that_is_not_utf8_where_no_path_is_taken_is_refused_by_position() {
+        assert_eq!(
+            parse_args([raw(b"\xFFrobot")]).err().unwrap(),
+            "argument 1 is not valid UTF-8: \"\\xFFrobot\""
+        );
+        assert_eq!(
+            parse_args([raw(b"--socket"), raw(b"/tmp/w.sock"), raw(b"x\xE9")])
+                .err()
+                .unwrap(),
+            "argument 3 is not valid UTF-8: \"x\\xE9\""
+        );
+        assert_eq!(
+            parse_args([raw(b"--he\xFClp")]).err().unwrap(),
+            "argument 1 is not valid UTF-8: \"--he\\xFClp\""
+        );
     }
 
     #[test]

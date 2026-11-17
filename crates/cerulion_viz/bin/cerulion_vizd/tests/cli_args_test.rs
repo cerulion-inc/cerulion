@@ -8,6 +8,7 @@
 //! daemon (a bounded wait — a regression that starts the daemon would hang, caught
 //! by the wait timeout).
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -17,6 +18,10 @@ use std::time::{Duration, Instant};
 /// that starts the daemon would block forever, so we SIGKILL past the bound and
 /// report a sentinel exit code that fails the assert loudly.
 fn run_vizd(args: &[&str]) -> (i32, String, String) {
+    run_vizd_os(&args.iter().map(OsString::from).collect::<Vec<_>>())
+}
+
+fn run_vizd_os(args: &[OsString]) -> (i32, String, String) {
     let bin = env!("CARGO_BIN_EXE_cerulion-vizd");
     let mut child = Command::new(bin)
         .args(args)
@@ -83,4 +88,26 @@ fn an_unknown_arg_exits_nonzero_with_usage_on_stderr() {
         stderr.contains("unrecognized argument") && stderr.contains("--bogus-flag"),
         "an unknown arg names the offender + prints usage to stderr:\n{stderr}"
     );
+}
+
+/// An argument that is not valid UTF-8 is refused with its position and bytes,
+/// a blank line and the usage on stderr, exit 2, and no panic.
+#[test]
+fn an_argument_that_is_not_utf8_is_refused_with_its_position_and_the_usage() {
+    use std::os::unix::ffi::OsStringExt as _;
+    let (code, stdout, stderr) = run_vizd_os(&[OsString::from_vec(b"\xFFrobot".to_vec())]);
+    assert!(!stderr.contains("panicked at"), "a panic:\n{stderr}");
+    assert_eq!(code, 2, "stderr:\n{stderr}");
+    let (line, usage) = stderr
+        .split_once("\n\n")
+        .expect("the refusal line, a blank line, then the usage");
+    assert_eq!(
+        line,
+        "cerulion-vizd: argument 1 is not valid UTF-8: \"\\xFFrobot\""
+    );
+    assert!(
+        usage.starts_with("cerulion-vizd ") && usage.contains("USAGE:"),
+        "the usage follows the blank line:\n{stderr}"
+    );
+    assert!(stdout.is_empty(), "nothing on stdout:\n{stdout}");
 }
