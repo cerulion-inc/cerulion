@@ -11239,7 +11239,7 @@ enum FrameIndexCensus {
     /// Every topic's index, within the budget.
     Indexed(BTreeMap<String, TopicFrameIndex>),
     /// The topics hold more recorded frames with a wire header than the
-    /// budget; nothing is indexed, and every such frame is counted.
+    /// budget: no index is returned, and every such frame is counted.
     OverBudget(FrameIndexOverrun),
 }
 
@@ -12434,11 +12434,11 @@ enum VerifierDecline {
     /// The bag's rank manifests carry no readable input tables, so no read
     /// record can be resolved to a `(node, input)` at all.
     InputTables,
-    /// This rank's recorded read log is larger than the record budget, by
-    /// the count the census took past it.
+    /// This rank's recorded read log is larger than the record budget,
+    /// carrying the count the census took past it.
     ReadLogBudget(ReadLogOverrun),
-    /// This rank consumes more recorded frames than the record budget, by the
-    /// count the frame index took past it.
+    /// This rank consumes more recorded frames than the record budget,
+    /// carrying the count the frame index took past it.
     FrameIndexBudget(FrameIndexOverrun),
     /// The per-step accumulation blew the budget MID-PASS (fires + reads).
     ScheduleBudget,
@@ -12540,8 +12540,8 @@ impl VerifierDecline {
     /// memory, so a recording that holds less is what fits. `None` for a cause
     /// in the recording's manifest, whose refusal names a re-record instead.
     ///
-    /// The schedule budget never refuses (it declines mid-pass, with a note),
-    /// so its sentence is never printed; it is the true remedy all the same.
+    /// The schedule budget declines mid-pass with a note and refuses nothing,
+    /// so no refusal prints its remedy.
     fn remedy(self) -> Option<&'static str> {
         match self {
             Self::ReadLogBudget(_) => Some(

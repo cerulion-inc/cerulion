@@ -33141,9 +33141,11 @@ fn a_verify_one_read_over_the_read_log_budget_is_refused_naming_both_numbers() {
 /// it, so its pass gates that topic over the read log, and a census over the
 /// budget leaves the gate nothing to be built from. The refusal ends with the
 /// budget's remedy, not the re-record sentence, which would give the same
-/// overrun again. CONTROL: at the shipped budget the same resim runs.
+/// overrun again, and the decline's WARN line carries the reads and the budget
+/// as fields. CONTROL: at the shipped budget the same resim runs.
 #[test]
 #[serial]
+#[tracing_test::traced_test]
 fn a_neutral_resim_of_a_rank_that_reads_its_own_topic_names_the_budget_and_a_shorter_recording() {
     let dir = tempfile::tempdir().unwrap();
     let bag = ls_never_failing_bag(&dir, "ls_resim_over.mcap");
@@ -33188,15 +33190,21 @@ fn a_neutral_resim_of_a_rank_that_reads_its_own_topic_names_the_budget_and_a_sho
         !detail.contains("Re-record the bag with this binary"),
         "a re-record gives the same overrun: {detail}"
     );
+    assert!(
+        logs_contain("cause=\"verifier_declined_read_log_budget\" reads=26 budget=25"),
+        "the census decline's WARN names the reads and the budget as fields"
+    );
 }
 
 /// **A `--verify` one frame over the frame-index budget is refused at its
 /// pass, naming the frames and the budget.** Rank 0 consumes the counter's 12
 /// recorded frames ([`LS_FRAMES`]), so a budget of 11 is one short. The frames
-/// carry their producers' stamps, so the refusal names no time. CONTROL: exactly
-/// at the budget (12) the replay verifies.
+/// carry their producers' stamps, so the refusal names no time, and the WARN
+/// line carries the frames and the budget as fields. CONTROL: exactly at the
+/// budget (12) the replay verifies.
 #[test]
 #[serial]
+#[tracing_test::traced_test]
 fn a_verify_one_frame_over_the_frame_index_budget_is_refused_naming_both_numbers() {
     let dir = tempfile::tempdir().unwrap();
     let bag = ls_never_failing_bag(&dir, "ls_frame_budget.mcap");
@@ -33222,6 +33230,10 @@ fn a_verify_one_frame_over_the_frame_index_budget_is_refused_naming_both_numbers
          it consumes 12 recorded frames, more than the verifier's budget of 11 frames per rank. \
          A verifying replay holds the frames each rank consumes in memory up to this budget, so \
          verify a shorter recording of this graph"
+    );
+    assert!(
+        logs_contain("rank=0 frames=12 budget=11"),
+        "the frame-index decline's WARN names the frames and the budget as fields"
     );
 }
 
