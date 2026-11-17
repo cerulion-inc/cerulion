@@ -988,9 +988,9 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   a stolen desk. Session refreshes are serialized across processes by an
   exclusive lock beside `auth.json` (`.auth-refresh.lock`): a refresh token is
   single-use, and the loser of a race uses the session the winner wrote.
-  netd's shutdown sends the worker SIGTERM as it begins
-  (`EpochSync::signal_stop`, before the robot server stops), and the stop grace
-  runs from that signal. The worker's handler only sets the `stopping` flag
+  netd's shutdown, and the teardown before a robot server restart, send the
+  worker SIGTERM as they begin (`EpochSync::signal_stop`, before the robot
+  server stops), and the stop grace runs from that signal. The worker's handler only sets the `stopping` flag
   `robot_bootstrap::sync_epoch` takes, after which it starts no session
   fallback, refresh (`login_cmd::refresh_session_if_stale_unless_stopping`
   reads the flag before the refresh lock and again before the exchange) or

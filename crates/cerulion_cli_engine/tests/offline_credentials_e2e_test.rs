@@ -1175,7 +1175,7 @@ fn a_sync_told_to_stop_tries_no_login_session_after_its_robot_proof_fails() {
 
 #[test]
 #[serial]
-fn a_sync_told_to_stop_during_its_fetch_starts_no_certificate_renewal() {
+fn a_sync_told_to_stop_starts_no_certificate_renewal_after_its_fetch() {
     let desk = desk();
     let (root, _robot_id, revoked) = registered_robot(&desk);
     let before = desk.cert_text();

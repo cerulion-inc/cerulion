@@ -1097,6 +1097,15 @@ pub(crate) fn refresh_session_if_stale_unless_stopping(
     )
 }
 
+/// The refusal of a refresh that a stop kept from sending its exchange.
+const STOP_REFUSAL: &str = "the session was not refreshed: this process is stopping";
+
+/// Whether `error` is the refusal of a refresh a stop kept from sending its
+/// exchange ([`refresh_session_if_stale_unless_stopping`]).
+pub(crate) fn is_stop_refusal(error: &CliError) -> bool {
+    matches!(error, CliError::Login(message) if message == STOP_REFUSAL)
+}
+
 // A successful exchange has consumed the old refresh token. Publication (or
 // retirement after a concurrent sign-out) must not inherit an exhausted HTTP
 // budget and discard the only replacement pair before a briefly busy store clears.
@@ -1136,9 +1145,7 @@ fn refresh_session_with_settlement(
 ) -> CliResult<Option<AuthState>> {
     let stop_requested = || -> CliResult<()> {
         match stopping {
-            Some(stopping) if stopping() => Err(CliError::Login(
-                "the session was not refreshed: this process is stopping".into(),
-            )),
+            Some(stopping) if stopping() => Err(CliError::Login(STOP_REFUSAL.into())),
             _ => Ok(()),
         }
     };
@@ -2068,6 +2075,15 @@ mod tests {
         let reads = std::cell::Cell::new(0);
         let lands_after_the_lock = || {
             reads.set(reads.get() + 1);
+            if reads.get() == 2 {
+                // The second read runs with the refresh lock held.
+                let held = std::thread::scope(|s| {
+                    s.spawn(|| auth::hold_refresh_lock_within(&path, Duration::ZERO).is_err())
+                        .join()
+                        .unwrap()
+                });
+                assert!(held, "the second read runs under the refresh lock");
+            }
             reads.get() > 1
         };
         let error = refresh_session_with_settlement(

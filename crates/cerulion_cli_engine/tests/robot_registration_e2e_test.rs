@@ -992,7 +992,9 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
 }
 
 /// A pass-through proxy to `upstream` that holds its first connection until
-/// `release` is sent: `arrived` fires once that connection is accepted.
+/// `release` is sent, then answers that connection's request with a bare 404;
+/// `arrived` fires once the connection is accepted. Later connections pass
+/// through.
 #[cfg(unix)]
 fn start_holding_proxy(
     upstream: u16,
@@ -1023,11 +1025,31 @@ fn start_holding_proxy(
         };
         let mut first = true;
         for client in listener.incoming() {
-            let Ok(client) = client else { continue };
+            let Ok(mut client) = client else { continue };
             if first {
                 first = false;
                 let _ = arrived_tx.send(());
                 let _ = release_rx.recv();
+                // Read the request head and body, then answer 404.
+                use std::io::{BufRead, BufReader, Read, Write};
+                let mut reader = BufReader::new(client.try_clone().unwrap());
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let _ = client.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = client.shutdown(Shutdown::Both);
+                continue;
             }
             pipe(client);
         }
@@ -1036,12 +1058,14 @@ fn start_holding_proxy(
 }
 
 /// netd's stop signal reaches the real `cerulion robot-sync-epoch` while its
-/// first robot-proof request is in flight: the worker keeps running through
-/// it, finishes its fetch and exits successfully.
+/// first robot-proof request is in flight: the worker keeps running through it,
+/// and when that request then answers 404 it does not fall back to its stale
+/// login session: it refreshes nothing, says it was told to stop, and exits
+/// with a failure, not by the signal.
 #[cfg(unix)]
 #[test]
 #[serial]
-fn the_revocation_sync_finishes_its_fetch_through_netds_stop_signal() {
+fn the_revocation_sync_outlives_netds_stop_signal_and_then_refreshes_nothing() {
     use cerulion_cli_engine::robot_bootstrap;
     use std::os::unix::fs::DirBuilderExt;
     use std::os::unix::process::ExitStatusExt;
@@ -1056,13 +1080,18 @@ fn the_revocation_sync_finishes_its_fetch_through_netds_stop_signal() {
         &format!("http://127.0.0.1:{port}"),
     );
     let _home = EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap());
-    let _state = login(port, &email);
+    let state = login(port, &email);
     let root = home_path.join("robot-state");
     robot_bootstrap::prepare(&root).unwrap();
     std::fs::DirBuilder::new()
         .mode(0o700)
         .create(root.join("remoted"))
         .unwrap();
+    // A stale session with a live refresh token: a fallback would refresh it.
+    let auth_path = home_path.join("auth.json");
+    let mut stale = state.clone();
+    stale.expires_at_ns = 1;
+    cerulion_cli_engine::auth::write_to(&auth_path, &stale).unwrap();
 
     let (proxy, arrived, release) = start_holding_proxy(port);
     let mut worker = ProcessGuard(
@@ -1115,6 +1144,17 @@ fn the_revocation_sync_finishes_its_fetch_through_netds_stop_signal() {
         .read_to_string(&mut stderr)
         .unwrap();
     assert_eq!(status.signal(), None, "{stderr}");
-    assert!(status.success(), "{stderr}");
-    assert_eq!(stdout, "{\"epoch\":null,\"version\":1}\n");
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the revocation sync was told to stop"),
+        "{stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(
+        cerulion_cli_engine::auth::load_from(&auth_path)
+            .state()
+            .unwrap(),
+        &stale,
+        "no refresh spent the stored token"
+    );
 }

@@ -272,7 +272,7 @@ fn fetch_access_by_session(
         return Err(told_to_stop());
     }
     let token = account_cmd::require_session_unrenewed(Some(stopping)).map_err(|e| {
-        if is_stopping(stopping) {
+        if login_cmd::is_stop_refusal(&e) {
             told_to_stop()
         } else {
             e

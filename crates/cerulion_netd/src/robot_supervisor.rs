@@ -481,15 +481,16 @@ fn epoch_sync_period_from_env() -> Duration {
     resolve_epoch_sync_period(std::env::var(EPOCH_SYNC_PERIOD_ENV).ok().as_deref())
 }
 
-/// The environment variable setting how long a netd shutdown waits for a
-/// running revocation fetch to finish before stopping it, in whole seconds from
-/// 5 to 120, counted from the SIGTERM the stop sends the fetch as it begins,
-/// after which the fetch starts no session refresh or certificate renewal. A
-/// longer wait lets a session refresh in flight publish its rotated token pair;
-/// it also lengthens a shutdown that lands during a fetch.
-/// A shutdown with no fetch running, or with one that ends sooner, does not
-/// wait. The robot server is stopped before this wait, and netd's hard-exit
-/// deadline (`CERULION_NETD_HARD_EXIT_MS`) is extended by this grace.
+/// The environment variable setting how long a netd shutdown (or the teardown
+/// before a robot server restart) waits for a running revocation fetch to finish
+/// before stopping it, in whole seconds from 5 to 120, counted from the SIGTERM
+/// the teardown sends the fetch as it begins, after which the fetch starts no
+/// session refresh or certificate renewal. A longer wait lets a session refresh
+/// in flight publish its rotated token pair; it also lengthens a shutdown that
+/// lands during a fetch. A shutdown with no fetch running, or with one that ends
+/// sooner, does not wait. The wait overlaps the robot server's own stop; a fetch
+/// still running once both have ended is stopped. netd's hard-exit deadline
+/// (`CERULION_NETD_HARD_EXIT_MS`) is extended by this grace.
 pub const EPOCH_SYNC_STOP_GRACE_ENV: &str = "CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S";
 /// What the stop grace adds to one account HTTP exchange: the worker's local
 /// publication of the refreshed pair and its own exit after the exchange.
@@ -689,7 +690,7 @@ impl EpochSync {
         let Some((mut child, _)) = self.child.take() else {
             return;
         };
-        let until = self.stop_signalled.unwrap_or_else(Instant::now) + self.stop_grace;
+        let until = self.stop_signalled.take().unwrap_or_else(Instant::now) + self.stop_grace;
         while Instant::now() < until {
             if !matches!(child.0.try_wait(), Ok(None)) {
                 return;

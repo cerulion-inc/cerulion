@@ -489,11 +489,20 @@ pub fn require_session() -> CliResult<String> {
 pub(crate) fn require_session_unrenewed(
     stopping: Option<&std::sync::atomic::AtomicBool>,
 ) -> CliResult<String> {
-    // Best-effort refresh if the session is stale (never fatal on its own).
-    let _ = match stopping {
-        Some(stopping) => login_cmd::refresh_session_if_stale_unless_stopping(None, stopping),
-        None => login_cmd::refresh_session_if_stale(),
-    };
+    // Best-effort refresh if the session is stale (never fatal on its own),
+    // except that a refresh a stop kept from sending is returned as such.
+    match stopping {
+        Some(stopping) => {
+            if let Err(e) = login_cmd::refresh_session_if_stale_unless_stopping(None, stopping) {
+                if login_cmd::is_stop_refusal(&e) {
+                    return Err(e);
+                }
+            }
+        }
+        None => {
+            let _ = login_cmd::refresh_session_if_stale();
+        }
+    }
     let loaded = crate::auth::load();
     let now = now_ns();
     match loaded.state() {
