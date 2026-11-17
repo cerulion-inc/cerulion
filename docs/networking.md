@@ -442,7 +442,8 @@ serialized plan + the run's iceoryx2 namespace.
   equal `next` minus `after`. A full page may have more waiting, so the desk
   asks again; that ask can come back empty. A lost sequence takes no row, so
   a shorter page reached the newest fire. The other
-  outcomes are `unknown_run` (the robot hosts no such run: ask `runs` again),
+  outcomes are `unknown_run` (the robot hosts no such run, or the run is
+  local-only and `runs` hides it: ask `runs` again),
   `not_served` (the run records no fires) and `refused` (the access gate that
   also guards `runs`; nothing is read and no lease is armed). The
   key space is DISTINCT from

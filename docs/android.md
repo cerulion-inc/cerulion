@@ -895,7 +895,9 @@ such a start describes no run and logs a warning.
 Under `open`, any host that reaches the gateway can read the graph YAML, the
 `run.json` and the node ticks, and can turn the recording on. Like the
 catalog, the description names topics that `egress` keeps on the device.
-Under `paired` both requests are refused and the recording stays off.
+Under `paired` the LAN gateway refuses both requests and the recording
+stays off. The paired remote plane, when the app hosts it, serves the
+catalog, schemas and topics but not `runs` or `fires`.
 `stop` withdraws the run and closes LAN access, so a desk's `runs` and
 `fires` requests are then refused. After another `open` start, the old run
 is no longer listed and a `fires` request for its id is answered

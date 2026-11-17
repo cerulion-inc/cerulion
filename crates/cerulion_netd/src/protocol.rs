@@ -575,8 +575,8 @@ impl Request {
             // so the gate here IS the capability negotiation, and it deliberately
             // leaves every OTHER verb's minimum untouched.
             Request::QueryRuns { .. } => RUNS_MIN_DAEMON_VERSION,
-            // Not in the account-route arm above: that arm answers 9, and a v9
-            // daemon has no `query_fires` handler.
+            // Not in the account-route arm above: that arm answers 9, and a
+            // daemon older than v12 has no `query_fires` handler.
             Request::QueryFires { .. } => FIRES_MIN_DAEMON_VERSION,
             // The catalog/schema query verbs need a v3 daemon.
             Request::QueryCatalog { .. } | Request::QuerySchema { .. } => 3,
@@ -2554,7 +2554,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fires_verb_needs_a_v10_daemon_and_leaves_its_siblings_alone() {
+    fn the_fires_verb_needs_a_v12_daemon_and_leaves_its_siblings_alone() {
         let fires = Request::QueryFires {
             id: 1,
             robot: "temi".to_string(),
@@ -2567,8 +2567,8 @@ mod tests {
         assert_eq!(fires.min_daemon_version(), FIRES_MIN_DAEMON_VERSION);
         const { assert!(PROTOCOL_VERSION >= FIRES_MIN_DAEMON_VERSION) };
 
-        // An account route stays a v10 request: the account arm answers 9, and a
-        // v9 daemon has no handler for this verb.
+        // An account route stays a v12 request: the account arm answers 9, and a
+        // daemon older than v12 has no handler for this verb.
         let account = Request::QueryFires {
             id: 2,
             robot: format!(
@@ -2579,7 +2579,7 @@ mod tests {
             run_id: FIRES_RUN.to_string(),
             after: Some(4),
         };
-        assert_eq!(account.min_daemon_version(), 10);
+        assert_eq!(account.min_daemon_version(), 12);
 
         assert_eq!(
             Request::QueryRuns { id: 3, robot: None }.min_daemon_version(),
@@ -2763,6 +2763,33 @@ mod tests {
             serde_json::from_str::<Response>(&error.to_json_line()).expect("decodes"),
             error
         );
+        let observed = Response::Observed(ObserveResponse {
+            demand: DemandResponse {
+                id: 11,
+                robot: "temi".into(),
+                topic: "/fires/out".into(),
+                refcount: 1,
+                mirror_created: true,
+            },
+            local_topic: "/temi/fires/out".into(),
+        });
+        assert_eq!(
+            serde_json::from_str::<Response>(&observed.to_json_line()).expect("decodes"),
+            observed
+        );
+        // A mirror-loss push carries no `id`: it is classified as the push, and
+        // no response, the fires answer included, decodes from it.
+        let lost = MirrorLost {
+            event: "mirror_lost".into(),
+            robot: "temi".into(),
+            topic: "/fires/out".into(),
+        };
+        let lost_line = lost.to_json_line();
+        assert_eq!(
+            classify_control_line(&lost_line),
+            ControlLine::MirrorLost(lost)
+        );
+        assert!(serde_json::from_str::<Response>(&lost_line).is_err());
         // An answer of a kind this binary does not know is a decode error, not
         // a silently different answer.
         assert!(serde_json::from_str::<Response>(r#"{"id":8,"answer":{"kind":"later"}}"#).is_err());
