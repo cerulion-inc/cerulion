@@ -1822,6 +1822,58 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
     );
 }
 
+/// `--check` finds the pinned file in a listing far longer than a pipe holds.
+///
+/// The pinned name is the listing's FIRST line and the listing runs to several
+/// hundred kilobytes, so a membership test that pipes the listing into `grep -q`
+/// has grep exit on line one while the writer still holds most of the listing:
+/// the writer takes SIGPIPE, and under `pipefail` the file reads as absent. A
+/// tests directory of generated empty files builds that listing on every run,
+/// where the real listing of a few kilobytes loses the race only now and then.
+#[cfg(unix)]
+#[test]
+fn the_shard_check_finds_the_pinned_file_in_a_listing_longer_than_a_pipe_holds() {
+    let script = repo_root().join("tools/scripts/ci_test_shard.sh");
+    let package = tempfile::tempdir().expect("a package directory");
+    let tests = package.path().join("tests");
+    std::fs::create_dir(&tests).expect("the package's tests directory");
+    std::fs::write(tests.join("macro_compile_fail_test.rs"), "").expect("the pinned file");
+    // 4000 names of 207 bytes that all sort after the pinned one: about 830 KB.
+    let pad = "x".repeat(200);
+    for i in 0..4000 {
+        std::fs::write(tests.join(format!("z_{pad}_{i:04}.rs")), "").expect("a test file");
+    }
+
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .args(["--check", "cerulion_core", "4"])
+        .arg(package.path())
+        .current_dir(repo_root())
+        .output()
+        .expect("running tools/scripts/ci_test_shard.sh --check on the generated package");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "--check refused a package whose pinned file is on disk.\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The 4000 others round robin to 1000 a shard, and the pinned file joins shard 2.
+    for line in [
+        "shard 0/4: 1000 test file(s)",
+        "shard 1/4: 1000 test file(s)",
+        "shard 2/4: 1001 test file(s)",
+        "shard 3/4: 1000 test file(s)",
+        "pinned: macro_compile_fail_test -> shard 2/4",
+    ] {
+        assert!(
+            stdout.lines().any(|l| l.starts_with(line)),
+            "the --check output lacks a line starting {line:?}; got:\n{stdout}"
+        );
+    }
+}
+
 /// Split a command tail into arguments, treating a whole `${{ ... }}`
 /// expression as ONE argument.
 ///
