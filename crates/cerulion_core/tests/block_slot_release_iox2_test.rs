@@ -45,7 +45,8 @@
 //!   consumer that stops for good still has its slot released;
 //! - a consumer node that stops with a fatal error has its slot released;
 //! - a consumer node restored stopped before the first step has its slot
-//!   released with no release counted, and its producer is never held;
+//!   released with no release counted, so that consumer never holds its
+//!   producer, while another consumer of the same topic keeps its own slot;
 //! - a node library `block` consumer whose tick panics keeps its slot: on one
 //!   frame, every other frame reaches downstream in order and the producer
 //!   stays paced; on every frame, the producer is paced, never held;
