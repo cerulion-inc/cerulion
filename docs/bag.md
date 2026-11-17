@@ -1294,6 +1294,25 @@ the bag's frames are walked (exit 2, `read_identity_feed_index_budget`), naming
 the bytes the reads need, the frame identities and labels they are charged for,
 the budget and the flag.
 
+A verifying replay also holds in memory, for each rank (one process or executor
+unit of the recording), the rank's reads, a folded record of N identical reads
+counting N, and the recorded frames with a wire header on the topics the rank
+consumes, up to the verifier's budget of 200000 of each. Both cover the whole
+recording, whatever `--duration` bounds. A recording over either is refused
+before the rank's first step (exit 2), over the reads with
+`read_identity_unplanned` and over the frames with `read_log_budget_declined`.
+The refusal names how many reads or frames the rank holds and the budget. A read
+refusal also names the step of the first read past the budget and that step's
+time into the rank's recording, counted from the rank's first step in the bag,
+so on a bag that begins mid-run it is time into the bag, not into the run. The
+remedy it names is a shorter recording: the longest that fits is about the
+budget divided by the rank's reads per second, or by the frames per second on
+the topics it consumes, whichever is reached first. A resim without `--verify`
+refuses only a rank that reads a topic it also produces, such as a
+`process_groups:` group holding a producer and its consumer, the same way with
+`read_log_budget_declined`; any other rank over a budget runs, with a warning
+that names the count.
+
 What cannot be fed is refused by name before the first step (exit 2), with the
 node, the input, the writer and the sequence:
 
@@ -1516,3 +1535,4 @@ holding those `.msg` files, or point `DDS_BRIDGE_CONFIG` at a config whose
 | **With discovery OFF** (which is `cerulion bag record` always, and any recorder run under `CERULION_RECORD_DISCOVERY=off`), a topic that appears mid-recording is neither recorded NOR named | `bag record` sets `discover_live = false` (it owns its own selection policy), and that flag short-circuits discovery entirely, so nothing is watching for the topic and there is nothing to write into `untapped` either. The bag records `enumerated: false`, which is the accurate form of "nobody looked", but it cannot name what it did not look for | Nothing widens a window that is not open. Re-run the capture with the producer already live, or use `graph run --record` (where discovery is on) if you need the recorder to pick up producers that register after it arms. `--discovery-settle-ms` is **inert** here: the hold is released immediately when discovery is off |
 | A non-finalized bag cannot be played | The zero-copy frame walk needs the summary footer | None: only a finalized bag is playable |
 | A type NEITHER this machine NOR the bag defines still renders nothing | Nothing anywhere knows it: the bag can only carry what its recording machine could resolve | Re-record from a workspace that holds the `.msg` files |
+| A `--verify` holds each rank's reads and the recorded frames it consumes in memory, up to 200000 of each, so a longer recording is refused (exit 2) before its first step | The replay plans every read's feed from the whole recording before the first step, so it holds both whole; `--duration` shortens neither | Verify a shorter recording. The refusal names the count, the budget and, for the reads, the step and time at which the rank ran past it; the longest recording that fits is about the budget divided by the rank's reads, or consumed frames, per second |
