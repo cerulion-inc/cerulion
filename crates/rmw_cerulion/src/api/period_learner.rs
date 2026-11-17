@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! Per-topic arrival period learner for the period-learned park (feature `period-park`).
+//! Per-topic arrival period learner for the period-learned park (cfg `cerulion_period_park`: every Linux aarch64
+//! build, and any other build with the `period-park` feature).
 //!
 //! Pure and integer-only: the same arrival sequence always yields the same state, with no clock reads.
 //! A topic is REGULAR only after `REGULAR_AFTER` consecutive in-range gaps whose smoothed deviation is at most one eighth of the smoothed period and at most a quarter of [`MAX_WINDOW_NS`]. Any other topic has no prediction and keeps the stock park behaviour.
