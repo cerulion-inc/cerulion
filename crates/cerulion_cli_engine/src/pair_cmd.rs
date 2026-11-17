@@ -610,9 +610,10 @@ impl Drop for OutcomeDir {
 /// Whether the outcome file at `path` reports an end where the robot may have
 /// paired this desk without confirming it: only the exact bytes
 /// [`OUTCOME_UNCONFIRMED`] do. A missing file is a plain end. An unreadable
-/// file, or one with any other content, is a plain end too, logged at warn,
-/// so nothing but the helper's own token makes the closing line say the robot
-/// may have paired. At most one byte past the token is read.
+/// file, or one with any other content, is a plain end too and fails quiet
+/// (a debug line only), so nothing but the helper's own token makes the
+/// closing line say the robot may have paired. At most one byte past the
+/// token is read.
 fn read_outcome(path: &Path) -> bool {
     let mut held = Vec::new();
     let read = std::fs::File::open(path).and_then(|file| {
@@ -622,7 +623,7 @@ fn read_outcome(path: &Path) -> bool {
     match read {
         Ok(_) if held == OUTCOME_UNCONFIRMED.as_bytes() => true,
         Ok(_) => {
-            tracing::warn!(
+            tracing::debug!(
                 path = %path.display(),
                 size_bytes = held.len(),
                 "cerulion pair: the helper's outcome file does not hold its token; closing as a \
@@ -632,7 +633,7 @@ fn read_outcome(path: &Path) -> bool {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
         Err(e) => {
-            tracing::warn!(
+            tracing::debug!(
                 error = %e,
                 path = %path.display(),
                 "cerulion pair: could not read the helper's outcome file; closing as a plain end"
