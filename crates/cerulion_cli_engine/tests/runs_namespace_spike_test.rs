@@ -445,7 +445,6 @@ fn a_production_minted_run_record_is_gatherable_by_a_netd_shaped_host() {
             gating: cerulion_cli_engine::run_dir::GatingClock::Wall,
             graph_yaml: "name: prod\nprefix: prod\nnodes: []\n".to_string(),
             env_json: b"{}".to_vec(),
-            recorder_json: b"{}".to_vec(),
         },
     )
     .expect("the production run-descriptor path");

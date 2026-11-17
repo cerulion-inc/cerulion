@@ -73,10 +73,12 @@ fn sync_graph(fires: Arc<AtomicU64>) -> (GraphConfig, IndexMap<String, Box<dyn N
                 InputDef {
                     name: "a".to_string(),
                     source: TOPIC_A.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "b".to_string(),
                     source: TOPIC_B.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],
@@ -409,14 +411,17 @@ fn ctx_graph(entry: Box<dyn NodeEntry>) -> (GraphConfig, IndexMap<String, Box<dy
                 InputDef {
                     name: "cam".to_string(),
                     source: TOPIC_CAM.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "lidar".to_string(),
                     source: TOPIC_LIDAR.to_string(),
+                    ..Default::default()
                 },
                 InputDef {
                     name: "config".to_string(),
                     source: TOPIC_CONFIG.to_string(),
+                    ..Default::default()
                 },
             ],
             outputs: vec![],

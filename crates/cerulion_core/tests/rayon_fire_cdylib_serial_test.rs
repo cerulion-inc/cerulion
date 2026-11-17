@@ -185,6 +185,7 @@ fn run_cdylib_mixed_trace(prefix: &str, threads: &str, steps: u32) -> Vec<TraceE
         inputs: vec![InputDef {
             name: "inp".to_string(),
             source: "feeder/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![OutputDef {
             name: "out".to_string(),
