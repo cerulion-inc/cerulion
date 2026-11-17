@@ -318,13 +318,15 @@ fn the_epoch_sync_period_is_read_from_the_environment() {
 }
 
 /// A stand-in worker: appends one line to `log` per run, exits with `code`.
+/// A scripted worker that, like the real one, keeps running through netd's
+/// stop signal, records its arguments and exits with `code`.
 fn fake_worker(dir: &Path, code: i32) -> (PathBuf, PathBuf) {
     let log = dir.join("runs.log");
     let script = dir.join("cerulion");
     install_script(
         &script,
         &format!(
-            "#!/bin/sh\necho \"$@\" >> '{}'\nexit {code}\n",
+            "#!/bin/sh\ntrap '' TERM\necho \"$@\" >> '{}'\nexit {code}\n",
             log.display()
         ),
     );
@@ -465,12 +467,7 @@ fn a_stop_signals_the_running_revocation_sync_and_returns_once_it_exits() {
     );
     sync.poll(t0);
     assert!(sync.child.is_some());
-    let until = Instant::now() + Duration::from_secs(10);
-    while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("ready"))
-        && Instant::now() < until
-    {
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    wait_until(|| std::fs::read_to_string(&log).is_ok_and(|text| text.contains("ready")));
     let stopping = Instant::now();
     sync.stop();
     assert_eq!(
@@ -548,17 +545,31 @@ fn the_configured_epoch_sync_period_is_honoured() {
 }
 
 /// A stand-in worker that sleeps `secs`, then appends one line to `log`.
+/// A scripted worker that, like the real one, keeps running through netd's
+/// stop signal: it marks `started` in `dir` once it ignores the signal, works
+/// for `secs` and then records its arguments.
 fn slow_worker(dir: &Path, secs: u32) -> (PathBuf, PathBuf) {
     let log = dir.join("runs.log");
     let script = dir.join("cerulion");
     install_script(
         &script,
         &format!(
-            "#!/bin/sh\nsleep {secs}\necho \"$@\" >> '{}'\nexit 0\n",
+            "#!/bin/sh\ntrap '' TERM\n: > '{}'\nsleep {secs}\necho \"$@\" >> '{}'\nexit 0\n",
+            dir.join("started").display(),
             log.display()
         ),
     );
     (script, log)
+}
+
+/// Wait, for at most ten seconds, until `ready` says the scripted worker can
+/// take netd's stop signal.
+fn wait_until(ready: impl Fn() -> bool) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while !ready() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready(), "the scripted worker started");
 }
 
 #[test]
@@ -593,6 +604,7 @@ fn stop_waits_for_a_fetch_still_running_after_five_seconds() {
     );
     sync.poll(t0);
     assert!(sync.child.is_some());
+    wait_until(|| dir.path().join("started").exists());
     let started = Instant::now();
     sync.stop();
     let waited = started.elapsed();
@@ -652,6 +664,7 @@ fn stop_returns_once_the_worker_exits_and_at_once_with_none_running() {
     );
     sync.poll(t0);
     assert!(sync.child.is_some());
+    wait_until(|| runs(&log) == 1);
     let started = Instant::now();
     sync.stop();
     assert!(
