@@ -28,7 +28,8 @@
 //! 5. otherwise a not-found error.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
@@ -491,20 +492,168 @@ fn write_string_atomically(path: &std::path::Path, content: &str) -> Result<(), 
 /// signal), and on a successful pairing (exit 0) pin `name → eid` into
 /// `robots.toml`. Returns the child's exit code (the pairing outcome contract).
 ///
+/// The helper is passed the hidden `--outcome-file <path>`, a path in a
+/// private directory this run creates under the system temp directory
+/// (`OutcomeDir`). The helper writes its `unconfirmed` token there on the two
+/// ends where the robot may have paired this desk without confirming it; the
+/// file is read once the helper exits (`read_outcome`) and the directory is
+/// removed on every way out of this function.
+///
 /// A `robots.toml` pin failure is NON-fatal: the pairing already succeeded (the
 /// robot trusts the desk), so it is a loud `warn!` with the `--eid` fallback, not
 /// a changed exit code.
 pub fn spawn_and_pair(plan: &PairPlan, running: Arc<AtomicBool>) -> CliResult<i32> {
+    spawn_and_pair_in(plan, running, &std::env::temp_dir(), &pin_robot)
+}
+
+/// [`spawn_and_pair`] over an INJECTED temp base and pin: the production form
+/// passes `std::env::temp_dir()` and [`pin_robot`], the tests a temporary
+/// directory of their own and a spy, so a scripted helper never touches the
+/// real `~/.cerulion`.
+fn spawn_and_pair_in(
+    plan: &PairPlan,
+    running: Arc<AtomicBool>,
+    temp_base: &Path,
+    pin: &dyn Fn(&str, &str) -> Result<(), String>,
+) -> CliResult<i32> {
+    // The guard removes the directory, and the file the helper wrote in it, on
+    // every way out: the return below, the `?` on a failed spawn and a panic
+    // unwind. Without a directory the run goes ahead with no outcome file, and
+    // every nonzero end closes with the plain line.
+    let outcome = match OutcomeDir::create(temp_base) {
+        Ok(dir) => Some(dir),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %temp_base.display(),
+                "cerulion pair: could not create a private directory for the helper's outcome \
+                 file; the closing line cannot tell an unconfirmed end from a plain one"
+            );
+            None
+        }
+    };
+    let mut argv = plan.argv.clone();
+    if let Some(dir) = &outcome {
+        argv.push("--outcome-file".to_string());
+        argv.push(dir.file().display().to_string());
+    }
     // Reuse the connect spawner's battle-tested inherit-stdio + signal-forward +
     // reap loop — the plan shape (bin + argv) is identical.
     let connect_plan = crate::connect_cmd::ConnectPlan {
         bin: plan.bin.clone(),
-        argv: plan.argv.clone(),
+        argv,
     };
     let code = crate::connect_cmd::spawn_and_wait(&connect_plan, running)?;
-    finalize_pairing(code, plan.name.as_deref(), &plan.eid, &pin_robot);
+    let unconfirmed = outcome
+        .as_ref()
+        .is_some_and(|dir| read_outcome(&dir.file()));
+    drop(outcome);
+    finalize_pairing(code, unconfirmed, plan.name.as_deref(), &plan.eid, pin);
     Ok(code)
 }
+
+/// The token the helper writes to its `--outcome-file` on an end where the
+/// robot may have paired this desk without confirming it: exactly these
+/// bytes, which `cerulion-connectd pair` defines too.
+const OUTCOME_UNCONFIRMED: &str = "unconfirmed\n";
+
+/// The name of the outcome file inside its [`OutcomeDir`].
+const OUTCOME_FILE_NAME: &str = "outcome";
+
+/// The private directory one `cerulion pair` run creates for the outcome file
+/// its helper writes. Dropping it removes the directory and everything in it,
+/// so every exit path out of [`spawn_and_pair_in`], an error return and a
+/// panic unwind included, cleans it up.
+#[derive(Debug)]
+struct OutcomeDir {
+    dir: PathBuf,
+}
+
+impl OutcomeDir {
+    /// Create a new directory under `base` named `cerulion-pair-` and 32
+    /// random hex digits, mode 0700 on Unix. One `mkdir`, which fails on an
+    /// existing entry of that name, a symlink included.
+    fn create(base: &Path) -> std::io::Result<Self> {
+        let mut nonce = [0_u8; 16];
+        getrandom::fill(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let dir = base.join(format!("cerulion-pair-{}", hex::encode(nonce)));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&dir)?;
+        Ok(Self { dir })
+    }
+
+    /// The path passed as `--outcome-file`; absent until the helper writes it.
+    fn file(&self) -> PathBuf {
+        self.dir.join(OUTCOME_FILE_NAME)
+    }
+}
+
+impl Drop for OutcomeDir {
+    fn drop(&mut self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.dir) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    error = %e,
+                    path = %self.dir.display(),
+                    "cerulion pair: could not remove the helper's outcome directory"
+                );
+            }
+        }
+    }
+}
+
+/// Whether the outcome file at `path` reports an end where the robot may have
+/// paired this desk without confirming it: only the exact bytes
+/// [`OUTCOME_UNCONFIRMED`] do. A missing file is a plain end. An unreadable
+/// file, or one with any other content, is a plain end too, logged at warn,
+/// so nothing but the helper's own token makes the closing line say the robot
+/// may have paired. At most one byte past the token is read.
+fn read_outcome(path: &Path) -> bool {
+    let mut held = Vec::new();
+    let read = std::fs::File::open(path).and_then(|file| {
+        file.take(OUTCOME_UNCONFIRMED.len() as u64 + 1)
+            .read_to_end(&mut held)
+    });
+    match read {
+        Ok(_) if held == OUTCOME_UNCONFIRMED.as_bytes() => true,
+        Ok(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                size_bytes = held.len(),
+                "cerulion pair: the helper's outcome file does not hold its token; closing as a \
+                 plain end"
+            );
+            false
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %path.display(),
+                "cerulion pair: could not read the helper's outcome file; closing as a plain end"
+            );
+            false
+        }
+    }
+}
+
+/// The line `cerulion pair` closes with on a nonzero exit, unless the helper
+/// reported an unconfirmed end.
+const NOT_COMPLETED: &str = "cerulion pair: did NOT complete; the robot did not confirm \
+                             pairing, so ~/.cerulion/robots.toml was NOT pinned";
+
+/// The line `cerulion pair` closes with on a nonzero exit when the helper
+/// reported an unconfirmed end: it was interrupted (130) or timed out (3)
+/// after the robot was asked to save this desk, and has just logged that the
+/// robot may have paired it.
+const NOT_COMPLETED_UNCONFIRMED: &str = "cerulion pair: did NOT complete; the robot did not \
+                                         confirm pairing in time; it may have paired, see \
+                                         above, so ~/.cerulion/robots.toml was NOT pinned";
 
 /// Decide + apply the post-ceremony `robots.toml` pin. Pins `name → eid` (and
 /// prints the `pinned:` state line) ONLY on a GENUINE exit 0 — the connectd `pair`
@@ -514,8 +663,11 @@ pub fn spawn_and_pair(plan: &PairPlan, running: Arc<AtomicBool>) -> CliResult<i3
 /// code (4), OR a signal-KILLED connectd that `connect_cmd::exit_code_of` maps to
 /// `128 + signo` (e.g. Ctrl-C at the code prompt → 130, NEVER a
 /// synthesized 0) — leaves `robots.toml` UNTOUCHED, prints no `pinned:` line, and
-/// emits a loud "did NOT complete" note. `pin` is injected so the pin-only-on-0
-/// gate is unit-testable with a spy (no real `~/.cerulion` write).
+/// emits a loud "did NOT complete" note: [`NOT_COMPLETED_UNCONFIRMED`] when
+/// `unconfirmed` (the helper reported an end where the robot may have paired
+/// this desk), [`NOT_COMPLETED`] otherwise. `unconfirmed` never blocks the pin
+/// on a genuine 0. `pin` is injected so the pin-only-on-0 gate is unit-testable
+/// with a spy (no real `~/.cerulion` write).
 // P12 exception: `pinned_line` is a machine-parseable state line on STDOUT —
 // this crate's OUTPUT PROTOCOL, not logging. A Studio driver parses it; moving
 // it to `tracing` would put it on stderr behind RUST_LOG and break the parser.
@@ -523,17 +675,17 @@ pub fn spawn_and_pair(plan: &PairPlan, running: Arc<AtomicBool>) -> CliResult<i3
 #[allow(clippy::print_stdout)]
 fn finalize_pairing(
     code: i32,
+    unconfirmed: bool,
     name: Option<&str>,
     eid: &str,
     pin: &dyn Fn(&str, &str) -> Result<(), String>,
 ) {
     if code != 0 {
-        tracing::warn!(
-            exit_code = code,
-            eid = %eid,
-            "cerulion pair: did NOT complete; the robot did not confirm pairing, so \
-             ~/.cerulion/robots.toml was NOT pinned"
-        );
+        if unconfirmed {
+            tracing::warn!(exit_code = code, eid = %eid, "{NOT_COMPLETED_UNCONFIRMED}");
+        } else {
+            tracing::warn!(exit_code = code, eid = %eid, "{NOT_COMPLETED}");
+        }
         return;
     }
     match name {
@@ -1039,17 +1191,21 @@ enabled = true
         };
 
         // Every non-zero outcome — INCLUDING the signal-killed 130 (a Ctrl-C at the
-        // code prompt) — must NOT pin.
+        // code prompt) and the two ends the helper reports unconfirmed — must
+        // NOT pin.
         for code in [130, 2, 3, 4, 1] {
-            finalize_pairing(code, Some("go2"), HEX64, &spy);
-            assert!(
-                calls.borrow().is_empty(),
-                "exit {code} must NOT pin robots.toml (only a genuine 0 pins)"
-            );
+            for unconfirmed in [false, true] {
+                finalize_pairing(code, unconfirmed, Some("go2"), HEX64, &spy);
+                assert!(
+                    calls.borrow().is_empty(),
+                    "exit {code} (unconfirmed {unconfirmed}) must NOT pin robots.toml (only a \
+                     genuine 0 pins)"
+                );
+            }
         }
 
         // A genuine 0 pins exactly once.
-        finalize_pairing(0, Some("go2"), HEX64, &spy);
+        finalize_pairing(0, false, Some("go2"), HEX64, &spy);
         assert_eq!(
             &*calls.borrow(),
             &[("go2".to_string(), HEX64.to_string())],
@@ -1057,12 +1213,256 @@ enabled = true
         );
 
         // A genuine 0 with NO name pins nothing more (nothing to pin — no error).
-        finalize_pairing(0, None, HEX64, &spy);
+        finalize_pairing(0, false, None, HEX64, &spy);
         assert_eq!(
             calls.borrow().len(),
             1,
             "a no-name success pins nothing (reconnect with --eid)"
         );
+
+        // The helper writes its token only on a nonzero end, and a genuine 0
+        // pins whatever the outcome file held.
+        finalize_pairing(0, true, Some("go2"), HEX64, &spy);
+        assert_eq!(calls.borrow().len(), 2, "a genuine exit 0 pins");
+    }
+
+    /// The closing line of an end the helper reported unconfirmed:
+    /// hand-written, never the const it renders.
+    const UNCONFIRMED_CLOSING: &str = "cerulion pair: did NOT complete; the robot did not \
+                                       confirm pairing in time; it may have paired, see above, \
+                                       so ~/.cerulion/robots.toml was NOT pinned";
+
+    /// The closing line of every other nonzero end: hand-written, never the
+    /// const it renders.
+    const PLAIN_CLOSING: &str = "cerulion pair: did NOT complete; the robot did not confirm \
+                                 pairing, so ~/.cerulion/robots.toml was NOT pinned";
+
+    /// `Ok` when the captured `lines` hold exactly `unconfirmed` lines with
+    /// [`UNCONFIRMED_CLOSING`] and `plain` with [`PLAIN_CLOSING`], each
+    /// carrying the exit code `code` of the end it closes when it is the
+    /// last one logged.
+    fn closing_counts(
+        lines: &[&str],
+        unconfirmed: usize,
+        plain: usize,
+        code: i32,
+    ) -> Result<(), String> {
+        let count = |needle: &str| lines.iter().filter(|l| l.contains(needle)).count();
+        let got = (count(UNCONFIRMED_CLOSING), count(PLAIN_CLOSING));
+        if got != (unconfirmed, plain) {
+            return Err(format!(
+                "want {unconfirmed} unconfirmed and {plain} plain closing lines, got {got:?}:\n{}",
+                lines.join("\n")
+            ));
+        }
+        let last = lines
+            .iter()
+            .rev()
+            .find(|l| l.contains("did NOT complete"))
+            .ok_or_else(|| "no closing line".to_string())?;
+        if !last.contains(&format!("exit_code={code}")) {
+            return Err(format!(
+                "the last closing line lacks exit_code={code}: {last}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// A pin spy for an end that must not pin.
+    fn never_pins(name: &str, eid: &str) -> Result<(), String> {
+        panic!("a nonzero end pinned {name} -> {eid}")
+    }
+
+    /// Each end the helper reported unconfirmed, the interrupt (130) and the
+    /// timeout (3), closes with the line that says the robot may have paired,
+    /// exactly once, and never with the plain line.
+    #[tracing_test::traced_test]
+    #[test]
+    fn closing_an_unconfirmed_end_says_the_robot_may_have_paired_once() {
+        for (code, seen) in [(130, 1), (3, 2)] {
+            finalize_pairing(code, true, Some("go2"), HEX64, &never_pins);
+            logs_assert(|lines| closing_counts(lines, seen, 0, code));
+        }
+    }
+
+    /// Every nonzero end the helper did not report unconfirmed closes with
+    /// the plain line, exactly once each, and never says the robot may have
+    /// paired: a Ctrl-C at the code prompt (130), a dial failure (3), a
+    /// refusal (2), a wrong code (4), a usage error (1) and a killed helper
+    /// (137).
+    #[tracing_test::traced_test]
+    #[test]
+    fn closing_a_plain_end_never_says_the_robot_may_have_paired() {
+        for (seen, code) in [130, 3, 2, 4, 1, 137].into_iter().enumerate() {
+            finalize_pairing(code, false, Some("go2"), HEX64, &never_pins);
+            logs_assert(|lines| closing_counts(lines, 0, seen + 1, code));
+        }
+        assert!(!logs_contain("may have paired"));
+    }
+
+    /// A genuine exit 0 logs no closing line, whatever the outcome file held.
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_paired_end_logs_no_closing_line() {
+        let no_pin = |_: &str, _: &str| -> Result<(), String> { Ok(()) };
+        finalize_pairing(0, false, None, HEX64, &no_pin);
+        finalize_pairing(0, true, None, HEX64, &no_pin);
+        assert!(!logs_contain("did NOT complete"));
+        assert!(logs_contain("paired OK with no robot name to pin"));
+    }
+
+    /// The outcome reader: only the exact token is an unconfirmed end. A
+    /// missing file, a file with other content and a path that cannot be
+    /// read as a file are each a plain end.
+    #[test]
+    fn only_the_exact_token_in_the_outcome_file_is_an_unconfirmed_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome");
+        assert!(!read_outcome(&path), "a missing file is a plain end");
+        let cases: [(&[u8], bool); 7] = [
+            (b"unconfirmed\n", true),
+            (b"unconfirmed", false),
+            (b"unconfirmed\nunconfirmed\n", false),
+            (b"unconfirmed\r\n", false),
+            (b"UNCONFIRMED\n", false),
+            (b"paired\n", false),
+            (b"", false),
+        ];
+        for (content, unconfirmed) in cases {
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(read_outcome(&path), unconfirmed, "{content:?}");
+        }
+        let unreadable = dir.path().join("a-directory");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(
+            !read_outcome(&unreadable),
+            "an unreadable path is a plain end"
+        );
+    }
+
+    /// The outcome directory is new, private (0700 on Unix) and named
+    /// `cerulion-pair-` plus 32 hex digits; two runs get two directories, and
+    /// dropping the guard removes the directory with the file in it, a
+    /// panic unwind included. A missing base fails to create one.
+    #[test]
+    fn the_outcome_directory_is_private_and_removed_with_its_file_on_drop() {
+        let base = tempfile::tempdir().unwrap();
+        let first = OutcomeDir::create(base.path()).unwrap();
+        let second = OutcomeDir::create(base.path()).unwrap();
+        assert_ne!(first.dir, second.dir);
+        let name = first.dir.file_name().unwrap().to_str().unwrap();
+        let digits = name.strip_prefix("cerulion-pair-").unwrap();
+        assert_eq!(digits.len(), 32, "{name}");
+        assert!(digits.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        assert_eq!(first.file(), first.dir.join("outcome"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&first.dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+        }
+        std::fs::write(first.file(), b"unconfirmed\n").unwrap();
+        let (kept, removed) = (second.dir.clone(), first.dir.clone());
+        drop(first);
+        assert!(
+            !removed.exists(),
+            "the guard removes the directory and its file"
+        );
+        assert!(kept.exists());
+
+        let made = std::sync::Mutex::new(None);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let dir = OutcomeDir::create(base.path()).unwrap();
+            std::fs::write(dir.file(), b"unconfirmed\n").unwrap();
+            *made.lock().unwrap() = Some(dir.dir.clone());
+            panic!("an unwind through the guard");
+        }));
+        assert!(unwound.is_err());
+        let made = made.into_inner().unwrap().expect("the directory was made");
+        assert!(!made.exists(), "an unwind removes the directory");
+        drop(second);
+        assert!(!kept.exists());
+
+        let missing = base.path().join("missing");
+        assert!(OutcomeDir::create(&missing).is_err());
+    }
+
+    /// A plan whose helper is `sh -c <script>`: the script sees
+    /// `--outcome-file` as `$1` and the path as `$2` when they are passed.
+    #[cfg(unix)]
+    fn scripted_helper(script: &str) -> PairPlan {
+        PairPlan {
+            bin: PathBuf::from("sh"),
+            argv: vec!["-c".to_string(), script.to_string(), "helper".to_string()],
+            name: Some("go2".to_string()),
+            eid: HEX64.to_string(),
+        }
+    }
+
+    /// The entries left under `base` once a run returned.
+    #[cfg(unix)]
+    fn left_under(base: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(base)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    /// Through a scripted helper: the helper is passed `--outcome-file` and a
+    /// path in a new private directory; a helper that writes the token and
+    /// exits 3 or 130 closes once with the line that says the robot may have
+    /// paired; one that exits 3 without it, or writes anything else, closes
+    /// with the plain line. The directory is gone after every run, and after
+    /// a helper that cannot be spawned.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn spawn_and_pair_reads_the_outcome_file_and_removes_its_directory() {
+        let base = tempfile::tempdir().unwrap();
+        let run = |script: &str| {
+            spawn_and_pair_in(
+                &scripted_helper(script),
+                Arc::new(AtomicBool::new(true)),
+                base.path(),
+                &never_pins,
+            )
+        };
+        let unconfirmed = r#"[ "$1" = --outcome-file ] && printf 'unconfirmed\n' > "$2"; exit "#;
+
+        assert_eq!(run(&format!("{unconfirmed}3")).unwrap(), 3);
+        logs_assert(|lines| closing_counts(lines, 1, 0, 3));
+        assert_eq!(left_under(base.path()), Vec::<PathBuf>::new());
+
+        assert_eq!(run(&format!("{unconfirmed}130")).unwrap(), 130);
+        logs_assert(|lines| closing_counts(lines, 2, 0, 130));
+        assert_eq!(left_under(base.path()), Vec::<PathBuf>::new());
+
+        // The helper sees the flag and a path in a new directory under the
+        // base, with no file in it yet, while it runs.
+        let fresh = format!(
+            r#"[ "$1" = --outcome-file ] && [ -d "$(dirname "$2")" ] && [ ! -e "$2" ] || exit 9
+            case "$2" in "{}"/cerulion-pair-*/outcome) exit 3;; esac; exit 8"#,
+            base.path().display()
+        );
+        assert_eq!(run(&fresh).unwrap(), 3);
+        logs_assert(|lines| closing_counts(lines, 2, 1, 3));
+
+        assert_eq!(run(r#"printf 'paired\n' > "$2"; exit 130"#).unwrap(), 130);
+        logs_assert(|lines| closing_counts(lines, 2, 2, 130));
+        assert_eq!(left_under(base.path()), Vec::<PathBuf>::new());
+
+        let missing = PairPlan {
+            bin: base.path().join("no-such-helper"),
+            ..scripted_helper("exit 0")
+        };
+        assert!(spawn_and_pair_in(
+            &missing,
+            Arc::new(AtomicBool::new(true)),
+            base.path(),
+            &never_pins
+        )
+        .is_err());
+        assert_eq!(left_under(base.path()), Vec::<PathBuf>::new());
     }
 
     /// The `pinned:` STDOUT state line has the exact Studio-contract format (hand

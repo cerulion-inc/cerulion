@@ -5,7 +5,9 @@
 //! alone (it forwards SIGINT to the helper) each end the run with exit 130
 //! (the documented `interrupted` code) within [`EXIT_CEILING`] of the signal,
 //! well inside the 5 s grace after which `cerulion` kills the helper (exit
-//! 137), with nothing on stdout (no ceremony began).
+//! 137), with nothing on stdout (no ceremony began). `cerulion` then closes
+//! with its plain NOT complete line, exactly once, and never says the robot
+//! may have paired: the helper reported no unconfirmed end.
 //!
 //! The signal is sent once stderr carries the helper's desk key line, which
 //! it logs after its signal handlers are in place. Each run has its own
@@ -27,6 +29,11 @@ const EID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f7075
 
 /// The stderr line the helper logs once its signal handlers are in place.
 const READY: &str = "cerulion pair: created a new desk device key (0600)";
+
+/// The line `cerulion` closes a nonzero end with when its helper reported no
+/// unconfirmed end: hand-written, never the const it renders.
+const PLAIN_CLOSING: &str = "cerulion pair: did NOT complete; the robot did not confirm \
+                             pairing, so ~/.cerulion/robots.toml was NOT pinned";
 
 /// How long the run may take to log [`READY`].
 const READY_LIMIT: Duration = Duration::from_secs(30);
@@ -209,6 +216,15 @@ fn assert_interrupted(signal: &str) {
     assert!(
         stderr.contains("cerulion pair: interrupted (Ctrl-C) before completion"),
         "SIG{signal}: stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches(PLAIN_CLOSING).count(),
+        1,
+        "SIG{signal}: stderr:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("may have paired"),
+        "SIG{signal}: a plain interrupt never says the robot may have paired; stderr:\n{stderr}"
     );
     assert_eq!(run.stdout, "", "SIG{signal}: stderr:\n{stderr}");
 }

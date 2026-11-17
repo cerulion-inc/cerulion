@@ -22,7 +22,7 @@
 //! lives in the library.
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -294,6 +294,14 @@ struct PairCli {
     /// networks.
     #[arg(long)]
     relay_disabled: bool,
+
+    /// The internal channel `cerulion pair` reads once this run ends: on the
+    /// two ends where the robot may have paired this desk without confirming
+    /// it, the run writes [`OUTCOME_UNCONFIRMED`] to this path, and nothing on
+    /// any other end ([`PairEnd::outcome`], [`write_outcome`]). Hidden from
+    /// `--help`: `cerulion pair` passes it, a user does not.
+    #[arg(long, value_name = "PATH", hide = true)]
+    outcome_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for PairCli {
@@ -804,6 +812,7 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
         .robot_name
         .unwrap_or_else(|| hex::encode(robot_eid.as_bytes()));
     let cli_code = cli.code;
+    let outcome_file = cli.outcome_file;
 
     // The code read and the ceremony: an interrupt that lands before the
     // ceremony sent `code-pair-finish` makes the result `None`; one that lands
@@ -856,6 +865,9 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
         };
         let result = run_pair(config, interrupt).await;
         let (exit, end) = pair_end(&result);
+        if let (Some(path), Some(token)) = (outcome_file.as_deref(), end.outcome()) {
+            write_outcome(path, token);
+        }
         match end {
             PairEnd::Paired => {}
             PairEnd::NotPaired => return None,
@@ -910,6 +922,55 @@ enum PairEnd {
     /// Any other failure: `pairing failed` at error, with this text of the
     /// error.
     Failed(String),
+}
+
+impl PairEnd {
+    /// What the run writes to `--outcome-file` for this end:
+    /// [`OUTCOME_UNCONFIRMED`] on the two ends where the robot may have paired
+    /// this desk without confirming it, and nothing on any other. Pure,
+    /// table-tested.
+    fn outcome(&self) -> Option<&'static str> {
+        match self {
+            PairEnd::InterruptedUnconfirmed | PairEnd::TimedOutUnconfirmed => {
+                Some(OUTCOME_UNCONFIRMED)
+            }
+            PairEnd::Paired | PairEnd::NotPaired | PairEnd::Failed(_) => None,
+        }
+    }
+}
+
+/// The token the run writes to `--outcome-file` on an end where the robot may
+/// have paired this desk without confirming it. `cerulion pair` reads exactly
+/// these bytes and closes with the line that says the robot may have paired.
+const OUTCOME_UNCONFIRMED: &str = "unconfirmed\n";
+
+/// Write `token` to `path` for `cerulion pair` to read once this run ends.
+/// Best effort: a failure is logged at warn and never changes the exit code,
+/// and `cerulion pair` then closes as it does for a plain end.
+fn write_outcome(path: &Path, token: &str) {
+    if let Err(e) = try_write_outcome(path, token) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "cerulion pair: could not write the outcome file `cerulion pair` reads; its closing \
+             line cannot say the robot may have paired this desk"
+        );
+    }
+}
+
+/// Create `path` new (an existing entry, a symlink included, is never
+/// followed or overwritten), mode 0600 on Unix, write `token` and sync it.
+fn try_write_outcome(path: &Path, token: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(token.as_bytes())?;
+    file.sync_all()
 }
 
 /// The exit code `cerulion-connectd pair` ends with for a `run_pair` result,
@@ -1110,9 +1171,11 @@ mod tests {
     }
 
     /// Hand-written table: a `run_pair` result, then the exit code the binary
-    /// ends with and the line it logs. A run interrupted or timed out after
-    /// the robot was asked to save this desk logs that the robot may have
-    /// paired it, never the NOT paired line or `pairing failed`.
+    /// ends with, the line it logs and what it writes to `--outcome-file`. A
+    /// run interrupted or timed out after the robot was asked to save this
+    /// desk logs that the robot may have paired it, never the NOT paired line
+    /// or `pairing failed`, and writes the `unconfirmed` token; every other
+    /// end writes nothing.
     #[test]
     fn a_pairing_the_robot_may_have_saved_is_never_logged_as_not_paired() {
         let paired = PairOutcome {
@@ -1120,43 +1183,138 @@ mod tests {
             source: "code_paired".into(),
             desk_eid_hex: "8a2e".into(),
         };
-        let cases: [(Result<PairOutcome, PairError>, u8, PairEnd); 8] = [
-            (Ok(paired), 0, PairEnd::Paired),
-            (Err(PairError::Interrupted), 130, PairEnd::NotPaired),
+        type Row = (
+            Result<PairOutcome, PairError>,
+            u8,
+            PairEnd,
+            Option<&'static str>,
+        );
+        let cases: [Row; 8] = [
+            (Ok(paired), 0, PairEnd::Paired, None),
+            (Err(PairError::Interrupted), 130, PairEnd::NotPaired, None),
             (
                 Err(PairError::InterruptedUnconfirmed),
                 130,
                 PairEnd::InterruptedUnconfirmed,
+                Some("unconfirmed\n"),
             ),
             (
                 Err(PairError::TimedOutUnconfirmed),
                 3,
                 PairEnd::TimedOutUnconfirmed,
+                Some("unconfirmed\n"),
             ),
             (
                 Err(PairError::Unreachable("u".into())),
                 3,
                 PairEnd::Failed("could not reach the robot: u".into()),
+                None,
             ),
             (
                 Err(PairError::Refused("r".into())),
                 2,
                 PairEnd::Failed("the robot refused pairing: r".into()),
+                None,
             ),
             (
                 Err(PairError::CodeMismatch("m".into())),
                 4,
                 PairEnd::Failed("wrong pairing code: m".into()),
+                None,
             ),
             (
                 Err(PairError::Usage("x".into())),
                 1,
                 PairEnd::Failed("pairing usage error: x".into()),
+                None,
             ),
         ];
-        for (result, exit, end) in cases {
+        for (result, exit, end, outcome) in cases {
             let row = format!("{result:?}");
-            assert_eq!(pair_end(&result), (exit, end), "{row}");
+            let got = pair_end(&result);
+            assert_eq!(got.1.outcome(), outcome, "{row}");
+            assert_eq!(got, (exit, end), "{row}");
+        }
+    }
+
+    /// The outcome file is created new with exactly the token, mode 0600 on
+    /// Unix. An entry already at the path, a symlink included, is never
+    /// followed or overwritten, and a path whose directory is missing fails;
+    /// both stay best effort, so `write_outcome` returns without panicking.
+    #[test]
+    fn the_outcome_file_is_created_new_with_the_token_and_never_follows_an_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome");
+        try_write_outcome(&path, OUTCOME_UNCONFIRMED).expect("a fresh path is written");
+        assert_eq!(std::fs::read(&path).unwrap(), b"unconfirmed\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+
+        let again = try_write_outcome(&path, "other\n").expect_err("an existing file is kept");
+        assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists, "{again}");
+        write_outcome(&path, "other\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"unconfirmed\n");
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("target");
+            std::fs::write(&target, b"kept\n").unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let followed = try_write_outcome(&link, OUTCOME_UNCONFIRMED)
+                .expect_err("a symlink at the path is never followed");
+            assert_eq!(followed.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&target).unwrap(), b"kept\n");
+        }
+
+        let missing = dir.path().join("missing").join("outcome");
+        let error = try_write_outcome(&missing, OUTCOME_UNCONFIRMED)
+            .expect_err("a missing directory fails");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        write_outcome(&missing, OUTCOME_UNCONFIRMED);
+        assert!(!missing.exists());
+    }
+
+    /// `--outcome-file` parses on `pair` and is hidden: `cerulion-connectd
+    /// pair --help` does not list it, while it lists the flags a user passes.
+    #[test]
+    fn the_outcome_file_flag_parses_and_is_hidden_from_pair_help() {
+        use clap::CommandFactory;
+        let eid = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let parsed =
+            PairCli::try_parse_from(["pair", "--eid", eid, "--outcome-file", "/run/x/outcome"])
+                .unwrap();
+        assert_eq!(
+            parsed.outcome_file.as_deref(),
+            Some(Path::new("/run/x/outcome"))
+        );
+        let without = PairCli::try_parse_from(["pair", "--eid", eid]).unwrap();
+        assert_eq!(without.outcome_file, None);
+
+        let cmd = Cli::command();
+        let pair = cmd
+            .find_subcommand("pair")
+            .expect("`pair` stays a subcommand");
+        let flag = pair
+            .get_arguments()
+            .find(|a| a.get_long() == Some("outcome-file"))
+            .expect("`pair` takes --outcome-file");
+        assert!(flag.is_hide_set(), "--outcome-file is hidden");
+        for argv in [
+            ["cerulion-connectd", "pair", "--help"],
+            ["cerulion-connectd", "help", "pair"],
+        ] {
+            let Err(help) = Cli::try_parse_from(argv) else {
+                panic!("{argv:?} must render help, not parse");
+            };
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp, "{argv:?}");
+            let text = help.to_string();
+            assert!(text.contains("--key-file"), "{argv:?}:\n{text}");
+            assert!(!text.contains("outcome"), "{argv:?}:\n{text}");
         }
     }
 

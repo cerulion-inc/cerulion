@@ -854,7 +854,18 @@ every slot is taken.
   which says the robot may have paired the desk. Either way a task that
   paired by then keeps paired. `cerulion-connectd pair` decides the line it
   logs for each result in one pure function (`pair_end`), so neither
-  unconfirmed end logs the NOT paired line or `pairing failed`. Stdout
+  unconfirmed end logs the NOT paired line or `pairing failed`. The hidden
+  `--outcome-file <path>` flag is an internal channel between `cerulion pair`
+  and this helper, absent from `--help` and from the user API page:
+  `cerulion pair` creates a new private directory (0700) under the system temp
+  directory, passes a path in it, and its drop guard (`OutcomeDir`) removes
+  the directory on every way out, a failed spawn and a panic included. The
+  helper writes the token `unconfirmed` there (created new, 0600, synced) on
+  exactly the two unconfirmed ends (`PairEnd::outcome`) and nothing on any
+  other; a write failure is a warn and changes no exit code. Once the helper
+  exits, `cerulion pair` reads the file (`read_outcome`): only the exact token
+  makes its closing line say the robot may have paired, and a missing,
+  unreadable or other file closes as a plain end. Stdout
   carries machine-parseable state lines for Studio, everything else goes to
   stderr. Pinned against a REAL in-process remoted ops
   plane by `pair_e2e_test.rs`, with the robot's durable trust state verified
