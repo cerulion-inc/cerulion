@@ -75,6 +75,10 @@ pub struct BackpressureCounters {
     /// concurrent reader may transiently see this one ahead of
     /// `block_fires_deferred_count`; at quiescence it is `<=` that count.
     pub block_defer_regimes_count: AtomicU64,
+    /// Number of times this `block` input's credit slot was released (its
+    /// consumer stopped, or `block_timeout_ms` passed with nothing drained).
+    /// Bumped by the releaser beside its loud release event.
+    pub block_slot_releases_count: AtomicU64,
 }
 
 impl BackpressureCounters {
@@ -959,6 +963,12 @@ impl NodeHandle {
         }
     }
 
+    /// The raw in-tick marker word, for a reader that samples it off the
+    /// executing thread and decodes `0` itself (the fire tap's `in_tick`).
+    pub(crate) fn in_tick_marker(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.in_tick_since_ns)
+    }
+
     /// Per-node count of publisher-loss transitions
     /// observed on this node's inputs by the runtime liveliness sweep
     /// (every `Lost` transition — a publisher disconnecting or crashing
@@ -1010,9 +1020,8 @@ impl NodeHandle {
     /// Per-input `Block` deferred-fire count for `input_name`.
     ///
     /// Returns the number of times the producer's tick was deferred by
-    /// the scheduler because this subscriber's buffer was full AND the
-    /// policy was `Block` AND no non-Block subscribers existed on the
-    /// topic (sole-Block-consumer-full or all-Block-buffers-full case).
+    /// the scheduler because this `block` input's credit slot was full
+    /// (whatever the topic's other consumers declare).
     /// NO DATA WAS LOST in these events. Returns 0 if the input is
     /// unknown.
     pub fn backpressure_block_fires_deferred_count(&self, input_name: &str) -> u64 {
@@ -1029,6 +1038,17 @@ impl NodeHandle {
     pub fn backpressure_block_defer_regimes_count(&self, input_name: &str) -> u64 {
         self.backpressure_load(input_name, |c| {
             c.block_defer_regimes_count.load(Ordering::Acquire)
+        })
+    }
+
+    /// Per-input count of `block` credit-slot RELEASES for `input_name`: how
+    /// many times this consumer's slot was given up on its producer's side
+    /// (the consumer node stopped, or `block_timeout_ms` passed with nothing
+    /// drained). Each release also logs a loud `warn!`. Returns 0 if the
+    /// input is unknown.
+    pub fn backpressure_block_slot_releases_count(&self, input_name: &str) -> u64 {
+        self.backpressure_load(input_name, |c| {
+            c.block_slot_releases_count.load(Ordering::Acquire)
         })
     }
 

@@ -1801,18 +1801,14 @@ mod tests {
         // it needs no path.)
         let (sleep, mv) = (resolve_tool("sleep"), resolve_tool("mv"));
         let script = bin_dir.join("ros2");
-        std::fs::write(
+        crate::fresh_executable::install_script(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\necho \"$$\" > \"${SIGINT_PIDFILE_ENV}.tmp\"\n{} \"${SIGINT_PIDFILE_ENV}.tmp\" \"${SIGINT_PIDFILE_ENV}\"\nexec {} 30\n",
                 mv.display(),
                 sleep.display()
             ),
-        )
-        .expect("write the ros2 stand-in");
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod the ros2 stand-in");
+        );
         script
     }
 

@@ -478,7 +478,10 @@ $_members"
     # describing anything must fail rather than evaporate, so on
     # $PINNED_PACKAGE an absent pin target is a VIOLATION naming both real
     # remedies. Other packages stay inert — they never had the file.
-    if printf '%s\n' "$_all" | grep -qx "$PINNED_TEST"; then
+    # A here-string, not a pipe: `grep -q` exits on the match, and a `printf`
+    # still writing the rest of the list would take SIGPIPE, which `pipefail`
+    # reads as "no such file".
+    if grep -qx -- "$PINNED_TEST" <<<"$_all"; then
         _pin_shard=$((PINNED_SHARD % _count))
         _pin_found=$(shard_members "$_dir" "$_pin_shard" "$_count" | grep -cx "$PINNED_TEST" || true)
         if [ "$_pin_found" -ne 1 ]; then

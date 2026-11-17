@@ -245,6 +245,7 @@ fn build_cdylib_hold_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -257,6 +258,7 @@ fn build_cdylib_hold_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "cdy/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

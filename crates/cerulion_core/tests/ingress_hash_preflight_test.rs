@@ -70,6 +70,7 @@ fn ingress_graph_consuming(input_name: &str) -> GraphConfig {
             inputs: vec![InputDef {
                 name: input_name.to_string(),
                 source: INGRESS_TOPIC.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],
@@ -204,6 +205,7 @@ fn preflight_passes_when_the_ingress_consumer_declares_a_schema() {
                 depth: 1,
                 backpressure: Default::default(),
                 expect_within_ms: None,
+                accumulate: false,
                 consume: Default::default(),
             }],
             vec![],

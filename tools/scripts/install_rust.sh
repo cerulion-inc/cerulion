@@ -156,6 +156,7 @@ temp=''
 rustup_lock=$rustup_home/.cerulion-rustup-setup.lock
 cargo_lock=$cargo_home/.cerulion-cargo-setup.lock
 rustup_lock_held=0 cargo_lock_held=0
+fresh_rustup=0
 cleanup_setup() {
     setup_status=$?
     trap '' HUP INT TERM
@@ -203,8 +204,19 @@ else
     curl --proto '=https' --tlsv1.2 -fsSL --retry 5 --retry-delay 5 \
         --connect-timeout 30 --max-time 120 https://sh.rustup.rs -o "$temp/rustup-init.sh" ||
         die "could not download the official rustup installer"
-    sh "$temp/rustup-init.sh" -y --profile minimal --default-toolchain stable --no-modify-path ||
+    # The bootstrap installs rustup alone; stable comes from the
+    # `rustup toolchain install` below, which draws its download progress on
+    # the terminal. The bootstrap's stdout carries its post-install note and,
+    # in rustup 1.29, the cc crate's build-script lines from its linker
+    # check: it goes to a file that is printed in full only when the
+    # bootstrap fails. Its stderr, with its info, warnings and errors, stays
+    # on the terminal.
+    if ! sh "$temp/rustup-init.sh" -y --profile minimal --default-toolchain none --no-modify-path \
+        > "$temp/rustup-init.out"; then
+        cat "$temp/rustup-init.out" >&2 || :
         die "Rust/Cargo installation failed; Cerulion binaries have not been replaced"
+    fi
+    fresh_rustup=1
     rustup=$cargo_home/bin/rustup
     [ -x "$rustup" ] || die "rustup did not install into $cargo_home/bin"
 fi
@@ -217,7 +229,9 @@ rustup="$rustup_dir/${rustup##*/}"
 if stable=$(rustc_release "$rustup" run stable rustc) && meets_floor "$stable"; then
     :
 else
-    printf '%s\n' 'Adding current stable Rust/Cargo alongside existing toolchains'
+    # A rustup installed just above has no toolchain to add stable beside.
+    [ "$fresh_rustup" -eq 1 ] ||
+        printf '%s\n' 'Adding current stable Rust/Cargo alongside existing toolchains'
     "$rustup" toolchain install stable --profile minimal --no-self-update ||
         die "could not install stable Rust/Cargo; Cerulion binaries have not been replaced"
     stable=$(rustc_release "$rustup" run stable rustc) ||

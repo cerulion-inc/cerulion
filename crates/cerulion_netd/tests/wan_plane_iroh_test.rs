@@ -22,6 +22,11 @@
 //! `cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- --test-threads=1`.
 #![cfg(feature = "wan")]
 
+// This binary waits only on copied binaries, so the script helpers stay unused.
+#[allow(dead_code)]
+#[path = "../src/fresh_executable.rs"]
+mod fresh_executable;
+
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -957,7 +962,9 @@ fn iroh_wan_plane_registers_and_removes_mirror_provenance() {
         .ensure_mirror(&key, ORACLE_SCHEMA_HASH)
         .expect("ensure");
     let _ = collect_frames(&manager_b, &topic, 2);
-    assert!(manager_b.is_network_mirror(&topic).unwrap());
+    assert!(manager_b
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 
     // Provenance registered, attributed to the DEMAND's robot (not the robot's
     // self-declared catalog identity) — so `topic list` folds it into REMOTE.
@@ -973,7 +980,9 @@ fn iroh_wan_plane_registers_and_removes_mirror_provenance() {
         gather_absent(&manager_b, &topic),
         "release removes the mirror provenance"
     );
-    assert!(!manager_b.is_network_mirror(&topic).unwrap());
+    assert!(!manager_b
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 
     stop.store(true, Ordering::Relaxed);
     let _ = producer.join();

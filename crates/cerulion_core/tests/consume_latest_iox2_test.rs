@@ -105,6 +105,7 @@ fn consumer_entry(c: Consumer, seen: Arc<Mutex<Vec<u64>>>) -> ClosureNodeEntry {
             backpressure: c.backpressure,
             expect_within_ms: None,
             consume: c.consume,
+            accumulate: false,
         }],
         vec![],
     )
@@ -135,6 +136,7 @@ fn sink_node(source: &str) -> NodeDef {
         inputs: vec![InputDef {
             name: "inp".to_string(),
             source: source.to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     }
@@ -593,6 +595,7 @@ fn a_cdylib_declaring_latest_forwards_only_the_newest_frame() {
         inputs: vec![InputDef {
             name: "trigger_in".to_string(),
             source: IN_TOPIC.to_string(),
+            ..Default::default()
         }],
         outputs: vec![OutputDef {
             name: "cmd".to_string(),
@@ -750,6 +753,7 @@ fn gap_injector_node() -> NodeDef {
         inputs: vec![InputDef {
             name: "ctx".to_string(),
             source: GAP_CTX.to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     }
@@ -903,6 +907,7 @@ fn forwarder_node() -> NodeDef {
         inputs: vec![InputDef {
             name: "trigger_in".to_string(),
             source: EXT.to_string(),
+            ..Default::default()
         }],
         outputs: vec![OutputDef {
             name: "cmd".to_string(),
@@ -1032,6 +1037,7 @@ fn block_gap_runtime(
             backpressure: BackpressurePolicy::Block,
             expect_within_ms: None,
             consume: InputConsume::Latest,
+            accumulate: false,
         }],
         vec![],
     )
@@ -1078,6 +1084,7 @@ fn block_gap_runtime(
             inputs: vec![InputDef {
                 name: "tick".to_string(),
                 source: "pace/tick".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         },

@@ -846,6 +846,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 Some(ms) => quote! { ::std::option::Option::Some(#ms) },
                 None => quote! { ::std::option::Option::None },
             };
+            let accumulate = i.accumulate.is_some();
             let consume_tok: TokenStream = match i.consume {
                 Some(crate::parse::ParsedConsume::Latest) => {
                     quote! { #__cer_root::graph::node::InputConsume::Latest }
@@ -862,6 +863,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     depth: #depth_tok,
                     backpressure: #backpressure_tok,
                     expect_within_ms: #expect_within_tok,
+                    accumulate: #accumulate,
                     consume: #consume_tok,
                 }
             }
@@ -914,6 +916,15 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 ctx.drain_trigger_input(input_name)
             } else {
                 (0, ::core::option::Option::None)
+            }
+        }
+
+        // Lets the fire tap attribute each tick's commits to its outputs. An
+        // entry without a context (before `init`, after `shutdown`) cannot.
+        fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+            match self.context.as_ref() {
+                ::core::option::Option::Some(ctx) => ctx.output_commit_counts(out),
+                ::core::option::Option::None => false,
             }
         }
 

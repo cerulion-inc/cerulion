@@ -40,7 +40,7 @@ usage() {
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --cyclictest-minutes)
-            if [ -z "${2:-}" ] || ! printf '%s' "$2" | grep -qE '^[1-9][0-9]*$'; then
+            if [ -z "${2:-}" ] || ! grep -qE '^[1-9][0-9]*$' <<<"$2"; then
                 echo "error: --cyclictest-minutes requires a positive integer (>= 1)" >&2
                 exit 2
             fi
