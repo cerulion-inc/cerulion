@@ -1881,7 +1881,8 @@ pub struct HostedRunSpec<'a> {
 /// `endpoints`, `topology` and, when the run serves fires, `telemetry`. The
 /// keys that describe a run directory (`run_dir`, `network`, `partition`,
 /// `gating`, `shm`, `chains`) are absent, which every run-directory reader
-/// reads as undeclared.
+/// reads as undeclared. A hosted run leaves out `network`, so
+/// [`cerulion_core::transport::run_artifacts::remote_visible`] lists it.
 ///
 /// The `runs` verb serves at most [`MAX_RUN_ARTIFACT_LEN`] bytes of
 /// `run.json`, and `topology` and `endpoints` grow with the graph. So a render
@@ -4224,6 +4225,23 @@ mod tests {
             })["run_id"],
             serde_json::json!("0x0000000000000000000000000000beef")
         );
+    }
+
+    /// A hosted `run.json` has no `network` key, so the `runs` verb lists the
+    /// run to a remote desk instead of hiding it as local-only.
+    #[test]
+    fn a_hosted_manifest_is_remote_visible() {
+        use cerulion_core::transport::run_artifacts::remote_visible;
+
+        let endpoints = lobby_endpoints();
+        let topology = lobby_topology();
+        for fires in [Some(LOBBY_FIRES), None] {
+            let spec = hosted_spec(&endpoints, &topology, fires);
+            let run_json = String::from_utf8(render_fitting(&spec)).unwrap();
+            let doc: serde_json::Value = serde_json::from_str(&run_json).unwrap();
+            assert!(doc.get("network").is_none(), "no network key");
+            assert!(remote_visible(&served_entry(&spec, run_json)));
+        }
     }
 
     /// A desk decodes `topology` back into the runtime's own type, for every
