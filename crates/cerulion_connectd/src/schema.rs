@@ -18,6 +18,11 @@
 //! user's own schema): an absent path is written, an identical path is a no-op,
 //! and a conflicting path is a loud `warn!` + skip (the local file wins).
 //!
+//! An absent path is written whole or not at all ([`write_whole`]): the text goes
+//! to a hidden temporary sibling, is synced, and is renamed into place, so a
+//! reader sees no file or the whole file, and a write that fails or is cut short
+//! leaves no partial file to be kept later as a local edit.
+//!
 //! # Peer text
 //!
 //! `SchemaDoc::qualified` is ROBOT-CONTROLLED, and this module is one of the crate's
@@ -125,7 +130,7 @@ fn materialize_one(schemas_dir: &Path, doc: &SchemaDoc) -> ConnectResult<Materia
             Ok(MaterializeOutcome::ConflictKeptLocal(dest))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&dest, &doc.text)
+            write_whole(&dest, doc.text.as_bytes())
                 .map_err(|e| ConnectError::Schema(format!("{shown_path}: {e}")))?;
             tracing::info!(
                 path = %shown_path,
@@ -145,6 +150,43 @@ fn materialize_one(schemas_dir: &Path, doc: &SchemaDoc) -> ConnectResult<Materia
 /// The robot-controlled `qualified` is VALIDATED first ([`validate_qualified`] —
 /// path-traversal guard, f0) so a hostile `../../../tmp/pwn/Evil` or an absolute
 /// name can never make the write escape `schemas_dir`.
+/// The hidden sibling [`write_whole`] stages `dest`'s text in: same directory,
+/// so the rename stays on one filesystem; a `.tmp` name, which no schema store
+/// reader loads.
+fn staging_path(dest: &Path) -> PathBuf {
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    dest.with_file_name(format!(".{name}.{}.tmp", std::process::id()))
+}
+
+/// Write `bytes` at `dest` whole or not at all: into [`staging_path`] (a stale
+/// one from an earlier cut-short write is removed first), synced, then renamed
+/// onto `dest`. On failure the staging file is removed and `dest` is untouched.
+fn write_whole(dest: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let staging = staging_path(dest);
+    match std::fs::remove_file(&staging) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&staging)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&staging, dest)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staging);
+    }
+    written
+}
+
 fn dest_path(schemas_dir: &Path, doc: &SchemaDoc) -> ConnectResult<PathBuf> {
     validate_qualified(&doc.qualified)?;
     let (pkg, ty) = split_qualified(&doc.qualified);
@@ -301,6 +343,88 @@ mod tests {
             "uint64 seq  # local edit\n",
             "the local file wins a conflict"
         );
+    }
+
+    /// A write cut short before its rename leaves only the hidden staging file:
+    /// the schema's own path stays absent (never empty or partial), no store
+    /// reader loads the staging file, and the next materialization writes the
+    /// whole schema rather than keeping a partial file as a local edit.
+    #[test]
+    fn a_write_cut_short_leaves_no_partial_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let doc = msg_doc("acme/Sub", "float64 x\n");
+        let dest = dir.path().join("acme").join("msg").join("Sub.msg");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        // A writer stopped after part of the text reached its staging file.
+        let staging = staging_path(&dest);
+        std::fs::write(&staging, "floa").unwrap();
+        assert!(!dest.exists());
+        let msg_files: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("msg"))
+            .collect();
+        assert!(msg_files.is_empty(), "{msg_files:?}");
+        assert_eq!(
+            materialize_docs(dir.path(), std::slice::from_ref(&doc)).unwrap(),
+            vec![MaterializeOutcome::Wrote(dest.clone())]
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "float64 x\n");
+        assert!(!staging.exists(), "the staging file was renamed into place");
+    }
+
+    /// A write that fails leaves the schema's path untouched and no staging file.
+    #[test]
+    fn a_failed_write_leaves_nothing_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        // The destination's directory is missing, so the staging file cannot be
+        // created.
+        let dest = dir.path().join("missing").join("Sub.msg");
+        assert!(write_whole(&dest, b"float64 x\n").is_err());
+        assert!(!dest.exists());
+        assert!(!staging_path(&dest).exists());
+        // A rename that fails (onto a directory) removes the staging file and
+        // leaves the directory as it was.
+        let onto_dir = dir.path().join("Sub.msg");
+        std::fs::create_dir(&onto_dir).unwrap();
+        std::fs::write(onto_dir.join("kept"), "kept").unwrap();
+        assert!(write_whole(&onto_dir, b"float64 x\n").is_err());
+        assert!(!staging_path(&onto_dir).exists());
+        assert_eq!(
+            std::fs::read_to_string(onto_dir.join("kept")).unwrap(),
+            "kept"
+        );
+    }
+
+    /// A reader polling the schema's path while it is materialized sees no file
+    /// or the whole file, never an empty or partial one.
+    #[test]
+    fn a_reader_never_sees_a_partial_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "float64 x\n".repeat(4096);
+        let dest = dir.path().join("acme").join("msg").join("Sub.msg");
+        std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        for _ in 0..50 {
+            let _ = std::fs::remove_file(&dest);
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reader = {
+                let (done, dest, text) = (done.clone(), dest.clone(), text.clone());
+                std::thread::spawn(move || {
+                    let mut seen = 0;
+                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                        if let Ok(read) = std::fs::read_to_string(&dest) {
+                            assert_eq!(read, text, "a reader saw a partial schema");
+                            seen += 1;
+                        }
+                    }
+                    seen
+                })
+            };
+            write_whole(&dest, text.as_bytes()).unwrap();
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), text);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            reader.join().unwrap();
+        }
     }
 
     /// A `.msg` doc with no package is REFUSED per-doc (a `Rejected` outcome —
