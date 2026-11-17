@@ -100,7 +100,9 @@ pub mod node_params_info;
 // verb calls it while `cerulion pair` is a hidden stub.
 pub mod pair_cmd;
 // The robot side of code pairing: the decisions of one pairing code's run
-// over the robot-local file handoff, and the texts it shows.
+// over the robot-local file handoff and the texts it shows, and on Unix the
+// runner that does its file operations, holds serving through cerulion-netd
+// and reads the process clocks and random source.
 pub mod pair_start_cmd;
 /// `--robot NAME` on `topic pub`, `topic snapshot` and `service call`.
 pub mod robot_act;
