@@ -4,53 +4,14 @@
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use cerud::receipt::ReceiptOutcome;
 use cerud::transport::CallerIdentity;
 use cerulion_ops_proto::SessionKind;
 
 use crate::clock::RemotedClock;
-
-// A one-second sweep leaves 500 ms for authorization and 250 ms for ordinary-job
-// cleanup inside the two-second revocation budget, with scheduling margin.
-const MAX_REAUTHORIZE_INTERVAL: Duration = Duration::from_secs(1);
-
-/// Robot-configurable resource limits. These never classify command contents.
-#[derive(Clone, Debug)]
-pub struct SessionLimits {
-    pub reauthorize_interval: Duration,
-    pub io_timeout: Duration,
-    pub max_recording_bytes: u64,
-    pub max_stdin_bytes: u64,
-    pub max_stdout_bytes: u64,
-    pub max_stderr_bytes: u64,
-    pub exec_timeout: Option<Duration>,
-    pub shell_timeout: Option<Duration>,
-    pub shell_idle_timeout: Option<Duration>,
-}
-
-impl Default for SessionLimits {
-    fn default() -> Self {
-        Self {
-            reauthorize_interval: MAX_REAUTHORIZE_INTERVAL,
-            io_timeout: Duration::from_secs(2),
-            max_recording_bytes: 64 * 1024 * 1024,
-            max_stdin_bytes: 1024 * 1024,
-            max_stdout_bytes: 1024 * 1024,
-            max_stderr_bytes: 1024 * 1024,
-            // One minute bounds unattended short commands; operators can extend
-            // or disable it for longer work through the exec timeout setting.
-            exec_timeout: Some(Duration::from_secs(60)),
-            // Eight hours permits a working session while bounding abandoned
-            // shells; the robot operator can extend or disable this wall limit.
-            shell_timeout: Some(Duration::from_secs(8 * 60 * 60)),
-            // Thirty minutes without input permits breaks while retiring idle
-            // terminals; the robot operator can extend or disable this limit.
-            shell_idle_timeout: Some(Duration::from_secs(30 * 60)),
-        }
-    }
-}
+pub use crate::remote_session::SessionLimits;
+use crate::remote_session::MAX_REAUTHORIZE_INTERVAL;
 
 pub type AuthorizeSession = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 pub type SessionReceipt =

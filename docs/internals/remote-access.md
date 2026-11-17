@@ -193,7 +193,9 @@ the same entry instead of running the daemon.
 Load-bearing boundary contracts:
 
 - **Session context**: `session_context::{SessionContext, SessionLimits}` holds
-  transport-supplied identity, callbacks and unchanged resource limits. Validation
+  transport-supplied identity, callbacks and unchanged resource limits. Its limits
+  re-export the type used by `RemotedConfig::remote_shell_limits`; defaults and
+  the authorization-interval bound have one definition. Validation
   checks the declared shell/exec parameters, an authenticated caller, a nonzero
   authorization interval of at most one second, and nonzero I/O timeout. It does
   no I/O, invokes no callback and grants no authorization. The driver must perform

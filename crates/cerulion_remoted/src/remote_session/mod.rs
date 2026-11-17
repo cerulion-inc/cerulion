@@ -12,3 +12,4 @@ pub use inspection::{
     verify_recording_prefix_file, RecordingListing, RecordingPrefixSummary,
 };
 pub use limits::SessionLimits;
+pub(crate) use limits::MAX_REAUTHORIZE_INTERVAL;

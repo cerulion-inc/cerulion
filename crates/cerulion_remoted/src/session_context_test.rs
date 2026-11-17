@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use cerulion_ops_proto::{ExecRequest, ShellRequest, WindowSize};
 
@@ -91,6 +92,53 @@ fn valid_exec_and_shell_validation_never_invokes_callbacks_or_rewrites_limits() 
         ),
         (None, None, None)
     );
+}
+
+#[test]
+fn configured_limits_enter_the_context_directly_and_remain_unchanged() {
+    let directory = tempfile::tempdir().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut configured = crate::config::RemotedConfig::from_state_root(
+        directory.path(),
+        cerulion_link::RelayConfig::Disabled,
+        false,
+    );
+    configured.remote_shell_limits = crate::remote_session::SessionLimits {
+        reauthorize_interval: Duration::from_millis(333),
+        io_timeout: Duration::from_secs(7),
+        max_recording_bytes: 2039,
+        max_stdin_bytes: 3,
+        max_stdout_bytes: 5,
+        max_stderr_bytes: 7,
+        exec_timeout: Some(Duration::from_secs(19)),
+        shell_timeout: Some(Duration::from_secs(23)),
+        shell_idle_timeout: Some(Duration::from_secs(29)),
+    };
+    let mut value = context(&calls, directory.path());
+    // This assignment also checks the public types are identical, without a
+    // conversion that could silently replace configured values with defaults.
+    value.limits = configured.remote_shell_limits;
+    for session in [value.session.clone(), shell()] {
+        value.session = session;
+        value.validate().unwrap();
+        assert_eq!(
+            value.limits.reauthorize_interval,
+            Duration::from_millis(333)
+        );
+        assert_eq!(value.limits.io_timeout, Duration::from_secs(7));
+        assert_eq!(value.limits.max_recording_bytes, 2039);
+        assert_eq!(value.limits.max_stdin_bytes, 3);
+        assert_eq!(value.limits.max_stdout_bytes, 5);
+        assert_eq!(value.limits.max_stderr_bytes, 7);
+        assert_eq!(value.limits.exec_timeout, Some(Duration::from_secs(19)));
+        assert_eq!(value.limits.shell_timeout, Some(Duration::from_secs(23)));
+        assert_eq!(
+            value.limits.shell_idle_timeout,
+            Some(Duration::from_secs(29))
+        );
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
 }
 
 #[test]
