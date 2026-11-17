@@ -3,10 +3,12 @@
 //!
 //! On a registered robot the network daemon's supervisor runs a sync worker
 //! that fetches this robot's signed access-list epoch from the account service
-//! (with the robot's own login) and writes it to [`EPOCH_PENDING_FILE`] in the
-//! remoted state directory, as `hex(postcard(EpochSyncWire))`, the encoding a
-//! desk's push carries. [`EpochPull`] picks it up every
-//! [`EPOCH_POLL_INTERVAL`] and applies it through [`SharedTrust::apply_epoch`]:
+//! (proving possession of the robot's transport key, or with the robot's own
+//! login where the service has no such route) and writes it to
+//! [`EPOCH_PENDING_FILE`] in the remoted state directory, as
+//! `hex(postcard(EpochSyncWire))`, the encoding a desk's push carries.
+//! [`EpochPull`] picks it up every [`EPOCH_POLL_INTERVAL`] and applies it
+//! through [`SharedTrust::apply_epoch`]:
 //! the intermediate is re-verified against this robot's root set, the epoch's
 //! signature, issuer and robot id are checked, and only a strictly newer epoch
 //! changes anything. A missing, unreadable or rejected file changes nothing.

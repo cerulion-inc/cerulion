@@ -112,16 +112,31 @@ const EPOCH_PENDING_FILE: &str = "epoch.pending";
 const REMOTED_SUBDIR: &str = "remoted";
 
 /// The hidden robot-side revocation sync: fetch this registered robot's current
-/// signed access-list epoch from the account service with this machine's login
-/// (refreshing a stale session, serialized across processes), and leave it for
-/// the remote-plane daemon to verify and apply. Writes one JSON line
+/// signed access-list epoch from the account service and leave it for the
+/// remote-plane daemon to verify and apply. Writes one JSON line
 /// `{"version":1,"epoch":N}` (`null` when the robot has no epoch yet).
+///
+/// The fetch first proves possession of the robot's transport key (the
+/// registration's device key): it signs a challenge request over the current
+/// time, then signs the challenge it is issued. A request time the service
+/// refuses (this clock more than five minutes off, or behind the robot's last
+/// accepted request after a step backwards) is retried once at the time the
+/// refusal names, so the robot's clock never strands the fetch. Neither needs an
+/// account session. A 429 there fails this run with nothing fetched and the
+/// login not tried, so the supervisor backs off as for any failed fetch and
+/// counts it. When the service answers 404 (no such route, or a service that
+/// does not know this robot), or the proof fetch fails otherwise, it falls back
+/// to this machine's login session (refreshing a stale one, serialized across
+/// processes).
+///
+/// The stored login is checked locally in both cases: it must name the
+/// registration's owner, though its session may have lapsed.
 ///
 /// # Errors
 ///
 /// Refuses loudly when no robot registration exists under `state_root`, when
-/// the login is not the registration's owner, or when the fetch fails; a
-/// failure changes nothing on the robot.
+/// the login is not the registration's owner, when the robot route answers 429,
+/// or when both fetches fail; a failure changes nothing on the robot.
 pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
     trusted_root(state_root)?;
     let bundle_path = state_root.join(BUNDLE_FILE);
@@ -137,9 +152,10 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
         }
         Err(e) => return Err(e.into()),
     };
-    let session = account_cmd::require_session()?;
+    // The stored login, read locally: an expired session still names its account.
     let login = auth::load()
         .state()
+        .filter(|s| s.logged_in_ever)
         .cloned()
         .ok_or_else(|| refused("run `cerulion login` before serving a robot"))?;
     if hex::encode(account_identity::pairing_account_id(&login.account_id)?.0)
@@ -153,7 +169,32 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
         .ok()
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| refused("the robot registration's robot id is malformed"))?;
-    let access = account_cmd::fetch_robot_access(&session, &URL_SAFE_NO_PAD.encode(robot_id))?;
+    let robot_id_b64 = URL_SAFE_NO_PAD.encode(robot_id);
+    let access = match fetch_access_by_robot_proof(&bundle, &robot_id) {
+        Ok(ProofFetch::Fetched(access)) => access,
+        Ok(ProofFetch::RateLimited) => {
+            return Err(refused(
+                "the account service is rate limiting this robot's access challenges (429); \
+                 revocations were not synced and the login session was not tried",
+            ))
+        }
+        Ok(ProofFetch::NoRoute) => {
+            tracing::info!(
+                "the account service answered 404 for this robot's access route (an older \
+                 service, or one that does not know this robot); fetching revocations with \
+                 this machine's login session"
+            );
+            fetch_access_by_session(&robot_id_b64)?
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "the robot-key revocation fetch failed; fetching with this machine's \
+                 login session instead"
+            );
+            fetch_access_by_session(&robot_id_b64)?
+        }
+    };
     let epoch = match account_cmd::epoch_cache_artifact_from(&access)? {
         None => None,
         Some(artifact) => {
@@ -186,6 +227,194 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
     .map_err(|_| refused("could not encode the worker result"))?;
     writeln!(out)?;
     Ok(())
+}
+
+/// The session fallback of [`sync_epoch`]: the robot's access state over this
+/// machine's login session.
+fn fetch_access_by_session(robot_id: &str) -> CliResult<account_cmd::RobotAccess> {
+    let token = account_cmd::require_session()?;
+    account_cmd::fetch_robot_access(&token, robot_id)
+}
+
+/// Each robot-proof request's timeout: 8 s. The fetch makes up to three (a
+/// challenge request, one retry at the time the service names, the access
+/// request), 24 s, and with the session fallback after it (a 30 s refresh-lock
+/// wait, a 30 s refresh and its 1 s save, a 30 s fetch) the worker ends by 115 s,
+/// inside the supervisor's 120 s worker deadline.
+const ROBOT_PROOF_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[derive(Deserialize)]
+struct RobotAccessChallenge {
+    challenge: String,
+    robot_id: String,
+}
+
+/// What the robot-proof fetch got.
+enum ProofFetch {
+    /// The robot's access state.
+    Fetched(account_cmd::RobotAccess),
+    /// The service has no robot access route (404).
+    NoRoute,
+    /// The service refused the challenge request for the robot's rate (429).
+    RateLimited,
+}
+
+/// Fetch this robot's access state by proving possession of its transport key:
+/// `POST /v1/robots/{id}/access/challenge` with a request signed over the
+/// current time, then `POST /v1/robots/{id}/access` with the issued challenge
+/// signed, both with the registration's device key. No account session.
+fn fetch_access_by_robot_proof(
+    bundle: &RegistrationBundle,
+    robot_id: &[u8; 32],
+) -> CliResult<ProofFetch> {
+    use cerulion_pairing::pop::{
+        sign_robot_pop, PURPOSE_ROBOT_ACCESS, PURPOSE_ROBOT_ACCESS_CHALLENGE,
+    };
+    let service = login_cmd::account_service_base();
+    let authority = trusted_service_url(&service)?;
+    let base = authority.as_str().trim_end_matches('/').to_owned();
+    let seed: [u8; 32] = read_private(&bundle.device_key_file, 32)?
+        .try_into()
+        .map_err(|_| refused("the robot's device key must contain exactly 32 bytes"))?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let transport_key = signing.verifying_key().to_bytes();
+    let client = login_cmd::http_client_bounded(ROBOT_PROOF_REQUEST_TIMEOUT)?;
+    let id = URL_SAFE_NO_PAD.encode(robot_id);
+    let request_challenge = |requested_at: u64| -> CliResult<Answer<RobotAccessChallenge>> {
+        let requested_at = requested_at.to_string();
+        let request_signature = sign_robot_pop(
+            &signing,
+            PURPOSE_ROBOT_ACCESS_CHALLENGE,
+            robot_id,
+            &transport_key,
+            &requested_at,
+        );
+        let response = client
+            .post(format!("{base}/v1/robots/{id}/access/challenge"))
+            .json(&serde_json::json!({
+                "requested_at_ns": requested_at,
+                "request_signature": URL_SAFE_NO_PAD.encode(request_signature.0),
+            }))
+            .send()
+            .map_err(|e| refused(&format!("the robot access challenge request failed: {e}")))?;
+        read_answer(response, "robot access challenge")
+    };
+    // A clock refusal names the service's time, and for a replay the next time
+    // it accepts; one retry signs the later of the two.
+    let mut answer = request_challenge(auth::now_unix_ns())?;
+    if let Answer::ClockRefused {
+        server_time_ns,
+        next_requested_at_ns,
+    } = answer
+    {
+        let retry_at = server_time_ns.max(next_requested_at_ns.unwrap_or(0));
+        answer = request_challenge(retry_at)?;
+    }
+    let challenge = match answer {
+        Answer::Body(challenge) => challenge,
+        Answer::NotFound => return Ok(ProofFetch::NoRoute),
+        Answer::RateLimited => return Ok(ProofFetch::RateLimited),
+        Answer::ClockRefused { .. } => {
+            return Err(refused(
+                "the account service refused the robot's request time twice",
+            ))
+        }
+    };
+    if challenge.robot_id != id {
+        return Err(refused(
+            "the robot access challenge names a different robot",
+        ));
+    }
+    let signature = sign_robot_pop(
+        &signing,
+        PURPOSE_ROBOT_ACCESS,
+        robot_id,
+        &transport_key,
+        &challenge.challenge,
+    );
+    let response = client
+        .post(format!("{base}/v1/robots/{id}/access"))
+        .json(&serde_json::json!({
+            "pop_challenge": challenge.challenge,
+            "pop_signature": URL_SAFE_NO_PAD.encode(signature.0),
+        }))
+        .send()
+        .map_err(|e| refused(&format!("the robot access request failed: {e}")))?;
+    let access = match read_answer::<account_cmd::RobotAccess>(response, "robot access")? {
+        Answer::Body(access) => access,
+        Answer::NotFound => return Ok(ProofFetch::NoRoute),
+        Answer::RateLimited => return Ok(ProofFetch::RateLimited),
+        Answer::ClockRefused { .. } => return Err(refused("the robot access request was refused")),
+    };
+    if access.robot_id != id {
+        return Err(refused("the robot access answer names a different robot"));
+    }
+    Ok(ProofFetch::Fetched(access))
+}
+
+/// A response body, or the refusals the robot-proof fetch acts on.
+enum Answer<T> {
+    Body(T),
+    NotFound,
+    RateLimited,
+    /// A 403 naming the service's clock, and for a replay the next request time
+    /// it accepts.
+    ClockRefused {
+        server_time_ns: u64,
+        next_requested_at_ns: Option<u64>,
+    },
+}
+
+/// A success body as `T` (read up to [`MAX_BUNDLE_BYTES`]); 404 and 429 as
+/// themselves; any other status is an error naming it and the service's
+/// description.
+fn read_answer<T: serde::de::DeserializeOwned>(
+    response: reqwest::blocking::Response,
+    what: &str,
+) -> CliResult<Answer<T>> {
+    #[derive(Deserialize, Default)]
+    struct ErrorBody {
+        #[serde(default)]
+        error_description: String,
+        #[serde(default)]
+        server_time_ns: Option<String>,
+        #[serde(default)]
+        next_requested_at_ns: Option<String>,
+    }
+    let status = response.status();
+    match status.as_u16() {
+        404 => return Ok(Answer::NotFound),
+        429 => return Ok(Answer::RateLimited),
+        _ => {}
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_BUNDLE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BUNDLE_BYTES {
+        return Err(refused(&format!(
+            "the {what} response exceeds its size limit"
+        )));
+    }
+    if !status.is_success() {
+        let body = serde_json::from_slice::<ErrorBody>(&bytes).unwrap_or_default();
+        let parse = |v: &Option<String>| v.as_deref().and_then(|t| t.parse::<u64>().ok());
+        if status.as_u16() == 403 {
+            if let Some(server_time_ns) = parse(&body.server_time_ns) {
+                return Ok(Answer::ClockRefused {
+                    server_time_ns,
+                    next_requested_at_ns: parse(&body.next_requested_at_ns),
+                });
+            }
+        }
+        let detail = body.error_description;
+        return Err(refused(&format!(
+            "the {what} request was refused ({status}): {detail}"
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .map(Answer::Body)
+        .map_err(|_| refused(&format!("the {what} response is malformed")))
 }
 
 /// Prepare a verified account-service registration for the robot writer.
