@@ -2004,7 +2004,10 @@ async fn a_malformed_robot_access_body_names_the_fields_its_route_needs() {
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["error"], "invalid_request");
         let text = body["error_description"].as_str().unwrap();
-        assert!(text.starts_with("invalid request body: "), "{text}");
+        assert!(
+            text.starts_with("bad request: invalid request body: "),
+            "{text}"
+        );
         assert!(text.ends_with(hint), "{url}: {text}");
         assert!(!text.contains("/v1/devices/challenge"), "{url}: {text}");
     }
