@@ -1158,3 +1158,59 @@ fn the_revocation_sync_outlives_netds_stop_signal_and_then_refreshes_nothing() {
         "no refresh spent the stored token"
     );
 }
+
+/// The real `cerulion robot-sync-epoch` logs to stderr. With this machine's
+/// certificate due and its login lapsed (expired, with a refresh token the
+/// service never issued), the sync still fetches with the robot's key and
+/// succeeds, and the renewal's failure warning reaches stderr, beside an
+/// hour's backoff recorded, while stdout carries only the result.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn the_revocation_sync_warns_on_stderr_when_a_due_renewal_cannot_run() {
+    use cerulion_cli_engine::device_cert_renewal::RENEW_WINDOW_ENV;
+    use cerulion_cli_engine::robot_bootstrap;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::process::Command;
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap());
+    let state = login(port, &email);
+    let root = home_path.join("robot-state");
+    robot_bootstrap::prepare(&root).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join("remoted"))
+        .unwrap();
+    let mut lapsed = state.clone();
+    lapsed.expires_at_ns = 1;
+    lapsed.refresh_token = "a-refresh-token-the-service-never-issued".into();
+    cerulion_cli_engine::auth::write_to(&home_path.join("auth.json"), &lapsed).unwrap();
+
+    let output = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .arg("robot-sync-epoch")
+            .arg("--state-root")
+            .arg(&root)
+            .env(RENEW_WINDOW_ENV, "2592000")
+            .env_remove("RUST_LOG"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\"epoch\":null,\"version\":1}\n"
+    );
+    assert!(
+        stderr.contains("this machine's device certificate could not be renewed"),
+        "{stderr}"
+    );
+    assert!(home_path.join(".device-renew.failed").exists());
+}

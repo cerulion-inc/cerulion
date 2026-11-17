@@ -105,6 +105,9 @@ When the service answers 404 there (no such route, or a service that does not kn
 robot), or that fetch fails otherwise, it fetches `GET /v1/robots/{id}/access` with the
 robot's own login instead. `cerulion-remoted` applies it
 through `SharedTrust::apply_epoch`, re-verifying it against the robot's own roots.
+The worker's warnings, such as a fetch that fell back to the login or a device certificate
+renewal that failed, go to its stderr, which netd passes through to its own (`RUST_LOG`
+sets the level; the default is `warn`).
 The worker runs at start, every `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (default 300 s), and early, at most every
 5 s, when an admitted key that has not connected in the last `CERULION_REMOTED_EPOCH_RECHECK_S`
 (default 60 s) connects; remoted applies a fetched epoch within `EPOCH_POLL_INTERVAL` (2 s),

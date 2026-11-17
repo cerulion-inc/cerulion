@@ -111,10 +111,12 @@ fn main() -> ExitCode {
 
     let matches = families::cli_command().get_matches();
     // The internal workers `cerulion-netd` starts on a robot (first-serve
-    // registration, the revocation sync): dispatched before telemetry,
-    // logging and the login gate, so they never start a browser login, record
-    // no event, and their JSON stdout carries nothing else. The engine
-    // requires an existing login.
+    // registration, the revocation sync): dispatched before telemetry and the
+    // login gate, so they never start a browser login, record no event, and
+    // their JSON stdout carries nothing else. The engine requires an existing
+    // login. The revocation sync logs to stderr, which netd passes through, at
+    // the one-shot verbs' `warn` default; first-serve registration's stderr is
+    // netd's error text and carries only its error.
     #[cfg(unix)]
     if matches!(
         matches.subcommand_name(),
@@ -125,7 +127,10 @@ fn main() -> ExitCode {
             .command
         {
             Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
-            Commands::RobotSyncEpoch { state_root } => robot_sync_epoch(&state_root),
+            Commands::RobotSyncEpoch { state_root } => {
+                init_logging(matches.get_flag("verbose"), true);
+                robot_sync_epoch(&state_root)
+            }
             _ => unreachable!("the subcommand name selected an internal worker"),
         };
         return match worker {
