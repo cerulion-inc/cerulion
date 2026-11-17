@@ -447,8 +447,13 @@ pub enum Commands {
     /// key file it cannot use) or a `CERULION_NETWORK` refusal, 2 = the robot
     /// refused (no armed code, denied, or the window expired), or the command
     /// line has an argument this command does not take, 3 = unreachable (dial
-    /// failure or timeout), 4 = wrong pairing code or attempts exhausted, 130 =
-    /// interrupted (Ctrl-C or SIGTERM during the ceremony; no pairing occurred).
+    /// failure or timeout) or the robot did not answer after it was asked to
+    /// save this desk: read stderr before you retry, 4 = wrong pairing code or
+    /// attempts exhausted, 130 = interrupted (Ctrl-C or SIGTERM during the
+    /// ceremony; not paired, unless the robot was already asked to save this
+    /// desk and its answer did not arrive in time: then the robot may have
+    /// paired this desk, and `cerulion connect --eid <eid>` connects if it
+    /// did, with the same `--key-file`, when this pairing used one).
     ///
     /// On the robot, `cerulion pair --start` makes the code instead. It asks
     /// `cerulion-netd` to serve this robot, shows an 8-digit pairing code that
@@ -2762,6 +2767,10 @@ mod pair_dispatch_tests {
             "pairs one desk within 10 minutes, with 3 tries every desk shares",
             "passing both is refused",
             "0 = paired, 1 = a usage or config",
+            "3 = unreachable (dial failure or timeout) or the robot did not answer after it was \
+             asked to save this desk: read stderr before you retry, 4 =",
+            "`cerulion connect --eid <eid>` connects if it did, with the same `--key-file`, when \
+             this pairing used one)",
             "0 = a desk paired, 1 = refused on this robot",
             "--start",
         ] {

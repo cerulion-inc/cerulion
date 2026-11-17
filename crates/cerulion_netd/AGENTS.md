@@ -41,7 +41,7 @@ One host gateway/zenoh session; NDJSON refcounts; spy wiring pins
 
 ## Tests
 - `-- --test-threads=1` (CLI shares SHM); `--no-default-features` green. Count oracles, not clocks.
-- Build `cerulion_cli`/`cerulion_remoted` first. WAN fixtures use real CLI/default
+- Build `cerulion_{cli,remoted,connectd}` first. WAN fixtures use real CLI/default
   SHM namespace and owner controller, serially.
 - `#[traced_test]` capture is thread-local: plane tokio workers are invisible.
   Test-only beacon suppression stays out of `src/**` (walk enforced).

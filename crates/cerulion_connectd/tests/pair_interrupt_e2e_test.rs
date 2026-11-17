@@ -9,7 +9,9 @@
 //! - In the ceremony: a code written on the open pipe reaches a test robot
 //!   that accepts the ops stream and never answers, so the ceremony waits on
 //!   its blocking read; SIGINT ends the run with exit 130 within
-//!   [`EXIT_CEILING`], and stdout carries exactly the `pairing:` line.
+//!   [`EXIT_CEILING`], stdout carries exactly the `pairing:` line, and the
+//!   robot sees the run close its connection, with code 0 and no reason,
+//!   within [`ROBOT_CLOSE_LIMIT`] of the reap.
 //! - A stdin closed with no code is the usage error (exit 1), with nothing on
 //!   stdout.
 //!
@@ -26,7 +28,8 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use cerulion_link::{
-    accept_frame_stream, accept_one, alpn, build_endpoint, EndpointConfig, RelayConfig,
+    accept_frame_stream, accept_one, alpn, build_endpoint, ConnectionError, EndpointConfig,
+    RelayConfig,
 };
 
 /// A well-formed endpoint id no robot in this test owns.
@@ -50,6 +53,12 @@ const WAIT_LIMIT: Duration = Duration::from_secs(10);
 
 /// How long the test reads the pipes after the run is reaped.
 const DRAIN_LIMIT: Duration = Duration::from_secs(5);
+
+/// How long after the reap the test robot may take to see the run's
+/// connection closed. A close the run sent before it exited is seen at once;
+/// a connection the run only dropped ends at the robot at its QUIC idle
+/// timeout, past this bound.
+const ROBOT_CLOSE_LIMIT: Duration = Duration::from_secs(5);
 
 /// A child that is killed and reaped when dropped, so a failed assertion
 /// leaves no process behind.
@@ -250,7 +259,7 @@ fn sigterm_at_the_code_read_exits_130_promptly_with_stdin_open() {
 }
 
 #[test]
-fn sigint_in_the_ceremony_with_a_silent_robot_exits_130_promptly_with_stdin_open() {
+fn sigint_in_the_ceremony_with_a_silent_robot_exits_130_promptly_and_closes_the_connection() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let robot = rt
         .block_on(build_endpoint(
@@ -291,6 +300,8 @@ fn sigint_in_the_ceremony_with_a_silent_robot_exits_130_promptly_with_stdin_open
     });
     let sent = run.signal("INT");
     let ended = run.finish(sent);
+    let closed =
+        rt.block_on(async { tokio::time::timeout(ROBOT_CLOSE_LIMIT, connection.closed()).await });
     drop(streams);
     drop(connection);
     rt.block_on(robot.close());
@@ -309,6 +320,17 @@ fn sigint_in_the_ceremony_with_a_silent_robot_exits_130_promptly_with_stdin_open
         "{what}: {}",
         ended.stderr
     );
+    match closed {
+        Ok(ConnectionError::ApplicationClosed(close)) => {
+            assert_eq!(close.error_code.into_inner(), 0, "{what}");
+            assert!(close.reason.is_empty(), "{what}: {close:?}");
+        }
+        other => panic!(
+            "{what}: the robot did not see the run close its connection within \
+             {ROBOT_CLOSE_LIMIT:?} of the reap: {other:?}; stderr:\n{}",
+            ended.stderr
+        ),
+    }
 }
 
 #[test]

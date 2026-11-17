@@ -22,7 +22,7 @@
 //! lives in the library.
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -32,7 +32,10 @@ use cerulion_connectd::config::{
     parse_account, parse_addrs, parse_eid, resolve_desk_seed, resolve_or_create_desk_seed,
     ConnectConfig, DemandSet, DEFAULT_ROBOT_TIMEOUT,
 };
-use cerulion_connectd::pair::{run_pair, PairConfig, EXIT_INTERRUPTED, EXIT_USAGE};
+use cerulion_connectd::pair::{
+    run_pair, PairConfig, PairError, PairOutcome, EXIT_INTERRUPTED, EXIT_PAIRED, EXIT_USAGE,
+    INTERRUPTED_UNCONFIRMED, TIMED_OUT_UNCONFIRMED,
+};
 use cerulion_connectd::rcp::{run_rcp, stdin_reader, RcpConfig};
 use cerulion_connectd::resolve_epoch_dir_from_env;
 use cerulion_connectd::sanitize_peer_text;
@@ -231,9 +234,14 @@ struct ConnectCli {
 /// # Exit codes (the machine signal a Studio driver branches on)
 ///
 /// - `0` paired, `1` usage or config error, `2` robot refused (no armed code,
-///   denied, or the window expired), `3` unreachable (dial failure or timeout),
-///   `4` wrong pairing code or attempts exhausted, `130` interrupted (Ctrl-C or
-///   SIGTERM during the ceremony; no pairing occurred).
+///   denied, or the window expired), `3` unreachable (dial failure or timeout)
+///   or the robot did not answer after it was asked to save this desk: read
+///   stderr before you retry, `4` wrong pairing code or attempts exhausted,
+///   `130` interrupted (Ctrl-C or SIGTERM during the ceremony; not paired,
+///   unless the robot was already asked to save this desk and its answer did
+///   not arrive in time: then the robot may have paired this desk, and
+///   `cerulion connect --eid <eid>` connects if it did, with the same
+///   `--key-file`, when this pairing used one).
 #[derive(Parser)]
 struct PairCli {
     /// The robot's iroh endpoint id (64-char hex: the public half of its
@@ -286,6 +294,14 @@ struct PairCli {
     /// networks.
     #[arg(long)]
     relay_disabled: bool,
+
+    /// The internal channel `cerulion pair` reads once this run ends: on the
+    /// two ends where the robot may have paired this desk without confirming
+    /// it, the run writes [`OUTCOME_UNCONFIRMED`] to this path, and nothing on
+    /// any other end ([`PairEnd::outcome`], [`record_end`]). Hidden from
+    /// `--help`: `cerulion pair` passes it, a user does not.
+    #[arg(long, value_name = "PATH", hide = true)]
+    outcome_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for PairCli {
@@ -756,9 +772,9 @@ async fn run_connect_command(cli: ConnectCli) -> ExitCode {
 async fn run_pair_command(cli: PairCli) -> ExitCode {
     // Made before anything else: on Unix this installs the SIGINT and SIGTERM
     // handlers, so a signal that lands while the inputs below resolve is kept
-    // for the select at the end instead of ending the process by its default
-    // disposition.
-    let interrupt = pair_interrupt();
+    // for the code read and the ceremony instead of ending the process by its
+    // default disposition.
+    let mut interrupt = std::pin::pin!(pair_interrupt());
     // Resolve every input up front; any config error is exit USAGE.
     let robot_eid = match parse_eid(&cli.eid) {
         Ok(e) => e,
@@ -796,31 +812,46 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
         .robot_name
         .unwrap_or_else(|| hex::encode(robot_eid.as_bytes()));
     let cli_code = cli.code;
+    let outcome_file = cli.outcome_file;
 
-    // The code read + the ceremony, BOTH cancellable by an interrupt. The
+    // The code read and the ceremony: an interrupt that lands before the
+    // ceremony sent `code-pair-finish` makes the result `None`; one that lands
+    // after that request makes run_pair wait a bounded time for the robot's
+    // answer and return the ceremony's own result, or
+    // `PairError::InterruptedUnconfirmed` when the answer did not arrive; one
+    // that lands during the endpoint close after the ceremony ended only
+    // shortens that wait, and run_pair returns the ceremony's own result
+    // (`pair_end` decides the line logged for each result). The
     // blocking stdin code read runs on a detached thread that hands its result
     // over a oneshot, so a signal AT the prompt resolves the select below (a
     // deliberate EXIT_INTERRUPTED) and the process then exits with the read
     // still parked on an open stdin. Dropping the runtime waits for every
     // running blocking-pool task, a parked `spawn_blocking` read included, but
-    // never for a plain thread, which the process exit ends.
+    // never for a plain thread, which the process exit ends. The ceremony
+    // watches the same interrupt itself, so it closes its endpoint before it
+    // ends as interrupted.
     let ceremony = async move {
         let (code_tx, code_rx) = tokio::sync::oneshot::channel();
         std::thread::spawn(move || {
             let _ = code_tx.send(resolve_pair_code(cli_code));
         });
-        let code = match code_rx.await {
+        let read = tokio::select! {
+            read = code_rx => read,
+            () = &mut interrupt => return None,
+        };
+        let code = match read {
             Ok(Ok(c)) => c,
             Ok(Err(msg)) => {
                 tracing::error!("cerulion pair: {msg}");
-                return ExitCode::from(EXIT_USAGE);
+                return Some(ExitCode::from(EXIT_USAGE));
             }
             // The reader thread ended without sending a result (it panicked).
             Err(e) => {
                 tracing::error!("cerulion pair: reading the pairing code failed: {e}");
-                return ExitCode::from(EXIT_USAGE);
+                return Some(ExitCode::from(EXIT_USAGE));
             }
         };
+        let eid = hex::encode(robot_eid.as_bytes());
         let config = PairConfig {
             robot_eid,
             direct_addrs,
@@ -832,32 +863,160 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
             robot_display,
             timeout: DEFAULT_ROBOT_TIMEOUT,
         };
-        match run_pair(config).await {
-            Ok(_outcome) => ExitCode::SUCCESS,
-            Err(e) => {
-                // Every `PairError` variant renders HERE, and the
-                // Refused / CodeMismatch ones carry text the ROBOT chose — at the moment
-                // the desk trusts the robot LEAST. Peer text is neutered + bounded where
-                // it ENTERS (`pair::classify_call_error` / `classify_transport_error` /
-                // `parse_finish_reply` / `decode_hex_field` / `classify_finish_error`);
-                // this arm sanitizes AGAIN as cheap defense-in-depth, exactly like the
-                // `connect` arms above and under the same idempotence + cost notes.
-                tracing::error!(
-                    error = %sanitize_peer_text(&e.to_string()),
-                    "cerulion pair: pairing failed"
-                );
-                ExitCode::from(e.exit_code())
-            }
+        let result = run_pair(config, interrupt).await;
+        let (exit, end) = pair_end(&result);
+        record_end(outcome_file.as_deref(), &eid, &end);
+        if end == PairEnd::NotPaired {
+            return None;
         }
+        Some(ExitCode::from(exit))
     };
 
-    tokio::select! {
-        code = ceremony => code,
-        _ = interrupt => {
+    match ceremony.await {
+        Some(code) => code,
+        None => {
             tracing::warn!("cerulion pair: interrupted (Ctrl-C) before completion — NOT paired");
             ExitCode::from(EXIT_INTERRUPTED)
         }
     }
+}
+
+/// The line `cerulion-connectd pair` logs once `run_pair` returned, and
+/// whether it then leaves the outcome token ([`PairEnd::outcome`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PairEnd {
+    /// Paired: no line here, as `run_pair` printed its `paired:` line.
+    Paired,
+    /// Interrupted before the robot was asked to save this desk: the NOT
+    /// paired line.
+    NotPaired,
+    /// Interrupted after the robot was asked to save this desk, before its
+    /// answer arrived: [`INTERRUPTED_UNCONFIRMED`] at warn, as the robot may
+    /// have paired this desk and the NOT paired line would be false.
+    InterruptedUnconfirmed,
+    /// Timed out after the robot was asked to save this desk, before its
+    /// answer arrived: [`TIMED_OUT_UNCONFIRMED`] at warn, as the robot may
+    /// have paired this desk and `pairing failed` would be false.
+    TimedOutUnconfirmed,
+    /// Any other failure: `pairing failed` at error, with this text of the
+    /// error.
+    Failed(String),
+}
+
+impl PairEnd {
+    /// What the run writes to `--outcome-file` for this end:
+    /// [`OUTCOME_UNCONFIRMED`] on the two ends where the robot may have paired
+    /// this desk without confirming it, and nothing on any other. Pure,
+    /// table-tested.
+    fn outcome(&self) -> Option<&'static str> {
+        match self {
+            PairEnd::InterruptedUnconfirmed | PairEnd::TimedOutUnconfirmed => {
+                Some(OUTCOME_UNCONFIRMED)
+            }
+            PairEnd::Paired | PairEnd::NotPaired | PairEnd::Failed(_) => None,
+        }
+    }
+}
+
+/// The token the run writes to `--outcome-file` on an end where the robot may
+/// have paired this desk without confirming it. `cerulion pair` reads exactly
+/// these bytes and closes with the line that says the robot may have paired.
+const OUTCOME_UNCONFIRMED: &str = "unconfirmed\n";
+
+/// What `cerulion-connectd pair` does once [`pair_end`] decided the end of a
+/// `run_pair` result: log the line for `end`, then, when `outcome_file` was
+/// passed, write the token of [`PairEnd::outcome`] there on the two ends
+/// where the robot may have paired this desk without confirming it, and
+/// nothing on any other. The line is logged first, so a run killed between
+/// the two leaves no token, and `cerulion pair` closes with its plain line.
+/// [`PairEnd::NotPaired`] logs nothing here: the caller logs the NOT paired
+/// line it shares with an interrupt at the code prompt. Table-tested.
+fn record_end(outcome_file: Option<&Path>, eid: &str, end: &PairEnd) {
+    match end {
+        PairEnd::Paired | PairEnd::NotPaired => {}
+        PairEnd::InterruptedUnconfirmed => {
+            tracing::warn!(eid = %eid, "cerulion pair: {INTERRUPTED_UNCONFIRMED}");
+        }
+        PairEnd::TimedOutUnconfirmed => {
+            tracing::warn!(eid = %eid, "cerulion pair: {TIMED_OUT_UNCONFIRMED}");
+        }
+        PairEnd::Failed(error) => {
+            // Every other `PairError` variant renders HERE, and the
+            // Refused / CodeMismatch ones carry text the ROBOT chose, at the moment
+            // the desk trusts the robot LEAST. Peer text is neutered + bounded where
+            // it ENTERS (`pair::classify_call_error` / `classify_transport_error` /
+            // `parse_finish_reply` / `decode_hex_field` / `classify_finish_error`);
+            // this arm sanitizes AGAIN as cheap defense-in-depth, exactly like the
+            // `connect` arms above and under the same idempotence + cost notes.
+            tracing::error!(
+                error = %sanitize_peer_text(error),
+                "cerulion pair: pairing failed"
+            );
+        }
+    }
+    if let (Some(path), Some(token)) = (outcome_file, end.outcome()) {
+        write_outcome(path, token);
+    }
+}
+
+/// Write `token` to `path` for `cerulion pair` to read once this run ends.
+/// Best effort: a failure is logged at warn and never changes the exit code,
+/// and `cerulion pair` then closes as it does for a plain end.
+fn write_outcome(path: &Path, token: &str) {
+    if let Err(e) = try_write_outcome(path, token) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "cerulion pair: could not write the outcome file `cerulion pair` reads; its closing \
+             line cannot say the robot may have paired this desk"
+        );
+    }
+}
+
+/// Create `path` new (an existing entry, a symlink included, is never
+/// followed or overwritten), mode 0600 on Unix, and write `token`. A write
+/// that fails removes the file it created before the error returns. If that
+/// removal fails too, what stays holds fewer bytes than the token, and
+/// `cerulion pair` accepts nothing but the whole token.
+///
+/// No sync: the reader is `cerulion pair` on the same host, which reads the
+/// file after it reaped this process, and the page cache already holds the
+/// written bytes for it.
+fn try_write_outcome(path: &Path, token: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    if let Err(e) = file.write_all(token.as_bytes()) {
+        drop(file);
+        // A file that stays after a failed removal holds fewer bytes than
+        // the token, and `cerulion pair` accepts nothing but the whole token.
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// The exit code `cerulion-connectd pair` ends with for a `run_pair` result,
+/// and the line it logs. Pure, table-tested.
+fn pair_end(result: &Result<PairOutcome, PairError>) -> (u8, PairEnd) {
+    let Err(error) = result else {
+        return (EXIT_PAIRED, PairEnd::Paired);
+    };
+    let end = match error {
+        PairError::Interrupted => PairEnd::NotPaired,
+        PairError::InterruptedUnconfirmed => PairEnd::InterruptedUnconfirmed,
+        PairError::TimedOutUnconfirmed => PairEnd::TimedOutUnconfirmed,
+        PairError::Usage(_)
+        | PairError::Unreachable(_)
+        | PairError::Refused(_)
+        | PairError::CodeMismatch(_) => PairEnd::Failed(error.to_string()),
+    };
+    (error.exit_code(), end)
 }
 
 /// An interrupt watcher for the pairing ceremony: Ctrl-C (SIGINT) and, on
@@ -1036,6 +1195,212 @@ mod tests {
                 assert_eq!(output, "PairCli { code: [REDACTED] }");
                 assert!(!output.contains(code));
             }
+        }
+    }
+
+    /// Hand-written table: a `run_pair` result, then the exit code the binary
+    /// ends with, the line it logs and what it writes to `--outcome-file`. A
+    /// run interrupted or timed out after the robot was asked to save this
+    /// desk logs that the robot may have paired it, never the NOT paired line
+    /// or `pairing failed`, and writes the `unconfirmed` token; every other
+    /// end writes nothing.
+    #[test]
+    fn a_pairing_the_robot_may_have_saved_is_never_logged_as_not_paired() {
+        let paired = PairOutcome {
+            account_hex: "8a2e".into(),
+            source: "code_paired".into(),
+            desk_eid_hex: "8a2e".into(),
+        };
+        type Row = (
+            Result<PairOutcome, PairError>,
+            u8,
+            PairEnd,
+            Option<&'static str>,
+        );
+        let cases: [Row; 8] = [
+            (Ok(paired), 0, PairEnd::Paired, None),
+            (Err(PairError::Interrupted), 130, PairEnd::NotPaired, None),
+            (
+                Err(PairError::InterruptedUnconfirmed),
+                130,
+                PairEnd::InterruptedUnconfirmed,
+                Some("unconfirmed\n"),
+            ),
+            (
+                Err(PairError::TimedOutUnconfirmed),
+                3,
+                PairEnd::TimedOutUnconfirmed,
+                Some("unconfirmed\n"),
+            ),
+            (
+                Err(PairError::Unreachable("u".into())),
+                3,
+                PairEnd::Failed("could not reach the robot: u".into()),
+                None,
+            ),
+            (
+                Err(PairError::Refused("r".into())),
+                2,
+                PairEnd::Failed("the robot refused pairing: r".into()),
+                None,
+            ),
+            (
+                Err(PairError::CodeMismatch("m".into())),
+                4,
+                PairEnd::Failed("wrong pairing code: m".into()),
+                None,
+            ),
+            (
+                Err(PairError::Usage("x".into())),
+                1,
+                PairEnd::Failed("pairing usage error: x".into()),
+                None,
+            ),
+        ];
+        for (result, exit, end, outcome) in cases {
+            let row = format!("{result:?}");
+            let got = pair_end(&result);
+            assert_eq!(got.1.outcome(), outcome, "{row}");
+            assert_eq!(got, (exit, end), "{row}");
+        }
+    }
+
+    /// Hand-written table over every `PairEnd`: what `record_end` leaves at
+    /// the `--outcome-file` path, and whether that file existed as each line
+    /// was logged. The two unconfirmed ends log their line while the path is
+    /// still absent, then write exactly the token; every other end leaves the
+    /// path absent. With no path, no end writes anything.
+    #[test]
+    fn record_end_logs_its_line_then_writes_the_token_only_on_an_unconfirmed_end() {
+        use std::sync::{Arc, Mutex};
+        // One row: the end, what it leaves at the path, and whether the file
+        // existed as each of its lines was logged.
+        type Row = (PairEnd, Option<&'static [u8]>, &'static [bool]);
+        let token = b"unconfirmed\n".as_slice();
+        let cases: [Row; 5] = [
+            (PairEnd::Paired, None, &[]),
+            (PairEnd::NotPaired, None, &[]),
+            (PairEnd::InterruptedUnconfirmed, Some(token), &[false]),
+            (PairEnd::TimedOutUnconfirmed, Some(token), &[false]),
+            (
+                PairEnd::Failed("wrong pairing code: m".into()),
+                None,
+                &[false],
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (row, (end, written, file_at_each_line)) in cases.iter().enumerate() {
+            let path = dir.path().join(format!("outcome-{row}"));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let (seen, path) = (Arc::clone(&seen), path.clone());
+                    move || {
+                        seen.lock().unwrap().push(path.exists());
+                        std::io::sink()
+                    }
+                })
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                record_end(Some(path.as_path()), "8a2e", end);
+            });
+            assert_eq!(std::fs::read(&path).ok().as_deref(), *written, "{end:?}");
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                *file_at_each_line,
+                "{end:?}"
+            );
+        }
+
+        for (end, _, _) in &cases {
+            record_end(None, "8a2e", end);
+        }
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["outcome-2", "outcome-3"]);
+    }
+
+    /// The outcome file is created new with exactly the token, mode 0600 on
+    /// Unix. An entry already at the path, a symlink included, is never
+    /// followed or overwritten, and a path whose directory is missing fails;
+    /// both stay best effort, so `write_outcome` returns without panicking.
+    #[test]
+    fn the_outcome_file_is_created_new_with_the_token_and_never_follows_an_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome");
+        try_write_outcome(&path, OUTCOME_UNCONFIRMED).expect("a fresh path is written");
+        assert_eq!(std::fs::read(&path).unwrap(), b"unconfirmed\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "{mode:o}");
+        }
+
+        let again = try_write_outcome(&path, "other\n").expect_err("an existing file is kept");
+        assert_eq!(again.kind(), std::io::ErrorKind::AlreadyExists, "{again}");
+        write_outcome(&path, "other\n");
+        assert_eq!(std::fs::read(&path).unwrap(), b"unconfirmed\n");
+
+        #[cfg(unix)]
+        {
+            let target = dir.path().join("target");
+            std::fs::write(&target, b"kept\n").unwrap();
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let followed = try_write_outcome(&link, OUTCOME_UNCONFIRMED)
+                .expect_err("a symlink at the path is never followed");
+            assert_eq!(followed.kind(), std::io::ErrorKind::AlreadyExists);
+            assert_eq!(std::fs::read(&target).unwrap(), b"kept\n");
+        }
+
+        let missing = dir.path().join("missing").join("outcome");
+        let error = try_write_outcome(&missing, OUTCOME_UNCONFIRMED)
+            .expect_err("a missing directory fails");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+        write_outcome(&missing, OUTCOME_UNCONFIRMED);
+        assert!(!missing.exists());
+    }
+
+    /// `--outcome-file` parses on `pair` and is hidden: `cerulion-connectd
+    /// pair --help` does not list it, while it lists the flags a user passes.
+    #[test]
+    fn the_outcome_file_flag_parses_and_is_hidden_from_pair_help() {
+        use clap::CommandFactory;
+        let eid = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+        let parsed =
+            PairCli::try_parse_from(["pair", "--eid", eid, "--outcome-file", "/run/x/outcome"])
+                .unwrap();
+        assert_eq!(
+            parsed.outcome_file.as_deref(),
+            Some(Path::new("/run/x/outcome"))
+        );
+        let without = PairCli::try_parse_from(["pair", "--eid", eid]).unwrap();
+        assert_eq!(without.outcome_file, None);
+
+        let cmd = Cli::command();
+        let pair = cmd
+            .find_subcommand("pair")
+            .expect("`pair` stays a subcommand");
+        let flag = pair
+            .get_arguments()
+            .find(|a| a.get_long() == Some("outcome-file"))
+            .expect("`pair` takes --outcome-file");
+        assert!(flag.is_hide_set(), "--outcome-file is hidden");
+        for argv in [
+            ["cerulion-connectd", "pair", "--help"],
+            ["cerulion-connectd", "help", "pair"],
+        ] {
+            let Err(help) = Cli::try_parse_from(argv) else {
+                panic!("{argv:?} must render help, not parse");
+            };
+            assert_eq!(help.kind(), clap::error::ErrorKind::DisplayHelp, "{argv:?}");
+            let text = help.to_string();
+            assert!(text.contains("--key-file"), "{argv:?}:\n{text}");
+            assert!(!text.contains("outcome"), "{argv:?}:\n{text}");
         }
     }
 

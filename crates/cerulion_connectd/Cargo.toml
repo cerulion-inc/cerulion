@@ -100,7 +100,15 @@ clap = { version = "4", features = ["derive", "env"] }
 # and `pair_e2e` runs the REAL CPace ceremony against a remoted `OpsServing`. A
 # dev-dep keeps the PRODUCTION build free of the robot's ops SERVER (remoted) — the
 # desk carries only the ops CLIENT (`cerud`, a prod dep for the `pair` ceremony).
-cerulion_remoted = { path = "../cerulion_remoted" }
+# Its `test-seam` feature gives the pairing tests two holds. The hold on the
+# robot's next admitted `code-pair-start`
+# (`SharedCodePairSessions::hold_next_build_for_test`) lets `pair_e2e` land an
+# interrupt on a try the robot holds pending, and lets the `pair` module's unit
+# test shut the ceremony's finish gate while the robot holds the desk's start.
+# The hold on its next right code's row save (`hold_next_save_for_test`) lets
+# `pair_e2e` land an interrupt or the desk-side timeout after the desk sent
+# `code-pair-finish` and before the robot answers.
+cerulion_remoted = { path = "../cerulion_remoted", features = ["test-seam"] }
 # The e2e tests build a CLAIMED + paired trust store to seed the robot's access
 # list (the desk key is admitted). Already a prod dep; the test uses more of it.
 cerulion_pairing = { path = "../cerulion_pairing" }

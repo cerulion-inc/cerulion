@@ -584,39 +584,67 @@ struct SessionsInner {
     codes_withdrawn: AtomicU64,
     clock: MonotonicClock,
     changed: tokio::sync::Notify,
-    /// A pause of the next start's CPace step ([`HeldBuild`]).
+    /// A pause of the next start's CPace step ([`HeldStep`]).
     #[cfg(any(test, feature = "test-seam"))]
-    build_pause: Mutex<Option<BuildPause>>,
+    build_pause: Mutex<Option<StepPause>>,
+    /// A pause of the next right code's row save ([`HeldStep`]).
+    #[cfg(any(test, feature = "test-seam"))]
+    save_pause: Mutex<Option<StepPause>>,
 }
 
-/// The two ends of a pause a [`HeldBuild`] holds: the start tells `reached`
-/// when its CPace step is due, and waits on `release`.
+/// The two ends of a pause a [`HeldStep`] holds: the paused step tells
+/// `reached` when it is due, and waits on `release`.
 #[cfg(any(test, feature = "test-seam"))]
-struct BuildPause {
+struct StepPause {
     reached: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<()>,
 }
 
-/// The next `code-pair-start` that is admitted, paused just before its CPace
-/// step, with the store's state lock released
-/// ([`SharedCodePairSessions::hold_next_build_for_test`]). Dropping it lets
+/// The next step of a kind, paused just before it runs, with the store's
+/// state lock released: an admitted `code-pair-start`'s CPace step
+/// ([`SharedCodePairSessions::hold_next_build_for_test`]) or a right code's
+/// row save in `code-pair-finish`
+/// ([`SharedCodePairSessions::hold_next_save_for_test`]). Dropping it lets
 /// the step run.
 #[cfg(any(test, feature = "test-seam"))]
-pub struct HeldBuild {
+pub struct HeldStep {
     reached: std::sync::mpsc::Receiver<()>,
     release: std::sync::mpsc::Sender<()>,
 }
 
 #[cfg(any(test, feature = "test-seam"))]
-impl HeldBuild {
-    /// Whether the paused start reached its CPace step within `bound`.
+impl HeldStep {
+    /// Whether the paused step was reached within `bound`.
     pub fn reached_within(&self, bound: Duration) -> bool {
         self.reached.recv_timeout(bound).is_ok()
     }
 
-    /// Let the paused start run its CPace step.
+    /// Let the paused step run.
     pub fn release(self) {
         let _ = self.release.send(());
+    }
+}
+
+/// Set the pause `slot` holds for its next step, and the [`HeldStep`] that
+/// watches and releases it.
+#[cfg(any(test, feature = "test-seam"))]
+fn hold_step(slot: &Mutex<Option<StepPause>>) -> HeldStep {
+    let (reached_tx, reached) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(StepPause {
+        reached: reached_tx,
+        release: release_rx,
+    });
+    HeldStep { reached, release }
+}
+
+/// Wait on the pause `slot` holds, if any, taking it so it pauses one step.
+#[cfg(any(test, feature = "test-seam"))]
+fn pause_step(slot: &Mutex<Option<StepPause>>) {
+    let pause = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+    if let Some(pause) = pause {
+        let _ = pause.reached.send(());
+        let _ = pause.release.recv();
     }
 }
 
@@ -699,6 +727,8 @@ impl SharedCodePairSessions {
             changed: tokio::sync::Notify::new(),
             #[cfg(any(test, feature = "test-seam"))]
             build_pause: Mutex::new(None),
+            #[cfg(any(test, feature = "test-seam"))]
+            save_pause: Mutex::new(None),
         }))
     }
 
@@ -745,37 +775,20 @@ impl SharedCodePairSessions {
     }
 
     /// Pause the next admitted `code-pair-start` just before its CPace step,
-    /// with the state lock released, until the returned [`HeldBuild`] is
+    /// with the state lock released, until the returned [`HeldStep`] is
     /// released or dropped.
     #[cfg(any(test, feature = "test-seam"))]
-    pub fn hold_next_build_for_test(&self) -> HeldBuild {
-        let (reached_tx, reached) = std::sync::mpsc::channel();
-        let (release, release_rx) = std::sync::mpsc::channel();
-        *self
-            .0
-            .build_pause
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(BuildPause {
-            reached: reached_tx,
-            release: release_rx,
-        });
-        HeldBuild { reached, release }
+    pub fn hold_next_build_for_test(&self) -> HeldStep {
+        hold_step(&self.0.build_pause)
     }
 
-    /// Wait on the pause [`SharedCodePairSessions::hold_next_build_for_test`]
-    /// set, if any.
+    /// Pause the next right code's row save in `code-pair-finish` just before
+    /// it runs, with the state lock released and the try already taken from
+    /// the pending ones, until the returned [`HeldStep`] is released or
+    /// dropped. The verb answers only once the save ended.
     #[cfg(any(test, feature = "test-seam"))]
-    fn pause_build(&self) {
-        let pause = self
-            .0
-            .build_pause
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(pause) = pause {
-            let _ = pause.reached.send(());
-            let _ = pause.release.recv();
-        }
+    pub fn hold_next_save_for_test(&self) -> HeldStep {
+        hold_step(&self.0.save_pause)
     }
 
     fn now(&self) -> u64 {
@@ -959,7 +972,7 @@ impl SharedCodePairSessions {
         let _starting = self.starting();
         let taken = self.take_try(initiator)?;
         #[cfg(any(test, feature = "test-seam"))]
-        self.pause_build();
+        pause_step(&self.0.build_pause);
         let mut responder = CpaceResponder::new(
             taken.code,
             PakeIdentities::new(PublicKey(initiator), responder_key, Vec::new()),
@@ -1125,6 +1138,8 @@ impl SharedCodePairSessions {
             arm,
             paired: None,
         };
+        #[cfg(any(test, feature = "test-seam"))]
+        pause_step(&self.0.save_pause);
         let saved = save(&confirmed);
         if saved.is_ok() {
             end.paired = Some(PairedDesk::tokenized(account.0, label));
