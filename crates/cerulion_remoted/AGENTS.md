@@ -1,6 +1,6 @@
 # cerulion_remoted
 
-One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + ops/1; pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
+One endpoint: public key=EndpointId; 32-byte secret seeds pairing. wire/2 + ops/1; pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
 ## Invariants
 - Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
@@ -29,7 +29,7 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
   connectd mirrors the robot protocol (no production remoted dep): update both,
   pinned by `protocol_parity_test.rs`.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Audit: regular files, bounded lines, external witness. Finals match Exit, 0600, no replacement. Checkpoints: newest valid, bounded sync wait; failure stops.
+- Audit: regular files, bounded lines, external witness. Finals: full IDs, 0600, exclusive; sync dirs/parent. Checkpoints: newest valid, bounded sync; failure stops.
 - Desk keys: 32 raw bytes; `create_new`, 0600, NEVER overwrite.
   `~/.cerulion` secrets: `auth::atomic_write_secret`.
   Epoch cache: ONE `cerulion_pairing::verify` resolver for writer and both desk readers;
