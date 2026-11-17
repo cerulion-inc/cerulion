@@ -239,6 +239,7 @@ fn chain_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vector3_output("out")],
             },
@@ -251,6 +252,7 @@ fn chain_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "relay/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vector3_output("out")],
             },
@@ -263,6 +265,7 @@ fn chain_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "mid/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -812,6 +815,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -825,6 +829,7 @@ fn live_step_wakes_both_unified_and_ipc_sources() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: EXT_TOPIC.to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

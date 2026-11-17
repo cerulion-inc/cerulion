@@ -153,6 +153,7 @@ fn dual_handler_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "prod/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -363,10 +364,12 @@ fn order_graph(
                     InputDef {
                         name: "zeta".to_string(),
                         source: "prod_zeta/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "alpha".to_string(),
                         source: "prod_alpha/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![],

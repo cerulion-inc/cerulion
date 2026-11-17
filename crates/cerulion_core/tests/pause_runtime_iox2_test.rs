@@ -145,6 +145,7 @@ fn consumer_graph(
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: topic.to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         }],

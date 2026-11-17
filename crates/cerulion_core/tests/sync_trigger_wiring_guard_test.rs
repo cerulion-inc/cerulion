@@ -58,6 +58,7 @@ fn meta_input(name: &str, trigger: bool) -> InputMeta {
         depth: 1,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     }
 }
@@ -125,6 +126,7 @@ fn wired(name: &str, source: &str) -> InputDef {
     InputDef {
         name: name.to_string(),
         source: source.to_string(),
+        ..Default::default()
     }
 }
 

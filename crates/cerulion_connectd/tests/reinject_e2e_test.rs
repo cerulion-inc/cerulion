@@ -17,8 +17,10 @@
 
 use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use cerulion_connectd::config::{ConnectConfig, DemandSet};
@@ -1029,6 +1031,66 @@ async fn robot_disconnect_exits_cleanly_and_releases_ingress() {
     manager_b
         .create_ingress_injector(&topic, ORACLE_SCHEMA_HASH, MaxSliceLen::const_new(256))
         .expect("a fresh ingress injector attaches after teardown");
+}
+
+// ---------------------------------------------------------------------------
+// (4b) A shutdown already resolved when the session starts streaming ends it at
+//      once, and the session polls it only the once that resolved it.
+// ---------------------------------------------------------------------------
+
+/// A shutdown future that is ready on every poll and counts its polls.
+struct ReadyShutdown(Arc<AtomicU64>);
+
+impl Future for ReadyShutdown {
+    type Output = ();
+
+    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Poll::Ready(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shutdown_ready_at_its_first_poll_ends_the_streaming_session_at_once() {
+    let manager_a = test_manager("readyA");
+    let manager_b = test_manager("readyB");
+    let topic = format!("/reinj/ready/{}", unique_id());
+
+    let mut producers = Producers::new();
+    producers.adopt(spawn_producer(
+        manager_a.clone(),
+        topic.clone(),
+        producers.stop(),
+    ));
+
+    let daemon = disabled_endpoint([215; 32]).await;
+    let authz = Arc::new(claimed_paired(desk_public_key()));
+    let plane = Arc::new(WirePlane::with_manager("robot-ready", manager_a.clone()));
+    let config = desk_config(&daemon, DemandSet::Named(vec![topic.clone()]), None);
+    let robot = spawn_robot(daemon, authz, plane);
+
+    let polls = Arc::new(AtomicU64::new(0));
+    let summary = bounded(
+        "desk with a resolved shutdown",
+        run_connect(
+            config,
+            manager_b,
+            ignore_catalog,
+            ReadyShutdown(polls.clone()),
+        ),
+    )
+    .await
+    .expect("run_connect returns Ok on a resolved shutdown");
+
+    // `demanded` is filled from the readers at teardown, so the session got as
+    // far as streaming the topic before it stopped.
+    assert_eq!(summary.demanded, vec![topic.clone()]);
+    assert_eq!(
+        polls.load(Ordering::SeqCst),
+        1,
+        "a shutdown that resolved is never polled again"
+    );
+    robot.abort();
 }
 
 // ---------------------------------------------------------------------------

@@ -147,6 +147,7 @@ pub fn build_graph_config(shape: &Shape) -> GraphConfig {
     let input = |source: &str| InputDef {
         name: "inp".to_string(),
         source: source.to_string(),
+        ..Default::default()
     };
     GraphConfig {
         level_assignments: None,
@@ -221,6 +222,7 @@ pub fn build_multirate_config(shape: &Shape, slow_lidar: bool) -> GraphConfig {
     let input = |name: &str| InputDef {
         name: name.to_string(),
         source: format!("{name}/out"),
+        ..Default::default()
     };
     GraphConfig {
         level_assignments: None,

@@ -1065,7 +1065,7 @@ fn revoke_session_with_timeout(state: &AuthState, timeout: Duration) -> CliResul
 /// The e2e
 /// (`stale_session_refreshes_against_the_real_service`) is its live proof.
 pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
-    refresh_session_until(None)
+    refresh_session_until(None, &std::time::Instant::now)
 }
 
 /// Bound refresh-lock acquisition and the HTTP exchange by `budget`.
@@ -1073,7 +1073,10 @@ pub fn refresh_session_if_stale() -> CliResult<Option<AuthState>> {
 /// Runs on the calling thread.
 /// The refresh token is single-use: never abandon this exchange on a worker thread.
 pub fn refresh_session_if_stale_within(budget: Duration) -> CliResult<Option<AuthState>> {
-    refresh_session_until(Some(std::time::Instant::now() + budget))
+    refresh_session_until(
+        Some(std::time::Instant::now() + budget),
+        &std::time::Instant::now,
+    )
 }
 
 // A successful exchange has consumed the old refresh token. Publication (or
@@ -1083,13 +1086,34 @@ const REFRESH_SETTLEMENT_BUDGET: Duration = Duration::from_secs(1);
 // Do not spend a single-use token on a request that cannot receive a reply.
 const REFRESH_REQUEST_FLOOR: Duration = Duration::from_millis(250);
 
-fn refresh_remaining(deadline: Option<std::time::Instant>, fallback: Duration) -> Duration {
-    deadline.map_or(fallback, |deadline| {
-        deadline.saturating_duration_since(std::time::Instant::now())
-    })
+/// What is left of `deadline` at `now`, zero once it has passed, or `fallback`
+/// for an unbounded refresh.
+fn refresh_remaining(
+    deadline: Option<std::time::Instant>,
+    fallback: Duration,
+    now: std::time::Instant,
+) -> Duration {
+    deadline.map_or(fallback, |deadline| deadline.saturating_duration_since(now))
 }
 
-fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Option<AuthState>> {
+/// The refresh both public wrappers call: [`refresh_session_with_settlement`]
+/// with [`REFRESH_SETTLEMENT_BUDGET`]. The wrappers pass the monotonic clock.
+fn refresh_session_until(
+    deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
+) -> CliResult<Option<AuthState>> {
+    refresh_session_with_settlement(deadline, now, REFRESH_SETTLEMENT_BUDGET)
+}
+
+/// Every budget is read off `now`. The store wait for publishing or retiring
+/// the rotated pair is `settlement`; for a bounded refresh it runs from the
+/// moment the exchange answered, and a revoke after a superseded publication
+/// spends what is left of it.
+fn refresh_session_with_settlement(
+    deadline: Option<std::time::Instant>,
+    now: &dyn Fn() -> std::time::Instant,
+    settlement: Duration,
+) -> CliResult<Option<AuthState>> {
     let loaded = auth::load();
     let Some(state) = loaded.state() else {
         // Never logged in (or corrupt) — nothing to refresh (the gate handles it).
@@ -1108,9 +1132,10 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         )
     })?;
     let refresh_lock = match deadline {
-        Some(_) => {
-            auth::hold_refresh_lock_within(&auth_path, refresh_remaining(deadline, HTTP_TIMEOUT))
-        }
+        Some(_) => auth::hold_refresh_lock_within(
+            &auth_path,
+            refresh_remaining(deadline, HTTP_TIMEOUT, now()),
+        ),
         None => auth::hold_refresh_lock(&auth_path),
     };
     let _refreshing =
@@ -1123,7 +1148,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         return Ok(None);
     }
     let base = account_service_base();
-    let remaining = refresh_remaining(deadline, HTTP_TIMEOUT);
+    let remaining = refresh_remaining(deadline, HTTP_TIMEOUT, now());
     if remaining < REFRESH_REQUEST_FLOOR {
         return Err(CliError::Login(
             "session refresh exceeded its time budget".into(),
@@ -1136,14 +1161,14 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         "/v1/auth/refresh",
         &serde_json::json!({ "refresh_token": state.refresh_token }),
     )?;
-    let settlement_deadline =
-        deadline.map(|_| std::time::Instant::now() + REFRESH_SETTLEMENT_BUDGET);
-    let now = auth::now_unix_ns();
+    let settlement_deadline = deadline.map(|_| now() + settlement);
+    let issued_at_ns = auth::now_unix_ns();
     let new_state = AuthState {
         account_id: state.account_id.clone(),
         session_token: refreshed.session_token,
         refresh_token: refreshed.refresh_token,
-        expires_at_ns: now.saturating_add(refreshed.expires_in.saturating_mul(1_000_000_000)),
+        expires_at_ns: issued_at_ns
+            .saturating_add(refreshed.expires_in.saturating_mul(1_000_000_000)),
         logged_in_ever: true,
         // A token refresh preserves this machine's install-determined
         // role (it is orthogonal to the session).
@@ -1159,7 +1184,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
     // with the session it just retired.
     let publication = auth::with_store_lock_within(
         &auth_path,
-        refresh_remaining(settlement_deadline, REFRESH_SETTLEMENT_BUDGET),
+        refresh_remaining(settlement_deadline, settlement, now()),
         || {
             let current = auth::load_from(&auth_path);
             let current_refresh = current.state().map(|c| c.refresh_token.as_str());
@@ -1188,7 +1213,7 @@ fn refresh_session_until(deadline: Option<std::time::Instant>) -> CliResult<Opti
         // revoked only the pair we exchanged, and a login or a peer's refresh
         // holds a different session. Retire it whatever replaced it, so no
         // session stays live at the service that this machine cannot sign out.
-        let remaining = refresh_remaining(settlement_deadline, HTTP_TIMEOUT);
+        let remaining = refresh_remaining(settlement_deadline, HTTP_TIMEOUT, now());
         let revoked = if remaining.is_zero() {
             Err(CliError::Login(
                 "session refresh exceeded its time budget".into(),
@@ -1564,6 +1589,21 @@ fn post_json<T: for<'de> Deserialize<'de>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_refresh_budget_left_is_read_off_the_given_instant_and_stops_at_zero() {
+        let now = std::time::Instant::now();
+        let fallback = Duration::from_millis(700);
+        assert_eq!(refresh_remaining(None, fallback, now), fallback);
+        assert_eq!(
+            refresh_remaining(Some(now + Duration::from_millis(5)), fallback, now),
+            Duration::from_millis(5)
+        );
+        assert_eq!(
+            refresh_remaining(Some(now), fallback, now + Duration::from_millis(1)),
+            Duration::ZERO
+        );
+    }
 
     #[test]
     fn a_refreshed_pair_a_peer_already_stored_is_kept_not_revoked() {
@@ -2014,80 +2054,147 @@ mod tests {
     struct BusyRefreshResult {
         refreshed: CliResult<Option<AuthState>>,
         stored: AuthState,
-        elapsed: Duration,
+        /// The account service operations the fake service answered, in order.
+        served: Vec<&'static str>,
+        auth_path: std::path::PathBuf,
     }
 
+    /// When the peer in [`refresh_after_busy_store`] releases the store.
     #[cfg(unix)]
-    fn refresh_after_busy_store(replacement: Option<AuthState>) -> BusyRefreshResult {
+    enum StoreRelease {
+        /// Once the account service has answered the refresh.
+        AfterRotation,
+        /// Once the refresh call has returned.
+        AfterReturn,
+    }
+
+    /// The refresh the client in [`refresh_after_busy_store`] runs.
+    #[cfg(unix)]
+    enum BusyRefresh {
+        /// [`refresh_session_with_settlement`] with this settlement window,
+        /// bounded at [`FIXTURE_CEILING`] on the moved clock.
+        Settling(Duration),
+        /// [`refresh_session_until`], the entry both public wrappers call,
+        /// bounded at [`FIXTURE_CEILING`] on the moved clock. It picks the
+        /// settlement budget itself.
+        Shipped,
+        /// The public [`refresh_session_if_stale`]: no request deadline, on the
+        /// monotonic clock.
+        Unbounded,
+    }
+
+    /// The stale pair the busy-store fixture seeds: its refresh token is the
+    /// single-use one the fake account service accepts.
+    #[cfg(unix)]
+    fn busy_store_seeded_pair() -> AuthState {
+        AuthState {
+            account_id: "publication-account".into(),
+            session_token: "original-session".into(),
+            refresh_token: "single-use-refresh".into(),
+            expires_at_ns: 1,
+            logged_in_ever: true,
+            role: None,
+        }
+    }
+
+    /// The bound on every wait in the busy-store fixture. Each step ends on a
+    /// signal from the step before it, so only a wedged step reaches this.
+    #[cfg(unix)]
+    const FIXTURE_CEILING: Duration = Duration::from_secs(30);
+
+    /// How far the fake account service moves the refresh's clock while it
+    /// answers the exchange: past the request deadline and past any
+    /// settlement window opened before the move.
+    #[cfg(unix)]
+    const CLOCK_JUMP: Duration = Duration::from_secs(3_600);
+
+    /// Runs `refresh` on a stale session while a peer holds the credential
+    /// store. A bounded refresh reads a clock the fake account service moves
+    /// forward by [`CLOCK_JUMP`] before it sends the rotated pair, so the
+    /// request deadline has passed when the client publishes or retires that
+    /// pair. The peer writes `replacement`, if any, once the service has
+    /// answered, and releases the store as `release` says.
+    #[cfg(unix)]
+    fn refresh_after_busy_store(
+        replacement: Option<AuthState>,
+        refresh: BusyRefresh,
+        release: StoreRelease,
+    ) -> BusyRefreshResult {
         use std::io::{BufRead, BufReader, Read, Write};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
         let _environment = env_lock();
         let directory = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("CERULION_HOME", directory.path().to_str().unwrap());
         let path = directory.path().join("auth.json");
-        auth::write_to(
-            &path,
-            &AuthState {
-                account_id: "publication-account".into(),
-                session_token: "original-session".into(),
-                refresh_token: "single-use-refresh".into(),
-                expires_at_ns: 1,
-                logged_in_ever: true,
-                role: None,
-            },
-        )
-        .unwrap();
+        auth::write_to(&path, &busy_store_seeded_pair()).unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let _service = EnvGuard::set(
             ACCOUNT_SERVICE_ENV,
             &format!("http://{}", listener.local_addr().unwrap()),
         );
         listener.set_nonblocking(true).unwrap();
+        let clock_jump_secs = Arc::new(AtomicU64::new(0));
+        let client_returned = Arc::new(AtomicBool::new(false));
         let (held, holding) = std::sync::mpsc::channel();
         let (rotated, rotation) = std::sync::mpsc::channel();
-        let retire = replacement.is_some();
+        let (returned, returning) = std::sync::mpsc::channel();
         let peer_path = path.clone();
         let peer = std::thread::spawn(move || {
             auth::with_store_lock(&peer_path, || {
                 held.send(()).unwrap();
-                rotation.recv_timeout(Duration::from_secs(3)).unwrap();
+                rotation
+                    .recv_timeout(FIXTURE_CEILING)
+                    .expect("the account service never answered the refresh");
                 if let Some(replacement) = replacement {
                     auth::write_to(&peer_path, &replacement)?;
                 }
-                // Keep the store occupied after the refresh request succeeded
-                // and past its caller deadline, optionally replacing the login.
-                std::thread::sleep(Duration::from_millis(500));
+                if let StoreRelease::AfterReturn = release {
+                    returning
+                        .recv_timeout(FIXTURE_CEILING)
+                        .expect("the refresh never returned");
+                }
                 Ok(())
             })
             .unwrap();
         });
-        holding.recv_timeout(Duration::from_secs(1)).unwrap();
+        holding
+            .recv_timeout(FIXTURE_CEILING)
+            .expect("the peer never took the store lock");
+        let service_clock = Arc::clone(&clock_jump_secs);
+        let service_saw_return = Arc::clone(&client_returned);
         let server = std::thread::spawn(move || {
-            for operation in ["refresh", "revoke"]
-                .into_iter()
-                .take(if retire { 2 } else { 1 })
-            {
-                let deadline = std::time::Instant::now() + Duration::from_secs(2);
-                let (mut stream, _) = loop {
-                    match listener.accept() {
-                        Ok(accepted) => break accepted,
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            assert!(
-                                std::time::Instant::now() < deadline,
-                                "refresh never reached the account service"
-                            );
-                            std::thread::sleep(Duration::from_millis(5));
+            let mut served = Vec::new();
+            let ceiling = std::time::Instant::now() + FIXTURE_CEILING;
+            loop {
+                // Read before the accept: a request the client sent before it
+                // returned is already queued, so the loop serves it first.
+                let returned = service_saw_return.load(Ordering::Acquire);
+                let mut stream = match listener.accept() {
+                    Ok((stream, _)) => stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if returned {
+                            return served;
                         }
-                        Err(error) => panic!("refresh accept failed: {error}"),
+                        assert!(
+                            std::time::Instant::now() < ceiling,
+                            "no further POST /v1/auth request reached the account service \
+                             and the refresh did not return; served {served:?}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
                     }
+                    Err(error) => panic!("account service accept failed: {error}"),
                 };
                 stream.set_nonblocking(false).unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(FIXTURE_CEILING)).unwrap();
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
                 assert_ne!(reader.read_line(&mut first).unwrap(), 0);
-                assert!(first.starts_with(&format!("POST /v1/auth/{operation} ")));
+                let operation = ["refresh", "revoke"]
+                    .into_iter()
+                    .find(|operation| first.starts_with(&format!("POST /v1/auth/{operation} ")))
+                    .unwrap_or_else(|| panic!("unexpected account service request: {first:?}"));
                 let mut length = 0;
                 let mut protocol = false;
                 let mut authorized_rotation = false;
@@ -2110,11 +2217,16 @@ mod tests {
                 drop(reader);
                 let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
                 let reply = if operation == "refresh" {
+                    assert!(
+                        served.is_empty(),
+                        "a refresh arrived after {served:?}; the single-use token is exchanged once"
+                    );
                     assert_eq!(
                         body,
                         serde_json::json!({"refresh_token":"single-use-refresh"})
                     );
-                    std::thread::sleep(Duration::from_millis(350));
+                    // The client reads its clock again only after this reply.
+                    service_clock.fetch_add(CLOCK_JUMP.as_secs(), Ordering::SeqCst);
                     r#"{"session_token":"rotated-session","refresh_token":"rotated-refresh","expires_in":60}"#
                 } else {
                     assert!(authorized_rotation);
@@ -2128,37 +2240,58 @@ mod tests {
                 if operation == "refresh" {
                     rotated.send(()).unwrap();
                 }
+                served.push(operation);
             }
         });
-        let budget = Duration::from_millis(500);
-        let began = std::time::Instant::now();
-        let refreshed = refresh_session_if_stale_within(budget);
-        let elapsed = began.elapsed();
-        server.join().unwrap();
-        peer.join().unwrap();
+        let client_clock = Arc::clone(&clock_jump_secs);
+        let now = move || {
+            std::time::Instant::now() + Duration::from_secs(client_clock.load(Ordering::SeqCst))
+        };
+        let deadline = now() + FIXTURE_CEILING;
+        let refreshed = match refresh {
+            BusyRefresh::Settling(settlement) => {
+                refresh_session_with_settlement(Some(deadline), &now, settlement)
+            }
+            BusyRefresh::Shipped => refresh_session_until(Some(deadline), &now),
+            BusyRefresh::Unbounded => refresh_session_if_stale(),
+        };
+        client_returned.store(true, Ordering::Release);
+        // A peer that released the store at the rotation has dropped its receiver.
+        let _ = returned.send(());
+        let server = server.join();
+        let peer = peer.join();
+        assert!(
+            peer.is_ok(),
+            "the peer holding the store failed; the refresh returned {refreshed:?}"
+        );
+        let Ok(served) = server else {
+            panic!("the fake account service failed; the refresh returned {refreshed:?}");
+        };
         BusyRefreshResult {
             refreshed,
             stored: auth::load_from(&path).state().unwrap().clone(),
-            elapsed,
+            served,
+            auth_path: path,
         }
     }
 
+    /// The request deadline passes while the exchange is in flight, and the
+    /// rotated pair is still returned and stored.
     #[test]
     #[cfg(unix)]
     fn a_successful_bounded_refresh_persists_rotated_tokens_after_the_request_deadline() {
-        let result = refresh_after_busy_store(None);
-        assert!(
-            result.refreshed.unwrap().is_some(),
-            "a spent refresh token's replacement must be persisted"
+        let result = refresh_after_busy_store(
+            None,
+            BusyRefresh::Settling(FIXTURE_CEILING),
+            StoreRelease::AfterRotation,
         );
-        assert!(
-            result.elapsed >= Duration::from_millis(500),
-            "publication must wait past the exhausted request budget"
-        );
-        assert!(
-            result.elapsed < Duration::from_secs(2),
-            "publication remains bounded: {:?}",
-            result.elapsed
+        let refreshed = result
+            .refreshed
+            .unwrap()
+            .expect("a spent refresh token's replacement must be persisted");
+        assert_eq!(
+            refreshed, result.stored,
+            "the stored pair is the returned one"
         );
         assert_eq!(result.stored.account_id, "publication-account");
         assert_eq!(result.stored.session_token, "rotated-session");
@@ -2166,8 +2299,12 @@ mod tests {
         assert!(result.stored.session_is_valid(auth::now_unix_ns()));
         assert!(result.stored.logged_in_ever);
         assert_eq!(result.stored.role, None);
+        assert_eq!(result.served, ["refresh"]);
     }
 
+    /// The revoke budget comes from the settlement window opened at the reply.
+    /// One taken from the passed request deadline is zero, which skips the
+    /// revoke and leaves `served` at `["refresh"]`.
     #[test]
     #[cfg(unix)]
     fn a_superseded_bounded_refresh_retires_its_pair_after_the_request_deadline() {
@@ -2179,17 +2316,80 @@ mod tests {
             logged_in_ever: true,
             role: None,
         };
-        let result = refresh_after_busy_store(Some(signed_out.clone()));
-        assert!(result.refreshed.unwrap().is_none());
+        let result = refresh_after_busy_store(
+            Some(signed_out.clone()),
+            BusyRefresh::Settling(FIXTURE_CEILING),
+            StoreRelease::AfterRotation,
+        );
+        assert_eq!(result.refreshed.unwrap(), None);
         assert_eq!(
             result.stored, signed_out,
             "a concurrent sign-out must never be overwritten"
         );
-        assert!(result.elapsed >= Duration::from_millis(500));
-        assert!(
-            result.elapsed < Duration::from_secs(2),
-            "retirement remains bounded: {:?}",
-            result.elapsed
+        assert_eq!(
+            result.served,
+            ["refresh", "revoke"],
+            "the unpublished rotated pair must be revoked"
+        );
+    }
+
+    /// While a peer holds the store past the settlement budget, the store wait
+    /// of the entry both public wrappers call ends at that budget. The wait is
+    /// measured from the reply: a zero wait, or one taken from the passed
+    /// request deadline, reports 0ms, and one longer than the shipped budget
+    /// reports more than 1000ms. The original pair stays.
+    #[test]
+    #[cfg(unix)]
+    fn a_bounded_refresh_stops_waiting_for_a_busy_store_at_the_settlement_budget() {
+        let result =
+            refresh_after_busy_store(None, BusyRefresh::Shipped, StoreRelease::AfterReturn);
+        let error = result
+            .refreshed
+            .expect_err("a store held past the settlement budget refuses the publication")
+            .to_string();
+        let prefix = format!(
+            "could not persist the refreshed session: another Cerulion process is writing {} and did not finish within ",
+            result.auth_path.display()
+        );
+        let waited_ms: u128 = error
+            .strip_prefix(&prefix)
+            .and_then(|text| text.strip_suffix("ms"))
+            .unwrap_or_else(|| panic!("the busy store must end the refresh: {error}"))
+            .parse()
+            .unwrap();
+        assert!((1..=1_000).contains(&waited_ms), "{error}");
+        assert_eq!(result.stored, busy_store_seeded_pair());
+        assert_eq!(
+            result.served.first(),
+            Some(&"refresh"),
+            "the store wait follows the exchange"
+        );
+    }
+
+    /// While a peer holds the store, the public unbounded refresh waits for it
+    /// exactly the settlement budget, as its refusal reports: a zero wait
+    /// reports 0ms, and the HTTP timeout 30000ms. The original pair stays.
+    #[test]
+    #[cfg(unix)]
+    fn an_unbounded_refresh_stops_waiting_for_a_busy_store_at_the_settlement_budget() {
+        let result =
+            refresh_after_busy_store(None, BusyRefresh::Unbounded, StoreRelease::AfterReturn);
+        let error = result
+            .refreshed
+            .expect_err("a store held past the settlement budget refuses the publication")
+            .to_string();
+        assert_eq!(
+            error,
+            format!(
+                "could not persist the refreshed session: another Cerulion process is writing {} and did not finish within 1000ms",
+                result.auth_path.display()
+            )
+        );
+        assert_eq!(result.stored, busy_store_seeded_pair());
+        assert_eq!(
+            result.served.first(),
+            Some(&"refresh"),
+            "the store wait follows the exchange"
         );
     }
 

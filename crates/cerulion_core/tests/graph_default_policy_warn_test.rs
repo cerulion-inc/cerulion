@@ -69,6 +69,7 @@ fn meta_input(name: &str, trigger: bool) -> InputMeta {
         depth: 1,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     }
 }
