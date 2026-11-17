@@ -8,18 +8,52 @@
 //! destruction, then removes its shared-memory files; an open in between
 //! fails with `IsMarkedForDestruction`. Once the files are gone an open sees
 //! the marker absent and an open-or-create builds a fresh one, so the state
-//! ends on its own. An open-only check therefore reads it as "not yet known",
-//! retries it within [`MarkerTeardown::BUDGET`], and refuses, naming the
-//! budget, only when the state outlasts it.
+//! ends on its own.
+//!
+//! Each caller of an open-only check names its [`TeardownWait`]. A request
+//! handled on its own thread or task waits the state out within
+//! [`MarkerTeardown::BUDGET`] and refuses, naming the budget, only when the
+//! state outlasts it. A check inside a zenoh callback, a demand authorizer, a
+//! listing filter, or a thread or loop that serves other work (a node's
+//! executor thread) opens once and refuses at once, naming the teardown, so a
+//! marker whose holder died mid-removal never holds up work that is not that
+//! request's.
 //!
 //! The budget counts opens and never reads a clock, so the outcome is a
-//! function of what the opens return. The opens run where a marker is opened
-//! (remote admission, the policy and mirror checks, and a local port's scope
-//! when the port is created), never on a publish or receive path: a pause
-//! changes when such an open answers, never what a frame carries.
+//! function of what the opens return. The opens run where a marker is opened,
+//! never on a publish or receive path: a pause changes when such an open
+//! answers, never what a frame carries.
 
 use std::num::NonZeroU32;
 use std::time::Duration;
+
+/// Whether an open-only marker check (the remote access policy check and the
+/// network mirror check) waits out a marker that iceoryx2 reports as being
+/// torn down: its last holder is dropping it and its files are not yet
+/// removed. Every other open error refuses the same way under both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownWait {
+    /// Open once and refuse at once, naming the teardown. For a check inside a
+    /// zenoh callback, a demand authorizer, a listing filter, or a thread or
+    /// loop that serves other work (a node's executor thread), where a wait
+    /// would hold up work that is not this request's.
+    Never,
+    /// Open again, up to 20 opens 25 ms apart, and refuse, naming that budget,
+    /// only if the marker is still being torn down after the last. For a request
+    /// handled on its own thread or task: an act verb, a remote demand or schema
+    /// read, a CLI command.
+    Bounded,
+}
+
+impl TeardownWait {
+    /// The opens this wait allows.
+    pub(crate) fn budget(self) -> MarkerTeardown {
+        match self {
+            Self::Never => MarkerTeardown::ONCE,
+            Self::Bounded => MarkerTeardown::BUDGET,
+        }
+    }
+}
 
 /// How many opens, and how far apart, a marker open retries a teardown in
 /// progress.
@@ -49,6 +83,9 @@ impl MarkerTeardown {
         super::OPEN_THEN_CREATE_TICK,
     );
 
+    /// One open and no pause: [`TeardownWait::Never`].
+    pub(crate) const ONCE: Self = Self::new(NonZeroU32::MIN, Duration::ZERO);
+
     pub(crate) const fn new(opens: NonZeroU32, pause: Duration) -> Self {
         Self { opens, pause }
     }
@@ -75,9 +112,15 @@ impl MarkerTeardown {
     }
 
     /// The refusal reason for `marker` still being torn down at the end of
-    /// this budget.
+    /// this budget; a single open says that this check does not wait.
     // hot-path-alloc-ok-fn: refusal text on a failed cold admission, never frame delivery.
     pub(crate) fn outlasted(self, marker: &str) -> String {
+        if self.opens == NonZeroU32::MIN {
+            return format!(
+                "{marker} was being torn down, and this check does not wait for it; retry the \
+                 request"
+            );
+        }
         format!(
             "{marker} was still being torn down after {} opens {} ms apart; retry the request",
             self.opens,
@@ -183,6 +226,33 @@ mod tests {
                 assert_eq!(run(20, &script), oracle, "round {round}: {script:?}");
             }
         }
+    }
+
+    #[test]
+    fn never_waiting_is_one_open_that_refuses_with_its_own_reason() {
+        assert_eq!(
+            TeardownWait::Never.budget(),
+            MarkerTeardown::new(NonZeroU32::new(1).unwrap(), Duration::ZERO)
+        );
+        assert_eq!(TeardownWait::Bounded.budget(), MarkerTeardown::BUDGET);
+        let torn = Err(Scripted::TornDown);
+        let mut calls = 0usize;
+        let outcome = TeardownWait::Never.budget().open(
+            || {
+                calls += 1;
+                [torn, Ok(1)][calls - 1]
+            },
+            |e| *e == Scripted::TornDown,
+        );
+        assert_eq!(
+            (outcome, calls),
+            (Err(MarkerOpenError::TornDown(MarkerTeardown::ONCE)), 1)
+        );
+        assert_eq!(
+            MarkerTeardown::ONCE.outlasted("its policy marker"),
+            "its policy marker was being torn down, and this check does not wait for it; retry \
+             the request"
+        );
     }
 
     #[test]

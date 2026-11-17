@@ -148,7 +148,14 @@ fn servable(topic: &str) -> CerudResult<()> {
     };
     let manager = cerulion_core::TransportManager::get_or_init()
         .map_err(|error| verb_error(VerbError::Unavailable(error.to_string())))?;
-    crate::wire::wire_servable(&manager, topic).map_err(|refusal| {
+    // An act verb runs on a blocking thread of its own: it waits out a marker
+    // being torn down.
+    crate::wire::wire_servable(
+        &manager,
+        topic,
+        cerulion_core::transport::TeardownWait::Bounded,
+    )
+    .map_err(|refusal| {
         let message = refusal.message(requested_topic);
         match refusal {
             crate::wire::SourceRefusal::Reserved => verb_error(VerbError::Usage(message)),

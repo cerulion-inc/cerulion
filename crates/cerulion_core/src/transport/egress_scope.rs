@@ -14,7 +14,7 @@ use iceoryx2::prelude::*;
 use iceoryx2::service::attribute::AttributeVerifier;
 use iceoryx2::service::builder::event::{EventOpenError, EventOpenOrCreateError};
 
-use super::marker_teardown::{MarkerOpenError, MarkerTeardown};
+use super::marker_teardown::{MarkerOpenError, MarkerTeardown, TeardownWait};
 use super::CerService;
 use crate::error::{TransportError, TransportResult};
 
@@ -267,16 +267,17 @@ impl RemoteTopicLease {
 }
 
 /// Open-only policy check. Missing means no exclusion. A marker still being
-/// torn down is opened again within [`MarkerTeardown::BUDGET`] and refuses,
-/// naming the budget, only once it outlasts it; every other error refuses.
+/// torn down is opened again as `wait` allows and refuses, naming that wait,
+/// only once it outlasts it; every other error refuses.
 // hot-path-alloc-ok-fn: cold control-plane check only, never frame delivery.
-pub(crate) fn allowed(node: &Node<CerService>, topic: &str) -> TransportResult<bool> {
-    allowed_with(
-        node,
-        topic,
-        MarkerTeardown::BUDGET,
-        &mut |builder, verifier| builder.open_with_attributes(verifier),
-    )
+pub(crate) fn allowed(
+    node: &Node<CerService>,
+    topic: &str,
+    wait: TeardownWait,
+) -> TransportResult<bool> {
+    allowed_with(node, topic, wait.budget(), &mut |builder, verifier| {
+        builder.open_with_attributes(verifier)
+    })
 }
 
 /// [`allowed`] with its teardown budget and its open of an existing marker
@@ -393,6 +394,32 @@ mod tests {
         let (answer, calls) = allowed_after(&node, "/teardown/stuck", 20, opens(20));
         assert_eq!(calls, 20);
         assert!(answer.is_err());
+    }
+
+    #[test]
+    fn a_check_that_never_waits_opens_once_and_refuses_at_once() {
+        let node = node();
+        let (answer, calls) = allowed_after(
+            &node,
+            "/teardown/callback",
+            usize::MAX,
+            TeardownWait::Never.budget(),
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            answer.unwrap_err().to_string(),
+            "Remote access policy for topic '/teardown/callback' refused: its policy marker was \
+             being torn down, and this check does not wait for it; retry the request"
+        );
+        // A marker that is not being torn down is read on that one open.
+        let _exclusion = LocalOnlyTopic::acquire(&node, "/teardown/callback_excluded").unwrap();
+        let (answer, calls) = allowed_after(
+            &node,
+            "/teardown/callback_excluded",
+            0,
+            TeardownWait::Never.budget(),
+        );
+        assert_eq!((answer.unwrap(), calls), (false, 1));
     }
 
     #[test]

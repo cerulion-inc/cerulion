@@ -593,7 +593,9 @@ fn open_genuine_local(
                 _lease: Box::new(lease),
             },
             Err(e) => {
-                return match transport.is_network_mirror(topic) {
+                return match transport
+                    .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+                {
                     Ok(true) => LocalOpen::Absent,
                     Ok(false) | Err(_) => LocalOpen::Failed(e),
                 }
@@ -610,7 +612,7 @@ fn open_genuine_local(
         Err(_) if transport.data_service_missing(topic) => return LocalOpen::Absent,
         Err(e) => return LocalOpen::Failed(e),
     };
-    match transport.is_network_mirror(topic) {
+    match transport.is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded) {
         Ok(false) => LocalOpen::Opened(Box::new(subscriber)),
         Ok(true) => LocalOpen::Absent,
         Err(e) => LocalOpen::Failed(e),

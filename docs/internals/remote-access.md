@@ -520,8 +520,11 @@ an engaged e-stop is the refusal whatever state the topic's markers are in
 `a_malformed_request_on_an_excluded_topic_is_a_usage_error`,
 `an_engaged_estop_is_the_refusal_on_an_excluded_topic`). A policy or mirror
 marker whose last holder is dropping it is opened again within
-`cerulion_core::transport::marker_teardown`'s budget (20 opens 25 ms apart)
-and refuses naming that budget only once it outlasts it.
+`cerulion_core::transport::marker_teardown`'s budget (20 opens 25 ms apart,
+`TeardownWait::Bounded`) and refuses naming that budget only once it outlasts
+it. The wire plane's demand and schema reads wait the same way; its catalog
+filter and catalog peek pass `TeardownWait::Never`, so a listing opens each
+marker once and leaves out a topic whose marker is being torn down.
 
 ## 6. The wire plane (robot side)
 

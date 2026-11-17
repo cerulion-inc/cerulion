@@ -20,7 +20,7 @@ use iceoryx2::prelude::*;
 use iceoryx2::service::attribute::AttributeVerifier;
 use iceoryx2::service::builder::event::{EventOpenError, EventOpenOrCreateError};
 
-use super::marker_teardown::{MarkerOpenError, MarkerTeardown};
+use super::marker_teardown::{MarkerOpenError, MarkerTeardown, TeardownWait};
 use super::CerService;
 use crate::error::{TransportError, TransportResult};
 
@@ -264,16 +264,17 @@ impl MirrorOrigin {
 
 /// Open-only identity check. A malformed/incompatible marker fails closed and
 /// names the marker service plus the remedy. A marker still being torn down is
-/// opened again within [`MarkerTeardown::BUDGET`] and refuses, naming the
-/// budget, only once it outlasts it.
+/// opened again as `wait` allows and refuses, naming that wait, only once it
+/// outlasts it.
 // hot-path-alloc-ok-fn: cold admission and refusal text, never frame delivery.
-pub(crate) fn is_network_mirror(node: &Node<CerService>, topic: &str) -> TransportResult<bool> {
-    is_network_mirror_with(
-        node,
-        topic,
-        MarkerTeardown::BUDGET,
-        &mut |builder, verifier| builder.open_with_attributes(verifier),
-    )
+pub(crate) fn is_network_mirror(
+    node: &Node<CerService>,
+    topic: &str,
+    wait: TeardownWait,
+) -> TransportResult<bool> {
+    is_network_mirror_with(node, topic, wait.budget(), &mut |builder, verifier| {
+        builder.open_with_attributes(verifier)
+    })
 }
 
 /// [`is_network_mirror`] with its teardown budget and its open of an existing
@@ -318,7 +319,7 @@ fn is_network_mirror_with(
 
 /// Enumerate marker identities on this manager's namespace, without a gather wait.
 // hot-path-alloc-ok-fn: one-shot topic listing, never frame delivery.
-pub(crate) fn topics(node: &Node<CerService>) -> TransportResult<Vec<String>> {
+pub(crate) fn topics(node: &Node<CerService>, wait: TeardownWait) -> TransportResult<Vec<String>> {
     let mut candidates: Vec<String> = Vec::new();
     let mut malformed: Option<(String, &'static str)> = None;
     <CerService as iceoryx2::service::Service>::list(
@@ -360,7 +361,7 @@ pub(crate) fn topics(node: &Node<CerService>) -> TransportResult<Vec<String>> {
     }
     let mut topics = Vec::new();
     for topic in candidates {
-        if is_network_mirror(node, &topic)? {
+        if is_network_mirror(node, &topic, wait)? {
             topics.push(topic);
         }
     }
@@ -548,6 +549,24 @@ mod tests {
         let (answer, calls) = mirror_after(&node, "/teardown/stuck", 20, opens(20));
         assert_eq!(calls, 20);
         assert!(answer.is_err());
+    }
+
+    #[test]
+    fn a_mirror_check_that_never_waits_opens_once_and_refuses_at_once() {
+        let node = node();
+        let (answer, calls) = mirror_after(
+            &node,
+            "/teardown/callback",
+            usize::MAX,
+            TeardownWait::Never.budget(),
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(
+            answer.unwrap_err().to_string(),
+            "Network mirror identity for topic '/teardown/callback' could not be established: \
+             its network mirror marker was being torn down, and this check does not wait for \
+             it; retry the request"
+        );
     }
 
     #[test]
