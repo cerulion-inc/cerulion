@@ -178,16 +178,17 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 /// directory where each one already exists.
 const STAGING_ATTEMPTS: u32 = 8;
 
-/// The longest part of a schema's file name a staging name embeds, so the
-/// staging name stays inside a filesystem's name limit wherever the schema's
-/// own name fits.
-const STAGING_NAME_CHARS: usize = 64;
+/// The longest file name, in bytes, a staging name is held to: the name limit
+/// of the filesystems a schema store sits on.
+const NAME_MAX_BYTES: usize = 255;
 
 /// A hidden sibling of `dest` for [`stage`] to create: the same directory, so
-/// publishing stays on one filesystem; the start of `dest`'s file name, the
-/// process id and the next [`STAGING_SEQ`]; and a `.tmp` extension, which no
-/// schema store reader loads. A name left by an earlier process with the same
-/// id can repeat, which [`stage`] meets by creating new and trying the next.
+/// publishing stays on one filesystem; a dot, then as much of `dest`'s file name
+/// as fits, cut at a character boundary, so the whole staging name stays within
+/// [`NAME_MAX_BYTES`]; then the process id, the next [`STAGING_SEQ`] and a
+/// `.tmp` extension, which no schema store reader loads. A name left by an
+/// earlier process with the same id can repeat, which [`stage`] meets by
+/// creating new and trying the next.
 fn staging_path(dest: &Path) -> std::io::Result<PathBuf> {
     let name = dest.file_name().ok_or_else(|| {
         std::io::Error::new(
@@ -195,13 +196,15 @@ fn staging_path(dest: &Path) -> std::io::Result<PathBuf> {
             "a schema path has no file name",
         )
     })?;
-    let name: String = name
-        .to_string_lossy()
-        .chars()
-        .take(STAGING_NAME_CHARS)
-        .collect();
+    let name = name.to_string_lossy();
     let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-    Ok(dest.with_file_name(format!(".{name}.{}.{seq}.tmp", std::process::id())))
+    let suffix = format!(".{}.{seq}.tmp", std::process::id());
+    // The leading dot and the suffix take their exact bytes; the name gets the rest.
+    let mut end = name.len().min(NAME_MAX_BYTES - 1 - suffix.len());
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    Ok(dest.with_file_name(format!(".{}{suffix}", &name[..end])))
 }
 
 /// Write `bytes` at `dest` whole or not at all: [`stage`] it, then
@@ -609,23 +612,82 @@ mod tests {
         assert!(logs_contain("WARN"));
     }
 
-    /// A staging name embeds at most the first 64 characters of the schema's
-    /// file name, and a path with no file name has no staging name.
+    /// A staging name embeds a short schema name whole and a long one cut at a
+    /// character boundary, and stays within the 255-byte name limit for a
+    /// 254-byte ASCII name and a 252-byte name of four-byte characters; a path
+    /// with no file name has no staging name.
     #[test]
-    fn a_staging_name_is_bounded_and_needs_a_file_name() {
-        let long = format!("{}.msg", "a".repeat(250));
-        let staging = staging_path(&Path::new("store").join(&long)).unwrap();
-        assert_eq!(staging.parent(), Some(Path::new("store")));
-        let name = staging.file_name().unwrap().to_str().unwrap();
-        let prefix = format!(".{}.{}.", "a".repeat(64), std::process::id());
+    fn a_staging_name_fits_the_name_limit_and_needs_a_file_name() {
+        let pid = std::process::id();
+        let short = staging_path(Path::new("store/Sub.msg")).unwrap();
+        let short = short.file_name().unwrap().to_str().unwrap().to_owned();
         assert!(
-            name.starts_with(&prefix) && name.ends_with(".tmp"),
-            "{name}"
+            short.starts_with(&format!(".Sub.msg.{pid}.")) && short.ends_with(".tmp"),
+            "{short}"
         );
+        for long in [
+            format!("{}.msg", "a".repeat(250)),
+            format!("{}.msg", "\u{1d538}".repeat(62)),
+        ] {
+            let staging = staging_path(&Path::new("store").join(&long)).unwrap();
+            assert_eq!(staging.parent(), Some(Path::new("store")));
+            let name = staging.file_name().unwrap().to_str().unwrap();
+            let suffix_at = name.rfind(&format!(".{pid}.")).unwrap();
+            let embedded = &name[1..suffix_at];
+            assert!(name.starts_with('.') && name.ends_with(".tmp"), "{name}");
+            assert!(name.len() <= 255, "{} bytes: {name}", name.len());
+            assert!(long.starts_with(embedded), "{embedded}");
+            // Cut at most one character short of the limit.
+            assert!(name.len() > 255 - 4, "{} bytes: {name}", name.len());
+        }
         assert_eq!(
             staging_path(Path::new("/")).unwrap_err().kind(),
             std::io::ErrorKind::InvalidInput
         );
+    }
+
+    /// A type name of 62 four-byte characters makes a 252-byte `.msg` file name,
+    /// inside the 255-byte limit: it is staged and written whole under its own
+    /// name. One character more is past the limit and is refused, as before,
+    /// with nothing left in the store.
+    #[test]
+    fn a_multibyte_name_at_the_limit_is_written_and_one_past_it_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let at_limit = "\u{1d538}".repeat(62);
+        let dest = dir
+            .path()
+            .join("acme")
+            .join("msg")
+            .join(format!("{at_limit}.msg"));
+        assert_eq!(dest.file_name().unwrap().len(), 252);
+        assert_eq!(
+            materialize_docs(
+                dir.path(),
+                &[msg_doc(&format!("acme/{at_limit}"), "float64 x\n")]
+            )
+            .unwrap(),
+            vec![MaterializeOutcome::Wrote(dest.clone())]
+        );
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "float64 x\n");
+        let entries = |path: &Path| -> Vec<std::ffi::OsString> {
+            std::fs::read_dir(path)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect()
+        };
+        assert_eq!(
+            entries(dest.parent().unwrap()),
+            vec![dest.file_name().unwrap().to_owned()]
+        );
+
+        let past = tempfile::tempdir().unwrap();
+        let err = materialize_docs(
+            past.path(),
+            &[msg_doc(&format!("acme/{at_limit}\u{1d538}"), "float64 x\n")],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("File name too long"), "{err}");
+        assert!(entries(&past.path().join("acme").join("msg")).is_empty());
     }
 
     /// A link to a missing file at a schema's path is left as it is: nothing is
