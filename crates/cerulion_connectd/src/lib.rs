@@ -52,6 +52,8 @@ pub mod act;
 pub mod pair;
 pub mod rcp;
 pub mod schema;
+#[cfg(unix)]
+pub mod session_witness;
 pub mod worker;
 
 pub use cerulion_wireclient::config::{

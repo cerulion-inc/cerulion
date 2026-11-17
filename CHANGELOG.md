@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- The connectd library can retain final session witnesses in private files. Witnesses must match a valid Exit before file creation, existing names are never replaced, and success includes durable file and directory sync.
 - The CLI engine resolves session targets from explicit pins, endpoint IDs or the owned account catalog. Ambiguous names require an explicit selector, account identity is rechecked around revocation refresh, and helper startup preserves its real exit status without passing session tokens in arguments.
 - The CLI engine provides paired remote-session argument planning and typed network refusals. Exec arguments remain literal, identity options stay intact, and invalid command or witness paths are refused before helper execution. Exhaustive Rust matches on `CliError` must handle the new `RemoteShellNetworkRefused(String)` variant or a fallback arm.
 - The remoted library lists complete session audit recordings and verifies complete files or committed prefixes against separately retained witnesses. Inspections retain incomplete paths for diagnostics, bound event lines and refuse non-regular files and Unix replacement races without changing the files.

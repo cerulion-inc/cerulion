@@ -21,8 +21,7 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so no session starves it (`estop_starvation_test.rs`).
   TLS: docs/remote_plane.md; paired keys Retry first.
-  Trust persistence is fail-closed: store-BEFORE-index, the live binding published
-  only after the durable write succeeds. Never reorder (`trust.rs`).
+  Trust: fail closed, store-BEFORE-index; publish binding only after durable success (`trust.rs`).
 - Pairing bytes: independent hand-serializer vectors (`format_vectors_test.rs`); update encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epochs monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
@@ -31,10 +30,11 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
   pinned by `protocol_parity_test.rs`.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
 - Audit verification: regular files, bounded lines; external witness required.
+- Final desk witnesses bind matching Exit, create 0600 files, never replace.
 - Desk keys: 32 raw bytes; `create_new`, 0600, NEVER overwrite.
   `~/.cerulion` secrets: `auth::atomic_write_secret`.
-  Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
-  writer and both desk readers, never hand-rolled (divergence stops revocations).
+  Epoch cache: ONE `cerulion_pairing::verify` resolver for writer and both desk readers;
+  never hand-roll (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata: namespace-checked netd snapshots or `SchemaSource`; no startup.
