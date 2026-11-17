@@ -17072,6 +17072,13 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
 /// share (bug reports, replay-as-CI, support), so the default must not leak
 /// secrets. Sorted-key JSON (BTreeMap) in every mode — deterministic bytes for
 /// a given environment.
+///
+/// In every mode a variable whose name is not valid UTF-8 is left out, because
+/// a JSON key must be text. In [`RecordEnvMode::Allowlist`] and
+/// [`RecordEnvMode::All`] a value that is not valid UTF-8 is stored as
+/// `{"fnv64": "<hex>", "redacted": true, "utf8": false}`, its FNV-1a 64 hash
+/// over the raw bytes. A warning names each variable left out, and each value
+/// the mode would have recorded verbatim.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecordEnvMode {
     /// The DEFAULT: record every variable NAME; record VALUES only for names
@@ -17084,7 +17091,8 @@ pub enum RecordEnvMode {
     /// secret itself.
     #[default]
     Allowlist,
-    /// Verbatim values for EVERY variable (full replay fidelity). A loud
+    /// Verbatim values for EVERY variable whose value is valid UTF-8 (full
+    /// replay fidelity). A loud
     /// `tracing::warn!` fires at record time: the bag embeds secrets.
     All,
     /// Variable NAMES only (values `null`). Replay env-fidelity is off

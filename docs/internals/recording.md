@@ -20,6 +20,15 @@ User-facing recording docs live in `docs/bag.md`.
   metadata), `record_health.json` (per-topic drain health),
   `record_coverage.json` (what was and was not recorded, and why), plus
   `graph.yaml` and `env.json` for replay.
+- The bag's `env.json` attachment and the run directory's `env.json` are
+  rendered by one pure function, `graph_cmd::render_env_json`, over
+  `std::env::vars_os()` (`render_process_env_json` reads the environment and
+  warns). A name that is not valid UTF-8 is left out, and under `allowlist` and
+  `all` a value that is not valid UTF-8 is stored as
+  `{"fnv64": "<hex>", "redacted": true, "utf8": false}`, hashed over its raw
+  bytes;
+  `replay_engine::compare_env_against` reads `fnv64` from any object, so it
+  compares that entry by bytes.
 - The bag's `graph.yaml` attachment is the **effective in-memory graph config
   the run executed**, rendered by `graph_cmd::render_effective_graph_yaml`,
   never a copy of the on-disk graph file. The same renderer writes the run
