@@ -6692,9 +6692,9 @@ impl DemandPlane for NetdDemandPlane {
 
     /// The same socket, a fresh lazy client: the follower's own connection.
     fn follower_plane(&self) -> Option<Arc<dyn DemandPlane>> {
-        Some(Arc::new(NetdDemandPlane {
-            client: Mutex::new(None),
-            socket: self.socket.clone(),
+        Some(Arc::new(match &self.socket {
+            Some(socket) => NetdDemandPlane::with_socket(socket.clone()),
+            None => NetdDemandPlane::new(),
         }))
     }
 }
@@ -7620,7 +7620,7 @@ mod fire_follower_tests {
         );
     }
 
-    /// A netd that greets as protocol v9, the last one without `query_fires`,
+    /// A netd that greets as protocol v11, the last one without `query_fires`,
     /// and counts the connections it accepts and the request lines it reads.
     struct OldNetd {
         dir: PathBuf,
@@ -7654,7 +7654,7 @@ mod fire_follower_tests {
                     }
                     counted.fetch_add(1, Ordering::SeqCst);
                     let banner = format!(
-                        r#"{{"hello":"cerulion-netd","protocol":9,"wire_header":{}}}"#,
+                        r#"{{"hello":"cerulion-netd","protocol":11,"wire_header":{}}}"#,
                         cerulion_core::wire::WIRE_HEADER_VERSION
                     );
                     if writeln!(stream, "{banner}").is_err() {
@@ -7702,9 +7702,9 @@ mod fire_follower_tests {
         for poll in 0..4 {
             let error = plane
                 .query_fires("temi", RUN_TEXT, None)
-                .expect_err("a v9 netd cannot serve fires");
+                .expect_err("a v11 netd cannot serve fires");
             assert!(
-                error.contains("v9") && error.contains("v10"),
+                error.contains("v11") && error.contains("v12"),
                 "poll {poll}: {error}"
             );
         }
@@ -7724,14 +7724,14 @@ mod fire_follower_tests {
             .expect("a netd plane opens follower planes");
         plane
             .query_fires("temi", RUN_TEXT, None)
-            .expect_err("a v9 netd cannot serve fires");
+            .expect_err("a v11 netd cannot serve fires");
         assert_eq!(netd.accepted.load(Ordering::SeqCst), 1);
 
         netd.hang_up();
         let error = plane
             .query_fires("temi", RUN_TEXT, None)
-            .expect_err("this netd is still v9");
-        assert!(error.contains("v9"), "{error}");
+            .expect_err("this netd is still v11");
+        assert!(error.contains("v11"), "{error}");
         assert_eq!(
             netd.accepted.load(Ordering::SeqCst),
             2,
