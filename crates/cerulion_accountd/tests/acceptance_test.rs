@@ -1792,3 +1792,224 @@ async fn team_page_is_served_openly_while_its_data_stays_session_gated() {
         );
     }
 }
+
+/// A robot reads its own access state by proving possession of its registered
+/// transport key, with no session: a challenge request signed by the key over
+/// its request time (`POST /v1/robots/{id}/access/challenge`), then the
+/// challenge signed by the key (`POST /v1/robots/{id}/access`). A request by any
+/// other key is refused uncounted, so it cannot spend the robot's budget; a
+/// replayed request is refused; the challenge is single use and bound to the
+/// robot; the answer is the owner's signed epoch; the budget is 900 an hour.
+#[tokio::test]
+async fn a_robot_reads_its_own_access_state_with_its_transport_key() {
+    use cerulion_pairing::pop::{
+        sign_robot_pop, PURPOSE_ROBOT_ACCESS, PURPOSE_ROBOT_ACCESS_CHALLENGE,
+    };
+    let (addr, _state, email) = spawn().await;
+    let http = reqwest::Client::new();
+    let (session, _owner) = login(&addr, &http, &email, "owner@robot-pop.example").await;
+    let robot_sk = SigningKey::from_bytes(&[0x6C; 32]);
+    let robot_key = robot_sk.verifying_key().to_bytes();
+    let robot_id_b64 = register_robot_http(&addr, &http, &session, &robot_sk, "pop-robot").await;
+    let robot_id: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&robot_id_b64)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    // A strictly later request time on every call.
+    let clock = std::sync::atomic::AtomicU64::new(now_ns());
+    let next_at = || {
+        clock.fetch_max(now_ns(), std::sync::atomic::Ordering::SeqCst);
+        (clock.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1).to_string()
+    };
+    let challenge_signed =
+        |id: String, signer: SigningKey, robot: [u8; 32], key: [u8; 32], at: String| {
+            let http = http.clone();
+            let addr = addr.clone();
+            async move {
+                let sig =
+                    sign_robot_pop(&signer, PURPOSE_ROBOT_ACCESS_CHALLENGE, &robot, &key, &at);
+                http.post(format!("{addr}/v1/robots/{id}/access/challenge"))
+                    .json(&serde_json::json!({
+                        "requested_at_ns": at,
+                        "request_signature": URL_SAFE_NO_PAD.encode(sig.0),
+                    }))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+    let read = |id: String, ch: String, sig: [u8; 64]| {
+        let http = http.clone();
+        let addr = addr.clone();
+        async move {
+            http.post(format!("{addr}/v1/robots/{id}/access"))
+                .json(&serde_json::json!({
+                    "pop_challenge": ch,
+                    "pop_signature": URL_SAFE_NO_PAD.encode(sig),
+                }))
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let challenge_of = |res: reqwest::Response| async move {
+        assert_eq!(res.status(), 200);
+        let v: Value = res.json().await.unwrap();
+        v["challenge"].as_str().unwrap().to_string()
+    };
+    let robot = || (robot_id_b64.clone(), robot_sk.clone(), robot_id, robot_key);
+
+    // Another key's request, and one far from the clock: refused, uncounted.
+    let other = SigningKey::from_bytes(&[0x6D; 32]);
+    let (id, _, rid, rkey) = robot();
+    assert_eq!(
+        challenge_signed(id.clone(), other.clone(), rid, rkey, next_at())
+            .await
+            .status(),
+        403
+    );
+    let stale = (now_ns() - 6 * 60 * 1_000_000_000).to_string();
+    let refused = challenge_signed(id.clone(), robot_sk.clone(), rid, rkey, stale).await;
+    assert_eq!(refused.status(), 403);
+    let body: Value = refused.json().await.unwrap();
+    // The refusal names the service's time so the robot can retry at once.
+    let server_time: u64 = body["server_time_ns"].as_str().unwrap().parse().unwrap();
+    assert!(server_time.abs_diff(now_ns()) < 60 * 1_000_000_000);
+    assert!(body.get("next_requested_at_ns").is_none());
+
+    // A replayed request: the first is answered, the same signed time again is not.
+    let at = next_at();
+    let (id, sk, rid, rkey) = robot();
+    let ch =
+        challenge_of(challenge_signed(id.clone(), sk.clone(), rid, rkey, at.clone()).await).await;
+    let replay = challenge_signed(id.clone(), sk.clone(), rid, rkey, at.clone()).await;
+    assert_eq!(replay.status(), 403);
+    let body: Value = replay.json().await.unwrap();
+    let next = (at.parse::<u64>().unwrap() + 1).to_string();
+    assert_eq!(body["next_requested_at_ns"], next.as_str());
+
+    // Another key's proof: 403, and the challenge is not burned.
+    let forged = sign_robot_pop(&other, PURPOSE_ROBOT_ACCESS, &robot_id, &robot_key, &ch);
+    assert_eq!(read(id.clone(), ch.clone(), forged.0).await.status(), 403);
+    let sig = sign_robot_pop(&robot_sk, PURPOSE_ROBOT_ACCESS, &robot_id, &robot_key, &ch);
+    let access0: Value = read(id.clone(), ch.clone(), sig.0)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(access0["epoch"], 0);
+    assert!(access0["signed_epoch"].is_null());
+    // Single use.
+    assert_eq!(read(id.clone(), ch.clone(), sig.0).await.status(), 403);
+
+    // The owner revokes a device; the robot's own read returns the signed epoch.
+    let revoked = URL_SAFE_NO_PAD.encode([0x5D_u8; 32]);
+    let rev = http
+        .post(format!("{addr}/v1/robots/{robot_id_b64}/revoke"))
+        .bearer_auth(&session)
+        .json(&serde_json::json!({ "device_key": revoked }))
+        .send()
+        .await
+        .unwrap();
+    assert!(rev.status().is_success());
+    let ch =
+        challenge_of(challenge_signed(id.clone(), sk.clone(), rid, rkey, next_at()).await).await;
+    let sig = sign_robot_pop(&robot_sk, PURPOSE_ROBOT_ACCESS, &robot_id, &robot_key, &ch);
+    let access1: Value = read(id.clone(), ch, sig.0).await.json().await.unwrap();
+    assert_eq!(access1["epoch"], 1);
+    assert_eq!(access1["revoked_devices"][0], revoked.as_str());
+    let signed: SignedEpoch =
+        cerulion_accountd::decode_b64(access1["signed_epoch"].as_str().unwrap()).unwrap();
+    assert_eq!(signed.epoch_data.robot, RobotId(robot_id));
+
+    // A challenge issued to one robot is not spendable by another.
+    let second_sk = SigningKey::from_bytes(&[0x6E; 32]);
+    let second_key = second_sk.verifying_key().to_bytes();
+    let second_b64 = register_robot_http(&addr, &http, &session, &second_sk, "pop-robot-2").await;
+    let second: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(&second_b64)
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let ch =
+        challenge_of(challenge_signed(id.clone(), sk.clone(), rid, rkey, next_at()).await).await;
+    let sig = sign_robot_pop(&second_sk, PURPOSE_ROBOT_ACCESS, &second, &second_key, &ch);
+    assert_eq!(read(second_b64.clone(), ch, sig.0).await.status(), 403);
+
+    // An unknown robot: 404 at both routes.
+    let unknown = URL_SAFE_NO_PAD.encode([0x01_u8; 32]);
+    assert_eq!(
+        challenge_signed(unknown.clone(), sk.clone(), [0x01; 32], rkey, next_at())
+            .await
+            .status(),
+        404
+    );
+    assert_eq!(read(unknown, "x".into(), [0; 64]).await.status(), 404);
+
+    // The window: 3 challenges issued so far; 897 more succeed, then 429. A
+    // request by another key in between is refused without counting.
+    for n in 0..897 {
+        if n == 448 {
+            assert_eq!(
+                challenge_signed(id.clone(), other.clone(), rid, rkey, next_at())
+                    .await
+                    .status(),
+                403
+            );
+        }
+        assert_eq!(
+            challenge_signed(id.clone(), sk.clone(), rid, rkey, next_at())
+                .await
+                .status(),
+            200
+        );
+    }
+    let limited = challenge_signed(id.clone(), sk.clone(), rid, rkey, next_at()).await;
+    assert_eq!(limited.status(), 429);
+    let body: Value = limited.json().await.unwrap();
+    assert_eq!(body["error"], "slow_down");
+    // Another robot's budget is its own.
+    let ok = challenge_signed(second_b64, second_sk.clone(), second, second_key, next_at()).await;
+    assert_eq!(ok.status(), 200);
+}
+
+/// A malformed body at a robot's own access routes is a 400 naming that route's
+/// fields and, for the access read, where its challenge comes from; never the
+/// session-bound device challenge, which a robot with a lapsed login cannot use.
+#[tokio::test]
+async fn a_malformed_robot_access_body_names_the_fields_its_route_needs() {
+    let (addr, _state, _email) = spawn().await;
+    let http = reqwest::Client::new();
+    let robot = URL_SAFE_NO_PAD.encode([0x6C_u8; 32]);
+    let cases = [
+        (
+            format!("{addr}/v1/robots/{robot}/access/challenge"),
+            serde_json::json!({ "requested_at_ns": 5 }),
+            "This endpoint needs no session: send `requested_at_ns`, the request time as a string \
+             of Unix nanoseconds, and `request_signature`, the robot's transport key signature \
+             over the robot proof message for `robot-access-challenge` ending in that time.",
+        ),
+        (
+            format!("{addr}/v1/robots/{robot}/access"),
+            serde_json::json!({ "pop_signature": "AA" }),
+            "This endpoint needs no session: send `pop_challenge`, a challenge from POST \
+             /v1/robots/{robot_id}/access/challenge, and `pop_signature`, the robot's transport \
+             key signature over the robot proof message for `robot-access` ending in that \
+             challenge.",
+        ),
+    ];
+    for (url, body, hint) in cases {
+        let resp = http.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), 400, "{url}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_request");
+        let text = body["error_description"].as_str().unwrap();
+        assert!(
+            text.starts_with("bad request: invalid request body: "),
+            "{text}"
+        );
+        assert!(text.ends_with(hint), "{url}: {text}");
+        assert!(!text.contains("/v1/devices/challenge"), "{url}: {text}");
+    }
+}

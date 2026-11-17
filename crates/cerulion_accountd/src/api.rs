@@ -22,12 +22,13 @@ use serde::{Deserialize, Serialize};
 
 use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, RobotId, Scope, Signature};
 use cerulion_pairing::pop::{
-    verify_pop, PopVerification, PURPOSE_DEVICE_REGISTRATION, PURPOSE_ROBOT_REGISTRATION,
+    verify_pop, verify_robot_pop, PopVerification, PURPOSE_DEVICE_REGISTRATION,
+    PURPOSE_ROBOT_ACCESS, PURPOSE_ROBOT_ACCESS_CHALLENGE, PURPOSE_ROBOT_REGISTRATION,
 };
 
 use crate::codec;
 use crate::config::SEC_NS;
-use crate::db::{RevocationTarget, SessionLookup, UserRow};
+use crate::db::{RevocationTarget, RobotChallengeIssue, SessionLookup, UserRow};
 use crate::device_code::{poll_outcome, should_record_poll, DeviceCodeSnapshot, PollOutcome};
 use crate::error::{AccountdError, Result};
 use crate::hash::hash_token;
@@ -63,7 +64,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/devices/{device_id}/revoke", post(revoke_device))
         .route("/v1/robots", post(register_robot).get(list_robots))
         .route("/v1/robots/{robot_id}", get(get_robot))
-        .route("/v1/robots/{robot_id}/access", get(robot_access))
+        .route(
+            "/v1/robots/{robot_id}/access",
+            get(robot_access).post(robot_access_by_proof),
+        )
+        .route(
+            "/v1/robots/{robot_id}/access/challenge",
+            post(robot_access_challenge),
+        )
         .route("/v1/robots/{robot_id}/revoke", post(robot_revoke))
         // The owner-facing Team & access PAGE. A
         // hosted web surface Studio renders in an in-app webview — see
@@ -177,19 +185,33 @@ fn parse_sig64_b64(s: &str, field: &'static str) -> Result<Signature> {
     Ok(Signature(arr))
 }
 
-/// A JSON body extractor for the PoP-gated registration endpoints (`POST
-/// /v1/devices`, `POST /v1/robots`). Unlike the stock `Json<T>` extractor — whose
+/// A JSON body extractor for the PoP-gated endpoints (`POST /v1/devices`,
+/// `POST /v1/robots`, and a robot's own `POST /v1/robots/{robot_id}/access/challenge`
+/// and `POST /v1/robots/{robot_id}/access`). Unlike the stock `Json<T>` extractor, whose
 /// deserialization failure surfaces as a framework-default 422 with a bare serde
-/// string — a parse failure here maps to the crate's STABLE
+/// string, a parse failure here maps to the crate's STABLE
 /// [`AccountdError::BadRequest`] body (`{error:"invalid_request", error_description}`)
-/// that NAMES the missing proof-of-possession requirement + the challenge endpoint.
-/// This keeps a client that omits `pop_challenge`/`pop_signature` on the
-/// account service's loud-actionable-error norm rather than an unnamed 4xx.
+/// that names, from the body type's [`PopBody::HINT`], the fields that endpoint
+/// needs and where its challenge comes from. This keeps a client that omits a proof
+/// field on the account service's loud-actionable-error norm rather than an
+/// unnamed 4xx.
 struct PopJson<T>(T);
+
+/// A proof-of-possession request body: what a parse failure tells its caller to send.
+trait PopBody: DeserializeOwned {
+    /// The sentence after the parse error naming the endpoint's fields.
+    const HINT: &'static str;
+}
+
+/// The hint of the registration endpoints, which prove possession of the key
+/// being registered with a challenge issued to the caller's session.
+const REGISTRATION_POP_HINT: &str = "This endpoint requires a proof of possession: request \
+     a challenge from POST /v1/devices/challenge, sign it with the key you are \
+     registering, and include `pop_challenge` + `pop_signature`.";
 
 impl<T, S> FromRequest<S> for PopJson<T>
 where
-    T: DeserializeOwned,
+    T: PopBody,
     S: Send + Sync,
 {
     type Rejection = AccountdError;
@@ -199,11 +221,7 @@ where
             .await
             .map_err(|_| AccountdError::BadRequest("could not read the request body".into()))?;
         let value = serde_json::from_slice::<T>(&bytes).map_err(|e| {
-            AccountdError::BadRequest(format!(
-                "invalid request body: {e}. This endpoint requires a proof of possession — request \
-                 a challenge from POST /v1/devices/challenge, sign it with the key you are \
-                 registering, and include `pop_challenge` + `pop_signature`."
-            ))
+            AccountdError::BadRequest(format!("invalid request body: {e}. {}", T::HINT))
         })?;
         Ok(PopJson(value))
     }
@@ -862,6 +880,10 @@ struct RegisterDeviceRequest {
     pop_signature: String,
 }
 
+impl PopBody for RegisterDeviceRequest {
+    const HINT: &'static str = REGISTRATION_POP_HINT;
+}
+
 #[derive(Serialize)]
 struct RegisterDeviceResponse {
     device_id: String,
@@ -1044,6 +1066,10 @@ struct RegisterRobotRequest {
     /// validated here).
     #[serde(default)]
     org_id: Option<String>,
+}
+
+impl PopBody for RegisterRobotRequest {
+    const HINT: &'static str = REGISTRATION_POP_HINT;
 }
 
 #[derive(Serialize)]
@@ -1445,6 +1471,207 @@ async fn robot_access(
 ) -> Result<Json<RobotAccessResponse>> {
     let (_user, robot) = authenticate_robot_owner(&state, &headers, &robot_id)?;
     Ok(Json(build_access_response(&state, &robot.robot_id)?))
+}
+
+/// Robot access challenges per robot per [`ROBOT_POP_RATE_WINDOW_NS`]: 900, the
+/// hosted issuer's limit. The robot's supervisor starts a fetch at most every
+/// 5 s (its early-fetch gap, its 5 s first retry, and a period of at least
+/// 30 s), 720 an hour; 900 is that plus a quarter for a restarted supervisor,
+/// which fetches at once. Only requests signed by the robot's key are counted.
+const ROBOT_POP_RATE_LIMIT: u32 = 900;
+/// The fixed window [`ROBOT_POP_RATE_LIMIT`] counts over: one hour.
+const ROBOT_POP_RATE_WINDOW_NS: u64 = 3600 * SEC_NS;
+/// How far a challenge request's signed time may be from this service's clock:
+/// five minutes, the issuance skew the pairing verifier accepts.
+const ROBOT_POP_REQUEST_SKEW_NS: u64 = 5 * 60 * SEC_NS;
+
+#[derive(Deserialize)]
+struct RobotChallengeRequest {
+    /// The request time, Unix nanoseconds, decimal digits.
+    requested_at_ns: String,
+    /// base64url ed25519 signature by the robot's transport key over the
+    /// robot proof message with purpose `robot-access-challenge` and the
+    /// request time as its last field.
+    request_signature: String,
+}
+
+impl PopBody for RobotChallengeRequest {
+    const HINT: &'static str = "This endpoint needs no session: send `requested_at_ns`, the \
+         request time as a string of Unix nanoseconds, and `request_signature`, the robot's \
+         transport key signature over the robot proof message for `robot-access-challenge` \
+         ending in that time.";
+}
+
+#[derive(Serialize)]
+struct RobotAccessChallengeResponse {
+    /// The opaque single-use challenge the robot signs.
+    challenge: String,
+    /// `base64url(RobotId)` the challenge is bound to.
+    robot_id: String,
+    /// Seconds until the challenge expires.
+    expires_in: u64,
+}
+
+/// `POST /v1/robots/{robot_id}/access/challenge`, with no session: a single-use
+/// challenge bound to the robot, which it signs with its registered transport
+/// key and spends at `POST /v1/robots/{robot_id}/access`. The request is itself
+/// signed by that key over its request time; a time more than
+/// [`ROBOT_POP_REQUEST_SKEW_NS`] from this clock, or not later than the robot's
+/// latest accepted one, is refused (403) and not counted; the refusal names
+/// `server_time_ns`, and for a replay `next_requested_at_ns`, so a robot whose
+/// clock is off or stepped backwards retries at once. The replay hint is sent
+/// only after the request's signature verified. At most
+/// [`ROBOT_POP_RATE_LIMIT`] verified requests per robot per window (429 beyond).
+async fn robot_access_challenge(
+    State(state): State<Arc<AppState>>,
+    Path(robot_id): Path<String>,
+    PopJson(req): PopJson<RobotChallengeRequest>,
+) -> Result<Json<RobotAccessChallengeResponse>> {
+    let robot_id_b = parse_key32_b64(&robot_id, "robot_id")?;
+    let signature = parse_sig64_b64(&req.request_signature, "request_signature")?;
+    let requested_at_ns: u64 = match req.requested_at_ns.parse() {
+        Ok(ns)
+            if (1..=19).contains(&req.requested_at_ns.len())
+                && req.requested_at_ns.bytes().all(|b| b.is_ascii_digit())
+                && ns <= i64::MAX as u64 =>
+        {
+            ns
+        }
+        _ => {
+            return Err(AccountdError::BadRequest(
+                "requested_at_ns must be Unix nanoseconds as decimal digits".into(),
+            ))
+        }
+    };
+    let now = state.clock.now_ns();
+    if requested_at_ns.abs_diff(now) > ROBOT_POP_REQUEST_SKEW_NS {
+        return Err(AccountdError::RobotClock {
+            message: "requested_at_ns is more than five minutes from the service's clock; sign a \
+                      request at server_time_ns"
+                .into(),
+            server_time_ns: now,
+            next_requested_at_ns: None,
+        });
+    }
+    let Some(robot) = state.db.get_robot(&robot_id_b)? else {
+        return Err(AccountdError::NotFound("robot"));
+    };
+    if verify_robot_pop(
+        &PublicKey(robot.robot_transport_key),
+        PURPOSE_ROBOT_ACCESS_CHALLENGE,
+        &robot_id_b,
+        &req.requested_at_ns,
+        &signature,
+    ) != PopVerification::Ok
+    {
+        return Err(AccountdError::ProofOfPossessionFailed(
+            "the request signature does not prove possession of this robot's transport key".into(),
+        ));
+    }
+    if let Err(e) = state.db.sweep_expired(now) {
+        tracing::warn!(error = %e, "expired-row sweep failed (non-fatal)");
+    }
+    let challenge = rng::opaque_token()?;
+    let expires_at = now.saturating_add(state.config.pop_challenge_ttl_ns);
+    match state.db.issue_robot_pop_challenge(
+        &hash_token(&challenge),
+        &robot_id_b,
+        requested_at_ns,
+        expires_at,
+        now,
+        ROBOT_POP_RATE_WINDOW_NS,
+        ROBOT_POP_RATE_LIMIT,
+    )? {
+        RobotChallengeIssue::Issued => {}
+        RobotChallengeIssue::Replayed { last_request_ns } => {
+            return Err(AccountdError::RobotClock {
+                message: "requested_at_ns is not later than this robot's previous challenge \
+                          request; sign a request at next_requested_at_ns or later"
+                    .into(),
+                server_time_ns: now,
+                next_requested_at_ns: Some(last_request_ns.saturating_add(1)),
+            })
+        }
+        RobotChallengeIssue::Limited => {
+            return Err(AccountdError::RateLimited(
+                "this robot has requested too many access challenges this hour; try again later"
+                    .into(),
+            ))
+        }
+    }
+    Ok(Json(RobotAccessChallengeResponse {
+        challenge,
+        robot_id: URL_SAFE_NO_PAD.encode(robot_id_b),
+        expires_in: state.config.pop_challenge_ttl_ns / SEC_NS,
+    }))
+}
+
+#[derive(Deserialize)]
+struct RobotProofRequest {
+    /// The challenge from `POST /v1/robots/{robot_id}/access/challenge`.
+    pop_challenge: String,
+    /// base64url ed25519 signature over the robot proof message.
+    pop_signature: String,
+}
+
+impl PopBody for RobotProofRequest {
+    const HINT: &'static str = "This endpoint needs no session: send `pop_challenge`, a \
+         challenge from POST /v1/robots/{robot_id}/access/challenge, and `pop_signature`, \
+         the robot's transport key signature over the robot proof message for `robot-access` \
+         ending in that challenge.";
+}
+
+/// `POST /v1/robots/{robot_id}/access`, with no session: the robot's own access state,
+/// for a robot that proves possession of its registered transport key. A request
+/// naming no live challenge of the robot is refused before the signature check;
+/// the signature is verified before the challenge is spent; the epoch is signed
+/// after the spend, so a signing failure costs the robot that challenge.
+async fn robot_access_by_proof(
+    State(state): State<Arc<AppState>>,
+    Path(robot_id): Path<String>,
+    PopJson(req): PopJson<RobotProofRequest>,
+) -> Result<Json<RobotAccessResponse>> {
+    let robot_id_b = parse_key32_b64(&robot_id, "robot_id")?;
+    let signature = parse_sig64_b64(&req.pop_signature, "pop_signature")?;
+    let Some(robot) = state.db.get_robot(&robot_id_b)? else {
+        return Err(AccountdError::NotFound("robot"));
+    };
+    let now = state.clock.now_ns();
+    let challenge_hash = hash_token(&req.pop_challenge);
+    // A request naming no live challenge of this robot costs no signature check.
+    if !state
+        .db
+        .robot_pop_challenge_live(&challenge_hash, &robot_id_b, now)?
+    {
+        return Err(robot_challenge_not_spendable());
+    }
+    if verify_robot_pop(
+        &PublicKey(robot.robot_transport_key),
+        PURPOSE_ROBOT_ACCESS,
+        &robot_id_b,
+        &req.pop_challenge,
+        &signature,
+    ) != PopVerification::Ok
+    {
+        return Err(AccountdError::ProofOfPossessionFailed(
+            "the signature does not prove possession of this robot's transport key".into(),
+        ));
+    }
+    if !state
+        .db
+        .consume_robot_pop_challenge(&challenge_hash, &robot_id_b, now)?
+    {
+        return Err(robot_challenge_not_spendable());
+    }
+    Ok(Json(build_access_response(&state, &robot_id_b)?))
+}
+
+fn robot_challenge_not_spendable() -> AccountdError {
+    AccountdError::ProofOfPossessionFailed(
+        "the challenge is unknown, expired, already used, or was issued to a different robot; \
+         request a fresh one from POST /v1/robots/{robot_id}/access/challenge"
+            .into(),
+    )
 }
 
 #[derive(Deserialize)]

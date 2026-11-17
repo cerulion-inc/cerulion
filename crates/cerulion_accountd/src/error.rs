@@ -65,6 +65,22 @@ pub enum AccountdError {
     /// Polled faster than the interval — back off and retry.
     #[error("slow down")]
     SlowDown,
+    /// A robot challenge request whose signed time the service refuses (HTTP 403):
+    /// too far from its clock, or not later than the robot's latest accepted one.
+    /// The body adds `server_time_ns`, and `next_requested_at_ns` for a replay,
+    /// so the robot can sign a fresh request at once.
+    #[error("proof of possession failed: {message}")]
+    RobotClock {
+        /// The client-facing description.
+        message: String,
+        /// This service's clock, Unix nanoseconds.
+        server_time_ns: u64,
+        /// One past the robot's latest accepted request time, for a replay.
+        next_requested_at_ns: Option<u64>,
+    },
+    /// A per-robot request budget is spent for the current window (HTTP 429).
+    #[error("rate limited: {0}")]
+    RateLimited(String),
     /// The device code has expired; start a new device-authorization request.
     #[error("expired token")]
     ExpiredToken,
@@ -97,6 +113,8 @@ impl AccountdError {
             AccountdError::IdentityResolverUnavailable(_) => "identity_resolver_unavailable",
             AccountdError::AuthorizationPending => "authorization_pending",
             AccountdError::SlowDown => "slow_down",
+            AccountdError::RateLimited(_) => "slow_down",
+            AccountdError::RobotClock { .. } => "proof_of_possession_failed",
             AccountdError::ExpiredToken => "expired_token",
             AccountdError::AlreadyRedeemed => "access_denied",
             AccountdError::Internal(_) => "internal_error",
@@ -111,6 +129,8 @@ impl AccountdError {
             AccountdError::NotFound(_) => StatusCode::NOT_FOUND,
             AccountdError::Conflict(_) => StatusCode::CONFLICT,
             AccountdError::ProofOfPossessionFailed(_) => StatusCode::FORBIDDEN,
+            AccountdError::RateLimited(_) => StatusCode::TOO_MANY_REQUESTS,
+            AccountdError::RobotClock { .. } => StatusCode::FORBIDDEN,
             // RFC 8628 §3.5: all device-flow polling errors are HTTP 400 with the
             // code in the body.
             AccountdError::BadRequest(_)
@@ -147,6 +167,22 @@ impl IntoResponse for AccountdError {
                 "error_id": error_id,
             }));
             return (status, body).into_response();
+        }
+        if let AccountdError::RobotClock {
+            message,
+            server_time_ns,
+            next_requested_at_ns,
+        } = &self
+        {
+            let mut body = json!({
+                "error": code,
+                "error_description": message,
+                "server_time_ns": server_time_ns.to_string(),
+            });
+            if let Some(next) = next_requested_at_ns {
+                body["next_requested_at_ns"] = json!(next.to_string());
+            }
+            return (status, Json(body)).into_response();
         }
         // 4xx: the message is client-actionable (missing token, bad request,
         // provider not configured) and carries no server internals.
