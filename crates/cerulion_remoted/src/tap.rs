@@ -214,7 +214,12 @@ impl TapManager {
         // Attach the listener-less tap (opens ONLY the data service; NEVER
         // creates it). A missing topic / exhausted introspection slot surfaces
         // here with an actionable message naming the topic.
-        crate::wire::wire_servable(manager, topic).map_err(|refusal| WireError::DemandFailed {
+        crate::wire::wire_servable(
+            manager,
+            topic,
+            cerulion_core::transport::TeardownWait::Bounded,
+        )
+        .map_err(|refusal| WireError::DemandFailed {
             topic: topic.to_owned(),
             reason: refusal.message(topic),
         })?;
@@ -504,7 +509,13 @@ pub fn catalog_peek_budget() -> Duration {
 /// cap), so N silent topics can never freeze the control stream for
 /// N×750ms. Blocking (poll + sleep) — the caller runs it under `spawn_blocking`.
 pub fn peek_schema_hash(manager: &TransportManager, topic: &str, deadline: Instant) -> Option<u64> {
-    crate::wire::wire_servable(manager, topic).ok()?;
+    // A catalog peek is a listing: it never waits for a marker being torn down.
+    crate::wire::wire_servable(
+        manager,
+        topic,
+        cerulion_core::transport::TeardownWait::Never,
+    )
+    .ok()?;
     // A missing topic has no header. Do not create and immediately destroy
     // policy services merely to discover that its data service is absent.
     if manager.data_service_missing(topic) {
