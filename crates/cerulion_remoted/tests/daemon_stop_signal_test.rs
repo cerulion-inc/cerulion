@@ -21,11 +21,12 @@
 //!   teardown's line written.
 //!
 //! The stage's participant is the test seam's probe, which logs whether the
-//! rcpd e-stop sender was already stopped when the stage ran it. A test that
-//! asserts a line the exit waits for sets the exit's wait for the log queue
-//! to 5 s through the test seam (the exit goes on once the line is written);
-//! the other full-stderr tests keep the 100 ms a build without the test seam
-//! waits.
+//! rcpd e-stop sender was already stopped when the stage ran it. The four
+//! tests that exit 4 and assert the line the stop thread logs just before
+//! that exit, and the test that holds lines queued behind a full stderr, set
+//! the exit's wait for the log queue to 5 s through the test seam (the exit
+//! goes on once the queue is written); the other tests keep the 100 ms a
+//! build without the test seam waits.
 //!
 //! Each daemon serves its own temp state root and device key, relays disabled;
 //! no peer connects, so the lazy wire plane never starts iceoryx2. The child
@@ -52,7 +53,9 @@ use common::stderr_pipe::{fill, pump, read_matching, KillOnDrop};
 
 /// The stop deadline variable, as docs/user-api.md names it.
 const HARD_EXIT_ENV: &str = "CERULION_REMOTED_HARD_EXIT_MS";
-/// The exit's wait for its line in the tests that assert that line.
+/// The exit's wait for the log queue, in the four tests that exit 4 and
+/// assert the line the stop thread logs just before that exit, and in the
+/// test that holds lines queued behind a full stderr.
 const GRACE_MS: &str = "5000";
 const MAC_KEY: &[u8] = b"stop-signal-mac-key";
 const CHASSIS: &[u8] = b"stop-signal-chassis-secret-not-serial-derived";
@@ -358,7 +361,7 @@ fn without_a_signal_the_deadline_ends_a_stop_the_endpoint_close_started_with_4()
         ],
     );
     // From the listening line: the 3 s deadline and at most the exit's 5 s
-    // wait for its line.
+    // wait for the log queue.
     let started = Instant::now();
     let (status, took) = daemon.wait_exit(started, STOP_BOUND);
     assert_eq!(
@@ -479,8 +482,8 @@ fn a_participant_that_fails_exits_3_after_the_teardown() {
 #[test]
 fn the_hard_exit_does_not_wait_for_a_full_stderr() {
     let deadline = Duration::from_millis(700);
-    // The exit's wait for its line, then process exit and the 20 ms poll on a
-    // loaded host.
+    // The exit's 100 ms wait for the log queue, then process exit and the
+    // 20 ms poll on a loaded host.
     let bound = deadline + Duration::from_millis(100) + Duration::from_secs(5);
     let (mut daemon, filler) =
         Daemon::start_holding(0x56, &[(HARD_EXIT_ENV, "700"), (PROBE_ENV, "stall")]);

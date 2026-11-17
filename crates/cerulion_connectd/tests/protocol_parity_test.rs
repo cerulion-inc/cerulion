@@ -49,6 +49,7 @@ fn a_catalog() -> CatalogReply {
         robot: "go2".to_string(),
         entries: vec![
             CatalogEntry {
+                egress_qos: None,
                 topic: "/imu".to_string(),
                 schema_hash: Some(0xDEAD_BEEF_CAFE_F00D),
                 schema_name: Some("sensor_msgs/Imu".to_string()),
@@ -57,6 +58,7 @@ fn a_catalog() -> CatalogReply {
                 liveness: None,
             },
             CatalogEntry {
+                egress_qos: None,
                 topic: "/silent".to_string(),
                 schema_hash: None,
                 schema_name: None,
@@ -96,6 +98,7 @@ fn wire_request_parity() {
     // Every desk request deserializes into the robot request identically.
     cross::<_, robot::WireRequest>(&desk::WireRequest::Catalog);
     cross::<_, robot::WireRequest>(&desk::WireRequest::Demand {
+        graph_ingress: false,
         topic: "/imu".to_string(),
     });
     cross::<_, robot::WireRequest>(&desk::WireRequest::Undemand {
@@ -114,6 +117,7 @@ fn wire_request_parity() {
 
     // Reverse: a robot request deserializes into the desk request identically.
     cross::<_, desk::WireRequest>(&robot::WireRequest::Demand {
+        graph_ingress: false,
         topic: "/z".to_string(),
     });
     cross::<_, desk::WireRequest>(&robot::WireRequest::SyncEpoch {
@@ -137,6 +141,7 @@ fn wire_response_parity() {
     });
     cross::<_, robot::WireResponse>(&desk::WireResponse::Status(desk::StatusReply {
         topics: vec![desk::TopicStatus {
+            wan_refused: Some(2),
             topic: "/imu".to_string(),
             wan_forwarded: 100,
             wan_dropped: 3,
@@ -238,6 +243,7 @@ fn an_older_peer_rejects_the_sync_epoch_verb_rather_than_mis_decoding_it() {
     .is_ok());
     assert!(serde_json::from_slice::<OldWireRequest>(
         &serde_json::to_vec(&desk::WireRequest::Demand {
+            graph_ingress: false,
             topic: "/imu".to_string()
         })
         .unwrap()
@@ -399,5 +405,17 @@ fn accept_decision_refusal_parity() {
     match desk::decode_first_reply(&bytes) {
         Err(Some(reason)) => assert!(reason.contains("unpaired"), "reason: {reason}"),
         other => panic!("expected an explicit refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn graph_import_flag_preserves_legacy_observer_bytes_and_round_trips() {
+    let legacy = br#"{"verb":"demand","topic":"/imu"}"#;
+    let graph = br#"{"verb":"demand","topic":"/imu","graph_ingress":true}"#;
+    for bytes in [legacy.as_slice(), graph.as_slice()] {
+        let desk: desk::WireRequest = serde_json::from_slice(bytes).unwrap();
+        let robot: robot::WireRequest = serde_json::from_slice(bytes).unwrap();
+        assert_eq!(serde_json::to_vec(&desk).unwrap(), bytes);
+        assert_eq!(serde_json::to_vec(&robot).unwrap(), bytes);
     }
 }

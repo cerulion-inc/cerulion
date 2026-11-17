@@ -75,6 +75,7 @@ fn undecodable_catalog_reply_warns_once_per_robot_independently() {
             robot_identity: Some(robot_a.to_string()),
             ..NetworkConfig::default()
         });
+        mgr.set_lan_access(cerulion_core::LanAccess::Open);
         if mgr.session().is_ok() {
             robot_side = Some((mgr, port));
             break;
@@ -96,6 +97,7 @@ fn undecodable_catalog_reply_warns_once_per_robot_independently() {
         connect_endpoints: vec![format!("tcp/127.0.0.1:{port}")],
         ..NetworkConfig::default()
     });
+    observer.set_lan_access(cerulion_core::LanAccess::Open);
     let obs_session = observer.session().expect("observer session opens");
 
     // Warm-up: retry the ANNOUNCE gather until the robot's identity token is

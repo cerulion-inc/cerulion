@@ -327,6 +327,7 @@ async fn daemon_serve_endpoint_evicts_a_revoked_demander_through_the_production_
         &mut send,
         &mut recv,
         &WireRequest::Demand {
+            graph_ingress: false,
             topic: topic.clone(),
         },
     )

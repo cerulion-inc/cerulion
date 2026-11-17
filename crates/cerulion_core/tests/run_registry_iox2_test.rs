@@ -48,6 +48,7 @@ type TestService = iceoryx2::service::local_threadsafe::Service;
 /// field-order slip in the codec cannot pass by coincidence.
 fn record(run_id: u128, graph: &str) -> RunRecord {
     RunRecord {
+        remote_visible: true,
         run_id,
         supervisor_pid: 4711,
         run_started_at_ns: 1_753_000_000_000_000_000,

@@ -17,7 +17,9 @@
 //! forbidden, taps are observation-only. So the drain thread copies
 //! each frame OUT of the SHM slot (releasing the borrow immediately) and pushes
 //! the owned bytes into this queue; only the writer task ever awaits QUIC. The
-//! freshest frame always wins.
+//! freshest frame wins for legacy observation. A declared reliable graph
+//! producer instead refuses the new frame at its resolved queue depth, retains
+//! queued frames in order, and exposes refused counts independently of drops.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,6 +100,7 @@ impl WanDropLatch {
 pub struct TopicCounters {
     forwarded: AtomicU64,
     dropped: AtomicU64,
+    refused: AtomicU64,
     frames_seen: AtomicU64,
     /// Frames carrying a NON-ZERO wire timestamp — the count that spans the Hz
     /// window. Distinct from `frames_seen` (which counts EVERY frame, including
@@ -150,6 +153,11 @@ impl TopicCounters {
         self.dropped.load(Ordering::Relaxed)
     }
 
+    /// New frames refused while a reliable queue was full.
+    pub fn refused(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
     /// Frames read off SHM (= forwarded + dropped + currently queued).
     pub fn frames_seen(&self) -> u64 {
         self.frames_seen.load(Ordering::Relaxed)
@@ -180,10 +188,12 @@ impl TopicCounters {
 ///
 /// The deque + latch live under one `std::sync::Mutex`; the counters are
 /// lock-free atomics; a `Notify` wakes the writer. On [`Self::push`] the deque
-/// never exceeds [`WAN_QUEUE_CAP`] — a push at capacity evicts the OLDEST frame
-/// first (drop-to-live) and reports the drop via the latch.
+/// never exceeds its configured depth. Legacy observation evicts the oldest
+/// frame; reliable graph producers refuse the new frame and count that refusal.
 #[derive(Debug)]
 pub struct ForwardChannel {
+    capacity: std::num::NonZeroUsize,
+    refuse_new: bool,
     inner: Mutex<ForwardInner>,
     notify: Notify,
     counters: TopicCounters,
@@ -196,6 +206,7 @@ pub struct ForwardChannel {
 struct ForwardInner {
     deque: VecDeque<Vec<u8>>,
     latch: WanDropLatch,
+    refusal_latch: cerulion_core::transport::failure_regime_latch::FailureRegimeLatch,
 }
 
 /// The outcome of one [`ForwardChannel::push`], returned so the (log-free) queue
@@ -209,12 +220,25 @@ pub enum PushOutcome {
     /// The queue was full: the OLDEST frame was evicted to make room for this
     /// one (drop-to-live). `level` is the flood-latch level to log the drop at.
     DroppedOldest { level: WanDropLevel },
+    /// Reliable queue congestion preserves queued frames and refuses this one.
+    RefusedNew {
+        /// Shared failure-regime logging decision.
+        decision: cerulion_core::transport::failure_regime_latch::RegimeDecision,
+    },
 }
 
 impl ForwardChannel {
     /// A fresh, empty, not-stopped channel.
     pub fn new() -> Self {
+        Self::with_policy(std::num::NonZeroUsize::new(WAN_QUEUE_CAP).unwrap(), false)
+    }
+
+    /// Construct a bounded queue. Reliable producers refuse new frames at
+    /// capacity; legacy observers retain the existing drop-oldest policy.
+    fn with_policy(capacity: std::num::NonZeroUsize, refuse_new: bool) -> Self {
         Self {
+            capacity,
+            refuse_new,
             inner: Mutex::new(ForwardInner::default()),
             notify: Notify::new(),
             counters: TopicCounters::default(),
@@ -222,12 +246,20 @@ impl ForwardChannel {
         }
     }
 
+    /// A reliable producer queue of the requested nonzero depth. A full queue
+    /// refuses a new frame and retains the queued frames in order.
+    pub fn reliable(capacity: std::num::NonZeroUsize) -> Self {
+        Self::with_policy(capacity, true)
+    }
+
     /// The per-topic counters (for the `status` verb + tests).
     pub fn counters(&self) -> &TopicCounters {
         &self.counters
     }
 
-    /// Push one owned wire frame (drop-to-live). Updates the Hz counters, then:
+    /// Push one owned wire frame under the resolved queue policy. Reliable
+    /// congestion refuses the new frame and increments [`TopicCounters::refused`].
+    /// Legacy observation updates the Hz counters, then:
     /// if the deque is at [`WAN_QUEUE_CAP`], evicts the OLDEST frame + counts the
     /// drop + returns [`PushOutcome::DroppedOldest`]; else queues with room and
     /// returns [`PushOutcome::Queued`]. Always wakes the writer. Never blocks —
@@ -242,13 +274,24 @@ impl ForwardChannel {
             // Poisoned only if a holder panicked mid-mutation; recover the guard
             // (the deque/latch are plain data — a poisoned lock is not fatal here).
             let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if inner.deque.len() >= WAN_QUEUE_CAP {
+            if inner.deque.len() >= self.capacity.get() && self.refuse_new {
+                self.counters.refused.fetch_add(1, Ordering::Relaxed);
+                PushOutcome::RefusedNew {
+                    decision: inner.refusal_latch.on_failure(),
+                }
+            } else if inner.deque.len() >= self.capacity.get() {
                 inner.deque.pop_front(); // drop the OLDEST (drop-to-live)
                 let level = inner.latch.on_drop();
                 inner.deque.push_back(frame);
                 PushOutcome::DroppedOldest { level }
             } else {
-                let recovered = inner.latch.on_room();
+                let recovered = if self.refuse_new {
+                    let recovering = inner.refusal_latch.is_failing();
+                    inner.refusal_latch.on_success();
+                    recovering
+                } else {
+                    inner.latch.on_room()
+                };
                 inner.deque.push_back(frame);
                 PushOutcome::Queued { recovered }
             }
@@ -265,6 +308,21 @@ impl ForwardChannel {
     pub fn take_into(&self, out: &mut Vec<Vec<u8>>) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         out.extend(inner.deque.drain(..));
+    }
+
+    /// Remove one queued frame, leaving the remaining capacity accounted for
+    /// while the writer awaits flow control on its single in-flight frame.
+    pub fn take_one(&self) -> Option<Vec<u8>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .deque
+            .pop_front()
+    }
+
+    /// Whether the producer requires reliable refusal rather than eviction.
+    pub fn refuses_new(&self) -> bool {
+        self.refuse_new
     }
 
     /// Whether the deque is currently empty (the writer uses it with `stop` to
@@ -308,6 +366,45 @@ impl Default for ForwardChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reliable_queue_preserves_the_oracle_frames_and_counts_refusals() {
+        use cerulion_core::transport::failure_regime_latch::RegimeDecision;
+        for _ in 0..2 {
+            let channel = ForwardChannel::reliable(std::num::NonZeroUsize::new(2).unwrap());
+            assert_eq!(
+                channel.push(vec![0x11, 0x22], 10),
+                PushOutcome::Queued { recovered: false }
+            );
+            assert_eq!(
+                channel.push(vec![0x33, 0x44], 20),
+                PushOutcome::Queued { recovered: false }
+            );
+            assert_eq!(
+                channel.push(vec![0x55, 0x66], 30),
+                PushOutcome::RefusedNew {
+                    decision: RegimeDecision::Loud
+                }
+            );
+            assert!(matches!(
+                channel.push(vec![0x77], 40),
+                PushOutcome::RefusedNew {
+                    decision: RegimeDecision::Suppressed { suppressed: 1 }
+                }
+            ));
+            assert_eq!(channel.take_one(), Some(vec![0x11, 0x22]));
+            assert_eq!(
+                channel.push(vec![0x88], 50),
+                PushOutcome::Queued { recovered: true }
+            );
+            assert_eq!(channel.take_one(), Some(vec![0x33, 0x44]));
+            assert_eq!(channel.take_one(), Some(vec![0x88]));
+            assert_eq!(channel.take_one(), None);
+            assert_eq!(channel.counters().refused(), 2);
+            assert_eq!(channel.counters().dropped(), 0);
+            assert_eq!(channel.counters().frames_seen(), 5);
+        }
+    }
 
     /// `WanDropLatch` full cycle: first drop warns, repeats debug, a push with
     /// room recovers once, the next drop warns again. Hand oracle (crib the

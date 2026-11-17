@@ -44,6 +44,7 @@ use std::time::{Duration, Instant};
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::config::{GraphConfig, NodeDef, OutputDef};
 use cerulion_core::graph::node::NodeEntry;
+use cerulion_core::graph::node_plugin_abi::RawIngress;
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use indexmap::IndexMap;
@@ -384,7 +385,7 @@ fn cyclone_peer_imu_reaches_cerulion_via_the_raw_generic_route() {
     let mut pump = BridgePump::with_transport(
         bridge_cfg,
         Arc::new(Mutex::new(SampleQueue::default())), // unused by raw routes
-        Arc::clone(&mgr),
+        RawIngress::native(Arc::clone(&mgr)),
     );
     let pump_stats = pump.stats();
     let pump_thread = std::thread::spawn(move || {

@@ -1469,6 +1469,179 @@ extern "C" {
     fn rmw_cerulion_vector_u8_assign(v: *mut c_void, data: *const u8, len: usize);
 }
 
+// =====================================================================
+// C++: an accessorless `bool[]` (the Foxy and Galactic typesupport)
+// sealed beside a forgeable `uint8[]`
+// =====================================================================
+
+use rmw_cerulion::ffi::introspection_cpp::{
+    rmw_cerulion_vector_bool_construct, rmw_cerulion_vector_bool_destruct,
+    rmw_cerulion_vector_bool_get, rmw_cerulion_vector_bool_size, rmw_cerulion_vector_bool_sizeof,
+};
+
+/// Storage for one REAL `std::vector<bool>` (over-sized; checked below).
+#[repr(C, align(16))]
+struct VecBoolSlot([u8; 64]);
+
+#[repr(C, align(16))]
+struct CppFlagged {
+    stamp: u32,
+    flags: VecBoolSlot,
+    data: VecU8Slot,
+}
+
+unsafe extern "C" fn flagged_init(msg: *mut c_void, _init: u32) {
+    let m = &mut *(msg as *mut CppFlagged);
+    m.stamp = 0;
+    rmw_cerulion_vector_bool_construct(m.flags.0.as_mut_ptr() as *mut c_void, std::ptr::null(), 0);
+    rmw_cerulion_vector_u8_construct(m.data.0.as_mut_ptr() as *mut c_void);
+}
+
+unsafe extern "C" fn flagged_fini(msg: *mut c_void) {
+    CPP_FINI_CALLS.fetch_add(1, Ordering::SeqCst);
+    let m = &mut *(msg as *mut CppFlagged);
+    rmw_cerulion_vector_bool_destruct(m.flags.0.as_mut_ptr() as *mut c_void);
+    rmw_cerulion_vector_u8_destruct(m.data.0.as_mut_ptr() as *mut c_void);
+}
+
+/// `{ uint32 stamp; bool[] flags; uint8[] data }` with `flags` in the shape
+/// the Foxy and Galactic generator emits (every accessor null) and `data`
+/// forgeable, so the type is served through the borrow window.
+fn flagged_bridge() -> CppBridgedMessage {
+    let mut flags = cpp_member(
+        "flags",
+        ROS_TYPE_BOOLEAN,
+        std::mem::offset_of!(CppFlagged, flags) as u32,
+    );
+    flags.is_array_ = true;
+    let mut data = cpp_member(
+        "data",
+        ROS_TYPE_UINT8,
+        std::mem::offset_of!(CppFlagged, data) as u32,
+    );
+    data.is_array_ = true;
+    data.size_function = Some(vecu8_size);
+    data.get_const_function = Some(vecu8_get_const);
+    data.get_function = Some(vecu8_get);
+    let members = vec![cpp_member("stamp", ROS_TYPE_UINT32, 0), flags, data];
+    let members = Box::leak(members.into_boxed_slice());
+    let members = Box::leak(Box::new(CppMessageMembers {
+        message_namespace_: cstr("seal_test::msg"),
+        message_name_: cstr("Flagged"),
+        member_count_: members.len() as u32,
+        size_of_: std::mem::size_of::<CppFlagged>(),
+        #[cfg(cerulion_has_is_key)]
+        has_any_key_member_: false,
+        members_: members.as_ptr(),
+        init_function: Some(flagged_init),
+        fini_function: Some(flagged_fini),
+    }));
+    unsafe { CppBridgedMessage::new(members) }.expect("bridge")
+}
+
+const ROS_TYPE_BOOLEAN: u8 = 6;
+
+/// The seal reads an accessorless `bool[]` through the shim into its owned
+/// arena, one byte per element, beside a heap `uint8[]` it copies (no window
+/// saw it), then destroys the struct exactly once.
+///
+/// Oracles, typed out here: the fixed section (`stamp` = 0x1234_5678,
+/// little endian), the `flags` entry's bytes `1 0 1 1 0`, the `data` entry's
+/// bytes `9 8 7 6`, and the values the copying decoder reads back.
+#[test]
+#[serial]
+fn cpp_seal_reads_an_accessorless_bool_sequence_through_the_shim() {
+    assert!(unsafe { rmw_cerulion_vector_bool_sizeof() } <= 64);
+    let bridge = flagged_bridge();
+    assert!(bridge.can_borrow_windowed());
+    assert_eq!(bridge.unwritable_bool_seq(), None);
+    let geo = bridge.borrow_geometry().expect("geometry");
+    let flag_elems = [1u8, 0, 1, 1, 0];
+    let data_bytes = [9u8, 8, 7, 6];
+    unsafe {
+        let mut slot = Slot::new();
+        let payload = slot.payload();
+        flagged_init(payload as *mut c_void, 0);
+        let m = &mut *(payload as *mut CppFlagged);
+        m.stamp = 0x1234_5678;
+        rmw_cerulion_vector_bool_destruct(m.flags.0.as_mut_ptr() as *mut c_void);
+        rmw_cerulion_vector_bool_construct(
+            m.flags.0.as_mut_ptr() as *mut c_void,
+            flag_elems.as_ptr(),
+            flag_elems.len(),
+        );
+        rmw_cerulion_vector_u8_assign(
+            m.data.0.as_mut_ptr() as *mut c_void,
+            data_bytes.as_ptr(),
+            data_bytes.len(),
+        );
+
+        CPP_FINI_CALLS.store(0, Ordering::SeqCst);
+        let seal = bridge
+            .seal_borrowed_frame(payload, PAYLOAD_LEN, &geo, None, GAP_OK, &mut scratch())
+            .expect("seal");
+        assert_eq!(
+            (seal.adopted, seal.escaped, seal.copied),
+            (0, 1, 1),
+            "the heap vector escapes, the bool sequence is copied from the arena"
+        );
+        assert_eq!(CPP_FINI_CALLS.load(Ordering::SeqCst), 1);
+
+        let got = std::slice::from_raw_parts(payload, seal.total_payload).to_vec();
+        assert_eq!(&got[0..4], &[0x78, 0x56, 0x34, 0x12]);
+        let table = bridge.layout.fixed_size;
+        let entry = |k: usize| {
+            let at = table + 8 * k;
+            let off = u32::from_le_bytes(got[at..at + 4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(got[at + 4..at + 8].try_into().unwrap()) as usize;
+            got[off..off + len].to_vec()
+        };
+        assert_eq!(
+            entry(0),
+            vec![1u8, 0, 1, 1, 0],
+            "flags, one byte per element"
+        );
+        assert_eq!(entry(1), vec![9u8, 8, 7, 6], "data");
+
+        let mut target: CppFlagged = std::mem::zeroed();
+        flagged_init(&mut target as *mut _ as *mut c_void, 0);
+        assert!(bridge.unflatten(&got, &mut target as *mut _ as *mut c_void));
+        assert_eq!(target.stamp, 0x1234_5678);
+        let flags_at = target.flags.0.as_ptr() as *const c_void;
+        let back: Vec<bool> = (0..rmw_cerulion_vector_bool_size(flags_at))
+            .map(|i| rmw_cerulion_vector_bool_get(flags_at, i))
+            .collect();
+        assert_eq!(back, vec![true, false, true, true, false]);
+        let vec = target.data.0.as_ptr() as *const c_void;
+        assert_eq!(rmw_cerulion_vector_u8_size(vec), data_bytes.len());
+        assert_eq!(
+            std::slice::from_raw_parts(rmw_cerulion_vector_u8_data(vec), data_bytes.len()),
+            &data_bytes
+        );
+        flagged_fini(&mut target as *mut _ as *mut c_void);
+
+        // The forged take of the same frame into an rmw-owned shadow: the
+        // bool sequence is never forged, so it is filled through the shim,
+        // while `data` (the only forgeable member, bit 0) aims at the frame.
+        let shadow = bridge.new_shadow().expect("shadow");
+        let outcome = bridge.unflatten_forged(&got, shadow).expect("forged take");
+        assert_eq!(outcome.forged, 1, "data is forged");
+        let sh = &*(shadow as *const CppFlagged);
+        assert_eq!(sh.stamp, 0x1234_5678);
+        let flags_at = sh.flags.0.as_ptr() as *const c_void;
+        let back: Vec<bool> = (0..rmw_cerulion_vector_bool_size(flags_at))
+            .map(|i| rmw_cerulion_vector_bool_get(flags_at, i))
+            .collect();
+        assert_eq!(back, vec![true, false, true, true, false]);
+        let vec = sh.data.0.as_ptr() as *const c_void;
+        assert_eq!(
+            std::slice::from_raw_parts(rmw_cerulion_vector_u8_data(vec), data_bytes.len()),
+            &data_bytes
+        );
+        bridge.destroy_shadow(shadow, outcome.forged);
+    }
+}
+
 /// Lyrical and Rolling: the borrow seal refuses a Buffer-backed top-level
 /// primitive sequence instance whose elements are not bytes (rosidl backs
 /// only `uint8[]` with a `rosidl::Buffer<uint8_t>`) before touching the

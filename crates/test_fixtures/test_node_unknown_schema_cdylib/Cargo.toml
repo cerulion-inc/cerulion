@@ -1,0 +1,15 @@
+[package]
+name = "test_node_unknown_schema_cdylib"
+version = "0.1.0"
+edition = "2021"
+description = "Stable raw node with an explicitly unknown input schema"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+cerulion_core.workspace = true
+
+[lints]
+workspace = true

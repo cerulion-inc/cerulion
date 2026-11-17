@@ -789,6 +789,7 @@ impl ScriptedNetd {
                                         cerulion_core::transport::cerulion_q::CATALOG_WIRE_VERSION,
                                     robot: t.robot.clone(),
                                     entries: vec![cerulion_core::CatalogEntry {
+                                        egress_qos: None,
                                         topic: t.topic.clone(),
                                         // Deliberately NONE: the peer's own
                                         // claimed hash is never used as

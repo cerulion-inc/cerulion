@@ -19,6 +19,20 @@ Multi-process buys you **fault isolation** (a crashed group takes down only
 its own nodes) and OS-level resource separation, not latency: intra-process
 fusion remains the fastest path.
 
+> **Deprecated:** the `CERULION_EXECUTION_MODE=lockstep` opt-out, and the
+> `CERULION_BARRIER_SPIN_US` and `CERULION_BARRIER_OS_SYNC` variables that tune
+> its barrier, are outside Semantic Versioning and may change or be removed in a
+> 2.x minor release. A multi-process run already free-runs by default. To order
+> a split edge between two nodes on the same level, mark the edge
+> `#[input(trigger)]` on a data-triggered consumer (the macro refuses it beside
+> `period_ms`), or co-locate both nodes in one `process_groups:` group that runs
+> as one executor unit (`cerulion graph plan` shows the units; a
+> `graphs/<NAME>.costs.yaml` profile or an `isolate: true` node can split a
+> group, and a plain `#[input]` between two units is not ordered); to keep every
+> node in one process, run `cerulion graph run --single-process`.
+> Replaying a bag stamped `coordination: lockstep` is not deprecated. See
+> [Multi-process execution](user-api.md#multi-process-execution).
+
 Related: `docs/multi_publisher_topics.md` (single-writer topics across
 groups), the cross-process barrier + deterministic-live clock,
 recording/replay,
@@ -38,8 +52,8 @@ recording's per-edge read log offline).
   is re-executed rank by rank; what a free-run run does NOT give you is the
   cross-rank equality the barrier buys, so the merged cross-process trace is
   not the monolith's.
-- **Under the `CERULION_EXECUTION_MODE=lockstep` opt-out** workers run in
-  lockstep: a shared-memory barrier gates every DAG-level
+- **Under the deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out**
+  workers run in lockstep: a shared-memory barrier gates every DAG-level
   boundary, and every worker advances the same deterministic-live logical
   clock quantum, so the merged cross-process fire TRACE is
   replay-deterministic, and so is the DATA on every edge the DAG orders. The
@@ -55,24 +69,31 @@ recording's per-edge read log offline).
   another worker cannot see. A SPLIT edge instead carries that mirror in shared
   memory, a **cross-process credit word** the supervisor mints per edge, and
   is then lossless across the boundary. One is minted for exactly the shape it
-  can describe: a topic with **exactly one in-graph producer** and **no
-  non-`block` consumers**. Every other split `block` edge is still refused
-  PRE-SPAWN (a multi-producer topic, because the word counts one producer's
-  outstanding frames; a MIXED topic, because its `block` consumers degrade to
-  `drop_oldest` and there is no lossless defer left to credit), and the refusal
-  names which bar it hit. The derived partition still co-locates every `block`
-  topic's WHOLE FLOW automatically (crossing a boundary costs a real hop
-  whether or not it is correct): its producers, its `block` consumers, and (on
-  a MIXED topic) the non-`block` siblings, without which the co-located worker
-  reads its flow as all-`block` and installs a defer `--single-process`
-  degrades (shown in `graph partition`'s consent preview). One residual is
+  can describe: a topic with **exactly one in-graph producer**, one word per
+  `block` consumer in another process. A split multi-producer `block` edge is
+  still refused PRE-SPAWN (the word counts one producer's outstanding frames),
+  and so is a split `block` input that sets `block_timeout_ms` (see
+  [The per-edge credit word](#the-per-edge-credit-word)); each refusal names
+  the bar. The topic's non-`block` consumers hold no
+  word and may sit in any group. A `block` consumer, split or not, defers the
+  producer's whole node, so wherever those `drop_oldest` and `sample(N)`
+  consumers sit they receive frames at the pace the `block` consumers allow.
+  The worker that runs the producer logs one load-time warning per such
+  topic, naming the consumers of every group, from the list the supervisor
+  derives from the whole graph (see
+  [Mixed topics](user-api.md#mixed-topics-each-block-consumer-holds-its-own-slot)).
+  The derived partition still co-locates every
+  `block` topic's WHOLE FLOW automatically (crossing a boundary costs a real
+  hop): its producers and all its consumers (shown in `graph partition`'s
+  consent preview). When a `block` consumer's worker dies, the supervisor
+  releases that consumer's slot and the producer resumes. One residual is
   worth knowing: on a
   `multi_publisher_topics:`-listed topic the credit word counts IN-GRAPH
   publishes only, so an out-of-graph writer can fill the consumer's queue
   without raising `outstanding`; the defer then arrives late and the queue can
   evict. That is a property of `block` on a listed topic, co-located or split.
-  A consumer drain that removes more frames than `outstanding` counts warns
-  `block credit drain removed frames its word never counted`, naming the
+  A consumer drain that removes more frames than its credit word has queued
+  warns `block credit drain removed frames its word never counted`, naming the
   topic, at the start of a run of such drains, so the outside writer shows in
   the log; while a run lasts, the drain that takes the running total to each
   power of ten warns a different line,
@@ -392,17 +413,15 @@ memory only. The deployment's produced topics reach the network through a
 GATEWAY, which taps them on the deployment's iceoryx2 namespace.
 One robot = one network peer: only the gateway process holds a zenoh session.
 
-- **Which gateway you get follows the posture.** A run with NO `network:`
-  block is PERMISSIVE (every produced topic is egressable; topic announce tokens
-  are declared when LAN access is open), and on
-  Unix the supervisor registers the deployment's egress plan with the
-  machine's shared `cerulion-netd` daemon, forwarding the supervisor-minted
-  worker namespace so netd's gateway taps the right shared memory. An explicit
-  block is STRICT (the declared allow-list): verbatim locators and an
-  allow-list cannot be represented on that shared session, so a Strict run is
-  routed to a per-run gateway child (`cerulion graph run-gateway`, hidden)
-  that honors the block. A permissive run falls back to the same child,
-  loudly, when netd is unreachable or resolved a different namespace.
+- **Export scope follows the block.** Without a `network:` block, every
+  produced topic is eligible for paired export. An enabled block restricts
+  egress and declares ingress. Paired strict and blockless runs register with
+  the shared `cerulion-netd`; authenticated imports select a unique producer.
+  The data plane uses the resolved shared data namespace, separate from the
+  deployment's coordination namespace. A namespace mismatch is refused.
+  Explicit open LAN strict plans retain verbatim zenoh locators and their
+  per-run gateway; a blockless open LAN plan retains the shared gateway and
+  its fallback when unavailable.
 - A per-run child is spawned AFTER the GO gate (the topics exist)
   and only while the run is live; a Ctrl-C'd spawn phase skips it.
 - The gateway is NOT a DAG worker: a per-run child is held in a separate
@@ -467,8 +486,10 @@ Two consequences to know:
 
 ### Barrier boundary spin (default-on)
 
-(A property of the `lockstep` opt-out, the mode that has a barrier to wait on;
-a free-run worker never reaches this wait.)
+(A property of the deprecated `lockstep` opt-out, the mode that has a barrier
+to wait on; a free-run worker never reaches this wait. The two variables
+below, `CERULION_BARRIER_SPIN_US` and `CERULION_BARRIER_OS_SYNC`, are
+deprecated with it.)
 
 At every level boundary each worker waits on the shared barrier. The
 blocking tier is a process-shared futex on Linux and, on macOS 14.4 and
@@ -504,7 +525,8 @@ never the fire set/order.
 A `block` edge is lossless because the producer reads the consumer's `outstanding` counter
 before it fires. Split the two across process groups and that read is gone, so such
 a split is accepted only for a **creditable** edge
-(exactly one in-graph producer, no non-`block` consumers), which gets a shared word to
+(exactly one in-graph producer; the topic's non-`block` consumers hold no word and do
+not count) whose `block` input sets no `block_timeout_ms`, which gets a shared word to
 read instead.
 
 **One word per EDGE, not per topic.** The identity is
@@ -562,19 +584,22 @@ an edge that is not there.
 ### Reading a credit-death warn
 
 Under `--peer-loss continue` the survivors keep running when a worker dies. If the dead rank
-was a credited edge's CONSUMER, the producer is now gating on a mirror nobody will drain, so
-the supervisor says so. The head is a `warn!` (emitted by `CreditDeathWatch` in `graph_cmd.rs`) with these fields:
+was a credited edge's CONSUMER, the supervisor releases that consumer's slot (its word only;
+every other consumer of the topic keeps its own) and the producer resumes. The head is a
+`warn!` (emitted by `CreditDeathWatch` in `graph_cmd.rs`) with these fields:
 
 ```
-group  node_id  topic  consumer_input  dead_rank
+group  node_id  topic  consumer_input  producer  reason  slot_released  dead_rank
 deferred_producer_ranks  deferred_producer_groups  total_failures
 ```
 
 Read it as: **`topic` + `consumer_input`** identify the edge; **`dead_rank` / `group`** say who
-died; **`deferred_producer_groups`** names the groups whose producers are now stuck on it (real
-group names, one per producer rank, not the batch; a rank whose group cannot be resolved
-renders `<rank N>` rather than being dropped);
-**`total_failures`** is a running, unconditional count that recovery never resets.
+died; **`producer`** names the edge's producer nodes; **`reason`** is `consumer_died`;
+**`slot_released`** is `true` when this report released the slot; **`deferred_producer_groups`**
+names the groups of the producers the dead consumer had been holding (real group names, one
+per producer rank, not the batch; a rank whose group cannot be resolved renders `<rank N>`
+rather than being dropped); **`total_failures`** is a running, unconditional count that
+recovery never resets.
 
 It is flood-latched on the shared `FailureRegimeLatch`: one loud head, `debug!` repeats,
 and a `warn!` re-announcement at each decade of the running total. If a
@@ -633,10 +658,14 @@ second at 1 kHz, about a minute and a half at 10 Hz. That is acceptable because 
 is permanent: a stalled consumer does not resume on its own, so the warn is
 late, never wrong.
 
-This is the second never-silent carrier for the wedge class, and it covers what the first
-cannot. The supervisor's `CreditDeathWatch` above reports a consumer whose PROCESS DIED; this
-reports one that is alive and idle. Between them both halves of a permanently-deferred
-producer are named.
+This warn only reports. `block_timeout_ms` cannot bound it on a split edge: the supervisor
+refuses the key, before any worker starts, on every edge it mints a credit word for, naming the
+edge and both process groups or executor units. The producer and the consumer fire on different
+threads there, so after a timeout release a read and a publish can interleave and the shared
+word can count a frame that is gone, or miss one and let a frame published after the release be
+evicted. To bound how long an alive-but-idle consumer can hold its producer, put both nodes in
+one process group (or run `--single-process`) and set the key there. A consumer whose PROCESS
+DIED needs no timeout: the supervisor's `CreditDeathWatch` above releases its slot.
 
 Pinned end to end over REAL processes by `crates/cerulion_cli/tests/credit_death_e2e_test.rs`: the
 loud head and its fields, the ABSENCE of a repeat, the retraction, the free-run `groups=`. The
@@ -807,8 +836,9 @@ each driven to its own recorded boundary targets:
   WOULD read cross-rank occupancy at instants nothing records, so an
   independently re-derived schedule could legally differ from the recorded one
   and report a fire-schedule divergence on a candidate that changed nothing.
-  (Such a bag CAN exist: plan time admits a creditable split,
-  so `graph run --record` of one produces a bag carrying a cross-process
+  (Such a bag CAN exist: plan time admits a creditable split whose `block`
+  input sets no `block_timeout_ms`, so `graph run --record` of one produces
+  a bag carrying a cross-process
   `block` edge. Replay does not accept it: `replay_engine` builds no
   credited-edge set, so the consumer's rank sees a producer-less `block` topic
   and refuses at exit 5.) In replay that
@@ -906,10 +936,10 @@ cerulion graph run perception_stack --trace-limit 500000
 | Flag | Notes |
 |---|---|
 | `--peer-loss <continue\|fail>` | Applies to every multi-process run, including one whose groups were derived automatically. A single-process run warns once that the option does not apply. Default `continue`. |
-| `--single-process` | Keeps every node in one process even with `process_groups:` (info log names the override). On a graph WITHOUT `process_groups:` it opts out of the multi-process auto-partition default entirely: no derivation, no confirm (info log). On the real clock a graph whose nodes split into executor units (from the graph's profile or a node's `isolate: true`; without either a graph is one unit) runs every unit in one worker process beside `graph run`; a graph that is one unit, and any run on the lockstep execution mode or a virtual or external time source, is the plain monolith. |
+| `--single-process` | Keeps every node in one process even with `process_groups:` (an `info` line, shown with `RUST_LOG=info`, names the override). On a graph WITHOUT `process_groups:` it opts out of the multi-process auto-partition default entirely: no derivation, no confirm (an `info` line, shown with `RUST_LOG=info`, says so). On the real clock a graph whose nodes split into executor units (from the graph's profile or a node's `isolate: true`; without either a graph is one unit) runs every unit in one worker process beside `graph run`; a graph that is one unit, and any run on the lockstep execution mode or a virtual or external time source, is the plain monolith. |
 | `--trace-limit <N>` | Caps the in-memory fire-trace ring (default 100 000 entries, stamped into every worker). The trace is a bounded observability window, NOT the replay record (recording is the bag's job). Unbounded growth costs ~2 GB/h at 1 kHz × 10 nodes, so `0` is rejected at parse; there is no unbounded escape hatch. |
 | `--record[=DIR]` | Records the MULTI-PROCESS run into ONE bag: the run's per-rank trace rings + the supervisor's departure ring, which exist on every multi-process run, recording or not (see `--no-rings`), all drained by one `bagd`; rank-stamped provenance in every record's `reserved`. By default (free-run) each rank records its OWN wall-faithful timeline from a shared epoch; under the `CERULION_EXECUTION_MODE=lockstep` opt-out the recording is quantum-timed (see "Recording a multi-process run" above); the bag's `coordination` stamp and the run directory's `gating` label say which. `--single-process --record` of a graph that is one executor unit (or under the opt-out) takes the single-process wall-faithful path instead; of a graph whose nodes split into several units it records from its one worker process, one rank per unit. Unix-only; requires the live clock. |
-| `--no-rings` | Declines this run's per-rank SCHEDULER-TRACE rings. They are provisioned by DEFAULT on every multi-process run so that a Flashback capture of ANY serving graph can be RE-EXECUTED (`cerulion bag play --resim`) rather than only a run somebody decided in advance to record; this is the opt-out for a memory-tight robot. Cost declined: ~40.06 MiB APPARENT per rank (`65_600 + 2^20 × 40` = 42,008,640 B) plus one 106,560 B departure ring; the segment is `ftruncate`d rather than written, so it costs a page at first and converges on the full figure only as the ring fills. It ALSO stops the Flashback window recorder being started for this run: with no trace rings nothing captured could be re-executed, so the run takes NO captures rather than frames-only ones (`CERULION_FLASHBACK=off` is the SEPARATE, orthogonal switch for the state plane + anchors). **Conflicts with `--record`** at parse time: `--record` requires the scheduler trace, because that is what a deterministic re-execution reads. On shapes that mint no ring anyway it is NOT a no-op: a `--single-process` run of a graph that is one executor unit, or a `--time-source external` run, still has its window recorder stopped by it, so the run takes no captures. Each says at launch which it was. (`cerulion ros2 attach` and `node run` define no such flag at all.) NOT `--trace-limit`, which caps the IN-MEMORY fire-trace ring above; these are the SHARED-MEMORY rings a recorder drains. |
+| `--no-rings` | Declines this run's per-rank SCHEDULER-TRACE rings. They are provisioned by DEFAULT on every multi-process run so that a Flashback capture of ANY serving graph can be RE-EXECUTED (`cerulion bag play --resim`) rather than only a run somebody decided in advance to record; this is the opt-out for a memory-tight robot. Cost declined: ~40.06 MiB APPARENT per rank (`65_600 + 2^20 × 40` = 42,008,640 B) plus one 106,560 B departure ring; the segment is `ftruncate`d rather than written, so it costs a page at first and converges on the full figure only as the ring fills. It ALSO stops the Flashback window recorder being started for this run: with no trace rings nothing captured could be re-executed, so the run takes NO captures rather than frames-only ones (`CERULION_FLASHBACK=off` is the SEPARATE, orthogonal switch for the state plane + anchors). **Conflicts with `--record`** at parse time: `--record` requires the scheduler trace, because that is what a deterministic re-execution reads. On shapes that mint no ring anyway it is NOT a no-op: a `--single-process` run of a graph that is one executor unit, or a `--time-source external` run, still has its window recorder stopped by it, so the run takes no captures. Each logs at `info` at launch which it was. (`cerulion ros2 attach` and `node run` define no such flag at all.) NOT `--trace-limit`, which caps the IN-MEMORY fire-trace ring above; these are the SHARED-MEMORY rings a recorder drains. |
 | `--time-source external` | **Rejected** for multi-process: every worker runs on the real clock (free-run by default, each rank on its own wall-faithful clock, or barrier-gated lockstep under `CERULION_EXECUTION_MODE=lockstep`) and an external time master driving N separate processes is unspecified either way. Drop the flag, or use `--single-process`. |
 | `--time-source virtual` | Ignored with a loud warning: multi-process workers always run on the real clock (free-run by default, barrier lockstep under the opt-out). With `--record` it is rejected outright: recording requires the live clock (`--time-source real`, the default). |
 

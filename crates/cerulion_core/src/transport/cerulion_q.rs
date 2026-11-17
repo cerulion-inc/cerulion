@@ -384,6 +384,10 @@ pub enum CatalogProvenance {
 /// One topic in a robot's catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogEntry {
+    /// The producer's declared wire queue policy. Absent on a source that
+    /// cannot verify its policy; graph ingress must refuse that source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress_qos: Option<super::carrier::EgressQos>,
     /// The canonical absolute topic name (leading `/`).
     pub topic: String,
     /// The wire `schema_hash` (recipe-3) the gateway advertises for the topic, or
@@ -2447,6 +2451,7 @@ mod tests {
             "go2",
             vec![
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/imu".to_string(),
                     schema_hash: Some(0x1111),
                     schema_name: Some("sensor_msgs/Imu".to_string()),
@@ -2455,6 +2460,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/camera/image".to_string(),
                     schema_hash: None,
                     schema_name: None,
@@ -2464,6 +2470,7 @@ mod tests {
                 },
                 // Duplicate canonical — the first (sorted-stable) wins.
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/imu".to_string(),
                     schema_hash: Some(0x2222),
                     schema_name: Some("other/Type".to_string()),
@@ -2499,6 +2506,7 @@ mod tests {
             robot: "go2".to_string(),
             entries: vec![
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/camera/image".to_string(),
                     schema_hash: None,
                     schema_name: None,
@@ -2507,6 +2515,7 @@ mod tests {
                     liveness: None,
                 },
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/utlidar/cloud".to_string(),
                     schema_hash: Some(0xDEAD_BEEF_CAFE_F00D),
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -2533,6 +2542,7 @@ mod tests {
         let served = build_catalog_reply(
             "go2",
             [CatalogEntry {
+                egress_qos: None,
                 topic: "/imu".to_string(),
                 schema_hash: Some(7),
                 schema_name: None,
@@ -2601,6 +2611,7 @@ mod tests {
         let bare = build_catalog_reply(
             "go2",
             [CatalogEntry {
+                egress_qos: None,
                 topic: "/imu".to_string(),
                 schema_hash: Some(7),
                 schema_name: None,
@@ -2638,6 +2649,7 @@ mod tests {
         let observed = build_catalog_reply(
             "go2",
             [CatalogEntry {
+                egress_qos: None,
                 topic: "/imu".to_string(),
                 schema_hash: Some(7),
                 schema_name: None,
@@ -2697,6 +2709,7 @@ mod tests {
         let new_wire = String::from_utf8(encode_catalog_reply(&build_catalog_reply(
             "go2",
             [CatalogEntry {
+                egress_qos: None,
                 topic: "/utlidar/cloud_deskewed".to_string(),
                 schema_hash: Some(7),
                 schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -2841,6 +2854,7 @@ mod tests {
             entries: vec![
                 // A live 20 Hz topic — one producer.
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/utlidar/cloud".to_string(),
                     schema_hash: Some(0x1),
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -2851,6 +2865,7 @@ mod tests {
                 // A registered-but-DEAD route (a DDS route / boot announce whose
                 // producer is not publishing).
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/uslam/cloud_map".to_string(),
                     schema_hash: None,
                     schema_name: Some("sensor_msgs/PointCloud2".to_string()),
@@ -2860,6 +2875,7 @@ mod tests {
                 },
                 // An un-probed topic (an older robot, or a probe-less serve path).
                 CatalogEntry {
+                    egress_qos: None,
                     topic: "/legacy".to_string(),
                     schema_hash: None,
                     schema_name: None,
@@ -2890,6 +2906,7 @@ mod tests {
             version: CATALOG_WIRE_VERSION,
             robot: "go2".to_string(),
             entries: vec![CatalogEntry {
+                egress_qos: None,
                 topic: "/imu".to_string(),
                 schema_hash: Some(7),
                 schema_name: Some("sensor_msgs/Imu".to_string()),
