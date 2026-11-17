@@ -1,6 +1,6 @@
 # cerulion_cli_engine
 
-Clap calls here; tests never spawn. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) through check/write: UNIX flock with wsd, reentrant; wait warns once; no-op elsewhere.
+Clap calls here; bound helper tests. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) through check/write: UNIX flock with wsd, reentrant; wait warns once; no-op elsewhere.
 Reads: `acquire_read` creates nothing, refuses same-thread re-entry; all
 refuse symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits
 tracked `.gitignore` when creating `.cerulion/`; migrate polls with
@@ -30,7 +30,7 @@ Ports: `graph_cmd::stage_declared_node`.
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
 ## Dependencies
 Deps follow binary: checkout/exact registry pins.
-Checks: cli dossier §11.
+Checks: dossier §11.
 ## Tests: lib env `test_env::env_lock`
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
   ungrounded/unmarked (`selection:`) selection, no `# doc-pin:`-less doc
