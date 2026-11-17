@@ -117,6 +117,7 @@ pub mod provision;
 pub mod rcp;
 pub mod robot_settings;
 pub mod serving_hold;
+pub mod shell_policy;
 pub mod shutdown;
 pub mod tap;
 pub mod trust;
