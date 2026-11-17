@@ -686,6 +686,12 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
         "release-only latency regression gate — the ci.yml test-latency headline",
     ),
     (
+        "live_exact_deadline_iox2_test",
+        "judges a 1 kHz node's fire gaps and the wait after a slow step against \
+         wall time; DEBUG-OK, so it gates every PR, and a loaded runner delays \
+         the ticker into catch-up double fires",
+    ),
+    (
         "period_decompose_bench_test",
         "release-only per-hop decomposition bench",
     ),
