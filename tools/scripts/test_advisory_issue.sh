@@ -199,7 +199,7 @@ expect_status() {
 }
 
 expect_output() {
-    printf '%s\n' "$output" | grep -Fq "$1" ||
+    grep -Fq "$1" <<<"$output" ||
         fail "$case_name: the output does not carry '$1'"
 }
 
