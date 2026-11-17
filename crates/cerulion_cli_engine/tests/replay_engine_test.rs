@@ -5351,6 +5351,133 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
     );
 }
 
+/// The bag the non-UTF-8 environment child replays. Set only on that child;
+/// the child test returns at once without it.
+const NON_UTF8_ENV_CHILD_BAG_ENV: &str = "CER_NON_UTF8_ENV_CHILD_BAG";
+
+/// The start of the line on which that child prints its replay's
+/// `env_divergence`, serialized as the `--report` JSON writes it.
+const ENV_DIVERGENCE_LINE: &str = "ENV_DIVERGENCE_JSON=";
+
+/// The child: replay the bag [`NON_UTF8_ENV_CHILD_BAG_ENV`] names under this
+/// process's environment, which the parent seeds with variables that are not
+/// valid UTF-8, require a pass, and print every env divergence.
+#[test]
+#[ignore = "subprocess child of env_non_utf8_value_matching_its_recorded_hash_is_not_a_divergence"]
+#[serial]
+fn replay_non_utf8_env_child() {
+    let Some(bag) = std::env::var_os(NON_UTF8_ENV_CHILD_BAG_ENV) else {
+        return; // Not the re-executed child: a no-op.
+    };
+    let outcome = replay(
+        std::path::Path::new(&bag),
+        source_relay_factories,
+        None,
+        None,
+    )
+    .expect("the child's replay runs");
+    assert!(
+        outcome.passed,
+        "env divergence never fails the run: {:?}",
+        outcome.violations
+    );
+    // A leading newline, because libtest's `--nocapture` progress line ends
+    // without one.
+    println!(
+        "\n{ENV_DIVERGENCE_LINE}{}",
+        serde_json::to_string(&outcome.env_divergence).expect("the entries serialize")
+    );
+}
+
+/// Replay `bag` in a re-executed child whose environment adds `vars` (raw
+/// bytes) and return the env divergence entries it printed. Fails unless the
+/// child builds its graph, passes and exits 0.
+fn replay_in_child_with_env(
+    bag: &std::path::Path,
+    vars: &[(&[u8], &[u8])],
+) -> Vec<serde_json::Value> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.args([
+        "--exact",
+        "replay_non_utf8_env_child",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(NON_UTF8_ENV_CHILD_BAG_ENV, bag);
+    for (name, value) in vars {
+        cmd.env(
+            std::ffi::OsStr::from_bytes(name),
+            std::ffi::OsStr::from_bytes(value),
+        );
+    }
+    let output = cmd.output().expect("spawn the replay child");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "the replay child must build its graph and pass (status {:?})\nstdout:\n{stdout}\nstderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(ENV_DIVERGENCE_LINE))
+        .unwrap_or_else(|| panic!("the child printed no {ENV_DIVERGENCE_LINE} line:\n{stdout}"));
+    serde_json::from_str(line).expect("the child's env divergence is JSON")
+}
+
+/// A recorded hash of a value that is not valid UTF-8 matches the same bytes
+/// at replay: the resim builds its graph under that value, and under a NAME
+/// that is not valid UTF-8 beside it, and reports no divergence for the
+/// variable. The control: other bytes report `HashChanged` with both hashes,
+/// so the silent case is a real match and not a skipped compare. Each replay
+/// runs in a child, so the bytes are set only in the child's environment.
+#[test]
+#[serial]
+fn env_non_utf8_value_matching_its_recorded_hash_is_not_a_divergence() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_not_utf8.mcap");
+    // FNV-1a 64 of the bytes `ff fe` is `0a99c807b6f645b0`.
+    let env = serde_json::json!({
+        "CER_REPLAY_NOT_UTF8": {"redacted": true, "fnv64": "0a99c807b6f645b0"},
+    });
+    write_bag(&rec, &bag, Some(&serde_json::to_vec(&env).unwrap()));
+    let ours = |entries: Vec<serde_json::Value>| -> Vec<serde_json::Value> {
+        entries
+            .into_iter()
+            .filter(|entry| entry["name"] == "CER_REPLAY_NOT_UTF8")
+            .collect()
+    };
+
+    let same = replay_in_child_with_env(
+        &bag,
+        &[
+            (b"CER_REPLAY_NOT_UTF8", b"\xff\xfe"),
+            (b"CER_REPLAY_NAME_\xff", b"v"),
+        ],
+    );
+    assert_eq!(
+        ours(same),
+        Vec::<serde_json::Value>::new(),
+        "the same bytes hash to the recorded value"
+    );
+
+    // FNV-1a 64 of the bytes `ff fd` is `0a99cb07b6f64ac9`.
+    let changed = replay_in_child_with_env(&bag, &[(b"CER_REPLAY_NOT_UTF8", b"\xff\xfd")]);
+    assert_eq!(
+        ours(changed),
+        [serde_json::json!({
+            "name": "CER_REPLAY_NOT_UTF8",
+            "kind": {"kind": "HashChanged"},
+            "detail": "redacted variable 'CER_REPLAY_NOT_UTF8' hash changed since recording \
+                       (recorded 0a99c807b6f645b0, now 0a99cb07b6f64ac9)",
+            "read_by": null,
+        })]
+    );
+}
+
 /// The singular NOTE line, hand-written: one differing variable that no
 /// runtime Cerulion starts reads.
 const ENV_NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
