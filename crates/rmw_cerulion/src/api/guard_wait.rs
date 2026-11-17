@@ -206,14 +206,13 @@
 //!   period-learned park is off too); any other non-empty value warns once
 //!   and keeps the default.
 //! * `CERULION_RMW_PERIOD_PARK`: rmw-only, the period-learned park's
-//!   switch, through the same classification, read per call on Linux where
-//!   the build carries the park (cfg `cerulion_period_park`: every Linux
-//!   aarch64 build, any other with the `period-park` feature), and not under
-//!   `CERULION_RMW_EVENT_WAIT=off`: `0` ⇒ off, the stock wait above; unset
-//!   or `1` ⇒ on; a near miss warns once and leaves it on. Where no wait
-//!   reads it (a build without the park, or off Linux), the first wait set
-//!   reads it once and warns on `1` or a near miss; `1` on a CPU without the
-//!   primitive warns too (`period_park_notice`).
+//!   switch, through the same classification, read ONCE per wait set when
+//!   `rmw_create_wait_set` builds it (never by `rmw_wait`, so the wait path
+//!   allocates nothing for it): `0` ⇒ off, the stock wait above; unset or
+//!   `1` ⇒ on where the build carries the park (cfg `cerulion_period_park`:
+//!   every Linux aarch64 build, any other with the `period-park` feature).
+//!   A near miss warns once and leaves it on; `1` warns once where the park
+//!   cannot run (`period_park_notice`).
 //! * `CERULION_RMW_EVENT_WAIT=off`: rmw-only, the
 //!   kill-switch: restores the legacy sleep-poll loop VERBATIM as exit 3 —
 //!   probe, `sleep(100 µs)`, probe: NO fd block, NO park, NO spin
@@ -589,8 +588,8 @@ fn period_park_notice(
     }
 }
 
-/// Log `notice` for the `CERULION_RMW_PERIOD_PARK` value `raw`, once per process for each
-/// caller's `Once`.
+/// Log `notice` for the `CERULION_RMW_PERIOD_PARK` value `raw` (the caller logs once per
+/// process).
 fn log_period_park_notice(notice: PeriodParkNotice, raw: &str) {
     match notice {
         PeriodParkNotice::NearMiss => tracing::warn!(
@@ -615,39 +614,35 @@ fn log_period_park_notice(notice: PeriodParkNotice, raw: &str) {
     }
 }
 
-/// `CERULION_RMW_PERIOD_PARK`, the period-learned park's switch, through the shared
-/// exact-match `classify_env_flag`, read per call like `CERULION_MONITOR_WAIT` by a call on a
-/// build that carries the park where a ring wakes it (Linux); [`predicts_windows`] applies
-/// it. `hw`: the CPU has the monitor-wait primitive. The first notice the value owes
-/// ([`period_park_notice`]: a near miss, or `1` without the primitive) is logged once.
-fn period_park_flag_from_env(hw: bool) -> cerulion_core::monitor_wait::EnvFlag {
+/// `CERULION_RMW_PERIOD_PARK` as resolved for one wait set ([`period_park_switch_at_create`]).
+/// A wait set built without `rmw_create_wait_set` (this crate's unit tests) holds the unset
+/// value, `EnvFlag::Auto`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PeriodParkSwitch(cerulion_core::monitor_wait::EnvFlag);
+
+impl Default for PeriodParkSwitch {
+    fn default() -> Self {
+        Self(cerulion_core::monitor_wait::EnvFlag::Auto)
+    }
+}
+
+/// `CERULION_RMW_PERIOD_PARK`, the period-learned park's switch, read ONCE per wait set, when
+/// `rmw_create_wait_set` builds it, through the shared exact-match `classify_env_flag`. Every
+/// `rmw_wait` on that wait set applies the resolved value ([`predicts_windows`]) and never reads
+/// the environment for it, so the wait path allocates nothing for the switch; a change to the
+/// variable applies to wait sets created after it. The first notice a value owes on this
+/// build ([`period_park_notice`]) is logged once per process.
+fn period_park_switch_at_create() -> PeriodParkSwitch {
     let raw = std::env::var("CERULION_RMW_PERIOD_PARK").ok();
     let flag = cerulion_core::monitor_wait::classify_env_flag(raw.as_deref());
-    if let Some(notice) = period_park_notice(flag, true, true, hw) {
+    let hw = cerulion_core::monitor_wait::monitor_wait_available();
+    if let Some(notice) =
+        period_park_notice(flag, cfg!(cerulion_period_park), RING_WAKES_THE_PARK, hw)
+    {
         static NOTICE: std::sync::Once = std::sync::Once::new();
         NOTICE.call_once(|| log_period_park_notice(notice, raw.as_deref().unwrap_or("")));
     }
-    flag
-}
-
-/// On a build without the period-learned park, or off Linux, no wait reads
-/// `CERULION_RMW_PERIOD_PARK`, so the first wait set reads it once here and logs the notice
-/// it owes ([`period_park_notice`]). Where a build carries the park on Linux, every wait
-/// reads it instead ([`period_park_flag_from_env`]).
-fn notice_once_where_no_wait_reads_the_period_park_switch() {
-    let carries = cfg!(cerulion_period_park);
-    if carries && RING_WAKES_THE_PARK {
-        return;
-    }
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        let raw = std::env::var("CERULION_RMW_PERIOD_PARK").ok();
-        let flag = cerulion_core::monitor_wait::classify_env_flag(raw.as_deref());
-        let hw = cerulion_core::monitor_wait::monitor_wait_available();
-        if let Some(notice) = period_park_notice(flag, carries, RING_WAKES_THE_PARK, hw) {
-            log_period_park_notice(notice, raw.as_deref().unwrap_or(""));
-        }
-    });
+    PeriodParkSwitch(flag)
 }
 
 /// The park horizon in µs under [`ParkHorizon::FirstRungOnce`] — the
@@ -927,10 +922,13 @@ pub struct WaitSetData {
     #[cfg(cerulion_period_park)]
     period: Mutex<PeriodState>,
     /// `rmw_wait` calls that ran the period-learned park: a mapped bell, and
-    /// `predicts_windows` on. A call under `CERULION_RMW_PERIOD_PARK=0` or
-    /// `CERULION_MONITOR_WAIT=0` is not counted, and runs the stock wait.
+    /// `predicts_windows` on. A call on a wait set created under
+    /// `CERULION_RMW_PERIOD_PARK=0`, or a call under `CERULION_MONITOR_WAIT=0`, is not
+    /// counted, and runs the stock wait.
     #[cfg(cerulion_period_park)]
     pub predicting_waits: AtomicU64,
+    /// `CERULION_RMW_PERIOD_PARK` as read when `rmw_create_wait_set` built this wait set.
+    period_park_switch: PeriodParkSwitch,
     /// Parks entered from a predicted window: the kernel lead timed out (or there was none).
     #[cfg(cerulion_period_park)]
     pub predicted_parks: AtomicU64,
@@ -1712,10 +1710,13 @@ pub unsafe extern "C" fn rmw_create_wait_set(
         if context.is_null() || !ffi::is_our_identifier((*context).implementation_identifier) {
             return std::ptr::null_mut();
         }
-        notice_once_where_no_wait_reads_the_period_park_switch();
+        let data = WaitSetData {
+            period_park_switch: period_park_switch_at_create(),
+            ..WaitSetData::default()
+        };
         let ws = Box::new(ffi::rmw_wait_set_t {
             implementation_identifier: ffi::implementation_identifier_ptr(),
-            data: Box::into_raw(Box::new(WaitSetData::default())) as *mut std::os::raw::c_void,
+            data: Box::into_raw(Box::new(data)) as *mut std::os::raw::c_void,
             guard_conditions: std::ptr::null_mut(),
         });
         Box::into_raw(ws)
@@ -2909,12 +2910,7 @@ unsafe fn rmw_wait_live(
         // A call that does not predict runs the stock wait with no learner work.
         let predict = cfg!(cerulion_period_park) && event_wait && RING_WAKES_THE_PARK && {
             let hw = cerulion_core::monitor_wait::monitor_wait_available();
-            predicts_windows(
-                period_park_flag_from_env(hw),
-                monitor_flag,
-                hw,
-                sub_topics.len(),
-            )
+            predicts_windows(ws.period_park_switch.0, monitor_flag, hw, sub_topics.len())
         };
         if use_park_cfg || predict {
             ws.refresh_park_bells(&sub_topics);

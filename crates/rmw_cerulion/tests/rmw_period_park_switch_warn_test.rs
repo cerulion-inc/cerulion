@@ -3,15 +3,16 @@
 //! is pinned here, in an OWN binary because `#[traced_test]` takes the process-global
 //! subscriber slot (the `rmw_cpp_bypass_warn_test` precedent), and because each notice is
 //! logged once per process. Which value owes which notice (`period_park_notice`) is
-//! oracle-pinned in the lib tests; this file pins the emission on the path THIS build takes:
+//! oracle-pinned in the lib tests; this file pins the emission on THIS build. Each wait set
+//! reads the value when it is created:
 //!
-//! - off Linux, or on a Linux build without the period-learned park: `1` is read once, at
-//!   the first wait set, and warns that the park runs only on Linux (or is not carried);
-//! - a build that carries it on Linux: every wait reads the value. With a monitor-wait
-//!   primitive, `1` and `0` stay silent and a near miss warns once; without one, `0` stays
-//!   silent and `1` warns once that the CPU has none.
+//! - off Linux, or on a Linux build without the period-learned park: `0` stays silent, and
+//!   `1` warns that the park runs only on Linux (or is not carried);
+//! - a build that carries it on Linux, with a monitor-wait primitive: `1` and `0` stay
+//!   silent, and a near miss warns once; without one, `0` stays silent and `1` warns once
+//!   that the CPU has none.
 //!
-//! Each value runs two waits on two wait sets, so a notice logged per call fails.
+//! Each value runs two waits on two wait sets, so a notice logged per wait set fails.
 #![cfg(unix)]
 
 use serial_test::serial;
@@ -89,9 +90,9 @@ fn the_period_park_switch_notice_is_one_warn_line_on_this_builds_path() {
     // (values set in order, the exact body of the one notice line expected)
     let near_miss = format!("{NEAR_MISS} value=on");
     let (values, expected): (&[&str], &str) = if !linux {
-        (&["1"], NOT_LINUX)
+        (&["0", "1"], NOT_LINUX)
     } else if !carries {
-        (&["1"], NOT_CARRIED)
+        (&["0", "1"], NOT_CARRIED)
     } else if hw {
         (&["1", "0", "on"], &near_miss)
     } else {
