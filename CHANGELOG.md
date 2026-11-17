@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Added
+- `cerulion_ops_proto::ExecClient` provides an argv-only session state machine with independent stdout and stderr capture limits, recording checkpoint consistency checks, partial progress after interruption, and a single completed result after a valid exit. Callers own authentication, transport, deadlines and witness persistence; a lost connection must not trigger automatic command replay.
 - The ops handshake carries an explicit session kind and negotiates version 2 while retaining version 1 for ordinary verbs. The ordinary client rejects an acknowledgement outside its offered or supported range, and ordinary ops services refuse shell and exec sessions before acknowledgement. Rust callers constructing `cerulion_ops_proto::Hello` or its `cerud::protocol` re-export must add `session: SessionKind::Ops` for ordinary verbs, or use `Hello::current()`.
 - `cerulion_ops_proto` can build and verify hash-chained shell and exec audit events against a recording witness retained by the client. Complete verification requires a final exit event; prefix verification covers only the events committed by its witness. Invalid appends leave the last valid chain state intact.
 - `cerulion_ops_proto` provides bounded shell and exec frame codecs, including terminal geometry, direct argv requests, binary chunks, exit reasons and recording commitments. Session frames reject unknown fields and oversized payloads; binary chunks use canonical padded base64.
