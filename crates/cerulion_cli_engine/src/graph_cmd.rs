@@ -6724,7 +6724,7 @@ pub fn graph_run(
                     // here: it carries each node's driver flag, so it is
                     // written once the nodes load (`write_run_recorder_best_effort`).
                     graph_yaml,
-                    env_json: render_env_json(record_env, std::env::vars()),
+                    env_json: render_process_env_json(record_env, EnvJsonArtifact::RunDirectory),
                 })
             }
             Err(e) => {
@@ -17291,39 +17291,188 @@ fn env_value_allowlisted(name: &str) -> bool {
         && !env_name_marks_a_secret(name)
 }
 
-/// Render the `env.json` attachment bytes for `mode`
-/// over `vars`. Pure (injectable vars) so every mode's shape is unit-testable
-/// without process-env mutation. Keys are SORTED (BTreeMap) — deterministic
-/// bytes for a given environment.
+/// What `env.json` stores for one variable whose name is valid UTF-8, as
+/// [`env_json_value`] decides it.
 #[cfg(unix)]
-fn render_env_json(
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvJsonValue {
+    /// The value as text.
+    Text(String),
+    /// `{"fnv64": "<hex>", "redacted": true}`: a UTF-8 value the mode hashes.
+    Hash { fnv64: u64 },
+    /// `{"fnv64": "<hex>", "redacted": true, "utf8": false}`: a value that is
+    /// not valid UTF-8, hashed over its raw bytes. `withheld` is true when the
+    /// mode would have stored the value as text had it been UTF-8.
+    NotUtf8 { fnv64: u64, withheld: bool },
+    /// `null`: the mode records names only.
+    NameOnly,
+}
+
+#[cfg(unix)]
+impl EnvJsonValue {
+    /// The JSON this entry is written as. Keys serialize sorted, so a hash
+    /// object reads `fnv64`, `redacted`, then `utf8`.
+    fn to_json(&self) -> serde_json::Value {
+        match self {
+            EnvJsonValue::Text(text) => serde_json::Value::String(text.clone()),
+            EnvJsonValue::Hash { fnv64 } => serde_json::json!({
+                "redacted": true,
+                "fnv64": format!("{fnv64:016x}"),
+            }),
+            EnvJsonValue::NotUtf8 { fnv64, .. } => serde_json::json!({
+                "redacted": true,
+                "fnv64": format!("{fnv64:016x}"),
+                "utf8": false,
+            }),
+            EnvJsonValue::NameOnly => serde_json::Value::Null,
+        }
+    }
+}
+
+/// Decide what `env.json` stores under `mode` for the variable `name` (valid
+/// UTF-8) with `value`. Pure.
+///
+/// `none` stores `null`. Otherwise the mode keeps the value as text (`all`
+/// always, `allowlist` when [`env_value_allowlisted`] says so) or hashes it.
+/// A value that is not valid UTF-8 cannot be JSON text, so it is hashed over
+/// its raw bytes in either case and marked `utf8: false`. The hash is FNV-1a
+/// 64 over the bytes, the same function a replay hashes the current value with.
+#[cfg(unix)]
+fn env_json_value(mode: RecordEnvMode, name: &str, value: std::ffi::OsString) -> EnvJsonValue {
+    use std::os::unix::ffi::OsStrExt as _;
+    let keeps_text = match mode {
+        RecordEnvMode::None => return EnvJsonValue::NameOnly,
+        RecordEnvMode::All => true,
+        RecordEnvMode::Allowlist => env_value_allowlisted(name),
+    };
+    match value.into_string() {
+        Ok(text) if keeps_text => EnvJsonValue::Text(text),
+        Ok(text) => EnvJsonValue::Hash {
+            fnv64: cerulion_core::wire::fnv1a_hash(text.as_bytes()),
+        },
+        Err(raw) => EnvJsonValue::NotUtf8 {
+            fnv64: cerulion_core::wire::fnv1a_hash(raw.as_bytes()),
+            withheld: keeps_text,
+        },
+    }
+}
+
+/// One rendered `env.json`, with the variables the render could not store as
+/// the mode asks.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct EnvJsonRender {
+    /// The attachment bytes: pretty JSON with sorted keys.
+    pub(crate) bytes: Vec<u8>,
+    /// The name of each variable left out because its name is not valid UTF-8
+    /// (a JSON key must be text), sorted by bytes, each name once.
+    pub(crate) left_out_names: Vec<std::ffi::OsString>,
+    /// The name of each variable whose value the mode would have stored as
+    /// text but which is not valid UTF-8, so its hash is stored instead;
+    /// sorted, each name once.
+    pub(crate) withheld_not_utf8: Vec<String>,
+}
+
+/// Render the `env.json` attachment for `mode` over `vars`, each name and
+/// value as the raw bytes the environment holds. Pure (injectable vars), so
+/// every mode's shape is unit-testable without process-env mutation.
+///
+/// Infallible: a variable whose name is not valid UTF-8 is left out and
+/// listed in [`EnvJsonRender::left_out_names`], and each value is stored as
+/// [`env_json_value`] decides. Keys are sorted (`BTreeMap`), so the bytes
+/// depend on the environment alone, never on its order.
+#[cfg(unix)]
+pub(crate) fn render_env_json(
     mode: RecordEnvMode,
-    vars: impl IntoIterator<Item = (String, String)>,
-) -> Vec<u8> {
-    let map: std::collections::BTreeMap<String, serde_json::Value> = vars
-        .into_iter()
-        .map(|(name, value)| {
-            let rendered = match mode {
-                RecordEnvMode::All => serde_json::Value::String(value),
-                RecordEnvMode::None => serde_json::Value::Null,
-                RecordEnvMode::Allowlist => {
-                    if env_value_allowlisted(&name) {
-                        serde_json::Value::String(value)
-                    } else {
-                        serde_json::json!({
-                            "redacted": true,
-                            "fnv64": format!(
-                                "{:016x}",
-                                cerulion_core::wire::fnv1a_hash(value.as_bytes())
-                            ),
-                        })
-                    }
-                }
-            };
-            (name, rendered)
-        })
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> EnvJsonRender {
+    let mut entries: std::collections::BTreeMap<String, EnvJsonValue> =
+        std::collections::BTreeMap::new();
+    let mut left_out_names = Vec::new();
+    for (name, value) in vars {
+        match name.into_string() {
+            Ok(name) => {
+                let entry = env_json_value(mode, &name, value);
+                entries.insert(name, entry);
+            }
+            Err(raw) => left_out_names.push(raw),
+        }
+    }
+    left_out_names.sort();
+    left_out_names.dedup();
+    let withheld_not_utf8 = entries
+        .iter()
+        .filter(|(_, entry)| matches!(entry, EnvJsonValue::NotUtf8 { withheld: true, .. }))
+        .map(|(name, _)| name.clone())
         .collect();
-    serde_json::to_vec_pretty(&map).expect("BTreeMap<String, Value> serializes to JSON infallibly")
+    let map: std::collections::BTreeMap<&str, serde_json::Value> = entries
+        .iter()
+        .map(|(name, entry)| (name.as_str(), entry.to_json()))
+        .collect();
+    let bytes = serde_json::to_vec_pretty(&map)
+        .expect("BTreeMap<&str, Value> serializes to JSON infallibly");
+    EnvJsonRender {
+        bytes,
+        left_out_names,
+        withheld_not_utf8,
+    }
+}
+
+/// Which artifact an `env.json` render is written to, as the `artifact`
+/// field of its warnings names it.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvJsonArtifact {
+    /// The run directory's `env.json`, written on every run.
+    RunDirectory,
+    /// A `--record` bag's `env.json` attachment.
+    Recording,
+}
+
+#[cfg(unix)]
+impl EnvJsonArtifact {
+    fn as_str(self) -> &'static str {
+        match self {
+            EnvJsonArtifact::RunDirectory => "run_directory",
+            EnvJsonArtifact::Recording => "recording",
+        }
+    }
+}
+
+/// Render `env.json` for `mode` from this process's environment
+/// (`std::env::vars_os()`, which never panics) and warn about each variable
+/// it could not store as the mode asks ([`warn_env_json_render`]).
+#[cfg(unix)]
+fn render_process_env_json(mode: RecordEnvMode, artifact: EnvJsonArtifact) -> Vec<u8> {
+    let render = render_env_json(mode, std::env::vars_os());
+    warn_env_json_render(&render, artifact);
+    render.bytes
+}
+
+/// Warn once per list that `render` left a variable out or stored a hash in
+/// place of the text its mode keeps, or do nothing when both lists are empty.
+///
+/// The messages are constant. The names ride the `names` field, where each
+/// byte of a name that is not valid UTF-8 prints escaped (`CER_\xFF`). No
+/// value is printed, because a value may be a secret.
+#[cfg(unix)]
+fn warn_env_json_render(render: &EnvJsonRender, artifact: EnvJsonArtifact) {
+    if !render.left_out_names.is_empty() {
+        tracing::warn!(
+            artifact = %artifact.as_str(),
+            names = ?render.left_out_names,
+            "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
+             compare them"
+        );
+    }
+    if !render.withheld_not_utf8.is_empty() {
+        tracing::warn!(
+            artifact = %artifact.as_str(),
+            names = ?render.withheld_not_utf8,
+            "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
+             utf8 false; a replay still detects a change"
+        );
+    }
 }
 
 /// Format an epoch-seconds instant as the bag-filename UTC
@@ -18137,7 +18286,7 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
     // (see `RecordEnvMode`). Loud about the fidelity
     // trade in the non-default modes (extracted + `#[traced_test]`-pinned).
     warn_record_env_mode(record_env);
-    let env_json = render_env_json(record_env, std::env::vars());
+    let env_json = render_process_env_json(record_env, EnvJsonArtifact::Recording);
     std::fs::write(&paths.env_json, &env_json)
         .map_err(|e| CliError::Validation(format!("recording: write env.json: {e}")))?;
     // recorder.json: the recording host's arch/os/
@@ -27548,6 +27697,28 @@ process_groups:
     // The env.json policy (`--record-env`).
     // =======================================================================
 
+    /// The `env.json` bytes for an environment of UTF-8 pairs, which leaves no
+    /// name out and stores every value as its mode asks.
+    #[cfg(unix)]
+    fn render_utf8_env_json(mode: RecordEnvMode, vars: Vec<(String, String)>) -> Vec<u8> {
+        let render = render_env_json(
+            mode,
+            vars.into_iter()
+                .map(|(name, value)| (name.into(), value.into())),
+        );
+        assert!(
+            render.left_out_names.is_empty(),
+            "{:?}",
+            render.left_out_names
+        );
+        assert!(
+            render.withheld_not_utf8.is_empty(),
+            "{:?}",
+            render.withheld_not_utf8
+        );
+        render.bytes
+    }
+
     /// Allowlist mode: allowlisted names keep their VALUES; every other value
     /// is `{"redacted": true, "fnv64": "<hex>"}`; the hash CHANGES when the
     /// value changes (divergence-detectable without the secret).
@@ -27560,7 +27731,7 @@ process_groups:
             ("IOX2_LOG_LEVEL".to_string(), "error".to_string()),
             ("AWS_SECRET".to_string(), "hunter2".to_string()),
         ];
-        let bytes = render_env_json(RecordEnvMode::Allowlist, vars);
+        let bytes = render_utf8_env_json(RecordEnvMode::Allowlist, vars);
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["CERULION_FOO"], "keepme", "CERULION_* value recorded");
         assert_eq!(v["RUST_LOG"], "debug", "RUST_LOG value recorded");
@@ -27576,7 +27747,7 @@ process_groups:
         // Hash changes when the value changes.
         let vars2 = vec![("AWS_SECRET".to_string(), "hunter3".to_string())];
         let v2: serde_json::Value =
-            serde_json::from_slice(&render_env_json(RecordEnvMode::Allowlist, vars2)).unwrap();
+            serde_json::from_slice(&render_utf8_env_json(RecordEnvMode::Allowlist, vars2)).unwrap();
         assert_ne!(
             v2["AWS_SECRET"]["fnv64"].as_str().unwrap(),
             h1,
@@ -27595,12 +27766,12 @@ process_groups:
             ]
         };
         let all: serde_json::Value =
-            serde_json::from_slice(&render_env_json(RecordEnvMode::All, vars())).unwrap();
+            serde_json::from_slice(&render_utf8_env_json(RecordEnvMode::All, vars())).unwrap();
         assert_eq!(all["SECRET"], "s3cret", "all mode is verbatim");
         assert_eq!(all["CERULION_X"], "1");
 
         let none: serde_json::Value =
-            serde_json::from_slice(&render_env_json(RecordEnvMode::None, vars())).unwrap();
+            serde_json::from_slice(&render_utf8_env_json(RecordEnvMode::None, vars())).unwrap();
         assert!(none["SECRET"].is_null(), "none mode records names only");
         assert!(none["CERULION_X"].is_null());
         assert!(
@@ -27622,8 +27793,8 @@ process_groups:
                 ("ALPHA".to_string(), "3".to_string()),
             ]
         };
-        let a = render_env_json(RecordEnvMode::All, vars());
-        let b = render_env_json(RecordEnvMode::All, vars());
+        let a = render_utf8_env_json(RecordEnvMode::All, vars());
+        let b = render_utf8_env_json(RecordEnvMode::All, vars());
         assert_eq!(a, b, "byte-identical across calls (deterministic)");
         let text = String::from_utf8(a).unwrap();
         let (pa, pm, pz) = (
@@ -27764,7 +27935,7 @@ process_groups:
              },\n  \
              \"RUST_LOG\": \"debug\"\n\
              }";
-        let first = render_env_json(RecordEnvMode::Allowlist, vars());
+        let first = render_utf8_env_json(RecordEnvMode::Allowlist, vars());
         assert_eq!(
             String::from_utf8(first.clone()).unwrap(),
             want,
@@ -27777,13 +27948,13 @@ process_groups:
         // Determinism: a second render and a reversed input order give the
         // same bytes.
         assert_eq!(
-            render_env_json(RecordEnvMode::Allowlist, vars()),
+            render_utf8_env_json(RecordEnvMode::Allowlist, vars()),
             first,
             "two renders are byte-identical"
         );
         let reversed: Vec<_> = vars().into_iter().rev().collect();
         assert_eq!(
-            render_env_json(RecordEnvMode::Allowlist, reversed),
+            render_utf8_env_json(RecordEnvMode::Allowlist, reversed),
             first,
             "input order does not change the bytes"
         );
@@ -27801,15 +27972,282 @@ process_groups:
             )]
         };
         assert_eq!(
-            String::from_utf8(render_env_json(RecordEnvMode::All, vars())).unwrap(),
+            String::from_utf8(render_utf8_env_json(RecordEnvMode::All, vars())).unwrap(),
             "{\n  \"CERULION_RCP_TOKEN\": \"rcp-token-value\"\n}",
             "all mode is verbatim for a secret-named variable"
         );
         assert_eq!(
-            String::from_utf8(render_env_json(RecordEnvMode::None, vars())).unwrap(),
+            String::from_utf8(render_utf8_env_json(RecordEnvMode::None, vars())).unwrap(),
             "{\n  \"CERULION_RCP_TOKEN\": null\n}",
             "none mode records the name only"
         );
+    }
+
+    /// `bytes` as an environment name or value. A name or value built this way
+    /// never enters this process's own environment.
+    #[cfg(unix)]
+    fn os(bytes: &[u8]) -> std::ffi::OsString {
+        use std::os::unix::ffi::OsStrExt as _;
+        std::ffi::OsStr::from_bytes(bytes).to_os_string()
+    }
+
+    /// One environment entry from raw bytes.
+    #[cfg(unix)]
+    fn raw_var(name: &[u8], value: &[u8]) -> (std::ffi::OsString, std::ffi::OsString) {
+        (os(name), os(value))
+    }
+
+    /// `\xff\xfe` is never UTF-8. Under `all` and `allowlist` it is stored as
+    /// its FNV-1a 64 hash over the raw bytes, 0a99c807b6f645b0 (computed
+    /// outside the tree), marked `utf8: false`; `none` stores `null`, as for
+    /// any value. Only `all` would have kept the value as text, so only `all`
+    /// lists it as withheld.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_records_a_non_utf8_value_as_its_raw_byte_hash_in_every_value_mode() {
+        let hashed = "{\n  \
+             \"CER_X\": {\n    \
+               \"fnv64\": \"0a99c807b6f645b0\",\n    \
+               \"redacted\": true,\n    \
+               \"utf8\": false\n  \
+             }\n\
+             }";
+        for (mode, want, withheld) in [
+            (RecordEnvMode::All, hashed, vec!["CER_X".to_string()]),
+            (RecordEnvMode::Allowlist, hashed, vec![]),
+            (RecordEnvMode::None, "{\n  \"CER_X\": null\n}", vec![]),
+        ] {
+            let render = render_env_json(mode, [raw_var(b"CER_X", b"\xff\xfe")]);
+            assert_eq!(String::from_utf8(render.bytes).unwrap(), want, "{mode:?}");
+            assert!(render.left_out_names.is_empty(), "{mode:?}");
+            assert_eq!(render.withheld_not_utf8, withheld, "{mode:?}");
+        }
+    }
+
+    /// A secret-named value that is not valid UTF-8 is hashed like any secret:
+    /// FNV-1a 64 of `\xffpw` is f810bc1be32e8897. It would have been hashed
+    /// anyway, so it is not withheld, and the bytes are UTF-8 JSON with no
+    /// replacement character in them.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_hashes_a_secret_named_non_utf8_value() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [raw_var(b"CERULION_DB_PASSWORD", b"\xffpw")],
+        );
+        let text = String::from_utf8(render.bytes).expect("env.json is UTF-8");
+        assert_eq!(
+            text,
+            "{\n  \
+             \"CERULION_DB_PASSWORD\": {\n    \
+               \"fnv64\": \"f810bc1be32e8897\",\n    \
+               \"redacted\": true,\n    \
+               \"utf8\": false\n  \
+             }\n\
+             }"
+        );
+        assert!(!text.contains('\u{fffd}'), "{text}");
+        assert!(render.left_out_names.is_empty());
+        assert!(render.withheld_not_utf8.is_empty());
+    }
+
+    /// A name that is not valid UTF-8 cannot be a JSON key, so in every mode it
+    /// is left out whole (no lossy `CER_\u{fffd}` key) and reported, while its
+    /// UTF-8 neighbour is written as the mode asks.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_leaves_out_a_non_utf8_name_in_every_mode_and_reports_it() {
+        for (mode, want) in [
+            (RecordEnvMode::All, "{\n  \"CERULION_KEPT\": \"kept\"\n}"),
+            (
+                RecordEnvMode::Allowlist,
+                "{\n  \"CERULION_KEPT\": \"kept\"\n}",
+            ),
+            (RecordEnvMode::None, "{\n  \"CERULION_KEPT\": null\n}"),
+        ] {
+            let render = render_env_json(
+                mode,
+                [
+                    raw_var(b"CER_\xff", b"v"),
+                    raw_var(b"CERULION_KEPT", b"kept"),
+                ],
+            );
+            assert_eq!(String::from_utf8(render.bytes).unwrap(), want, "{mode:?}");
+            assert_eq!(render.left_out_names, [os(b"CER_\xff")], "{mode:?}");
+            assert!(render.withheld_not_utf8.is_empty(), "{mode:?}");
+        }
+    }
+
+    /// `caf\xc3\xa9` is "café" in UTF-8 and `caf\xe9` is "café" in Latin-1,
+    /// where `\xe9` starts a three-byte UTF-8 sequence that never finishes. The
+    /// UTF-8 spelling stays text on the allowlist and, off it, is hashed with
+    /// no `utf8` key (48e8823acfa40d89); the Latin-1 spelling is hashed over
+    /// its raw bytes (b538f990e85962dc), marked `utf8: false` and withheld.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_keeps_a_multibyte_utf8_value_and_hashes_its_latin1_spelling() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [
+                raw_var(b"CERULION_LAYOUT", b"caf\xc3\xa9"),
+                raw_var(b"LAYOUT", b"caf\xc3\xa9"),
+                raw_var(b"CERULION_LATIN1", b"caf\xe9"),
+            ],
+        );
+        let want = "{\n  \
+             \"CERULION_LATIN1\": {\n    \
+               \"fnv64\": \"b538f990e85962dc\",\n    \
+               \"redacted\": true,\n    \
+               \"utf8\": false\n  \
+             },\n  \
+             \"CERULION_LAYOUT\": \"caf\u{e9}\",\n  \
+             \"LAYOUT\": {\n    \
+               \"fnv64\": \"48e8823acfa40d89\",\n    \
+               \"redacted\": true\n  \
+             }\n\
+             }";
+        assert_eq!(String::from_utf8(render.bytes).unwrap(), want);
+        assert_eq!(render.withheld_not_utf8, ["CERULION_LATIN1"]);
+    }
+
+    /// A value that is not valid UTF-8 is withheld only where the mode would
+    /// have kept it as text: every name under `all`, and an allowlisted name
+    /// with no secret marker under `allowlist`. A value the mode hashes anyway
+    /// loses nothing and is not listed, and `none` keeps no value at all.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_withholds_only_values_the_mode_would_have_kept() {
+        let withheld = |mode| {
+            render_env_json(
+                mode,
+                [
+                    raw_var(b"CER_X", b"\xff\xfe"),
+                    raw_var(b"CERULION_LATIN1", b"caf\xe9"),
+                    raw_var(b"CERULION_DB_PASSWORD", b"\xffpw"),
+                    raw_var(b"CERULION_KEPT", b"kept"),
+                ],
+            )
+            .withheld_not_utf8
+        };
+        assert_eq!(
+            withheld(RecordEnvMode::All),
+            ["CERULION_DB_PASSWORD", "CERULION_LATIN1", "CER_X"]
+        );
+        assert_eq!(withheld(RecordEnvMode::Allowlist), ["CERULION_LATIN1"]);
+        assert!(withheld(RecordEnvMode::None).is_empty());
+    }
+
+    /// Two renders of one environment and a render of it in reverse order all
+    /// equal one hand-written render: the same bytes, and the left-out names
+    /// in byte order.
+    #[cfg(unix)]
+    #[test]
+    fn render_env_json_with_non_utf8_entries_is_identical_across_renders_and_input_orders() {
+        let vars = vec![
+            raw_var(b"CER_\xff", b"v"),
+            raw_var(b"CER_X", b"\xff\xfe"),
+            raw_var(b"CER_\xfe", b"v"),
+            raw_var(b"CERULION_KEPT", b"kept"),
+        ];
+        let want = EnvJsonRender {
+            bytes: "{\n  \
+                 \"CERULION_KEPT\": \"kept\",\n  \
+                 \"CER_X\": {\n    \
+                   \"fnv64\": \"0a99c807b6f645b0\",\n    \
+                   \"redacted\": true,\n    \
+                   \"utf8\": false\n  \
+                 }\n\
+                 }"
+            .as_bytes()
+            .to_vec(),
+            left_out_names: vec![os(b"CER_\xfe"), os(b"CER_\xff")],
+            withheld_not_utf8: vec!["CER_X".to_string()],
+        };
+        let reversed: Vec<_> = vars.iter().rev().cloned().collect();
+        for input in [vars.clone(), vars, reversed] {
+            assert_eq!(render_env_json(RecordEnvMode::All, input), want);
+        }
+    }
+
+    /// The two `env.json` warning texts, typed out by hand rather than shared
+    /// with the code.
+    #[cfg(unix)]
+    const ENV_JSON_LEFT_OUT_WARNING: &str = "env.json: variables whose name is not valid UTF-8 \
+                                             are left out; a replay cannot compare them";
+    #[cfg(unix)]
+    const ENV_JSON_WITHHELD_WARNING: &str = "env.json: values that are not valid UTF-8 are \
+                                             recorded as their FNV-1a 64 hash with utf8 false; \
+                                             a replay still detects a change";
+
+    /// One WARN line per list, each naming the artifact and its variables (a
+    /// name's invalid byte escaped), and no line carrying a value: not the
+    /// plain value of the left-out name, not the withheld value, not the
+    /// secret-named value that is not UTF-8.
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn env_json_render_warns_once_per_list_naming_each_variable_and_no_value() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [
+                raw_var(b"CER_\xff", b"plainvalue"),
+                raw_var(b"CERULION_LATIN1", b"caf\xe9"),
+                raw_var(b"CERULION_DB_PASSWORD", b"\xffpw"),
+                raw_var(b"CERULION_KEPT", b"kept"),
+            ],
+        );
+        warn_env_json_render(&render, EnvJsonArtifact::RunDirectory);
+        logs_assert(|lines: &[&str]| {
+            for (message, names) in [
+                (ENV_JSON_LEFT_OUT_WARNING, r#"names=["CER_\xFF"]"#),
+                (ENV_JSON_WITHHELD_WARNING, r#"names=["CERULION_LATIN1"]"#),
+            ] {
+                match lines
+                    .iter()
+                    .filter(|line| line.contains(message))
+                    .collect::<Vec<_>>()
+                    .as_slice()
+                {
+                    [line]
+                        if line.contains(" WARN ")
+                            && line.contains("artifact=run_directory")
+                            && line.contains(names) => {}
+                    other => {
+                        return Err(format!(
+                            "one WARN line for {message:?} naming {names}: {other:#?}"
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        });
+        for absent in [
+            "plainvalue",
+            "caf",
+            "pw",
+            "CERULION_KEPT",
+            "CERULION_DB_PASSWORD",
+        ] {
+            assert!(!logs_contain(absent), "no warning carries {absent}");
+        }
+    }
+
+    /// The control: a value that is not valid UTF-8 which the mode hashes
+    /// anyway, beside a UTF-8 neighbour, leaves nothing out and withholds
+    /// nothing, so neither line is printed.
+    #[cfg(unix)]
+    #[test]
+    #[tracing_test::traced_test]
+    fn env_json_render_is_silent_when_it_hashes_only_what_the_mode_hashes_anyway() {
+        let render = render_env_json(
+            RecordEnvMode::Allowlist,
+            [
+                raw_var(b"CER_X", b"\xff\xfe"),
+                raw_var(b"CERULION_KEPT", b"kept"),
+            ],
+        );
+        warn_env_json_render(&render, EnvJsonArtifact::Recording);
+        assert!(!logs_contain("env.json:"));
     }
 
     // =======================================================================
@@ -34105,7 +34543,10 @@ process_groups:
                 crate::multiprocess::ExecutionMode::Lockstep,
             ),
             graph_yaml: render_effective_graph_yaml(&pre.config).expect("render"),
-            env_json: render_env_json(RecordEnvMode::Allowlist, std::env::vars()),
+            env_json: render_process_env_json(
+                RecordEnvMode::Allowlist,
+                EnvJsonArtifact::RunDirectory,
+            ),
         })
         .expect("run dir");
 

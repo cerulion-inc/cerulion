@@ -1,0 +1,22 @@
+# Mutation baseline for cerulion_cli_engine: pure decision functions only.
+#
+# Scope: each block below names the pure functions it mutates. The rest of the
+# crate holds process, filesystem, transport and terminal paths that the
+# mutation rule does not cover, so every Run line limits mutation to the named
+# functions with `--re`.
+#
+# Every mutant that survives the test suite is listed below its block with the
+# reason it is not killed. A survivor that is not listed here is a gap in the
+# tests: kill it with a test, or list it here with a reason.
+
+# env.json rendering: what `env.json` stores for each variable, by mode, when a
+# name or value is not valid UTF-8 (`graph_cmd::env_json_value`,
+# `graph_cmd::EnvJsonValue::to_json`, `graph_cmd::render_env_json`).
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/graph_cmd.rs \
+#            --re 'env_json_value|EnvJsonValue::to_json|render_env_json' \
+#            --timeout 300 -- --lib
+# Result:  pending (run on Linux)
+
+(none)
