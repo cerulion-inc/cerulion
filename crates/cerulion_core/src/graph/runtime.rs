@@ -15837,7 +15837,10 @@ impl GraphRuntime {
             super::period_park::ENGAGES_ON_THIS_TARGET,
             self.config.identity(),
         );
-        if period_park_on && super::period_park::ENGAGES_ON_THIS_TARGET {
+        // On a target it does not engage on, the switch says so once above and
+        // logs nothing else: no `on` line and no exit telemetry.
+        let period_park_engaged = period_park_on && super::period_park::ENGAGES_ON_THIS_TARGET;
+        if period_park_engaged {
             tracing::info!(
                 graph = %self.config.identity(),
                 park_active = self.park_active(),
@@ -16009,7 +16012,7 @@ impl GraphRuntime {
             park_core_yields = core_yields_now - core_yields_at_entry,
             "live loop park telemetry"
         );
-        if period_park_on {
+        if period_park_engaged {
             let st = self
                 .period_park
                 .lock()

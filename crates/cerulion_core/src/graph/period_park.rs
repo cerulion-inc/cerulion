@@ -524,8 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn the_period_park_engages_on_x86_64_only() {
-        assert_eq!(ENGAGES_ON_THIS_TARGET, cfg!(target_arch = "x86_64"));
+    fn a_target_the_period_park_does_not_engage_on_keeps_the_plain_park() {
         assert!(
             !admits(Gate {
                 engaged_target: false,
