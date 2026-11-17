@@ -244,6 +244,7 @@ fn recording_on_scheduler_step_is_zero_alloc_at_steady_state() {
         inputs: vec![cerulion_core::graph::config::InputDef {
             name: "inp".to_string(),
             source: "za0/out".to_string(),
+            ..Default::default()
         }],
         outputs: vec![],
     });

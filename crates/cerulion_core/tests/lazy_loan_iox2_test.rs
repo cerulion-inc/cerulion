@@ -413,6 +413,7 @@ fn build_sparse_graph(prefix: &str) -> (GraphRuntime, SparseHandles) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/written".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -425,6 +426,7 @@ fn build_sparse_graph(prefix: &str) -> (GraphRuntime, SparseHandles) {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/skipped".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -607,6 +609,7 @@ fn alternating_write_empty_ticks_never_flood_discard_errors() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/msg".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -867,6 +870,7 @@ fn zero_field_emit_publishes_every_tick_unemitted_is_silent() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/pulse".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -879,6 +883,7 @@ fn zero_field_emit_publishes_every_tick_unemitted_is_silent() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/quiet".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -1017,6 +1022,7 @@ fn read_back_after_write_sees_just_written_value() {
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },

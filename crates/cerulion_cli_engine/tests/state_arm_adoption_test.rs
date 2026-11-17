@@ -717,14 +717,12 @@ fn the_always_on_recorders_are_handed_the_plane_and_the_run_context() {
          CERULION_STATE_ARM_TAG is adopted into this run's captures: {spec:?}"
     );
     assert!(
-        spec.contains("handoff: &handoff,"),
+        spec.contains(
+            "run_dir: _run_descriptor .as_ref() .map(crate::run_dir::RunDescriptor::path),"
+        ),
         "the run context (graph.yaml / env.json / recorder.json, from this run's \
          run directory) must reach the recorder, or every capture can be VIEWED and none \
          re-executed: {spec:?}"
-    );
-    assert!(
-        monolith.contains("resolve_flashback_handoff("),
-        "…and the handoff must be RESOLVED from the run directory rather than defaulted"
     );
     // …and the plane is armed BEFORE the spawn, which is what lets the tag be
     // conditioned on the arm at all (the `run_graph_recording` rule, applied to
@@ -755,12 +753,19 @@ fn the_always_on_recorders_are_handed_the_plane_and_the_run_context() {
          this deployment publishes: {spec:?}"
     );
     assert!(
-        spec.contains("handoff: &handoff,"),
-        "the supervisor must hand over this run's run-directory artifacts too: {spec:?}"
+        spec.contains(" run_dir, "),
+        "the supervisor must hand over the run directory `graph_run` threaded in, not a \
+         default: {spec:?}"
     );
+
+    // ---- the RESOLUTION both seams share. The spawn resolves the handoff from
+    // the spec it was given, so the run directory and the rings that decide
+    // whether the graph rides beside the trace are one value at both seams.
+    let spawn = squash_ws(fn_body(&code, "fn spawn_flashback_recorder("));
     assert!(
-        supervisor.contains("resolve_flashback_handoff(run_dir)"),
-        "…resolved from the `run_dir` `graph_run` threaded in, not defaulted"
+        contains_call(&spawn, "flashback_argv(&spec, &spec.handoff())"),
+        "the spawn must build its argv from the handoff RESOLVED out of its own spec, or a \
+         seam can hand over rings and a handoff decided without them: {spawn:?}"
     );
 }
 

@@ -135,7 +135,10 @@ Rules that must not drift:
   bag. Listing is UNCONDITIONAL: a topic that MATCHED under the fallback is
   listed too, with `matched_under_fallback: true`, and is still not credited: a
   match there is evidence the fallback reproduced the frames, not evidence the
-  candidate is correct.
+  candidate is correct. A split topic some of whose passes' frames were not
+  compared is never MATCHED: its read-log row reads `false`, and its
+  `split_topic_frames_unattributed` row beside it names those ranks
+  (`read_log_decline_rows`, one row per cause).
   **The bound on all of this:** the rule rests on a FALLBACK, so a refused read
   log on a rank with
   **nothing injected declines nothing; there is no fallback to withhold**,
@@ -184,6 +187,109 @@ Rules that must not drift:
   `prepare_recording_inputs` seam), never a copy of the on-disk graph file. The same
   renderer writes the run directory's `graph.yaml`, so run dir and bag agree by
   construction; changing one means checking the other.
+- **A driver's outputs are recorded inputs**: `classify_topics` names every produced topic
+  whose every in-graph writer is a driver in `TopicClasses::driver`, the driver set coming
+  from `resolve_driver_set` (below). A resim never queries
+  `external_source()`, so the driver fires as recorded with no device; what its tick still
+  writes is published and never compared. Its topics stay in `produced` for every
+  derivation about what the graph writes (the consistency checks, a cross-rank injector, the
+  read gate, the `--record-out` channels) and leave only the comparison: `pass_topics`
+  captures a topic only where a member other than a driver writes it and lists the rest in
+  `record_out_only`, which a `--record-out` run taps (`RecordOutTap`) for the output bag
+  alone, leaving out the frames its own pass's injector re-publishes on the topic, and
+  `assemble_outcome` neither diffs nor counts it. A record-health-lossy driver
+  topic is still a per-topic `RecordSideTapLoss`, judged in a partial report once a rank of
+  its drivers completed (`topic_owner_ranks`); a topic a driver shares is owned by its other
+  writers' ranks alone, so an abort in those ranks leaves it unjudged. A `multi_publisher_topics` topic a driver shares with other nodes
+  (`TopicClasses::driver_shared`) stays captured: `build_capture_partitionings` leaves every
+  driver out of `producible` and names in `uncompared` a driver of the pass, whose frames
+  `diff_partitioned` leaves out of the diff, the tripwire and every count (the drain writes a
+  replayed one to `--record-out`). A shared topic every capturing pass partitioned is judged
+  per writer with no topic-level `MissingTopic`/`ExtraTopic` triage and counted as the
+  partitions' sum. An unpartitioned one (any `build_capture_partitionings` fallback: no
+  labels, a headerless frame, an unnamed publisher, a torn index or
+  the frame-index record budget) keeps the whole recorded count, the drivers' frames
+  included; `assemble_outcome` lists it in `DriverInputsReport::unattributed_topics`, whose
+  NOTE says it was compared over every recorded frame, and a fed read of one is refused before
+  that when its reads name more than one writer (`read_identity_frames_unattributed`, exit 2).
+  Every topic, shared or not, is judged over every pass that captured it: a pass captures a
+  topic its rank runs a writer of other than a driver, so a split `multi_publisher_topics`
+  topic has one `CaptureSummary` per such rank, and `PassAccumulators` keeps them all.
+  `uncompared` also names a pass's injector by its publisher id (`WriterKey::Origin`): it
+  re-publishes the recorded frames of every foreign writer of the topic, however many, copies of
+  what each writer's own pass compares or a foreign driver's recorded inputs, which no pass
+  compares, so a pass's partitions hold only the writers it runs. `judge_passes` picks the
+  verdict: `merge_partitioned_summaries` folds passes that all partitioned the topic into their
+  union, each writer from the one pass that runs it; the only pass whose own writers published a
+  frame (`CaptureSummary::own_replayed`, which leaves its injector's frames out), if it neither
+  partitioned nor injected the topic (`CaptureSummary::injected`), is judged alone against every
+  recorded frame, its rank the tail window; any other mix is `SplitPasses`, which
+  `push_split_violations` judges: the partitioned passes per writer, the rest counted together
+  (the recorded frames no partition holds against their `own_replayed` and, once each, the
+  recorded frames of a driver none of them runs that any pass's injector re-published, a
+  partitioned pass's included, `SplitPasses::driver_copies`, which an injector counts by frame
+  index where the injection names each frame's writer, `DriverCopies` and
+  `CaptureSummary::injected_drivers`; a fed pass opens no injector, so a fed `--verify` counts
+  none and fails such a topic), an injecting pass's one stream compared with every
+  recorded frame, and a pass of its own writers' frames alone, beside another whose writers
+  published frames, returned as `SplitUnjudged`, which `assemble_outcome` DECLINES
+  (`split_topic_frames_unattributed`, its one-stream verdicts withheld) when nothing else on the
+  topic failed. The ragged-tail frame tolerance (`tail_extra_ranks`) bounds a partitioned
+  topic writer by writer, each writer's extra frames within its rank's tail width times the most
+  frames it published in one recorded step (`PartitionCounts::burst`, `writer_bursts`), and a
+  one-stream topic by the sum of its ranks' windows at the topic's largest one-step burst
+  (`RecordedMessages::max_burst`); a split topic is bounded part by part
+  (`SplitPasses::tail_extra_ranks`), its one-stream passes' frames together by the sum of their
+  ranks' windows, guarded by the frames it compares (`SplitPasses::tail_clean`). `--tolerance`
+  rows fold across passes to one per field and metric (`fold_tolerance_worsts`). A metadata read that fails
+  keeps the node's topics compared. `plan_driver_topic_feeds` returns `DriverTopicFeeds`. A
+  LOCKSTEP pass decides its own fires, so nothing fires a driver: one WARN names every
+  driver node and every topic one writes, shared ones included, and still fires for a
+  driver with no output. A free-run plan sorts the topics into fed (INFO), unfed and unread
+  (one WARN each): a pass that is not fed injects no in-rank topic, so a topic a node reads
+  in a rank running one of its driver writers is unfed, a shared one too, while fed and
+  unread hold only the topics drivers alone write (a shared topic is compared over its
+  other writers, or over every recorded frame when unattributed). A `0/0` tally with a driver warns that nothing was compared. The same
+  classification rides the outcome as `ReplayOutcome::driver_inputs` (`driver_inputs_report`
+  over the plan; a lockstep plan counts every driver topic a node reads as unfed), so the
+  `--report` JSON and the verdict NOTE lines (`render_driver_input_lines`, PASS and FAIL alike)
+  carry it, not log text alone; `ResimReport::driver_lines` carries the same lines into the
+  neutral summary, whose match observation names the left-out driver frames when
+  `driver_frames_uncompared` (`DriverInputsReport::leaves_driver_frames_out`). The driver set
+  comes from the recording: `recorder.json`'s `node_external` (each native node's flag, from
+  the LOADED `info()` through `replay_engine::is_external_policy`, the predicate the
+  candidate set `external_node_ids` uses too) is read at gate 6b as contract key 3
+  (`RecordedDriverStamp`; unreadable refuses `BagInvalidAttachment` after the version gate)
+  and admitted against the embedded graph's native nodes (`DriverStamp::admit`, the type's
+  only constructor; a node too many or too few refuses `RecordingInconsistent`).
+  `resolve_driver_set` (pure) then classifies from the stamp and refuses
+  `ReplayError::DriverSetDrift` (exit 2, every node in id order, both directions) when the
+  candidate set differs, after `NodeLoad` and the resume refusals, under `--verify` and the
+  neutral resim alike. A bag with no stamp takes the candidate set, with ONE warn when it is
+  non-empty, and `DriverInputsReport::declared_by` (`recording` or `replayed_build`) and the
+  NOTE parenthetical say which. Pinned by `driver_topic_tests`, `driver_stamp_tests`, the
+  stamp arms of `replay_gates_test.rs`, the driver-graph arms of `replay_engine_test.rs`
+  (the `drv_*` fixtures: the unstamped ones pin the older-recording arm, the stamped ones
+  the match and both refusals) and `replay_driver_stamp_cdylib_test.rs`, which carries a
+  stamp from the gate to the engine's refusal through `run_replay` over a workspace
+  cdylib; `docs/bag.md` states the user-facing rules.
+- **Environment divergence prints once and never changes the exit code.** A resim never
+  applies the bag's `env.json`: its nodes read the replay shell's environment, and
+  `replay_engine::compare_env_against` compares the two (no `env.json`, no comparison). One
+  pure rule, `env_reader`, names the variables that can change the re-execution
+  (`CERULION_`, `IOX2_`, `LD_`, `DYLD_`, `PYTHON`, plus the exact name `CARGO_TARGET_DIR`,
+  which `graph_cmd::cdylib_target_base` reads to pick the node library build directory,
+  minus every name the recorder's secret marker rule marks); such a variable set only at
+  replay is `Added`. The terminal text has one source, `render_env_divergence_lines` (a
+  `WARNING:` per such variable, then one `NOTE:` counting the rest, with no value or hash),
+  printed by the verdict and, through `ResimReport::env_lines`, by both arms of the neutral
+  summary. The engine logs each divergence once (`log_env_divergences`, after the report
+  write): an `info!` for every divergence on a run that returns its outcome, and a `warn!`
+  for a loud one on a run that returns an error instead (a rank aborts, or a passing run's
+  `--report` cannot be written), where the CLI prints only that error (the others stay
+  `info!`). At the quiet default each divergence shows once; with `-v` a loud one also
+  shows as its `info!` line, as a violation does. The `--report` entry's `read_by` is
+  derived from the name by the same rule.
 - **Cross-host bags warn, never refuse**: bags carry a `__cerulion/recorder.json`
   host-identity attachment; replay warns on a cross-arch/os bag (float ULP-skew
   advisory). Absent = silent back-compat; malformed = loud warn.
@@ -256,7 +362,15 @@ buffered; replay memory stays bounded by advise-behind eviction in the bag reade
   failure is exactly one `warn!`. The write sits after the partition pre-flight and
   before deployment dispatch, and the recorded `process_groups` comes from the RESOLVED
   deployment, never from the config's own flag (the config may not reflect an in-memory
-  derived partition).
+  derived partition). `recorder.json` is the exception: it carries each node's driver flag
+  from the LOADED metadata, so `write_run_recorder_best_effort` writes it once the nodes
+  load (the monolith after `load_node_factories_from_cache`, the supervisor after
+  `loaded_entry_infos`) and before any ring is named in `run.json` or the window recorder
+  spawns; `bag_cmd::read_run_artifacts` reads `run.json` first, so a declared ring implies
+  the file unless its write failed, and a bag or capture that carries the trace without it
+  embeds no graph (`RunArtifacts::graph_yaml_to_embed`, named in the attach's
+  `artifacts_unreadable`), so it is viewed, never re-executed under assumed contract keys.
+  Source-order pins hold both.
 - **Launch arguments**: `graph run <NAME> [NAME:=VALUE]...` reads the graph through
   `graph_launch_args::graph_read_raw_with_launch_args`, the same read `graph_read_raw` makes
   with no overrides, so every verb sees the resolved graph. The resolution is
@@ -982,8 +1096,9 @@ own binary.
 
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
-| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
+| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the byte-mismatch line naming the field and both values, per writer and under a tolerance; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
+| `replay_driver_stamp_cdylib_test.rs` | A crafted bag's `node_external` stamp reaches the engine through `run_replay`: a workspace build that runs a recorded driver as an ordinary node is refused with `DriverSetDrift` (exit 2) | one test (moves the working directory, mints the resim transport) | `test_node_macro_period_cdylib` |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
 | `graph_profile_iox2_test.rs` | `graph profile` e2e: artifact writes on happy/cap-hit/Ctrl-C paths, auto-derived targets, starved-node isolation, load-degrade classifier | yes (global iceoryx2 namespace) | `test_node_macro_period_cdylib`, `test_node_macro_data_trigger_cdylib` |
 | `graph_params_e2e_test.rs` | `params:` e2e over the real binary: one type staged twice publishes per-instance values (hand oracles off the bag), the recorded graph carries the resolved values (defaults included), `bag play --resim all --verify` passes before and after the workspace file changes, each refusal class exits non-zero from `graph validate` and `graph run --no-validate` naming node and param, `node info` lists the params table | yes (default iceoryx2 namespace) | `test_node_macro_param_cdylib`, `test_node_macro_period_cdylib` |
@@ -1011,7 +1126,9 @@ own binary.
 `ros2_graph.rs` carries its own unit oracles (the `classify_child_exit` matrix, relative
 launch/params resolution + missing-file refusal). Metric math + decodability
 classification live as unit tests inside `tolerance_metrics.rs` /
-`replay_field_registry.rs`.
+`replay_field_registry.rs`. The byte-mismatch value diff (`replay_value_diff.rs`: what a
+byte-mismatch line names, in which order, and how each value is spelled) carries its
+hand-oracle unit tests in `replay_value_diff/tests.rs`.
 
 ## 9. Test map: `cerulion_cli`
 
@@ -1129,18 +1246,28 @@ Checkout dependencies use absolute `path` entries. The result is exposed as
 `CerulionWorkspace::dependency_source`; nodes inherit `{ workspace = true }`,
 and user overrides are rewritten on recreation.
 
-New workspaces pin the CLI's stable `RUSTC_RELEASE` in `rust-toolchain.toml`
-with the minimal profile only after installed-only `rustup run` verifies its
-full `RUSTC_FINGERPRINT`. Missing or mismatching compilers warn and preserve
-ambient selection; workspace creation never downloads a toolchain. Preserve
-existing TOML or legacy toolchain files and symlinks without probing; warn when
-preserving a choice or when nightly or beta metadata cannot name a toolchain.
-Never change rustup defaults.
+New workspaces write no `rust-toolchain` or `rust-toolchain.toml` and leave an
+existing one as it is; any compiler at or above the MSRV builds loadable nodes.
 
-Write and sync the toolchain manifest to a sibling staging file before publishing
-it with a no-replace hard link. Failed writes leave no partial final manifest;
-concurrent choices win. Clean up the staging file and propagate filesystem errors,
-including filesystems without hard-link support; never fall back to overwriting.
+`rust_setup::check_rust` runs before `node build` (for a node that exists) and
+after `workspace create`/`init`. The decision is the pure `rust_readiness` over
+what the probe found (`cargo` on `PATH`, then the `RUSTC`, `CARGO_BUILD_RUSTC` or
+`rustc` release run in the workspace with `RUSTUP_AUTO_INSTALL=0`, the toolchain
+file that selects it, and rustup's `default` exit status when no release reads),
+whether rustup is there, and
+whether stdin and stderr are both terminals; only that last case asks.
+`check_rust` reads that itself and never fails the verb: a terminal error is
+logged and taken as a no. Install routes, after a yes only: `cerulion-install-rust`,
+else the existing rustup (stable added, default set only when unset), else the
+official installer with the release installer's arguments, which installs
+rustup alone with its stdout held (`run_bootstrap` shows it, through the pure
+`bootstrap_stdout_shown`, only when the installer fails) and is followed, in
+`bootstrap_then_add_stable`, by the existing-rustup step on the rustup it
+installed in Cargo's home. A route that installs
+into a Cargo home off `PATH` hands that directory to
+`node_build_with_cargo_dir`, which runs its `cargo` with the directory first on
+`PATH`. A declined or non-terminal check prints the command and returns, so
+`node build` reaches its existing error and exit code.
 
 `node build` uses Cargo compiler selection through toolchain files and compiler
 overrides. Cargo enforces the workspace MSRV. Native loading checks the frozen
