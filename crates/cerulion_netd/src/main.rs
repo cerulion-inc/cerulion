@@ -247,7 +247,7 @@ enum ArgAction {
 /// `--version`/`-V` each win as soon as they are seen — same precedence, so
 /// either short-circuits a preceding unknown argument exactly as `--help`
 /// already does; the first other argument is [`ArgAction::Unknown`], or
-/// [`ArgAction::NotUtf8`] when it is not valid UTF-8. Pure — oracle-tested.
+/// [`ArgAction::NotUtf8`] when it is not valid UTF-8. Pure, and oracle-tested.
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> ArgAction {
     let mut refused: Option<ArgAction> = None;
     for (index, arg) in args.into_iter().enumerate() {
