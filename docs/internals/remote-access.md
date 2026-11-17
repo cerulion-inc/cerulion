@@ -192,6 +192,17 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Session audit inspection**: `remote_session::list_recordings_with_incomplete`
+  returns sorted complete heads and unfinished paths. A locally computed head
+  checks structure, not authenticity; `verify_recording_file` and
+  `verify_recording_prefix_file` require a separately retained witness.
+  Complete verification requires an Exit and newline-terminated events.
+  Prefix verification commits only the witnessed events and reports all
+  following bytes as unverified, including malformed or interrupted tails.
+  Inspections open only regular files, bound each event to twice the session
+  frame cap and make no writes. Unix opens refuse final-component symlinks,
+  use nonblocking mode for raced special files and compare descriptor identity.
+
 - **Session settings**: `remote_session::SessionLimits` supplies resource
   defaults, and `shell_config::ShellFlags` validates parsed options before
   changing `RemotedConfig`. The caller supplies environment text explicitly;
