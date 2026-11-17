@@ -213,9 +213,23 @@ fn run(args: &[String]) -> Result<String> {
     }
 }
 
+/// The arguments after the program name, or the failure naming the first one
+/// that is not valid UTF-8 by its position.
+fn utf8_args() -> Result<Vec<String>> {
+    std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                let position = index + 1;
+                format!("argument {position} is not valid UTF-8: {arg:?}").into()
+            })
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    match utf8_args().and_then(|args| run(&args)) {
         Ok(fact) => {
             println!("{fact}");
             ExitCode::SUCCESS

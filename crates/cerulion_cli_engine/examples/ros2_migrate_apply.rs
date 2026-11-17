@@ -26,13 +26,14 @@ use cerulion_cli_engine::ros2_migrate::{
 };
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Every argument is a path, kept as the bytes given.
+    let args: Vec<std::path::PathBuf> = std::env::args_os().skip(1).map(Into::into).collect();
     if args.len() < 2 {
         return Err("usage: ros2_migrate_apply <ws-src-root> <analysis.json>...".into());
     }
-    let ws_src = std::path::PathBuf::from(&args[0])
+    let ws_src = args[0]
         .canonicalize()
-        .map_err(|e| format!("canonicalize src root {}: {e}", args[0]))?;
+        .map_err(|e| format!("canonicalize src root {}: {e}", args[0].display()))?;
     let mut outputs = Vec::new();
     for path in &args[1..] {
         // Analysis integrity: the verb's
@@ -44,8 +45,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // in the remaining window is DETECTED; this gate is what stops a
         // non-regular object from wedging the apply before that check can
         // speak.
-        let json = read_regular_bounded_to_string(std::path::Path::new(path))
-            .map_err(|e| format!("read {path}: {e}"))?;
+        let json = read_regular_bounded_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
         outputs.push(parse_tool_output(&json)?);
     }
     let analysis = merge_tool_outputs(&outputs);

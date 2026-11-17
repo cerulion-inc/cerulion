@@ -113,7 +113,17 @@ fn parse_args(argv: impl Iterator<Item = String>) -> Result<Args, String> {
 // This binary's stdout IS its report: the e2e parses the one fact line.
 #[allow(clippy::print_stdout)]
 fn main() -> Result<(), Box<dyn Error>> {
-    let args = parse_args(std::env::args().skip(1))?;
+    let argv = std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                let position = index + 1;
+                format!("argument {position} is not valid UTF-8: {arg:?}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let args = parse_args(argv.into_iter())?;
     let manager = TransportManager::init(TransportConfig {
         node_name: "android_e2e_demand_probe".to_string(),
         network: Some(NetworkConfig {
