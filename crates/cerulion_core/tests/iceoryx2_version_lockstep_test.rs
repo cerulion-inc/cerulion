@@ -256,9 +256,10 @@ fn every_committed_lockfile_resolves_the_family_to_the_pin() {
 /// duplicate-types build failure the root comment describes.
 ///
 /// Scoped to manifests that patch and lockfiles that resolve from git: the
-/// example and bench workspaces resolve the family from crates.io today and are
-/// governed by the version arm, not this one. If the root carries no iceoryx2
-/// patch (the fix landed upstream), no other manifest may carry one.
+/// bench workspaces and the examples other than `aspire_arm` and `basic_timer`
+/// resolve the family from crates.io today and are governed by the version arm,
+/// not this one. If the root carries no iceoryx2 patch (the fix landed
+/// upstream), no other manifest may carry one.
 #[test]
 fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -296,6 +297,18 @@ fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
         );
         return;
     };
+    // A walk that stops short of the deepest patched manifests passes every
+    // assert below without reading them: the root, `crates/cerulion_py`, the
+    // Android runtime, `examples/aspire_arm`, `examples/basic_timer` and the
+    // nine Python node fixtures under `crates/cerulion_py/fixtures/pynodes`
+    // each carry a copy of the root block.
+    assert!(
+        patched.len() >= 14,
+        "the manifest walk found only {} manifests that patch iceoryx2, so a stale copy \
+         of the root block could pass unread: {:?}",
+        patched.len(),
+        patched.keys().collect::<Vec<_>>()
+    );
     let root_source = root
         .get("iceoryx2")
         .unwrap_or_else(|| {
@@ -342,6 +355,12 @@ fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
     // fork. A count of git-resolving locks would be satisfied by an unrelated
     // workspace's lock while this one was never re-resolved.
     for manifest in patched.keys() {
+        if UNLOCKED_FIXTURE_ROOTS
+            .iter()
+            .any(|root| manifest.starts_with(root))
+        {
+            continue;
+        }
         let lock = repo.join(manifest).with_file_name("Cargo.lock");
         let text = std::fs::read_to_string(&lock).unwrap_or_else(|e| {
             panic!(
@@ -434,10 +453,23 @@ fn iceoryx2_sources(text: &str) -> BTreeSet<(String, String)> {
     sources
 }
 
+/// Fixture workspaces that CI builds from their manifest alone, with no
+/// committed lockfile (`.gitignore` keeps every `Cargo.lock` out but the ones it
+/// names). A build of one resolves the rev its manifest names, which the
+/// equality arm checks, and a lockfile a local build left there is not part of
+/// the tree, so the lockfile pairing skips them.
+const UNLOCKED_FIXTURE_ROOTS: &[&str] = &["crates/cerulion_py/fixtures/pynodes/"];
+
+/// How deep the manifest walk descends below the directory it starts from: the
+/// deepest committed manifest that patches iceoryx2 sits seven directories
+/// below the repository root
+/// (`crates/cerulion_py/fixtures/pynodes/shared/nodes/<name>/`).
+const MANIFEST_WALK_DEPTH: usize = 8;
+
 /// Every `Cargo.toml` under `dir`, nested members included, skipping build
 /// output and version control. Depth-bounded so a symlink loop cannot hang.
 fn collect_manifests(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 4 {
+    if depth > MANIFEST_WALK_DEPTH {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
