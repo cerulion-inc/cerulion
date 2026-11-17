@@ -703,7 +703,8 @@ re_grpc_server = { git = "https://github.com/cerulion-inc/re_grpc_server", rev =
 # trigger, so a notify that claimed the idle state and sent its byte between the
 # two lost that byte to the drain and then marked the listener notified. Every
 # later notify saw the notified state and sent nothing, so the listener's
-# descriptor never became readable again and its subscription stopped waking on
+# descriptor stayed unreadable until a later drain reset the state, and a
+# subscription whose wait blocks on that descriptor stopped waking on
 # publishes. The fork empties the trigger, then stores the idle state, then
 # drains the event bits, so a notify that lands during a drain is delivered by
 # that drain or leaves the trigger holding a byte for the next wait.
