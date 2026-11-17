@@ -38,6 +38,11 @@ pub mod node_plugin_abi;
 pub mod param_resume;
 pub mod params;
 pub mod partition;
+// The live loop's opt-in kernel sleep between expected events
+// (`CERULION_PERIOD_PARK=1`).
+pub(crate) mod period_park;
+#[cfg(any(test, feature = "test-helpers"))]
+pub use period_park::PeriodParkStats;
 pub mod run_topology;
 pub mod runtime;
 // The two sibling topic sets a split worker is told about, one type per
