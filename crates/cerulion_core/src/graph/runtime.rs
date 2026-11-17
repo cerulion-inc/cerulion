@@ -2944,11 +2944,11 @@ const LIVE_POLL_FLOOR_NS: u64 = 1_000_000;
 const LIVE_DEADLINE_FLOOR_NS: u64 = 10_000;
 
 /// PURE: the live loop's next wait in ns. A Period deadline still ahead is
-/// waited for exactly (floored at [`LIVE_DEADLINE_FLOOR_NS`]), together with a
-/// fixed-quantum boundary when one applies; every other pending fire keeps the
-/// [`LIVE_POLL_FLOOR_NS`] poll, and so does the quantum boundary when no Period
-/// deadline is ahead. Nothing pending, or a wait past it, is capped at
-/// [`LIVE_WAIT_CAP_NS`].
+/// waited for exactly (floored at [`LIVE_DEADLINE_FLOOR_NS`]), capped at a
+/// fixed-quantum boundary when one applies; every other pending fire, capped at
+/// the same boundary, keeps the [`LIVE_POLL_FLOOR_NS`] poll, so the boundary
+/// waits less than 1 ms only beside a deadline still ahead. Nothing pending, or
+/// a wait past it, is capped at [`LIVE_WAIT_CAP_NS`].
 ///
 /// The exact class is what keeps a Period node on its grid: a wait floored at
 /// 1 ms for a deadline less than 1 ms ahead starts each fire's wait from a late
@@ -2963,12 +2963,12 @@ pub(crate) fn live_wait_ns(
             .map_or(deadline, |boundary| deadline.min(boundary))
             .max(LIVE_DEADLINE_FLOOR_NS)
     });
+    // The boundary caps the poll too. Beside a deadline ahead that never
+    // matters: the exact half is already no later than the boundary.
     let polled = next.poll_ns.map(|poll| {
-        let poll = match quantum_boundary_ns {
-            Some(boundary) if next.deadline_ns.is_none() => poll.min(boundary),
-            _ => poll,
-        };
-        poll.max(LIVE_POLL_FLOOR_NS)
+        quantum_boundary_ns
+            .map_or(poll, |boundary| poll.min(boundary))
+            .max(LIVE_POLL_FLOOR_NS)
     });
     match (exact, polled) {
         (Some(e), Some(p)) => e.min(p),

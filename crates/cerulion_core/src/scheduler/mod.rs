@@ -12469,6 +12469,38 @@ mod next_fire_split_tests {
         assert_eq!((next.deadline_ns, next.poll_ns), (None, Some(4_800_000)));
     }
 
+    /// A throttle window that ends before the Period deadline, or exactly at
+    /// it, moves nothing: the deadline stays the exact half.
+    #[test]
+    fn a_throttle_that_ends_by_the_deadline_leaves_it_exact() {
+        for (throttle_ns, now_ns, left_ns) in [
+            (300_000, 1_100_000, 900_000),
+            (PERIOD_NS, 1_200_000, 800_000),
+        ] {
+            let mut s = scheduler();
+            add(&mut s, "tick", period());
+            s.set_throttle_ns("tick", throttle_ns).unwrap();
+            s.step(Duration::from_nanos(PERIOD_NS));
+            let next = s.next_fire_split(now_ns);
+            assert_eq!(
+                (next.deadline_ns, next.poll_ns),
+                (Some(left_ns), None),
+                "throttle {throttle_ns} ns at {now_ns} ns"
+            );
+        }
+    }
+
+    /// A `block` release at exactly the Period deadline moves nothing either.
+    #[test]
+    fn a_hold_released_at_the_deadline_leaves_it_exact() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        s.set_block_hold("tick", || BlockHold::Until(PERIOD_NS))
+            .unwrap();
+        let next = s.next_fire_split(250_000);
+        assert_eq!((next.deadline_ns, next.poll_ns), (Some(750_000), None));
+    }
+
     #[test]
     fn a_due_data_node_beside_a_period_deadline_reports_both_halves() {
         let mut s = scheduler();
@@ -12480,6 +12512,46 @@ mod next_fire_split_tests {
         assert_eq!(next.poll_ns, Some(0), "a due node is a poll");
         assert_eq!(next.soonest(), Some(0));
         assert_eq!(s.ns_until_next_fire(250_000), Some(0));
+    }
+
+    /// A Data or Sync node owes a fire only while it holds a backlog: idle, it
+    /// adds nothing to either half; with its backlog flag set it is due now.
+    #[test]
+    fn a_data_or_sync_node_is_due_only_while_it_holds_a_backlog() {
+        let mut s = scheduler();
+        add(&mut s, "sink", TriggerPolicy::Data);
+        add(
+            &mut s,
+            "join",
+            TriggerPolicy::Sync {
+                inputs: vec!["/a".to_string(), "/b".to_string()],
+                window: None,
+            },
+        );
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire::default(),
+            "idle: nothing owed"
+        );
+        s.nodes.get_mut("join").expect("join").sync_backlog_hint = true;
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire {
+                deadline_ns: None,
+                poll_ns: Some(0)
+            },
+            "a carried complete set is due now"
+        );
+        s.nodes.get_mut("join").expect("join").sync_backlog_hint = false;
+        s.nodes.get_mut("sink").expect("sink").data_backlog_hint = true;
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire {
+                deadline_ns: None,
+                poll_ns: Some(0)
+            },
+            "a frame held at the carry cap is due now"
+        );
     }
 
     #[test]
