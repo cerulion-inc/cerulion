@@ -1,9 +1,9 @@
-# Mutation baseline for cerulion_core: the ROS IDL parser decision functions
-# and the live loop's wait sizing.
+# Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
+# the live loop's wait sizing and its period-park decisions.
 #
-# Scope: the two pure parser files, the three pure wait-sizing functions named
-# below, and the oracle mutants listed below, each on one pure decision
-# function. The rest of the crate holds transport and scheduler paths that the
+# Scope: the two pure parser files, the pure wait-sizing and period-park
+# functions named below, and the oracle mutants listed below, each on one pure
+# decision function. The rest of the crate holds transport and scheduler paths that the
 # mutation rule does not cover.
 #
 # Run:     cargo mutants -p cerulion_core \
@@ -32,6 +32,24 @@
 #          missed mutant is outside the three functions: a struct-field
 #          deletion in `CrossProcessWiring::validation_options` that the run
 #          also tried. Every mutant inside the three functions is caught.
+#
+# Live-loop period-park (`graph/period_park.rs`, `CERULION_PERIOD_PARK=1`):
+# `refusal` and `admits` (where it applies), `NotEngaged::as_str` (the
+# warning's reason), `announce` (the start line or the one warning),
+# `classify` (the switch), `Plan::phase` (nap or park), `KernelLead` (how late
+# a nap returns) and `ArrivalLearner` (a data input's period and phase).
+#
+# Run:     cargo mutants -p cerulion_core --in-place -C --lib \
+#            -f crates/cerulion_core/src/graph/period_park.rs \
+#            --re "admits|refusal|NotEngaged::as_str|announce|classify|Plan::phase|KernelLead::|ArrivalLearner::" \
+#            -- -- period_park
+# Result:  93 mutants: 61 caught, 18 unviable, 14 missed. Eleven missed
+#          mutants were boundaries no test held (the learner's shortest and
+#          longest gap, its tolerance, the instant a window closes), now
+#          pinned. Three were in code that changed nothing (two checks in
+#          `Plan::phase`, a cap in `ArrivalLearner::half_width_ns`), now gone.
+#          Re-run over `ArrivalLearner::` and `Plan::phase` after both fixes:
+#          60 mutants, 52 caught, 8 unviable, 0 missed.
 #
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
