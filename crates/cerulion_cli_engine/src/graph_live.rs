@@ -4460,6 +4460,7 @@ nodes:
                     backpressure: BackpressurePolicy::DropOldest,
                     expect_within_ms: None,
                     consume: Default::default(),
+                    accumulate: false,
                 }],
                 vec![OutputMeta::new("out".to_string(), 0, None)],
             )
