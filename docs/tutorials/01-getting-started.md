@@ -903,19 +903,19 @@ cerulion topic echo /demo/safety_controller/cmd_vel
 **Expected output (streaming):**
 
 ```
-# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=56
+# seq=230 ts=1997419229602750ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.5
 y: 0.0
 z: 0.0
 ---
-# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=56
+# seq=231 ts=1997419329630041ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
 z: 0.0
 ---
-# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=56
+# seq=232 ts=1997419429638875ns schema=0xd43ee5592039b9df size=64
 # geometry_msgs/Vector3
 x: 0.0
 y: 0.0
@@ -933,10 +933,10 @@ wire header:
   jitter (100.027 ms then 100.009 ms in the capture above) instead of landing on
   exact multiples. What makes the Step 7 replay exact is not a tidy clock but
   the recorded posture: every step boundary is written into the bag and replayed
-  from there. `CERULION_EXECUTION_MODE=lockstep` opts into the other shape,
-  where every rank advances the same 100 ms quantum behind a shared barrier, so
-  its stamps are logical quantum values counted from zero instead of readings
-  that carry the run's jitter.
+  from there. The deprecated `CERULION_EXECUTION_MODE=lockstep` opt-out gives
+  the other shape, where every rank advances the same 100 ms quantum behind a
+  shared barrier, so its stamps are logical quantum values counted from zero
+  instead of readings that carry the run's jitter.
 - `schema`: the layout-sensitive schema hash (see the wire-format footnote below)
 - `size`: total wire size (header + payload)
 
@@ -1051,7 +1051,7 @@ frames: 774 across 2 topic(s); span 38.600s
 
 TOPIC                                       FRAMES   MAX BYTES  SCHEMA
 /demo/lidar_sensor/scan                        387        1361  sensor_msgs/LaserScan
-/demo/safety_controller/cmd_vel                387          56  geometry_msgs/Vector3
+/demo/safety_controller/cmd_vel                387          64  geometry_msgs/Vector3
 ...
 ```
 
@@ -1070,9 +1070,21 @@ It ends with:
 replay PASS: recordings/obstacle_avoidance_<timestamp>.mcap (387 tick(s) replayed, 2/2 topic(s) matched byte-for-byte and were credited)
 ```
 
-and exits 0. (It may also print `WARNING: env divergence` lines for shell
-variables such as `SHLVL` that differ between the two terminals. They are
-advisory; the verdict is the `replay PASS` line and the exit code.)
+and exits 0. The re-execution runs in your shell's environment, and the bag
+holds a record of the environment the recording ran in, so the two are
+compared. Variables that only your shell or terminal sets, such as `SHLVL`,
+often differ between two terminals, and a difference like that is counted in one
+line above the verdict:
+
+```
+NOTE: 1 other environment variable differs from the recording. Cerulion does not read it to decide what the re-execution runs, so it matters only if code in one of your nodes reads it. Run with -v to list it.
+```
+
+That line is information. A line that starts with
+`WARNING: environment variable` names a variable that Cerulion, the dynamic
+linker or the Python interpreter reads, such as a `CERULION_` setting, so the
+re-execution may not match the recorded run: set that variable as it was when
+you recorded before you trust the result.
 
 ### Change the controller, and verify again
 
@@ -1094,12 +1106,13 @@ This time the verdict is a divergence, and the exit code is 1:
 ```
 FRAME-CONTENT DIVERGENCE: recordings/obstacle_avoidance_<timestamp>.mcap
   387 tick(s) replayed; 1/2 topic(s) matched and were credited; 1 violation(s):
-  - /demo/safety_controller/cmd_vel [byte-mismatch]: frame 0 differs at byte 38 on '/demo/safety_controller/cmd_vel' (recorded 56 B, replayed 56 B)
+  - /demo/safety_controller/cmd_vel [byte-mismatch]: frame 0 on '/demo/safety_controller/cmd_vel' differs at x: recorded 0.5, replayed 0.25 (recorded 64 B, replayed 64 B)
   Topics passed: 1/2
 ```
 
-On the same sensor inputs, the changed controller commands a different speed. The
-scan topic still matches, because the sensor did not change. That is the loop:
+On the same sensor inputs, the changed controller commands a different speed: the
+line names the field that changed, `x`, with the recorded and the replayed value.
+The scan topic still matches, because the sensor did not change. That is the loop:
 record once on the robot, then check every later change against the recording
 before it reaches the robot again. In CI the nonzero exit is the gate.
 

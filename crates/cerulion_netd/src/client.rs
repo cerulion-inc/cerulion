@@ -186,6 +186,24 @@ const MIRROR_BUSY_DELAYS: [Duration; 7] = [
     Duration::from_millis(389),
 ];
 
+/// The clock the busy-mirror retry budget is read from and its backoffs sleep
+/// on. Every constructor installs [`MirrorBusyClock::MONOTONIC`]. The budget's
+/// end is also the retry round trips' I/O deadline, which `bounded_round_trip`
+/// measures on the monotonic clock, so a clock whose `now` runs behind the
+/// monotonic one shortens that deadline.
+#[derive(Debug, Clone, Copy)]
+struct MirrorBusyClock {
+    now: fn() -> Instant,
+    sleep: fn(Duration),
+}
+
+impl MirrorBusyClock {
+    const MONOTONIC: Self = Self {
+        now: Instant::now,
+        sleep: std::thread::sleep,
+    };
+}
+
 fn mirror_busy_delay(retries: usize, remaining: Duration) -> Option<Duration> {
     MIRROR_BUSY_DELAYS
         .get(retries)
@@ -624,6 +642,7 @@ pub struct NetdClient {
     pending_losses: Vec<crate::protocol::MirrorLost>,
     push_fragment: Vec<u8>,
     mirror_busy_failures: FailureRegimeLatch,
+    mirror_busy_clock: MirrorBusyClock,
 }
 
 impl NetdClient {
@@ -923,6 +942,7 @@ impl NetdClient {
             pending_losses: Vec::new(),
             push_fragment: Vec::new(),
             mirror_busy_failures: FailureRegimeLatch::new(),
+            mirror_busy_clock: MirrorBusyClock::MONOTONIC,
         };
         let line = client.read_line()?;
         client.daemon_protocol = validate_hello(&line)?;
@@ -1064,6 +1084,7 @@ impl NetdClient {
         request: impl Fn(u64) -> Request,
     ) -> Result<(u64, Response), ClientError> {
         let key = crate::registry::TopicKey::new(robot, topic);
+        let clock = self.mirror_busy_clock;
         let mut retry_deadline = None;
         let mut retries = 0;
         loop {
@@ -1075,13 +1096,13 @@ impl NetdClient {
             if let Response::Error(error) = &response {
                 if error.id == Some(id) && is_transient_mirror_refusal(&error.error, &key) {
                     let end =
-                        *retry_deadline.get_or_insert_with(|| Instant::now() + MIRROR_BUSY_BUDGET);
+                        *retry_deadline.get_or_insert_with(|| (clock.now)() + MIRROR_BUSY_BUDGET);
                     if let Some(delay) =
-                        mirror_busy_delay(retries, end.saturating_duration_since(Instant::now()))
+                        mirror_busy_delay(retries, end.saturating_duration_since((clock.now)()))
                     {
                         tracing::debug!(robot = %key.robot, topic = %key.topic, attempt = retries + 1, delay_ms = delay.as_millis(), "remote mirror controller busy; retrying");
-                        std::thread::sleep(delay);
-                        if Instant::now() < end {
+                        (clock.sleep)(delay);
+                        if (clock.now)() < end {
                             retries += 1;
                             continue;
                         }
@@ -3191,6 +3212,7 @@ mod tests {
             pending_losses: Vec::new(),
             push_fragment: Vec::new(),
             mirror_busy_failures: FailureRegimeLatch::new(),
+            mirror_busy_clock: MirrorBusyClock::MONOTONIC,
         };
         assert_eq!(
             client.observe("arm", "/extra", 7).unwrap().local_topic,
@@ -3222,6 +3244,7 @@ mod tests {
             pending_losses: Vec::new(),
             push_fragment: Vec::new(),
             mirror_busy_failures: FailureRegimeLatch::new(),
+            mirror_busy_clock: MirrorBusyClock::MONOTONIC,
         };
         client.poll_pushed_losses().unwrap();
         assert!(!client.poisoned);

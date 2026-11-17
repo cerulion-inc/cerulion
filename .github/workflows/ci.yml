@@ -1761,11 +1761,13 @@ jobs:
         run: |
           echo "selection: skipped cerulion_android (selected: $SELECTED)"
 
-  # THE `period-park` FEATURE OF `rmw_cerulion`, built, linted and tested on
-  # both Linux architectures. Every other job builds `rmw_cerulion` with its
-  # default features, so the code behind the feature in
-  # `src/api/guard_wait.rs` (the predicted wait and its doorbell tests) is
-  # built nowhere else.
+  # THE PERIOD-LEARNED PARK OF `rmw_cerulion` (cfg `cerulion_period_park`),
+  # built, linted and tested on both Linux architectures. Every Linux aarch64
+  # build carries it; anywhere else only the `period-park` feature does. Every
+  # other job builds `rmw_cerulion` with its default features on x86_64 Linux or
+  # macOS, where the cfg is off, so the code behind it in
+  # `src/api/guard_wait.rs` (the predicted wait and its doorbell tests) is built
+  # nowhere else.
   #
   # TWO LEGS, one per architecture, because the code differs between them: the
   # park's monitor wait is `WFE` on aarch64 and `UMWAIT` on x86_64 (when the
@@ -1778,10 +1780,16 @@ jobs:
   # feature on; `cargo clippy -p rmw_cerulion` with no `--all-targets` is the
   # only build of the lib without it.
   #
-  # THE DEFAULT BUILD is tested on the aarch64 leg as well. With the feature
-  # on, a regular publisher takes the predicted wait, so the feature run does
-  # not cover the default idle park (`WFE`) that every aarch64 Linux build
-  # ships; the test shards cover the default build on x86_64.
+  # On the aarch64 leg the default-feature clippy steps compile the same cfg as
+  # the feature steps (only the cfg rule's own test reads the feature there);
+  # both legs keep one step list.
+  #
+  # THE DEFAULT BUILD is tested on the aarch64 leg as well, with
+  # `CERULION_RMW_PERIOD_PARK=0`. On aarch64 the default build carries the
+  # learned park just as the feature build does, and a regular publisher takes
+  # the predicted wait, so only the switched-off run covers the one-rung idle
+  # park (`WFE`) that the switch restores; the test shards cover the default
+  # build on x86_64.
   #
   # Serial (`--test-threads=1`) for the same reason as the shard step: the
   # tests touch the iceoryx2 singleton.
@@ -1870,10 +1878,12 @@ jobs:
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
         run: cargo test -p rmw_cerulion --features period-park -- --test-threads=1
 
-      - name: rmw_cerulion tests, default features (serial)
+      - name: rmw_cerulion tests, default features, learned park off (serial)
         if: >-
           matrix.arch == 'aarch64'
           && contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion')
+        env:
+          CERULION_RMW_PERIOD_PARK: "0"
         run: cargo test -p rmw_cerulion -- --test-threads=1
 
       - name: selection marker, rmw_cerulion
@@ -1947,6 +1957,57 @@ jobs:
             cargo-examples-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-examples-${{ runner.os }}-main-
             cargo-examples-${{ runner.os }}-
+
+      # Every committed Cargo.lock outside the root workspace (each example,
+      # each bench, the Python wheel, the Android sample runtime) must match
+      # its manifest. These workspaces take the root crates as path
+      # dependencies, so a dependency change under crates/ reaches them too:
+      # a stale lockfile is rewritten by the first `cargo build` a user runs
+      # (a modified file in `git status`) and refused by `cargo build --locked`.
+      # `cargo metadata --locked` resolves without building and fails when the
+      # lockfile would change.
+      #
+      # A WALK over the tracked lockfiles, not a hand list, so a new
+      # standalone workspace is covered the day its lockfile lands. It runs
+      # BEFORE any build step in this job: a build without --locked rewrites a
+      # stale lockfile in the checkout, and a check after it would pass on the
+      # rewritten file. Every lockfile is checked before the step fails, so one
+      # stale lockfile does not hide the others.
+      #
+      # To refresh one, run `cargo metadata --format-version 1 --manifest-path
+      # <dir>/Cargo.toml > /dev/null` from the repo root. That is not a
+      # minimal edit: it adds every crate the manifests now require at its
+      # newest compatible version, and where a path crate's dependencies
+      # changed it can re-point a dependency edge of a crate already locked.
+      # Read its diff before committing; the `examples` entry in
+      # docs/internals/ci-and-gates.md says which changes to keep.
+      - name: Check every standalone workspace lockfile (--locked)
+        run: |
+          set -uo pipefail
+          fail=0
+          checked=0
+          while IFS= read -r lock; do
+            [ "$lock" = "Cargo.lock" ] && continue
+            manifest="$(dirname "$lock")/Cargo.toml"
+            echo "::group::cargo metadata --locked ${manifest}"
+            if ! cargo metadata --locked --format-version 1 --manifest-path "$manifest" > /dev/null; then
+              echo "::error file=${lock}::${lock} does not match ${manifest}. Refresh it with: cargo metadata --format-version 1 --manifest-path ${manifest} > /dev/null, which adds each newly required crate at its newest compatible version and can re-point edges of crates already locked; review the diff as the examples entry in docs/internals/ci-and-gates.md describes before committing"
+              fail=1
+            fi
+            echo "::endgroup::"
+            checked=$((checked + 1))
+          done < <(git ls-files -- '*Cargo.lock' | sort)
+          # A walk that matched nothing would be a silent green. The floor is
+          # the exact number of standalone lockfiles in the tree (three under
+          # benches, eight examples, the Python wheel, the Android sample
+          # runtime), so losing any one of them trips it. Raise it in the
+          # commit that adds a lockfile.
+          if [ "$checked" -lt 13 ]; then
+            echo "::error::only ${checked} standalone lockfile(s) were checked: the walk is not reaching them"
+            exit 1
+          fi
+          echo "checked ${checked} standalone lockfile(s)"
+          exit $fail
 
       # Each example is its OWN workspace with its OWN lockfile + target dir
       # (isolated workspaces resolve fresh), so check them one at a time from
@@ -2602,6 +2663,7 @@ jobs:
       # read a tree outside their own crate. The set is derived from the test
       # sources by `ci_doc_pin_walk_test`, which fails on a missing or a stale
       # line, so a path-to-step map cannot lose one of these binaries.
+      # doc-pin: cerulion_core::cerulion_core reads docs
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
       # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks
@@ -2651,7 +2713,7 @@ jobs:
             exit 0
           fi
           args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 4)
-          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+          if ! grep -qFx upstream_waivers_test <<<"$args"; then
             echo "this shard does not run the waiver gate; nothing to build"
             exit 0
           fi
@@ -3865,7 +3927,7 @@ jobs:
             exit 0
           fi
           args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core ${{ matrix.shard }} 3)
-          if ! printf '%s\n' "$args" | grep -qFx upstream_waivers_test; then
+          if ! grep -qFx upstream_waivers_test <<<"$args"; then
             echo "this shard does not run the waiver gate; nothing to build"
             exit 0
           fi

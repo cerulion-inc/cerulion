@@ -321,6 +321,7 @@ fn node(id: &str, ty: &str, inputs: Vec<(&str, &str)>, outputs: Vec<&str>) -> No
             .map(|(name, source)| InputDef {
                 name: name.to_string(),
                 source: source.to_string(),
+                ..Default::default()
             })
             .collect(),
         outputs: outputs
@@ -361,6 +362,7 @@ fn recording_sink(fires: Fires) -> ClosureNodeEntry {
         depth: 16,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     };
     ClosureNodeEntry::new(
