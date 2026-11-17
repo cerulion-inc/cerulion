@@ -948,6 +948,7 @@ fn gated_plain_input_meta(name: &str) -> InputMeta {
         depth: 8,
         backpressure: BackpressurePolicy::DropOldest,
         expect_within_ms: None,
+        accumulate: false,
         consume: Default::default(),
     }
 }
@@ -968,6 +969,7 @@ fn build_gated_runtime() -> GraphRuntime {
             inputs: vec![InputDef {
                 name: "inp".to_string(),
                 source: "feeder/bp_out".to_string(),
+                ..Default::default()
             }],
             outputs: vec![],
         },

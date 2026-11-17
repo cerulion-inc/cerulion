@@ -160,6 +160,7 @@ fn clockprobe_graph(
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "probe/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
