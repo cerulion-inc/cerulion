@@ -30,11 +30,11 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1; pairing
   connectd mirrors the robot protocol (no production remoted dep): update both,
   pinned by `protocol_parity_test.rs`.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Audit verification: regular files, bounded lines; external witness required.
+- Audit: private files, append before forwarding, reserve Exit; one write/read line cap, external witnesses.
 - Desk keys: 32 raw bytes; `create_new`, 0600, NEVER overwrite.
   `~/.cerulion` secrets: `auth::atomic_write_secret`.
-  Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
-  writer and both desk readers, never hand-rolled (divergence stops revocations).
+  Epoch cache: ONE `cerulion_pairing::verify` resolver for writer and both desk readers;
+  never hand-roll (divergence stops revocations).
 - Revocation has its OWN task/timer; assert standing revoke and eviction, never response order (`epoch_push_e2e_test.rs`).
 - Metadata: namespace-checked netd snapshots or `SchemaSource`; no startup.
   Recheck CAP_OBSERVE/privacy after awaits; schema-only reads hold no leases.
