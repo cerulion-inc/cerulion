@@ -541,6 +541,17 @@ spill lifetime, repeat views, state refusal and allocation-detector controls.
   Listeners alone do not classify a topic REMOTE. Automatic local reads acquire
   no lease. The lease and private CLI wrapper add no publisher/subscriber FFI
   fields, wire changes, or data delivery work.
+- A policy marker (`transport/egress_scope`) or mirror marker whose last holder
+  is dropping it reads as `IsMarkedForDestruction` until iceoryx2 removes its
+  files. The open-only checks (`egress_scope::allowed`,
+  `mirror_origin::is_network_mirror`) open it again within
+  `transport/marker_teardown`'s budget, 20 opens 25 ms apart, counted rather
+  than timed, and refuse naming that budget only when the state outlasts it.
+  The open-or-create paths keep iceoryx2's own wait for that state, which ends
+  with the node's creation window; a refusal at its end names the window.
+  Every other open error refuses as before. Oracle tests: the
+  `marker_teardown`, `egress_scope` and `mirror_origin` unit tests, which
+  inject the teardown through the open seam.
 - Run registry (`transport/run_registry.rs`, `/__cerulion/runs`): exactly one record per
   run for its whole life: no register/unregister, only `set_state` (`Live` → `Ending`).
   `Ending` is a LAST WORD, not a durable state: a fresh-subscriber poll structurally
