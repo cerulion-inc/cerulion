@@ -9942,6 +9942,7 @@ fn judge_capture_resimmable(
             // bag carries no record of a rank's removed steps.
             ranks_without_a_kept_step: &trimmed.ranks_without_a_kept_step,
             anchor_facts,
+            frame_gap: None,
         },
     )
 }
