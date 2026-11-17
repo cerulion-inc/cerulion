@@ -3,7 +3,9 @@
 
 use std::time::Duration;
 
-pub(super) const MAX_REAUTHORIZE_INTERVAL: Duration = Duration::from_secs(1);
+// A one-second sweep leaves 500 ms for authorization and 250 ms for ordinary-job
+// cleanup inside the two-second revocation budget, with scheduling margin.
+pub(crate) const MAX_REAUTHORIZE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Robot-configurable resource limits. These never classify command contents.
 #[derive(Clone, Debug)]

@@ -10,7 +10,7 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1; pairing
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
 - `PairingAuthorizer` classifies accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
   Shell/exec: owner + policy; missing file ON, invalid OFF; absent handle denies, immutable hard-off wins.
-  Settings/context: bounds before work; either OFF wins.
+  Shared limits; bounds before work; either OFF wins.
 - Bootstrap verifies chassis secret/cert chain/owner grant/CPace witness. Subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
