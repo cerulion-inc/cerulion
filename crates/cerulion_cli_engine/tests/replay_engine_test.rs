@@ -31738,7 +31738,7 @@ fn a_free_run_pass_that_cannot_read_its_input_tables_says_so() {
             note.detail
         );
         assert!(
-            !note.detail.contains("record budget"),
+            !note.detail.contains("record budget") && !note.detail.contains("verifier's budget"),
             "and it does NOT blame the record budget: {}",
             note.detail
         );
@@ -32498,6 +32498,44 @@ fn sole_verifier_decline_note(outcome: &ReplayOutcome) -> &replay_engine::Rederi
 /// read log (so the input-tables cause, which is NOT a budget cause, cannot
 /// fire first and mask the one under test).
 fn sy_read_log_bag(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+    sy_read_log_bag_counted(dir, name).0
+}
+
+/// What the two prepare-time budgets count on the `sy` read-log bag, read off
+/// the recording by this file's own walk (never the engine's census).
+struct SyBudgetCounts {
+    /// Rank 1's (`fusion`'s) kind-6 records in file order, as `(step,
+    /// occurrences)`: a read counts its run, a producer annotation counts one.
+    rank1_reads: Vec<(u64, u32)>,
+    /// The recorded frames with a wire header on the two topics rank 1 consumes.
+    rank1_frames: usize,
+}
+
+impl SyBudgetCounts {
+    /// Every read rank 1's log holds.
+    fn reads(&self) -> u64 {
+        self.rank1_reads.iter().map(|&(_, n)| u64::from(n)).sum()
+    }
+
+    /// The step of the first record whose reads take the count past `budget`.
+    fn run_out_step(&self, budget: u64) -> u64 {
+        let mut total = 0u64;
+        for &(step, n) in &self.rank1_reads {
+            total += u64::from(n);
+            if total > budget {
+                return step;
+            }
+        }
+        panic!("rank 1's {total} reads fit a budget of {budget}");
+    }
+}
+
+/// [`sy_read_log_bag`], with [`SyBudgetCounts`] taken from the recording it
+/// writes.
+fn sy_read_log_bag_counted(
+    dir: &tempfile::TempDir,
+    name: &str,
+) -> (std::path::PathBuf, SyBudgetCounts) {
     let rec =
         record_uniform_with_read_log(&sy_yaml("sum_fusion"), sy_bounded_factories, &[], SY_STEPS);
     assert!(
@@ -32505,17 +32543,51 @@ fn sy_read_log_bag(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
         "the precondition every budget arm rests on: this recording HAS a read log, so a \
          decline it reports is a BUDGET decline and not the input-tables cause"
     );
+    let fusion = rec
+        .node_ids
+        .iter()
+        .position(|id| id == "fusion")
+        .expect("the fusion node is in the manifest") as u32;
+    let rank1_reads = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME && r.node_idx == fusion)
+        .map(|r| {
+            let (_, kind, _) =
+                cerulion_core::trace_ring::unpack_read_outcome_meta_full(r.global_level);
+            let n = if kind == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER {
+                1
+            } else {
+                cerulion_core::trace_ring::unpack_read_outcome_run(r.duration_ns)
+            };
+            (r.step, n)
+        })
+        .collect();
+    let rank1_frames = [SY_A_TOPIC, SY_B_TOPIC]
+        .iter()
+        .flat_map(|t| rec.messages[*t].iter())
+        .filter(|f| WireHeader::read_from_buf(f).is_some())
+        .count();
+    let counts = SyBudgetCounts {
+        rank1_reads,
+        rank1_frames,
+    };
+    assert!(
+        counts.reads() > 1 && counts.rank1_frames > 1,
+        "PREMISE: rank 1 holds more than one read and one frame, so a budget of one is \
+         exceeded on both counts"
+    );
     let bag = dir.path().join(name);
     write_sy_bag(rec, &bag, |_| {});
-    bag
+    (bag, counts)
 }
 
 /// **A read log past the budget DECLINES BOTH additive gates, and names the
-/// read-log cause.**
+/// read-log cause, the reads the rank holds and the step it ran out at.**
 ///
-/// `collect_rank_read_log` answers `Ok(None)` when the collection reaches the
-/// budget, and its contract is that the caller then declines the steered
-/// injection AND the re-derivation verdict and SAYS SO. Both halves are
+/// `collect_rank_read_log` answers a budget decline when the collection runs
+/// past the budget, and on a rank that gates nothing the caller then declines
+/// the steered injection AND the re-derivation verdict and SAYS SO. Both halves are
 /// asserted, because each alone is satisfied by a wrong build: an engine that
 /// stood the topics down but silently kept re-deriving over a truncated read
 /// log passes the stand-down assertion, and one that declined the re-derivation
@@ -32526,11 +32598,11 @@ fn sy_read_log_bag(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
 ///
 /// (a) swap this cause's token with `FrameIndexBudget`'s — both stand-downs
 ///     read `verifier_declined_frame_index_budget`;
-/// (b) make `collect_rank_read_log` ignore its budget (never return `Ok(None)`)
-///     — the stand-down list is `[]`, nothing declines at all;
-/// (c) return `Ok(Some(Vec::new()))` on a blown budget instead of `Ok(None)` —
-///     the stand-downs read `no_read_log_coverage`. That is the outcome the
-///     `Ok(None)` contract exists to refuse, and it is the reason this arm
+/// (b) make `collect_rank_read_log` ignore its budget (never decline) — the
+///     stand-down list is `[]`, nothing declines at all;
+/// (c) return an empty collected census on a blown budget instead of the
+///     decline — the stand-downs read `no_read_log_coverage`. That is the
+///     outcome the decline exists to refuse, and it is the reason this arm
 ///     asserts the CODE rather than merely "something stood down": an empty
 ///     read log is reported as an edge that HAS no coverage, which is a claim
 ///     about the recording, where the truth is that the verifier stopped
@@ -32540,7 +32612,7 @@ fn sy_read_log_bag(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
 fn a_read_log_past_the_budget_declines_both_additive_gates() {
     const TINY_BUDGET: usize = 1;
     let dir = tempfile::tempdir().unwrap();
-    let bag = sy_read_log_bag(&dir, "read_log_budget.mcap");
+    let (bag, counts) = sy_read_log_bag_counted(&dir, "read_log_budget.mcap");
 
     // ANTI-TAUTOLOGY, on the SAME bag: at the shipped budget this fixture
     // declines NOTHING and steers both cross-rank topics. Without this the arm
@@ -32604,24 +32676,28 @@ fn a_read_log_past_the_budget_declines_both_additive_gates() {
     // The RENDERED text, on both artifacts — the token is what a CI job greps,
     // the sentence is what an operator reads, and three causes used to print one
     // wrong sentence between them.
+    let named = format!(
+        "it holds {} reads, more than the verifier's budget of {TINY_BUDGET} reads per rank, \
+         and reaches the budget at step {}",
+        counts.reads(),
+        counts.run_out_step(TINY_BUDGET as u64)
+    );
     let note = sole_verifier_decline_note(&outcome);
     assert!(
-        note.detail.contains("recorded read log is larger")
-            && note
-                .detail
-                .contains(&format!("{TINY_BUDGET}-record budget")),
-        "the note names the READ-LOG cause and the budget the site actually read: {}",
+        note.detail.contains(&named),
+        "the note names the READ-LOG cause, the reads, the budget the site actually read and \
+         the step it ran out at ({named}): {}",
         note.detail
     );
     assert!(
-        !note.detail.contains("consumes more recorded frames")
+        !note.detail.contains("frames per rank")
             && !note.detail.contains("recorded schedule exceeds"),
         "…and blames neither sibling budget: {}",
         note.detail
     );
     for sd in &outcome.injection_stand_downs {
         assert!(
-            sd.detail.contains("recorded read log is larger")
+            sd.detail.contains(&named)
                 && sd
                     .detail
                     .contains("fell back to the recorded-clock injection window"),
@@ -32641,9 +32717,10 @@ fn a_read_log_past_the_budget_declines_both_additive_gates() {
 }
 
 /// **A consumed-frame count past the budget declines BOTH additive gates, and
-/// names the FRAME-INDEX cause — not the read log's.**
+/// names the FRAME-INDEX cause and the frames the rank consumes — not the read
+/// log's.**
 ///
-/// The second `Ok(None)` producer. It is only reachable at all because the
+/// The second prepare-time budget. It is only reachable at all because the
 /// override is per site: the read log is collected first, so a single global
 /// budget low enough to blow the frame index always declines upstream of it and
 /// this arm could not exist.
@@ -32658,7 +32735,7 @@ fn a_read_log_past_the_budget_declines_both_additive_gates() {
 fn a_consumed_frame_count_past_the_budget_declines_both_additive_gates() {
     const TINY_BUDGET: usize = 1;
     let dir = tempfile::tempdir().unwrap();
-    let bag = sy_read_log_bag(&dir, "frame_index_budget.mcap");
+    let (bag, counts) = sy_read_log_bag_counted(&dir, "frame_index_budget.mcap");
 
     let control = replay(&bag, sy_bounded_factories, None, None).expect("the control bag replays");
     assert_eq!(
@@ -32700,17 +32777,19 @@ fn a_consumed_frame_count_past_the_budget_declines_both_additive_gates() {
         vec![(1, "verifier_declined_frame_index_budget".to_string())],
     );
 
+    let named = format!(
+        "it consumes {} recorded frames, more than the verifier's budget of {TINY_BUDGET} \
+         frames per rank",
+        counts.rank1_frames
+    );
     let note = sole_verifier_decline_note(&outcome);
     assert!(
-        note.detail.contains("consumes more recorded frames")
-            && note
-                .detail
-                .contains(&format!("{TINY_BUDGET}-record budget")),
-        "the note names the FRAME-INDEX cause: {}",
+        note.detail.contains(&named),
+        "the note names the FRAME-INDEX cause, the frames and the budget ({named}): {}",
         note.detail
     );
     assert!(
-        !note.detail.contains("recorded read log is larger"),
+        !note.detail.contains("reads per rank"),
         "…and NOT the read log, whose budget was untouched: {}",
         note.detail
     );
@@ -32826,8 +32905,7 @@ fn the_mid_loop_schedule_budget_declines_the_rederivation_alone() {
             note.detail
         );
         assert!(
-            !note.detail.contains("recorded read log is larger")
-                && !note.detail.contains("consumes more recorded frames"),
+            !note.detail.contains("reads per rank") && !note.detail.contains("frames per rank"),
             "…and neither prepare-time cause: {}",
             note.detail
         );
