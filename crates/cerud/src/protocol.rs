@@ -19,12 +19,14 @@
 //! payload bytes. Payloads are JSON. A hard [`MAX_FRAME_BYTES`] cap bounds a
 //! hostile/garbled length prefix.
 //!
-//! # Handshake (version negotiation, day one)
+//! # Handshake
 //!
 //! On connect the client sends a [`Hello`] carrying the inclusive version
-//! range it supports. The server replies with [`HandshakeReply::Ack`] naming
-//! the chosen version (the highest common) or [`HandshakeReply::Reject`] if
-//! there is no overlap — refused before any verb runs.
+//! range it supports and its session kind. Ordinary ops accept versions 1 and 2;
+//! a Hello without a session field means ordinary ops. The server replies with
+//! [`HandshakeReply::Ack`] naming the highest common version, or
+//! [`HandshakeReply::Reject`] before any verb runs. [`crate::server::OpsServer`]
+//! refuses shell and exec sessions because it only dispatches ordinary verbs.
 
 use std::io::{Read, Write};
 

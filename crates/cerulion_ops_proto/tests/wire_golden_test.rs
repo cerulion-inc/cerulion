@@ -18,6 +18,10 @@ use serde::Serialize;
 
 use cerulion_ops_proto::protocol::{self, HandshakeReply, Hello, Request, Response};
 use cerulion_ops_proto::Inventory;
+use cerulion_ops_proto::{
+    ClientFrame, ExecRequest, ExitReason, OutputStream, RecordingWitness, ServerFrame, SessionExit,
+    SessionKind, ShellRequest, WindowSize,
+};
 
 const FIXTURE: &str = include_str!("fixtures/ops_wire_golden.txt");
 
@@ -118,7 +122,7 @@ where
 #[test]
 fn the_fixture_hex_is_the_commented_json_behind_a_big_endian_length() {
     let cases = fixture();
-    assert_eq!(cases.len(), 10, "fixture case count changed");
+    assert_eq!(cases.len(), 23, "fixture case count changed");
     for (name, case) in &cases {
         let (prefix, payload) = case.frame.split_at(4);
         let declared = u32::from_be_bytes(prefix.try_into().unwrap()) as usize;
@@ -153,6 +157,7 @@ fn golden_hello_frames() {
         &Hello {
             min_version: 2,
             max_version: 3,
+            session: SessionKind::Ops,
         },
     );
 }
@@ -162,7 +167,7 @@ fn golden_handshake_reply_frames() {
     assert_golden(
         "handshake_ack",
         &HandshakeReply::Ack {
-            chosen_version: 1,
+            chosen_version: 2,
             server_name: "cerud".to_string(),
         },
     );
@@ -170,8 +175,8 @@ fn golden_handshake_reply_frames() {
         "handshake_reject",
         &HandshakeReply::Reject {
             server_min: 1,
-            server_max: 1,
-            message: "protocol version mismatch: server supports 1..=1, client offered 2..=3"
+            server_max: 2,
+            message: "protocol version mismatch: server supports 1..=2, client offered 3..=3"
                 .to_string(),
         },
     );
@@ -243,6 +248,119 @@ fn golden_inventory_frame() {
             jetpack_l4t: None,
             disk_free_bytes: Some(1_048_576),
             cerulion_version: "1.0.0".to_string(),
+        },
+    );
+}
+
+#[test]
+fn golden_session_open_frames() {
+    assert_golden(
+        "hello_shell",
+        &Hello {
+            min_version: 2,
+            max_version: 2,
+            session: SessionKind::Shell(ShellRequest {
+                term: "xterm-256color".into(),
+                size: WindowSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            }),
+        },
+    );
+    assert_golden(
+        "hello_exec",
+        &Hello {
+            min_version: 2,
+            max_version: 2,
+            session: SessionKind::Exec(ExecRequest {
+                argv: vec!["printf".into(), "hello".into()],
+            }),
+        },
+    );
+}
+
+#[test]
+fn golden_client_session_frames() {
+    assert_golden(
+        "client_stdin",
+        &ClientFrame::Stdin {
+            data: "AP9hCg==".into(),
+        },
+    );
+    assert_golden("client_stdin_eof", &ClientFrame::StdinEof);
+    assert_golden(
+        "client_resize",
+        &ClientFrame::Resize {
+            size: WindowSize {
+                rows: 48,
+                cols: 120,
+                pixel_width: 960,
+                pixel_height: 768,
+            },
+        },
+    );
+    assert_golden("client_close", &ClientFrame::Close);
+}
+
+#[test]
+fn golden_server_session_frames() {
+    assert_golden(
+        "server_witness",
+        &ServerFrame::Witness {
+            witness: RecordingWitness {
+                session_id: "shell-1".into(),
+                head: "d78f2237b17c59bb9fb87b7dcf41b6b3473800ef66a0a52e3f5e16ab6ddfefca".into(),
+                events: 1,
+            },
+        },
+    );
+    assert_golden(
+        "server_started",
+        &ServerFrame::Started {
+            session_id: "session-1".into(),
+        },
+    );
+    assert_golden(
+        "server_stdout",
+        &ServerFrame::Data {
+            stream: OutputStream::Stdout,
+            data: "aGVsbG8K".into(),
+        },
+    );
+    assert_golden(
+        "server_stderr",
+        &ServerFrame::Data {
+            stream: OutputStream::Stderr,
+            data: "ZXJyb3IK".into(),
+        },
+    );
+    assert_golden(
+        "server_pty",
+        &ServerFrame::Data {
+            stream: OutputStream::Pty,
+            data: "G1szMW1oaRtbMG0=".into(),
+        },
+    );
+    assert_golden(
+        "server_exit",
+        &ServerFrame::Exit(SessionExit {
+            code: Some(7),
+            signal: None,
+            reason: ExitReason::Exited,
+            recording_head: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
+            events: 6,
+            stdout_truncated: false,
+            stderr_truncated: true,
+        }),
+    );
+    assert_golden(
+        "server_error",
+        &ServerFrame::Error {
+            message: "recording unavailable".into(),
         },
     );
 }

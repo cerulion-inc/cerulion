@@ -115,6 +115,17 @@ impl OpsServer {
         let frame = protocol::read_frame(&mut conn.stream)?;
         let hello: Hello = protocol::decode(&frame)?;
 
+        if hello.session.verb().is_some() {
+            let message = "this ops service does not support shell or exec sessions";
+            let reply = HandshakeReply::Reject {
+                server_min: cerulion_ops_proto::MIN_SESSION_PROTOCOL_VERSION,
+                server_max: PROTOCOL_VERSION,
+                message: message.to_owned(),
+            };
+            protocol::write_frame(&mut conn.stream, &protocol::encode(&reply)?)?;
+            return Err(CerudError::Decode(message.to_owned()));
+        }
+
         match protocol::negotiate_version(
             hello.min_version,
             hello.max_version,

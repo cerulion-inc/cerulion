@@ -87,7 +87,7 @@ fn permissive_server_serves_inventory_and_receipts_it() {
     );
 
     let mut client = connect_client(&socket);
-    assert_eq!(client.negotiated_version(), 1);
+    assert_eq!(client.negotiated_version(), 2);
     assert_eq!(client.server_name(), "cerud-test");
 
     let result = client.call("inventory", serde_json::json!({})).unwrap();
@@ -102,6 +102,32 @@ fn permissive_server_serves_inventory_and_receipts_it() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].verb, "inventory");
     assert_eq!(receipts[0].caller, "local-dev");
+    assert_eq!(receipts[0].outcome, ReceiptOutcome::Ok);
+    verify_chain(&receipts).unwrap();
+}
+
+#[test]
+fn legacy_client_serves_ordinary_ops_at_version_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("ops.sock");
+    let receipt_log = dir.path().join("receipts.log");
+    let handle = spawn_one_connection_server(
+        &socket,
+        &receipt_log,
+        dir.path().to_path_buf(),
+        Box::new(PermissiveDevAuthorizer),
+    );
+    let stream = connect_unix(&socket).unwrap();
+    stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+    stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
+    let mut client = OpsClient::connect(stream, 1, 1).unwrap();
+    assert_eq!(client.negotiated_version(), 1);
+    assert!(client.call("inventory", serde_json::json!({})).unwrap()["arch"].is_string());
+    drop(client);
+    handle.join().unwrap();
+    let receipts = read_all(&receipt_log).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].verb, "inventory");
     assert_eq!(receipts[0].outcome, ReceiptOutcome::Ok);
     verify_chain(&receipts).unwrap();
 }
@@ -192,19 +218,19 @@ fn version_mismatch_is_refused_at_the_handshake() {
         Box::new(PermissiveDevAuthorizer),
     );
 
-    // The client only speaks versions 2..=3; the server only speaks 1 → refused.
+    // A version 3 client has no overlap with the server's supported range.
     let stream = connect_unix(&socket).unwrap();
     stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
     stream.set_write_timeout(Some(IO_TIMEOUT)).unwrap();
     // OpsClient is not Debug, so match without formatting the Ok arm's client.
-    match OpsClient::connect(stream, 2, 3) {
+    match OpsClient::connect(stream, 3, 3) {
         Err(CerudError::HandshakeRejected {
             reason,
             server_min,
             server_max,
         }) => {
             // The server's range travels the Reject frame verbatim.
-            assert_eq!((server_min, server_max), (1, 1));
+            assert_eq!((server_min, server_max), (1, 2));
             // The reason is the server's OWN explanation, surfaced verbatim —
             // not a client-manufactured string. Here it is the server-side
             // version-mismatch message naming both ranges.
@@ -213,7 +239,7 @@ fn version_mismatch_is_refused_at_the_handshake() {
                 "reason should carry the server's version-mismatch explanation, got: {reason}"
             );
             assert!(
-                reason.contains("1..=1") && reason.contains("2..=3"),
+                reason.contains("3..=3") && reason.contains("1..=2"),
                 "got: {reason}"
             );
         }
@@ -258,7 +284,7 @@ fn non_version_rejection_is_surfaced_faithfully_not_as_version_mismatch() {
             server_min,
             server_max,
         }) => {
-            assert_eq!((server_min, server_max), (1, 1));
+            assert_eq!((server_min, server_max), (1, 2));
             // The reason is the server's inverted-range explanation — proving
             // the client did NOT reinterpret this non-version rejection as a
             // version mismatch.
@@ -275,6 +301,50 @@ fn non_version_rejection_is_surfaced_faithfully_not_as_version_mismatch() {
 
     let receipts = read_all(&receipt_log).unwrap();
     assert!(receipts.is_empty());
+}
+
+#[test]
+fn unix_ops_service_refuses_command_sessions_before_acknowledgement() {
+    use cerud::protocol::{decode, encode, read_frame, write_frame, HandshakeReply, Hello};
+    use cerulion_ops_proto::{ExecRequest, SessionKind, ShellRequest, WindowSize};
+
+    for session in [
+        SessionKind::Exec(ExecRequest {
+            argv: vec!["true".into()],
+        }),
+        SessionKind::Shell(ShellRequest {
+            term: "xterm".into(),
+            size: WindowSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        }),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ops.sock");
+        let receipt_log = dir.path().join("receipts.log");
+        let handle = spawn_one_connection_server(
+            &socket,
+            &receipt_log,
+            dir.path().to_path_buf(),
+            Box::new(PermissiveDevAuthorizer),
+        );
+        let mut stream = connect_unix(&socket).unwrap();
+        stream.set_read_timeout(Some(IO_TIMEOUT)).unwrap();
+        let hello = Hello {
+            session,
+            ..Hello::current()
+        };
+        write_frame(&mut stream, &encode(&hello).unwrap()).unwrap();
+        let reply: HandshakeReply = decode(&read_frame(&mut stream).unwrap()).unwrap();
+        assert!(
+            matches!(reply, HandshakeReply::Reject { server_min: 2, server_max: 2, message } if message == "this ops service does not support shell or exec sessions")
+        );
+        handle.join().unwrap();
+        assert!(read_all(&receipt_log).unwrap().is_empty());
+    }
 }
 
 #[test]

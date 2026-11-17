@@ -67,7 +67,7 @@ fn real_binary_serves_a_verb_and_receipts_it() {
         .unwrap();
 
     let mut client = OpsClient::connect_current(stream).expect("handshake");
-    assert_eq!(client.negotiated_version(), 1);
+    assert_eq!(client.negotiated_version(), 2);
     assert_eq!(client.server_name(), "cerud");
 
     let result = client
