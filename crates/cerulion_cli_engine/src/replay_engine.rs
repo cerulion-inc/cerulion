@@ -10698,7 +10698,7 @@ const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
 /// production value.
 #[derive(Clone, Copy)]
 enum BudgetSite {
-    /// [`collect_rank_read_log`] — this rank's kind-6 records. The per-step
+    /// [`collect_rank_read_log`]: this rank's kind-6 records. The per-step
     /// pull and the replayed half of the per-edge verifier read this site too,
     /// each against its own per-step count ([`expand_run`]).
     ReadLog,
@@ -14148,7 +14148,7 @@ fn prepare_pass_verification(
                 "replay: this rank consumes more recorded frames than the verifier's record \
                  budget, so the rank-local re-derivation verdict is DECLINED for this rank \
                  and any read-log-steered injection it had falls back to the recorded-clock \
-                 window — `declines` says what that costs this rank's topics"
+                 window; `declines` says what that costs this rank's topics"
             );
             let cause = VerifierDecline::FrameIndexBudget(overrun);
             if !reads.is_empty() {

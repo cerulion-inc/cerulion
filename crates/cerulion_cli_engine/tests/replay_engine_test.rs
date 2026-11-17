@@ -32598,10 +32598,10 @@ fn sy_read_log_bag_counted(
 ///
 /// (a) swap this cause's token with `FrameIndexBudget`'s — both stand-downs
 ///     read `verifier_declined_frame_index_budget`;
-/// (b) make `collect_rank_read_log` ignore its budget (never decline) — the
+/// (b) make `collect_rank_read_log` ignore its budget (never decline): the
 ///     stand-down list is `[]`, nothing declines at all;
 /// (c) return an empty collected census on a blown budget instead of the
-///     decline — the stand-downs read `no_read_log_coverage`. That is the
+///     decline: the stand-downs read `no_read_log_coverage`. That is the
 ///     outcome the decline exists to refuse, and it is the reason this arm
 ///     asserts the CODE rather than merely "something stood down": an empty
 ///     read log is reported as an edge that HAS no coverage, which is a claim
@@ -32717,7 +32717,7 @@ fn a_read_log_past_the_budget_declines_both_additive_gates() {
 }
 
 /// **A consumed-frame count past the budget declines BOTH additive gates, and
-/// names the FRAME-INDEX cause and the frames the rank consumes — not the read
+/// names the FRAME-INDEX cause and the frames the rank consumes, not the read
 /// log's.**
 ///
 /// The second prepare-time budget. It is only reachable at all because the
