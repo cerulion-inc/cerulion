@@ -468,6 +468,10 @@ fn a_stop_signals_the_running_revocation_sync_and_returns_once_it_exits() {
     sync.poll(t0);
     assert!(sync.child.is_some());
     wait_until(|| std::fs::read_to_string(&log).is_ok_and(|text| text.contains("ready")));
+    // The signal goes out first, at the start of shutdown, and only once.
+    sync.signal_stop();
+    wait_until(|| std::fs::read_to_string(&log).is_ok_and(|text| text.contains("stopping")));
+    sync.signal_stop();
     let stopping = Instant::now();
     sync.stop();
     assert_eq!(

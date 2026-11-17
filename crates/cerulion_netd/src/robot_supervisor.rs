@@ -390,8 +390,12 @@ fn serve(
         &provisioned.endpoint_id,
         &refresh_facts,
     );
-    // Gracefully reap the child, then finish the revocation fetch before
-    // returning the shared endpoint and restoring outgoing reader pins.
+    // Tell a running revocation fetch the stop began, gracefully reap the
+    // child, then finish the fetch before returning the shared endpoint and
+    // restoring outgoing reader pins.
+    if let Some(sync) = epoch_sync.as_mut() {
+        sync.signal_stop();
+    }
     drop(child);
     if let Some(sync) = epoch_sync.as_mut() {
         sync.stop();
@@ -479,10 +483,10 @@ fn epoch_sync_period_from_env() -> Duration {
 
 /// The environment variable setting how long a netd shutdown waits for a
 /// running revocation fetch to finish before stopping it, in whole seconds from
-/// 5 to 120. The stop first sends the fetch SIGTERM, after which it starts no
-/// session refresh or certificate renewal. A longer wait lets a session refresh
-/// in flight publish its rotated token pair; it also lengthens a shutdown that
-/// lands during a fetch.
+/// 5 to 120, counted from the SIGTERM the stop sends the fetch as it begins,
+/// after which the fetch starts no session refresh or certificate renewal. A
+/// longer wait lets a session refresh in flight publish its rotated token pair;
+/// it also lengthens a shutdown that lands during a fetch.
 /// A shutdown with no fetch running, or with one that ends sooner, does not
 /// wait. The robot server is stopped before this wait, and netd's hard-exit
 /// deadline (`CERULION_NETD_HARD_EXIT_MS`) is extended by this grace.
@@ -574,6 +578,8 @@ struct EpochSync {
     next: Instant,
     last_start: Option<Instant>,
     failures: u32,
+    /// When [`EpochSync::signal_stop`] signalled the running fetch.
+    stop_signalled: Option<Instant>,
 }
 
 impl EpochSync {
@@ -593,6 +599,7 @@ impl EpochSync {
             next: now,
             last_start: None,
             failures: 0,
+            stop_signalled: None,
         }
     }
 
@@ -650,25 +657,39 @@ impl EpochSync {
         }
     }
 
-    /// Shutdown: tell a running fetch the stop began (SIGTERM, on which it starts
-    /// no session refresh or certificate renewal and finishes only an exchange in
-    /// flight), wait for it to exit for at most the stop grace, then stop it
-    /// (dropping the child kills and reaps it). Returns as soon as the worker
-    /// exits, and at once when none is running.
-    fn stop(&mut self) {
-        let Some((mut child, _)) = self.child.take() else {
+    /// The start of shutdown: send a running fetch SIGTERM, once, after which it
+    /// starts no session refresh or certificate renewal; requests already sent,
+    /// and requests that spend no token, may still run. The stop grace runs from
+    /// here.
+    fn signal_stop(&mut self) {
+        if self.stop_signalled.is_some() {
+            return;
+        }
+        let Some((child, _)) = self.child.as_mut() else {
             return;
         };
         if !matches!(child.0.try_wait(), Ok(None)) {
             return;
         }
+        self.stop_signalled = Some(Instant::now());
         if let Err(error) = send_sigterm(child.0.id()) {
             tracing::warn!(
                 error = %error,
                 "could not tell the robot revocation sync that netd is stopping; waiting within its stop grace"
             );
         }
-        let until = Instant::now() + self.stop_grace;
+    }
+
+    /// Shutdown: signal a running fetch ([`EpochSync::signal_stop`]) unless that
+    /// was done, wait for it to exit until the stop grace after the signal, then
+    /// stop it (dropping the child kills and reaps it). Returns as soon as the
+    /// worker exits, and at once when none is running.
+    fn stop(&mut self) {
+        self.signal_stop();
+        let Some((mut child, _)) = self.child.take() else {
+            return;
+        };
+        let until = self.stop_signalled.unwrap_or_else(Instant::now) + self.stop_grace;
         while Instant::now() < until {
             if !matches!(child.0.try_wait(), Ok(None)) {
                 return;

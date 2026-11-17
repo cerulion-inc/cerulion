@@ -990,3 +990,131 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
         vec![cerulion_pairing::format::PublicKey(revoked)]
     );
 }
+
+/// A pass-through proxy to `upstream` that holds its first connection until
+/// `release` is sent: `arrived` fires once that connection is accepted.
+#[cfg(unix)]
+fn start_holding_proxy(
+    upstream: u16,
+) -> (
+    u16,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (arrived_tx, arrived) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let pipe = |client: TcpStream| {
+            let server = TcpStream::connect(("127.0.0.1", upstream)).unwrap();
+            let (mut client_in, mut server_out) =
+                (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_in, &mut server_out);
+                let _ = server_out.shutdown(Shutdown::Write);
+            });
+            let (mut server_in, mut client_out) = (server, client);
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut server_in, &mut client_out);
+                let _ = client_out.shutdown(Shutdown::Write);
+            });
+        };
+        let mut first = true;
+        for client in listener.incoming() {
+            let Ok(client) = client else { continue };
+            if first {
+                first = false;
+                let _ = arrived_tx.send(());
+                let _ = release_rx.recv();
+            }
+            pipe(client);
+        }
+    });
+    (port, arrived, release)
+}
+
+/// netd's stop signal reaches the real `cerulion robot-sync-epoch` while its
+/// first robot-proof request is in flight: the worker keeps running through
+/// it, finishes its fetch and exits successfully.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn the_revocation_sync_finishes_its_fetch_through_netds_stop_signal() {
+    use cerulion_cli_engine::robot_bootstrap;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap());
+    let _state = login(port, &email);
+    let root = home_path.join("robot-state");
+    robot_bootstrap::prepare(&root).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join("remoted"))
+        .unwrap();
+
+    let (proxy, arrived, release) = start_holding_proxy(port);
+    let mut worker = ProcessGuard(
+        Command::new(built_binary("cerulion"))
+            .arg("robot-sync-epoch")
+            .arg("--state-root")
+            .arg(&root)
+            .env(
+                "CERULION_ACCOUNT_SERVICE",
+                format!("http://127.0.0.1:{proxy}"),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the real revocation sync"),
+    );
+    arrived
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the challenge request reached the proxy");
+    // netd's stop signal while that request is held.
+    let signalled = Command::new("kill")
+        .args(["-TERM", &worker.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        worker.0.try_wait().unwrap().is_none(),
+        "the worker outlived the stop signal"
+    );
+    release.send(()).unwrap();
+    let status = wait_for(|| worker.0.try_wait().unwrap(), Duration::from_secs(30))
+        .expect("the worker exited after its fetch");
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    use std::io::Read;
+    worker
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    worker
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.signal(), None, "{stderr}");
+    assert!(status.success(), "{stderr}");
+    assert_eq!(stdout, "{\"epoch\":null,\"version\":1}\n");
+}

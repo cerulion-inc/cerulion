@@ -1127,7 +1127,11 @@ fn a_sync_told_to_stop_tries_no_login_session_after_its_robot_proof_fails() {
     ));
     let stopping = std::sync::atomic::AtomicBool::new(true);
     let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &stopping).unwrap_err();
-    assert!(err.to_string().contains("netd is stopping"), "{err}");
+    assert!(
+        err.to_string()
+            .contains("the revocation sync was told to stop"),
+        "{err}"
+    );
     // The proof fetch in flight ran; no refresh, no session read.
     assert_eq!(access_requests(&desk), (1, 0, 0));
     assert!(!desk
@@ -1151,6 +1155,10 @@ fn a_sync_told_to_stop_during_its_fetch_starts_no_certificate_renewal() {
     let (root, _robot_id, revoked) = registered_robot(&desk);
     let before = desk.cert_text();
     let _due = desk.due_on_the_wall_clock();
+    // A stale session with a live refresh token: the renewal would refresh it.
+    let mut stale = desk.state.clone();
+    stale.expires_at_ns = 1;
+    auth::write_to(&desk.home.join("auth.json"), &stale).unwrap();
     let stopping = std::sync::atomic::AtomicBool::new(true);
     let mut out = Vec::new();
     robot_bootstrap::sync_epoch(&root, &mut out, &stopping).unwrap();
@@ -1163,7 +1171,14 @@ fn a_sync_told_to_stop_during_its_fetch_starts_no_certificate_renewal() {
         vec![cerulion_pairing::format::PublicKey(revoked)]
     );
     assert_eq!(access_requests(&desk), (1, 1, 0));
-    // Due, but not renewed and not counted as a failure: the next sync renews.
+    // Due, but not refreshed, not renewed and not counted as a failure: the
+    // next sync renews.
+    assert!(!desk
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("/v1/auth/refresh")));
     assert_eq!(desk.registrations(), 0);
     assert_eq!(desk.cert_text(), before);
     assert!(!desk.failure_recorded());

@@ -1165,15 +1165,21 @@ fn bootstrap_robot(state_root: &std::path::Path) -> CliResult<()> {
 }
 
 /// The revocation sync netd runs for a registered robot. netd's stop sends it
-/// SIGTERM: the handler only sets `stopping`, so an exchange in flight finishes
-/// inside netd's stop grace and nothing new starts after it.
+/// SIGTERM: the handler only sets `stopping`, after which the sync starts no
+/// session refresh or certificate renewal, and an exchange in flight finishes
+/// inside netd's stop grace.
 #[cfg(unix)]
 fn robot_sync_epoch(state_root: &std::path::Path) -> CliResult<()> {
     let stopping = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&stopping);
     if let Err(e) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
-        // Without the handler, netd's stop signal ends the sync at once.
-        eprintln!("warning: the revocation sync cannot watch for netd's stop signal: {e}");
+        // Without the handler, netd's stop signal would end the sync in the
+        // middle of an exchange, so this run spends no refresh token at all.
+        stopping.store(true, Ordering::SeqCst);
+        eprintln!(
+            "warning: the revocation sync cannot watch for netd's stop signal, so it refreshes \
+             no session and renews no certificate this run: {e}"
+        );
     }
     cerulion_cli_engine::robot_bootstrap::sync_epoch(
         state_root,

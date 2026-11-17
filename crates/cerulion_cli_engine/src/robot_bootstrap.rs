@@ -130,9 +130,9 @@ const REMOTED_SUBDIR: &str = "remoted";
 /// processes). Afterwards, while time remains inside the supervisor's worker
 /// deadline, it renews a device certificate that is due.
 ///
-/// Once `stopping` is set (netd's stop has begun), the sync starts no session
-/// fallback, session refresh or renewal; an exchange already in flight
-/// finishes, inside netd's stop grace.
+/// Once `stopping` is set (netd signals its stop), the sync starts no login
+/// session fallback, session refresh or certificate renewal. Requests that
+/// spend no token, the robot-proof fetch's and an access read, may still run.
 ///
 /// The stored login is checked locally in both cases: it must name the
 /// registration's owner, though its session may have lapsed.
@@ -238,11 +238,7 @@ pub fn sync_epoch(
     )
     .map_err(|_| refused("could not encode the worker result"))?;
     writeln!(out)?;
-    if is_stopping(stopping) {
-        tracing::info!(
-            "netd is stopping; the device certificate renewal waits for the next revocation sync"
-        );
-    } else if started.elapsed() <= WORKER_RENEWAL_START_LIMIT {
+    if started.elapsed() <= WORKER_RENEWAL_START_LIMIT {
         renew_device_cert(session, stopping);
     } else {
         tracing::info!(
@@ -253,7 +249,7 @@ pub fn sync_epoch(
     Ok(())
 }
 
-/// Whether netd's stop has begun ([`sync_epoch`]'s `stopping`).
+/// Whether the sync was told to stop ([`sync_epoch`]'s `stopping`).
 fn is_stopping(stopping: &std::sync::atomic::AtomicBool) -> bool {
     stopping.load(std::sync::atomic::Ordering::SeqCst)
 }
@@ -266,12 +262,22 @@ fn fetch_access_by_session(
     session: &mut Option<String>,
     stopping: &std::sync::atomic::AtomicBool,
 ) -> CliResult<account_cmd::RobotAccess> {
+    let told_to_stop = || {
+        refused(
+            "the revocation sync was told to stop; revocations were not synced and the login \
+             session was not tried",
+        )
+    };
     if is_stopping(stopping) {
-        return Err(refused(
-            "netd is stopping; revocations were not synced and the login session was not tried",
-        ));
+        return Err(told_to_stop());
     }
-    let token = account_cmd::require_session_unrenewed(Some(stopping))?;
+    let token = account_cmd::require_session_unrenewed(Some(stopping)).map_err(|e| {
+        if is_stopping(stopping) {
+            told_to_stop()
+        } else {
+            e
+        }
+    })?;
     let access = account_cmd::fetch_robot_access(&token, robot_id)?;
     *session = Some(token);
     Ok(access)
@@ -304,10 +310,11 @@ fn renew_device_cert(session: Option<String>, stopping: &std::sync::atomic::Atom
         return;
     }
     let session = session.map_or_else(|| worker_session(stopping), Ok);
-    // A stop that began during the refresh is no failure: nothing is recorded.
+    // A stop, before or during the refresh, is no failure: nothing is recorded.
     if is_stopping(stopping) {
         tracing::info!(
-            "netd is stopping; the device certificate renewal waits for the next revocation sync"
+            "the revocation sync was told to stop; the device certificate renewal waits for the \
+             next sync"
         );
         return;
     }

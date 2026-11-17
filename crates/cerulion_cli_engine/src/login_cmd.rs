@@ -1093,7 +1093,7 @@ pub(crate) fn refresh_session_if_stale_unless_stopping(
         budget.map(|budget| std::time::Instant::now() + budget),
         &std::time::Instant::now,
         REFRESH_SETTLEMENT_BUDGET,
-        Some(stopping),
+        Some(&|| stopping.load(std::sync::atomic::Ordering::SeqCst)),
     )
 }
 
@@ -1126,18 +1126,19 @@ fn refresh_session_until(
 /// Every budget is read off `now`. The store wait for publishing or retiring
 /// the rotated pair is `settlement`; for a bounded refresh it runs from the
 /// moment the exchange answered, and a revoke after a superseded publication
-/// spends what is left of it. Once `stopping` is set, no exchange is sent.
+/// spends what is left of it. Once `stopping` answers true, read before the
+/// refresh lock and again before the exchange, no exchange is sent.
 fn refresh_session_with_settlement(
     deadline: Option<std::time::Instant>,
     now: &dyn Fn() -> std::time::Instant,
     settlement: Duration,
-    stopping: Option<&std::sync::atomic::AtomicBool>,
+    stopping: Option<&dyn Fn() -> bool>,
 ) -> CliResult<Option<AuthState>> {
     let stop_requested = || -> CliResult<()> {
         match stopping {
-            Some(stopping) if stopping.load(std::sync::atomic::Ordering::SeqCst) => Err(
-                CliError::Login("the session was not refreshed: this process is stopping".into()),
-            ),
+            Some(stopping) if stopping() => Err(CliError::Login(
+                "the session was not refreshed: this process is stopping".into(),
+            )),
             _ => Ok(()),
         }
     };
@@ -2057,6 +2058,30 @@ mod tests {
                 "the session was not refreshed: this process is stopping"
             );
         }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(auth::load_from(&path).state().unwrap(), &stale);
+        // A stop that lands while the refresh waits for its lock: the second
+        // read, right before the exchange, sends nothing either.
+        let reads = std::cell::Cell::new(0);
+        let lands_after_the_lock = || {
+            reads.set(reads.get() + 1);
+            reads.get() > 1
+        };
+        let error = refresh_session_with_settlement(
+            Some(std::time::Instant::now() + Duration::from_secs(5)),
+            &std::time::Instant::now,
+            REFRESH_SETTLEMENT_BUDGET,
+            Some(&lands_after_the_lock),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the session was not refreshed: this process is stopping"
+        );
+        assert_eq!(reads.get(), 2);
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock
