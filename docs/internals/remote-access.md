@@ -854,18 +854,7 @@ every slot is taken.
   which says the robot may have paired the desk. Either way a task that
   paired by then keeps paired. `cerulion-connectd pair` decides the line it
   logs for each result in one pure function (`pair_end`), so neither
-  unconfirmed end logs the NOT paired line or `pairing failed`. The hidden
-  `--outcome-file <path>` flag is an internal channel between `cerulion pair`
-  and this helper, absent from `--help` and from the user API page:
-  `cerulion pair` creates a new private directory (0700) under the system temp
-  directory, passes a path in it, and its drop guard (`OutcomeDir`) removes
-  the directory on every way out, a failed spawn and a panic included. The
-  helper writes the token `unconfirmed` there (created new, 0600, synced) on
-  exactly the two unconfirmed ends (`PairEnd::outcome`) and nothing on any
-  other; a write failure is a warn and changes no exit code. Once the helper
-  exits, `cerulion pair` reads the file (`read_outcome`): only the exact token
-  makes its closing line say the robot may have paired, and a missing,
-  unreadable or other file closes as a plain end. Stdout
+  unconfirmed end logs the NOT paired line or `pairing failed`. Stdout
   carries machine-parseable state lines for Studio, everything else goes to
   stderr. Pinned against a REAL in-process remoted ops
   plane by `pair_e2e_test.rs`, with the robot's durable trust state verified
@@ -882,6 +871,32 @@ every slot is taken.
   `pair_interrupt_e2e_test.rs` pins the same
   close for a SIGINT to the real binary, at a test robot that sees the
   connection closed.
+
+  The hidden `--outcome-file <path>` flag is an internal channel between
+  `cerulion pair` and this helper, absent from `--help` and from the user API
+  page: `cerulion pair` creates a new private directory (0700) under the
+  system temp directory, passes a path in it, and its drop guard
+  (`OutcomeDir`) removes the directory on every way out, a failed spawn and a
+  panic included. When it cannot create the directory it warns, with the
+  remedy of a writable `TMPDIR`, and runs the helper without the flag. The
+  helper logs its end line first and then writes the token `unconfirmed`
+  there (`record_end`) on exactly the two unconfirmed ends
+  (`PairEnd::outcome`) and nothing on any other, so a helper killed between
+  the two leaves no token. The file is created new, 0600, and removed again
+  when the write fails; it is not synced, as `cerulion pair` reads it on the
+  same host after it reaped the helper. A write failure is a warn and changes
+  no exit code. Once the helper exits, `cerulion pair` reads the file
+  (`read_outcome`): only the exact token makes its closing line say the
+  robot may have paired, and a missing, unreadable or other file closes as a
+  plain end. The pins of this channel are unit and process tests:
+  the `record_end` table in the helper's `main.rs` (every end, what it
+  leaves at the path and that the line is logged before the token), the
+  `read_outcome` and `OutcomeDir` tests and the scripted helper tests of
+  `spawn_and_pair_in` in `pair_cmd` (an unconfirmed 3 and 130, a plain 3,
+  other content, a failed spawn, a temporary directory that cannot be
+  created), and `crates/cerulion_cli/tests/pair_interrupt_e2e_test.rs`, where
+  an interrupt of the real `cerulion pair` at the code prompt closes with the
+  plain line and leaves no outcome directory under its own `TMPDIR`.
 - **Desk key discipline** (`wireclient::config`): a key file is exactly 32 raw
   bytes; `resolve_or_create_desk_seed` creates 0600 with `create_new` and NEVER
   overwrites an existing key (a wrong-size file is a loud error, never silently

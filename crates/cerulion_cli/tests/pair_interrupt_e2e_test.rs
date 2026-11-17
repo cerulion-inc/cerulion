@@ -11,8 +11,10 @@
 //!
 //! The signal is sent once stderr carries the helper's desk key line, which
 //! it logs after its signal handlers are in place. Each run has its own
-//! signed-in home and key file, and no code is ever written, so nothing is
-//! dialed.
+//! signed-in home, key file and `TMPDIR`, and no code is ever written, so
+//! nothing is dialed. The private directory `cerulion` makes under that
+//! `TMPDIR` for the helper's outcome file is there while the helper waits
+//! for the code and gone once the run is reaped.
 //!
 //! Prerequisite: `cargo build -p cerulion_connectd` in the same target and
 //! profile, which puts `cerulion-connectd` beside `cerulion`.
@@ -29,6 +31,10 @@ const EID: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f7075
 
 /// The stderr line the helper logs once its signal handlers are in place.
 const READY: &str = "cerulion pair: created a new desk device key (0600)";
+
+/// The name each private directory `cerulion pair` makes for its helper's
+/// outcome file starts with: hand-written, never the code that names it.
+const OUTCOME_DIR_PREFIX: &str = "cerulion-pair-";
 
 /// The line `cerulion` closes a nonzero end with when its helper reported no
 /// unconfirmed end: hand-written, never the const it renders.
@@ -72,12 +78,27 @@ impl Drop for KillOnDrop {
 
 /// What one interrupted run left: its exit status (`None` when it had not
 /// exited [`WAIT_LIMIT`] after the signal), the time from the signal to the
-/// reaped exit, its stdout and its stderr.
+/// reaped exit, its stdout and its stderr, and the [`OUTCOME_DIR_PREFIX`]
+/// entries under its `TMPDIR` while the helper waited for the code and once
+/// the run was reaped.
 struct Interrupted {
     status: Option<ExitStatus>,
     elapsed: Duration,
     stdout: String,
     stderr: String,
+    outcome_dirs_while_waiting: Vec<String>,
+    outcome_dirs_left: Vec<String>,
+}
+
+/// The names of the entries under `dir` that start with
+/// [`OUTCOME_DIR_PREFIX`].
+fn outcome_dirs_under(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .expect("read the run's TMPDIR")
+        .map(|entry| entry.expect("a TMPDIR entry").file_name())
+        .filter_map(|name| name.into_string().ok())
+        .filter(|name| name.starts_with(OUTCOME_DIR_PREFIX))
+        .collect()
 }
 
 /// Read `pipe` to its end on a thread, line by line, into the returned
@@ -125,6 +146,8 @@ fn interrupt_at_the_code_read(signal: &str) -> Interrupted {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path().join("home");
     cerulion_cli_engine::auth::seed_logged_in_at(&home, "pair-interrupt-cli-test").unwrap();
+    let tmp = dir.path().join("tmp");
+    std::fs::create_dir(&tmp).unwrap();
     let mut command = Command::new(env!("CARGO_BIN_EXE_cerulion"));
     command
         .args(["pair", "--eid", EID, "--relay-disabled"])
@@ -134,6 +157,7 @@ fn interrupt_at_the_code_read(signal: &str) -> Interrupted {
         .args(["--label", "pair-interrupt-cli-test"])
         .current_dir(dir.path())
         .env("CERULION_HOME", &home)
+        .env("TMPDIR", &tmp)
         .env("CERULION_CONNECTD_BIN", connectd())
         .env("CERULION_ACCOUNT_SERVICE", "http://127.0.0.1:1")
         .env("DO_NOT_TRACK", "1")
@@ -165,6 +189,7 @@ fn interrupt_at_the_code_read(signal: &str) -> Interrupted {
         }
     }
 
+    let outcome_dirs_while_waiting = outcome_dirs_under(&tmp);
     let sent = Instant::now();
     let kill = Command::new("kill")
         .args(["-s", signal, &run.0.id().to_string()])
@@ -174,6 +199,7 @@ fn interrupt_at_the_code_read(signal: &str) -> Interrupted {
     let status = wait_bounded(&mut run.0, WAIT_LIMIT);
     let elapsed = sent.elapsed();
     drop(run);
+    let outcome_dirs_left = outcome_dirs_under(&tmp);
     drop(stdin);
     drain(&lines, &mut log, DRAIN_LIMIT);
     let mut out = Vec::new();
@@ -183,12 +209,15 @@ fn interrupt_at_the_code_read(signal: &str) -> Interrupted {
         elapsed,
         stdout: out.join("\n"),
         stderr: log.join("\n"),
+        outcome_dirs_while_waiting,
+        outcome_dirs_left,
     }
 }
 
 /// `signal` to `cerulion` at the helper's code read ends the run with exit
 /// 130 within [`EXIT_CEILING`], the helper having caught the forwarded
-/// SIGINT, with nothing on stdout.
+/// SIGINT, with nothing on stdout, and leaves no [`OUTCOME_DIR_PREFIX`]
+/// entry under the run's `TMPDIR`, where exactly one was made.
 fn assert_interrupted(signal: &str) {
     let run = interrupt_at_the_code_read(signal);
     let stderr = &run.stderr;
@@ -227,6 +256,17 @@ fn assert_interrupted(signal: &str) {
         "SIG{signal}: a plain interrupt never says the robot may have paired; stderr:\n{stderr}"
     );
     assert_eq!(run.stdout, "", "SIG{signal}: stderr:\n{stderr}");
+    assert_eq!(
+        run.outcome_dirs_while_waiting.len(),
+        1,
+        "SIG{signal}: one outcome directory while the helper waits: {:?}",
+        run.outcome_dirs_while_waiting
+    );
+    assert_eq!(
+        run.outcome_dirs_left,
+        Vec::<String>::new(),
+        "SIG{signal}: no outcome directory is left once the run is reaped"
+    );
 }
 
 #[test]

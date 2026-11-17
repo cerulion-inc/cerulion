@@ -298,7 +298,7 @@ struct PairCli {
     /// The internal channel `cerulion pair` reads once this run ends: on the
     /// two ends where the robot may have paired this desk without confirming
     /// it, the run writes [`OUTCOME_UNCONFIRMED`] to this path, and nothing on
-    /// any other end ([`PairEnd::outcome`], [`write_outcome`]). Hidden from
+    /// any other end ([`PairEnd::outcome`], [`record_end`]). Hidden from
     /// `--help`: `cerulion pair` passes it, a user does not.
     #[arg(long, value_name = "PATH", hide = true)]
     outcome_file: Option<PathBuf>,
@@ -865,31 +865,9 @@ async fn run_pair_command(cli: PairCli) -> ExitCode {
         };
         let result = run_pair(config, interrupt).await;
         let (exit, end) = pair_end(&result);
-        if let (Some(path), Some(token)) = (outcome_file.as_deref(), end.outcome()) {
-            write_outcome(path, token);
-        }
-        match end {
-            PairEnd::Paired => {}
-            PairEnd::NotPaired => return None,
-            PairEnd::InterruptedUnconfirmed => {
-                tracing::warn!(eid = %eid, "cerulion pair: {INTERRUPTED_UNCONFIRMED}");
-            }
-            PairEnd::TimedOutUnconfirmed => {
-                tracing::warn!(eid = %eid, "cerulion pair: {TIMED_OUT_UNCONFIRMED}");
-            }
-            PairEnd::Failed(error) => {
-                // Every other `PairError` variant renders HERE, and the
-                // Refused / CodeMismatch ones carry text the ROBOT chose — at the moment
-                // the desk trusts the robot LEAST. Peer text is neutered + bounded where
-                // it ENTERS (`pair::classify_call_error` / `classify_transport_error` /
-                // `parse_finish_reply` / `decode_hex_field` / `classify_finish_error`);
-                // this arm sanitizes AGAIN as cheap defense-in-depth, exactly like the
-                // `connect` arms above and under the same idempotence + cost notes.
-                tracing::error!(
-                    error = %sanitize_peer_text(&error),
-                    "cerulion pair: pairing failed"
-                );
-            }
+        record_end(outcome_file.as_deref(), &eid, &end);
+        if end == PairEnd::NotPaired {
+            return None;
         }
         Some(ExitCode::from(exit))
     };
@@ -944,6 +922,42 @@ impl PairEnd {
 /// these bytes and closes with the line that says the robot may have paired.
 const OUTCOME_UNCONFIRMED: &str = "unconfirmed\n";
 
+/// What `cerulion-connectd pair` does once [`pair_end`] decided the end of a
+/// `run_pair` result: log the line for `end`, then, when `outcome_file` was
+/// passed, write the token of [`PairEnd::outcome`] there on the two ends
+/// where the robot may have paired this desk without confirming it, and
+/// nothing on any other. The line is logged first, so a run killed between
+/// the two leaves no token, and `cerulion pair` closes with its plain line.
+/// [`PairEnd::NotPaired`] logs nothing here: the caller logs the NOT paired
+/// line it shares with an interrupt at the code prompt. Table-tested.
+fn record_end(outcome_file: Option<&Path>, eid: &str, end: &PairEnd) {
+    match end {
+        PairEnd::Paired | PairEnd::NotPaired => {}
+        PairEnd::InterruptedUnconfirmed => {
+            tracing::warn!(eid = %eid, "cerulion pair: {INTERRUPTED_UNCONFIRMED}");
+        }
+        PairEnd::TimedOutUnconfirmed => {
+            tracing::warn!(eid = %eid, "cerulion pair: {TIMED_OUT_UNCONFIRMED}");
+        }
+        PairEnd::Failed(error) => {
+            // Every other `PairError` variant renders HERE, and the
+            // Refused / CodeMismatch ones carry text the ROBOT chose — at the moment
+            // the desk trusts the robot LEAST. Peer text is neutered + bounded where
+            // it ENTERS (`pair::classify_call_error` / `classify_transport_error` /
+            // `parse_finish_reply` / `decode_hex_field` / `classify_finish_error`);
+            // this arm sanitizes AGAIN as cheap defense-in-depth, exactly like the
+            // `connect` arms above and under the same idempotence + cost notes.
+            tracing::error!(
+                error = %sanitize_peer_text(error),
+                "cerulion pair: pairing failed"
+            );
+        }
+    }
+    if let (Some(path), Some(token)) = (outcome_file, end.outcome()) {
+        write_outcome(path, token);
+    }
+}
+
 /// Write `token` to `path` for `cerulion pair` to read once this run ends.
 /// Best effort: a failure is logged at warn and never changes the exit code,
 /// and `cerulion pair` then closes as it does for a plain end.
@@ -959,7 +973,13 @@ fn write_outcome(path: &Path, token: &str) {
 }
 
 /// Create `path` new (an existing entry, a symlink included, is never
-/// followed or overwritten), mode 0600 on Unix, write `token` and sync it.
+/// followed or overwritten), mode 0600 on Unix, and write `token`. A write
+/// that fails removes the file it created before the error returns, so no
+/// part of a token is left for `cerulion pair` to read.
+///
+/// No sync: the reader is `cerulion pair` on the same host, which reads the
+/// file after it reaped this process, and the page cache already holds the
+/// written bytes for it.
 fn try_write_outcome(path: &Path, token: &str) -> std::io::Result<()> {
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -969,8 +989,14 @@ fn try_write_outcome(path: &Path, token: &str) -> std::io::Result<()> {
         options.mode(0o600);
     }
     let mut file = options.open(path)?;
-    file.write_all(token.as_bytes())?;
-    file.sync_all()
+    if let Err(e) = file.write_all(token.as_bytes()) {
+        drop(file);
+        // A file that stays after a failed removal holds fewer bytes than
+        // the token, and `cerulion pair` accepts nothing but the whole token.
+        let _ = std::fs::remove_file(path);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// The exit code `cerulion-connectd pair` ends with for a `run_pair` result,
@@ -1235,6 +1261,61 @@ mod tests {
             assert_eq!(got.1.outcome(), outcome, "{row}");
             assert_eq!(got, (exit, end), "{row}");
         }
+    }
+
+    /// Hand-written table over every `PairEnd`: what `record_end` leaves at
+    /// the `--outcome-file` path, and whether that file existed as each line
+    /// was logged. The two unconfirmed ends log their line while the path is
+    /// still absent, then write exactly the token; every other end leaves the
+    /// path absent. With no path, no end writes anything.
+    #[test]
+    fn record_end_logs_its_line_then_writes_the_token_only_on_an_unconfirmed_end() {
+        use std::sync::{Arc, Mutex};
+        let token = b"unconfirmed\n".as_slice();
+        let cases: [(PairEnd, Option<&[u8]>, &[bool]); 5] = [
+            (PairEnd::Paired, None, &[]),
+            (PairEnd::NotPaired, None, &[]),
+            (PairEnd::InterruptedUnconfirmed, Some(token), &[false]),
+            (PairEnd::TimedOutUnconfirmed, Some(token), &[false]),
+            (
+                PairEnd::Failed("wrong pairing code: m".into()),
+                None,
+                &[false],
+            ),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        for (row, (end, written, file_at_each_line)) in cases.iter().enumerate() {
+            let path = dir.path().join(format!("outcome-{row}"));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let (seen, path) = (Arc::clone(&seen), path.clone());
+                    move || {
+                        seen.lock().unwrap().push(path.exists());
+                        std::io::sink()
+                    }
+                })
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                record_end(Some(path.as_path()), "8a2e", end);
+            });
+            assert_eq!(std::fs::read(&path).ok().as_deref(), *written, "{end:?}");
+            assert_eq!(
+                seen.lock().unwrap().as_slice(),
+                *file_at_each_line,
+                "{end:?}"
+            );
+        }
+
+        for (end, _, _) in &cases {
+            record_end(None, "8a2e", end);
+        }
+        let mut left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["outcome-2", "outcome-3"]);
     }
 
     /// The outcome file is created new with exactly the token, mode 0600 on

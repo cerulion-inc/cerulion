@@ -526,8 +526,7 @@ fn spawn_and_pair_in(
             tracing::warn!(
                 error = %e,
                 path = %temp_base.display(),
-                "cerulion pair: could not create a private directory for the helper's outcome \
-                 file; the closing line cannot tell an unconfirmed end from a plain one"
+                "{OUTCOME_DIR_UNAVAILABLE}"
             );
             None
         }
@@ -559,6 +558,14 @@ const OUTCOME_UNCONFIRMED: &str = "unconfirmed\n";
 
 /// The name of the outcome file inside its [`OutcomeDir`].
 const OUTCOME_FILE_NAME: &str = "outcome";
+
+/// The warn `cerulion pair` logs when it cannot create the [`OutcomeDir`]
+/// under the system temp directory: the run goes ahead without an outcome
+/// file, and every nonzero end closes with [`NOT_COMPLETED`].
+const OUTCOME_DIR_UNAVAILABLE: &str = "cerulion pair: could not create a private directory for \
+                                       the helper's outcome file, so the closing line cannot \
+                                       tell an unconfirmed end from a plain one; set TMPDIR to a \
+                                       writable directory";
 
 /// The private directory one `cerulion pair` run creates for the outcome file
 /// its helper writes. Dropping it removes the directory and everything in it,
@@ -1239,9 +1246,9 @@ enabled = true
                                  pairing, so ~/.cerulion/robots.toml was NOT pinned";
 
     /// `Ok` when the captured `lines` hold exactly `unconfirmed` lines with
-    /// [`UNCONFIRMED_CLOSING`] and `plain` with [`PLAIN_CLOSING`], each
-    /// carrying the exit code `code` of the end it closes when it is the
-    /// last one logged.
+    /// [`UNCONFIRMED_CLOSING`] and `plain` with [`PLAIN_CLOSING`], the last
+    /// one logged carrying the field `exit_code={code}` as a whole
+    /// space-delimited word, so `exit_code=1` never matches 130 or 137.
     fn closing_counts(
         lines: &[&str],
         unconfirmed: usize,
@@ -1261,7 +1268,8 @@ enabled = true
             .rev()
             .find(|l| l.contains("did NOT complete"))
             .ok_or_else(|| "no closing line".to_string())?;
-        if !last.contains(&format!("exit_code={code}")) {
+        let field = format!("exit_code={code}");
+        if !last.split(' ').any(|word| word == field) {
             return Err(format!(
                 "the last closing line lacks exit_code={code}: {last}"
             ));
@@ -1464,6 +1472,48 @@ enabled = true
         )
         .is_err());
         assert_eq!(left_under(base.path()), Vec::<PathBuf>::new());
+    }
+
+    /// The warn of a run that cannot create its outcome directory:
+    /// hand-written, never the const it renders.
+    const OUTCOME_DIR_WARN: &str = "cerulion pair: could not create a private directory for the \
+                                    helper's outcome file, so the closing line cannot tell an \
+                                    unconfirmed end from a plain one; set TMPDIR to a writable \
+                                    directory";
+
+    /// Through a scripted helper under a temp base that does not exist: the
+    /// run warns once that it cannot create the outcome directory, with the
+    /// remedy, and spawns the helper with no `--outcome-file` (the script
+    /// exits 9 on any argument). The helper's exit 3 is kept and closes once
+    /// with the plain line, never saying the robot may have paired, and the
+    /// base is not created.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_run_that_cannot_create_its_outcome_directory_closes_with_the_plain_line() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("missing");
+        let code = spawn_and_pair_in(
+            &scripted_helper(r#"[ "$#" -eq 0 ] || exit 9; exit 3"#),
+            Arc::new(AtomicBool::new(true)),
+            &missing,
+            &never_pins,
+        )
+        .unwrap();
+        assert_eq!(code, 3);
+        logs_assert(|lines| closing_counts(lines, 0, 1, 3));
+        assert!(!logs_contain("may have paired"));
+        logs_assert(|lines| {
+            match lines
+                .iter()
+                .filter(|l| l.contains(OUTCOME_DIR_WARN))
+                .count()
+            {
+                1 => Ok(()),
+                n => Err(format!("want 1 warn line, got {n}:\n{}", lines.join("\n"))),
+            }
+        });
+        assert!(!missing.exists());
     }
 
     /// The `pinned:` STDOUT state line has the exact Studio-contract format (hand
