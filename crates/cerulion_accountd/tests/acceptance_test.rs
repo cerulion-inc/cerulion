@@ -1973,3 +1973,39 @@ async fn a_robot_reads_its_own_access_state_with_its_transport_key() {
     let ok = challenge_signed(second_b64, second_sk.clone(), second, second_key, next_at()).await;
     assert_eq!(ok.status(), 200);
 }
+
+/// A malformed body at a robot's own access routes is a 400 naming that route's
+/// fields and, for the access read, where its challenge comes from; never the
+/// session-bound device challenge, which a robot with a lapsed login cannot use.
+#[tokio::test]
+async fn a_malformed_robot_access_body_names_the_fields_its_route_needs() {
+    let (addr, _state, _email) = spawn().await;
+    let http = reqwest::Client::new();
+    let robot = URL_SAFE_NO_PAD.encode([0x6C_u8; 32]);
+    let cases = [
+        (
+            format!("{addr}/v1/robots/{robot}/access/challenge"),
+            serde_json::json!({ "requested_at_ns": 5 }),
+            "This endpoint needs no session: send `requested_at_ns`, the request time as Unix \
+             nanoseconds in decimal digits, and `request_signature`, the robot's transport key \
+             signature over it.",
+        ),
+        (
+            format!("{addr}/v1/robots/{robot}/access"),
+            serde_json::json!({ "pop_signature": "AA" }),
+            "This endpoint needs no session: send `pop_challenge`, a challenge from POST \
+             /v1/robots/{robot_id}/access/challenge, and `pop_signature`, the robot's transport \
+             key signature over it.",
+        ),
+    ];
+    for (url, body, hint) in cases {
+        let resp = http.post(&url).json(&body).send().await.unwrap();
+        assert_eq!(resp.status(), 400, "{url}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"], "invalid_request");
+        let text = body["error_description"].as_str().unwrap();
+        assert!(text.starts_with("invalid request body: "), "{text}");
+        assert!(text.ends_with(hint), "{url}: {text}");
+        assert!(!text.contains("/v1/devices/challenge"), "{url}: {text}");
+    }
+}

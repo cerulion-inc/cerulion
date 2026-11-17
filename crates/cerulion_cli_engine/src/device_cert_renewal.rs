@@ -655,8 +655,8 @@ pub fn check_reissued(
 enum ConsumerAction {
     /// Stage the reissued certificate at it.
     Replace,
-    /// A symlink already resolving to the reissued certificate, or to the CLI's
-    /// own copy: left as it is.
+    /// A symlink already resolving to the reissued certificate, or whose chain
+    /// passes through the CLI's own copy: left as it is.
     AlreadyHolds,
     /// Content that is not a certificate for this key and account: left alone.
     Foreign,
@@ -664,8 +664,8 @@ enum ConsumerAction {
 
 /// The one rule every consumer path follows: absent, or holding a certificate
 /// for `key` and `account` (through a symlink too), is replaced, unless it is a
-/// symlink already holding `new` or following `own` (the CLI's own copy);
-/// anything else is left alone.
+/// symlink already holding `new` or whose chain passes through `own` (the CLI's
+/// own copy); anything else is left alone.
 fn consumer_action(
     path: &Path,
     own: &Path,
@@ -673,7 +673,7 @@ fn consumer_action(
     account: &AccountId,
     new: &str,
 ) -> ConsumerAction {
-    if login_cmd::symlink_already_holds(path, new) || links_to(path, own) {
+    if login_cmd::symlink_already_holds(path, new) || follows_own(path, own) {
         return ConsumerAction::AlreadyHolds;
     }
     match std::fs::symlink_metadata(path) {
@@ -689,14 +689,48 @@ fn consumer_action(
     }
 }
 
-/// Whether `path` is a symlink resolving to the same file as `own`: it follows
-/// the CLI's own copy, which the renewal replaces, so it is left as a link.
-fn links_to(path: &Path, own: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-        && matches!(
-            (std::fs::canonicalize(path), std::fs::canonicalize(own)),
-            (Ok(a), Ok(b)) if a == b
-        )
+/// The symlink hops [`follows_own`] walks at most, the kernel's own limit on
+/// Linux.
+const MAX_LINK_HOPS: usize = 40;
+
+/// Whether `path` is a symlink whose chain passes through `own`, the CLI's own
+/// copy: the renewal renames the reissued certificate onto `own`, so such a link
+/// follows it and is left as a link. A link that only shares `own`'s final
+/// target does not follow it: when `own` is itself a symlink, the rename
+/// replaces that link and leaves the shared target with the old certificate.
+fn follows_own(path: &Path, own: &Path) -> bool {
+    let Some(own) = entry(own) else {
+        return false;
+    };
+    let mut hop = path.to_path_buf();
+    for _ in 0..MAX_LINK_HOPS {
+        if !std::fs::symlink_metadata(&hop).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+        let Ok(target) = std::fs::read_link(&hop) else {
+            return false;
+        };
+        let next = match hop.parent() {
+            Some(dir) => dir.join(target),
+            None => target,
+        };
+        if entry(&next).as_ref() == Some(&own) {
+            return true;
+        }
+        hop = next;
+    }
+    false
+}
+
+/// The directory entry `path` names: its directory, resolved, and its file
+/// name, so two spellings of one entry compare equal without following the
+/// entry itself.
+fn entry(path: &Path) -> Option<PathBuf> {
+    let dir = match path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => Path::new("."),
+    };
+    Some(std::fs::canonicalize(dir).ok()?.join(path.file_name()?))
 }
 
 /// What publication did.
@@ -1069,10 +1103,28 @@ mod tests {
         let link_new = dir.path().join("link-new");
         symlink(&new_target, &link_new).unwrap();
         assert_eq!(action(&link_new), ConsumerAction::AlreadyHolds);
-        // A symlink following the CLI's own copy stays a link.
+        // A symlink following the CLI's own copy stays a link, through any
+        // number of hops and by a relative target too.
         let link_own = dir.path().join("link-own");
         symlink(&own, &link_own).unwrap();
         assert_eq!(action(&link_own), ConsumerAction::AlreadyHolds);
+        let link_link_own = dir.path().join("link-link-own");
+        symlink("link-own", &link_link_own).unwrap();
+        assert_eq!(action(&link_link_own), ConsumerAction::AlreadyHolds);
+        // When the CLI's own copy is itself a link to a managed file, a consumer
+        // linking to that file directly does not follow the CLI's copy, which the
+        // renewal replaces: it is replaced too. One linking to the CLI's copy
+        // still follows it.
+        let managed = at("managed", &old);
+        let own_link = dir.path().join("own-link");
+        symlink(&managed, &own_link).unwrap();
+        let via_link = |p: &Path| consumer_action(p, &own_link, &key, &account, &new);
+        let shares_target = dir.path().join("shares-target");
+        symlink(&managed, &shares_target).unwrap();
+        assert_eq!(via_link(&shares_target), ConsumerAction::Replace);
+        let follows_own_link = dir.path().join("follows-own-link");
+        symlink(&own_link, &follows_own_link).unwrap();
+        assert_eq!(via_link(&follows_own_link), ConsumerAction::AlreadyHolds);
         // Anything else is left alone.
         assert_eq!(action(&at("key", &other_key)), ConsumerAction::Foreign);
         assert_eq!(
@@ -1187,6 +1239,50 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&chain_path).unwrap()).unwrap();
         assert_eq!(stored["device_cert"], new.as_str());
         assert_eq!(stored["intermediate"], c.intermediate.as_str());
+    }
+
+    #[test]
+    fn a_netd_copy_linked_to_the_file_the_cli_copy_links_to_is_renewed_too() {
+        use std::os::unix::fs::{symlink, DirBuilderExt};
+        let c = chain();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = IsolatedHome::at(dir.path());
+        let auth_path = dir.path().join("auth.json");
+        let old = wire(&leaf(&c, 100, |_| {}));
+        let new = wire(&leaf(&c, 200, |_| {}));
+        // The CLI's copy and netd's relocated copy both link to one managed file.
+        for sub in ["managed", "netd"] {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(dir.path().join(sub))
+                .unwrap();
+        }
+        let managed = dir.path().join("managed").join("device.cert");
+        std::fs::write(&managed, &old).unwrap();
+        let cert_path = dir.path().join("device.cert");
+        symlink(&managed, &cert_path).unwrap();
+        let netd_path = dir.path().join("netd").join("device.cert");
+        symlink(&managed, &netd_path).unwrap();
+        std::env::set_var(auth::NETD_DEVICE_CERT_ENV, &netd_path);
+        auth::write_to(&auth_path, &login_for(&c.account)).unwrap();
+        let cached = Cached {
+            text: old.clone(),
+            cert: decode(&old).unwrap(),
+        };
+        let reissued = login_cmd::ReissuedCert {
+            device_cert: new.clone(),
+            intermediate: c.intermediate.clone(),
+        };
+        assert!(matches!(
+            publish(&auth_path, &cert_path, &cached, &reissued),
+            Ok(Published::Complete)
+        ));
+        assert_eq!(std::fs::read_to_string(&cert_path).unwrap(), new);
+        assert_eq!(std::fs::read_to_string(&netd_path).unwrap(), new);
+        assert!(!consumer_differs(
+            &auth_path,
+            &read_cached(&cert_path).unwrap()
+        ));
     }
 
     #[test]

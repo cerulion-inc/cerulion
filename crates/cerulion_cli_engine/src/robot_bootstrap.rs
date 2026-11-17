@@ -120,9 +120,9 @@ const REMOTED_SUBDIR: &str = "remoted";
 /// registration's device key): it signs a challenge request over the current
 /// time, then signs the challenge it is issued. A request time the service
 /// refuses (this clock more than five minutes off, or behind the robot's last
-/// accepted request after a step backwards) is retried once at the time the
-/// refusal names, so the robot's clock never strands the fetch. Neither needs an
-/// account session. A 429 there fails this run with nothing fetched and the
+/// accepted request after a step backwards) is retried at the time the refusal
+/// names, at most twice, so the robot's clock never strands the fetch. Neither
+/// needs an account session. A 429 there fails this run with nothing fetched and the
 /// login not tried, so the supervisor backs off as for any failed fetch and
 /// counts it. When the service answers 404 (no such route, or a service that
 /// does not know this robot), or the proof fetch fails otherwise, it falls back
@@ -298,12 +298,24 @@ fn worker_session() -> CliResult<String> {
         .ok_or_else(|| refused("this machine's login session has lapsed; run `cerulion login`"))
 }
 
-/// Each robot-proof request's timeout: 8 s. The fetch makes up to three (a
-/// challenge request, one retry at the time the service names, the access
-/// request), 24 s, and with the session fallback after it (a 30 s refresh-lock
-/// wait, a 30 s refresh and its 1 s save, a 30 s fetch) the worker ends by 115 s,
-/// inside the supervisor's 120 s worker deadline.
+/// Each robot-proof request's timeout: 8 s, cut to what is left of
+/// [`ROBOT_PROOF_FETCH_BUDGET`].
 const ROBOT_PROOF_REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The bound on the whole robot-proof fetch: 24 s, three requests' timeouts. It
+/// makes up to four requests (a challenge request, up to two retries at the times
+/// the service names, the access request) within it, and with the session
+/// fallback after it (a 30 s refresh-lock wait, a 30 s refresh and its 1 s save,
+/// a 30 s fetch) the worker ends by 115 s, inside the supervisor's 120 s worker
+/// deadline.
+const ROBOT_PROOF_FETCH_BUDGET: Duration = Duration::from_secs(24);
+
+/// The challenge requests one fetch makes at most: the first and two retries. A
+/// clock refusal names the service's time, and for a replay the next request
+/// time it accepts; a refusal for skew names no next time, so a robot whose
+/// accepted request was ahead of the service and whose clock then stepped far
+/// behind meets a skew refusal and then a replay refusal.
+const ROBOT_PROOF_CHALLENGE_ATTEMPTS: usize = 3;
 
 #[derive(Deserialize)]
 struct RobotAccessChallenge {
@@ -341,6 +353,13 @@ fn fetch_access_by_robot_proof(
     let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
     let transport_key = signing.verifying_key().to_bytes();
     let client = login_cmd::http_client_bounded(ROBOT_PROOF_REQUEST_TIMEOUT)?;
+    let deadline = std::time::Instant::now() + ROBOT_PROOF_FETCH_BUDGET;
+    let timeout = || -> CliResult<Duration> {
+        match deadline.checked_duration_since(std::time::Instant::now()) {
+            Some(left) if !left.is_zero() => Ok(left.min(ROBOT_PROOF_REQUEST_TIMEOUT)),
+            _ => Err(refused("the robot-proof fetch ran out of time")),
+        }
+    };
     let id = URL_SAFE_NO_PAD.encode(robot_id);
     let request_challenge = |requested_at: u64| -> CliResult<Answer<RobotAccessChallenge>> {
         let requested_at = requested_at.to_string();
@@ -353,6 +372,7 @@ fn fetch_access_by_robot_proof(
         );
         let response = client
             .post(format!("{base}/v1/robots/{id}/access/challenge"))
+            .timeout(timeout()?)
             .json(&serde_json::json!({
                 "requested_at_ns": requested_at,
                 "request_signature": URL_SAFE_NO_PAD.encode(request_signature.0),
@@ -361,25 +381,27 @@ fn fetch_access_by_robot_proof(
             .map_err(|e| refused(&format!("the robot access challenge request failed: {e}")))?;
         read_answer(response, "robot access challenge")
     };
-    // A clock refusal names the service's time, and for a replay the next time
-    // it accepts; one retry signs the later of the two.
-    let mut answer = request_challenge(auth::now_unix_ns())?;
-    if let Answer::ClockRefused {
-        server_time_ns,
-        next_requested_at_ns,
-    } = answer
-    {
-        let retry_at = server_time_ns.max(next_requested_at_ns.unwrap_or(0));
-        answer = request_challenge(retry_at)?;
-    }
-    let challenge = match answer {
-        Answer::Body(challenge) => challenge,
-        Answer::NotFound => return Ok(ProofFetch::NoRoute),
-        Answer::RateLimited => return Ok(ProofFetch::RateLimited),
-        Answer::ClockRefused { .. } => {
-            return Err(refused(
-                "the account service refused the robot's request time twice",
-            ))
+    // Each retry signs the later of the service's time and the next request
+    // time it names.
+    let mut requested_at = auth::now_unix_ns();
+    let mut attempt = 1;
+    let challenge = loop {
+        match request_challenge(requested_at)? {
+            Answer::Body(challenge) => break challenge,
+            Answer::NotFound => return Ok(ProofFetch::NoRoute),
+            Answer::RateLimited => return Ok(ProofFetch::RateLimited),
+            Answer::ClockRefused { .. } if attempt == ROBOT_PROOF_CHALLENGE_ATTEMPTS => {
+                return Err(refused(
+                    "the account service refused the robot's request time three times",
+                ))
+            }
+            Answer::ClockRefused {
+                server_time_ns,
+                next_requested_at_ns,
+            } => {
+                requested_at = server_time_ns.max(next_requested_at_ns.unwrap_or(0));
+                attempt += 1;
+            }
         }
     };
     if challenge.robot_id != id {
@@ -396,6 +418,7 @@ fn fetch_access_by_robot_proof(
     );
     let response = client
         .post(format!("{base}/v1/robots/{id}/access"))
+        .timeout(timeout()?)
         .json(&serde_json::json!({
             "pop_challenge": challenge.challenge,
             "pop_signature": URL_SAFE_NO_PAD.encode(signature.0),
