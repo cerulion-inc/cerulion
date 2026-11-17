@@ -9,9 +9,12 @@
 //! on its own. Either way it drops the shutdown future before it logs anything,
 //! then runs the
 //! [`ShutdownStage`] of its [`OpsServing`](crate::OpsServing) before it
-//! returns. The daemon's serving core then ends the rcpd e-stop delivery in
-//! flight and stops the epoch poller, the entry closes the endpoint, and the
-//! binary's runtime teardown waits for the work left on its blocking pool.
+//! returns. The daemon's serving core stops arming pairing codes on a stop
+//! request before the stage runs (after a close of the endpoint's own, once the
+//! stage returned). After the stage it ends the rcpd e-stop delivery in flight
+//! and stops the epoch poller and the pair-code poller, the entry closes the
+//! endpoint, and the binary's runtime teardown waits for the work left on its
+//! blocking pool.
 //!
 //! While the stage runs, the ops server and its receipt sink are alive. After
 //! a stop request the endpoint and its open connections are alive too, and
