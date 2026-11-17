@@ -4,9 +4,11 @@
 //!
 //! `cerulion login` and the one-time enrollment of an existing key are the other
 //! places a device certificate is issued, and the certificate is short-lived
-//! (seven days from the hosted issuer). A caller holding a valid account session
-//! runs [`renew_if_due`]; [`renew_once_within`] is its bounded form, at most one
-//! attempt per process. It:
+//! (seven days from the hosted issuer). Three callers reach [`renew_if_due`]:
+//! every command that takes the account session through
+//! [`crate::account_cmd::require_session`], the automatic account paths (remote
+//! topic discovery) through [`renew_once_within`], which waits at most its budget
+//! once per process, and the robot's revocation worker after its fetch. It:
 //!
 //! 1. reads `~/.cerulion/device.cert` and the other consumer copies (netd's
 //!    relocated paths and the `device-chain.json` leaf), and does nothing (no
@@ -243,6 +245,14 @@ pub(crate) fn warn_failed(e: &CliError) {
             "this machine's device certificate has expired or is unreadable and could not be \
              renewed; `cerulion login` issues a new one"
         ),
+    }
+}
+
+/// Record a failed attempt that happened outside [`renew_device_cert_if_due`]
+/// (the robot worker could not get a session), so the next one waits an hour.
+pub(crate) fn record_failure() {
+    if let Some(auth_path) = auth::auth_json_path() {
+        record_failure_at(&auth_path, auth::now_unix_ns());
     }
 }
 

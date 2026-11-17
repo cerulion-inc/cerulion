@@ -8,7 +8,7 @@ tracked `.gitignore` when creating `.cerulion/`; migrate polls with
 Ports: `graph_cmd::stage_declared_node`.
 ## Rules
 - Engine enforces invariants; CLI checks are UX.
-- Catalogs bind account/key; resolve collisions. Paired skips implicit LAN; Open/locators/scan keep it; diagnose broken pairs. Refresh<=2s, save<=1s; enroll<=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; warn on failed registration.
+- Catalogs bind account/key; resolve collisions. Paired skips implicit LAN; Open/locators/scan keep it; diagnose broken pairs. Refresh<=2s, save<=1s; enroll/renew<=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; warn on failed registration.
 - Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; recorder I/O absolute; output/status keep spelling.
 - Paired graph producers need serving_authority; canonical ingress before GO retains pinned demands; refuse schema/QoS/writer mismatches.
 - Observers pin source/hash/channel; busy=unknown. Loss re-demands, graph rechecks identity. Epoch errors retain trust and route latches on reconnect.
@@ -39,7 +39,7 @@ Checks: cli dossier §11.
   `pairing_*_parity_test` JSON oracles match the app byte-for-byte. Build
   `test_node_macro_{period,data_trigger}_cdylib` first.
 ## Gotchas
-- `proc_macro2::Literal::to_string()` keeps `100_000`, `100u64`, `0xff`; use
-  Use `parse_int_literal`/`syn::LitInt::base10_parse`.
+- `proc_macro2::Literal::to_string()` keeps `100_000`, `100u64`, `0xff`;
+  use `parse_int_literal`/`syn::LitInt::base10_parse`.
 - Guard NaN, >2^53 widening and lengths.
 `docs/internals/cli.md`: topics/scope/starters/replay/completions/Python (§13)/graph run/profile/partition.

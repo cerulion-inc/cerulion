@@ -532,7 +532,9 @@ fn epoch_sync_stop_grace_from_env() -> Duration {
 /// The bound on one revocation fetch: above the worker's own bound (up to three
 /// 8 s robot-proof requests, then a 30 s wait for the session refresh lock, a
 /// 30 s refresh request and its 1 s save, and a 30 s access request: 115 s), so
-/// the deadline never cuts a refresh in flight.
+/// the deadline never cuts a refresh in flight. The worker starts a
+/// device-certificate renewal only in its first 15 s, and a renewal takes at most
+/// 62 s.
 const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(120);
 /// The shortest gap between two fetches started by connection requests: caps
 /// the account-service load connecting keys can cause at 12 requests a minute.

@@ -127,7 +127,8 @@ const REMOTED_SUBDIR: &str = "remoted";
 /// counts it. When the service answers 404 (no such route, or a service that
 /// does not know this robot), or the proof fetch fails otherwise, it falls back
 /// to this machine's login session (refreshing a stale one, serialized across
-/// processes).
+/// processes). Afterwards, while time remains inside the supervisor's worker
+/// deadline, it renews a device certificate that is due.
 ///
 /// The stored login is checked locally in both cases: it must name the
 /// registration's owner, though its session may have lapsed.
@@ -138,6 +139,7 @@ const REMOTED_SUBDIR: &str = "remoted";
 /// the login is not the registration's owner, when the robot route answers 429,
 /// or when both fetches fail; a failure changes nothing on the robot.
 pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
+    let started = std::time::Instant::now();
     trusted_root(state_root)?;
     let bundle_path = state_root.join(BUNDLE_FILE);
     let bundle: RegistrationBundle = match fs::symlink_metadata(&bundle_path) {
@@ -170,6 +172,7 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
         .and_then(|v| v.try_into().ok())
         .ok_or_else(|| refused("the robot registration's robot id is malformed"))?;
     let robot_id_b64 = URL_SAFE_NO_PAD.encode(robot_id);
+    let mut session: Option<String> = None;
     let access = match fetch_access_by_robot_proof(&bundle, &robot_id) {
         Ok(ProofFetch::Fetched(access)) => access,
         Ok(ProofFetch::RateLimited) => {
@@ -184,7 +187,7 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
                  service, or one that does not know this robot); fetching revocations with \
                  this machine's login session"
             );
-            fetch_access_by_session(&robot_id_b64)?
+            fetch_access_by_session(&robot_id_b64, &mut session)?
         }
         Err(e) => {
             tracing::warn!(
@@ -192,7 +195,7 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
                 "the robot-key revocation fetch failed; fetching with this machine's \
                  login session instead"
             );
-            fetch_access_by_session(&robot_id_b64)?
+            fetch_access_by_session(&robot_id_b64, &mut session)?
         }
     };
     let epoch = match account_cmd::epoch_cache_artifact_from(&access)? {
@@ -226,14 +229,73 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
     )
     .map_err(|_| refused("could not encode the worker result"))?;
     writeln!(out)?;
+    if started.elapsed() <= WORKER_RENEWAL_START_LIMIT {
+        renew_device_cert(session);
+    } else {
+        tracing::info!(
+            "no time left in this revocation sync to renew the device certificate; the next \
+             sync checks it"
+        );
+    }
     Ok(())
 }
 
 /// The session fallback of [`sync_epoch`]: the robot's access state over this
-/// machine's login session.
-fn fetch_access_by_session(robot_id: &str) -> CliResult<account_cmd::RobotAccess> {
-    let token = account_cmd::require_session()?;
-    account_cmd::fetch_robot_access(&token, robot_id)
+/// machine's login session, which is kept in `session` for the renewal after it.
+fn fetch_access_by_session(
+    robot_id: &str,
+    session: &mut Option<String>,
+) -> CliResult<account_cmd::RobotAccess> {
+    let token = account_cmd::require_session_unrenewed()?;
+    let access = account_cmd::fetch_robot_access(&token, robot_id)?;
+    *session = Some(token);
+    Ok(access)
+}
+
+/// The latest the worker starts a device-certificate renewal: 15 s after it
+/// starts. A renewal may first refresh the session within
+/// [`WORKER_RENEWAL_REFRESH_BUDGET`] (30 s, plus 1 s to publish or retire the
+/// rotated pair), then makes two requests of
+/// [`device_cert_renewal::RENEW_REQUEST_TIMEOUT`] (15 s each) and takes the store
+/// lock once (1 s), 62 s in all, so one started by then ends by 77 s, inside the
+/// supervisor's 120 s worker deadline, which starts at spawn.
+///
+/// [`device_cert_renewal::RENEW_REQUEST_TIMEOUT`]: crate::device_cert_renewal::RENEW_REQUEST_TIMEOUT
+const WORKER_RENEWAL_START_LIMIT: Duration = Duration::from_secs(15);
+
+/// The bound on the session refresh a renewal in the worker may need: the
+/// refresh-lock wait and the refresh request together. At most one account
+/// request (30 s), so netd's default stop grace still lets a refresh in flight
+/// save its rotated pair.
+const WORKER_RENEWAL_REFRESH_BUDGET: Duration = Duration::from_secs(30);
+
+/// Renew a due device certificate with `session`, or with this machine's login
+/// session when the fetch did not need one (refreshed within
+/// [`WORKER_RENEWAL_REFRESH_BUDGET`]). Nothing is requested unless the
+/// certificate is due; a failure is one warning, and the next attempt waits an
+/// hour.
+fn renew_device_cert(session: Option<String>) {
+    if !crate::device_cert_renewal::is_due_now() {
+        return;
+    }
+    match session.map_or_else(worker_session, Ok) {
+        Ok(token) => crate::device_cert_renewal::renew_if_due(&token),
+        Err(e) => {
+            crate::device_cert_renewal::record_failure();
+            crate::device_cert_renewal::warn_failed(&e);
+        }
+    }
+}
+
+/// This machine's session for a renewal in the worker: refreshed when stale,
+/// within [`WORKER_RENEWAL_REFRESH_BUDGET`], on this thread.
+fn worker_session() -> CliResult<String> {
+    login_cmd::refresh_session_if_stale_within(WORKER_RENEWAL_REFRESH_BUDGET)?;
+    auth::load()
+        .state()
+        .filter(|s| s.logged_in_ever && s.session_is_valid(auth::now_unix_ns()))
+        .map(|s| s.session_token.clone())
+        .ok_or_else(|| refused("this machine's login session has lapsed; run `cerulion login`"))
 }
 
 /// Each robot-proof request's timeout: 8 s. The fetch makes up to three (a
