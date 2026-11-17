@@ -1465,8 +1465,10 @@ fn no_tty_default_mp_run_writes_and_announces_its_run_directory() {
         let found = std::fs::read_dir(&runs)
             .ok()
             .and_then(|d| d.filter_map(Result::ok).map(|e| e.path()).next());
+        // `recorder.json` lands once the nodes load, after the rest of the
+        // description, so the wait covers it too.
         if let Some(dir) = found {
-            if dir.join("run.json").exists() {
+            if dir.join("run.json").exists() && dir.join("recorder.json").exists() {
                 break dir;
             }
         }
@@ -1502,6 +1504,17 @@ fn no_tty_default_mp_run_writes_and_announces_its_run_directory() {
     assert!(
         !original_yaml.contains("process_groups:"),
         "the DISCRIMINATOR: the graph file carries no partition"
+    );
+    // The supervisor writes the run directory's recorder.json from the nodes it
+    // loaded: one driver flag per node, and none of these three fixtures
+    // declares the `external` policy.
+    let recorder: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(run_dir.join("recorder.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        recorder["node_external"],
+        serde_json::json!({"relay": false, "sink": false, "ticker": false}),
+        "the run directory names every node's driver flag: {recorder}"
     );
     let manifest: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(run_dir.join("run.json")).unwrap()).unwrap();
@@ -2002,9 +2015,9 @@ fn a_hand_written_split_of_a_multi_producer_block_edge_is_refused_pre_spawn() {
     // continuation indentation into the literal, and `cargo fmt` never
     // rewrites a string's contents).
     for sentence in [
-        "A SPLIT edge can carry that mirror in shared memory — a cross-process \
-         credit word — but only for a topic with exactly ONE in-graph producer and NO \
-         non-`block` consumers",
+        "A SPLIT edge can carry that mirror in shared memory",
+        "but only for a topic with exactly ONE in-graph \
+         producer, and topic",
         "Rewriting it to `drop_oldest` would silently LOSE data, so this is refused instead.",
         "Deleting the `process_groups:` block entirely also works",
     ] {

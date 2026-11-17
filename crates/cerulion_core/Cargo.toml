@@ -284,8 +284,9 @@ local-transport = []
 # Oracle MUTANT seams, compiled only with this feature and never in a release
 # build; the engine's `oracle-mutants` feature turns it on. The read-identity
 # mutant (`replay_feed::mutants`) is a runtime that stages writer runs on
-# multi-writer edges, and `CERULION_UNIT_BUDGET_MUTANT` makes executor-unit
-# derivation ignore the tick budget.
+# multi-writer edges, `CERULION_UNIT_BUDGET_MUTANT` makes executor-unit
+# derivation ignore the tick budget, and each `crate::oracle_mutant::active(name)`
+# site breaks one rule while `CERULION_ORACLE_MUTANT=<name>` is set.
 oracle-mutants = []
 
 [dev-dependencies]

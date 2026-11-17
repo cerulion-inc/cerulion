@@ -172,6 +172,21 @@ pub enum BlockSendHook {
     FailNextSend,
 }
 
+/// One `block` consumer's credit word on a publisher, and the take-back of
+/// the frame [`CerulionPublisher::send_counted`] is sending on it.
+///
+/// Every count before `send()` stores its
+/// [`PublishUndo`](crate::credit::PublishUndo) in `pending`, `None` on a
+/// released slot, and a send that errs takes it and hands it to
+/// [`CreditShared::record_unpublished`](crate::credit::CreditShared::record_unpublished).
+/// The store is unconditional, so the token a take-back reads is always the
+/// one its own send's count returned.
+#[derive(Debug)]
+pub(crate) struct BlockCountSlot {
+    word: crate::credit::CreditWord,
+    pending: Option<crate::credit::PublishUndo>,
+}
+
 /// Why [`CerulionPublisher::send_counted`] sent nothing. Either arm has
 /// already taken the frame's `block` count back.
 #[derive(Debug)]
@@ -373,17 +388,17 @@ pub struct CerulionPublisher {
     /// the publisher, not the recorder tap.
     frames_dropped_send_fail: std::sync::atomic::AtomicU64,
     /// `block`: one shared outstanding counter per
-    /// `block`-policy consumer of this publisher's topic. Each is the
-    /// deterministic mirror of that consumer's iceoryx2 queue depth —
-    /// incremented here before every send makes a frame visible (and taken
-    /// back when the send fails, see [`Self::send_counted`]), decremented on
-    /// the consumer's [`CerulionSubscriber`] drain. The producer's scheduler pre-fire
-    /// check reads these to defer the moment any consumer's queue is
-    /// full. Empty unless the graph runtime wired this publisher's topic
-    /// as all-`block` (mixed topics degrade to native drop_oldest and
-    /// install no counter). The frame is never buffered or copied here —
-    /// this is a plain atomic mirror, not a data path.
-    block_outstanding: Vec<crate::credit::CreditWord>,
+    /// `block`-policy consumer of this publisher's topic, each in a
+    /// [`BlockCountSlot`] beside the take-back of the frame being sent. Each
+    /// word is the deterministic mirror of that consumer's iceoryx2 queue
+    /// depth, incremented here before every send makes a frame visible (and
+    /// taken back when the send fails, see [`Self::send_counted`]),
+    /// decremented on the consumer's [`CerulionSubscriber`] drain. The
+    /// producer's scheduler pre-fire check reads these to defer the moment any
+    /// consumer's queue is full. One slot per `block` consumer of the topic;
+    /// the topic's other consumers hold none. The frame is never buffered or
+    /// copied here: this is a plain atomic mirror, not a data path.
+    block_outstanding: Vec<BlockCountSlot>,
     /// Shared `last_publish_ns` anchor for this output's
     /// `#[output(promise_within_ms = N)]` watchdog. `Some` only when the
     /// graph runtime wired a watchdog on this output; the same
@@ -859,11 +874,14 @@ impl CerulionPublisher {
 
     /// `block`: register one consumer's outstanding counter. The
     /// graph runtime calls this once per `block` consumer of this
-    /// publisher's topic (all-`block` topics only). The same `Arc` is
-    /// shared into that consumer's [`CerulionSubscriber`] (drain
-    /// decrement) and the producer's pre-fire check (fullness read).
+    /// publisher's topic; the topic's other consumers register none. The
+    /// same word is shared into that consumer's [`CerulionSubscriber`]
+    /// (drain decrement) and the producer's pre-fire check (fullness read).
     pub(crate) fn register_block_outstanding(&mut self, counter: crate::credit::CreditWord) {
-        self.block_outstanding.push(counter);
+        self.block_outstanding.push(BlockCountSlot {
+            word: counter,
+            pending: None,
+        });
     }
 
     /// Wire this output's `#[output(promise_within_ms = N)]`
@@ -1096,26 +1114,31 @@ impl CerulionPublisher {
         }
     }
 
-    /// `block`: count one frame on every registered consumer's word. Called
-    /// only by [`Self::send_counted`], before the send. A no-op (empty vec)
-    /// unless the topic was wired all-`block`. `Release` so the producer's
-    /// pre-fire `Acquire` load sees a consistent depth.
-    fn record_block_published(&self) {
-        for counter in &self.block_outstanding {
-            // `record_published` IS the `fetch_add(1, Release)`
-            // of the block credit — on whichever word backs the
-            // edge, so a split edge's producer bumps the SHARED page and its
-            // peer consumer's drain sees the same count.
-            counter.record_published();
+    /// `block`: count one frame on every registered consumer's word and
+    /// store each count's take-back in its slot. Called only by
+    /// [`Self::send_counted`], before the send. A no-op (empty vec) unless the
+    /// topic has a `block` consumer. `Release` so the producer's pre-fire
+    /// `Acquire` load sees a consistent depth.
+    fn record_block_published(&mut self) {
+        for slot in &mut self.block_outstanding {
+            // `record_published_with_undo` IS the `Release` RMW of the block
+            // credit, on whichever word backs the edge, so a split edge's
+            // producer bumps the SHARED page and its peer consumer's drain
+            // sees the same count. Stored unconditionally: a released slot
+            // stores `None` over any token an earlier send left.
+            slot.pending = slot.word.record_published_with_undo();
         }
     }
 
     /// `block`: take back the count [`Self::record_block_published`] took on
-    /// every registered consumer's word, for a send that reached no queue.
-    /// Called only by [`Self::send_counted`], on its `Err` arm.
-    fn record_block_unpublished(&self) {
-        for counter in &self.block_outstanding {
-            counter.record_unpublished();
+    /// every registered consumer's word, for a send that reached no queue,
+    /// with the token each count stored. Called only by
+    /// [`Self::send_counted`], on its `Err` arm.
+    fn record_block_unpublished(&mut self) {
+        for slot in &mut self.block_outstanding {
+            if let Some(undo) = slot.pending.take() {
+                slot.word.record_unpublished(undo);
+            }
         }
     }
 
@@ -2376,7 +2399,7 @@ impl CerulionPublisher {
         // mirror, else a `block` topic publishing via the flatten-into-loan
         // path would silently overflow (Principle #6). `send_counted` counts
         // before the frame becomes visible; a no-op (empty
-        // `block_outstanding` vec) unless the topic is all-block.
+        // `block_outstanding` vec) unless the topic has a `block` consumer.
         let recipients = self
             .send_counted(sample)
             .map_err(|e| TransportError::Publish {
@@ -2473,7 +2496,7 @@ impl CerulionPublisher {
         // for exactly this reason. This counts live sends + genuine raw-FFI
         // re-publishes only.) `send_counted` above took the count before the
         // frame became visible; a no-op (empty `block_outstanding` vec)
-        // unless the topic is all-block.
+        // unless the topic has a `block` consumer.
         // A frame went out — reset the output's
         // `promise_within_ms` watchdog (no-op unless one is wired).
         self.record_promise_within_published();

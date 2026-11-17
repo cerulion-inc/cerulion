@@ -483,7 +483,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_kill_switch_refuses_before_the_helper_is_spawned() {
-        use std::os::unix::fs::PermissionsExt;
         let _lock = crate::test_env::env_lock();
         let _env = EnvRestore::take(&["CERULION_HOME", "CERULION_CONNECTD_BIN"]);
         let home = tempfile::tempdir().unwrap();
@@ -494,15 +493,13 @@ mod tests {
             .unwrap();
         let marker = home.path().join("helper-ran");
         let helper = home.path().join("connectd-helper");
-        std::fs::write(
+        crate::fresh_executable::install_script(
             &helper,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf ran > '{}'\nprintf '{{}}'\n",
                 marker.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         std::env::set_var("CERULION_CONNECTD_BIN", &helper);
         let robot = "ab".repeat(32);
         let args = serde_json::json!({});
