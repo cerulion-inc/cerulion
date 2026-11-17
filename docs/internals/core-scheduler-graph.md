@@ -338,6 +338,11 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   1 kHz node would drift until it skipped a slot and double-fired. Pins:
   `live_exact_deadline_iox2_test` (delivery), the held-producer poll rate in
   `credit_block_iox2_test`, and the `live_wait_tests` oracle.
+- Period-park (`CERULION_PERIOD_PARK=1`, `graph/period_park.rs`): inside `monitor_wait_block`, a
+  plan fixed at entry naps in the kernel (100 us, doorbell wake word on the armed line, a plain
+  sleep without one) until a learned lead before the deadline or a predicted data window, then
+  runs the normal park. `period_park::admits` is the pure gate (no barrier, credit word or fd
+  source; a real primitive). Record-only like every park path; pins in `period_park_iox2_test`.
 - iceoryx2 events cannot be monitor-waited (they are sockets; see the transport
   dossier), hence the SHM DOORBELL: a cache-line-aligned atomic per topic; the publisher
   rings AFTER the iceoryx2 send; where the CPU carries a monitor-wait primitive the

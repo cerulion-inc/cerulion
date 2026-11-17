@@ -15948,6 +15948,11 @@ impl GraphRuntime {
         // The period-park, as THIS process resolved it: once per live-loop entry,
         // so a run's log shows whether it can engage and why not.
         let period_park_on = self.period_park_on();
+        let period_park_at_entry = self
+            .period_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats;
         if self.period_park_override.is_none()
             && super::period_park::env_mode() == super::period_park::Mode::Unrecognized
         {
@@ -16134,7 +16139,7 @@ impl GraphRuntime {
                 .period_park
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let s = st.stats;
+            let s = st.stats.since(period_park_at_entry);
             tracing::info!(
                 graph = %self.config.identity(),
                 blocks = s.blocks,

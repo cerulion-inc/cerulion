@@ -90,7 +90,8 @@ pub(crate) struct Gate {
     pub(crate) primitive: bool,
     /// The runtime waits on a barrier word.
     pub(crate) barrier: bool,
-    /// The runtime waits on a cross-process credit word.
+    /// The runtime produces on a cross-process `block` edge (a credit word it
+    /// may wait on).
     pub(crate) credit_edges: bool,
     /// The park polls an external fd source.
     pub(crate) fd_sources: bool,
@@ -327,7 +328,7 @@ impl Plan {
     }
 }
 
-/// Record-only counters for the exit line and the tests.
+/// Record-only counters for the exit line and the tests, lifetime-cumulative.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PeriodParkStats {
     /// Park blocks the period-park planned.
@@ -348,6 +349,25 @@ pub struct PeriodParkStats {
     pub data_caught_hot: u64,
     /// Data wakes seen after a kernel nap before a predicted window.
     pub data_before_window: u64,
+}
+
+impl PeriodParkStats {
+    /// The counts since `earlier` (a snapshot of the same lifetime-cumulative
+    /// counters), so a resumed live loop reports only its own session.
+    pub(crate) fn since(self, earlier: Self) -> Self {
+        Self {
+            blocks: self.blocks - earlier.blocks,
+            predicted_blocks: self.predicted_blocks - earlier.predicted_blocks,
+            kernel_sleeps: self.kernel_sleeps - earlier.kernel_sleeps,
+            kernel_sleeps_cut_by_data: self.kernel_sleeps_cut_by_data
+                - earlier.kernel_sleeps_cut_by_data,
+            timer_wakes: self.timer_wakes - earlier.timer_wakes,
+            timer_late: self.timer_late - earlier.timer_late,
+            data_wakes: self.data_wakes - earlier.data_wakes,
+            data_caught_hot: self.data_caught_hot - earlier.data_caught_hot,
+            data_before_window: self.data_before_window - earlier.data_before_window,
+        }
+    }
 }
 
 /// The live loop's period-park state. Only the live-loop thread touches it.
@@ -548,7 +568,7 @@ mod tests {
     }
 
     #[test]
-    fn an_overshoot_spike_raises_the_lead_by_its_deviation() {
+    fn one_late_overshoot_raises_the_lead_by_its_deviation() {
         let mut l = KernelLead::default();
         for _ in 0..200 {
             l.observe(50_000);
@@ -557,7 +577,7 @@ mod tests {
         l.observe(150_000);
         assert!(
             l.lead_ns() > steady + 4 * 20_000,
-            "one 100 us spike widens the lead: {} vs {steady}",
+            "one overshoot 100 us above the mean widens the lead: {} vs {steady}",
             l.lead_ns()
         );
     }
@@ -707,13 +727,13 @@ mod tests {
     }
 
     #[test]
-    fn a_window_past_the_timer_lead_is_ignored_for_the_timer() {
+    fn a_window_that_opens_at_the_deadline_leaves_the_timer_plan() {
         let t0 = Instant::now();
         let plan = Plan {
             deadline: t0 + Duration::from_micros(1_000),
             window: Some((
-                t0 + Duration::from_micros(960),
                 t0 + Duration::from_micros(1_000),
+                t0 + Duration::from_micros(1_020),
             )),
             lead: Duration::from_micros(100),
         };
@@ -779,6 +799,26 @@ mod tests {
         st.note_data_wake(t0 + Duration::from_millis(14), LastWait::Hot);
         assert_eq!(st.stats.data_caught_hot, 1);
         assert_eq!(st.arrivals.early_ns, 0);
+    }
+
+    #[test]
+    fn a_session_reports_its_counts_since_its_entry_snapshot() {
+        let t0 = Instant::now();
+        let mut st = State::default();
+        st.plan(t0, t0 + Duration::from_millis(1));
+        st.note_timer_wake(t0, t0 + Duration::from_micros(9));
+        let entry = st.stats;
+        st.plan(t0, t0 + Duration::from_millis(1));
+        st.note_kernel_sleep(t0, t0 + Duration::from_micros(40));
+        let session = st.stats.since(entry);
+        assert_eq!(
+            session,
+            PeriodParkStats {
+                blocks: 1,
+                kernel_sleeps: 1,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
