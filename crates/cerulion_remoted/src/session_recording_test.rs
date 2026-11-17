@@ -281,6 +281,123 @@ fn start_with_principal(principal_id: String) -> RecordingPayload {
 }
 
 #[test]
+fn checkpoint_syncs_the_existing_file_and_preserves_a_literal_prefix_commitment() {
+    let oracle =
+        include_str!("../../cerulion_ops_proto/tests/fixtures/recording_exec_golden.jsonl");
+    let prefix = oracle.lines().take(2).collect::<Vec<_>>().join("\n") + "\n";
+    let expected = RecordingWitness {
+        session_id: "exec-1".into(),
+        events: 2,
+        head: "ff949a94d4c5a0170974df12da3c501090d9b293953bcb70a3e697206a9fee79".into(),
+    };
+    for _ in 0..2 {
+        let directory = private_directory();
+        let mut file = RecordingFile::create(directory.path(), "exec-1".into(), 4096).unwrap();
+        let path = directory.path().join("exec-1.jsonl");
+        file.append(
+            0,
+            RecordingPayload::Started {
+                session_id: "exec-1".into(),
+                principal_id: "owner-1".into(),
+                account_id: Some("account-1".into()),
+                session: SessionKind::Exec(ExecRequest {
+                    argv: vec![
+                        "sh".into(),
+                        "-c".into(),
+                        "printf out; printf err >&2; exit 7".into(),
+                    ],
+                }),
+            },
+        )
+        .unwrap();
+        file.append(
+            100,
+            RecordingPayload::Output {
+                stream: OutputStream::Stdout,
+                data: "b3V0".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(file.checkpoint().unwrap(), expected);
+        assert_eq!(file.checkpoint().unwrap(), expected);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), prefix);
+        assert_eq!(file.bytes, prefix.len() as u64);
+        crate::remote_session::verify_recording_prefix_file(&path, &expected).unwrap();
+        file.append(
+            200,
+            RecordingPayload::Output {
+                stream: OutputStream::Stderr,
+                data: "ZXJy".into(),
+            },
+        )
+        .unwrap();
+        file.append(
+            300,
+            RecordingPayload::Exit {
+                code: Some(7),
+                signal: None,
+                reason: ExitReason::Exited,
+            },
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), oracle);
+        crate::remote_session::verify_recording_prefix_file(&path, &expected).unwrap();
+        assert_eq!(
+            file.checkpoint().unwrap(),
+            RecordingWitness {
+                session_id: "exec-1".into(),
+                events: 4,
+                head: "3f1352e989697121f70af74c842c8cb73833a47a9a19361995af4b77d5a2055c".into(),
+            }
+        );
+    }
+}
+
+#[test]
+fn checkpoint_sync_failure_keeps_the_commitment_and_permanently_refuses_more_work() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+
+    let directory = private_directory();
+    let mut file = RecordingFile::create(directory.path(), "test-session".into(), 4096).unwrap();
+    let path = directory.path().join("test-session.jsonl");
+    file.append(1, start_with_principal("owner".into()))
+        .unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let witness = file.witness();
+    let original = Arc::clone(&file.file);
+    // A real socket descriptor cannot be synced as a regular recording file.
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let descriptor: OwnedFd = socket.into();
+    file.file = Arc::new(File::from(descriptor));
+    assert!(file.checkpoint().is_err());
+    assert!(file.failed);
+    file.file = original;
+    assert!(file.checkpoint().is_err());
+    assert!(file.append(2, RecordingPayload::StdinEof).is_err());
+    assert_eq!(file.witness(), witness);
+    assert_eq!(file.bytes, before.len() as u64);
+    assert_eq!(std::fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn checkpoint_before_started_is_a_healthy_refusal_with_no_file_change() {
+    let directory = private_directory();
+    let mut file = RecordingFile::create(directory.path(), "test-session".into(), 4096).unwrap();
+    let path = directory.path().join("test-session.jsonl");
+    assert_eq!(
+        file.checkpoint().unwrap_err().kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert!(!file.failed);
+    assert_eq!(file.witness().events, 0);
+    assert!(std::fs::read(&path).unwrap().is_empty());
+    file.append(1, start_with_principal("owner".into()))
+        .unwrap();
+    assert_eq!(file.checkpoint().unwrap().events, 1);
+}
+
+#[test]
 fn write_failure_is_sticky_even_after_the_file_handle_becomes_writable() {
     let directory = private_directory();
     let mut file = recorder(directory.path());
@@ -290,6 +407,7 @@ fn write_failure_is_sticky_even_after_the_file_handle_becomes_writable() {
     file.file = Arc::new(File::open(&path).unwrap());
     assert!(file.append(2, RecordingPayload::StdinEof).is_err());
     file.file = Arc::new(OpenOptions::new().append(true).open(&path).unwrap());
+    assert!(file.checkpoint().is_err());
     assert_eq!(
         file.append(3, exit()).unwrap_err().to_string(),
         "session recording write failed"

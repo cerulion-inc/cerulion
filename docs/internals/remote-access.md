@@ -199,8 +199,10 @@ Load-bearing boundary contracts:
   lines, including their newline, must fit the same event limit as both readers.
   A refused event leaves the file and commitment unchanged; a write or sync error poisons
   the writer and may leave uncommitted bytes. Started and Exit are synced before
-  success. Ordinary events need a separate durable flush before their witness
-  is advertised. Callers run blocking file work away from async executor threads
+  success. `checkpoint` syncs the held descriptor before returning an ordinary
+  event's durable commitment. It refuses before Started; a sync failure
+  permanently refuses checkpoints and appends without changing the commitment.
+  Callers run blocking file work away from async executor threads
   and forward bytes only after append succeeds. Session audit JSONL is not a bag.
 
 - **Session work ownership**: `session_work::SessionWork` registers work before

@@ -165,8 +165,30 @@ impl RecordingFile {
         Ok(AppendOutcome::Appended)
     }
 
-    /// The written commitment. Ordinary events require a flush before advertising
-    /// this value as durable; Started and Exit appends already include that flush.
+    /// Sync the existing descriptor and return its durable recording commitment.
+    ///
+    /// A Started event must already exist. This blocking operation runs off async
+    /// executor threads; it adds no event or bytes. A sync error permanently
+    /// refuses appends and checkpoints, even if the descriptor becomes usable.
+    pub fn checkpoint(&mut self) -> io::Result<RecordingWitness> {
+        if self.failed {
+            return Err(io::Error::other("session recording write failed"));
+        }
+        if self.chain.events() == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "session recording has not started",
+            ));
+        }
+        if let Err(error) = self.file.sync_data() {
+            self.failed = true;
+            return Err(error);
+        }
+        Ok(self.witness())
+    }
+
+    /// The written commitment. Use `checkpoint` before advertising ordinary events
+    /// as durable; Started and Exit appends already include that flush.
     pub fn witness(&self) -> RecordingWitness {
         RecordingWitness {
             session_id: self.session_id.clone(),
