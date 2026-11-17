@@ -6,8 +6,7 @@
 //!
 //! The argument-to-action mapping is oracle-tested in `src/main.rs`; this pins
 //! the output contract. The refusal returns before tracing and transport init,
-//! so this needs no socket, lock, SHM root or env: parallel-safe like every
-//! file in this crate.
+//! so this needs no socket, lock, SHM root or env, and is parallel-safe.
 
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt as _;
