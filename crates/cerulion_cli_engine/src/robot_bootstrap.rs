@@ -436,7 +436,8 @@ enum Answer<T> {
 const MAX_ROBOT_ACCESS_RESPONSE_BYTES: usize = 2 * MAX_EPOCH_PENDING_BYTES;
 
 /// A success body as `T`, read up to `limit` bytes; 404 and 429 as themselves;
-/// any other status is an error naming it and the service's description.
+/// a 403 naming the service's time as a clock refusal; any other status is an
+/// error naming it and the service's description.
 fn read_answer<T: serde::de::DeserializeOwned>(
     response: reqwest::blocking::Response,
     what: &str,
@@ -880,10 +881,11 @@ mod tests {
         assert_eq!(access.revoked_devices[9_999], id_text(9_999));
     }
 
-    /// A response of exactly the access bound is read; one byte more is refused
-    /// with the response named.
+    /// A response of exactly the access bound, 2 MiB, is read; one byte more is
+    /// refused with the response named.
     #[test]
     fn an_access_response_over_its_bound_is_refused() {
+        assert_eq!(MAX_ROBOT_ACCESS_RESPONSE_BYTES, 2_097_152);
         let listing = access_listing(1);
         let at_bound = format!(
             "{}{listing}",
@@ -956,9 +958,10 @@ mod tests {
         )
     }
 
-    /// The largest epoch the remote-plane daemon applies has 16,375 revoked keys,
-    /// the most whose file fits its 1 MiB bound; it is written, and one key more
-    /// is refused with nothing written. The access response for that epoch is
+    /// With this test's envelope (one root signature, small timestamps), the
+    /// largest epoch the remote-plane daemon applies has 16,375 revoked keys, the
+    /// most whose file fits its 1 MiB bound; it is written, and one key more is
+    /// refused with nothing written. The access response for that epoch is
     /// larger than the file and fits the access bound, under 1.4 times the file.
     #[test]
     fn the_response_for_the_largest_epoch_the_daemon_applies_fits_its_bound() {
