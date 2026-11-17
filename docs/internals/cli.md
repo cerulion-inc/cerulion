@@ -10,8 +10,8 @@ Related user-facing docs: `docs/cli_completions.md`, `docs/schema_resolution.md`
 `docs/multi_process.md`, `docs/auto_partitioning.md`, `docs/networking.md`,
 `docs/replay_determinism_footguns.md`, `docs/user-api.md`.
 
-The `remote_shell` library module prepares paired session helper arguments without
-spawning a process. `session_plan` accepts a `connect_cmd::plan` result, retains its
+The `remote_shell::session_plan` library function prepares paired session helper
+arguments without spawning a process. It accepts a `connect_cmd::plan` result, retains its
 identity and route options, and puts exec arguments literally after `--`. Shell and
 exec witness paths must be nonempty UTF-8 without NUL; policy requests use no witness
 path. Callers must check `require_network` before identity lookup or helper resolution.
@@ -20,6 +20,16 @@ network rules: `CERULION_NETWORK` uses the fail-closed parse, and
 `CERULION_NETD_NETWORK` disables access only for the exact value `off`.
 `CliError::RemoteShellNetworkRefused(String)` carries that diagnostic. Rust callers
 with exhaustive matches on `CliError` must handle the new variant or a fallback arm.
+
+`remote_shell::run` resolves explicit pins and endpoint IDs locally. Other selectors
+use the owned account catalog, with canonical `account:<robot-id>` routes; duplicate
+names and collisions with cached LAN names require an explicit selector. Account
+login/key identity is checked before and after the bounded revocation-refresh
+wait, and cancellation prevents helper startup. A failed refresh is reported;
+timeout does not cancel its request worker, which may later replace the epoch
+cache atomically. A changed login or key refuses the operation.
+Only public account/key context and locked-store paths enter the helper arguments.
+The helper owns proof handling and returns its actual exit status to the caller.
 
 ---
 
