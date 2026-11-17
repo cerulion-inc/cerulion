@@ -29,6 +29,7 @@ name = "cerulion-connectd"
 path = "src/main.rs"
 
 [dependencies]
+cerulion_ops_proto = { path = "../cerulion_ops_proto" }
 # The shared desk-side `cerulion/wire/1` client substrate: the
 # control vocabulary (`protocol`), the dial-config parsers (`config`), the unified
 # `error`, and the per-topic re-inject reader (`reader::run_topic_reader`). This
@@ -91,6 +92,10 @@ hex = "0.4"
 # Thin CLI for the binary (the robot eid / direct addrs / topic set / key file /
 # schemas dir / relay seam). Already a workspace citizen (cerud/bagd/remoted).
 clap = { version = "4", features = ["derive", "env"] }
+
+[target.'cfg(unix)'.dependencies]
+# Safe descriptor-relative creation and ownership checks for private witnesses.
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 # The e2e tests drive the REAL robot side in-process: `reinject_e2e` builds a

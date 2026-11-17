@@ -192,6 +192,14 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Client final witnesses**: Unix `cerulion_connectd::session_witness::WitnessStore`
+  holds a private directory descriptor. Its blocking `persist` checks filename
+  components and requires the witness count/head to match a valid Exit before
+  creating a file. Exclusive 0600 creation and descriptor-relative access refuse
+  collisions and final-component symlinks. Success syncs the file and directory;
+  an I/O failure may retain partial bytes, which a later call never overwrites.
+  The caller authenticates the robot and keeps filesystem work off async tasks.
+
 - **Session audit inspection**: `remote_session::list_recordings_with_incomplete`
   returns sorted complete heads and unfinished paths. A locally computed head
   checks structure, not authenticity; `verify_recording_file` and
