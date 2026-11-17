@@ -39,9 +39,9 @@
 //!   anti-tautology arm: the value is genuinely plumbed from the environment,
 //!   not a hardcoded constant.
 //! * `IOX2_LOG_LEVEL=warn` beside a name and a value that are not valid UTF-8,
-//!   set only in the child's environment ⇒ the build still loads the cdylib and
-//!   it still reports `WARN_LEVEL` (3): the host table serves the library the
-//!   same snapshot, with those variables left out.
+//!   set only in the child's environment ⇒ the build still loads the cdylib,
+//!   the host table still serves it the snapshot, and it reports `WARN_LEVEL`
+//!   (3).
 //!
 //! # The RAW-FFI half
 //!

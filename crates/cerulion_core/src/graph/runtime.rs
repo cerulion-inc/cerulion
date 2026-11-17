@@ -20642,11 +20642,11 @@ struct NodeEnvCapture {
 
 /// Split `vars` into the snapshot the nodes read and the names left out of it.
 ///
-/// A variable is kept only when both its name and its value are valid UTF-8;
-/// `std::env::var` likewise returns an error for a value that is not, so a node
-/// reads the default for such a variable either way. The split is infallible:
-/// no name or value can fail the build, where `std::env::vars()` panics on the
-/// first variable that is not valid UTF-8.
+/// A variable is kept only when both its name and its value are valid UTF-8,
+/// the case in which `std::env::var` returns its value, so a node reads the
+/// default for any other variable. The split is infallible: no name or value
+/// can fail the build, where `std::env::vars()` panics on the first variable
+/// that is not valid UTF-8.
 // hot-path-alloc-ok-fn: cold: graph BUILD, once per GraphRuntime, before the first step
 fn capture_node_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> NodeEnvCapture {
     let mut snapshot = HashMap::new();
