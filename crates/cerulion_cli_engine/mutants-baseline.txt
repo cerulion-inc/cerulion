@@ -1,0 +1,23 @@
+# Mutation baseline for cerulion_cli_engine: the verifier budget's pure decision
+# functions.
+#
+# Scope: the functions in src/replay_engine.rs that count one rank's reads
+# against the verifier's record budget, place the step the count ran past it,
+# and pick and render what a refusal over the budget says and which remedy it
+# names. The rest of the file walks bags and drives the replay loop over the
+# transport, which the mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --re 'BudgetTally::add|RunOutTime::from_targets|ReadLogOverrun::sentence|FrameIndexOverrun::sentence|seconds_text|VerifierDecline::remedy|declined_census_detail|enforcement_blocked_by_decline' \
+#            --timeout 300 -- --lib
+#          (run in 5 shards, --shard k/5, with the lib tests' fixture cdylibs built first)
+# Result:  22 mutants: 10 caught, 12 unviable, 0 missed. The unviable ones replace
+#          a whole function body with a constant: the parameters go unused, and
+#          the workspace denies unused variables, so they do not compile.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
