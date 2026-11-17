@@ -249,6 +249,7 @@ fn in_def(name: &str, source: &str) -> InputDef {
     InputDef {
         name: name.to_string(),
         source: source.to_string(),
+        ..Default::default()
     }
 }
 

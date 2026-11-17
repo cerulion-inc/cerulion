@@ -6043,6 +6043,13 @@ struct RemoteChannel {
     failures: FailureRegimeLatch,
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Default)]
+struct ObserveAcks {
+    counts: Mutex<BTreeMap<(String, String), u64>>,
+    changed: std::sync::Condvar,
+}
+
 /// The production demand plane. Each source owns its holding connection, so a
 /// failed recovery closes only that source's demands. Catalog, schema and runs
 /// queries use a separate demand-free client. All connections are lazy; a daemon
@@ -6054,6 +6061,8 @@ pub struct NetdDemandPlane {
     /// `Some(socket)` targets a SPECIFIC control socket (the e2e's in-process netd);
     /// `None` uses the well-known default path (production, first-consumer-spawns).
     socket: Option<PathBuf>,
+    #[cfg(any(test, feature = "test-helpers"))]
+    observe_acks: ObserveAcks,
 }
 
 impl NetdDemandPlane {
@@ -6065,6 +6074,8 @@ impl NetdDemandPlane {
             channels: Mutex::new(BTreeMap::new()),
             probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            observe_acks: Default::default(),
         }
     }
 
@@ -6076,7 +6087,38 @@ impl NetdDemandPlane {
             channels: Mutex::new(BTreeMap::new()),
             probe_failures: Mutex::new(FailureRegimeLatch::new()),
             socket: Some(socket),
+            #[cfg(any(test, feature = "test-helpers"))]
+            observe_acks: Default::default(),
         }
+    }
+
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn acknowledge_observe_for_test(&self, key: &(String, String)) {
+        let mut acks = self.observe_acks.counts.lock().unwrap();
+        *acks.entry(key.clone()).or_default() += 1;
+        self.observe_acks.changed.notify_all();
+    }
+
+    /// Wait for accepted Observe replies on this source's holding connection.
+    /// Only actual initial demands and re-demands advance the count; status
+    /// probes and a server-side demand commit do not acknowledge recovery.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn wait_for_observe_ack_for_test(
+        &self,
+        robot: &str,
+        topic: &str,
+        count: u64,
+        timeout: Duration,
+    ) -> bool {
+        let key = (robot.to_owned(), topic.to_owned());
+        let (acks, _) = self
+            .observe_acks
+            .changed
+            .wait_timeout_while(self.observe_acks.counts.lock().unwrap(), timeout, |acks| {
+                acks.get(&key).copied().unwrap_or(0) < count
+            })
+            .unwrap();
+        acks.get(&key).copied().unwrap_or(0) >= count
     }
 
     /// Run `f` against the lazily-connected client. Connects (spawning netd if
@@ -6299,6 +6341,8 @@ impl DemandPlane for NetdDemandPlane {
                         if let Some(suppressed) = channel.failures.on_success() {
                             tracing::info!(robot = %robot, topic = %topic, suppressed, "visualization reader recovered");
                         }
+                        #[cfg(any(test, feature = "test-helpers"))]
+                        self.acknowledge_observe_for_test(&key);
                     }
                 }
                 Ok(_) => {
@@ -6431,6 +6475,8 @@ impl DemandPlane for NetdDemandPlane {
                 Err(error) => format!("remote observer channel changed for robot '{robot}' topic '{topic}'; cancellation release failed: {error}"),
             });
         }
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.acknowledge_observe_for_test(&key);
         Ok(())
     }
     fn release(&self, robot: &str, topic: &str) -> Result<(), String> {

@@ -102,7 +102,7 @@ const WAIVED_2034: &[(&str, &str)] = &[
     ),
     (
         "crates/cerulion_core/tests/cdylib_block_degrade_test.rs",
-        "dylib_block_degrade_is_deterministic",
+        "dylib_block_on_a_mixed_topic_is_deterministic",
     ),
     (
         "crates/cerulion_core/tests/cdylib_collapse_no_publish_test.rs",
