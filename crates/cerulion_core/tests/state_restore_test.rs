@@ -624,9 +624,10 @@ fn a_stopped_section_round_trips_exactly() {
 fn a_running_nodes_section_keeps_the_version_it_had_and_reads_as_running() {
     // The flags byte is written only for a stopped node, so every running
     // node's section keeps the version and bytes it had before the byte
-    // existed. The version-1, -3 and -4 bytes are pinned by hand above and the
-    // version-2 bytes in `a_v2_section_is_pinned_bytes_in_each_shape` below;
-    // this arm pins the version word and the decoded stop.
+    // existed. The version-1 bytes are pinned by hand above, the version-3 and
+    // -4 bytes in their own tests below, and the version-2 bytes in
+    // `a_v2_section_is_pinned_bytes_in_each_shape`; this arm pins the version
+    // word and the decoded stop.
     for (section, version) in [
         (populated_section(), 1u32),
         (populated_v2_section(), 2),

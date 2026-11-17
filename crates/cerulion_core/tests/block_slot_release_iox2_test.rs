@@ -2258,6 +2258,45 @@ fn a_restored_stop_releases_the_consumers_block_slot_as_its_fatal_return_did() {
     assert_eq!(releases(&held, "dies"), 0);
 }
 
+/// A restore releases only the slots of the nodes it names: a second
+/// consumer of the same topic keeps its slot, so it still holds the producer
+/// at depth.
+#[test]
+fn a_restored_stop_releases_only_the_named_consumers_slot() {
+    let mut rt = build(config(
+        "bsr_restored_one",
+        vec![
+            node("producer", "producer", vec![], vec![output("out")]),
+            node("stopped", "host_block", vec![input("producer/out")], vec![]),
+            node("held", "host_block", vec![input("producer/out")], vec![]),
+        ],
+    ))
+    .expect("build");
+    rt.restore_stopped_nodes(&["stopped".to_string()].into_iter().collect())
+        .expect("stopped is in the graph");
+    for _ in 0..STEPS {
+        rt.step(Duration::from_millis(10));
+    }
+    assert_eq!(
+        outstanding(&rt, "stopped"),
+        0,
+        "the named slot was released"
+    );
+    assert_eq!(
+        outstanding(&rt, "held"),
+        2,
+        "the other consumer's slot is untouched: still full"
+    );
+    assert_eq!(releases(&rt, "held"), 0);
+    assert_eq!(
+        fires(&rt, "producer"),
+        2,
+        "the held consumer still defers the producer at depth 2"
+    );
+    assert!(rt.is_node_stopped("stopped"));
+    assert!(!rt.is_node_stopped("held"));
+}
+
 /// `period_ms = 10`, publishes `x = 1000 + n`: every frame is one the panic
 /// fixture panics on.
 #[cerulion_node(period_ms = 10)]

@@ -11675,8 +11675,10 @@ impl GraphRuntime {
                 // the resume side rather than the sharper "drain-to-latest"
                 // — both keep the whole band, so only the note's wording
                 // differs. (The format itself CAN say `Some({})`, and the
-                // reader rules for it are pinned; the carrier just has no
-                // node worth spending 4 bytes per anchor to say it about.)
+                // reader rules for it are pinned. A RUNNING node's section
+                // never says it; a stopped node's version-5 section always
+                // carries a table, empty when this leaves `None`, because a
+                // later tail follows it.)
                 state.input_service = self.service_cursors.get(id.as_str()).map(|cursors| {
                     cursors
                         .iter()
@@ -18657,11 +18659,13 @@ impl GraphRuntime {
     /// Release every `block` slot a node in `ids` holds as a consumer, with no
     /// event and no counter bump.
     ///
-    /// Each retained `block_credit_edges` word is a clone of the word the
-    /// consumer's tick callback holds in its `HeldBlockSlot`s, so this releases
-    /// exactly the slots `release_held_block_slots` releases on a live stop. A
-    /// cross-process word is the shared page, so the producer in the other
-    /// process stops waiting too.
+    /// Called only after `Scheduler::restore_stopped_nodes` has accepted
+    /// `ids`, so every id names a node this runtime runs. For such a node,
+    /// each retained `block_credit_edges` entry whose consumer it is holds a
+    /// clone of the word its tick callback holds in a `HeldBlockSlot`, so this
+    /// releases exactly the slots `release_held_block_slots` releases on a
+    /// live stop. A cross-process word is the shared page, so the producer in
+    /// the other process stops waiting too.
     fn release_block_slots_held_by(&self, ids: &std::collections::BTreeSet<String>) {
         for edge in &self.block_credit_edges {
             if ids.contains(&edge.consumer_node) {

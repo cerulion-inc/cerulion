@@ -431,8 +431,8 @@ const FRAMEWORK_SECTION_V1_PREFIX: usize = 4 + 1 + 8 + 8 + 4;
 /// `ScheduledNode` is not serializable as a struct: it carries
 /// `callback: Box<dyn FnMut() + Send>` and `Arc<AtomicU64>` handles shared with
 /// `NodeHandle`. Those are WIRING, rebuilt by `GraphRuntime::build`. What a
-/// resumed graph cannot rebuild is the node's TIMING and TRIGGER state — the
-/// plain-data fields below — and without them a resumed graph
+/// resumed graph cannot rebuild is the node's TIMING and TRIGGER state, the
+/// plain-data fields below, and without them a resumed graph
 /// executes a different schedule from the one the recording holds while
 /// reporting the difference as the candidate's fault:
 ///
@@ -540,8 +540,9 @@ pub struct NodeFrameworkState {
     /// writes the floor's tail anyway, stating it absent when there is none.
     pub sync_epoch_floor: Option<u64>,
     /// `ScheduledNode::disabled` at the anchor boundary: the scheduler had
-    /// stopped this node, after a `NodeError::Fatal` return or a tripped
-    /// circuit breaker, and fires it no more.
+    /// stopped this node, after a `NodeError::Fatal` return, a tripped
+    /// circuit breaker or a `restore_stopped_nodes` call on a resumed run, and
+    /// fires it no more.
     ///
     /// A node whose entry was poisoned by a host-side panic is NOT stopped:
     /// the scheduler keeps firing it and its callback returns cleanly, so the
