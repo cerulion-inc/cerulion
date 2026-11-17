@@ -3513,6 +3513,9 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // ros2_cmd holds `RMW_LIB_FILENAME`, `librmw_cerulion.so`, the artifact
     // rmw_cerulion builds.
     ("cerulion_cli_engine", "rmw_cerulion", "dlopen"),
+    // connect_interrupt_e2e_test runs the `cerulion` binary cargo built beside
+    // `cerulion-connectd`, through `with_file_name`.
+    ("cerulion_connectd", "cerulion_cli", "binary"),
     // cdylib_iox2_log_level_test's EXCLUSIONS table names `crates/test_fixtures/`,
     // a tree that holds many members, and the same package's
     // serial_discipline_test walks the repository root itself

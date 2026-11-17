@@ -527,17 +527,19 @@ OBSERVATION_ERROR_CASES = [
 # moves to with=9 without=4; `cerulion_heaphook` is unchanged.
 #
 # `cerulion_cli` and `cerulion_connectd` build the binaries a `cerulion_netd`
+# test runs, and `cerulion_cli` also builds the binary a `cerulion_connectd`
 # test runs, counted by hand off the manifests and the table. No member depends
 # on either, so each cargo closure is the package alone. With the edges each
 # gains `cerulion_netd` and the four packages that observe `all`
 # (`cerulion_cli`, `cerulion_cli_engine`, `cerulion_core`, `cerulion_hygiene`);
-# for `cerulion_cli` the first of those four is the package itself.
+# for `cerulion_cli` the first of those four is the package itself, and it
+# gains `cerulion_connectd` as well.
 #
 # Dropping the union from the closure shrinks every row, which is the mutant
-# these rows exist to kill; dropping one of the two `binary` rows shrinks its
+# these rows exist to kill; dropping one of the `binary` rows shrinks its
 # package's row by one.
 LIVE_OBSERVATION_ORACLE = {
-    'cerulion_cli': (5, 1),
+    'cerulion_cli': (6, 1),
     'cerulion_connectd': (6, 1),
     'cerulion_heaphook': (6, 1),
     'go2_tf': (9, 4),
