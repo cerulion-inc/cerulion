@@ -1882,9 +1882,10 @@ impl<S: WritevSink> BagWriter<S> {
     /// [`finalize`](Self::finalize), an abandoned one logs no warning that the
     /// bag is unfinished.
     ///
-    /// This never removes the file. The caller removes it after this returns,
-    /// and a caller that keeps the file should let the writer drop instead, so
-    /// the warning tells whoever reads the file later that its tail is torn.
+    /// This never removes the file: the caller removes it after this returns.
+    /// A caller that keeps the unfinished file should drop the writer instead,
+    /// whose warning says the bag has no summary and is readable only up to
+    /// its last flushed chunk.
     pub fn abandon(mut self) {
         self.abandoned = true;
     }
