@@ -62,6 +62,9 @@ pub enum CliError {
     /// (`cerulion login`) where the failure is a missing/expired identity.
     #[error("{0}")]
     Login(String),
+    /// A remote operation refused by the network kill switch.
+    #[error("{0}")]
+    RemoteShellNetworkRefused(String),
     /// One or more nodes returned `NodeError::Fatal` during the run and were
     /// stopped: `(node id, the fatal error's message)` in graph order. The run
     /// itself completed; the process exits with [`EXIT_NODE_FATAL`].
