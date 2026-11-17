@@ -3868,7 +3868,7 @@ hex digits); anything else is refused with an error. A LOCAL-ONLY daemon
 (`CERULION_VIZD_NETWORK=off`) refuses every `activity` with an error and asks
 no robot, even when `cerulion-netd` has its network on. The first `activity` for a
 run starts a follower that asks the robot for the run's fires four times a
-second, through `cerulion-netd` (protocol 10 or newer) on a connection of its
+second, through `cerulion-netd` (protocol 12 or newer) on a connection of its
 own, and answers `starting`, so ask a few times a second. Each `activity` keeps
 the follower until three seconds after it; the robot records fires only while it
 is asked, and stops five seconds after the follower's last poll. At most four
