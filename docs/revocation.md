@@ -98,8 +98,9 @@ against the robot's 900 challenges an hour, so no other caller can use them up; 
 there fails the run with nothing fetched and without trying the login, and the supervisor
 backs off as for any failed fetch. A refused request time (the robot's clock more than five
 minutes off, or behind its previous accepted request after the clock steps backwards)
-names the time the service accepts, and the robot retries once at that time, so the
-robot's clock never decides whether it learns its revocations.
+names the time the service accepts, and the robot retries at that time, at most twice
+(a clock that was ahead and then stepped far behind meets a skew refusal, then a replay
+refusal), so the robot's clock never decides whether it learns its revocations.
 When the service answers 404 there (no such route, or a service that does not know this
 robot), or that fetch fails otherwise, it fetches `GET /v1/robots/{id}/access` with the
 robot's own login instead. `cerulion-remoted` applies it
@@ -125,8 +126,8 @@ fetches are succeeding.
 |---|---|---|
 | `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (30 to 86400) | 300 | The revocation lag for a key that stays away, at one HTTPS request per robot per period to the account service (288 a day). 300 s keeps that load negligible while a stolen desk that holds a connection open is cut within minutes. |
 | `CERULION_REMOTED_EPOCH_RECHECK_S` (5 to 3600) | 60 | How soon a key that reconnects asks for another early fetch. Shorter cuts a quickly reconnecting revoked key sooner, at up to one extra request per key per interval. |
-| Fetch deadline | 120 s | Above the worker's own bound (up to three 8 s robot-proof requests, then a 30 s refresh-lock wait, a 30 s session refresh and its 1 s save, a 30 s access request: 115 s), so it never stops a session refresh midway. |
-| Robot-proof request timeout | 8 s | Each robot-proof request: a challenge request, one retry at the time the service names, the access request. With the login fallback's 91 s after them the worker ends by 115 s. |
+| Fetch deadline | 120 s | Above the worker's own bound (a robot-proof fetch bounded at 24 s, then a 30 s refresh-lock wait, a 30 s session refresh and its 1 s save, a 30 s access request: 115 s), so it never stops a session refresh midway. |
+| Robot-proof request timeout | 8 s | Each robot-proof request: a challenge request, up to two retries at the times the service names, the access request, all within the fetch's 24 s, three requests' timeouts. With the login fallback's 91 s after them the worker ends by 115 s. |
 | Robot challenge budget | 900 an hour | The supervisor starts a fetch at most every 5 s (720 an hour); the rest covers a restarted supervisor, which fetches at once. Only requests signed by the robot's key count. A `cerulion-netd` that restarts every few seconds can use the budget up; its fetches then fail with a 429, counted by the supervisor's failure backoff, until the hour's window resets, while the robot keeps its last applied epoch. |
 | `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` (5 to 120) | 35 | How long a netd shutdown waits for a running fetch: one 30 s account request plus 5 s, so a session refresh in flight publishes its rotated, single-use token pair instead of being stopped midway. A shutdown that lands during a fetch can take up to this long; one with no fetch running, or a fetch that ends sooner, does not wait. The robot server stops before this wait, and netd's `CERULION_NETD_HARD_EXIT_MS` deadline is extended by it. The fetch runs in its own process group, so a Ctrl-C to netd's process group does not end it early. Under systemd, set `KillMode=mixed` so a service stop signals only netd and this wait applies. |
 | Failure backoff | 5 s doubling to 300 s, never past the period | A short outage costs one short delay; a long one stops hammering the service. Fetching never stops, and recovery is no slower than the period. |
