@@ -358,7 +358,13 @@ fn run_child(reads: &[&str], vars: &[(&[u8], &[u8])]) -> ChildOutput {
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("the child did not exit within {CHILD_TIMEOUT:?}");
+            let stdout =
+                String::from_utf8_lossy(&stdout.join().expect("the stdout reader")).into_owned();
+            let stderr =
+                String::from_utf8_lossy(&stderr.join().expect("the stderr reader")).into_owned();
+            panic!(
+                "the child did not exit within {CHILD_TIMEOUT:?} and was killed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            );
         }
         std::thread::sleep(Duration::from_millis(20));
     };
