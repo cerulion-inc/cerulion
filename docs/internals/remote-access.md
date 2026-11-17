@@ -192,6 +192,14 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Session context**: `session_context::{SessionContext, SessionLimits}` holds
+  transport-supplied identity, callbacks and unchanged resource limits. Validation
+  checks the declared shell/exec parameters, an authenticated caller, a nonzero
+  authorization interval of at most one second, and nonzero I/O timeout. It does
+  no I/O, invokes no callback and grants no authorization. The driver must perform
+  fresh authorization before spawn and throughout execution. Byte budgets and
+  optional duration limits are enforced by their recording and I/O paths.
+
 - **Recording file writes**: Unix `session_recording::RecordingFile` creates a
   private audit file without overwriting existing paths. Session IDs are single
   filename components and the Started event must name that ID. Appends preview
