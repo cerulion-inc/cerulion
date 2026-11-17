@@ -141,6 +141,9 @@ pub const RESTART_STOPPED_NOT_STARTED: &str = "the robot's e-stop was engaged du
 /// so no session ever blocks another (see the module docs).
 pub struct OpsServing {
     fence: Option<crate::serving_hold::AdmissionFence>,
+    /// The code-pairing store the code-pair verbs use; each session is opened
+    /// on it for its peer's key ([`SharedCodePairSessions::open_session`]).
+    code_pairing: SharedCodePairSessions,
     /// Shared, `&self`-served across concurrent sessions. Its receipt sink is a
     /// brief-append `Mutex` (in `cerud`), so concurrent appends stay chain-valid
     /// without any whole-session serialization here.
@@ -217,6 +220,7 @@ impl OpsServing {
         #[cfg(feature = "test-seam")]
         crate::shutdown::register_probe_for_test(&shutdown, host.rcpd_estop());
         let fence = serving_holds.map(crate::serving_hold::AdmissionFence::new);
+        let code_pairing = sessions.clone();
         let verbs = verb_registry(host, &shared, sessions, clock, log_root, fence.as_ref());
         let authorizer: Box<dyn Authorizer> = Box::new(PairingAuthorizer::from_shared(shared));
         let receipts = ReceiptLog::open(receipt_path).map_err(|e| {
@@ -228,6 +232,7 @@ impl OpsServing {
         let server = OpsServer::new(server_name, authorizer, verbs, receipts);
         Ok(OpsServing {
             fence,
+            code_pairing,
             server: Arc::new(server),
             deadline: OPS_SESSION_DEADLINE,
             shutdown,
@@ -300,6 +305,12 @@ impl OpsServing {
     /// chain write), the session is refused fail-closed and the connection is
     /// closed with the accurate reason `ops receipt sink poisoned` — appending to a
     /// possibly-corrupt audit log is never attempted.
+    ///
+    /// The session's blocking run is opened on the code-pairing store for the
+    /// peer's key ([`SharedCodePairSessions::open_session`]) and closed after
+    /// `serve_connection` returns, also on the deadline path, so a pending
+    /// code-pairing try of that key is counted failed only once no session of
+    /// the key is open and no `code-pair-finish` for it can arrive.
     pub async fn serve_session(self: Arc<Self>, accepted: Accepted) {
         let Accepted {
             connection,
@@ -341,7 +352,15 @@ impl OpsServing {
         //    only serialization, and only for the append.
         let ops_stream = QuicOpsStream::new(send, recv);
         let server = self.server.clone();
+        let code_pairing = self.code_pairing.clone();
+        let peer_key = *remote_id.as_bytes();
         let mut join = tokio::task::spawn_blocking(move || {
+            // Open for the session's whole blocking run, and dropped after
+            // `serve_connection` returned, so after any `code-pair-finish`
+            // this session sends: a code-pairing try this peer left pending
+            // is counted failed only once no session of its key is open. The
+            // store's lock is taken here, on the blocking thread.
+            let _code_pairing = code_pairing.open_session(peer_key);
             // FAIL-CLOSED on a POISONED receipt sink: a poisoned receipt `Mutex`
             // (inside the shared OpsServer) means a prior session PANICKED mid
             // hash-chain write — exactly when the audit log could be half-written.
