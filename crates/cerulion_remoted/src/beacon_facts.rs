@@ -26,9 +26,10 @@
 //! is a STRING `"0"`/`"1"` so the gateway passes it into the TXT record
 //! verbatim.
 //!
-//! **The reader lives in `cerulion_cli_engine::mdns_discovery`** (it cannot link
-//! this crate — iroh), so the two sides share this shape by convention; keep
-//! them in lockstep (both pin it with the identical literal-JSON oracle).
+//! **The reader lives in `cerulion_mdns`** (`read_beacon_facts_at`; it cannot
+//! link this crate, which pulls iroh), so the two sides share this shape by
+//! convention; keep them in lockstep (both pin it with the identical
+//! literal-JSON oracle).
 //!
 //! ## Lifecycle
 //!
