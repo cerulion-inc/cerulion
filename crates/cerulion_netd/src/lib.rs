@@ -167,6 +167,11 @@ pub use wan::{
     parse_robots_spec, pick_plane, DeskPathInputs, DualMirrorPlane, Plane, WanRegistry, WanRobot,
 };
 
+/// Shell scripts a test writes and runs at once, guarded against ETXTBSY. The
+/// `tests/*.rs` binaries that need it compile the same file by `#[path]`.
+#[cfg(all(test, unix))]
+mod fresh_executable;
+
 /// The ONE crate-wide lock serializing every env-mutating
 /// **lib** test in `cerulion_netd`.
 ///

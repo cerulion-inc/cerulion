@@ -622,7 +622,7 @@ impl<'loan, T: ShmMessage + 'loan> Drop for OutputProxy<'loan, T> {
                 // consumer in another process that pops and records it while
                 // this drop is still running finds the count already there.
                 // On `Err` it has taken the count back (no-op unless this
-                // topic is wired all-`block`).
+                // topic has a `block` consumer).
                 if let Err(e) = pubr.send_counted(sample_mut) {
                     // The sequence was consumed at commit but the frame
                     // never reached any subscriber queue. Bump the send-fail

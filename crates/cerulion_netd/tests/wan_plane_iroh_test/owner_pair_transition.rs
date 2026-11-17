@@ -108,15 +108,33 @@ fn serving_transition_restores_canonical_and_observer_pins_on_the_same_subscribe
             )
         });
     }
-    let output = std::process::Command::new(directory.path().join("transition-test"))
-        .args([
-            "--ignored",
-            "--exact",
-            "owner_pair::controller::transition::actual_child_fixture",
-            "--test-threads=1",
-            "--nocapture",
-        ])
-        .output()
+    // The fixture child starts the copied remoted; it must not find it busy.
+    let copied_remoted = directory.path().join("cerulion-remoted");
+    let version =
+        crate::fresh_executable::retry_while_busy(crate::fresh_executable::BUSY_PAUSE, || {
+            std::process::Command::new(&copied_remoted)
+                .arg("--version")
+                .output()
+        })
+        .unwrap();
+    assert!(
+        version.status.success(),
+        "{} --version: {}",
+        copied_remoted.display(),
+        String::from_utf8_lossy(&version.stderr)
+    );
+    let output =
+        crate::fresh_executable::retry_while_busy(crate::fresh_executable::BUSY_PAUSE, || {
+            std::process::Command::new(directory.path().join("transition-test"))
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "owner_pair::controller::transition::actual_child_fixture",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .output()
+        })
         .unwrap();
     assert!(
         output.status.success(),

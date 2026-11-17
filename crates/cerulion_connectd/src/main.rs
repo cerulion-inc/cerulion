@@ -469,7 +469,14 @@ async fn shutdown_signal() {
         if std::io::stdin().is_terminal() {
             std::future::pending::<()>().await;
         } else {
-            let _ = tokio::task::spawn_blocking(|| {
+            // The blocking read runs on a detached thread that reports the end
+            // over a oneshot, so after a Ctrl-C the process exits with the read
+            // still parked on an open stdin. Dropping the runtime waits for
+            // every running blocking-pool task, a parked `spawn_blocking` read
+            // included, but never for a plain thread, which the process exit
+            // ends.
+            let (eof_tx, eof_rx) = tokio::sync::oneshot::channel::<()>();
+            std::thread::spawn(move || {
                 let mut buf = [0u8; 64];
                 // Read until EOF (0) or error; the parent closing our stdin ends it.
                 while let Ok(n) = std::io::stdin().read(&mut buf) {
@@ -477,8 +484,11 @@ async fn shutdown_signal() {
                         break;
                     }
                 }
-            })
-            .await;
+                let _ = eof_tx.send(());
+            });
+            // A reader thread that ended without sending (it panicked) ends
+            // the watch too.
+            let _ = eof_rx.await;
             tracing::info!("cerulion connect: stdin closed (parent went away)");
         }
     };
