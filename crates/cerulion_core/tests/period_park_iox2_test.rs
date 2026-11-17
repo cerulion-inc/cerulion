@@ -491,9 +491,9 @@ fn ticker_run(tag: &str, period_park: bool, fires: usize) -> (Vec<u64>, Vec<f64>
 /// Under the period-park a 1 kHz node still fires on its grid: after its
 /// start-up catch-up, almost no fire lands less than half a period after the
 /// previous one and the median gap is the period. Judged where the
-/// period-park applies; on any other host the live loop's own grid is
-/// `live_exact_deadline_iox2_test`'s, and this arm asserts the switch did
-/// nothing.
+/// period-park applies; on any other host this arm asserts the switch did
+/// nothing (the plain loop's grid is judged, on Linux, by
+/// `live_exact_deadline_iox2_test`).
 #[test]
 #[serial]
 fn a_period_node_under_the_period_park_stays_on_its_grid() {
