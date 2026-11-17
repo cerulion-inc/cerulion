@@ -357,7 +357,7 @@ fn every_iceoryx2_patch_tracks_the_root_fork_rev() {
     for manifest in patched.keys() {
         if UNLOCKED_FIXTURE_ROOTS
             .iter()
-            .any(|root| manifest.starts_with(root))
+            .any(|prefix| manifest.starts_with(prefix))
         {
             continue;
         }
@@ -496,7 +496,11 @@ fn collect_manifests(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
 }
 
 /// Every `Cargo.lock` under `dir`, skipping build output and version control.
-/// Depth-bounded so a symlink loop cannot turn this into a hang.
+/// Depth-bounded so a symlink loop cannot turn this into a hang. It stops four
+/// directories below the root, shallower than the manifest walk: the only
+/// lockfiles under `crates/cerulion_py/fixtures/pynodes` (five and seven below)
+/// are ones a local build leaves, which can name an earlier fork rev (see
+/// [`UNLOCKED_FIXTURE_ROOTS`]).
 fn collect_lockfiles(dir: &PathBuf, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > 4 {
         return;
