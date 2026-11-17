@@ -410,12 +410,14 @@ const FRAMEWORK_SECTION_V1_PREFIX: usize = 4 + 1 + 8 + 8 + 4;
 ///
 /// # Whose view this is
 ///
-/// It is the CAPTURE CARRIER's composite, not one subsystem's. Four of the
-/// fields are read off the `Scheduler` (`next_fire_ns`, `pending_data_count`,
-/// `sync_input_timestamps`, `stopped` — `Scheduler::node_framework_state`
-/// supplies them);
-/// [`Self::input_service`] is read off the graph runtime's per-input SERVICE
-/// CURSORS, which live on the transport ports. They ride ONE section because a
+/// It is the CAPTURE CARRIER's composite, not one subsystem's.
+/// `Scheduler::node_framework_state` supplies four of the fields:
+/// `next_fire_ns`, `pending_data_count`, `sync_input_timestamps` and
+/// `stopped`. The graph runtime fills the rest: [`Self::input_service`] from
+/// its per-input SERVICE CURSORS, which live on the transport ports, and the
+/// capture-time Sync tail ([`Self::sync_capture_high_water`],
+/// [`Self::sync_epoch_floor`]) from its capture ports and the scheduler's
+/// epoch floor. They ride ONE section because a
 /// reader cannot usefully hold one without the other: the scheduler's counters
 /// say what the node was owed, and the cursors say which frames it had already
 /// been served, and only the pair describes the state a resume must re-create.
@@ -430,7 +432,7 @@ const FRAMEWORK_SECTION_V1_PREFIX: usize = 4 + 1 + 8 + 8 + 4;
 /// `callback: Box<dyn FnMut() + Send>` and `Arc<AtomicU64>` handles shared with
 /// `NodeHandle`. Those are WIRING, rebuilt by `GraphRuntime::build`. What a
 /// resumed graph cannot rebuild is the node's TIMING and TRIGGER state — the
-/// first three plain-data fields below — and without them a resumed graph
+/// plain-data fields below — and without them a resumed graph
 /// executes a different schedule from the one the recording holds while
 /// reporting the difference as the candidate's fault:
 ///
@@ -445,6 +447,10 @@ const FRAMEWORK_SECTION_V1_PREFIX: usize = 4 + 1 + 8 + 8 + 4;
 ///   `sync_window_ms = 50` fusion node checkpointed with `/cam` arrived and
 ///   `/lidar` not must restore with `/cam` STILL arrived, or it waits for a
 ///   second `/cam` the recording never sent.
+/// * `stopped`: a node the scheduler had stopped (a `NodeError::Fatal`
+///   return, or the consecutive-panic breaker) is rebuilt enabled, so a
+///   resumed graph would fire it again where the recording holds no fire of
+///   it.
 ///
 /// # It is a VALUE, never an identity
 ///
@@ -509,7 +515,9 @@ pub struct NodeFrameworkState {
     ///
     /// Empty on every other node. A section with neither this table nor an
     /// epoch floor ([`Self::sync_epoch_floor`]) does not write it, so it stays
-    /// at the version it had before this table existed. A
+    /// at the version it had before this table existed, unless the node is
+    /// stopped: a version-5 section writes every earlier tail, so it writes
+    /// this table empty. A
     /// version-3 section with no version-2 table to precede it writes an
     /// empty one, so it decodes as "no per-message FIFO input" (`Some({})`);
     /// only a per-set Sync node carries capture state, and the runtime always
@@ -528,7 +536,8 @@ pub struct NodeFrameworkState {
     ///
     /// Only a section that states a floor is written at version 4, the
     /// version that carries it; every other section keeps the version it
-    /// had before the floor existed.
+    /// had before the floor existed. A stopped node's version-5 section
+    /// writes the floor's tail anyway, stating it absent when there is none.
     pub sync_epoch_floor: Option<u64>,
     /// `ScheduledNode::disabled` at the anchor boundary: the scheduler had
     /// stopped this node, after a `NodeError::Fatal` return or a tripped
@@ -742,11 +751,13 @@ impl NodeFrameworkState {
 
     /// Read a section body back.
     ///
-    /// Total inverse of [`Self::encode`] for a version-1 section. A section
-    /// declaring a HIGHER version is read for its version-1 prefix and its
-    /// remainder ignored — the additive contract — while anything this build
-    /// cannot make sense of is a refusal naming the node and what was wrong,
-    /// never a silently empty section.
+    /// Reads every structure the section's version declares: the version-1
+    /// prefix, then each later tail in order. Bytes past the last structure
+    /// this build knows are ignored (the additive contract), and so are the
+    /// flag bits a version after 5 may add; at version 5 every flag bit but
+    /// bit 0 is refused. Anything else this build cannot make sense of is a
+    /// refusal naming the node and what was wrong, never a silently empty
+    /// section.
     pub fn decode(node: &str, bytes: &[u8]) -> Result<Self, RestoreRefusal> {
         let malformed = |reason: String| RestoreRefusal::MalformedFrameworkSection {
             node: node.to_string(),

@@ -624,7 +624,9 @@ fn a_stopped_section_round_trips_exactly() {
 fn a_running_nodes_section_keeps_the_version_it_had_and_reads_as_running() {
     // The flags byte is written only for a stopped node, so every running
     // node's section keeps the version and bytes it had before the byte
-    // existed (the hand vectors of those versions are pinned above).
+    // existed. The version-1, -3 and -4 bytes are pinned by hand above and the
+    // version-2 bytes in `a_v2_section_is_pinned_bytes_in_each_shape` below;
+    // this arm pins the version word and the decoded stop.
     for (section, version) in [
         (populated_section(), 1u32),
         (populated_v2_section(), 2),
@@ -689,19 +691,99 @@ fn an_unknown_flag_bit_and_a_missing_flag_byte_are_refused() {
         }
     }
 
-    // A version-5 section that ends before its flags byte is refused, never
-    // read as running.
-    let mut bytes = stopped_only_bytes();
-    bytes.pop();
-    match NodeFrameworkState::decode("sink", &bytes) {
-        Err(RestoreRefusal::MalformedFrameworkSection { reason, .. }) => {
-            assert!(
-                reason.contains("declares a node flags byte") && reason.contains("42 byte(s)"),
-                "{reason}"
-            );
+    // A section of version 5 or later that ends before its flags byte is
+    // refused, never read as running.
+    for version in [5u32, 6] {
+        let mut bytes = stopped_only_bytes();
+        bytes[0..4].copy_from_slice(&version.to_le_bytes());
+        bytes.pop();
+        match NodeFrameworkState::decode("sink", &bytes) {
+            Err(RestoreRefusal::MalformedFrameworkSection { node, reason }) => {
+                assert_eq!(node, "sink");
+                assert!(
+                    reason.contains(&format!(
+                        "a version-{version} section declares a node flags byte"
+                    )) && reason.contains("42 byte(s)"),
+                    "{reason}"
+                );
+            }
+            other => panic!("version {version}: a missing flags byte must refuse, got {other:?}"),
         }
-        other => panic!("a missing flags byte must refuse, got {other:?}"),
     }
+}
+
+#[test]
+fn a_v2_section_is_pinned_bytes_in_each_shape() {
+    // The version-2 tail is written whenever a later tail follows or the node
+    // states a table, so each shape that reaches it is pinned by hand: a
+    // populated table, an empty stated table alone, and the empty table a
+    // version-3 section writes ahead of its own.
+    let mut v1 = VecSink::new();
+    populated_section().encode(&mut v1).expect("fits");
+    let v1 = v1.into_inner();
+
+    // (a) The populated table: 59 v1 bytes, then two cursors sorted by name.
+    let section = populated_v2_section();
+    let mut sink = VecSink::new();
+    section.encode(&mut sink).expect("fits");
+    let bytes = sink.into_inner();
+    let mut expected = v1.clone();
+    expected[0..4].copy_from_slice(&2u32.to_le_bytes());
+    expected.extend_from_slice(&2u32.to_le_bytes()); // two cursors
+    expected.extend_from_slice(&3u32.to_le_bytes());
+    expected.extend_from_slice(b"cam");
+    expected.push(1); // served
+    expected.extend_from_slice(&0x0055_6677u32.to_le_bytes());
+    expected.extend_from_slice(&5u32.to_le_bytes());
+    expected.extend_from_slice(b"lidar");
+    expected.push(0); // nothing served
+    expected.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(bytes.len(), 89);
+    assert_eq!(section.encoded_len(), 89, "encoded_len matches encode");
+
+    // (b) An empty stated table alone: the 25-byte prefix at version 2, then
+    // a zero count.
+    let section = NodeFrameworkState {
+        input_service: Some(std::collections::BTreeMap::new()),
+        ..Default::default()
+    };
+    let mut sink = VecSink::new();
+    section.encode(&mut sink).expect("fits");
+    let bytes = sink.into_inner();
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // version 2
+    expected.push(0x00); // no next fire
+    expected.extend_from_slice(&[0x00; 8]);
+    expected.extend_from_slice(&[0x00; 8]); // pending data
+    expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // no sync heads
+    expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty service table
+    assert_eq!(bytes, expected);
+    assert_eq!(bytes.len(), 29);
+    assert_eq!(section.encoded_len(), 29, "encoded_len matches encode");
+
+    // (c) A version-3 section with no table of its own writes an empty one
+    // ahead of the high-water table.
+    let section = NodeFrameworkState {
+        input_service: None,
+        ..populated_v3_section()
+    };
+    let mut sink = VecSink::new();
+    section.encode(&mut sink).expect("fits");
+    let bytes = sink.into_inner();
+    let mut expected = v1.clone();
+    expected[0..4].copy_from_slice(&3u32.to_le_bytes());
+    expected.extend_from_slice(&0u32.to_le_bytes()); // empty service table
+    expected.extend_from_slice(&2u32.to_le_bytes()); // high-water count
+    expected.extend_from_slice(&4u32.to_le_bytes());
+    expected.extend_from_slice(b"/cam");
+    expected.extend_from_slice(&0x0000_0000_7777_8888u64.to_le_bytes());
+    expected.extend_from_slice(&6u32.to_le_bytes());
+    expected.extend_from_slice(b"/lidar");
+    expected.extend_from_slice(&0x0000_0000_5555_6666u64.to_le_bytes());
+    assert_eq!(bytes, expected);
+    assert_eq!(bytes.len(), 101);
+    assert_eq!(section.encoded_len(), 101, "encoded_len matches encode");
 }
 
 #[test]
@@ -1238,6 +1320,11 @@ fn no_capture_can_write_a_section_below_the_readers_floor() {
             ..Default::default()
         },
         populated_section(),
+        populated_v2_section(),
+        NodeFrameworkState {
+            input_service: Some(Default::default()),
+            ..Default::default()
+        },
         NodeFrameworkState {
             stopped: true,
             ..Default::default()
