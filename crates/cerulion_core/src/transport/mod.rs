@@ -49,6 +49,7 @@ pub mod ingress_build;
 pub mod input_view;
 pub mod kind;
 pub mod liveness;
+pub(crate) mod marker_teardown;
 pub mod mirror_origin;
 pub mod mirror_registry;
 pub mod network;
