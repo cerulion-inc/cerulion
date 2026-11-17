@@ -500,6 +500,13 @@ fn record_e2e_ctrl_c_exits_zero_with_finalized_bag_and_ordered_lifecycle() {
         recorder["recorded_at_ns"].as_u64().unwrap_or(0) > 0,
         "recorder.json carries the recording start timestamp: {recorder}"
     );
+    // Each native node's driver flag, from the loaded library: the period
+    // fixture is an ordinary node.
+    assert_eq!(
+        recorder["node_external"],
+        serde_json::json!({"ticker": false}),
+        "recorder.json names every node's driver flag: {recorder}"
+    );
 
     // Ordered lifecycle in the merged child log. The lifecycle breadcrumbs are
     // `tracing::info!` events, which go to STDERR (init_logging writes there so
