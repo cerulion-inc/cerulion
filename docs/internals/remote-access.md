@@ -192,6 +192,18 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Shell policy**: `cerulion_remoted::shell_policy::ShellPolicy` and
+  `PairingAuthorizer::with_shell_policy` share a live owner setting. Shell and
+  exec require the owner tier and the effective policy; a missing policy handle
+  refuses execution. An absent persisted file defaults on, while unreadable,
+  malformed, oversized, symlinked or wrongly permissioned files disable access.
+  On Unix, the opened file must match the inspected file. The immutable robot-local
+  prohibition wins over the owner setting. Settings are synced before becoming
+  effective, and a failed persistence attempt disables live access. Ordinary
+  ops and the owner policy handler remain available while shell access is off.
+  These library components authorize and persist settings; they do not launch
+  a process or register a daemon command themselves.
+
 - **Local identity**: `cerulion_wireclient::local_identity` holds the existing
   never-renamed auth-store lock while reading the account and actual machine key.
   A busy writer refuses immediately. Identity-only reads never open certificate

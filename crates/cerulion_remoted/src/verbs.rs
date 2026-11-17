@@ -65,6 +65,13 @@ pub const CODE_PAIR_START: &str = "code-pair-start";
 /// persist the code-paired access row (the durable, mutating effect).
 pub const CODE_PAIR_FINISH: &str = "code-pair-finish";
 
+/// Owner-only interactive terminal session.
+pub const SHELL: &str = "shell";
+/// Owner-only command execution session.
+pub const EXEC: &str = "exec";
+/// Owner-only policy inspection and mutation.
+pub const REMOTE_SHELL_POLICY: &str = "remote-shell-policy";
+
 // ── Owner robot settings ─────────────────────────────────────────────────────
 
 /// Read or set the robot's allow-from-cloud switch (`{"allow": bool}` sets it;

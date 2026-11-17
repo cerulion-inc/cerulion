@@ -373,6 +373,97 @@ fn paired_with_cap_is_allowed() {
 }
 
 #[test]
+fn shell_and_exec_require_owner_and_a_live_enabled_policy() {
+    let (authz, fixtures) = claimed_authorizer();
+    let dir = tempfile::tempdir().unwrap();
+    let policy =
+        cerulion_remoted::shell_policy::ShellPolicy::load(dir.path().join("policy.json"), false);
+    let authz = authz.with_shell_policy(policy.clone());
+    for verb in [verbs::SHELL, verbs::EXEC] {
+        assert_allow(
+            authz.authorize_verb(&caller_for(&fixtures.owner_device_key), verb),
+            "owner session",
+        );
+        for key in [
+            fixtures.viewer_device_key,
+            fixtures.operator_device_key,
+            fixtures.unpaired_device_key,
+        ] {
+            assert!(matches!(
+                authz.authorize_verb(&caller_for(&key), verb),
+                AuthzDecision::Deny { .. }
+            ));
+        }
+    }
+    policy.set_enabled(false).unwrap();
+    for verb in [verbs::SHELL, verbs::EXEC] {
+        assert_deny(
+            authz.authorize_verb(&caller_for(&fixtures.owner_device_key), verb),
+            "disabled",
+            "owner switch off",
+        );
+    }
+    assert_allow(
+        authz.authorize_verb(
+            &caller_for(&fixtures.owner_device_key),
+            verbs::REMOTE_SHELL_POLICY,
+        ),
+        "owner can restore policy",
+    );
+    policy.set_enabled(true).unwrap();
+    assert_allow(
+        authz.authorize_verb(&caller_for(&fixtures.owner_device_key), verbs::EXEC),
+        "owner switch restored",
+    );
+}
+
+#[test]
+fn shell_policy_is_owner_only_and_hard_off_denies_execution() {
+    let (authz, fixtures) = claimed_authorizer();
+    let dir = tempfile::tempdir().unwrap();
+    let policy =
+        cerulion_remoted::shell_policy::ShellPolicy::load(dir.path().join("policy.json"), true);
+    let authz = authz.with_shell_policy(policy.clone());
+    for key in [fixtures.viewer_device_key, fixtures.operator_device_key] {
+        assert!(matches!(
+            authz.authorize_verb(&caller_for(&key), verbs::REMOTE_SHELL_POLICY),
+            AuthzDecision::Deny { .. }
+        ));
+    }
+    assert!(policy.set_enabled(true).is_err());
+    for verb in [verbs::SHELL, verbs::EXEC] {
+        assert_deny(
+            authz.authorize_verb(&caller_for(&fixtures.owner_device_key), verb),
+            "disabled",
+            "local hard off",
+        );
+    }
+}
+
+#[test]
+fn missing_policy_handle_refuses_sessions_without_blocking_ordinary_ops() {
+    let (authz, fixtures) = claimed_authorizer();
+    let owner = caller_for(&fixtures.owner_device_key);
+    for verb in [verbs::SHELL, verbs::EXEC] {
+        assert_deny(
+            authz.authorize_verb(&owner, verb),
+            "disabled",
+            "no policy handle",
+        );
+    }
+    for verb in [
+        verbs::INVENTORY,
+        verbs::ENGAGE_ESTOP,
+        verbs::REMOTE_SHELL_POLICY,
+    ] {
+        assert_allow(
+            authz.authorize_verb(&owner, verb),
+            "ordinary owner operation",
+        );
+    }
+}
+
+#[test]
 fn paired_without_cap_is_denied() {
     let (authz, f) = claimed_authorizer();
     let viewer = caller_for(&f.viewer_device_key);

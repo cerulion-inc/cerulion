@@ -7,8 +7,8 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
   final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
-- `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
-  verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
+- `PairingAuthorizer` classifies accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
+  Shell/exec: owner + policy; missing file ON, invalid OFF; absent handle denies, immutable hard-off wins.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
