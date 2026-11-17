@@ -273,6 +273,7 @@ fn write_worker_plan(dir: &Path, ns: &str, ready: &Path, ix_config_json: String)
         sibling_consumed_topics: cerulion_core::graph::SiblingConsumedTopics::default(),
         // No credit-backed cross-process `block` edge.
         credit_edges: Vec::new(),
+        paced_topic_warnings: Vec::new(),
         // Not recording in this harness (the supervisor stamps the
         // ring tag in production; the worker recording seam has its own pins).
         recording_ring: None,
