@@ -548,22 +548,19 @@ fn a_robot_whose_clock_is_far_behind_the_service_fetches_after_one_retry() {
 fn a_robot_whose_accepted_time_ran_ahead_and_whose_clock_then_fell_behind_fetches() {
     let desk = desk();
     let (root, _robot_id, revoked) = registered_robot(&desk);
-    // A first fetch: the service accepts this machine's request time.
     lapse_the_session(&desk);
+    let minute = 60 * 1_000_000_000;
+    // The service twelve minutes ahead of this machine: a skew refusal, then
+    // the retry at the service's time is accepted, so the robot's accepted
+    // request time is now that time.
+    desk.clock.store(wall_ns() + 12 * minute, Ordering::SeqCst);
     robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
-    assert_eq!(access_requests(&desk), (1, 1, 0));
-    // The service's clock two minutes behind the request time it accepted, so
-    // that time was ahead of it; and this machine's next request refused for
-    // skew (the shape of its clock stepping ten minutes behind), naming the
-    // service's time and no next request time.
-    let service_now = wall_ns() - 120 * 1_000_000_000;
-    desk.clock.store(service_now, Ordering::SeqCst);
-    desk.overrides.lock().unwrap().push((
-        "/access/challenge ".into(),
-        403,
-        format!(r#"{{"error":"proof_of_possession_failed","server_time_ns":"{service_now}"}}"#),
-        true,
-    ));
+    assert_eq!(access_requests(&desk), (2, 1, 0));
+    // The service at ten minutes ahead: this machine is ten minutes behind it
+    // (a skew refusal naming no next time), and the service's own time is
+    // two minutes behind the accepted request (a replay refusal naming the
+    // next time it accepts).
+    desk.clock.store(wall_ns() + 10 * minute, Ordering::SeqCst);
     desk.log.lock().unwrap().clear();
     let mut out = Vec::new();
     robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
@@ -575,7 +572,35 @@ fn a_robot_whose_accepted_time_ran_ahead_and_whose_clock_then_fell_behind_fetche
         pending_epoch(&root).signed_epoch.epoch_data.revoked_devices,
         vec![cerulion_pairing::format::PublicKey(revoked)]
     );
-    // The skew refusal, the retry at the service's time refused as a replay,
-    // the retry at the next time it names, and one signed read; no session.
+    // The skew refusal, the replay refusal, the request at the next time, and
+    // one signed read; no session.
     assert_eq!(access_requests(&desk), (3, 1, 0));
+}
+
+#[test]
+#[serial]
+fn a_request_time_refused_three_times_falls_back_to_the_login_session() {
+    let desk = desk();
+    let (root, _robot_id, revoked) = registered_robot(&desk);
+    desk.overrides.lock().unwrap().push((
+        "/access/challenge ".into(),
+        403,
+        format!(
+            r#"{{"error":"proof_of_possession_failed","server_time_ns":"{}"}}"#,
+            wall_ns()
+        ),
+        false,
+    ));
+    let mut out = Vec::new();
+    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\"epoch\":1,\"version\":1}\n"
+    );
+    assert_eq!(
+        pending_epoch(&root).signed_epoch.epoch_data.revoked_devices,
+        vec![cerulion_pairing::format::PublicKey(revoked)]
+    );
+    // Three challenge requests, no signed read, then the session read.
+    assert_eq!(access_requests(&desk), (3, 0, 1));
 }
