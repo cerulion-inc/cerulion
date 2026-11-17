@@ -342,7 +342,7 @@ pub fn capture_anchor_blob_with_framework<T: CerulionState>(
 /// within the section's declared length — which is what makes a future field an
 /// addition rather than a break. It is the section's LENGTH, not this number,
 /// that bounds the skip.
-pub const FRAMEWORK_SECTION_WRITE_VERSION: u32 = 4;
+pub const FRAMEWORK_SECTION_WRITE_VERSION: u32 = 5;
 
 /// The LOWEST framework-section version this build can read.
 ///
@@ -383,6 +383,24 @@ const FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION: u32 = 3;
 /// the floor existed.
 const FRAMEWORK_SECTION_EPOCH_FLOOR_VERSION: u32 = 4;
 
+/// The first section version that carries the node flags byte
+/// ([`NODE_FLAG_STOPPED`]), after the epoch floor.
+///
+/// A version-5 section always carries every earlier tail: the input-service
+/// table, the capture high-water table and the epoch floor, each stated empty
+/// or absent when the node has nothing to say there. Only a stopped node's
+/// section is written at version 5, so a running node's section keeps the
+/// version it had before the flags byte existed, byte for byte.
+const FRAMEWORK_SECTION_NODE_FLAGS_VERSION: u32 = 5;
+
+/// Bit 0 of a version-5 section's flags byte: the node had stopped at the
+/// anchor boundary ([`NodeFrameworkState::stopped`]).
+///
+/// At version 5 every other bit is refused. A section of a later version may
+/// define more bits, and this build reads bit 0 and ignores the rest, as the
+/// additive contract above asks.
+pub const NODE_FLAG_STOPPED: u8 = 0x01;
+
 /// Bytes a version-1 section carries ahead of its sync-input table:
 /// `version(u32) ++ next_fire_present(u8) ++ next_fire_ns(u64) ++
 /// pending_data_count(u64) ++ sync_count(u32)`.
@@ -392,9 +410,10 @@ const FRAMEWORK_SECTION_V1_PREFIX: usize = 4 + 1 + 8 + 8 + 4;
 ///
 /// # Whose view this is
 ///
-/// It is the CAPTURE CARRIER's composite, not one subsystem's. Three of the
+/// It is the CAPTURE CARRIER's composite, not one subsystem's. Four of the
 /// fields are read off the `Scheduler` (`next_fire_ns`, `pending_data_count`,
-/// `sync_input_timestamps` — `Scheduler::node_framework_state` supplies them);
+/// `sync_input_timestamps`, `stopped` — `Scheduler::node_framework_state`
+/// supplies them);
 /// [`Self::input_service`] is read off the graph runtime's per-input SERVICE
 /// CURSORS, which live on the transport ports. They ride ONE section because a
 /// reader cannot usefully hold one without the other: the scheduler's counters
@@ -511,6 +530,18 @@ pub struct NodeFrameworkState {
     /// version that carries it; every other section keeps the version it
     /// had before the floor existed.
     pub sync_epoch_floor: Option<u64>,
+    /// `ScheduledNode::disabled` at the anchor boundary: the scheduler had
+    /// stopped this node, after a `NodeError::Fatal` return or a tripped
+    /// circuit breaker, and fires it no more.
+    ///
+    /// A node whose entry was poisoned by a host-side panic is NOT stopped:
+    /// the scheduler keeps firing it and its callback returns cleanly, so the
+    /// recording holds those fires.
+    ///
+    /// `true` writes the section at version 5 with [`NODE_FLAG_STOPPED`] set;
+    /// `false` leaves the section at the version it had before the flags byte
+    /// existed. A section below version 5 decodes as `false`.
+    pub stopped: bool,
 }
 
 /// What a recording says about ONE input's service cursor.
@@ -540,6 +571,7 @@ impl NodeFrameworkState {
     /// no pending data writes exactly the v1 bytes.
     pub fn is_empty(&self) -> bool {
         self.next_fire_ns.is_none()
+            && !self.stopped
             && self.pending_data_count == 0
             && self.sync_input_timestamps.is_empty()
             && !self.has_capture_tail()
@@ -586,7 +618,9 @@ impl NodeFrameworkState {
     /// The section version these bytes are written at — CONTENT-dependent, see
     /// [`FRAMEWORK_SECTION_WRITE_VERSION`].
     fn wire_version(&self) -> u32 {
-        if self.sync_epoch_floor.is_some() {
+        if self.stopped {
+            FRAMEWORK_SECTION_NODE_FLAGS_VERSION
+        } else if self.sync_epoch_floor.is_some() {
             FRAMEWORK_SECTION_EPOCH_FLOOR_VERSION
         } else if self.has_capture_tail() {
             FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION
@@ -604,21 +638,24 @@ impl NodeFrameworkState {
     /// byte budget, where an allocation is exactly what the bounded
     /// attempt exists to avoid.
     pub fn encoded_len(&self) -> usize {
+        let version = self.wire_version();
         FRAMEWORK_SECTION_V1_PREFIX
             + self
                 .sync_input_timestamps
                 .keys()
                 .map(|name| 4 + name.len() + 8)
                 .sum::<usize>()
-            + match &self.input_service {
-                Some(m) => 4 + m.keys().map(|name| 4 + name.len() + 1 + 4).sum::<usize>(),
-                // A version-3 section writes an empty version-2 table ahead of
-                // its own.
-                None if self.has_capture_tail() => 4,
-                None => 0,
+            // The version-2 tail: the service table, stated empty when a
+            // later tail must follow it and the node states none.
+            + if version >= FRAMEWORK_SECTION_INPUT_SERVICE_VERSION {
+                4 + self.input_service.as_ref().map_or(0, |m| {
+                    m.keys().map(|name| 4 + name.len() + 1 + 4).sum::<usize>()
+                })
+            } else {
+                0
             }
-            + if self.has_capture_tail() {
-                // The version-3 high-water table.
+            // The version-3 high-water table, possibly empty.
+            + if version >= FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION {
                 4 + self
                     .sync_capture_high_water
                     .keys()
@@ -628,7 +665,9 @@ impl NodeFrameworkState {
                 0
             }
             // The version-4 tail: `floor_present(u8) ++ floor(u64)`.
-            + if self.sync_epoch_floor.is_some() { 1 + 8 } else { 0 }
+            + if version >= FRAMEWORK_SECTION_EPOCH_FLOOR_VERSION { 1 + 8 } else { 0 }
+            // The version-5 tail: `flags(u8)`.
+            + if version >= FRAMEWORK_SECTION_NODE_FLAGS_VERSION { 1 } else { 0 }
     }
 
     /// Write the section body — everything INSIDE the length the framing
@@ -638,7 +677,8 @@ impl NodeFrameworkState {
     /// in this repo: the bytes are a format contract, so they must not depend
     /// on the recording host's endianness or on a struct layout.
     pub fn encode(&self, out: &mut dyn StateSink) -> Result<(), StateError> {
-        out.write(&self.wire_version().to_le_bytes())?;
+        let version = self.wire_version();
+        out.write(&version.to_le_bytes())?;
         out.write(&[u8::from(self.next_fire_ns.is_some())])?;
         out.write(&self.next_fire_ns.unwrap_or(0).to_le_bytes())?;
         out.write(&self.pending_data_count.to_le_bytes())?;
@@ -651,26 +691,32 @@ impl NodeFrameworkState {
             out.write(name.as_bytes())?;
             out.write(&ts.to_le_bytes())?;
         }
-        // The version-2 tail. Written only when the section STATES a
-        // table (`wire_version` above), so a section with nothing to say here
-        // is still a version-1 section, byte for byte.
-        if let Some(cursors) = &self.input_service {
-            let count = u32::try_from(cursors.len()).map_err(|_| StateError::SinkFull)?;
-            out.write(&count.to_le_bytes())?;
-            for (name, seq) in cursors {
-                let name_len = u32::try_from(name.len()).map_err(|_| StateError::SinkFull)?;
-                out.write(&name_len.to_le_bytes())?;
-                out.write(name.as_bytes())?;
-                out.write(&[u8::from(seq.is_some())])?;
-                out.write(&seq.unwrap_or(0).to_le_bytes())?;
+        // Each tail is written exactly when the section's version carries it
+        // (`wire_version` above), so a section with nothing to say past
+        // version 1 is still a version-1 section, byte for byte, and a later
+        // tail always follows every earlier one.
+        //
+        // The version-2 tail: the service table, or an empty one when the
+        // node states none and a later tail follows.
+        if version >= FRAMEWORK_SECTION_INPUT_SERVICE_VERSION {
+            match &self.input_service {
+                Some(cursors) => {
+                    let count = u32::try_from(cursors.len()).map_err(|_| StateError::SinkFull)?;
+                    out.write(&count.to_le_bytes())?;
+                    for (name, seq) in cursors {
+                        let name_len =
+                            u32::try_from(name.len()).map_err(|_| StateError::SinkFull)?;
+                        out.write(&name_len.to_le_bytes())?;
+                        out.write(name.as_bytes())?;
+                        out.write(&[u8::from(seq.is_some())])?;
+                        out.write(&seq.unwrap_or(0).to_le_bytes())?;
+                    }
+                }
+                None => out.write(&0u32.to_le_bytes())?,
             }
-        } else if self.has_capture_tail() {
-            // The version-3 table follows the version-2 one: an empty one.
-            out.write(&0u32.to_le_bytes())?;
         }
-        // The version-3 tail, written only when there is capture state to
-        // state: the high-water table.
-        if self.has_capture_tail() {
+        // The version-3 tail: the high-water table, possibly empty.
+        if version >= FRAMEWORK_SECTION_CAPTURE_HIGH_WATER_VERSION {
             let count = u32::try_from(self.sync_capture_high_water.len())
                 .map_err(|_| StateError::SinkFull)?;
             out.write(&count.to_le_bytes())?;
@@ -681,11 +727,15 @@ impl NodeFrameworkState {
                 out.write(&ts.to_le_bytes())?;
             }
         }
-        // The version-4 tail, written only when there is a floor: a section
-        // without one stays at version 3 or below, byte for byte.
-        if let Some(floor) = self.sync_epoch_floor {
-            out.write(&[1])?;
-            out.write(&floor.to_le_bytes())?;
+        // The version-4 tail: the epoch floor, present or stated absent.
+        if version >= FRAMEWORK_SECTION_EPOCH_FLOOR_VERSION {
+            out.write(&[u8::from(self.sync_epoch_floor.is_some())])?;
+            out.write(&self.sync_epoch_floor.unwrap_or(0).to_le_bytes())?;
+        }
+        // The version-5 tail: the node flags byte.
+        if version >= FRAMEWORK_SECTION_NODE_FLAGS_VERSION {
+            let flags = if self.stopped { NODE_FLAG_STOPPED } else { 0 };
+            out.write(&[flags])?;
         }
         Ok(())
     }
@@ -939,6 +989,30 @@ impl NodeFrameworkState {
             let floor =
                 u64::from_le_bytes(bytes[cursor + 1..floor_end].try_into().expect("8 bytes"));
             sync_epoch_floor = (present == 1).then_some(floor);
+            cursor = floor_end;
+        }
+        // The version-5 tail: the node flags byte. At version 5 every bit but
+        // bit 0 is refused, so a corrupt byte is never read as a claim. A
+        // later version may define more bits, so its unknown bits are read
+        // past (the additive contract).
+        let mut stopped = false;
+        if version >= FRAMEWORK_SECTION_NODE_FLAGS_VERSION {
+            let flags = *bytes.get(cursor).ok_or_else(|| {
+                malformed(format!(
+                    "a version-{version} section declares a node flags byte after its epoch \
+                     floor, but the section ends after {} byte(s)",
+                    bytes.len()
+                ))
+            })?;
+            let unknown = flags & !NODE_FLAG_STOPPED;
+            if version == FRAMEWORK_SECTION_NODE_FLAGS_VERSION && unknown != 0 {
+                return Err(malformed(format!(
+                    "the node flags byte is {flags:#04x}, and bit {} is not defined at section \
+                     version {version}",
+                    unknown.trailing_zeros()
+                )));
+            }
+            stopped = flags & NODE_FLAG_STOPPED != 0;
         }
 
         Ok(Self {
@@ -948,6 +1022,7 @@ impl NodeFrameworkState {
             input_service,
             sync_capture_high_water,
             sync_epoch_floor,
+            stopped,
         })
     }
 }

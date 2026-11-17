@@ -318,6 +318,7 @@ fn counter_framework_oracle(step: u64) -> cerulion_core::state_restore::NodeFram
         input_service: None,
         sync_capture_high_water: Default::default(),
         sync_epoch_floor: None,
+        stopped: false,
     }
 }
 
