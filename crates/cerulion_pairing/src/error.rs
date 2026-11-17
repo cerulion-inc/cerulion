@@ -269,6 +269,10 @@ pub enum PairingError {
     /// The underlying CPace primitive rejected a message.
     #[error("CPace protocol error: {0}")]
     PakeProtocol(&'static str),
+    /// A pair-code request or result file (`pair_code`) breaks its grammar, or
+    /// a result was asked for a ceremony policy it cannot state.
+    #[error("pair-code file: {0}")]
+    PairCodeFile(&'static str),
 
     // ---- team trust formats ------------------------------------------------
     /// A team short name is not one DNS label of `[a-z0-9-]`, 1 to 63
