@@ -13,7 +13,7 @@ use cerulion_pairing::format::{
     PublicKey, RobotId, RootSet, SignedDeviceCert, SignedGrant, SignedIntermediateCert,
     FORMAT_VERSION,
 };
-use cerulion_pairing::verify::{PairingPresentation, TrustStore};
+use cerulion_pairing::verify::{PairingPresentation, TrustStore, MAX_EPOCH_PENDING_BYTES};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{CliError, CliResult};
@@ -216,7 +216,7 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
                 }
             }
             let pending = remoted.join(EPOCH_PENDING_FILE);
-            auth::atomic_write_secret(&pending, hex::encode(postcard).as_bytes())?;
+            auth::atomic_write_secret(&pending, &pending_epoch_text(&postcard)?)?;
             Some(access.epoch)
         }
     };
@@ -227,6 +227,20 @@ pub fn sync_epoch(state_root: &Path, out: &mut impl Write) -> CliResult<()> {
     .map_err(|_| refused("could not encode the worker result"))?;
     writeln!(out)?;
     Ok(())
+}
+
+/// The epoch file text for an epoch's `postcard`: its hex, refused above
+/// [`MAX_EPOCH_PENDING_BYTES`], which the remote-plane daemon discards unread.
+fn pending_epoch_text(postcard: &[u8]) -> CliResult<Vec<u8>> {
+    let text = hex::encode(postcard).into_bytes();
+    if text.len() > MAX_EPOCH_PENDING_BYTES {
+        return Err(refused(&format!(
+            "the fetched epoch is {} bytes as hex, above the {MAX_EPOCH_PENDING_BYTES}-byte \
+             bound the remote-plane daemon applies; revocations were not synced",
+            text.len()
+        )));
+    }
+    Ok(text)
 }
 
 /// The session fallback of [`sync_epoch`]: the robot's access state over this
@@ -340,7 +354,7 @@ fn fetch_access_by_robot_proof(
             }))
             .send()
             .map_err(|e| refused(&format!("the robot access challenge request failed: {e}")))?;
-        read_answer(response, "robot access challenge")
+        read_answer(response, "robot access challenge", MAX_BUNDLE_BYTES)
     };
     // Each retry signs the later of the service's time and the next request
     // time it names.
@@ -387,7 +401,11 @@ fn fetch_access_by_robot_proof(
         }))
         .send()
         .map_err(|e| refused(&format!("the robot access request failed: {e}")))?;
-    let access = match read_answer::<account_cmd::RobotAccess>(response, "robot access")? {
+    let access = match read_answer::<account_cmd::RobotAccess>(
+        response,
+        "robot access",
+        MAX_ROBOT_ACCESS_RESPONSE_BYTES,
+    )? {
         Answer::Body(access) => access,
         Answer::NotFound => return Ok(ProofFetch::NoRoute),
         Answer::RateLimited => return Ok(ProofFetch::RateLimited),
@@ -412,12 +430,30 @@ enum Answer<T> {
     },
 }
 
-/// A success body as `T` (read up to [`MAX_BUNDLE_BYTES`]); 404 and 429 as
-/// themselves; any other status is an error naming it and the service's
-/// description.
+/// The largest robot access response read: twice [`MAX_EPOCH_PENDING_BYTES`].
+/// The epoch file holds an epoch's postcard as hex, 64 bytes per revoked id; the
+/// response holds the same epoch as base64 and each revoked id again as a JSON
+/// string, about 89 bytes per id, so the response for the largest epoch the
+/// remote-plane daemon applies stays under 1.4 times that file.
+const MAX_ROBOT_ACCESS_RESPONSE_BYTES: usize = 2 * MAX_EPOCH_PENDING_BYTES;
+
+/// A success body as `T`, read up to `limit` bytes; 404 and 429 as themselves;
+/// any other status is an error naming it and the service's description.
 fn read_answer<T: serde::de::DeserializeOwned>(
     response: reqwest::blocking::Response,
     what: &str,
+    limit: usize,
+) -> CliResult<Answer<T>> {
+    let status = response.status();
+    answer_from(status, response, what, limit)
+}
+
+/// [`read_answer`] over a response's `status` and `body`.
+fn answer_from<T: serde::de::DeserializeOwned>(
+    status: reqwest::StatusCode,
+    body: impl Read,
+    what: &str,
+    limit: usize,
 ) -> CliResult<Answer<T>> {
     #[derive(Deserialize, Default)]
     struct ErrorBody {
@@ -428,17 +464,14 @@ fn read_answer<T: serde::de::DeserializeOwned>(
         #[serde(default)]
         next_requested_at_ns: Option<String>,
     }
-    let status = response.status();
     match status.as_u16() {
         404 => return Ok(Answer::NotFound),
         429 => return Ok(Answer::RateLimited),
         _ => {}
     }
     let mut bytes = Vec::new();
-    response
-        .take(MAX_BUNDLE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() > MAX_BUNDLE_BYTES {
+    body.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
         return Err(refused(&format!(
             "the {what} response exceeds its size limit"
         )));
@@ -790,6 +823,156 @@ fn create_state_root(path: &Path) -> CliResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An account id or device key as the access response spells it.
+    fn id_text(n: u32) -> String {
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&n.to_be_bytes());
+        URL_SAFE_NO_PAD.encode(id)
+    }
+
+    /// An access response revoking `devices` keys, with no epoch attached.
+    fn access_listing(devices: u32) -> String {
+        let revoked: Vec<String> = (0..devices).map(id_text).collect();
+        serde_json::json!({
+            "robot_id": "R",
+            "epoch": 7,
+            "revoked_accounts": [],
+            "revoked_devices": revoked,
+        })
+        .to_string()
+    }
+
+    fn read_access(body: &str) -> CliResult<Answer<account_cmd::RobotAccess>> {
+        answer_from(
+            reqwest::StatusCode::OK,
+            std::io::Cursor::new(body.as_bytes()),
+            "robot access",
+            MAX_ROBOT_ACCESS_RESPONSE_BYTES,
+        )
+    }
+
+    /// A list of 10,000 revoked keys, past the 256 KiB the registration files
+    /// are held to, is read whole.
+    #[test]
+    fn an_access_response_past_the_registration_bound_is_read_whole() {
+        let body = access_listing(10_000);
+        assert!(body.len() > MAX_BUNDLE_BYTES && body.len() < 1024 * 1024);
+        let Answer::Body(access) = read_access(&body).unwrap() else {
+            panic!("a success body");
+        };
+        assert_eq!(access.epoch, 7);
+        assert_eq!(access.revoked_devices.len(), 10_000);
+        assert_eq!(
+            access.revoked_devices[0],
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        );
+        assert_eq!(access.revoked_devices[9_999], id_text(9_999));
+    }
+
+    /// A response of exactly the access bound is read; one byte more is refused
+    /// with the response named.
+    #[test]
+    fn an_access_response_over_its_bound_is_refused() {
+        let listing = access_listing(1);
+        let at_bound = format!(
+            "{}{listing}",
+            " ".repeat(MAX_ROBOT_ACCESS_RESPONSE_BYTES - listing.len())
+        );
+        assert!(matches!(read_access(&at_bound), Ok(Answer::Body(_))));
+        let over = format!(" {at_bound}");
+        let err = read_access(&over).err().expect("refused");
+        assert!(
+            err.to_string()
+                .ends_with("the robot access response exceeds its size limit"),
+            "{err}"
+        );
+    }
+
+    /// The signed artifacts the service returns for a robot with `devices`
+    /// revoked keys: the access response and the epoch's postcard as the
+    /// worker writes it.
+    fn epoch_parts(devices: u32) -> (String, Vec<u8>) {
+        use cerulion_pairing::format::{
+            AccessListEpoch, IntermediateCert, PublicKey, RobotId, Scope, Validity,
+        };
+        let root = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let issuer = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+        let issuer_key = PublicKey(issuer.verifying_key().to_bytes());
+        let intermediate = IntermediateCert {
+            version: FORMAT_VERSION,
+            intermediate_key: issuer_key,
+            validity: Validity {
+                not_before_ns: 0,
+                not_after_ns: 100_000_000_000_000,
+            },
+            issued_at_ns: 5,
+            max_scope: Scope::OWNER_FULL,
+        }
+        .sign_by_roots(&[&root]);
+        let revoked: Vec<PublicKey> = (0..devices)
+            .map(|n| {
+                let mut key = [0u8; 32];
+                key[..4].copy_from_slice(&n.to_be_bytes());
+                PublicKey(key)
+            })
+            .collect();
+        let signed_epoch = AccessListEpoch {
+            version: FORMAT_VERSION,
+            robot: RobotId([0x0B; 32]),
+            epoch: 1,
+            revoked_accounts: vec![],
+            revoked_devices: revoked,
+            issued_at_ns: 6,
+            issuer_key,
+        }
+        .sign(&issuer);
+        let response = serde_json::json!({
+            "robot_id": "R",
+            "epoch": 1,
+            "revoked_accounts": [],
+            "revoked_devices": (0..devices).map(id_text).collect::<Vec<_>>(),
+            "signed_epoch": URL_SAFE_NO_PAD.encode(postcard::to_stdvec(&signed_epoch).unwrap()),
+            "intermediate": URL_SAFE_NO_PAD.encode(postcard::to_stdvec(&intermediate).unwrap()),
+        })
+        .to_string();
+        let access: account_cmd::RobotAccess = serde_json::from_str(&response).unwrap();
+        let artifact = account_cmd::epoch_cache_artifact_from(&access)
+            .unwrap()
+            .expect("an epoch");
+        (
+            response,
+            URL_SAFE_NO_PAD.decode(artifact.as_bytes()).unwrap(),
+        )
+    }
+
+    /// The largest epoch the remote-plane daemon applies is the one whose file
+    /// fits its bound; one more revoked key is refused before it is written.
+    /// The access response for that epoch is larger than the file and fits the
+    /// access bound, under 1.4 times the file.
+    #[test]
+    fn the_response_for_the_largest_epoch_the_daemon_applies_fits_its_bound() {
+        let (_, empty) = epoch_parts(0);
+        // 32 bytes per key, and a count that takes two bytes from 128 keys.
+        let largest = ((MAX_EPOCH_PENDING_BYTES / 2 - empty.len() - 1) / 32) as u32;
+        let (response, postcard) = epoch_parts(largest);
+        assert_eq!(postcard.len(), empty.len() + 1 + 32 * largest as usize);
+        assert!(pending_epoch_text(&postcard).is_ok());
+        assert!(response.len() > MAX_EPOCH_PENDING_BYTES);
+        assert!(response.len() * 5 < MAX_EPOCH_PENDING_BYTES * 7);
+        assert!(matches!(read_access(&response), Ok(Answer::Body(_))));
+
+        let (_, one_more) = epoch_parts(largest + 1);
+        let err = pending_epoch_text(&one_more).unwrap_err();
+        assert!(
+            err.to_string().ends_with(&format!(
+                "the fetched epoch is {} bytes as hex, above the 1048576-byte bound the \
+                 remote-plane daemon applies; revocations were not synced",
+                2 * one_more.len()
+            )),
+            "{err}"
+        );
+    }
 
     #[test]
     fn a_proof_request_gets_its_timeout_cut_to_what_is_left_of_the_fetch() {
