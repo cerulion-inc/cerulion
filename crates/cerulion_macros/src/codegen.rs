@@ -846,6 +846,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                 Some(ms) => quote! { ::std::option::Option::Some(#ms) },
                 None => quote! { ::std::option::Option::None },
             };
+            let accumulate = i.accumulate.is_some();
             let consume_tok: TokenStream = match i.consume {
                 Some(crate::parse::ParsedConsume::Latest) => {
                     quote! { #__cer_root::graph::node::InputConsume::Latest }
@@ -862,6 +863,7 @@ fn gen_zero_copy_node_entry_impl(params: &NodeEntryParams) -> TokenStream {
                     depth: #depth_tok,
                     backpressure: #backpressure_tok,
                     expect_within_ms: #expect_within_tok,
+                    accumulate: #accumulate,
                     consume: #consume_tok,
                 }
             }

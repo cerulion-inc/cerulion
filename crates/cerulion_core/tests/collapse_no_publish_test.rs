@@ -210,6 +210,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -222,6 +223,7 @@ fn build_period_graph(prefix: &str, val: f64) -> (GraphRuntime, Arc<AtomicU64>, 
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -284,6 +286,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "producer/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![vec3_out("out")],
             },
@@ -296,6 +299,7 @@ fn build_block_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<AtomicU
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
@@ -613,10 +617,12 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                     InputDef {
                         name: "a".to_string(),
                         source: "producer_a/out".to_string(),
+                        ..Default::default()
                     },
                     InputDef {
                         name: "b".to_string(),
                         source: "producer_b/out".to_string(),
+                        ..Default::default()
                     },
                 ],
                 outputs: vec![vec3_out("out")],
@@ -630,6 +636,7 @@ fn build_two_input_graph(prefix: &str) -> (GraphRuntime, Arc<AtomicU64>, Arc<Ato
                 inputs: vec![InputDef {
                     name: "inp".to_string(),
                     source: "dut/out".to_string(),
+                    ..Default::default()
                 }],
                 outputs: vec![],
             },
