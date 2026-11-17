@@ -745,23 +745,35 @@ async fn schema_closure_is_materialized_into_the_desk_store() {
         },
     ));
 
-    // Poll for the materialized store files (bounded); assert byte-exact content.
     let state_msg = schemas_dir
         .path()
         .join("acme")
         .join("msg")
         .join("State.msg");
     let sub_msg = schemas_dir.path().join("acme").join("msg").join("Sub.msg");
+    // Poll for both files to hold their exact text (bounded); on the deadline the
+    // last reads are asserted, so a wrong or missing file is named.
+    let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if state_msg.exists() && sub_msg.exists() {
+        let (state, sub) = (read(&state_msg), read(&sub_msg));
+        if state.as_deref() == Some(root_text) && sub.as_deref() == Some(sub_text) {
             break;
         }
-        assert!(Instant::now() < deadline, "schema files never materialized");
+        if Instant::now() >= deadline {
+            assert_eq!(
+                state.as_deref(),
+                Some(root_text),
+                "the root schema materialized"
+            );
+            assert_eq!(
+                sub.as_deref(),
+                Some(sub_text),
+                "the nested schema materialized"
+            );
+        }
         tokio::time::sleep(Duration::from_millis(30)).await;
     }
-    assert_eq!(std::fs::read_to_string(&state_msg).unwrap(), root_text);
-    assert_eq!(std::fs::read_to_string(&sub_msg).unwrap(), sub_text);
 
     let _ = shutdown_tx.send(());
     let _ = bounded("desk join", desk).await;
