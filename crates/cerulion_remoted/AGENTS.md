@@ -1,8 +1,9 @@
 # cerulion_remoted
 
-One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + ops/1; pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
+One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1; pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
 
 ## Invariants
+- SessionWork: tickets outlive dropped waits; drain after driver join; settled includes failures.
 - Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
   final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
@@ -21,8 +22,7 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so no session starves it (`estop_starvation_test.rs`).
   TLS: docs/remote_plane.md; paired keys Retry first.
-  Trust persistence is fail-closed: store-BEFORE-index, the live binding published
-  only after the durable write succeeds. Never reorder (`trust.rs`).
+  Trust: fail closed, store-BEFORE-index; publish binding only after durable success (`trust.rs`).
 - Pairing bytes: independent hand-serializer vectors (`format_vectors_test.rs`); update encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epochs monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
@@ -35,16 +35,14 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
   `~/.cerulion` secrets: `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
-- The revocation sweep runs on its OWN task and timer: assert the revocation stands
-  and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
+- Revocation has its OWN task/timer; assert standing revoke and eviction, never response order (`epoch_push_e2e_test.rs`).
 - Metadata: namespace-checked netd snapshots or `SchemaSource`; no startup.
   Recheck CAP_OBSERVE/privacy after awaits; schema-only reads hold no leases.
 - Declared imports need Reliable/send_queue, native capacity one and one live writer; observers keep best-effort/all writers; proxies carry the flag. Never re-export mirrors.
 - Same-user outbound shares endpoint/runtime/node; pre-dial key/namespace gate. Metadata per-call; validation refusals keep readers/idle fence; cleanup errors fence control. Retire only outbound.
 
 ## Tests
-- `wire_plane_test` uses `-- --test-threads=1`: parallel tests at the macOS
-  256-file soft limit hit iceoryx service/port errors.
+- `wire_plane_test`: `-- --test-threads=1`; parallel tests hit macOS's 256-fd limit and iceoryx service/port errors.
 - Family: parallel (`cargo test -p <crate>`, no `#[ignore]`); direct
   `TransportManager::get_or_init()` callers are `#[serial]`;
   e2e: loopback iroh and relays only, bounded awaits.
