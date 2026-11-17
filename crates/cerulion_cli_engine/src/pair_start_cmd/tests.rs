@@ -1519,10 +1519,10 @@ fn the_texts_outside_the_machine_are_byte_exact() {
     assert_eq!(
         state_root_mismatch_msg(
             Path::new("/srv/robot"),
-            Path::new("/home/r/.cerulion/robot-state")
+            Path::new("/opt/r/.cerulion/robot-state")
         ),
         "Error: cerulion-netd serves the robot state at /srv/robot but this command uses \
-         /home/r/.cerulion/robot-state; run both with the same CERULION_STATE_ROOT or \
+         /opt/r/.cerulion/robot-state; run both with the same CERULION_STATE_ROOT or \
          CERULION_HOME. No code was made."
     );
     assert_eq!(
