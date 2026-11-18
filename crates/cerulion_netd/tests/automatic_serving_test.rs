@@ -34,6 +34,10 @@ const DESK_SEED: [u8; 32] = [0x42; 32];
 const OWNER: AccountId = AccountId([0x43; 32]);
 const MAC: [u8; 32] = [0x44; 32];
 const LIMIT: Duration = Duration::from_secs(15);
+/// How long remoted keeps a refused connection that never sends its control
+/// frame before it drops it: remoted's private `HANDSHAKE_DEADLINE`, pinned at
+/// its source by `the_handshake_deadline_is_ten_seconds` in its daemon tests.
+const REMOTED_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 static PAIRED_DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct Daemon {
@@ -1312,4 +1316,184 @@ fn a_failed_server_spawn_keeps_registration_and_releases_endpoint_fencing() {
     drop(second);
     daemon.stop();
     drop(fixture.root);
+}
+
+/// Hold serving on `client` for `ttl_s` seconds; the reply names `state_root`
+/// and grants the length asked for.
+fn hold_serving(
+    client: &mut (UnixStream, BufReader<UnixStream>),
+    id: u64,
+    ttl_s: u64,
+    state_root: &Path,
+) {
+    match request(client, Request::HoldServing { id, ttl_s }) {
+        Response::ServingHeld(held) => {
+            assert_eq!(held.id, id);
+            assert_eq!(held.ttl_s, ttl_s);
+            assert_eq!(Path::new(&held.state_root), state_root);
+        }
+        other => panic!("serving hold refused: {other:?}"),
+    }
+}
+
+/// Start the owned server for a fresh serving hold and return its process
+/// and loopback address, read from the beacon facts this server writes.
+fn served_by_hold(
+    daemon: &Daemon,
+    holder: &mut (UnixStream, BufReader<UnixStream>),
+    id: u64,
+) -> (Vec<u32>, EndpointAddr) {
+    let state_root = daemon.root.path().join("robot-state");
+    let facts = state_root.join("remoted/beacon_facts.json");
+    let _ = std::fs::remove_file(&facts);
+    hold_serving(holder, id, 900, &state_root);
+    until(|| !children(daemon.child.id()).is_empty() && facts.exists());
+    let server = children(daemon.child.id());
+    assert_eq!(server.len(), 1);
+    let facts: serde_json::Value = serde_json::from_slice(&std::fs::read(facts).unwrap()).unwrap();
+    let address = EndpointAddr::new(
+        cerulion_link::EndpointId::from_bytes(
+            &DeviceIdentity::from_seed(&ROBOT_SEED).public_key().0,
+        )
+        .unwrap(),
+    )
+    .with_ip_addr(
+        format!("127.0.0.1:{}", facts["iroh_port"].as_u64().unwrap())
+            .parse()
+            .unwrap(),
+    );
+    (server, address)
+}
+
+/// A serving hold lapses at its deadline although peers without paired
+/// authority keep connections to the owned server open: two overlapping
+/// unpaired ops connections that never open a stream and a refused rcp
+/// connection do not fence the idle reap, so the server is reaped while the
+/// hold's own connection stays open, before remoted's handshake deadline
+/// would drop the refused one. A paired ops session does fence it: the
+/// server keeps serving past the deadline until that session closes, then it
+/// is reaped.
+#[test]
+fn a_lapsed_serving_hold_reaps_past_unpaired_peers_and_waits_for_a_paired_session() {
+    let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    let ix = IsolatedRoot::mint("hold");
+    let mut daemon = Daemon::start(&ix, false, false, None, false);
+    let state_root = daemon.root.path().join("robot-state");
+    let fence = cerulion_netd::serving_hold::fence_path(&state_root);
+    let mut holder = daemon.connect();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+
+    // The paired control: an ops session open across the deadline.
+    let (server, address) = served_by_hold(&daemon, &mut holder, 1);
+    let (desk, session, mut send, mut recv) = runtime.block_on(async {
+        let desk = build_endpoint(EndpointConfig::new(DESK_SEED).with_relay(RelayConfig::Disabled))
+            .await
+            .unwrap();
+        let session = tokio::time::timeout(LIMIT, dial(&desk, address, alpn::OPS))
+            .await
+            .unwrap()
+            .unwrap();
+        let (mut send, mut recv) = open_frame_stream(&session).await.unwrap();
+        let ack = tokio::time::timeout(
+            LIMIT,
+            ops_exchange(
+                &mut send,
+                &mut recv,
+                br#"{"min_version":1,"max_version":1}"#,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ack["type"], "ack", "{ack}");
+        (desk, session, send, recv)
+    });
+    hold_serving(&mut holder, 2, 1, &state_root);
+    // netd's deadline is at most one second after this reply; its worker
+    // re-decides every 100 ms, so two seconds past it is twenty passes.
+    let past = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < past {
+        assert_eq!(
+            children(daemon.child.id()),
+            server,
+            "a paired ops session keeps the server past the hold's deadline"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        cerulion_netd::serving_hold::IdleFence::try_acquire(&fence)
+            .unwrap()
+            .is_none(),
+        "the paired session holds the serving fence"
+    );
+    let inventory = runtime.block_on(async {
+        tokio::time::timeout(
+            LIMIT,
+            ops_exchange(
+                &mut send,
+                &mut recv,
+                br#"{"id":1,"verb":"inventory","args":{}}"#,
+            ),
+        )
+        .await
+        .unwrap()
+    });
+    assert_eq!(inventory["status"], "ok", "{inventory}");
+    runtime.block_on(async {
+        drop((send, recv));
+        session.close(0u32.into(), b"done");
+        desk.close().await;
+    });
+    until(|| children(daemon.child.id()).is_empty());
+
+    // Peers without paired authority: two overlapping unpaired ops connections
+    // and a refused rcp connection, none of which opens a stream. The rcp one
+    // is dialed last; remoted closes it once its control-frame handshake
+    // deadline passes, so the reap must come before that.
+    let (_server, address) = served_by_hold(&daemon, &mut holder, 3);
+    let (strangers, connections, rcp_dialed) = runtime.block_on(async {
+        let mut strangers = Vec::new();
+        let mut connections = Vec::new();
+        for (seed, plane) in [(0x51, alpn::OPS), (0x52, alpn::OPS), (0x53, alpn::RCP)] {
+            let stranger =
+                build_endpoint(EndpointConfig::new([seed; 32]).with_relay(RelayConfig::Disabled))
+                    .await
+                    .unwrap();
+            let connection = tokio::time::timeout(LIMIT, dial(&stranger, address.clone(), plane))
+                .await
+                .unwrap()
+                .unwrap();
+            strangers.push(stranger);
+            connections.push(connection);
+        }
+        (strangers, connections, Instant::now())
+    });
+    assert!(
+        connections.iter().all(|c| c.close_reason().is_none()),
+        "every unpaired connection is open before the hold lapses"
+    );
+    hold_serving(&mut holder, 4, 1, &state_root);
+    until(|| children(daemon.child.id()).is_empty());
+    assert!(
+        rcp_dialed.elapsed() < REMOTED_HANDSHAKE_DEADLINE,
+        "the server is reaped while the refused rcp connection is inside its control-frame \
+         handshake deadline, after {:?}",
+        rcp_dialed.elapsed()
+    );
+    assert!(
+        matches!(
+            request(&mut holder, Request::Status { id: 5 }),
+            Response::Status(_)
+        ),
+        "the hold's connection stays open after the reap"
+    );
+    runtime.block_on(async {
+        for connection in connections {
+            connection.close(0u32.into(), b"done");
+        }
+        for stranger in strangers {
+            stranger.close().await;
+        }
+    });
+    drop(holder);
+    daemon.stop();
 }

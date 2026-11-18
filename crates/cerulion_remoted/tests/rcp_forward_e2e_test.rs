@@ -46,8 +46,8 @@ use cerulion_core::wire::MaxSliceLen;
 use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_link::{
     alpn, build_endpoint, dial, direct_addr, open_frame_stream, read_frame, write_frame,
-    Connection, Endpoint, EndpointAddr, EndpointConfig, EndpointId, QuicOpsStream, RecvStream,
-    RelayConfig, SendStream,
+    Connection, ConnectionError, Endpoint, EndpointAddr, EndpointConfig, EndpointId, QuicOpsStream,
+    RecvStream, RelayConfig, SendStream,
 };
 use cerulion_pairing::format::{
     AccessListEpoch, AccountId, DeviceCert, Grant, IntermediateCert, PrincipalKind, PublicKey,
@@ -730,7 +730,7 @@ async fn open_session_from(desk: Endpoint, addr: EndpointAddr) -> Session {
         .expect("open_bi");
     Session {
         _desk: desk,
-        _conn: conn,
+        conn,
         send,
         recv,
     }
@@ -738,7 +738,7 @@ async fn open_session_from(desk: Endpoint, addr: EndpointAddr) -> Session {
 
 struct Session {
     _desk: Endpoint,
-    _conn: Connection,
+    conn: Connection,
     send: SendStream,
     recv: RecvStream,
 }
@@ -1172,6 +1172,8 @@ fn revoke_operator_device_in(trust: &SharedTrust) {
         .expect("epoch applies");
 }
 
+/// A revoked key's open session that sends nothing is closed by the
+/// connection's periodic check.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_quiet_revoked_session_is_closed_by_the_periodic_check() {
@@ -1185,6 +1187,47 @@ async fn a_quiet_revoked_session_is_closed_by_the_periodic_check() {
         .await
         .expect("the robot closed the session within the check interval");
     assert!(next.is_err(), "{next:?}");
+}
+
+/// A revoked key's rcp connection is closed with `CLOSE_REVOKED` by the
+/// connection's periodic check while no stream is open: the desk ended its
+/// only stream and the robot ended its side.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_revoked_connection_with_no_stream_open_is_closed_by_the_periodic_check() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut stand_in = stand_in_rcpd().await;
+    let served = serve_rcp_plane(dir.path(), stand_in.addr, |_| {}).await;
+    let mut s = open_session(&served.robot, OPERATOR.0).await;
+    // The plane refuses this frame itself: the reply shows the connection was
+    // admitted and its stream served, with nothing sent to rcpd.
+    s.send_raw(br#"{"jsonrpc":"1.0","id":7,"method":"ping"}"#)
+        .await;
+    let refused = s.reply(&json!(7)).await;
+    assert_eq!(
+        refused,
+        json!({ "jsonrpc": "2.0", "id": 7,
+                "error": { "code": -32600, "message": "refused: jsonrpc must be \"2.0\"" } })
+    );
+    s.send.finish().expect("finish");
+    let end = bounded("the stream ends", read_frame(&mut s.recv, 1 << 20)).await;
+    assert!(end.is_err(), "the robot ended the stream: {end:?}");
+    revoke_operator_device_in(&served.trust);
+    let closed = tokio::time::timeout(QUIET_REVOKE_CHECK * 5, s.conn.closed())
+        .await
+        .expect("the robot closed the connection within the check interval");
+    match closed {
+        ConnectionError::ApplicationClosed(close) => {
+            assert_eq!(
+                close.error_code.into_inner(),
+                u64::from(cerulion_remoted::rcp::CLOSE_REVOKED)
+            );
+            assert_eq!(&close.reason[..], b"rcp access revoked");
+        }
+        other => panic!("the robot must close the connection as revoked, got {other:?}"),
+    }
+    assert!(stand_in.posts.try_recv().is_err(), "nothing reached rcpd");
+    let _ = served.stop_serving.send(());
 }
 
 #[tokio::test(flavor = "multi_thread")]

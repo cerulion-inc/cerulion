@@ -185,7 +185,9 @@ struct Provisioned {
     owner_account: String,
 }
 
-fn absolute_without_traversal(path: &Path) -> bool {
+/// Whether `path` is absolute with no `.` or `..` component, as the supervisor
+/// requires of the robot state root and the registration bundle path.
+pub(crate) fn absolute_without_traversal(path: &Path) -> bool {
     path.is_absolute()
         && !path
             .components()

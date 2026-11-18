@@ -140,7 +140,7 @@ pub const RESTART_STOPPED_NOT_STARTED: &str = "the robot's e-stop was engaged du
 /// through it CONCURRENTLY — the receipt sink serializes only the brief append,
 /// so no session ever blocks another (see the module docs).
 pub struct OpsServing {
-    serving_holds: Option<crate::serving_hold::ServingHolds>,
+    fence: Option<crate::serving_hold::AdmissionFence>,
     /// Shared, `&self`-served across concurrent sessions. Its receipt sink is a
     /// brief-append `Mutex` (in `cerud`), so concurrent appends stay chain-valid
     /// without any whole-session serialization here.
@@ -192,13 +192,16 @@ impl OpsServing {
             receipt_path,
             log_root,
             server_name,
+            None,
         )
     }
 
     /// [`OpsServing::new`] with the verb set of `host`: a library host registers
     /// [`DaemonOnlyVerb`] under the `restart`, `engage-estop` and act verb
     /// names, so the authorizer still classifies each call and a permitted
-    /// caller gets a clear refusal instead of an unknown verb.
+    /// caller gets a clear refusal instead of an unknown verb. With
+    /// `serving_holds`, the daemon's native idle admission, every verb outside
+    /// the bootstrap surface runs as a [`FencedVerb`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_host(
         host: OpsHost,
@@ -208,11 +211,13 @@ impl OpsServing {
         receipt_path: &Path,
         log_root: PathBuf,
         server_name: impl Into<String>,
+        serving_holds: Option<crate::serving_hold::ServingHolds>,
     ) -> Result<Self, RemotedError> {
         let shutdown = ShutdownStage::default();
         #[cfg(feature = "test-seam")]
         crate::shutdown::register_probe_for_test(&shutdown, host.rcpd_estop());
-        let verbs = verb_registry(host, &shared, sessions, clock, log_root);
+        let fence = serving_holds.map(crate::serving_hold::AdmissionFence::new);
+        let verbs = verb_registry(host, &shared, sessions, clock, log_root, fence.as_ref());
         let authorizer: Box<dyn Authorizer> = Box::new(PairingAuthorizer::from_shared(shared));
         let receipts = ReceiptLog::open(receipt_path).map_err(|e| {
             RemotedError::Ops(format!(
@@ -222,7 +227,7 @@ impl OpsServing {
         })?;
         let server = OpsServer::new(server_name, authorizer, verbs, receipts);
         Ok(OpsServing {
-            serving_holds: None,
+            fence,
             server: Arc::new(server),
             deadline: OPS_SESSION_DEADLINE,
             shutdown,
@@ -240,15 +245,15 @@ impl OpsServing {
 
     /// Native idle admission for a daemon; absent on an embedded ops host.
     pub fn serving_holds(&self) -> Option<&crate::serving_hold::ServingHolds> {
-        self.serving_holds.as_ref()
+        self.fence
+            .as_ref()
+            .map(crate::serving_hold::AdmissionFence::holds)
     }
 
-    pub(crate) fn with_serving_holds(
-        mut self,
-        holds: Option<crate::serving_hold::ServingHolds>,
-    ) -> Self {
-        self.serving_holds = holds;
-        self
+    /// The admission the daemon's accept loop and its fenced verbs share,
+    /// over [`OpsServing::serving_holds`].
+    pub(crate) fn admission_fence(&self) -> Option<&crate::serving_hold::AdmissionFence> {
+        self.fence.as_ref()
     }
 
     /// Override the per-session deadline (tests only) so the deadline-unwedge +
@@ -390,13 +395,15 @@ impl OpsServing {
 /// bootstrap and safety verbs and the act verbs, with `restart`, `engage-estop`
 /// and the act verbs refused by name on an embedded host. Both hosts register
 /// the same names. The daemon's `restart` carries an [`EstopRestartGate`] over
-/// the daemon's lease.
+/// the daemon's lease. With `fence`, each verb the authorizer does not class
+/// as bootstrap is registered as a [`FencedVerb`] behind it.
 fn verb_registry(
     host: OpsHost,
     shared: &SharedTrust,
     sessions: SharedCodePairSessions,
     clock: RemotedClock,
     log_root: PathBuf,
+    fence: Option<&crate::serving_hold::AdmissionFence>,
 ) -> VerbRegistry {
     let (restart, engage_estop, act_lease): (Box<dyn VerbHandler>, Box<dyn VerbHandler>, _) =
         match host {
@@ -419,47 +426,111 @@ fn verb_registry(
                 None,
             ),
         };
-    let mut verbs = VerbRegistry::new();
-    // cerud's mechanical ops verbs.
-    verbs
-        .register(Box::new(InventoryVerb))
-        .register(Box::new(LogTailVerb::new(log_root)))
-        .register(restart)
+    let mut handlers: Vec<Box<dyn VerbHandler>> = vec![
+        // cerud's mechanical ops verbs.
+        Box::new(InventoryVerb),
+        Box::new(LogTailVerb::new(log_root)),
+        restart,
         // The remote-plane bootstrap + safety verbs (self-gating; the pairing
         // authorizer classifies them bootstrap/e-stop-floor).
-        .register(Box::new(ClaimVerb::new(shared.clone(), clock.clone())))
-        .register(Box::new(PairVerb::new(shared.clone(), clock.clone())))
+        Box::new(ClaimVerb::new(shared.clone(), clock.clone())),
+        Box::new(PairVerb::new(shared.clone(), clock.clone())),
         // Establish access from a desk-carried, owner-signed grant.
-        .register(Box::new(PresentGrantVerb::new(
-            shared.clone(),
-            clock.clone(),
-        )))
-        .register(Box::new(CodePairStartVerb::new(
+        Box::new(PresentGrantVerb::new(shared.clone(), clock.clone())),
+        Box::new(CodePairStartVerb::new(
             shared.clone(),
             sessions.clone(),
             clock.clone(),
-        )))
-        .register(Box::new(CodePairFinishVerb::new(
-            shared.clone(),
-            sessions,
-            clock,
-        )))
-        .register(engage_estop)
-        .register(Box::new(crate::robot_settings::CloudAccessVerb::new(
-            shared.clone(),
-        )));
+        )),
+        Box::new(CodePairFinishVerb::new(shared.clone(), sessions, clock)),
+        engage_estop,
+        Box::new(crate::robot_settings::CloudAccessVerb::new(shared.clone())),
+    ];
     // The act verbs: publish, service call, snapshot, one message.
     match act_lease {
-        Some(lease) => crate::act_verbs::register(&mut verbs, lease),
-        None => {
-            verbs
-                .register(Box::new(DaemonOnlyVerb::TOPIC_PUBLISH))
-                .register(Box::new(DaemonOnlyVerb::SERVICE_CALL))
-                .register(Box::new(DaemonOnlyVerb::TOPIC_SNAPSHOT))
-                .register(Box::new(DaemonOnlyVerb::TOPIC_ECHO_ONCE));
-        }
+        Some(lease) => handlers.extend(crate::act_verbs::handlers(lease)),
+        None => handlers.extend([
+            Box::new(DaemonOnlyVerb::TOPIC_PUBLISH) as Box<dyn VerbHandler>,
+            Box::new(DaemonOnlyVerb::SERVICE_CALL),
+            Box::new(DaemonOnlyVerb::TOPIC_SNAPSHOT),
+            Box::new(DaemonOnlyVerb::TOPIC_ECHO_ONCE),
+        ]),
+    }
+    let mut verbs = VerbRegistry::new();
+    for verb in handlers {
+        verbs.register(match fence {
+            Some(fence) if !crate::authorizer::is_bootstrap_verb(verb.name()) => {
+                Box::new(FencedVerb {
+                    floor: crate::authorizer::is_estop_floor_verb(verb.name()),
+                    verb,
+                    fence: fence.clone(),
+                })
+            }
+            _ => verb,
+        });
     }
     verbs
+}
+
+/// A verb outside the bootstrap surface, run under a serving-hold work guard
+/// taken before the verb and released after it returns, so idle teardown
+/// waits for the call. A session admitted only to the bootstrap surface holds
+/// no guard of its own, and a key it claims or pairs may then call these verbs
+/// on the same connection; a paired session already holds one, so its calls
+/// are never refused here. When the fence cannot be taken (netd holds the
+/// exclusive fence for a committed idle stop, or the lock call fails), the
+/// call is refused ([`stopping_refusal`]), the refusal is logged through the
+/// fence's regime and the verb does not run. The e-stop floor
+/// (`engage-estop`) is the exception: it takes the guard when it can and runs
+/// either way, so a committed idle stop never refuses an e-stop.
+struct FencedVerb {
+    verb: Box<dyn VerbHandler>,
+    fence: crate::serving_hold::AdmissionFence,
+    /// The verb is the e-stop floor, which an idle stop never refuses.
+    floor: bool,
+}
+
+impl FencedVerb {
+    fn guard(&self) -> CerudResult<Option<crate::serving_hold::ServingHold>> {
+        match self.fence.admit() {
+            Some(hold) => Ok(Some(hold)),
+            None if self.floor => Ok(None),
+            None => Err(stopping_refusal(self.verb.name())),
+        }
+    }
+}
+
+impl VerbHandler for FencedVerb {
+    fn name(&self) -> &'static str {
+        self.verb.name()
+    }
+    fn is_mutating(&self) -> bool {
+        self.verb.is_mutating()
+    }
+    fn execute(&self, args: &serde_json::Value) -> CerudResult<serde_json::Value> {
+        let _hold = self.guard()?;
+        self.verb.execute(args)
+    }
+    fn execute_with_caller(
+        &self,
+        caller: &CallerIdentity,
+        args: &serde_json::Value,
+    ) -> CerudResult<serde_json::Value> {
+        let _hold = self.guard()?;
+        self.verb.execute_with_caller(caller, args)
+    }
+}
+
+/// The refusal of a [`FencedVerb`] call to `verb` while the server's idle stop
+/// is committed: `unavailable: the remote server is stopping, so <verb> is
+/// refused`.
+fn stopping_refusal(verb: &str) -> CerudError {
+    CerudError::Verb(
+        VerbError::Unavailable(format!(
+            "the remote server is stopping, so {verb} is refused"
+        ))
+        .to_classed(),
+    )
 }
 
 /// The daemon's `restart` gate over the robot's e-stop on its lease. Each
@@ -561,6 +632,15 @@ mod verb_set_tests {
     use cerulion_pairing::verify::TrustStore;
 
     fn registry(host: OpsHost) -> VerbRegistry {
+        registry_with(host, None)
+    }
+
+    /// The registry of `host`, its verbs outside the bootstrap surface behind
+    /// `fence` when given.
+    fn registry_with(
+        host: OpsHost,
+        fence: Option<&crate::serving_hold::AdmissionFence>,
+    ) -> VerbRegistry {
         let root = PublicKey(
             ed25519_dalek::SigningKey::from_bytes(&[1; 32])
                 .verifying_key()
@@ -581,6 +661,7 @@ mod verb_set_tests {
             SharedCodePairSessions::new(),
             RemotedClock::fixed(0),
             PathBuf::from("logs"),
+            fence,
         )
     }
 
@@ -817,6 +898,163 @@ mod verb_set_tests {
              was not started again after its stop"
         );
         assert_eq!(*calls.lock().unwrap(), vec![stop]);
+    }
+
+    /// The daemon's verbs outside the bootstrap surface, by hand.
+    const FENCED: [&str; 9] = [
+        "cloud-access",
+        "engage-estop",
+        "inventory",
+        "log-tail",
+        "restart",
+        "service-call",
+        "topic-echo-once",
+        "topic-publish",
+        "topic-snapshot",
+    ];
+    /// The bootstrap surface, by hand.
+    const BOOTSTRAP: [&str; 5] = [
+        "claim",
+        "code-pair-finish",
+        "code-pair-start",
+        "pair",
+        "present-grant",
+    ];
+
+    /// The bootstrap predicate splits the daemon's verb names into exactly
+    /// the two hand-written sets.
+    #[test]
+    fn only_the_five_pairing_verbs_are_on_the_bootstrap_surface() {
+        let mut split: Vec<(&str, bool)> = FENCED
+            .iter()
+            .map(|verb| (*verb, false))
+            .chain(BOOTSTRAP.iter().map(|verb| (*verb, true)))
+            .collect();
+        split.sort();
+        let names = names(OpsHost::daemon());
+        assert_eq!(
+            names,
+            split.iter().map(|(verb, _)| *verb).collect::<Vec<_>>()
+        );
+        for (verb, bootstrap) in split {
+            assert_eq!(
+                crate::authorizer::is_bootstrap_verb(verb),
+                bootstrap,
+                "{verb}"
+            );
+        }
+    }
+
+    /// While netd holds the exclusive fence for a committed idle stop, each
+    /// daemon verb outside the bootstrap surface is refused with the stopping
+    /// text before it runs, except the e-stop floor: `engage-estop` still runs
+    /// and latches the e-stop. Each bootstrap verb still runs, and once the
+    /// stop is withdrawn the same registry runs a fenced verb again.
+    #[test]
+    fn a_committed_idle_stop_refuses_every_verb_outside_the_bootstrap_surface() {
+        use cerulion_netd::serving_hold::IdleFence;
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::serving_hold::fence_path(dir.path());
+        let fence = crate::serving_hold::AdmissionFence::new(
+            crate::serving_hold::ServingHolds::open(&path).unwrap(),
+        );
+        let host = OpsHost::daemon();
+        let lease = host.estop_lease().expect("the daemon has an e-stop lease");
+        let registry = registry_with(host, Some(&fence));
+        let caller = CallerIdentity::verified("ab".repeat(32));
+        let args = serde_json::json!({});
+        let idle = IdleFence::try_acquire(&path)
+            .unwrap()
+            .expect("no work holds the fence");
+        for verb in FENCED.iter().filter(|verb| **verb != "engage-estop") {
+            let err = registry
+                .get(verb)
+                .unwrap()
+                .execute_with_caller(&caller, &args)
+                .unwrap_err();
+            assert_eq!(
+                verb_message(err),
+                format!("unavailable: the remote server is stopping, so {verb} is refused")
+            );
+        }
+        assert!(!lease.holds(), "no refused verb reached the latch");
+        let engaged = registry
+            .get(verbs::ENGAGE_ESTOP)
+            .unwrap()
+            .execute_with_caller(&caller, &args)
+            .expect("an idle stop never refuses the e-stop floor");
+        assert_eq!(engaged["engaged"], serde_json::json!(true), "{engaged}");
+        assert!(
+            lease.holds(),
+            "the e-stop latched during the committed stop"
+        );
+        for verb in BOOTSTRAP {
+            let result = registry
+                .get(verb)
+                .unwrap()
+                .execute_with_caller(&caller, &args);
+            assert!(
+                !format!("{result:?}").contains("remote server is stopping"),
+                "{verb} ran its own handler: {result:?}"
+            );
+        }
+        assert!(registry.get(verbs::RESTART).unwrap().is_mutating());
+        assert!(!registry.get(verbs::INVENTORY).unwrap().is_mutating());
+        drop(idle);
+        let inventory = registry
+            .get(verbs::INVENTORY)
+            .unwrap()
+            .execute(&args)
+            .expect("inventory runs once the idle stop is withdrawn");
+        assert!(inventory["arch"].is_string(), "{inventory}");
+    }
+
+    /// A fenced call holds the serving fence from before its verb runs until
+    /// the verb returns, on both dispatch paths, and releases it afterwards;
+    /// the same verb unfenced runs with the fence free.
+    #[test]
+    fn a_fenced_call_holds_the_serving_fence_while_its_verb_runs() {
+        use cerulion_netd::serving_hold::IdleFence;
+        struct Probe(PathBuf);
+        impl VerbHandler for Probe {
+            fn name(&self) -> &'static str {
+                verbs::INVENTORY
+            }
+            fn is_mutating(&self) -> bool {
+                false
+            }
+            fn execute(&self, _args: &serde_json::Value) -> CerudResult<serde_json::Value> {
+                let free = IdleFence::try_acquire(&self.0)
+                    .expect("the fence opens")
+                    .is_some();
+                Ok(serde_json::json!({ "fence_free": free }))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::serving_hold::fence_path(dir.path());
+        let verb = FencedVerb {
+            verb: Box::new(Probe(path.clone())),
+            fence: crate::serving_hold::AdmissionFence::new(
+                crate::serving_hold::ServingHolds::open(&path).unwrap(),
+            ),
+            floor: false,
+        };
+        let args = serde_json::json!({});
+        let held = serde_json::json!({ "fence_free": false });
+        assert_eq!(verb.execute(&args).unwrap(), held);
+        assert_eq!(
+            verb.execute_with_caller(&CallerIdentity::verified("ab".repeat(32)), &args)
+                .unwrap(),
+            held
+        );
+        assert!(
+            IdleFence::try_acquire(&path).unwrap().is_some(),
+            "the call released the fence"
+        );
+        assert_eq!(
+            Probe(path.clone()).execute(&args).unwrap(),
+            serde_json::json!({ "fence_free": true })
+        );
     }
 
     #[test]

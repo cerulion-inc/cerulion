@@ -82,6 +82,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use cerulion_core::transport::TransportManager;
 use cerulion_core::{
@@ -96,10 +97,40 @@ use crate::registry::{canonical_topic, ConnId};
 /// a spy can count per client and a future retraction can key by it.
 pub type EgressId = ConnId;
 
+/// The refusal of a serving hold by a plane that runs no remote server.
+pub const REMOTE_SERVING_UNAVAILABLE: &str = "this cerulion-netd does not serve remote access: \
+     its network is off or it was built without remote serving; remove CERULION_NETD_NETWORK=off \
+     or rebuild it with the default wan feature, then restart cerulion-netd";
+
+/// The refusal of a serving hold when no robot state root resolves.
+pub const NO_STATE_ROOT: &str = "no robot state root is available, so cerulion-netd cannot serve \
+     remote access; set CERULION_STATE_ROOT, CERULION_HOME or HOME and restart cerulion-netd";
+
+/// The refusal of a serving hold whose robot state root is relative, empty or
+/// holds a `.` or `..` component, which the remote server refuses to use.
+pub const STATE_ROOT_NOT_ABSOLUTE: &str = "the robot state root must be an absolute path with no \
+     '.' or '..' components; set CERULION_STATE_ROOT to such a path and restart cerulion-netd";
+
+/// The refusal of a serving hold whose robot state root is not UTF-8, which the
+/// control protocol cannot carry.
+pub const STATE_ROOT_NOT_UTF8: &str = "the robot state root is not a UTF-8 path, so cerulion-netd \
+     cannot report it; set CERULION_STATE_ROOT to a UTF-8 path and restart cerulion-netd";
+
 /// An error from an [`EgressPlane`] operation. The daemon maps it to a structured
-/// protocol error and rolls the registry's egress accounting back.
+/// protocol error; for a registration it also rolls the registry's egress
+/// accounting back.
 #[derive(Debug)]
 pub enum EgressError {
+    /// This plane runs no remote server, so it cannot hold one
+    /// ([`REMOTE_SERVING_UNAVAILABLE`]).
+    ServingUnavailable,
+    /// No robot state root resolves, so no server can run ([`NO_STATE_ROOT`]).
+    NoStateRoot,
+    /// The robot state root is not absolute or holds traversal
+    /// ([`STATE_ROOT_NOT_ABSOLUTE`]).
+    StateRootNotAbsolute,
+    /// The robot state root is not UTF-8 ([`STATE_ROOT_NOT_UTF8`]).
+    StateRootNotUtf8,
     /// The machine could not queue its owned authenticated server lifecycle.
     Server {
         /// The daemon is stopping or its lifecycle worker could not start.
@@ -133,6 +164,10 @@ pub enum EgressError {
 impl std::fmt::Display for EgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            EgressError::ServingUnavailable => f.write_str(REMOTE_SERVING_UNAVAILABLE),
+            EgressError::NoStateRoot => f.write_str(NO_STATE_ROOT),
+            EgressError::StateRootNotAbsolute => f.write_str(STATE_ROOT_NOT_ABSOLUTE),
+            EgressError::StateRootNotUtf8 => f.write_str(STATE_ROOT_NOT_UTF8),
             EgressError::Server { reason } => write!(f, "remote server startup failed: {reason}"),
             EgressError::Gateway { source } => {
                 write!(f, "failed to register the network egress plan: {source}")
@@ -153,7 +188,11 @@ impl std::fmt::Display for EgressError {
 impl std::error::Error for EgressError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            EgressError::Server { .. } => None,
+            EgressError::ServingUnavailable
+            | EgressError::NoStateRoot
+            | EgressError::StateRootNotAbsolute
+            | EgressError::StateRootNotUtf8
+            | EgressError::Server { .. } => None,
             EgressError::Gateway { source } => Some(source.as_ref()),
             EgressError::NamespaceMismatch { .. } => None,
         }
@@ -222,6 +261,29 @@ pub trait EgressPlane: Send + Sync {
     fn robot_startup_error(&self) -> Option<String> {
         None
     }
+
+    /// The robot state root this plane's remote server uses, as the UTF-8 text
+    /// the control protocol carries. Changes no state, so the daemon asks it
+    /// before the serving-authority check of a hold: a root that resolves to
+    /// nothing, is not absolute, holds traversal or is not UTF-8 is refused
+    /// first. The default refuses with [`EgressError::ServingUnavailable`]: a
+    /// plane without a supervised remote server has nothing to hold.
+    fn serving_state_root(&self) -> Result<String, EgressError> {
+        Err(EgressError::ServingUnavailable)
+    }
+
+    /// Hold the machine's remote server for connection `id` until `until` with
+    /// no egress registration, without waiting for the server to start. A
+    /// later hold for the same `id` replaces the earlier one. The default
+    /// refuses with [`EgressError::ServingUnavailable`], like
+    /// [`Self::serving_state_root`].
+    fn hold_serving(&self, _id: EgressId, _until: Instant) -> Result<(), EgressError> {
+        Err(EgressError::ServingUnavailable)
+    }
+
+    /// Drop connection `id`'s serving hold. A no-op when it holds none, and by
+    /// default.
+    fn release_serving(&self, _id: EgressId) {}
 
     /// Release the egress registration for `id`. The registered egress LINGERS
     /// on the shared gateway past release (the reg-channel is add-only; retraction
@@ -1040,6 +1102,44 @@ mod tests {
         );
         // release is a safe no-op.
         plane.release_egress(0);
+    }
+
+    /// A plane without a supervised remote server refuses both the state-root
+    /// check and the hold itself with the one refusal text, and its release is
+    /// a no-op: the no-op plane and the bare gateway plane a network-off or
+    /// no-WAN daemon runs.
+    #[test]
+    fn planes_without_a_remote_server_refuse_a_serving_hold_with_the_exact_text() {
+        let oracle = "this cerulion-netd does not serve remote access: its network is off or \
+                      it was built without remote serving; remove CERULION_NETD_NETWORK=off or \
+                      rebuild it with the default wan feature, then restart cerulion-netd";
+        assert_eq!(REMOTE_SERVING_UNAVAILABLE, oracle);
+        let root = cerulion_core::testing::IsolatedRoot::mint("h1");
+        let manager = TransportManager::init_for_test(
+            cerulion_core::TransportConfig::default(),
+            root.config(),
+        )
+        .unwrap();
+        let gateway = GatewayEgressPlane::new_without_mdns_for_test(manager);
+        let planes: [&dyn EgressPlane; 2] = [&NoopEgressPlane, &gateway];
+        for plane in planes {
+            let refusals = [
+                plane
+                    .serving_state_root()
+                    .expect_err("no remote server, no root"),
+                plane
+                    .hold_serving(3, Instant::now() + std::time::Duration::from_secs(60))
+                    .expect_err("no remote server to hold"),
+            ];
+            for err in refusals {
+                assert!(matches!(err, EgressError::ServingUnavailable), "{err:?}");
+                assert_eq!(err.to_string(), oracle);
+                assert!(std::error::Error::source(&err).is_none());
+            }
+            plane.release_serving(3);
+            assert!(!plane.holds_serving_endpoint());
+        }
+        assert!(!gateway.gateway_running(), "a refused hold boots nothing");
     }
 
     #[test]
