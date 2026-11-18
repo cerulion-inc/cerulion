@@ -1,0 +1,3 @@
+# Files of rcp/ that the plain arm's tree does not have, one path per line, relative to rcp/.
+# assemble.py leaves them out when it builds that tree.
+rcpx/bounds_book_read.py
