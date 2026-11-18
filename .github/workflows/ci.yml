@@ -55,10 +55,13 @@ permissions:
 #
 #   * `pull_request`  ⇒ group = the PR number; cancel-in-progress on. A new
 #     push to the PR cancels the run for the commit it just replaced.
-#   * `merge_group`   ⇒ group = the queue's own temporary branch, which is
-#     unique per BATCH; cancel-in-progress OFF. The queue is waiting on this
+#   * `merge_group`   ⇒ group = the queue's own temporary branch, named per
+#     BATCH (and named the same again when a pull request is queued again on
+#     the same `main`); cancel-in-progress OFF. The queue is waiting on this
 #     run's verdict to decide whether to merge, so a cancelled required
-#     context reads as "not passed" forever and the batch stalls.
+#     context reads as "not passed" forever and the batch stalls. The one
+#     cancel a queue run takes is `queue-watchdog.yml`'s, once a required job
+#     has already failed the batch.
 #   * push / workflow_dispatch / schedule ⇒ group = `github.run_id`, which is
 #     unique per run, so every main commit keeps its own run, nothing is
 #     ever queued behind a sibling, and nothing is ever cancelled.
@@ -768,6 +771,11 @@ jobs:
 
       - name: Advisory issue bookkeeping self-test
         run: ./tools/scripts/test_advisory_issue.sh
+
+      # `queue-watchdog.yml` runs on merge-queue runs only, so its decision is
+      # pinned here, on every pull request.
+      - name: Queue run watchdog self-test
+        run: ./tools/scripts/test_ci_queue_watchdog.sh
 
       # The Android e2e runs on a path filter, so the verdict it applies to the
       # direct data demand probe is pinned here, on every pull request.

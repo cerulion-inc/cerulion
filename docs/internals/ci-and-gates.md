@@ -734,6 +734,31 @@ actionlint, the cache save policy checker and the script self-test; the first ru
 the clock is on `main`. GitHub also disables scheduled workflows on a repository
 after 60 days with no commit.
 
+## The queue run watchdog
+
+`.github/workflows/queue-watchdog.yml` runs on every merge-queue batch, beside the `ci.yml`
+run of the same queue commit, and cancels that run at its first failed required job. A failed
+required context fails the batch by itself, so the rest of the run changes no verdict; what it
+holds is its runner minutes and its concurrency group, which `ci.yml` keys on the queue branch,
+and a pull request queued again on the same `main` gets the same branch, so its new run waits
+in that group until the failed one ends. `tools/scripts/ci_queue_watchdog.sh` finds the run as
+the one `ci.yml` run with event `merge_group` and the batch's head commit, then once a minute
+reads its jobs and cancels it when a job named in `tools/ci/required_contexts.txt` ends
+`failure`, `timed_out` or `cancelled`. Once no job is left running it reads the run as well,
+and stops when the run has completed: one request a minute while jobs run, from the job token's
+hourly budget that every job of the repository shares. A failed job that is not required, and a
+skipped required one, cancel nothing; the three Leak guard contexts are reported by
+`leak-guard.yml`, so their failures cancel nothing here either. The cost is that a failed batch
+shows only the failures that ended before the cancel: a pull request run, which the watchdog
+never touches, shows them all.
+
+It lives in a file of its own because no `ci.yml` job takes `actions: write` except to prune
+its cache (`ci_cache_policy_check.py` R4), and cancelling needs it; a job inside `ci.yml` would
+also sit in the run it cancels. It reports no required context, so a watchdog that cannot find
+the run, cannot read it or has its cancel refused exits nonzero, cancels nothing, and leaves the
+batch to finish as it would have; a cancel refused because the run completed first exits 0. Its
+oracle, `tools/scripts/test_ci_queue_watchdog.sh`, runs as a step of `lint`.
+
 ## The cache save policy (`CACHE_SAVE_*` in `ci.yml`)
 
 The Actions cache store has a 10 GB free allowance; storage above it is billed, and while the
@@ -884,6 +909,7 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
+| `tools/scripts/test_ci_queue_watchdog.sh` | the oracle table for `tools/scripts/ci_queue_watchdog.sh`: a failed, timed-out or cancelled required job cancels the run once under its rendered matrix name, read through the committed required list too; a failed job that is not required and a skipped required job cancel nothing; the first of two failed required jobs is the one named; the run itself is read only once no job is left running, and the watch ends when it has completed, with jobs or without any, and keeps going while jobs are still to be listed; the run is found by its commit, after a listing that holds only a run of another commit, and two runs or none are refused; a jobs read, a run read and a run listing each failing three times; a cancel retried, refused while the run runs, and refused because it had completed; a jobs page cut at 100; every argument and environment refusal, a missing `jq` among them, before any call; the exact waits between reads; the same answers giving the same calls twice. The run ends on a case-count floor | n/a |
 | `tools/scripts/test_android_e2e_probe_verdict.sh` | the oracle table for `tools/scripts/android_e2e_probe_verdict.sh`, the verdict the Android emulator e2e applies to each run of the direct data demand probe: a passing report and every failing rule for each of the four expectations (`paired`, `open`, `schema-mismatch`, where every frame on the wire must die on the schema, and `connect`, the open rules over a link the app dialed), the `dialer=` field (missing or not `probe` or `app` is refused; `connect` needs `dialer=app`, every other expectation `dialer=probe`), every rule that holds for all four (every counted ack from the app's robot identity and none named without an ack, no ack from a peer the probe did not name because its peer set was full or the name too long, no more acks than demand passes, no more frames delivered or dropped on the schema than crossed the wire, no wire-header refusal, no decode, re-injection or LAN-posture drop), a report line that is absent, repeated, missing a field, carrying a field twice or a non-number or an `ack_peers=` that is not a list of robot names, `wire_frames=` never read as `frames=`, the three usage refusals (an unknown expectation, a missing argument, an app identity that is not a robot name), and the same report giving the same bytes twice. The run ends on a case-count floor | n/a |
 | `tools/scripts/test_android_release_docs.py` | the Android app copy step in `docs/android.md` against the root `Cargo.toml`: the app runtime example plus the root table's `iceoryx2*` entries parse as one `[patch.crates-io]` table, the same entries pasted under a second header do not parse, the root table holds entries beyond the `iceoryx2*` family (`re_grpc_server`), the family `cerulion workspace create` writes is the root table's family, and the step text says entries under the existing header and not a complete block; and the `CHANGELOG.md` entry for the empty trust-store MAC key, which appears once and names no key length | n/a |
 | `tools/scripts/test_package_android_java.py` | the oracle table for `tools/scripts/package_android_java.py`, which builds the `cerulion-android-java-<version>.tar.gz` release asset in the `android-java` job of `release-artifacts.yml`: the asset from this checkout carries exactly `CerulionRuntime.java` and the crate's `LICENSE` under its versioned directory, byte for byte; over a hand-written crate, the member order, owner, mode and time, the `sha256sum` line, a gzip header with no time and no name, and two runs byte-identical after the source times change; a prerelease identifier with a hyphen accepted; refusals for a version that is not `X.Y.Z` or `X.Y.Z-<pre>`, a crate with no `java/` tree, a tree with no `.java` file, a missing `LICENSE`, a `java/` directory or `LICENSE` that is a symbolic link, a symbolic link or a special file in the tree and missing arguments, each writing nothing | n/a |
