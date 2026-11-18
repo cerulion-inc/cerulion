@@ -1133,6 +1133,17 @@ fn a_stalled_link_does_not_stall_a_topic_on_another_link() {
         "PRECONDITION: the slow topic's send queue must fill: {:?}",
         stats_of(&stats, &slow.topic)
     );
+    // The fast frames share the stall bound with the fill above, so a fill
+    // that used most of it would leave a missing fast frame unexplained. With
+    // at least half the bound left, a frame that does not arrive was held
+    // behind the stalled link.
+    let filled_after = paused_at.elapsed();
+    assert!(
+        filled_after < STALL_CEILING / 2,
+        "PRECONDITION: the slow topic's send queue took {filled_after:?} of the \
+         {STALL_CEILING:?} stall bound to fill, too little is left to tell a held fast frame \
+         from a slow host"
+    );
     // One fast frame at a time: each is published once the one before it has
     // reached the receiver, so the fast topic's egress tap and its 4-deep send
     // queue hold at most one frame and neither can overflow however the host

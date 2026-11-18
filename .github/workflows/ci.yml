@@ -4540,7 +4540,7 @@ jobs:
       # to themselves (their nextest timing fence) and the liveliness tests
       # share the iceoryx2 singleton. A run counts as passed only when cargo
       # exits 0 AND libtest reports at least one passed test and none failed,
-      # so a run that executed nothing is a failure. Every run of both binaries
+      # so a run that executed nothing is a failure. Every run of every binary
       # goes ahead whatever an earlier one did, and the step fails at the end
       # on any failed run.
       - name: Repeat each binary 20 times

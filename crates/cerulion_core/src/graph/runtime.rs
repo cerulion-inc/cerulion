@@ -3102,7 +3102,8 @@ struct CleanupGate {
     period_ms: u64,
     /// Bumped by every cadence change. A wait that sees it move re-arms with
     /// the new period, also when the old period ran out before the wait took
-    /// the lock back.
+    /// the lock back. Only the test seam changes the cadence.
+    #[cfg(any(test, feature = "test-helpers"))]
     period_changes: u64,
     /// `true` from the moment the thread decides to run a pass until that
     /// pass returns (the test seam waits on it).
@@ -3111,9 +3112,17 @@ struct CleanupGate {
 }
 
 /// Ends the pass [`DeadNodeCleanupShared::wait_period`] started when dropped,
-/// so a pass that panics still ends.
+/// so a pass that panics still ends. Only `wait_period` makes one, in the same
+/// lock hold that marks the pass as under way.
 #[cfg(any(test, feature = "test-helpers"))]
 struct PassEnd<'a>(&'a DeadNodeCleanupShared);
+
+/// The pass [`DeadNodeCleanupShared::wait_period`] decided to run. Under the
+/// test seam it is the [`PassEnd`] that ends it; otherwise it carries nothing.
+#[cfg(any(test, feature = "test-helpers"))]
+type PassToken<'a> = PassEnd<'a>;
+#[cfg(not(any(test, feature = "test-helpers")))]
+type PassToken<'a> = std::marker::PhantomData<&'a DeadNodeCleanupShared>;
 
 #[cfg(any(test, feature = "test-helpers"))]
 impl Drop for PassEnd<'_> {
@@ -3129,6 +3138,7 @@ impl DeadNodeCleanupShared {
             gate: Mutex::new(CleanupGate {
                 stopped: false,
                 period_ms,
+                #[cfg(any(test, feature = "test-helpers"))]
                 period_changes: 0,
                 #[cfg(any(test, feature = "test-helpers"))]
                 in_pass: false,
@@ -3149,24 +3159,23 @@ impl DeadNodeCleanupShared {
 
     /// Run `pass` once per period until the owner stops the thread.
     fn run_passes(&self, mut pass: impl FnMut()) {
-        while self.wait_period() {
-            #[cfg(any(test, feature = "test-helpers"))]
-            let _end = PassEnd(self);
+        while let Some(_end) = self.wait_period() {
             pass();
         }
     }
 
-    /// Wait one period. `true` when the period elapsed (run a pass), `false`
-    /// when the owner asked the thread to stop. A cadence change re-arms the
-    /// wait with the new value, also when it landed after the old period ran
-    /// out but before this thread took the lock back: the condvar reports
-    /// that wake as a timeout.
-    fn wait_period(&self) -> bool {
+    /// Wait one period. `Some` when the period elapsed (run a pass; the pass
+    /// ends when the token drops), `None` when the owner asked the thread to
+    /// stop. A cadence change re-arms the wait with the new value, also when
+    /// it landed after the old period ran out but before this thread took the
+    /// lock back: the condvar reports that wake as a timeout.
+    fn wait_period(&self) -> Option<PassToken<'_>> {
         let mut gate = self.lock_gate();
         loop {
             if gate.stopped {
-                return false;
+                return None;
             }
+            #[cfg(any(test, feature = "test-helpers"))]
             let changes = gate.period_changes;
             let period = Duration::from_millis(gate.period_ms);
             let (guard, timeout) = self
@@ -3175,14 +3184,20 @@ impl DeadNodeCleanupShared {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             gate = guard;
             if gate.stopped {
-                return false;
+                return None;
             }
-            if timeout.timed_out() && gate.period_changes == changes {
+            #[cfg(any(test, feature = "test-helpers"))]
+            let unchanged = gate.period_changes == changes;
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            let unchanged = true;
+            if timeout.timed_out() && unchanged {
                 #[cfg(any(test, feature = "test-helpers"))]
                 {
                     gate.in_pass = true;
+                    return Some(PassEnd(self));
                 }
-                return true;
+                #[cfg(not(any(test, feature = "test-helpers")))]
+                return Some(std::marker::PhantomData);
             }
         }
     }
@@ -3340,17 +3355,28 @@ mod dead_node_cleanup_schedule_tests {
         worker.join().expect("reclaim thread");
     }
 
-    /// The thread's 20 ms wait runs out while the test holds the schedule
-    /// lock, and the park lands before the thread takes the lock back: the
-    /// condvar reports a timeout, and the park must still win.
+    /// The test holds the schedule lock for 100 ms with no pass under way, so
+    /// the thread's 20 ms wait runs out before it takes the lock back (unless
+    /// the thread had not yet re-entered its wait when the test took the
+    /// lock), and the park lands first: the condvar reports a timeout, and the
+    /// park must still win.
     #[test]
     fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
         let (shared, passes, worker) = start_counting(20);
         wait_for_passes(&passes, 1);
-        let gate = shared.lock_gate();
+        let mut gate = shared.lock_gate();
+        while gate.in_pass {
+            gate = shared
+                .pass_done
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
         std::thread::sleep(Duration::from_millis(100));
-        shared.change_period(gate, PARKED_MS);
+        // The lock is held and no pass is under way, so none can start or
+        // count until the park below releases the lock: this is the count the
+        // park must keep.
         let parked = passes.load(Ordering::Relaxed);
+        shared.change_period(gate, PARKED_MS);
         std::thread::sleep(QUIET_WINDOW);
         assert_eq!(
             passes.load(Ordering::Relaxed),
