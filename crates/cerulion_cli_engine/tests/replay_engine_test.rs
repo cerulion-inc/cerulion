@@ -21358,7 +21358,7 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
     write_bag_with_recorder_json(&rec, &stamped, pre_stamp_recorder_json(lockstep));
-    // This bag is recorded BY THIS BINARY, so it stamps 9
+    // This bag is recorded BY THIS BINARY, so it stamps 10
     // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
     // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
@@ -23638,12 +23638,12 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 9 on every
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 10 on every
 /// bag this binary writes (every gated consult, and every frame of each batch
-/// that fits its read stage's window, record), so every "corpus" bag elsewhere in this file is a format-**9** bag, a PRECONDITION that roles are
+/// that fits its read stage's window, record), so every "corpus" bag elsewhere in this file is a format-**10** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 9, the identity and
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 10, the identity and
 /// consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a

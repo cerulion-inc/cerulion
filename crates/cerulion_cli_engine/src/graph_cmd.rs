@@ -17581,9 +17581,10 @@ pub fn render_recorder_json(
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
         // binary writes; v8 marks a stream in which every edge names its frames'
-        // writers by run, and v9 one in which every multi-frame read whose batch
-        // fits its read stage's window names each frame it consumed, both also
-        // every bag this binary writes.
+        // writers by run, v9 one in which every multi-frame read whose batch
+        // fits its read stage's window names each frame it consumed, and v10
+        // one whose checkpoints state every node the scheduler had stopped,
+        // all three also every bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17605,9 +17606,12 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stamps_consult_records(),
             // Whether every edge carries its frames' writers, one annotation per
             // writer run, and every multi-frame read whose batch fits its read
-            // stage's window names each frame it consumed: it does, so every bag
-            // this binary writes stamps 9.
+            // stage's window names each frame it consumed: it does.
             crate::replay_engine::recorder_records_read_identity(),
+            // Whether every complete checkpoint part of a stopped node carries
+            // the stopped flag: it does, so every bag this binary writes
+            // stamps 10.
+            crate::replay_engine::recorder_states_anchor_stops(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -30609,16 +30613,18 @@ process_groups:
                 crate::replay_engine::recorder_stamps_read_site_roles(),
                 cerulion_core::read_outcome::fold_enabled(),
                 crate::replay_engine::recorder_stamps_consult_records(),
-                crate::replay_engine::recorder_records_read_identity()
+                crate::replay_engine::recorder_records_read_identity(),
+                crate::replay_engine::recorder_states_anchor_stops()
             )
         );
         assert_eq!(
-            v["trace_format"], 9,
+            v["trace_format"], 10,
             "every bag this binary writes carries read-site roles, folds runs, \
-             records an empty consult a replay also makes AND names the writer and \
+             records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
-             read stage's window: a reader below 9 does not know the per-frame \
-             record, so the stamp makes it refuse the bag"
+             read stage's window AND states every stopped node in its checkpoints: \
+             a reader below 10 reads past the stopped flag, so the stamp makes it \
+             refuse the bag"
         );
     }
 
@@ -30628,13 +30634,14 @@ process_groups:
     /// contract to a stream built to violate it).
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
-    /// it to 5, folding to 6, the consult record to 7, read identity to 8 and
-    /// per-frame batch identity to the 9 asserted here.
+    /// it to 5, folding to 6, the consult record to 7, read identity to 8,
+    /// per-frame batch identity to 9 and checkpoint stops to the 10 asserted
+    /// here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_ten() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
@@ -30647,9 +30654,10 @@ process_groups:
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
         // folding overrides both. 7, not 6: the consult record overrides
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
-        // every consumed frame of a batch is named (`stamp_trace_format`'s
-        // hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 9);
+        // every consumed frame of a batch is named. 10, not 9: the checkpoints
+        // state every stopped node (`stamp_trace_format`'s hand table pins the
+        // whole matrix).
+        assert_eq!(v["trace_format"], 10);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -30678,7 +30686,7 @@ process_groups:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":10}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
