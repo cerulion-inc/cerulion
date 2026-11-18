@@ -13,7 +13,8 @@
 //!
 //! This module is the ROOT-FREE alternative: replace the blocking wait with a
 //! CPU MONITOR-WAIT so the core parks in a SHALLOW optimized state (x86 `C0.1`,
-//! aarch64 `WFE`) instead of deep-idling — no cpuidle C-state, so no cold-wake.
+//! AMD `MWAITX` in C0, aarch64 `WFE`) instead of deep-idling: no cpuidle
+//! C-state, so no cold-wake.
 //!
 //! # Determinism firewall (NON-NEGOTIABLE)
 //!
@@ -26,20 +27,26 @@
 //!
 //! # Scope (LOCKED)
 //!
-//! Exactly TWO real backends ship; everything else is a clean fallback:
+//! Exactly THREE real backends ship; everything else is a clean fallback:
 //!
 //! - `linux + x86_64` with WAITPKG enumerated → `WaitpkgUmwait`: CPUID-gated
 //!   `UMONITOR`/`UMWAIT`, control `1` (the low-latency `C0.1` substate).
+//! - `linux + x86_64` without WAITPKG but with `MONITORX`/`MWAITX` enumerated
+//!   (CPUID Fn8000_0001 ECX bit 29, AMD) → `AmdMwaitx`: `MONITORX` on the
+//!   line, then `MWAITX` with its timer enabled and hint `0xF0` (stay in C0,
+//!   the hint the Linux kernel's own `MWAITX` delay loop uses). WAITPKG wins
+//!   on a CPU that enumerates both.
 //! - `linux + aarch64` → `ArmWfeEventStream`: the ARMv8 baseline `WFE` +
 //!   generic-timer event-stream idiom (`SEVL; WFE; LDXR; EOR; CBNZ; WFE`). One
 //!   bounded `WFE` per call.
-//! - everything else — other arches, non-Linux (incl. macOS), or x86 without
-//!   WAITPKG → `Unavailable`: the public entry points return `false`/no-op so
-//!   the caller falls back to the normal blocking WaitSet wait. NOT a
-//!   busy-spin and NOT a spin-then-block floor (that measured a no-op).
+//! - everything else, meaning other arches, non-Linux (incl. macOS), or x86
+//!   with neither WAITPKG nor `MWAITX` → `Unavailable`: the public entry points
+//!   return `false`/no-op so the caller falls back to the normal blocking
+//!   WaitSet wait. NOT a busy-spin and NOT a spin-then-block floor (that
+//!   measured a no-op).
 //!
-//! Deliberately not supported: AMD `MWAITX` and ARMv8.7 `WFET`. Those
-//! resolve to `Unavailable` so they take the blocking-WaitSet fallback.
+//! Not supported: ARMv8.7 `WFET`. An aarch64 CPU that has it parks on the
+//! base `WFE` backend above.
 //!
 //! # The macOS degraded-tier NAP
 //!
@@ -67,8 +74,9 @@ use std::time::{Duration, Instant};
 ///   SHALLOW CPU monitor-wait park (no deep cpuidle C-state; the timer-deadline
 ///   path for period nodes).
 /// - `doorbell`: also wake the park on the producer-rung SHM doorbell the
-///   instant DATA is published (the data-hop path): `UMONITOR`/`WFE` armed on
-///   the line where the CPU carries a monitor-wait primitive, a kernel block on
+///   instant DATA is published (the data-hop path): `UMONITOR`, `MONITORX`
+///   or `WFE` armed on the line where the CPU carries a monitor-wait
+///   primitive, a kernel block on
 ///   the page's wake word elsewhere (a shared futex on Linux and Android,
 ///   os_sync on macOS 14.4 and later). IMPLIES
 ///   `monitor_wait` (the ring wakes the same park). The invariant `doorbell` ⇒
@@ -162,11 +170,12 @@ impl MonitorWaitPolicy {
 /// ONCE (cached in `current_backend`).
 ///
 /// `Unavailable` is the safe fallback: the public entry points no-op on it so
-/// the caller blocks on the normal WaitSet. The two real variants are each
+/// the caller blocks on the normal WaitSet. The three real variants are each
 /// constructed only on their own target (`WaitpkgUmwait` on `linux + x86_64`
-/// with WAITPKG; `ArmWfeEventStream` on `linux + aarch64`) — hence the
+/// with WAITPKG; `AmdMwaitx` on `linux + x86_64` with `MWAITX` and without
+/// WAITPKG; `ArmWfeEventStream` on `linux + aarch64`), hence the
 /// per-variant `cfg_attr(allow(dead_code))` for the OTHER targets, mirroring
-/// `dma_lock`'s cfg-conditional dead-code handling. (Both real variants are
+/// `dma_lock`'s cfg-conditional dead-code handling. (Every real variant is
 /// still constructed under `cfg(test)` by the hermetic backend-injection tests.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MonitorWaitBackend {
@@ -177,6 +186,14 @@ enum MonitorWaitBackend {
         allow(dead_code)
     )]
     WaitpkgUmwait,
+    /// AMD `MONITORX`/`MWAITX` with its relative TSC-rate timer, hint `0xF0`
+    /// (C0). Constructed only on `linux + x86_64` with CPUID Fn8000_0001 ECX
+    /// bit 29 set and WAITPKG clear.
+    #[cfg_attr(
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        allow(dead_code)
+    )]
+    AmdMwaitx,
     /// ARMv8 `WFE` + generic-timer event stream. Constructed only on
     /// `linux + aarch64`.
     #[cfg_attr(
@@ -186,49 +203,123 @@ enum MonitorWaitBackend {
     ArmWfeEventStream,
     /// No real primitive — the caller falls back to the blocking WaitSet wait.
     /// Constructed on every target by `CERULION_MONITOR_WAIT_PRIMITIVE=0`, on
-    /// `linux + x86_64` without WAITPKG (the CPUID-clear else) and on every
-    /// NON-Linux / other-arch target (the `not(any(...))` arm). On
-    /// `linux + aarch64` the knob is the only route to it, which is why it needs
-    /// no per-target dead-code allow there.
+    /// `linux + x86_64` with neither WAITPKG nor `MWAITX` (the CPUID-clear
+    /// arm of `x86_backend_from`) and on every NON-Linux / other-arch target
+    /// (the `not(any(...))` arm). On `linux + aarch64` the knob is the only
+    /// route to it, which is why it needs no per-target dead-code allow there.
     Unavailable,
 }
 
-/// Resolve the backend for THIS target (uncached — `current_backend` caches it).
-///
-/// `linux + x86_64`: probe CPUID leaf 7 sub-leaf 0, ECX bit 5 (WAITPKG); set
-/// ⇒ `WaitpkgUmwait`, else `Unavailable`. `linux + aarch64`:
-/// `ArmWfeEventStream` (the `WFE` + event-stream idiom is ARMv8 baseline).
-/// Every other target ⇒ `Unavailable`. On every target
-/// `CERULION_MONITOR_WAIT_PRIMITIVE=0` resolves `Unavailable` before the probe.
-///
-/// **WAITPKG on virtualized x86:** selection is
-/// purely the CPUID WAITPKG bit; some hypervisors enumerate WAITPKG yet trap
-/// UMWAIT (#UD → SIGILL) or pin an inconsistent CPUID/feature baseline across
-/// live-migration. There is no in-process #UD fault guard, so on such a VM the
-/// operator must disable the park with `--no-monitor-wait` /
-/// `CERULION_MONITOR_WAIT=0`. Bare metal is unaffected (verified on WAITPKG hardware).
-///
-/// True iff the CPU enumerates WAITPKG (UMWAIT/UMONITOR/TPAUSE): CPUID leaf 7,
-/// sub-leaf 0, ECX bit 5. Marked `unsafe fn` only to make `resolve_backend`'s
+/// The CPU facts the `linux + x86_64` backend choice reads, injected so the
+/// rule ([`x86_backend_from`]) is a pure function the tests drive on any OS.
+/// The `CERULION_MONITOR_WAIT_PRIMITIVE=0` knob is not a CPU fact: it is
+/// applied first, before any probe, by `resolve_backend` on every target.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+#[derive(Clone, Copy, Debug)]
+struct X86CpuFacts {
+    /// CPUID leaf 7, sub-leaf 0, ECX bit 5: `UMONITOR`/`UMWAIT`
+    /// ([`waitpkg_from_cpuid`]).
+    waitpkg: bool,
+    /// CPUID Fn8000_0001 ECX bit 29: `MONITORX`/`MWAITX` ([`mwaitx_from_cpuid`]).
+    mwaitx: bool,
+}
+
+/// PURE: the `linux + x86_64` backend for the injected CPU facts. WAITPKG wins
+/// over `MWAITX` (a CPU that enumerates both parks on `UMWAIT`); `MWAITX`
+/// alone resolves `AmdMwaitx`; neither resolves `Unavailable`.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn x86_backend_from(facts: X86CpuFacts) -> MonitorWaitBackend {
+    let X86CpuFacts { waitpkg, mwaitx } = facts;
+    if waitpkg {
+        MonitorWaitBackend::WaitpkgUmwait
+    } else if mwaitx {
+        MonitorWaitBackend::AmdMwaitx
+    } else {
+        MonitorWaitBackend::Unavailable
+    }
+}
+
+/// CPUID leaf 7, sub-leaf 0, ECX bit 5: the CPU executes `UMONITOR`/`UMWAIT`.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+const CPUID_7_ECX_WAITPKG: u32 = 1 << 5;
+
+/// CPUID Fn8000_0001 ECX bit 29: the CPU executes `MONITORX`/`MWAITX`.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+const CPUID_8000_0001_ECX_MONITORX: u32 = 1 << 29;
+
+/// PURE: does the CPU enumerate WAITPKG, given the highest basic CPUID leaf
+/// (leaf 0 EAX) and a reader for leaf 7 sub-leaf 0 ECX? The reader runs only
+/// when the basic range reaches leaf 7: an Intel CPU answers a leaf above its
+/// range with the data of its highest basic leaf, so a bit read there means
+/// nothing.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn waitpkg_from_cpuid(max_basic_leaf: u32, leaf7_ecx: impl FnOnce() -> u32) -> bool {
+    max_basic_leaf >= 7 && (leaf7_ecx() & CPUID_7_ECX_WAITPKG) != 0
+}
+
+/// PURE: does the CPU enumerate `MONITORX`/`MWAITX`, given the highest
+/// extended CPUID leaf (Fn8000_0000 EAX) and a reader for Fn8000_0001 ECX?
+/// The reader runs only when the extended range reaches Fn8000_0001: a leaf
+/// above the reported range returns unrelated data, so its bit 29 means
+/// nothing. Firmware that turns the instructions off (HWCR bit 9) clears the
+/// bit too, so this one check covers it.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn mwaitx_from_cpuid(max_extended_leaf: u32, fn8000_0001_ecx: impl FnOnce() -> u32) -> bool {
+    max_extended_leaf >= 0x8000_0001 && (fn8000_0001_ecx() & CPUID_8000_0001_ECX_MONITORX) != 0
+}
+
+/// PURE: the `MWAITX` timer operand (EBX) for a wait of `cycles` TSC-rate
+/// cycles. The count is RELATIVE (cycles from the `MWAITX`, not a TSC
+/// deadline) and 32 bits wide, so a longer wait saturates at `u32::MAX` (the
+/// caller's recheck loop re-parks for the rest). A zero count with the timer
+/// enabled means NO timer at all, an unbounded wait, so the count is never
+/// below 1.
+#[cfg(any(test, all(target_os = "linux", target_arch = "x86_64")))]
+fn mwaitx_timer_count(cycles: u64) -> u32 {
+    u32::try_from(cycles.max(1)).unwrap_or(u32::MAX)
+}
+
+/// True iff the CPU enumerates WAITPKG (UMWAIT/UMONITOR/TPAUSE): leaf 0 EAX
+/// reaches leaf 7 and leaf 7, sub-leaf 0, ECX bit 5 is set
+/// ([`waitpkg_from_cpuid`]). Marked `unsafe fn` only to make `resolve_backend`'s
 /// call site's `unsafe` block genuine on every toolchain the crate has built
 /// with (`__cpuid_count` was `unsafe` on 1.88 and is `safe` from the 1.95 floor
 /// on), see the call site. `#[inline]` so it costs nothing vs the inline intrinsic.
 ///
 /// # Safety
-/// CPUID is baseline on every x86_64 CPU and leaf 7 / sub-leaf 0 is always a
-/// valid query, so the read is sound on any CPU that can run this binary. Callers
-/// need not uphold any precondition.
+/// CPUID is baseline on every x86_64 CPU and leaf 0 is always a valid query;
+/// leaf 7 is read only when leaf 0 reports it. Callers need not uphold any
+/// precondition.
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 #[inline]
 unsafe fn waitpkg_enumerated() -> bool {
-    (core::arch::x86_64::__cpuid_count(7, 0).ecx & (1 << 5)) != 0
+    waitpkg_from_cpuid(core::arch::x86_64::__cpuid(0).eax, || {
+        core::arch::x86_64::__cpuid_count(7, 0).ecx
+    })
+}
+
+/// True iff the CPU enumerates `MONITORX`/`MWAITX`: Fn8000_0000 EAX reaches
+/// Fn8000_0001 and that leaf's ECX bit 29 is set ([`mwaitx_from_cpuid`]).
+/// `unsafe fn` for the same toolchain reason as [`waitpkg_enumerated`].
+///
+/// # Safety
+/// CPUID is baseline on every x86_64 CPU and Fn8000_0000 is always a valid
+/// query; Fn8000_0001 is read only when Fn8000_0000 reports it. Callers need
+/// not uphold any precondition.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[inline]
+unsafe fn mwaitx_enumerated() -> bool {
+    mwaitx_from_cpuid(core::arch::x86_64::__cpuid(0x8000_0000).eax, || {
+        core::arch::x86_64::__cpuid(0x8000_0001).ecx
+    })
 }
 
 /// Hidden measurement knob `CERULION_MONITOR_WAIT_PRIMITIVE`: `0` resolves the
-/// backend to `Unavailable`, so a host whose CPU carries WAITPKG or WFE parks on
-/// the tier a host without one parks on (the bounded sleep-recheck nap, and the
-/// doorbell's kernel wake word where the target has one). Read once, with the
-/// backend; unset or any other value leaves the CPU probe in charge.
+/// backend to `Unavailable`, so a host whose CPU carries WAITPKG, `MWAITX` or
+/// WFE parks on the tier a host without one parks on (the bounded sleep-recheck
+/// nap, and the doorbell's kernel wake word where the target has one). Read
+/// once, with the backend; unset or any other value leaves the CPU probe in
+/// charge.
 fn primitive_disabled_by_env() -> bool {
     primitive_disabled_from(
         std::env::var("CERULION_MONITOR_WAIT_PRIMITIVE")
@@ -243,30 +334,49 @@ fn primitive_disabled_from(raw: Option<&str>) -> bool {
     raw == Some("0")
 }
 
+/// Resolve the backend for THIS target (uncached; `current_backend` caches it).
+///
+/// `linux + x86_64`: probe CPUID leaf 7 sub-leaf 0, ECX bit 5 (WAITPKG) and
+/// Fn8000_0001 ECX bit 29 (`MWAITX`), then apply `x86_backend_from`:
+/// WAITPKG ⇒ `WaitpkgUmwait`, else `MWAITX` ⇒ `AmdMwaitx`, else
+/// `Unavailable`. `linux + aarch64`: `ArmWfeEventStream` (the `WFE` +
+/// event-stream idiom is ARMv8 baseline). Every other target ⇒ `Unavailable`.
+/// On every target `CERULION_MONITOR_WAIT_PRIMITIVE=0` resolves `Unavailable`
+/// before any probe.
+///
+/// **Monitor-wait on virtualized x86:** selection is purely the CPUID bits;
+/// some hypervisors enumerate WAITPKG yet trap UMWAIT (#UD → SIGILL) or pin an
+/// inconsistent CPUID/feature baseline across live-migration. KVM does not
+/// advertise `MONITORX` to a guest (it intercepts the pair), so a KVM guest on
+/// an AMD host resolves `Unavailable` from the CPUID check alone; a hypervisor
+/// that advertised the bit and trapped the instruction would fault the same
+/// way UMWAIT does. There is no in-process #UD fault guard, so on such a VM
+/// the operator must disable the park with `--no-monitor-wait` /
+/// `CERULION_MONITOR_WAIT=0`. Bare metal is unaffected (UMWAIT verified on
+/// WAITPKG hardware; MONITORX/MWAITX run at any privilege level wherever
+/// CPUID enumerates them).
 fn resolve_backend() -> MonitorWaitBackend {
     if primitive_disabled_by_env() {
         return MonitorWaitBackend::Unavailable;
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        // SAFETY: `waitpkg_enumerated` only does a baseline CPUID read (see its
-        // doc). It is an `unsafe fn` purely so the call's `unsafe` is GENUINE on
-        // every toolchain: `core::arch::x86_64::__cpuid_count` was `unsafe` on the
-        // 1.88 toolchain this crate once built with and is `safe` from the 1.95
+        // SAFETY: `waitpkg_enumerated` and `mwaitx_enumerated` only do baseline
+        // CPUID reads (see their docs). They are `unsafe fn`s purely so each
+        // call's `unsafe` is GENUINE on every toolchain:
+        // `core::arch::x86_64::__cpuid_count` / `__cpuid` were `unsafe` on the
+        // 1.88 toolchain this crate once built with and are `safe` from the 1.95
         // floor on, so a direct `unsafe { __cpuid_count(..) }` would be
         // `unused_unsafe` (a `-D warnings` fail) on current toolchains, while a
         // bare call was `E0133` on the old one. Routing through an `unsafe fn`
         // makes the `unsafe` block load-bearing regardless (calling an `unsafe fn`
         // always requires `unsafe`), with no `#[allow]` and no
-        // `is_x86_feature_detected!` ("waitpkg" is not a recognized feature
-        // string). NOTE: the x86_64 path is cfg'd OUT on aarch64-macOS; verify
-        // changes here with `cargo +1.95.0 check -p cerulion_core --target
-        // x86_64-unknown-linux-gnu`.
-        if unsafe { waitpkg_enumerated() } {
-            MonitorWaitBackend::WaitpkgUmwait
-        } else {
-            MonitorWaitBackend::Unavailable
-        }
+        // `is_x86_feature_detected!` (neither "waitpkg" nor "mwaitx" is a
+        // recognized feature string). NOTE: the x86_64 path is cfg'd OUT on
+        // aarch64-macOS; verify changes here with `cargo +1.95.0 check -p
+        // cerulion_core --target x86_64-unknown-linux-gnu`.
+        let (waitpkg, mwaitx) = unsafe { (waitpkg_enumerated(), mwaitx_enumerated()) };
+        x86_backend_from(X86CpuFacts { waitpkg, mwaitx })
     }
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
@@ -286,21 +396,15 @@ fn current_backend() -> MonitorWaitBackend {
     static BACKEND: OnceLock<MonitorWaitBackend> = OnceLock::new();
     *BACKEND.get_or_init(|| {
         let backend = resolve_backend();
-        // One-time post-mortem breadcrumb: if a
-        // WAITPKG-enumerating VM later #UD/SIGILLs on UMWAIT, this records that
-        // the park was armed and on which primitive. Logged once (OnceLock), so
-        // it never touches the hot path.
+        // One-time post-mortem breadcrumb: if a VM that enumerates WAITPKG
+        // or `MONITORX` later #UD/SIGILLs on UMWAIT or MWAITX, this records
+        // that the park was armed and on which primitive. Logged once
+        // (OnceLock), so it never touches the hot path.
         tracing::debug!(backend = ?backend, "monitor-wait: resolved CPU-park backend");
         backend
     })
 }
 
-/// Returns `true` iff a real shallow monitor-wait primitive is available on
-/// this target: `linux + x86_64` with WAITPKG enumerated, or `linux + aarch64`
-/// (`WFE` + event stream). `false` on macOS / Windows / other arches / x86
-/// without WAITPKG — the caller must fall back to the blocking WaitSet wait.
-///
-/// Cheap + cached: the underlying probe runs once.
 /// The clamp ceiling for the live spin knob (`CERULION_LIVE_SPIN_US`),
 /// 100 ms in µs — ONE ceiling for every consumer of the knob (the native
 /// live loop's spin and the rmw wait's spin both clamp here, by
@@ -318,12 +422,12 @@ pub const SPIN_BUDGET_MAX_US: u64 = 100_000;
 ///
 /// Every slice that ends without a wake must be followed by
 /// `std::thread::yield_now()` at the call site: to the OS scheduler a
-/// `UMWAIT`/`WFE`-parked thread is RUNNING, so a park that slices without
+/// `UMWAIT`/`MWAITX`/`WFE`-parked thread is RUNNING, so a park that slices without
 /// yielding holds its core for the whole idle and a co-located runnable peer
 /// gets it only at CFS wakeup granularity — measured p50 **6.997 ms** on a
 /// same-core pinned ping-pong (rmw park, x86_64) versus 17 µs on the
 /// kernel-sleeping tier. 20 µs is short enough that a co-located peer runs
-/// well inside 100 µs (a few slices per same-core hop) while `UMWAIT`/`WFE`
+/// well inside 100 µs (a few slices per same-core hop) while `UMWAIT`/`MWAITX`/`WFE`
 /// still wake instantly on a doorbell store INSIDE a slice; the cost is one
 /// ~0.5 µs `sched_yield` per slice, on the idle path only. (The no-primitive
 /// DEGRADED sleep tiers are unaffected by this constant — a sleeping thread
@@ -417,6 +521,14 @@ pub fn classify_live_spin_us(raw: Option<&str>) -> LiveSpinSetting {
     }
 }
 
+/// Returns `true` iff a real shallow monitor-wait primitive is available on
+/// this target: `linux + x86_64` with WAITPKG or `MWAITX` enumerated, or
+/// `linux + aarch64` (`WFE` + event stream). `false` on macOS / Windows /
+/// other arches / x86 with neither, and wherever
+/// `CERULION_MONITOR_WAIT_PRIMITIVE=0` is set; the caller must fall back to
+/// the blocking WaitSet wait.
+///
+/// Cheap + cached: the underlying probe runs once.
 pub fn monitor_wait_available() -> bool {
     !matches!(current_backend(), MonitorWaitBackend::Unavailable)
 }
@@ -432,8 +544,8 @@ pub fn monitor_wait_available() -> bool {
 /// the caller's own loop-top deadline check fires first in practice.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddrParkOutcome {
-    /// A real monitor-wait executed (`UMWAIT`/`WFE` reached, or the wait was
-    /// already at its deadline).
+    /// A real monitor-wait executed (`UMWAIT`/`MWAITX`/`WFE` reached, or the
+    /// wait was already at its deadline).
     Parked,
     /// The lost-wakeup guard detected a ring since the caller's snapshot and
     /// skipped the park entirely — a WAKE in flight, not a slice.
@@ -466,7 +578,10 @@ impl AddrParkOutcome {
 /// blocks on the WaitSet.
 ///
 /// On x86 a single `UMWAIT` parks for `min(recheck, time-to-deadline)` — a
-/// real TSC deadline, so the requested slice is honored. On aarch64 one `WFE`
+/// real TSC deadline, so the requested slice is honored; a single `MWAITX`
+/// parks for the same span as a relative TSC-rate count (a span longer than
+/// `u32::MAX` cycles, one to two seconds at common TSC rates, saturates there
+/// and the caller loops on). On aarch64 one `WFE`
 /// parks for up to one event-stream period regardless of `recheck`; the
 /// caller loops until `deadline`. Box-measured: base
 /// `WFE` has NO timeout operand, so the event stream is the ONLY bound — its
@@ -482,8 +597,8 @@ pub(crate) fn monitor_wait_until(deadline: Instant, recheck: Duration) -> bool {
 
 /// Like `monitor_wait_until`, but ARM the monitor on the GIVEN `addr` (a
 /// doorbell's `AtomicU64` payload) instead of a private scratch word — so a
-/// producer's store to that line wakes `UMWAIT`/`WFE` the instant data is
-/// published, not just on the TSC / event-stream timer. Returns an
+/// producer's store to that line wakes `UMWAIT`/`MWAITX`/`WFE` the instant
+/// data is published, not just on the TSC / event-stream timer. Returns an
 /// [`AddrParkOutcome`]: `Parked` for a real monitor-wait;
 /// `RingPending` when the lost-wakeup guard (either layer) detected a ring
 /// since the caller's `expected` snapshot and SKIPPED the park — the caller
@@ -503,7 +618,8 @@ pub(crate) fn monitor_wait_until(deadline: Instant, recheck: Duration) -> bool {
 ///    moved past `expected`, a ring landed — skip the park entirely.
 /// 2. the backend's arm-then-recheck:
 ///    AFTER `UMONITOR`-arming the line and BEFORE `UMWAIT`, re-read
-///    `*addr` and compare against `expected`; if it differs, skip `UMWAIT`. (On
+///    `*addr` and compare against `expected`; if it differs, skip `UMWAIT`.
+///    `AmdMwaitx` does the same between `MONITORX` and `MWAITX`. (On
 ///    aarch64 the `ldxr` arming the exclusive monitor plus the `cbnz` compare
 ///    against `expected` is the equivalent.)
 ///
@@ -530,7 +646,7 @@ pub unsafe fn monitor_wait_until_addr(
 // These private fns ARE the hermetic test seam: they run the full dispatch
 // (incl. the `Unavailable` fallback and the platform-independent lost-wakeup
 // early-out) against an INJECTED backend, so those paths are testable on ANY
-// OS without the WAITPKG/WFE hardware (mirrors `dma_lock`'s path-injected
+// OS without the WAITPKG/MWAITX/WFE hardware (mirrors `dma_lock`'s path-injected
 // `deepest_cap_from_cpu_root`). The public entry points above feed them the
 // real `current_backend()`.
 
@@ -548,11 +664,13 @@ fn monitor_wait_until_with_backend(
         }
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         MonitorWaitBackend::WaitpkgUmwait => x86::monitor_wait_until(deadline, recheck),
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        MonitorWaitBackend::AmdMwaitx => x86::mwaitx_until(deadline, recheck),
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         MonitorWaitBackend::ArmWfeEventStream => aarch64::monitor_wait_until(deadline, recheck),
         // A real backend variant off its target is never produced by
-        // `resolve_backend` (and the hermetic tests inject only `Unavailable`
-        // here), so this is genuinely unreachable. `_` (not a named arm) keeps
+        // `resolve_backend` (and the tests inject a real one here only on its
+        // own target), so this is genuinely unreachable. `_` (not a named arm) keeps
         // the match exhaustive across every target's cfg without an
         // unreachable-pattern warning.
         _ => {
@@ -592,14 +710,16 @@ fn monitor_wait_until_addr_with_backend(
         MonitorWaitBackend::WaitpkgUmwait => {
             x86::monitor_wait_until_addr(addr, expected, deadline, recheck)
         }
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        MonitorWaitBackend::AmdMwaitx => x86::mwaitx_until_addr(addr, expected, deadline, recheck),
         #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
         MonitorWaitBackend::ArmWfeEventStream => {
             aarch64::monitor_wait_until_addr(addr, expected, deadline, recheck)
         }
         // Unavailable handled above; a real backend off its target is never
-        // produced by `resolve_backend`, and the hermetic tests only inject a
-        // real backend WITH `addr` pre-moved (which the layer-1 early-out above
-        // catches first), so this is unreachable.
+        // produced by `resolve_backend`, and the tests inject one here only on
+        // its own target or WITH `addr` pre-moved (which the layer-1 early-out
+        // above catches first), so this is unreachable.
         _ => {
             let _ = (addr, expected, deadline, recheck);
             unreachable!("a real monitor-wait backend can only run on its own target")
@@ -903,7 +1023,8 @@ mod x86 {
 
     /// Invariant-TSC cycles-per-nanosecond, calibrated ONCE against `Instant`
     /// via a short busy-spin window. Used to convert the wait `Duration` into
-    /// the absolute TSC deadline `UMWAIT` consumes in `EDX:EAX`.
+    /// the absolute TSC deadline `UMWAIT` consumes in `EDX:EAX`, and into the
+    /// relative count of TSC-rate cycles `MWAITX` consumes in EBX.
     fn tsc_per_ns() -> f64 {
         static CAL: OnceLock<f64> = OnceLock::new();
         *CAL.get_or_init(|| {
@@ -913,9 +1034,14 @@ mod x86 {
             while start.elapsed() < Duration::from_millis(2) {
                 std::hint::spin_loop();
             }
-            let elapsed_ns = start.elapsed().as_nanos() as f64;
+            // `c1` is read BEFORE the closing `elapsed`, as `c0` is read after
+            // `start`: a preemption in either gap then undercounts cycles and
+            // shortens every converted wait instead of stretching it (the
+            // rate is cached for the life of the process, and `MWAITX` has no
+            // OS cap on its timer the way Linux caps `UMWAIT`).
             // SAFETY: `_rdtsc` is sound on any x86_64 CPU.
             let c1 = unsafe { core::arch::x86_64::_rdtsc() };
+            let elapsed_ns = start.elapsed().as_nanos() as f64;
             let cycles = c1.saturating_sub(c0) as f64;
             // Floor the rate so a degenerate calibration (rdtsc not advancing)
             // can't yield 0 cycles/ns and stall the deadline arithmetic.
@@ -1039,6 +1165,140 @@ mod x86 {
                 options(nostack),
             );
         }
+        super::AddrParkOutcome::Parked
+    }
+
+    /// The `MWAITX` hint (EAX): bits 7:4 = `0xF` asks for no C-state at all,
+    /// so the core waits in C0. It is the hint the Linux kernel's own
+    /// `MWAITX` delay loop passes (`MWAITX_DISABLE_CSTATES`); a fixed
+    /// constant, not a knob.
+    const MWAITX_HINT_C0: u32 = 0xF0;
+
+    /// The `MWAITX` extensions (ECX): bit 1 enables the timer in EBX. Bit 0
+    /// (wake on a masked interrupt) stays clear, and bits 31:2 must be zero.
+    const MWAITX_ECX_TIMER_ENABLE: u32 = 1 << 1;
+
+    /// The relative `MWAITX` timer count for `wait`: TSC-rate cycles, clamped
+    /// to `1..=u32::MAX` by [`super::mwaitx_timer_count`].
+    fn mwaitx_timer_for(wait: Duration) -> u32 {
+        super::mwaitx_timer_count((wait.as_nanos() as f64 * tsc_per_ns()) as u64)
+    }
+
+    /// `MONITORX` arming the cache line that holds `addr`.
+    ///
+    /// # Safety
+    /// The CPU must enumerate `MONITORX`/`MWAITX` (CPUID Fn8000_0001 ECX bit
+    /// 29; the backend is `AmdMwaitx` only then), or the instruction raises
+    /// #UD. MONITORX checks `addr` like a one-byte read (an unmapped address
+    /// raises #PF) but loads no data from it; every caller passes a live local
+    /// or the caller-guaranteed doorbell word.
+    #[inline(always)]
+    unsafe fn monitorx(addr: *const u8) {
+        // SAFETY: the caller's contract above. MONITORX (0f 01 fa) reads the
+        // address in rax, extensions in ecx and hints in edx; zero is the only
+        // defined value for both. It writes no register, no memory and no
+        // flag, hence `preserves_flags`.
+        unsafe {
+            core::arch::asm!(
+                ".byte 0x0f, 0x01, 0xfa",
+                in("rax") addr,
+                in("ecx") 0u32,
+                in("edx") 0u32,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+
+    /// `MWAITX` with the timer enabled: waits in C0 until the line armed by
+    /// the preceding [`monitorx`] is written, an interrupt arrives, or `count`
+    /// TSC-rate cycles pass.
+    ///
+    /// # Safety
+    /// The CPU must enumerate `MONITORX`/`MWAITX` (the backend is `AmdMwaitx`
+    /// only then), or the instruction raises #UD. `count` must be at least 1:
+    /// a zero count with the timer enabled waits with no timer at all
+    /// ([`super::mwaitx_timer_count`] never returns 0).
+    #[inline(always)]
+    unsafe fn mwaitx(count: u32) {
+        // SAFETY: the caller's contract above. MWAITX (0f 01 fb) reads the hint
+        // in eax, the extensions in ecx and the timer count in ebx. LLVM
+        // reserves rbx, so it cannot be an asm operand: the count is swapped
+        // into rbx with `xchg` and the compiler's rbx swapped back before the
+        // block ends. MWAITX writes no register and no memory. The APM lists
+        // no flag it changes; `preserves_flags` is left off anyway, which only
+        // stops the compiler keeping flags live across the block.
+        unsafe {
+            core::arch::asm!(
+                "xchg {count}, rbx",
+                ".byte 0x0f, 0x01, 0xfb",
+                "xchg {count}, rbx",
+                count = inout(reg) u64::from(count) => _,
+                in("eax") MWAITX_HINT_C0,
+                in("ecx") MWAITX_ECX_TIMER_ENABLE,
+                options(nostack),
+            );
+        }
+    }
+
+    /// `MONITORX` a private scratch word + `MWAITX` for `min(recheck,
+    /// deadline)`. Wakes on the timer (or any interrupt); no writer is
+    /// expected, so there is no lost-wakeup hazard. Only ever called by the
+    /// dispatch seam when the backend is `AmdMwaitx` (`MWAITX` enumerated).
+    pub(super) fn mwaitx_until(deadline: Instant, recheck: Duration) -> bool {
+        let now = Instant::now();
+        if now >= deadline {
+            // Already past the deadline; nothing to park for. The caller
+            // re-polls + re-checks the deadline, so report "performed".
+            return true;
+        }
+        let count = mwaitx_timer_for(deadline.saturating_duration_since(now).min(recheck));
+        // The watched word lives on this stack frame and nothing writes it;
+        // a touch of its line returns MWAITX early at worst (the caller loops).
+        let scratch: u64 = 0;
+        // SAFETY: reached only on `AmdMwaitx`, which is resolved only when
+        // CPUID enumerates MONITORX/MWAITX; `scratch` is a live local, and
+        // `count` comes from `mwaitx_timer_count`, so it is at least 1.
+        unsafe {
+            monitorx(&scratch as *const u64 as *const u8);
+            mwaitx(count);
+        }
+        true
+    }
+
+    /// `MONITORX` the doorbell `addr` so a producer's store wakes `MWAITX`,
+    /// with the same layer-2 lost-wakeup guard as
+    /// [`monitor_wait_until_addr`]: after arming, the line is compared with
+    /// the CALLER's snapshot `expected` (NOT a fresh internal read), and a
+    /// difference skips the wait. Only ever called by the dispatch seam when
+    /// the backend is `AmdMwaitx`.
+    pub(super) fn mwaitx_until_addr(
+        addr: *const u64,
+        expected: u64,
+        deadline: Instant,
+        recheck: Duration,
+    ) -> super::AddrParkOutcome {
+        let now = Instant::now();
+        if now >= deadline {
+            // Deadline-boundary reads Parked (pre-existing, bounded; see
+            // the AddrParkOutcome doc).
+            return super::AddrParkOutcome::Parked;
+        }
+        let count = mwaitx_timer_for(deadline.saturating_duration_since(now).min(recheck));
+        // SAFETY: reached only on `AmdMwaitx` (CPUID enumerates the pair);
+        // MONITORX arms the DOORBELL line, which the caller guarantees is a
+        // valid, mapped, 8-byte-aligned `u64`.
+        unsafe { monitorx(addr as *const u8) };
+        // Layer 2: a ring between the caller's snapshot and the arm would not
+        // wake the wait, so the armed line is compared with `expected` before
+        // MWAITX. A fresh internal read here would equal the just-armed value
+        // and ABSORB (lose) that ring.
+        // SAFETY: caller guarantees `addr` is a valid 8-byte-aligned mapped u64.
+        if unsafe { core::ptr::read_volatile(addr) } != expected {
+            return super::AddrParkOutcome::RingPending;
+        }
+        // SAFETY: the line is armed just above and the CPU enumerates MWAITX;
+        // `count` comes from `mwaitx_timer_count`, so it is at least 1.
+        unsafe { mwaitx(count) };
         super::AddrParkOutcome::Parked
     }
 }
@@ -1167,14 +1427,19 @@ mod tests {
     use super::*;
 
     // Hermetic vs hardware-only coverage:
-    // - Every test below is HERMETIC (runs on any OS, incl. macOS):
-    //   they exercise the backend RESOLUTION, the `Unavailable` no-op fallback,
-    //   and the platform-independent layer-1 lost-wakeup early-out via the
-    //   backend-injection seams — all pure logic, no WAITPKG/WFE hardware.
-    // - HARDWARE-ONLY (NOT asserted here): the actual `UMWAIT`/`WFE` wake-on-store
-    //   latency and shallow-park behaviour. Those need real x86-WAITPKG /
-    //   aarch64 silicon and a producer on another core; they are measured on
-    //   that hardware, not in this unit suite.
+    // - Every test below runs on any OS, incl. macOS, except the `mwaitx_hw`
+    //   module (Linux x86_64 only). Most are pure logic over the
+    //   backend-injection seams: the backend RESOLUTION, the `Unavailable`
+    //   no-op fallback and the platform-independent layer-1 lost-wakeup
+    //   early-out. `available_*` and the primitive-knob subprocess pair
+    //   resolve the real backend; `mwaitx_hw` checks the CPUID probes against
+    //   `/proc/cpuinfo` and, on a CPU that enumerates `MWAITX`, runs the real
+    //   park (timer-only waits, a delivered store, the arm-time re-check; the
+    //   median store-to-wake bound is `#[ignore]`d, hardware-only).
+    // - HARDWARE-ONLY (NOT asserted in the default run): the `UMWAIT` and
+    //   `WFE` parks, and the wake latency of every primitive. An interrupt
+    //   also ends each wait, so a default-run test pins delivery but not which
+    //   event woke the core.
 
     #[test]
     fn policy_off_is_all_false_empty_ns() {
@@ -1336,17 +1601,18 @@ mod tests {
         // The layer-1 lost-wakeup EARLY-OUT (pure logic, no hardware): inject a
         // REAL backend but pre-move the doorbell so the observed word differs
         // from the caller's `expected` snapshot. The dispatch must detect the
-        // already-landed ring and return `true` immediately WITHOUT reaching
-        // the (target-gated) UMWAIT/WFE asm — so this runs hermetically on any
-        // OS, incl. macOS where neither asm backend is compiled.
+        // already-landed ring and return `RingPending` immediately WITHOUT
+        // reaching the (target-gated) UMWAIT/MWAITX/WFE asm, so this runs
+        // hermetically on any OS, incl. macOS where no asm backend is compiled.
         let word: u64 = 42; // current doorbell value
         let expected: u64 = 41; // caller's older snapshot → a ring already landed
         let deadline = Instant::now() + Duration::from_secs(3600);
         let started = Instant::now();
-        // Use BOTH real backends to pin that the early-out precedes dispatch on
-        // either target's variant.
+        // Use EVERY real backend to pin that the early-out precedes dispatch on
+        // each target's variant.
         for backend in [
             MonitorWaitBackend::WaitpkgUmwait,
+            MonitorWaitBackend::AmdMwaitx,
             MonitorWaitBackend::ArmWfeEventStream,
         ] {
             let outcome = monitor_wait_until_addr_with_backend(
@@ -1372,6 +1638,219 @@ mod tests {
         );
     }
 
+    /// The `linux + x86_64` resolution rule over EVERY combination of its two
+    /// CPU facts, hand-written: WAITPKG wins over `MWAITX`, `MWAITX` alone
+    /// parks on `AmdMwaitx`, and a CPU with neither falls back. (The knob is
+    /// applied before this rule; `the_primitive_knob_forces_the_fallback_in_a_fresh_process`
+    /// pins it end to end.)
+    #[test]
+    fn x86_backend_resolution_truth_table() {
+        use MonitorWaitBackend::*;
+        let table: [(X86CpuFacts, MonitorWaitBackend); 4] = [
+            (
+                X86CpuFacts {
+                    waitpkg: false,
+                    mwaitx: false,
+                },
+                Unavailable,
+            ),
+            (
+                X86CpuFacts {
+                    waitpkg: false,
+                    mwaitx: true,
+                },
+                AmdMwaitx,
+            ),
+            (
+                X86CpuFacts {
+                    waitpkg: true,
+                    mwaitx: false,
+                },
+                WaitpkgUmwait,
+            ),
+            (
+                X86CpuFacts {
+                    waitpkg: true,
+                    mwaitx: true,
+                },
+                WaitpkgUmwait,
+            ),
+        ];
+        for (facts, want) in table {
+            assert_eq!(x86_backend_from(facts), want, "{facts:?}");
+        }
+    }
+
+    /// The WAITPKG CPUID rule: bit 5 of leaf 7 ECX counts only when leaf 0
+    /// reports leaf 7, and leaf 7 is not even read otherwise (an Intel CPU
+    /// answers a leaf above its range with its highest basic leaf's data).
+    #[test]
+    fn waitpkg_bit_counts_only_inside_the_reported_basic_range() {
+        let only_bit_5: u32 = 0x20;
+        let every_bit_but_5: u32 = !0x20;
+        assert!(waitpkg_from_cpuid(7, || only_bit_5));
+        assert!(waitpkg_from_cpuid(0x23, || only_bit_5));
+        assert!(!waitpkg_from_cpuid(0x23, || 0));
+        assert!(!waitpkg_from_cpuid(0x23, || every_bit_but_5));
+        for max_basic_leaf in [0, 1, 6] {
+            assert!(
+                !waitpkg_from_cpuid(max_basic_leaf, || panic!(
+                    "leaf 7 read with the basic range ending at {max_basic_leaf}"
+                )),
+                "a basic range ending at {max_basic_leaf} never enumerates WAITPKG"
+            );
+        }
+    }
+
+    /// The child half of the knob pin. A NORMAL run (no `EXPECT_PRIMITIVE_KNOB`)
+    /// is a no-op pass; the parent below re-invokes THIS binary with `--exact`
+    /// and the knob set or removed, because the backend is cached in a
+    /// per-process `OnceLock` and the knob is read once with it. A failing
+    /// assert exits the child non-zero through the panic.
+    #[test]
+    fn subprocess_child_primitive_knob_probe() {
+        let Ok(expect) = std::env::var("EXPECT_PRIMITIVE_KNOB") else {
+            return; // normal run, not the child invocation
+        };
+        match expect.as_str() {
+            "disabled" => {
+                assert!(primitive_disabled_by_env(), "the child must see the knob");
+                assert_eq!(resolve_backend(), MonitorWaitBackend::Unavailable);
+                assert!(!monitor_wait_available());
+                assert!(
+                    !monitor_wait_until(
+                        Instant::now() + Duration::from_secs(5),
+                        Duration::from_millis(1)
+                    ),
+                    "with the knob set the park must report no wait performed"
+                );
+            }
+            "unset" => {
+                assert!(
+                    !primitive_disabled_by_env(),
+                    "the child must not see the knob"
+                );
+                // Anti-tautology control: the same child without the knob
+                // resolves the platform's own backend.
+                #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+                assert_eq!(resolve_backend(), MonitorWaitBackend::ArmWfeEventStream);
+                #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+                {
+                    // SAFETY: baseline CPUID reads with no precondition.
+                    let (waitpkg, mwaitx) = unsafe { (waitpkg_enumerated(), mwaitx_enumerated()) };
+                    assert_eq!(
+                        resolve_backend(),
+                        x86_backend_from(X86CpuFacts { waitpkg, mwaitx })
+                    );
+                }
+                #[cfg(not(any(
+                    all(target_os = "linux", target_arch = "x86_64"),
+                    all(target_os = "linux", target_arch = "aarch64")
+                )))]
+                assert_eq!(resolve_backend(), MonitorWaitBackend::Unavailable);
+            }
+            other => panic!("unknown EXPECT_PRIMITIVE_KNOB value {other:?}"),
+        }
+    }
+
+    /// `CERULION_MONITOR_WAIT_PRIMITIVE=0` forces the `Unavailable` backend in
+    /// a real process on every target, whatever its CPU carries: the child
+    /// above reads the knob through the production `resolve_backend` and
+    /// `current_backend`. The control run (knob removed) must resolve the
+    /// platform's own backend, so the kill arm is not vacuous on a host with
+    /// a primitive. Moving the knob check out of `resolve_backend` (or
+    /// skipping it on one target) fails the kill arm on a host whose CPU
+    /// carries a primitive (Linux aarch64, or x86_64 with WAITPKG or MWAITX);
+    /// on a host without one the kill arm cannot tell.
+    #[test]
+    fn the_primitive_knob_forces_the_fallback_in_a_fresh_process() {
+        fn run_child(knob: Option<&str>, expect: &str) {
+            let exe = std::env::current_exe().expect("current_exe");
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args([
+                "--exact",
+                "monitor_wait::tests::subprocess_child_primitive_knob_probe",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env("EXPECT_PRIMITIVE_KNOB", expect)
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+            match knob {
+                Some(v) => cmd.env("CERULION_MONITOR_WAIT_PRIMITIVE", v),
+                None => cmd.env_remove("CERULION_MONITOR_WAIT_PRIMITIVE"),
+            };
+            let mut child = cmd.spawn().expect("spawn the knob child");
+            // BOUNDED wait in SECONDS (a liveness ceiling, never a wall in park
+            // units); a hung child is killed and reaped.
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("the knob child hung past its 60 s liveness ceiling");
+                    }
+                }
+            };
+            assert!(
+                status.success(),
+                "knob child (CERULION_MONITOR_WAIT_PRIMITIVE={knob:?}, expecting {expect}) \
+                 failed with {status:?}; see its stderr above"
+            );
+        }
+        run_child(Some("0"), "disabled");
+        run_child(None, "unset");
+    }
+
+    /// The `MONITORX` CPUID rule: bit 29 of Fn8000_0001 ECX counts only when
+    /// Fn8000_0000 reports that leaf, and the leaf is not even read
+    /// otherwise (a leaf above the reported range returns unrelated data).
+    #[test]
+    fn mwaitx_bit_counts_only_inside_the_reported_extended_range() {
+        let only_bit_29: u32 = 0x2000_0000;
+        let every_bit_but_29: u32 = !0x2000_0000;
+        // Inside the range: the bit alone decides.
+        assert!(mwaitx_from_cpuid(0x8000_0001, || only_bit_29));
+        assert!(mwaitx_from_cpuid(0x8000_0021, || only_bit_29));
+        assert!(mwaitx_from_cpuid(u32::MAX, || u32::MAX));
+        assert!(!mwaitx_from_cpuid(0x8000_0021, || 0));
+        assert!(!mwaitx_from_cpuid(0x8000_0021, || every_bit_but_29));
+        // Outside the range: false, and the leaf is never read.
+        for max_extended_leaf in [0, 0x7FFF_FFFF, 0x8000_0000] {
+            assert!(
+                !mwaitx_from_cpuid(max_extended_leaf, || panic!(
+                    "Fn8000_0001 read with the range ending at {max_extended_leaf:#x}"
+                )),
+                "a range ending at {max_extended_leaf:#x} never enumerates MWAITX"
+            );
+        }
+    }
+
+    /// The `MWAITX` timer operand: a zero count would mean no timer at all, so
+    /// it is never below 1, and a wait longer than 32 bits of cycles
+    /// saturates at `u32::MAX` instead of wrapping to a short or zero count.
+    #[test]
+    fn mwaitx_timer_count_is_clamped_to_one_through_u32_max() {
+        let cases: [(u64, u32); 8] = [
+            (0, 1),
+            (1, 1),
+            (2, 2),
+            (60_000, 60_000),
+            (0xFFFF_FFFF, u32::MAX),
+            (0x1_0000_0000, u32::MAX),
+            (0x1_0000_0001, u32::MAX),
+            (u64::MAX, u32::MAX),
+        ];
+        for (cycles, want) in cases {
+            assert_eq!(mwaitx_timer_count(cycles), want, "cycles = {cycles:#x}");
+        }
+    }
+
     /// The outcome→caller mapping truth table. `performed`
     /// gates the sleep fallback (everything but Unavailable skips it);
     /// `parked` gates slice telemetry (only a real completed wait counts).
@@ -1381,6 +1860,302 @@ mod tests {
         assert!(Parked.performed() && Parked.parked());
         assert!(RingPending.performed() && !RingPending.parked());
         assert!(!Unavailable.performed() && !Unavailable.parked());
+    }
+
+    /// The real CPUID probes and the real `MWAITX` park on Linux x86_64. The
+    /// probes are checked against the kernel's own derivation of the same
+    /// bits (the `flags` line of `/proc/cpuinfo`) on every x86_64 Linux host;
+    /// the park tests run on a CPU that enumerates `MWAITX` and, on any other
+    /// CPU, assert that the resolved backend is not `AmdMwaitx` and say why
+    /// they skipped the park.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    mod mwaitx_hw {
+        use super::super::*;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        /// The kernel's CPU flags (the first `flags` line of `/proc/cpuinfo`),
+        /// or `None` where the file or the line is missing.
+        fn kernel_cpu_flags() -> Option<Vec<String>> {
+            let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+            let line = text.lines().find(|l| l.starts_with("flags"))?;
+            let (_, flags) = line.split_once(':')?;
+            Some(flags.split_whitespace().map(str::to_owned).collect())
+        }
+
+        /// `mwaitx` as this CPU enumerates it through the code under test.
+        fn cpu_has_mwaitx() -> bool {
+            // SAFETY: a baseline CPUID read with no precondition (see its doc).
+            unsafe { mwaitx_enumerated() }
+        }
+
+        /// The skip arm: the CPU cannot run this test's park, so the resolved
+        /// backend must not be the one that would execute `MWAITX`.
+        fn assert_not_resolved_and_skip(why: &str) {
+            let resolved = resolve_backend();
+            assert_ne!(
+                resolved,
+                MonitorWaitBackend::AmdMwaitx,
+                "a CPU where {why} must never resolve the MWAITX backend"
+            );
+            eprintln!("skipping the MWAITX park: {why} (resolved backend: {resolved:?})");
+        }
+
+        /// The probes read the bits the kernel reads: `waitpkg_enumerated` and
+        /// `mwaitx_enumerated` agree with the kernel's `waitpkg` and `mwaitx`
+        /// flags, and the production resolution is the backend those flags
+        /// call for (hand-derived here from the flags, not from the probes):
+        /// WAITPKG ⇒ `WaitpkgUmwait`, else `mwaitx` ⇒ `AmdMwaitx`, else
+        /// `Unavailable`, and `Unavailable` whenever the knob is set. A probe
+        /// that reads the wrong leaf, register or bit, or a resolution that
+        /// drops or swaps a fact, fails here on the CPU it misreads. (A kernel
+        /// booted with `clearcpuid=` hiding one of the two flags would fail it
+        /// too, which is a host the park does not honour.)
+        #[test]
+        fn the_resolved_backend_matches_the_kernels_cpu_flags() {
+            let Some(flags) = kernel_cpu_flags() else {
+                eprintln!("skipping: /proc/cpuinfo has no flags line on this host");
+                return;
+            };
+            let has = |flag: &str| flags.iter().any(|f| f == flag);
+            let (kernel_waitpkg, kernel_mwaitx) = (has("waitpkg"), has("mwaitx"));
+            // SAFETY: baseline CPUID reads with no precondition (see their docs).
+            let (waitpkg, mwaitx) = unsafe { (waitpkg_enumerated(), mwaitx_enumerated()) };
+            assert_eq!(
+                waitpkg, kernel_waitpkg,
+                "WAITPKG probe vs the kernel's flag"
+            );
+            assert_eq!(mwaitx, kernel_mwaitx, "MWAITX probe vs the kernel's flag");
+            let want = if primitive_disabled_by_env() {
+                MonitorWaitBackend::Unavailable
+            } else if kernel_waitpkg {
+                MonitorWaitBackend::WaitpkgUmwait
+            } else if kernel_mwaitx {
+                MonitorWaitBackend::AmdMwaitx
+            } else {
+                MonitorWaitBackend::Unavailable
+            };
+            assert_eq!(resolve_backend(), want);
+            assert_eq!(current_backend(), want);
+            assert_eq!(
+                monitor_wait_available(),
+                want != MonitorWaitBackend::Unavailable
+            );
+        }
+
+        /// A timer-only park on `AmdMwaitx` (a private scratch line nobody
+        /// writes) reports a performed wait, really waits, and returns well
+        /// inside its deadline. Each of 21 parks asks for a 2 ms slice; the
+        /// median must be at least 20 µs (an interrupt can end any one wait
+        /// early, a park that skipped `MWAITX` returns in well under 1 µs) and
+        /// every park must return inside its 5 s deadline (the timer or an
+        /// interrupt ends it, and nothing faults; this test cannot tell which). Both bounds are load-safe: load only
+        /// lengthens a wait, and 5 s is a liveness ceiling.
+        #[test]
+        fn mwaitx_timer_only_park_waits_and_returns_inside_its_deadline() {
+            if !cpu_has_mwaitx() {
+                assert_not_resolved_and_skip("CPUID reports no MWAITX");
+                return;
+            }
+            let mut waits = Vec::new();
+            for _ in 0..21 {
+                let started = Instant::now();
+                assert!(
+                    monitor_wait_until_with_backend(
+                        MonitorWaitBackend::AmdMwaitx,
+                        started + Duration::from_secs(5),
+                        Duration::from_millis(2),
+                    ),
+                    "a timer-only MWAITX park reports a performed wait"
+                );
+                let waited = started.elapsed();
+                assert!(
+                    waited < Duration::from_secs(5),
+                    "a 2 ms timer-only park must return well inside its 5 s deadline"
+                );
+                waits.push(waited);
+            }
+            waits.sort_unstable();
+            let median = waits[waits.len() / 2];
+            assert!(
+                median >= Duration::from_micros(20),
+                "median timer-only park {median:?}: MWAITX did not wait (parks {waits:?})"
+            );
+        }
+
+        /// Run `trials` doorbell trials against a parker thread parked on
+        /// `AmdMwaitx` with a `recheck` timer: each trial pauses 2 ms (long
+        /// enough for the parker to re-enter MWAITX), stores the trial number
+        /// and waits, with a 10 s liveness ceiling, until the parker reports
+        /// it. Returns each trial's store-to-observation delay in ns and the
+        /// parker's count of completed parks.
+        fn doorbell_trials(trials: u64, recheck: Duration) -> (Vec<u64>, u64) {
+            let base = Instant::now();
+            let word = Arc::new(AtomicU64::new(0));
+            let parks = Arc::new(AtomicU64::new(0));
+            let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // The parker's observation: (value seen, ns since `base` when
+            // seen). `seen_at_ns` is stored before `seen_value`, and the main
+            // thread reads `seen_value` first, so each trial reads its own
+            // timestamp.
+            let seen_value = Arc::new(AtomicU64::new(0));
+            let seen_at_ns = Arc::new(AtomicU64::new(0));
+            let parker = {
+                let (word, parks) = (Arc::clone(&word), Arc::clone(&parks));
+                let (seen_value, seen_at_ns) = (Arc::clone(&seen_value), Arc::clone(&seen_at_ns));
+                let running = Arc::clone(&running);
+                std::thread::spawn(move || {
+                    running.store(true, Ordering::SeqCst);
+                    let addr = word.as_ptr() as *const u64;
+                    let deadline = Instant::now() + Duration::from_secs(60);
+                    let mut last = 0;
+                    while last < trials {
+                        let now_value = word.load(Ordering::SeqCst);
+                        if now_value != last {
+                            seen_at_ns.store(base.elapsed().as_nanos() as u64, Ordering::SeqCst);
+                            seen_value.store(now_value, Ordering::SeqCst);
+                            last = now_value;
+                            continue;
+                        }
+                        assert!(Instant::now() < deadline, "the parker ran past 60 s");
+                        // `addr` is the `AtomicU64` this thread's `Arc` keeps
+                        // alive and 8-byte aligned for the whole call (the
+                        // seam's validity contract).
+                        let outcome = monitor_wait_until_addr_with_backend(
+                            MonitorWaitBackend::AmdMwaitx,
+                            addr,
+                            now_value,
+                            deadline,
+                            recheck,
+                        );
+                        assert!(outcome.performed(), "AmdMwaitx always performs");
+                        if outcome.parked() {
+                            parks.fetch_add(1, Ordering::SeqCst);
+                        }
+                    }
+                })
+            };
+            let start = Instant::now() + Duration::from_secs(10);
+            while !running.load(Ordering::SeqCst) {
+                assert!(
+                    Instant::now() < start,
+                    "the parker never started within 10 s"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut delays_ns = Vec::new();
+            for trial in 1..=trials {
+                std::thread::sleep(Duration::from_millis(2));
+                let stored_at_ns = base.elapsed().as_nanos() as u64;
+                word.store(trial, Ordering::SeqCst);
+                let observe = Instant::now() + Duration::from_secs(10);
+                while seen_value.load(Ordering::SeqCst) != trial {
+                    assert!(
+                        Instant::now() < observe,
+                        "the parker never observed trial {trial}'s store within 10 s"
+                    );
+                    std::hint::spin_loop();
+                }
+                delays_ns.push(
+                    seen_at_ns
+                        .load(Ordering::SeqCst)
+                        .saturating_sub(stored_at_ns),
+                );
+            }
+            parker.join().expect("the parker thread panicked");
+            (delays_ns, parks.load(Ordering::SeqCst))
+        }
+
+        /// A doorbell park on `AmdMwaitx` delivers a store another thread
+        /// makes: over 5 trials the parker parks (MWAITX runs, so `parks`
+        /// moves) and observes every stored value, each within a 10 s
+        /// liveness ceiling. Which event ended a given wait (the store or an
+        /// interrupt) is not observable here; the latency bound is
+        /// `mwaitx_doorbell_store_ends_the_wait_at_a_median_under_200us`. A
+        /// park that never waits also passes this test; the waiting half is
+        /// pinned by the timed control in
+        /// `mwaitx_arm_time_recheck_skips_the_wait_when_the_line_already_moved`.
+        #[test]
+        fn mwaitx_doorbell_park_delivers_a_store_from_another_thread() {
+            if !cpu_has_mwaitx() {
+                assert_not_resolved_and_skip("CPUID reports no MWAITX");
+                return;
+            }
+            let (delays_ns, parks) = doorbell_trials(5, Duration::from_millis(50));
+            assert_eq!(delays_ns.len(), 5, "every trial's store must be observed");
+            assert!(parks >= 1, "the parker never completed an MWAITX park");
+        }
+
+        /// The store itself ends the `AmdMwaitx` doorbell wait: over 31 trials
+        /// with a 500 ms timer the median store-to-observation delay stays
+        /// under 200 µs. The timer cannot end a wait that soon, and a periodic
+        /// tick ends one at a median of half its period (500 µs at 1000 Hz,
+        /// more at lower rates), so a `MONITORX` armed on any other line fails
+        /// the bound. A wall-clock ceiling needs a quiet core (a preempted
+        /// parker sees the store a scheduler slice late), so this runs only on
+        /// demand, alone, on an idle host with MWAITX.
+        #[test]
+        #[ignore = "hardware-only: a median wake-latency bound needs an idle Linux x86_64 host with MWAITX; run alone with --ignored --test-threads=1"]
+        fn mwaitx_doorbell_store_ends_the_wait_at_a_median_under_200us() {
+            if !cpu_has_mwaitx() {
+                assert_not_resolved_and_skip("CPUID reports no MWAITX");
+                return;
+            }
+            let (mut delays_ns, parks) = doorbell_trials(31, Duration::from_millis(500));
+            assert!(parks >= 1, "the parker never completed an MWAITX park");
+            delays_ns.sort_unstable();
+            let median_ns = delays_ns[delays_ns.len() / 2];
+            assert!(
+                median_ns < 200_000,
+                "median store-to-observation {median_ns} ns over 31 trials: the store did not \
+                 end the MWAITX wait (delays {delays_ns:?})"
+            );
+        }
+
+        /// Layer 2 of the lost-wakeup guard on `AmdMwaitx`, called directly so
+        /// layer 1 cannot answer first: with the line already past the
+        /// caller's snapshot, the arm-time re-check returns `RingPending` and
+        /// never reaches `MWAITX`. Removing the re-check makes it wait and
+        /// report `Parked`. With the snapshot current, the same call parks and
+        /// really waits: the median of 21 calls asking for 2 ms is at least
+        /// 20 µs, which a doorbell park that lost its `MONITORX` (MWAITX then
+        /// returns at once) or its `MWAITX` fails. The bound is a load-safe
+        /// floor: load only lengthens a wait.
+        #[test]
+        fn mwaitx_arm_time_recheck_skips_the_wait_when_the_line_already_moved() {
+            if !cpu_has_mwaitx() {
+                assert_not_resolved_and_skip("CPUID reports no MWAITX");
+                return;
+            }
+            let word: u64 = 42;
+            let far = Instant::now() + Duration::from_secs(3600);
+            assert_eq!(
+                x86::mwaitx_until_addr(&word, 41, far, Duration::from_secs(1)),
+                AddrParkOutcome::RingPending,
+                "a line that moved before the arm must skip the wait"
+            );
+            let mut waits = Vec::new();
+            for _ in 0..21 {
+                let started = Instant::now();
+                assert_eq!(
+                    x86::mwaitx_until_addr(&word, 42, far, Duration::from_millis(2)),
+                    AddrParkOutcome::Parked,
+                    "a line still at the snapshot must park"
+                );
+                waits.push(started.elapsed());
+            }
+            waits.sort_unstable();
+            let median = waits[waits.len() / 2];
+            assert!(
+                median >= Duration::from_micros(20),
+                "median doorbell park {median:?}: MWAITX did not wait (parks {waits:?})"
+            );
+            assert_eq!(
+                x86::mwaitx_until_addr(&word, 42, Instant::now(), Duration::from_secs(1)),
+                AddrParkOutcome::Parked,
+                "a deadline already reached reads Parked"
+            );
+        }
     }
 
     // ================= The degraded-park NAP tests =================
