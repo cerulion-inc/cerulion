@@ -22,12 +22,19 @@ the hash of the shipped file, and a status:
 and dropped_files, the measured files the shipped tree leaves out. Every measured file is a row or a dropped file.
 OUTSIDE_SNAPSHOT names the one shipped file that is in neither measured tree: the launcher that ran the grid, whose
 measured hash only the ledger holds.
+
+    python -m cerulion_harness.verify [HARNESS]
+
+checks HARNESS (by default the harness folder this file is in) and prints each arm's snapshot id and file count and
+every problem. It exits 0 only when both arms were checked and no problem was found, 1 when there is a problem, 2 on
+a usage error.
 """
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import sys
 import tempfile
 
 SNAPSHOTS = {
@@ -37,6 +44,9 @@ SNAPSHOTS = {
 OUTSIDE_SNAPSHOT = ("runs/tools/grid_ext.py",)
 STATUSES = ("identical", "comments_and_docstrings", "text_edited", "strings_edited", "code_edited")
 MANIFEST_LINE = re.compile(r"^([0-9a-f]{64})  (\S(?:.*\S)?)$")
+# The harness folder: src/cerulion_harness/ is two levels below it.
+HARNESS = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+USAGE = "usage: python -m cerulion_harness.verify [HARNESS]   (HARNESS: a harness folder, by default this file's)"
 
 
 def _sha(path):
@@ -185,3 +195,34 @@ def verify(home):
                           "shipped_by_status": dict(sorted(by_status.items(), key=lambda kv: str(kv[0]))),
                           "left_out": len(entry.get("dropped_files", []))}
     return problems, facts
+
+
+def main(argv=None):
+    """The command line: verify one folder and print the result. An arm with no checked file is a problem of its
+    own, so the exit is 0 only when every arm was checked and no problem was found."""
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv in (["-h"], ["--help"]):
+        print(USAGE)
+        return 0
+    if len(argv) > 1 or (argv and argv[0].startswith("-")):
+        print(USAGE, file=sys.stderr)
+        return 2
+    problems, facts = verify(argv[0] if argv else HARNESS)
+    problems = list(problems)
+    for arm in SNAPSHOTS:
+        if not (facts.get(arm) or {}).get("shipped_files"):
+            problems.append(f"{arm}: no shipped file was checked")
+    for arm in sorted(facts):
+        fact = facts[arm]
+        print(f"{arm}: snapshot {fact.get('snapshot')}, {fact.get('shipped_files')} shipped files")
+    for problem in problems:
+        print("PROBLEM: " + problem, file=sys.stderr)
+    if problems:
+        print(f"verify: {len(problems)} problem(s); this folder is not the measured code")
+        return 1
+    print("verify: ok, this folder holds the code the benchmark measured")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

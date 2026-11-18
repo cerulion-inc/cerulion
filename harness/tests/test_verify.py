@@ -4,11 +4,14 @@
 cerulion_harness.verify and measured/assemble.py are loaded from their paths. The oracles are written here: the two
 snapshot ids the results package cites, the file counts of the ledger, the paths of the plain overlay and its absent
 list, and the hashes of the two texts the model reads unchanged from the measured trees. Every tampering test works on
-a copy of the folder in a temporary directory.
+a copy of the folder in a temporary directory. The command-line tests run python -m cerulion_harness.verify with this
+folder's src/ on the path.
 """
 
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -17,6 +20,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 HARNESS = pathlib.Path(__file__).resolve().parent.parent
 MEASURED = HARNESS / "measured"
@@ -58,10 +62,23 @@ def sha(path):
     return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
 
 
+# What a run leaves inside a code tree, which neither verify nor the assembly reads: Python's caches, the run output
+# folders and the file macOS writes. Written here, not read from assemble.py.
+RUN_OUTPUT_TREES = ("runs/derived_mjcf/", "runs/benchmarks/")
+
+
+def run_output(rel):
+    parts = rel.split("/")
+    return ("__pycache__" in parts or rel.endswith(".pyc") or parts[-1] == ".DS_Store"
+            or rel.startswith(RUN_OUTPUT_TREES))
+
+
 def listing(root):
-    """[(relative path, sha256)] of every file under root, sorted: an oracle walk that does not use assemble.py."""
+    """[(relative path, sha256)] of every file under root but what a run leaves there, sorted: an oracle walk that
+    does not use assemble.py."""
     root = pathlib.Path(root)
-    return sorted((p.relative_to(root).as_posix(), sha(p)) for p in root.rglob("*") if p.is_file())
+    return sorted((p.relative_to(root).as_posix(), sha(p)) for p in root.rglob("*")
+                  if p.is_file() and not run_output(p.relative_to(root).as_posix()))
 
 
 class Copy:
@@ -105,20 +122,34 @@ class ShippedTree(unittest.TestCase):
 
 
 class Assembly(unittest.TestCase):
-    def test_the_plain_tree_is_rcp_with_the_overlay_and_without_the_absent_file(self):
+    def assert_plain_is_rcp_with_the_overlay(self, measured):
         with tempfile.TemporaryDirectory() as tmp:
             dest = os.path.join(tmp, "plain")
-            written = A.assemble_plain(str(MEASURED), dest)
-            rcp = dict(listing(MEASURED / "rcp"))
+            written = A.assemble_plain(str(measured), dest)
+            rcp = dict(listing(measured / "rcp"))
             got = dict(listing(dest))
             self.assertEqual(sorted(got), sorted(set(rcp) - set(ABSENT)))
             self.assertEqual(written, sorted(got))
             self.assertEqual(len(got), 320)
             for rel, digest in got.items():
-                source = MEASURED / ("plain-overlay" if rel in OVERLAY else "rcp") / rel
+                source = measured / ("plain-overlay" if rel in OVERLAY else "rcp") / rel
                 self.assertEqual(digest, sha(source), rel)
             for rel in ("rcpx/eyes_service/start.sh", "rcpx/eyes_service/stop.sh"):
                 self.assertTrue(os.access(os.path.join(dest, rel), os.X_OK), rel)
+
+    def test_the_plain_tree_is_rcp_with_the_overlay_and_without_the_absent_file(self):
+        self.assert_plain_is_rcp_with_the_overlay(MEASURED)
+
+    def test_the_plain_tree_is_the_same_after_a_run_wrote_its_caches_into_rcp(self):
+        # An episode imports the rcp tree and leaves Python's caches beside its files: the comparison ignores
+        # them, as the assembly does.
+        with Copy() as home:
+            rcp = home / "measured" / "rcp"
+            for rel in ("rcpx/__pycache__/server.cpython-312.pyc", "bench/__pycache__/__init__.cpython-310.pyc",
+                        "runs/derived_mjcf/panda.xml", ".DS_Store"):
+                (rcp / rel).parent.mkdir(parents=True, exist_ok=True)
+                (rcp / rel).write_bytes(b"run output\n")
+            self.assert_plain_is_rcp_with_the_overlay(home / "measured")
 
     def test_two_assemblies_are_identical(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -314,6 +345,79 @@ class Tampering(unittest.TestCase):
 
     def test_two_runs_agree(self):
         self.assertEqual(V.verify(str(HARNESS)), V.verify(str(HARNESS)))
+
+
+def run_module(*args):
+    """python -m cerulion_harness.verify ARGS, with this harness folder's src/ as the only addition to the path."""
+    env = dict(os.environ, PYTHONPATH=str(HARNESS / "src"))
+    env.pop("PYTHONHOME", None)
+    with tempfile.TemporaryDirectory() as cwd:
+        return subprocess.run([sys.executable, "-B", "-m", "cerulion_harness.verify", *map(str, args)], cwd=cwd,
+                              env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+
+
+class CommandLine(unittest.TestCase):
+    def test_the_shipped_folder_is_checked_and_passes(self):
+        run = run_module()
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stderr, "")
+        self.assertEqual(run.stdout.splitlines(), [
+            f"plain: snapshot {PLAIN_SNAPSHOT}, 320 shipped files",
+            f"rcp: snapshot {RCP_SNAPSHOT}, 321 shipped files",
+            "verify: ok, this folder holds the code the benchmark measured"])
+
+    def test_a_changed_byte_exits_1_and_names_each_problem(self):
+        with Copy() as home:
+            path = home / "measured" / "rcp" / "rcpx" / "server.py"
+            data = bytearray(path.read_bytes())
+            data[-2] ^= 1
+            path.write_bytes(bytes(data))
+            run = run_module(home)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertEqual(run.stderr.splitlines(), ["PROBLEM: rcp: rcpx/server.py differs from the ledger",
+                                                   "PROBLEM: plain: rcpx/server.py differs from the ledger"])
+        self.assertEqual(run.stdout.splitlines()[-1], "verify: 2 problem(s); this folder is not the measured code")
+
+    def test_a_deleted_file_exits_1(self):
+        with Copy() as home:
+            (home / "measured" / "rcp" / "rcpx" / "surfaces.py").unlink()
+            run = run_module(home)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        self.assertIn("PROBLEM: rcp: rcpx/surfaces.py is missing", run.stderr.splitlines())
+
+    def test_a_folder_with_nothing_to_check_exits_1(self):
+        with tempfile.TemporaryDirectory() as empty:
+            run = run_module(empty)
+        self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+        lines = run.stderr.splitlines()
+        self.assertEqual(len(lines), 3, lines)
+        self.assertTrue(lines[0].startswith("PROBLEM: cannot read the provenance files"), lines)
+        self.assertEqual(lines[1:], ["PROBLEM: rcp: no shipped file was checked",
+                                     "PROBLEM: plain: no shipped file was checked"])
+        self.assertEqual(run.stdout, "verify: 3 problem(s); this folder is not the measured code\n")
+
+    def test_an_arm_the_check_never_reached_is_a_problem(self):
+        # verify() names a problem for every arm it cannot check; were one ever missing with no problem, the
+        # command line still would not pass.
+        facts = {"rcp": dict(FACTS["rcp"])}
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(V, "verify", return_value=([], facts)), contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            code = V.main(["somewhere"])
+        self.assertEqual(code, 1)
+        self.assertEqual(err.getvalue(), "PROBLEM: plain: no shipped file was checked\n")
+        self.assertEqual(out.getvalue().splitlines()[-1], "verify: 1 problem(s); this folder is not the measured code")
+
+    def test_usage(self):
+        for args in (("one", "two"), ("--fast",)):
+            with self.subTest(args=args):
+                run = run_module(*args)
+                self.assertEqual(run.returncode, 2)
+                self.assertIn("usage: python -m cerulion_harness.verify [HARNESS]", run.stderr)
+                self.assertEqual(run.stdout, "")
+        run = run_module("--help")
+        self.assertEqual(run.returncode, 0)
+        self.assertIn("usage: python -m cerulion_harness.verify [HARNESS]", run.stdout)
 
 
 if __name__ == "__main__":
