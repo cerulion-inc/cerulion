@@ -25,8 +25,8 @@ workspace = true
 trybuild = "1"
 
 # The context-helper programs, as examples: `cargo test` builds each one with
-# the default `cdylib` feature and no `cfg(test)`, as trybuild's pass mode did,
-# and the lib's `context_compile_tests` runs it.
+# the default `cdylib` feature and no `cfg(test)`, as a downstream `cargo
+# build` compiles it, and the lib's `context_compile_tests` runs it.
 [[example]]
 name = "pass_annotated_context_helper"
 path = "tests/ui/annotated_context_helper.rs"

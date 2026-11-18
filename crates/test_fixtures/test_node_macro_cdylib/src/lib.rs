@@ -162,7 +162,7 @@ mod context_compile_tests {
     }
 
     #[test]
-    fn stable_context_helpers_compile_with_the_author_migration() {
+    fn every_context_helper_program_built_with_the_migration_runs_to_success() {
         // `target/<profile>/deps/<this binary>` to `target/<profile>/examples`.
         let exe = std::env::current_exe().expect("this test binary's own path");
         let deps = exe
@@ -204,8 +204,9 @@ mod context_compile_tests {
                 .unwrap_or_else(|e| panic!("start {}: {e}", path.display()));
             if !output.status.success() {
                 failures.push(format!(
-                    "{name} exited with {}\nstderr:\n{}",
+                    "{name} exited with {}\nstdout:\n{}\nstderr:\n{}",
                     output.status,
+                    String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 ));
             }
