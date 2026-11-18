@@ -194,25 +194,30 @@ env:
 # CARGO TIMING REPORTS AND RUNNER HARDWARE. In every job that carries the three
 # steps below, each cargo build, check, clippy, doc and test command passes
 # `--timings` (the cerulion_core shards pass it through `CI_TEST_SHARD_EXTRA`),
-# so each command writes one HTML report under `<target dir>/cargo-timings/`.
+# so each command writes one `cargo-timing-<timestamp>-<hash>.html` report under
+# `<target dir>/cargo-timings/`, plus `cargo-timing.html`, a copy of the newest.
 #
 #   * `Log the runner's CPU and memory`, right after checkout, prints the
 #     architecture, CPU model, core count and memory, and writes the same lines
 #     to `runner.txt`.
-#   * `Collect the cargo timing reports` moves each listed target directory's
-#     `cargo-timings/` to `$RUNNER_TEMP/cargo-timings/<target dir>/`. It runs
-#     before any cache trim, prune or save, so no saved archive carries a
-#     report and a restored archive holds none from an earlier run.
+#   * `Collect the cargo timing reports` deletes `cargo-timing.html` and moves
+#     each listed target directory's `cargo-timings/` to
+#     `$RUNNER_TEMP/cargo-timings/<target dir>/`. It runs before any cache
+#     trim, prune or save, so no saved archive carries a report and a restored
+#     archive holds none from an earlier run.
 #   * `Upload the cargo timing reports` uploads that directory as the artifact
 #     `cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7
-#     days.
+#     days. `runner.txt` is always there, so a job whose cargo steps the path
+#     selection skipped uploads an artifact holding only that file.
 #
 # The last two run under `always()`, so a failed, cancelled or timed-out job
 # still uploads what it built. The collect step exits 0 on every path (a report
 # it cannot move is a warning), and the upload carries `continue-on-error:
-# true`, so neither can fail a job. `deb-smoke` and `stable-node-compiler-skew`
-# build inside scripts, and `fuzz` and `miri` build through cargo plugins on
-# the pinned nightly; those four write no reports.
+# true` and a 5 minute step timeout, so a failed or stalled upload never fails
+# a job. `deb-smoke` and `stable-node-compiler-skew` build inside scripts, and
+# `fuzz` and `miri` build through cargo plugins on the pinned nightly; those
+# four carry none of these steps. `cargo install` builds a tool in a temporary
+# target directory and writes no report anywhere.
 jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
   # that care: a checkout with full history plus a workspace resolve.
@@ -1260,14 +1265,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-lint-attempt-${{ github.run_attempt }}
@@ -1371,14 +1378,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-cross-aarch64-linux-attempt-${{ github.run_attempt }}
@@ -1531,14 +1540,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-msrv-attempt-${{ github.run_attempt }}
@@ -1714,14 +1725,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target crates/cerulion_android/android/runtime/target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-android-check-attempt-${{ github.run_attempt }}
@@ -1889,14 +1902,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-local-transport-attempt-${{ github.run_attempt }}
@@ -2043,14 +2058,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-period-park-${{ matrix.arch }}-attempt-${{ github.run_attempt }}
@@ -2211,14 +2228,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in examples/*/target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-examples-attempt-${{ github.run_attempt }}
@@ -2453,14 +2472,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in examples/go2/target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-demos-go2-attempt-${{ github.run_attempt }}
@@ -3551,14 +3572,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-test-linux-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
@@ -4574,14 +4597,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-test-macos-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
@@ -5038,14 +5063,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-crate-tests-${{ matrix.os }}-attempt-${{ github.run_attempt }}
@@ -5171,14 +5198,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-rcpd-eye-host-repeat-attempt-${{ github.run_attempt }}
@@ -5322,15 +5351,17 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         working-directory: ${{ github.workspace }}
         run: |
           for dir in target crates/cerulion_py/target crates/cerulion_py/target/pynodes; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-python-client-${{ matrix.os }}-attempt-${{ github.run_attempt }}
@@ -5491,14 +5522,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-test-latency-attempt-${{ github.run_attempt }}
@@ -5629,14 +5662,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-cli-e2e-latency-${{ matrix.os }}-attempt-${{ github.run_attempt }}
@@ -5952,14 +5987,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-docs-attempt-${{ github.run_attempt }}
@@ -6080,14 +6117,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-netd-wan-attempt-${{ github.run_attempt }}
@@ -6589,14 +6628,16 @@ jobs:
 
       - name: Collect the cargo timing reports
         if: always()
+        timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
           done
 
       - name: Upload the cargo timing reports
         if: always()
         continue-on-error: true
+        timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: cargo-timings-viz-tests-${{ matrix.lane }}-${{ matrix.os }}-attempt-${{ github.run_attempt }}

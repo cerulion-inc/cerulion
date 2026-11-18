@@ -660,15 +660,17 @@ Every `ci.yml` job that compiles with cargo commands written in the workflow pas
 shards through `CI_TEST_SHARD_EXTRA`), prints the runner's architecture, CPU model, core
 count and memory right after checkout, and uploads one artifact per job and matrix leg named
 `cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7 days. It holds
-`runner.txt` (the hardware lines) and one `cargo-timing-<time>.html` report per cargo
-command, under the path of the target directory it came from (`target/cargo-timings/`,
+`runner.txt` (the hardware lines, present even when the path selection skipped every cargo
+step) and one `cargo-timing-<timestamp>-<hash>.html` report per cargo command, under the path
+of the target directory it came from (`target/cargo-timings/`,
 `examples/go2/target/cargo-timings/`). Download it from the run's summary page or with
 `gh run download <run id> --pattern 'cargo-timings-*'`. The collect and upload steps run
 under `always()`, so a red or timed-out job still uploads; the collect step moves the reports
 out of the job's target directories before any cache save, so no cache archive carries one;
-and only the upload carries `continue-on-error: true`. `deb-smoke` and
-`stable-node-compiler-skew` build inside scripts and `fuzz` and `miri` through cargo plugins,
-so those four carry none of these steps.
+and only the upload carries `continue-on-error: true` (with a 5 minute step timeout).
+`deb-smoke` and `stable-node-compiler-skew` build inside scripts and `fuzz` and `miri` through
+cargo plugins, so those four carry none of these steps, and a `cargo install` tool build
+writes no report.
 
 ## Scheduled workflows
 
