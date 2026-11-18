@@ -106,6 +106,52 @@ class InstallScript(unittest.TestCase):
                          [f"not installed: the episode server environment ({self.copy}/venv)"])
 
     @unittest.skipUnless(SUPPORTED, "the script runs on macOS on Apple silicon and Linux on x86-64 or arm64")
+    def test_an_environment_whose_interpreter_is_gone_is_made_again(self):
+        # Both Python environments exist, but their interpreters are links to a Python that was removed. A stand-in
+        # uv on PATH refuses to make an environment over an existing folder, as uv does, and records its words.
+        # The scenes are current, so the run reaches no network.
+        self.stamp("scenes", sha_of(self.copy, "benchmarks/fetch.sh", "benchmarks/LIBERO-PRO-data.files.txt",
+                                    "benchmarks/LIBERO-PRO-data.sha256"))
+        (self.copy / "bx/LIBERO-PRO/libero/libero").mkdir(parents=True)
+        gone = pathlib.Path(self.tmp.name) / "removed-python"
+        for env in ("bx/libero-env", "venv"):
+            (self.copy / env / "bin").mkdir(parents=True)
+            (self.copy / env / "bin/python").symlink_to(gone)
+        mac_gl = "macos/cerulion_harness_macos_gl.py"
+        (self.copy / mac_gl).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HARNESS / mac_gl, self.copy / mac_gl)
+        tools = pathlib.Path(self.tmp.name) / "tools"
+        tools.mkdir()
+        log = pathlib.Path(self.tmp.name) / "uv.log"
+        (tools / "uv").write_text(
+            '#!/bin/sh\n'
+            'echo "$*" >> "$UV_LOG"\n'
+            '[ "$1" = venv ] || exit 0\n'
+            'for env; do :; done\n'
+            '[ -e "$env" ] && { echo "A virtual environment already exists at $env" >&2; exit 2; }\n'
+            'mkdir -p "$env/bin" "$env/site"\n'
+            'printf \'#!/bin/sh\\n[ "$1" = -c ] && echo "%s/site"\\nexit 0\\n\' "$env" > "$env/bin/python"\n'
+            'chmod +x "$env/bin/python"\n', encoding="utf-8")
+        # The renderer check reads ldconfig; this stand-in lists the renderer, as a machine that has it does.
+        (tools / "ldconfig").write_text('#!/bin/sh\necho "libOSMesa.so.8 (libc6) => /usr/lib/libOSMesa.so.8"\n',
+                                        encoding="utf-8")
+        for tool in ("uv", "ldconfig"):
+            (tools / tool).chmod(0o755)
+        env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", UV_LOG=str(log))
+        done = subprocess.run(["bash", str(self.copy / "install.sh")], stdin=subprocess.DEVNULL, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        words = log.read_text(encoding="utf-8").splitlines()
+        self.assertIn(f"venv --python 3.10 {self.copy}/bx/libero-env", words)
+        self.assertIn(f"venv --python 3.12 {self.copy}/venv", words)
+        for env_dir in ("bx/libero-env", "venv"):
+            python = self.copy / env_dir / "bin/python"
+            self.assertFalse(python.is_symlink(), env_dir)
+            self.assertTrue(os.access(python, os.X_OK), env_dir)
+        self.assertEqual((self.copy / "venv/site/cerulion_harness.pth").read_text(encoding="utf-8").strip(),
+                         f"{self.copy}/src")
+
+    @unittest.skipUnless(SUPPORTED, "the script runs on macOS on Apple silicon and Linux on x86-64 or arm64")
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can write any folder")
     def test_a_folder_this_user_cannot_write_is_refused_before_anything_is_fetched(self):
         os.chmod(self.copy, stat.S_IRUSR | stat.S_IXUSR)

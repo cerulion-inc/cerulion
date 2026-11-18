@@ -139,7 +139,9 @@ if current sim "$SIM_IN" && [ -x "$SIM_PY" ]; then
 else
   t=$(date +%s)
   rm -f "$BX/.step-sim"
-  [ -x "$SIM_PY" ] || "$UV" venv --python 3.10 "$BX/libero-env"
+  # An environment whose interpreter no longer runs (its Python was removed) is made again: uv refuses to
+  # write over an existing one.
+  [ -x "$SIM_PY" ] || { rm -rf "$BX/libero-env"; "$UV" venv --python 3.10 "$BX/libero-env"; }
   "$UV" pip install --python "$SIM_PY" -r "$HARNESS/requirements/sim-py310.txt"
   if [ "$OS" = Darwin ]; then
     # macOS wheels of torch carry no "+cpu" tag and live on the default index: the same version, CPU only.
@@ -178,7 +180,7 @@ if current server "$SERVER_IN" && [ -x "$VENV_PY" ]; then
 else
   t=$(date +%s)
   rm -f "$BX/.step-server"
-  [ -x "$VENV_PY" ] || "$UV" venv --python 3.12 "$HARNESS/venv"
+  [ -x "$VENV_PY" ] || { rm -rf "$HARNESS/venv"; "$UV" venv --python 3.12 "$HARNESS/venv"; }
   "$UV" pip install --python "$VENV_PY" -r "$HARNESS/requirements/server-py312.txt"
   SITE=$("$VENV_PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
   # This folder's src/ on the environment's path: python -m cerulion_harness runs this folder's code.
