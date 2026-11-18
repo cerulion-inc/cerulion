@@ -136,6 +136,10 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # `env` feature powers the CERULION_STATE_ROOT / CERULION_RELAY_URL fallbacks.
 clap = { version = "4", features = ["derive", "env"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Native process handles and readiness checks for caller-owned session cleanup.
+rustix = { version = "1", features = ["process", "event"] }
+
 [dev-dependencies]
 # Genuine loopback relay tests only; server features never enter normal builds.
 iroh-relay = { version = "=1.0.2", features = ["server"] }

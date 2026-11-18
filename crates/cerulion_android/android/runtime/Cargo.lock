@@ -755,6 +755,7 @@ dependencies = [
  "indexmap 2.14.0",
  "libc",
  "postcard",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
