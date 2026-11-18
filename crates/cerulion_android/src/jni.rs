@@ -7,23 +7,23 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use jni::objects::{JClass, JObject, JString, JValue};
 use jni::strings::JNIString;
 use jni::sys::{jint, jlong, jstring};
-use jni::JNIEnv;
+use jni::{Env, EnvUnowned, Outcome};
 
 use crate::error::codes;
 
 #[no_mangle]
-pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeInit(
-    mut env: JNIEnv,
-    _class: JClass,
-    files_dir: JString,
-    robot_name: JString,
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeInit<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    files_dir: JString<'caller>,
+    robot_name: JString<'caller>,
 ) -> jint {
-    guarded_code(|| {
-        let files_dir = match java_string(&mut env, &files_dir) {
+    guarded_with_env(&mut env, |env| {
+        let files_dir = match java_string(env, &files_dir) {
             Ok(value) => value,
             Err(code) => return code,
         };
-        let robot_name = match java_string(&mut env, &robot_name) {
+        let robot_name = match java_string(env, &robot_name) {
             Ok(value) => value,
             Err(code) => return code,
         };
@@ -32,48 +32,53 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeInit(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeStart(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeStart<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    config_json: JString<'caller>,
 ) -> jint {
-    guarded_code(|| match java_string(&mut env, &config_json) {
+    guarded_with_env(&mut env, |env| match java_string(env, &config_json) {
         Ok(value) => crate::host::start(&value),
         Err(code) => code,
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublish(
-    mut env: JNIEnv,
-    _class: JClass,
-    topic: JString,
-    json: JString,
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublish<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    topic: JString<'caller>,
+    json: JString<'caller>,
 ) -> jint {
-    guarded_code(|| publish(&mut env, &topic, &json, None))
+    guarded_with_env(&mut env, |env| publish(env, &topic, &json, None))
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublishStamped(
-    mut env: JNIEnv,
-    _class: JClass,
-    topic: JString,
-    json: JString,
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePublishStamped<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    topic: JString<'caller>,
+    json: JString<'caller>,
     stamp_ns: jlong,
 ) -> jint {
-    guarded_code(|| {
+    guarded_with_env(&mut env, |env| {
         // A stamp is nanoseconds on the runtime clock's base, so a negative
         // one names no time.
         let Ok(stamp_ns) = u64::try_from(stamp_ns) else {
             return codes::INVALID_ARGUMENT;
         };
-        publish(&mut env, &topic, &json, Some(stamp_ns))
+        publish(env, &topic, &json, Some(stamp_ns))
     })
 }
 
 /// Publish `json` on `topic`, stamped `stamp_ns` or, when it is `None`, with
 /// the runtime clock's time.
-fn publish(env: &mut JNIEnv, topic: &JString, json: &JString, stamp_ns: Option<u64>) -> jint {
+fn publish(
+    env: &mut Env<'_>,
+    topic: &JString<'_>,
+    json: &JString<'_>,
+    stamp_ns: Option<u64>,
+) -> jint {
     let topic = match java_string(env, topic) {
         Ok(value) => value,
         Err(code) => return code,
@@ -92,14 +97,13 @@ fn publish(env: &mut JNIEnv, topic: &JString, json: &JString, stamp_ns: Option<u
     // unknown-topic code come first). The exact byte check in
     // `encode_json` still applies after conversion.
     let prepare = |limit: usize| {
-        // SAFETY: `env` is the live JNIEnv for this call and `json` is a
-        // local ref from its arguments.
+        // SAFETY: `env` is the live JNIEnv for this call, `json` is a
+        // non-null local ref from its arguments, and no Java exception is
+        // pending: the only JNI calls before this one read `topic`, and any
+        // failure there returns before `prepare` runs.
         let utf16_len = unsafe {
             let raw = env.get_raw();
-            let get_length = (**raw)
-                .GetStringLength
-                .expect("GetStringLength is in JNI 1.0");
-            get_length(raw, json.as_raw())
+            ((**raw).v1_1.GetStringLength)(raw, json.as_raw())
         };
         if utf16_len < 0 || utf16_len as usize > limit {
             return Err(codes::ENCODE);
@@ -113,14 +117,14 @@ fn publish(env: &mut JNIEnv, topic: &JString, json: &JString, stamp_ns: Option<u
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePoll(
-    mut env: JNIEnv,
-    _class: JClass,
-    topic: JString,
-    out: JObject,
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePoll<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
+    topic: JString<'caller>,
+    out: JObject<'caller>,
 ) -> jint {
-    guarded_code(|| {
-        let topic = match java_string(&mut env, &topic) {
+    guarded_with_env(&mut env, |env| {
+        let topic = match java_string(env, &topic) {
             Ok(value) => value,
             Err(code) => return code,
         };
@@ -133,8 +137,8 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePoll(
             let appended = env.new_string(json).and_then(|text| {
                 env.call_method(
                     &out,
-                    "append",
-                    "(Ljava/lang/String;)Ljava/lang/StringBuilder;",
+                    jni::jni_str!("append"),
+                    jni::jni_sig!("(Ljava/lang/String;)Ljava/lang/StringBuilder;"),
                     &[JValue::Object(&text)],
                 )
             });
@@ -142,24 +146,38 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativePoll(
                 Ok(_) => codes::OK,
                 // Out of memory: the Java exception is pending and is what
                 // the caller sees when this call returns.
-                Err(_) => codes::PANIC,
+                Err(_) => {
+                    throw_out_of_memory_unless_pending(env);
+                    codes::PANIC
+                }
             }
         })
     })
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeStatus(
-    env: JNIEnv,
-    _class: JClass,
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeStatus<'caller>(
+    mut env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
 ) -> jstring {
     match catch_unwind(AssertUnwindSafe(|| {
-        env.new_string(crate::host::status())
-            .map(JString::into_raw)
-            .unwrap_or(std::ptr::null_mut())
+        env.with_env_no_catch(|env| {
+            Ok::<_, jni::errors::Error>(match env.new_string(crate::host::status()) {
+                Ok(status) => status.into_raw(),
+                // Out of memory: the Java exception is pending and is what
+                // the caller sees when this call returns.
+                Err(_) => {
+                    throw_out_of_memory_unless_pending(env);
+                    std::ptr::null_mut()
+                }
+            })
+        })
+        .into_outcome()
     })) {
-        Ok(value) => value,
-        Err(_) => {
+        Ok(Outcome::Ok(status)) => status,
+        // The closure above returns `Ok` on every path.
+        Ok(Outcome::Err(_)) => std::ptr::null_mut(),
+        Ok(Outcome::Panic(_)) | Err(_) => {
             crate::host::panic_code();
             std::ptr::null_mut()
         }
@@ -167,9 +185,9 @@ pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeStatus(
 }
 
 #[no_mangle]
-pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeStop(
-    _env: JNIEnv,
-    _class: JClass,
+pub extern "system" fn Java_com_cerulion_android_CerulionRuntime_nativeStop<'caller>(
+    _env: EnvUnowned<'caller>,
+    _class: JClass<'caller>,
 ) -> jint {
     guarded_code(crate::host::stop)
 }
@@ -181,11 +199,46 @@ fn guarded_code(operation: impl FnOnce() -> jint) -> jint {
     }
 }
 
-fn java_string(env: &mut JNIEnv, value: &JString) -> Result<String, jint> {
+/// [`guarded_code`] with the call's [`Env`]. `operation` maps every JNI
+/// failure to a status code itself, so the only outcome it can leave is `Ok`;
+/// `with_env_no_catch` leaves panics to the `catch_unwind` here, which reports
+/// them through the host as before.
+fn guarded_with_env<'caller>(
+    env: &mut EnvUnowned<'caller>,
+    operation: impl FnOnce(&mut Env<'caller>) -> jint,
+) -> jint {
+    guarded_code(|| {
+        match env
+            .with_env_no_catch(|env| Ok::<_, jni::errors::Error>(operation(env)))
+            .into_outcome()
+        {
+            Outcome::Ok(code) => code,
+            Outcome::Err(_) | Outcome::Panic(_) => crate::host::panic_code(),
+        }
+    })
+}
+
+/// jni 0.22 clears the `OutOfMemoryError` a failed string or method lookup
+/// raised and returns an error instead. Throw one again, unless an exception
+/// is already pending, so the Java caller still sees the failure when the
+/// native call returns.
+fn throw_out_of_memory_unless_pending(env: &mut Env<'_>) {
+    if !env.exception_check() {
+        // A throw that fails leaves this path nothing else to report.
+        let _ = env.throw_new(
+            jni::jni_str!("java/lang/OutOfMemoryError"),
+            jni::jni_str!("cerulion: out of memory"),
+        );
+    }
+}
+
+fn java_string(env: &Env<'_>, value: &JString<'_>) -> Result<String, jint> {
     if value.is_null() {
         return Err(codes::INVALID_ARGUMENT);
     }
-    let java_value = env.get_string(value).map_err(|_| codes::INVALID_ARGUMENT)?;
+    let java_value = value
+        .mutf8_chars(env)
+        .map_err(|_| codes::INVALID_ARGUMENT)?;
     let original_bytes = java_value.to_bytes().to_vec();
     let value: String = Cow::from(&java_value).into_owned();
     let round_trip = JNIString::from(value.as_str());
