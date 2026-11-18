@@ -452,7 +452,7 @@ dependencies = [
  "cerulion_mdns",
  "iceoryx2",
  "indexmap 2.14.0",
- "jni 0.21.1",
+ "jni 0.22.4",
  "serde",
  "serde_json",
  "thiserror 2.0.17",
