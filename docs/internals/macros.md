@@ -233,19 +233,27 @@ or allocator crosses. See [Node ABI](node-abi.md) for the exact contract.
 
 ## Trybuild suite and regen
 
-Compile-fail coverage lives in `crates/cerulion_core/tests/macro_compile_fail_test.rs` over
-`crates/cerulion_core/tests/ui/`:
+Compile-fail coverage lives in two places:
 
-- **Blocking** (every PR): `tests/ui/*.rs`, our own `compile_error!` diagnostics,
-  stable across rustc versions, plus compile-pass fixtures in `tests/ui/pass/`.
-- **`#[ignore]`d** (toolchain-fragile rustc renderings): `tests/ui/const_eval/`
-  (const-eval panics) and `tests/ui/type_error/` (rustc-rendered type errors, e.g. the
+- **Blocking** (every PR): the `node_macro_ui` package,
+  `crates/test_fixtures/node_macro_ui/tests/ui/*.rs`, each fixture failing with a
+  diagnostic the macros emit themselves (the `.stderr` also holds any rustc output
+  around it), checked by trybuild in
+  `tests/compile_fail.rs`. The compile-pass programs in `tests/ui/pass/` are example
+  targets of that package: `cargo test` builds each one as `cargo build` builds a
+  package that uses the macros, and `tests/pass_programs.rs` runs it. CI runs the package alone,
+  `cargo test -p node_macro_ui`.
+- **`#[ignore]`d** (toolchain-fragile rustc renderings):
+  `crates/cerulion_core/tests/macro_compile_fail_test.rs` over
+  `crates/cerulion_core/tests/ui/const_eval/` (const-eval panics) and
+  `crates/cerulion_core/tests/ui/type_error/` (rustc-rendered type errors, e.g. the
   write-only-proxy misuse diagnostics). Run via `-- --ignored`.
 
 Regen after an intentional diagnostic change or a toolchain bump:
 
 ```bash
-TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test
+TRYBUILD=overwrite cargo test -p node_macro_ui --test compile_fail
+TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test -- --ignored
 ```
 
 Two regen cautions:
@@ -269,7 +277,8 @@ prebuilt (`cargo build -p <fixture>`); each test file's header names its exact p
 | `cerulion_macros` in-src `#[cfg(test)]` (parse.rs, impl_macro.rs, determinism.rs) | Attribute parsing, emitted rewrite shapes (incl. the hoist-and-`?` nested-chain form), banned-symbol table | no | none |
 | `crates/cerulion_core/tests/macro_test.rs` | Macro lifecycle, `info()`, state | no | none |
 | `crates/cerulion/tests/one_dependency_build_test.rs` | The `::cerulion::core` root: scratch node crates whose only dependency is `cerulion`, built with the `cdylib` feature the scaffold turns on (data-trigger, sync and external nodes; params, accumulate, every state escape); a package naming neither crate gets the named error from all three macros; a field failing a state bound is reported at the field under both roots | no | none (drives `cargo check` on scratch projects; `CERULION_SCRATCH_TARGET_DIR` moves their target dir) |
-| `macro_compile_fail_test.rs` | Diagnostics via trybuild (blocking + ignored groups above) | no | none |
+| `node_macro_ui` (`tests/compile_fail.rs`, `tests/ui/pass/*.rs`) | Blocking diagnostics via trybuild; compile-pass programs built and run | no | none |
+| `macro_compile_fail_test.rs` | The `#[ignore]`d rustc-rendered groups above | no | none |
 | `fill_from_rewriter_test.rs` | Rewriter no-false-positives (`fill_from` forms; `=` rewrite preserved) | no | none |
 | `rewriter_var_field_assign_test.rs` | The schema-blind `=` write-shim rewrite, in-process | no | none |
 | `macro_graph_test.rs` | Macro nodes inside `GraphRuntime` | yes | none |
@@ -282,7 +291,7 @@ prebuilt (`cargo build -p <fixture>`); each test file's header names its exact p
 | `cdylib_iox2_log_level_test.rs` | Generated + hand-written inits apply `IOX2_LOG_LEVEL` (repo-walk guard) | yes | `test_node_discard_probe_cdylib`, `test_node_cdylib` |
 | `macro_params_test.rs` | `#[param]` in process: specs in `info()`, defaults at `new()`, `set_params` values reach `init` and the first tick, unknown name and wrong type refused at `init`, a param written in `init` or `tick` refuses the state capture | no | none |
 | `cdylib_params_test.rs` | `#[param]` across the FFI: specs in the info JSON, values through the optional `cerulion_node_init_with_params` symbol, two instances differ, a symbol-less cdylib refuses a handoff, a library that declares params without the symbol is refused when its info is read | yes | `test_node_macro_param_cdylib`, `test_node_cdylib`, `test_node_params_no_symbol_cdylib` |
-| `tests/ui/param_*.rs` | The six `#[param]` compile-fail diagnostics (unknown key, wrong-type default, `min` above `max`, default outside bounds, bounds on a `String`, `live` reserved) and `pass/param_fields_pass.rs` | no | none |
+| `node_macro_ui/tests/ui/param_*.rs` | The `#[param]` compile-fail diagnostics (unknown key, wrong-type default, `min` above `max`, default outside bounds, bounds on a `String`, `live` reserved) and `pass/param_fields_pass.rs` | no | none |
 
 Further siblings (`macro_lifecycle_test`, `macro_shim_methods_test`,
 `macro_shim_clock_sources_test`, `macro_sync_threading_test`,

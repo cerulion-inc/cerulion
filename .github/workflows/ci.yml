@@ -2902,11 +2902,12 @@ jobs:
       # to 51-63 s per shard outside the tail and no other binary exceeds
       # 18 s, so the file map in `ci_test_shard.sh` stays round-robin and no
       # second pin is warranted. The package steps are the whole imbalance.
-      # (The tail itself is not addressable: splitting it by expectation
-      # WITHIN the job measured +158 s of trybuild work, +2.4 min of
-      # shard-step wall. It is PINNED so it cannot relocate
-      # when an unrelated test file is added — evidence and the bar for a
-      # second name at `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. And it does
+      # (The tail is now the `node_macro_ui` package, run by the
+      # `cerulion_node diagnostics suite` step on this same shard: its
+      # compile-pass programs build as cargo examples, so trybuild checks
+      # the compile-fail set alone, in one dependency pass. The emptied core
+      # binary stays PINNED, which keeps every other file on its shard; see
+      # `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. The suite does
       # NOT get its own job: a new job is not in branch protection's required
       # list, which would silently demote the only compile-fail gate to
       # advisory.)
@@ -3079,6 +3080,22 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
+
+      # The #[cerulion_node] diagnostics suite: one trybuild check of every
+      # compile-fail fixture against its .stderr, then the compile-pass
+      # programs, each an example cargo builds with no cfg(test) and no
+      # harness, run by `tests/pass_programs.rs`. `-p` names this package alone,
+      # so the programs build with only the features its manifest asks for;
+      # trybuild's scratch project is a workspace of its own either way.
+      - name: cerulion_node diagnostics suite
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui')
+        run: cargo test -p node_macro_ui
+      - name: selection marker, node_macro_ui
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped node_macro_ui (selected: $SELECTED)"
 
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
@@ -3381,7 +3398,7 @@ jobs:
   # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
   # stay together so that ~390-crate tree compiles once; `--lib` and the
   # doctests ride shard 0 because the shard script puts the lib unit tests
-  # there; and the trybuild tail lands on `PINNED_SHARD % 3` = shard 2, so
+  # there; and the trybuild suite runs on shard 2, so
   # shard 2 gets the lightest package set. Re-tilt if a run shows the legs
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
@@ -3728,8 +3745,8 @@ jobs:
       # `cerulion_cli_engine/tests/ci_test_coverage_test.rs`, which walks every
       # job a pull request can fail and this job is one of them.
       # `--check cerulion_core 3` proves the partition
-      # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
-      # on shard 2, which is why shard 2 gets the lightest package set below).
+      # (108 + 108 + 109 files; the trybuild suite runs on shard 2, which is why
+      # shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
       # Descriptor sampler, recording only what it can read. The kernel's
       # open-file counters at 10 Hz on one line per tick, and once a second a
@@ -4006,7 +4023,7 @@ jobs:
       #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
       #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
       #            tree kept together (wireclient, connectd, netd-wan)
-      #   shard 2  the pinned trybuild tail, native_ros2_messages, macros,
+      #   shard 2  the cerulion_node diagnostics suite, native_ros2_messages, macros,
       #            discovery, and the folded viz suites
       #
       # Every `run:` line is byte-identical to the 2-way map, so nothing about
@@ -4081,6 +4098,22 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
+
+      # The #[cerulion_node] diagnostics suite: one trybuild check of every
+      # compile-fail fixture against its .stderr, then the compile-pass
+      # programs, each an example cargo builds with no cfg(test) and no
+      # harness, run by `tests/pass_programs.rs`. `-p` names this package alone,
+      # so the programs build with only the features its manifest asks for;
+      # trybuild's scratch project is a workspace of its own either way.
+      - name: cerulion_node diagnostics suite
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui')
+        run: cargo test -p node_macro_ui
+      - name: selection marker, node_macro_ui
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped node_macro_ui (selected: $SELECTED)"
 
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite

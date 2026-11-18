@@ -365,7 +365,7 @@ def read_metadata(source):
 # dev-dependency edges dropped)`, and LIVE_MEMBER_COUNT is the workspace member
 # count, all measured off this workspace independently of this script. The two
 # sizes in a row differ wherever a dev-dependency edge carries the closure, and
-# `cerulion_bag` is the extreme case: 69 packages can observe a change to it,
+# `cerulion_bag` is the extreme case: 70 packages can observe a change to it,
 # ten of them without dev-dependency edges. That gap is what proves the edges
 # are followed on the real graph rather than only on a fixture.
 #
@@ -377,16 +377,16 @@ def read_metadata(source):
 # LIVE_ORACLE_MEASURED is False while a measurement is outstanding, and the live
 # arm then reports a miss rather than passing on numbers nobody measured.
 LIVE_ORACLE_MEASURED = True
-LIVE_MEMBER_COUNT = 87
+LIVE_MEMBER_COUNT = 88
 LIVE_ORACLE = {
-    'cerulion_bag': (69, 10),
+    'cerulion_bag': (70, 10),
     'cerulion_cli': (1, 1),
-    'cerulion_cli_engine': (69, 6),
-    'cerulion_core': (69, 69),
+    'cerulion_cli_engine': (70, 6),
+    'cerulion_core': (70, 69),
     'cerulion_viz': (2, 2),
     'cerulion_vizd': (1, 1),
     'go2_tf': (4, 4),
-    'native_ros2_messages': (69, 58),
+    'native_ros2_messages': (70, 58),
 }
 
 
@@ -524,11 +524,15 @@ OBSERVATION_ERROR_CASES = [
 # members): its `hot_path_dependency_gate` walks `examples/go2`, so `go2_tf`
 # moves to with=9 without=4; `cerulion_heaphook` is unchanged.
 #
+# `node_macro_ui` joins it: its pass-program runner joins `examples` onto the
+# target directory, which the walk records as observing that tree, so `go2_tf`
+# moves to with=10 without=4.
+#
 # Dropping the union from the closure shrinks both, which is the mutant these
 # rows exist to kill.
 LIVE_OBSERVATION_ORACLE = {
     'cerulion_heaphook': (6, 1),
-    'go2_tf': (9, 4),
+    'go2_tf': (10, 4),
 }
 
 # `name | document | touched | dev edges followed | expected closure`.

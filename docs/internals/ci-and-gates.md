@@ -501,10 +501,10 @@ PROJECTED from those per-step costs at 26.6 min warm; the eight default-branch r
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
 `index mod count`, GENERATED, never hand-listed, save for ONE pinned name
-(`macro_compile_fail_test`, the serial trybuild tail (see `PINNED_TEST` in that script for the
-per-run measurement), which must not relocate every time a test
-file is added; it lands on `PINNED_SHARD % count`, shard 2 of 4 on Linux, shard 2 of 3 on
-macOS, and `--check` proves the pin), and execs `cargo nextest run --profile ci`
+(`macro_compile_fail_test`, held out of the rotation so the other files keep their shards
+(see `PINNED_TEST` in that script); it lands on `PINNED_SHARD % count`, shard 2 of 4 on
+Linux, shard 2 of 3 on macOS, and `--check` proves the pin; the blocking trybuild suite it
+held runs as the `node_macro_ui` package on that same shard), and execs `cargo nextest run --profile ci`
 (install via `tools/scripts/install_nextest.sh`). It does NOT pass `--test-threads=1`; see the
 serialisation fence below. The split across runners is legal because each VM has its own
 `/dev/shm`.
@@ -512,7 +512,7 @@ serialisation fence below. The split across runners is legal because each VM has
 shards (one per shard on Linux; a hand-balanced 3-way tilt on macOS), with the iroh-tree
 packages kept together so that large tree compiles once. On macOS, shard 2 also carries the
 six viz steps (`cerulion_viz`, `go2_tf`, the serial `cerulion-vizd` suite and the three
-OpenH264 steps) beside the trybuild tail, which is why it takes the lightest package set;
+OpenH264 steps) beside the trybuild suite, which is why it takes the lightest package set;
 there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
 shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, for the same
 reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by

@@ -1,0 +1,80 @@
+[package]
+name = "node_macro_ui"
+version = "0.1.0"
+edition.workspace = true
+description = "The #[cerulion_node] diagnostics suite: trybuild compile-fail fixtures with their .stderr oracles, and the compile-pass programs built as examples and run."
+publish = false
+
+# Cargo needs one library or binary target; this one is empty.
+[lib]
+path = "src/lib.rs"
+
+# The crates the fixtures name, with the features cerulion_core's own test
+# build turns on, because a fixture's diagnostic can name an item that exists
+# only under one of them. `state_derive_escape_in_variant` derives serde's
+# traits itself.
+[dev-dependencies]
+cerulion_core = { path = "../../cerulion_core", features = ["test-helpers"] }
+native_ros2_messages = { path = "../../native_ros2_messages", features = ["test-helpers"] }
+serde = { version = "1", features = ["derive"] }
+trybuild = "1"
+
+# The compile-pass programs, as examples: `cargo test` builds every example
+# as `cargo build` builds a package that uses the macros (no `cfg(test)`, no
+# harness), and
+# `tests/pass_programs.rs` then runs each one, which is what trybuild's pass
+# mode did: `main` must return success. Unlike trybuild's scratch build they get
+# the workspace lints and no `-A dead_code`, so three carry an `#![allow]` for
+# what they compile on purpose: unread fields, an unconstructed node, a remedy
+# written with `.last()`, and a doc comment's `+` line.
+[[example]]
+name = "pass_determinism_allow_non_deterministic_passes"
+path = "tests/ui/pass/determinism_allow_non_deterministic_passes.rs"
+
+[[example]]
+name = "pass_determinism_fs_read_dir_warns"
+path = "tests/ui/pass/determinism_fs_read_dir_warns.rs"
+
+[[example]]
+name = "pass_determinism_method_receiver_no_false_positive"
+path = "tests/ui/pass/determinism_method_receiver_no_false_positive.rs"
+
+[[example]]
+name = "pass_determinism_uses_live_io_passes"
+path = "tests/ui/pass/determinism_uses_live_io_passes.rs"
+
+[[example]]
+name = "pass_determinism_warn_class_compiles"
+path = "tests/ui/pass/determinism_warn_class_compiles.rs"
+
+[[example]]
+name = "pass_external_source_host_driven_passes"
+path = "tests/ui/pass/external_source_host_driven_passes.rs"
+
+[[example]]
+name = "pass_generic_node_state_bounds_pass"
+path = "tests/ui/pass/generic_node_state_bounds_pass.rs"
+
+[[example]]
+name = "pass_param_fields_pass"
+path = "tests/ui/pass/param_fields_pass.rs"
+
+[[example]]
+name = "pass_port_field_hoisted_before_macro_passes"
+path = "tests/ui/pass/port_field_hoisted_before_macro_passes.rs"
+
+[[example]]
+name = "pass_port_write_in_result_closure_passes"
+path = "tests/ui/pass/port_write_in_result_closure_passes.rs"
+
+[[example]]
+name = "pass_shim_assign_and_fill_from_passes"
+path = "tests/ui/pass/shim_assign_and_fill_from_passes.rs"
+
+[[example]]
+name = "pass_state_derive_shapes"
+path = "tests/ui/pass/state_derive_shapes.rs"
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

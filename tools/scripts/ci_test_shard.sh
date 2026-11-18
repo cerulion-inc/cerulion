@@ -32,11 +32,10 @@
 # lands in a shard automatically; nothing needs editing.
 #
 # WITH EXACTLY ONE NAMED EXCEPTION, and the rule above is why it is one name
-# and not a list: `macro_compile_fail_test` is PINNED to a fixed shard, because
-# it is a multi-minute serial trybuild tail whose round-robin position — and
-# therefore which runner pays it — changes every time an unrelated test file is
-# added. Everything else still round-robins with no edit here. The evidence,
-# the arithmetic and the bar for adding a second name are at `PINNED_TEST`
+# and not a list: `macro_compile_fail_test` is PINNED to a fixed shard and held
+# out of the rotation, so every other file keeps the shard the package map was
+# balanced against. Everything else still round-robins with no edit here. Why
+# the pin exists and the bar for adding a second name are at `PINNED_TEST`
 # below; `--check` proves the pin landed where it says it did.
 #
 # `--lib` (the package's own unit tests) rides shard 0. It is a single target,
@@ -101,42 +100,29 @@ DEFAULT_SHARD_COUNT=4
 # because this is a deliberate, single-name carve-out of it and nothing else
 # may follow it in without the same evidence.
 #
-# WHY. `macro_compile_fail_test::compile_fail_tests` is a trybuild harness: it
-# invokes rustc once per `tests/ui/*.rs` case, inside ONE test, serially.
-# THE SIZE IS A PER-RUN MEASUREMENT, and this block is where it is RECORDED — the
-# reading and the earlier samples. Everything else refers to
-# "the serial tail" without a figure, with ONE deliberate exception: the shard-map
-# block in `.github/workflows/ci.yml` restates it at MINUTE scale (~4.4 vs the
-# ~9.2 its sums were built on) because its worked arithmetic is in minutes and an
-# argument you cannot follow is worse than a second copy. That is the whole of the
-# duplication, and it is named in both directions. Latest: 266.771 s
-# (~4.4 min), 99.3 % of its shard's nextest run wall, on `Test (Linux) shard 2`
-# (2026-09-12). On the self-hosted Linux
-# runners, six green runs on 2026-09-14 put shard 2's
-# whole nextest run wall at 228.7 / 247.6 / 296.3 / 265.7 / 250.7 / 428.3 s,
-# against 12-22 s for every other shard's — and in the one of
-# those runs whose log names every test this test alone was
-# 227.0 s of that 228.7. Earlier: 545.2 s and 559.3 s
-# on two green main runs, ~97 % of that wall. The
-# RATIO is what has held across every sample — this one test is essentially the
-# whole of whichever shard holds it, against 20-38 s for every other shard's.
-# That cost is not addressable here: splitting it by expectation WITHIN the
-# same job costs +158 s of trybuild work and +2.4 min of shard-step wall,
-# so it stays whole.
+# WHY. `macro_compile_fail_test` held the serial trybuild tail: one test of a
+# few minutes, essentially the whole of whichever shard held it. That suite is
+# now its own package, `node_macro_ui`, run by the `cerulion_node diagnostics
+# suite` step on shard 2 of both lanes, and this binary keeps only the
+# `#[ignore]`d rustc-rendering group, so by default it runs nothing. The pin
+# still holds the file out of the rotation, which keeps every other file on the
+# shard the package map in `.github/workflows/ci.yml` was balanced against:
+# without it the file rejoins the rotation at its sorted position and every file
+# after it moves to the next shard.
 #
-# WHY PIN IT rather than let the round-robin place it. The round-robin is over
-# the SORTED file list, so the tail's shard is a function of how many
-# `cerulion_core/tests/*.rs` sort before it — i.e. adding ANY test file has a
-# ~1-in-`count` chance of moving that whole block to another runner. It sat on
-# shard 1 for both runs above and moved to shard 2 on ONE added file. That
+# WHY IT WAS PINNED rather than placed by the round-robin. The round-robin is
+# over the SORTED file list, so a binary's shard is a function of how many
+# `cerulion_core/tests/*.rs` sort before it: adding ANY test file had a
+# ~1-in-`count` chance of moving the trybuild tail to another runner. The tail
+# once sat on shard 1 and moved to shard 2 on ONE added file. That
 # makes the fleet's critical path a lottery: no package-to-shard map can be
 # balanced against a load that relocates on an unrelated PR, and the observed
 # walls swung 24 -> 45 min on shards whose own contents never changed.
-# Pinning converts the tail from a variable into a constant, which is what lets
-# the workflow's package map be packed around it: the tail is one FIXED term of
-# shard 2's measured wall, and the package steps are placed largest-first
-# around every shard's fixed term. See the map and its measurement in
-# `.github/workflows/ci.yml` above the package steps.
+# Pinning converted the tail from a variable into a constant, which is what let
+# the workflow's package map be packed around it; that trybuild work is now the
+# diagnostics suite step on the same shard 2, and the package steps are placed
+# largest-first around every shard's fixed term. See the map and its
+# measurement in `.github/workflows/ci.yml` above the package steps.
 #
 # WHAT IS NOT CHANGED. New test files still round-robin, automatically, with no
 # edit here — the generated-list property the header defends is intact for
@@ -144,9 +130,10 @@ DEFAULT_SHARD_COUNT=4
 # partition is still total and disjoint AND that the pin landed where declared
 # (`do_check` below), so a future arithmetic slip is a red, not a silent drop.
 #
-# ADDING A SECOND NAME HERE NEEDS THE SAME EVIDENCE: a measured wall showing
-# one binary dominates a shard, and a map that is balanced around it. Absent
-# that, the answer is the round-robin.
+# ADDING A SECOND NAME HERE NEEDS EVIDENCE: a measured wall showing one binary
+# dominates a shard, and a map that is balanced around it. Absent that, the
+# answer is the round-robin. The one name here no longer dominates its shard;
+# it stays so the files after it keep their shards.
 #
 # PINNED_SHARD is taken `% count`, so the pin is always a valid index for any
 # shard count: `--check cerulion_core 2` still partitions. TWO counts ship, 4 on
@@ -488,7 +475,7 @@ $_members"
             printf 'VIOLATION: %s is pinned to shard %d/%d but is not in it.\n' \
                 "$PINNED_TEST" "$_pin_shard" "$_count" >&2
             printf 'The workflow package map in .github/workflows/ci.yml is balanced around\n' >&2
-            printf 'that shard carrying this serial tail. Fix shard_members() in %s.\n' "$0" >&2
+            printf 'the other files staying where the pin leaves them. Fix shard_members() in %s.\n' "$0" >&2
             exit 1
         fi
         printf 'pinned: %s -> shard %d/%d (the one routing exception)\n' \
@@ -496,13 +483,12 @@ $_members"
     elif [ "$_pkg" = "$PINNED_PACKAGE" ]; then
         printf 'VIOLATION: %s pins %s, but %s/tests holds no such file.\n' \
             "$PINNED_PACKAGE" "$PINNED_TEST" "$_dir" >&2
-        printf 'The pin is now describing nothing, and the serial trybuild tail it\n' >&2
-        printf 'names has silently rejoined the round-robin — which is what the pin\n' >&2
-        printf 'exists to prevent, and what the workflow package map is balanced against.\n' >&2
+        printf 'The pin is now describing nothing, and the file positions the workflow\n' >&2
+        printf 'package map is balanced against no longer hold.\n' >&2
         printf 'Fix ONE of:\n' >&2
         printf '  * restore %s/tests/%s.rs (it was renamed or deleted), or\n' "$_dir" "$PINNED_TEST" >&2
         printf '  * update PINNED_TEST in %s to the new name AND re-check the package\n' "$0" >&2
-        printf '    map in .github/workflows/ci.yml still counts shard %d as carrying the tail.\n' "$PINNED_SHARD" >&2
+        printf '    map in .github/workflows/ci.yml still matches shard %d.\n' "$PINNED_SHARD" >&2
         exit 1
     fi
 

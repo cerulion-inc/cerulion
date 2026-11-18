@@ -1796,20 +1796,17 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
 
     // The ONE routing exception must be reported, by name and by shard.
     //
-    // `--check` pins `macro_compile_fail_test` to a fixed shard because it is the
-    // serial trybuild tail: one test that is essentially the whole of whichever
-    // quarter holds it. This comment is
-    // figure-free on purpose — the measurement and its provenance live in exactly
-    // one place, `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. What matters here is
-    // that `.github/workflows/ci.yml`'s package map counts the tail as a FIXED
-    // term of that shard's wall and packs the package steps around it. The
+    // `--check` pins `macro_compile_fail_test` to a fixed shard and holds it out
+    // of the rotation, so every other file keeps the shard
+    // `.github/workflows/ci.yml`'s package map was balanced against; why, in one
+    // place, is `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. The
     // assertions above cannot see any of that: a pin that drifted to another
-    // shard, or one whose target file was renamed away so the tail rejoined the
+    // shard, or one whose target file was renamed away so it rejoined the
     // round-robin, both leave the partition perfectly total and disjoint.
     //
     // So this asserts the LINE, which is what makes the pin observable. Without
-    // it the pin's own guard can go inert — silently, and in exactly the
-    // direction that puts the tail back on a runner chosen by an unrelated PR.
+    // it the pin's own guard can go inert, silently, and every file after the
+    // pinned one moves to another shard.
     let expected_pin = "pinned: macro_compile_fail_test -> shard 2";
     assert!(
         stdout.contains(expected_pin),
@@ -2089,7 +2086,9 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         .collect();
     // The cdylib feature is required to compile the node context migration
     // cases; required Linux and macOS shards run this fixture's lib harness.
-    let allowed = BTreeSet::from(["test_node_macro_cdylib"]);
+    // node_macro_ui is the #[cerulion_node] diagnostics suite (trybuild plus
+    // the compile-pass examples), run alone with `-p` on the same shards.
+    let allowed = BTreeSet::from(["test_node_macro_cdylib", "node_macro_ui"]);
     let unexpected: Vec<_> = fixtures
         .iter()
         .filter(|name| !allowed.contains(name.as_str()))

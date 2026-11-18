@@ -39,8 +39,9 @@ Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
   (`cargo nextest run`, NOT `--test-threads=1`); fence `.config/nextest.toml`, `serial_discipline_test`.
 - Rebuild ALL cdylib fixtures after any core change (`cargo build -p test_node_*`); stale ones SIGABRT. Executor/step/drain changes run EVERY `GraphRuntime`/`step()` binary.
 - Cross-process credit: `credit_test`, `credit_block_iox2_test`, `free_run_ctor_iox2_test`:
-  parallel-safe, no fence. Re-bless trybuild (`TRYBUILD=overwrite`, `macro_compile_fail_test`)
-  on drift, from CI's output.
+  parallel-safe, no fence. Re-bless trybuild on drift, from CI's output: the blocking
+  suite is `TRYBUILD=overwrite cargo test -p node_macro_ui --test compile_fail`; the
+  `#[ignore]`d rustc-rendered groups stay in `macro_compile_fail_test`.
 
 ## Traps
 

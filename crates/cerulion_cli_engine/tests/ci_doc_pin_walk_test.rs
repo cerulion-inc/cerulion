@@ -1316,14 +1316,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 87 where the root manifest's `members` array lists 86: the extra one is the
+/// 88 where the root manifest's `members` array lists 87: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 87;
+const WORKSPACE_MEMBER_COUNT: usize = 88;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -3452,6 +3452,11 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_rcpd", "cerulion_cli_engine", "crate-path"),
     // hot_path_dependency_gate walks `examples/go2`, which holds that member.
     ("cerulion_telemetry", "go2_tf_source", "crate-path"),
+    // pass_programs joins `examples` onto the target directory, where cargo
+    // puts example binaries; the walk reads it as the repository's `examples/`
+    // tree, which holds that member. A change there selects every package
+    // already, so the row adds no selection.
+    ("node_macro_ui", "go2_tf_source", "crate-path"),
     // heaphook's own unit test reads `../cerulion_heaphook/src`.
     ("rmw_cerulion", "cerulion_heaphook", "crate-path"),
     // rmw_adopt_take_linux_test loads `libcerulion_heaphook.so` out of the
