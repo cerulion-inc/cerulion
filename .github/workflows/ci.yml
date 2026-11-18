@@ -4483,7 +4483,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
 
-  # REPEAT RUNS of two `cerulion_core` test binaries whose tests wait on
+  # REPEAT RUNS of three `cerulion_core` test binaries whose tests wait on
   # counters the product exposes, on the hosted macOS runner, where thread
   # scheduling varies most. Each binary runs 20 times in a row, so a wait that
   # still depends on how a loaded host schedules threads shows up here as a
@@ -4491,14 +4491,15 @@ jobs:
   # request.
   #
   # NOT a required status context (`tools/ci/required_contexts.txt` does not
-  # name it): a red here reports a flake and blocks no merge. Pull requests
-  # that select `cerulion_core` and pushes to `main` run it; a merge-queue
-  # batch does not, because no verdict there waits on it. Restore-only cache:
-  # it reads the macOS test shards' archive and saves nothing.
+  # name it): a red here reports a flake and blocks no merge. Pushes to `main`
+  # and `workflow_dispatch` runs run it; pull requests and merge-queue batches do
+  # not, because it would hold one more macOS runner that a pull request's own
+  # macOS test shards wait for. Restore-only cache: it reads the macOS test
+  # shards' archive and saves nothing.
   core-repeat:
     name: Repeat runs (cerulion_core, macOS)
     needs: [changes]
-    if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+    if: ${{ !cancelled() && github.event_name != 'merge_group' && github.event_name != 'pull_request' }}
     runs-on: macos-latest
     permissions:
       contents: read
@@ -4533,7 +4534,7 @@ jobs:
 
       - name: Build the repeated test binaries
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
-        run: cargo build -p cerulion_core --test gateway_egress_congestion_iox2_test --test liveliness_sweep_iox2_test
+        run: cargo build -p cerulion_core --test gateway_egress_congestion_iox2_test --test liveliness_sweep_iox2_test --test free_run_ctor_iox2_test
 
       # The whole binary per run, serially: the stall tests each want the host
       # to themselves (their nextest timing fence) and the liveliness tests
@@ -4550,7 +4551,7 @@ jobs:
           set -o pipefail
           runs=20
           failed=0
-          for test_binary in gateway_egress_congestion_iox2_test liveliness_sweep_iox2_test; do
+          for test_binary in gateway_egress_congestion_iox2_test liveliness_sweep_iox2_test free_run_ctor_iox2_test; do
             binary_failed=0
             for run in $(seq 1 "$runs"); do
               log="$RUNNER_TEMP/repeat-$test_binary-$run.log"

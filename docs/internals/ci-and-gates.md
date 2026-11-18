@@ -582,16 +582,19 @@ entries of that namespace; the namespace token `msrv-1.95` is absent from the
 scratch on every run. It lists no `needs:`, so a pull request starts it beside `lint` rather
 than after it.
 
-`core-repeat` (`Repeat runs (cerulion_core, macOS)`) runs two `cerulion_core` test binaries,
-`gateway_egress_congestion_iox2_test` and `liveliness_sweep_iox2_test`, 20 times each on
+`core-repeat` (`Repeat runs (cerulion_core, macOS)`) runs three `cerulion_core` test binaries,
+`gateway_egress_congestion_iox2_test`, `liveliness_sweep_iox2_test` and
+`free_run_ctor_iox2_test`, 20 times each on
 `macos-latest`, where thread scheduling varies most. Their tests wait on counters the product
 exposes, so a failed run here is a wait that still depends on how a loaded host schedules
 threads. Each run is the whole binary under `--test-threads=1`; it passes only when cargo exits
 0 AND libtest reports at least one passed test and none failed. Every run goes ahead whatever an
 earlier one did, and the step fails at the end on any failed run, with the count printed per
-binary. The job carries `if: ${{ !cancelled() && github.event_name != 'merge_group' }}`: pull
-requests that select `cerulion_core` and pushes to `main` run it, a merge-queue batch does not,
-and the coverage walk drops it from the PR-blocking view. It is not a required status context,
+binary. The job carries `if: ${{ !cancelled() && github.event_name != 'merge_group' &&
+github.event_name != 'pull_request' }}`: pushes to `main` and `workflow_dispatch` runs run it, pull
+requests and merge-queue batches do not, since it would hold one more macOS runner that a pull
+request's own macOS test shards wait for, and the coverage walk drops it from the PR-blocking
+view. It is not a required status context,
 so a red reports a flake and blocks no merge. Its cache is restore-only (the macOS test shards'
 archive).
 
