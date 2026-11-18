@@ -28,7 +28,7 @@ out=$(cargo tree --locked -e features,normal,build -i cerulion_pairing "${packag
     echo "check_no_dev_issuer: cargo tree failed" >&2
     exit 2
 }
-if printf '%s\n' "$out" | grep -q 'feature "dev-issuer"'; then
+if grep -q 'feature "dev-issuer"' <<<"$out"; then
     echo "check_no_dev_issuer: a release package enables cerulion_pairing/dev-issuer:" >&2
     printf '%s\n' "$out" | grep -A3 'feature "dev-issuer"' >&2
     exit 1

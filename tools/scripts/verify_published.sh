@@ -477,12 +477,11 @@ verify_crate() {
         report PASS "$name" licence-field "'$api_license' on the manifest and the metadata"
     fi
 
-    # The description is read into a variable, then written to the match by one
-    # `printf`: a single write of one line completes before `grep -Eq` can exit
-    # on a hit and close the pipe. A producer that streams its output into the
-    # same reader is the SIGPIPE shape above.
+    # The description is read into a variable and handed to `grep -Eq` as a
+    # here-string, so no writer is left to take SIGPIPE when grep exits on a hit
+    # (the shape above).
     described=$(manifest_string description "$root/Cargo.toml")
-    if printf '%s' "$described" | grep -Eq "$TRACKER_RE"; then
+    if grep -Eq "$TRACKER_RE" <<<"$described"; then
         report FAIL "$name" description "the packaged description carries a tracker id"
     else
         report PASS "$name" description "no tracker id in the packaged description"
@@ -538,7 +537,7 @@ members=$(cargo metadata --no-deps --format-version 1 |
 if [ -n "$wanted" ]; then
     while IFS= read -r name; do
         [ -n "$name" ] || continue
-        printf '%s\n' "$members" | grep -Fxq "$name" ||
+        grep -Fxq -- "$name" <<<"$members" ||
             die "$name is not a publishable workspace member"
     done <<<"$wanted"
     members=$(printf '%s' "$wanted" | grep -v '^$')
