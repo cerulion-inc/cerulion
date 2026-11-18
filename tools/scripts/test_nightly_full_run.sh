@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=29
+CASES_EXPECTED=33
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-nightly-test.XXXXXX")
@@ -294,10 +294,10 @@ ok() {
 # on the read after that, so the wait polls before it ends.
 new_case green_no_issue
 standard_dispatch
-printf 'FAIL: HTTP 502\n' | answer GET "$R/actions/runs/200" 1
-run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200" 2
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+printf 'FAIL: HTTP 502\n' | answer GET "$R/actions/runs/200/attempts/1" 1
+run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200/attempts/1" 2
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 run_case run
 expect_status 0
 expect_output 'dispatched ci.yml on main: run 200'
@@ -316,8 +316,8 @@ ok 'two green runs and no open issue write nothing'
 new_case green_closes_issue
 standard_dispatch
 issue_open '2026-11-16T05:00:00Z'
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 run_case run
 expect_status 0
 expect_output 'every run passed; closed issue 42'
@@ -334,15 +334,18 @@ EOF
 ok 'two green runs close the open issue'
 
 # ci.yml fails, its failed jobs are rerun once and pass: the issue opens and
-# names the job that failed. Right after the rerun request the run still reads
-# `completed` on attempt 1, which must not be taken for the rerun's result.
+# names the job that failed. Right after the rerun request attempt 2 does not
+# exist yet and answers 404 (three tries), which reads as not finished rather
+# than as a refusal; then it is in progress, then it passes.
 make_red_then_green() {
     standard_dispatch
-    run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200" 1
-    run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200" 2
-    run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200" 3
-    run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200"
-    run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+    run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+    for n in 1 2 3; do
+        printf 'FAIL: HTTP 404: Not Found\n' | answer GET "$R/actions/runs/200/attempts/2" "$n"
+    done
+    run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200/attempts/2" 4
+    run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200/attempts/2"
+    run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
     printf '%s\n' '{"total_count":3,"jobs":[{"name":"Lint","conclusion":"success"},{"name":"Test (macOS) shard 1","conclusion":"failure"},{"name":"Fuzz (Linux)","conclusion":"skipped"}]}' |
         answer GET "$(jobs_path 200 1)"
     : | answer POST "$R/actions/runs/200/rerun-failed-jobs"
@@ -374,7 +377,7 @@ expect_no_call "$R/actions/runs/400/rerun-failed-jobs"
 expect_no_call 'attempts/2/jobs'
 expect_call "issue create --title $TITLE --label bug --body-file "
 red_then_green_body | expect_body
-expect_sleeps 2
+expect_sleeps 4
 ok 'a red run rerun to green opens the issue and names the failed job'
 
 # The same fixtures twice give the same calls and the same text.
@@ -396,10 +399,10 @@ ok 'the same fixtures give the same calls and text'
 new_case red_twice_issue_open
 standard_dispatch
 issue_open '2026-11-15T05:00:00Z'
-run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200" 1
-run_json 200 completed '"failure"' 2 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"timed_out"' 1 | answer GET "$R/actions/runs/400" 1
-run_json 400 completed '"success"' 2 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 completed '"failure"' 2 | answer GET "$R/actions/runs/200/attempts/2"
+run_json 400 completed '"timed_out"' 1 | answer GET "$R/actions/runs/400/attempts/1"
+run_json 400 completed '"success"' 2 | answer GET "$R/actions/runs/400/attempts/2"
 printf '%s\n' '{"total_count":2,"jobs":[{"name":"Lint","conclusion":"failure"},{"name":"Documentation","conclusion":"cancelled"}]}' |
     answer GET "$(jobs_path 200 1)"
 printf '%s\n' '{"total_count":2,"jobs":[{"name":"Lint","conclusion":"failure"},{"name":"Documentation","conclusion":"success"}]}' |
@@ -438,8 +441,10 @@ ok 'a run red on both attempts comments on the open issue'
 # The rerun request is refused: the issue says so, and no attempt 2 is read.
 new_case rerun_refused
 standard_dispatch
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+# The run as a whole, read after the refusal: still on attempt 1.
 run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf '%s\n' '{"total_count":1,"jobs":[{"name":"Lint","conclusion":"failure"}]}' | answer GET "$(jobs_path 200 1)"
 printf 'FAIL: HTTP 403: This workflow run cannot be retried\n' | answer POST "$R/actions/runs/200/rerun-failed-jobs"
 run_case run
@@ -461,14 +466,14 @@ Nightly: $U/777
 EOF2
 ok 'a refused rerun is reported and the result still recorded'
 
-# The rerun request errors three times, yet the server took it: the run reads
-# attempt 2, so the rerun is waited for and reported as it ended.
+# The rerun request errors three times, yet the server took it: the run as a
+# whole reads attempt 2, so the rerun is waited for and reported as it ended.
 new_case rerun_taken_despite_an_error
 standard_dispatch
-run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200" 1
-run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200" 2
-run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200"
+run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200/attempts/2"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf '%s\n' '{"total_count":1,"jobs":[{"name":"Lint","conclusion":"failure"}]}' | answer GET "$(jobs_path 200 1)"
 printf 'FAIL: HTTP 502\n' | answer POST "$R/actions/runs/200/rerun-failed-jobs"
 run_case run
@@ -495,8 +500,8 @@ ok 'a rerun the server took despite an error is waited for'
 # is not rerun; the green one is reported as it is.
 new_case deadline
 standard_dispatch
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 in_progress null 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 in_progress null 1 | answer GET "$R/actions/runs/400/attempts/1"
 FAKE_DATE_STEP=7200 run_case run
 expect_status 0
 expect_output 'opened the issue'
@@ -522,8 +527,8 @@ standard_dispatch
 runs_json "100:$BOT" "90:someone" | answer GET "$(list_path ci.yml)" 2
 runs_json "201:someone" "100:$BOT" "90:someone" | answer GET "$(list_path ci.yml)" 3
 runs_json "201:someone" "200:$BOT" "100:$BOT" "90:someone" | answer GET "$(list_path ci.yml)"
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 run_case run
 expect_status 0
 expect_output 'dispatched ci.yml on main: run 200'
@@ -536,8 +541,8 @@ ok "a late run is waited for and a person's dispatch is never the nightly's"
 new_case person_started_the_nightly
 standard_dispatch
 runs_json "200:$BOT:someone" "100:$BOT" "90:someone" | answer GET "$(list_path ci.yml)"
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 run_case run
 expect_status 0
 expect_output 'dispatched ci.yml on main: run 200'
@@ -568,10 +573,10 @@ ok 'two new bot runs after one dispatch are refused'
 # A read that fails three times refuses, naming the call and the error.
 new_case api_fails_three_times
 standard_dispatch
-printf 'FAIL: HTTP 502\n' | answer GET "$R/actions/runs/200"
+printf 'FAIL: HTTP 502\n' | answer GET "$R/actions/runs/200/attempts/1"
 run_case run
 expect_status 2
-expect_output "gh api $R/actions/runs/200 failed three times: FAIL: HTTP 502"
+expect_output "gh api $R/actions/runs/200/attempts/1 failed three times: FAIL: HTTP 502"
 expect_no_call 'issue'
 ok 'a read that fails three times is refused'
 
@@ -583,8 +588,8 @@ printf '{"workflow_run_id":200,"run_url":"https://api.github.invalid/x","html_ur
     answer POST "$R/actions/workflows/ci.yml/dispatches"
 printf '{"workflow_run_id":400,"run_url":"https://api.github.invalid/y","html_url":"%s/400"}\n' "$U" |
     answer POST "$R/actions/workflows/rmw-distros.yml/dispatches"
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 run_case run
 expect_status 0
 expect_output 'dispatched ci.yml on main: run 200'
@@ -598,27 +603,27 @@ ok 'a dispatch that names its run is taken at its word'
 new_case bot_triggering_actor_only
 standard_dispatch
 runs_json "200:someone:$BOT" "100:$BOT" "90:someone" | answer GET "$(list_path ci.yml)"
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 run_case run
 expect_status 0
 expect_output 'dispatched ci.yml on main: run 200'
 ok 'a run whose triggering actor is the bot is found'
 
 # The deadline passes while a rerun is still running: the rerun is reported
-# unfinished and its attempt is not read. A neutral job is not a failure, and a
+# unfinished and its attempt's jobs are not read. A neutral job is not a failure, and a
 # run with more jobs than one page says so.
 new_case rerun_unfinished_at_deadline
 standard_dispatch
-run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200" 1
-run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200/attempts/2"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf '%s\n' '{"total_count":150,"jobs":[{"name":"Lint","conclusion":"failure"},{"name":"Gate","conclusion":"neutral"}]}' |
     answer GET "$(jobs_path 200 1)"
 : | answer POST "$R/actions/runs/200/rerun-failed-jobs"
 FAKE_DATE_STEP=3600 run_case run
 expect_status 0
-expect_no_call 'attempts/2'
+expect_no_call "$(jobs_path 200 2)"
 expect_body <<EOF2
 == create
 The nightly full run of \`main\` did not pass.
@@ -640,11 +645,11 @@ ok 'a rerun unfinished at the deadline is reported unfinished'
 # A run that ends red after the deadline has passed is not rerun.
 new_case red_past_deadline
 standard_dispatch
-run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200" 1
-run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200" 2
-run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200" 3
-run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200/attempts/1" 1
+run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200/attempts/1" 2
+run_json 200 in_progress null 1 | answer GET "$R/actions/runs/200/attempts/1" 3
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf '%s\n' '{"total_count":1,"jobs":[{"name":"Lint","conclusion":"failure"}]}' | answer GET "$(jobs_path 200 1)"
 FAKE_DATE_STEP=5000 run_case run
 expect_status 0
@@ -667,8 +672,8 @@ ok 'a run red after the deadline is not rerun'
 # A refused issue listing is refused, not read as no issue open.
 new_case issue_list_refused
 standard_dispatch
-run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf 'FAIL: HTTP 403\n' > "$answers/issues"
 run_case run
 expect_status 2
@@ -676,13 +681,73 @@ expect_output 'gh refused the issue listing: FAIL: HTTP 403'
 expect_no_writes
 ok 'a refused issue listing is refused'
 
+# Someone reran the failed run by hand before the first read: the latest attempt
+# passed, but attempt 1 is what is read, so the failure is still reported.
+new_case manual_rerun_before_the_first_read
+standard_dispatch
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200/attempts/2"
+run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
+printf '%s\n' '{"total_count":1,"jobs":[{"name":"Lint","conclusion":"failure"}]}' | answer GET "$(jobs_path 200 1)"
+: | answer POST "$R/actions/runs/200/rerun-failed-jobs"
+run_case run
+expect_status 0
+expect_output 'opened the issue'
+expect_no_call 'issue close'
+grep -Fq -- '  - first attempt: failure' "$case_dir/body" || fail "$case_name: attempt 1's failure is not reported"
+ok "a rerun someone started by hand never stands in for attempt 1"
+
+# The dispatch errors but the server started the run: it is found on the
+# first listing after the error, and no second request is sent.
+new_case dispatch_errors_but_starts_a_run
+standard_dispatch
+printf 'FAIL: HTTP 502\n' | answer POST "$R/actions/workflows/ci.yml/dispatches"
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
+run_case run
+expect_status 0
+expect_output 'dispatched ci.yml on main: run 200'
+[ "$(grep -Fxc -- "api -X POST $R/actions/workflows/ci.yml/dispatches -f ref=main" "$case_dir/calls")" -eq 1 ] ||
+    fail "$case_name: a second dispatch was sent for a run that had started"
+ok 'a dispatch that errors after starting a run is not sent again'
+
+# The dispatch errors and no run appears in four reads: it is sent once more,
+# which starts the run.
+new_case dispatch_errors_then_starts
+standard_dispatch
+printf 'FAIL: HTTP 502\n' | answer POST "$R/actions/workflows/ci.yml/dispatches" 1
+for n in 2 3 4 5; do
+    runs_json "100:$BOT" "90:someone" | answer GET "$(list_path ci.yml)" "$n"
+done
+run_json 200 completed '"success"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
+run_case run
+expect_status 0
+expect_output 'dispatched ci.yml on main: run 200'
+[ "$(grep -Fxc -- "api -X POST $R/actions/workflows/ci.yml/dispatches -f ref=main" "$case_dir/calls")" -eq 2 ] ||
+    fail "$case_name: expected two dispatch requests"
+ok 'a dispatch that errors and starts nothing is sent again'
+
+# Three dispatches error and none starts a run: refuse, naming the error.
+new_case dispatch_fails_three_times
+standard_dispatch
+printf 'FAIL: HTTP 502\n' | answer POST "$R/actions/workflows/ci.yml/dispatches"
+runs_json "100:$BOT" "90:someone" | answer GET "$(list_path ci.yml)"
+run_case run
+expect_status 2
+expect_output 'the dispatch of ci.yml failed three times and started no run: FAIL: HTTP 502'
+expect_no_call 'issue'
+ok 'three failed dispatches that start nothing are refused'
+
 # Two open issues carrying the title: refuse rather than write to either.
 new_case two_open_issues
 standard_dispatch
-run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200"
-run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf '%s\n' '{"total_count":1,"jobs":[{"name":"Lint","conclusion":"failure"}]}' | answer GET "$(jobs_path 200 1)"
 printf 'FAIL: HTTP 403\n' | answer POST "$R/actions/runs/200/rerun-failed-jobs"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200"
 printf '%s\t%s\t%s\n' 42 "$TITLE" '2026-11-15T05:00:00Z' 91 "$TITLE" '2026-11-16T05:00:00Z' > "$answers/issues"
 run_case run
 expect_status 2

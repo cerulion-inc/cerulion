@@ -17,13 +17,14 @@
 #   any run red, or not finished by the deadline, one issue    comment on it
 #
 # When the dispatch answers with the id of the run it started, that id is the
-# run. When the answer carries none (an empty 204), the run is the one run of
-# that workflow, event
-# `workflow_dispatch` and branch `main` whose actor or triggering actor is BOT
-# (the account the job's token acts as) and which was not listed before the
-# dispatch; a person's dispatch carries that person in both, and `nightly.yml`
-# holds a concurrency group, so two nightly runs never dispatch at once. No
-# rerun is requested once the deadline has passed.
+# run. When the answer carries none (an empty 204), or the request errors, the
+# run is the one run of that workflow, event `workflow_dispatch` and branch
+# `main` whose actor or triggering actor is BOT (the account the job's token
+# acts as) and which was not listed before the dispatch; a person's dispatch
+# carries that person in both, and `nightly.yml` holds a concurrency group, so
+# two nightly runs never dispatch at once. A request that errors is sent again
+# only when no new run appears. Each attempt's result is read by its attempt
+# number. No rerun is requested once the deadline has passed.
 #
 # RUN exits 0 once the result is recorded, red or green, or once every run
 # passed with no issue open to close, so a successful run of `nightly.yml` means
@@ -37,9 +38,10 @@
 # recently than that is left alone.
 #
 # REFUSALS, exit 2 with one message each: an unknown mode; no repository named;
-# `jq` absent; a `gh api` call that fails three times; a dispatched run that does
-# not appear; more than one bot-dispatched run appearing after one dispatch; a
-# timestamp that does not parse; a refused issue listing; two open issues
+# `jq` absent; a `gh api` call that fails three times (for an attempt, other
+# than with 404); a dispatch that fails three times and starts no run; a
+# dispatched run that does not appear; more than one bot-dispatched run
+# appearing after one dispatch; a timestamp that does not parse; a refused issue listing; two open issues
 # carrying TITLE, which holds both modes until one is closed.
 #
 # ENVIRONMENT. `GH_TOKEN` is read by `gh` itself. `GITHUB_REPOSITORY` (or
@@ -66,6 +68,7 @@ POLL_SECONDS=180
 DEADLINE_SECONDS=$((330 * 60))
 FIND_TRIES=20
 FIND_SECONDS=15
+DISPATCH_CHECKS=4
 STALE_SECONDS=$((26 * 3600))
 REPEAT_SECONDS=$((24 * 3600))
 # One page of jobs per run attempt; ci.yml expands to fewer jobs than this.
@@ -141,26 +144,78 @@ bot_runs() {
         | select(.actor.login == $bot or .triggering_actor.login == $bot) | .id' <<< "$page"
 }
 
+# The bot-dispatched runs of workflow $1 whose ids are not in the list $2, one
+# read of the listing.
+fresh_runs() {
+    local listed
+    listed=$(bot_runs "$1") || exit 2
+    # Through the environment: awk refuses a `-v` value that holds a newline.
+    BEFORE=$2 awk '
+        BEGIN { n = split(ENVIRON["BEFORE"], b, "\n"); for (i = 1; i <= n; i++) seen[b[i]] = 1 }
+        $0 != "" && !($0 in seen)' <<< "$listed"
+}
+
+# How many ids the list $1 holds; refuses more than one for workflow $2.
+fresh_count() {
+    local count
+    count=$(printf '%s' "$1" | grep -c . || true)
+    [ "$count" -le 1 ] ||
+        die "${count} bot-dispatched runs of $2 appeared after one dispatch ($(printf '%s' "$1" | tr '\n' ' ')): which one is the nightly's cannot be told" 2
+    printf '%s\n' "$count"
+}
+
 # The one bot-dispatched run of workflow $1 whose id is not in the list $2.
 find_new_run() {
-    local wf=$1 before=$2 try=1 listed fresh count
+    local wf=$1 before=$2 try=1 fresh count
     while :; do
-        listed=$(bot_runs "$wf") || exit 2
-        # Through the environment: awk refuses a `-v` value that holds a newline.
-        fresh=$(BEFORE=$before awk '
-            BEGIN { n = split(ENVIRON["BEFORE"], b, "\n"); for (i = 1; i <= n; i++) seen[b[i]] = 1 }
-            $0 != "" && !($0 in seen)' <<< "$listed")
-        count=$(printf '%s' "$fresh" | grep -c . || true)
+        fresh=$(fresh_runs "$wf" "$before") || exit 2
+        count=$(fresh_count "$fresh" "$wf") || exit 2
         if [ "$count" -eq 1 ]; then
             printf '%s\n' "$fresh"
             return 0
         fi
-        [ "$count" -eq 0 ] ||
-            die "${count} bot-dispatched runs of ${wf} appeared after one dispatch ($(printf '%s' "$fresh" | tr '\n' ' ')): which one is the nightly's cannot be told" 2
         [ "$try" -lt "$FIND_TRIES" ] ||
             die "the dispatched run of ${wf} did not appear within $((FIND_TRIES * FIND_SECONDS)) s" 2
         try=$((try + 1))
         sleep "$FIND_SECONDS"
+    done
+}
+
+# Dispatch workflow $1 and print the id of the run it started; $2 lists the
+# bot-dispatched runs from before. A request the server took may still answer
+# with an error, and sending it again would start a second full run, so after
+# an error the listing is read DISPATCH_CHECKS times for a new run before the
+# request goes again, three requests at most.
+dispatch() {
+    local wf=$1 before=$2 attempt=1 answer id check fresh count refusal
+    while :; do
+        if answer=$(gh api -X POST "repos/${repository}/actions/workflows/${wf}/dispatches" \
+            -f "ref=${REF}" 2> "$err_file"); then
+            # An empty answer (204) or one carrying no run id falls back to the listing.
+            id=$(jq -r '.workflow_run_id // empty' <<< "$answer" 2> /dev/null || true)
+            if [ -n "$id" ]; then
+                printf '%s\n' "$id"
+                return 0
+            fi
+            find_new_run "$wf" "$before" || exit 2
+            return 0
+        fi
+        # Kept before the listing reads below overwrite err_file.
+        refusal=$(tr '\n' ' ' < "$err_file")
+        check=1
+        while [ "$check" -le "$DISPATCH_CHECKS" ]; do
+            sleep "$FIND_SECONDS"
+            fresh=$(fresh_runs "$wf" "$before") || exit 2
+            count=$(fresh_count "$fresh" "$wf") || exit 2
+            if [ "$count" -eq 1 ]; then
+                printf '%s\n' "$fresh"
+                return 0
+            fi
+            check=$((check + 1))
+        done
+        [ "$attempt" -lt 3 ] ||
+            die "the dispatch of ${wf} failed three times and started no run: ${refusal}" 2
+        attempt=$((attempt + 1))
     done
 }
 
@@ -238,21 +293,26 @@ past_deadline() {
     [ $(($(now) - started)) -ge "$DEADLINE_SECONDS" ]
 }
 
-# Wait until every run reports `completed` on the attempt it is waiting for, or
-# the deadline passes. A rerun reads `completed` on the old attempt for a
-# moment after it is requested, which is why the attempt number is read too.
+# Wait until the attempt each run is waiting for reports `completed`, or the
+# deadline passes. The attempt is read by its number, so a rerun someone else
+# starts is never taken for the one waited on. An attempt not created yet
+# answers 404, which reads as not finished; any other error refuses.
 wait_all() {
-    local i json status attempt all_done
+    local i json status all_done
     while :; do
         all_done=1
         for i in "${!ids[@]}"; do
             [ "${finished[i]}" -eq 0 ] || continue
-            json=$(api "repos/${repository}/actions/runs/${ids[i]}")
+            if ! json=$(api_try "repos/${repository}/actions/runs/${ids[i]}/attempts/${want[i]}"); then
+                grep -q 'HTTP 404' "$err_file" ||
+                    die "gh api repos/${repository}/actions/runs/${ids[i]}/attempts/${want[i]} failed three times: $(tr '\n' ' ' < "$err_file")" 2
+                all_done=0
+                continue
+            fi
             status=$(jq -r '.status' <<< "$json")
-            attempt=$(jq -r '.run_attempt' <<< "$json")
             url[i]=$(jq -r '.html_url' <<< "$json")
             sha[i]=$(jq -r '.head_sha' <<< "$json")
-            if [ "$status" = completed ] && [ "$attempt" -ge "${want[i]}" ]; then
+            if [ "$status" = completed ]; then
                 finished[i]=1
                 concl[i]=$(jq -r '.conclusion // "none"' <<< "$json")
             else
@@ -271,14 +331,11 @@ wait_all() {
 }
 
 cmd_run() {
-    local wf before answer id i red=0 reran=0 issue number
+    local wf before id i red=0 reran=0 issue number
     started=$(now)
     for wf in $WORKFLOWS; do
         before=$(bot_runs "$wf")
-        answer=$(api -X POST "repos/${repository}/actions/workflows/${wf}/dispatches" -f "ref=${REF}")
-        # An empty answer (204) or one carrying no run id falls back to the listing.
-        id=$(jq -r '.workflow_run_id // empty' <<< "$answer" 2> /dev/null || true)
-        [ -n "$id" ] || id=$(find_new_run "$wf" "$before")
+        id=$(dispatch "$wf" "$before")
         say "dispatched ${wf} on ${REF}: run ${id}"
         wfs+=("$wf")
         ids+=("$id")
