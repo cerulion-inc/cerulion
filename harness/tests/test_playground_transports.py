@@ -171,6 +171,31 @@ class Stdio(unittest.TestCase):
         self.assertEqual(run.proc.wait(timeout=60), 0)
         self.assertEqual(run.history()[0][2], "server_stopped")
 
+    def test_a_repeat_of_the_stop_signal_within_a_second_is_the_same_stop(self):
+        # A terminal's Ctrl+C reaches cerulion and the server, and cerulion forwards the one it got: the two arrive
+        # a moment apart, while the live episode's simulator is still stopping (the fixture's stop takes 2 s).
+        os.environ["FAKE_SIM_STOP_S"] = "2"
+        self.addCleanup(os.environ.pop, "FAKE_SIM_STOP_S", None)
+        run = Run(self)
+        run.answer(initialize())
+        run.proc.send_signal(signal.SIGINT)
+        time.sleep(0.1)
+        run.proc.send_signal(signal.SIGINT)
+        self.assertEqual(run.proc.wait(timeout=60), 0)
+        self.assertEqual(run.history()[0][2], "server_stopped")
+        self.assertEqual([c["verb"] for c in run.launcher()], ["start", "score", "stop"])
+
+    def test_a_second_stop_signal_after_a_second_exits_at_once(self):
+        os.environ["FAKE_SIM_STOP_S"] = "5"
+        self.addCleanup(os.environ.pop, "FAKE_SIM_STOP_S", None)
+        run = Run(self)
+        run.answer(initialize())
+        run.proc.send_signal(signal.SIGINT)
+        time.sleep(1.5)
+        run.proc.send_signal(signal.SIGINT)
+        self.assertEqual(run.proc.wait(timeout=4), 1)
+        self.assertEqual(run.history(), [])
+
     def test_a_simulator_that_does_not_start_is_an_error_with_its_reason(self):
         os.environ["FAKE_SIM_FAIL"] = "start"
         self.addCleanup(os.environ.pop, "FAKE_SIM_FAIL", None)
@@ -279,6 +304,20 @@ class StreamableHttp(unittest.TestCase):
         http.run.proc.send_signal(signal.SIGTERM)
         self.assertEqual(http.run.proc.wait(timeout=60), 0)
         self.assertEqual([r[2] for r in http.run.history()], ["claim", "session_closed", "server_stopped"])
+
+
+@unittest.skipUnless(HAS_MCP, "the MCP SDK is not in this interpreter (the harness venv has it)")
+class StreamableHttpStop(unittest.TestCase):
+    def test_a_repeat_of_the_stop_signal_within_a_second_is_the_same_stop(self):
+        os.environ["FAKE_SIM_STOP_S"] = "2"
+        self.addCleanup(os.environ.pop, "FAKE_SIM_STOP_S", None)
+        http = Http(self)
+        http.mcp(initialize())
+        http.run.proc.send_signal(signal.SIGINT)
+        time.sleep(0.1)
+        http.run.proc.send_signal(signal.SIGINT)
+        self.assertEqual(http.run.proc.wait(timeout=60), 0)
+        self.assertEqual([r[2] for r in http.run.history()], ["server_stopped"])
 
 
 class CommandLine(unittest.TestCase):

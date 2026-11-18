@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """A stand-in for the measured launcher (python -m bench.ext.episode_ext start | score | stop), for the sim
 server's tests: no simulator runs. Every call is appended to the JSON lines file FAKE_SIM_LOG with its arguments
-and the environment the server gave it. FAKE_SIM_FAIL=start makes start fail."""
+and the environment the server gave it. FAKE_SIM_FAIL=start makes start fail; FAKE_SIM_STOP_S=N makes stop take N
+seconds."""
 import json
 import os
 import sys
+import time
 
 ENV_KEYS = ("PYTHONPATH", "LIBERO_BX", "RCPX_SELFKNOW_DIR", "MUJOCO_GL", "PYOPENGL_PLATFORM", "RCPX_EXT_ENVHOST",
             "PLAYGROUND_SNAPSHOT", "OMP_NUM_THREADS")
@@ -37,6 +39,7 @@ def main(argv):
                                         "end_reason": "claim" if claimed else None}))
         return 0
     if verb == "stop":
+        time.sleep(float(os.environ.get("FAKE_SIM_STOP_S", "0")))
         return 0
     return 2
 

@@ -8,6 +8,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 from .mcp_server import build_mcp
 from .pool import AGAIN_HTTP, AGAIN_STDIO, make_pool
@@ -15,6 +16,9 @@ from .web import build_routes
 
 log = logging.getLogger("cerulion.sim")
 DEFAULT_HTTP = "127.0.0.1:8765"
+# A terminal's Ctrl+C reaches cerulion and this server at once, and cerulion then forwards the signal it got, so
+# a stop signal arriving within this many seconds of the first is that same stop, not a second one.
+SAME_STOP_S = 1.0
 LOOPBACK_NAMES = ("localhost",)
 
 
@@ -139,7 +143,14 @@ def serve_http(settings, addr):
                 for sig, handler in original.items():
                     signal.signal(sig, handler)
 
+        first_stop = None
+
         def handle_exit(self, sig, frame):
+            now = time.monotonic()
+            if self.first_stop is not None and now - self.first_stop <= SAME_STOP_S:
+                return
+            if self.first_stop is None:
+                self.first_stop = now
             app.on_signal(sig)
             super().handle_exit(sig, frame)
 
@@ -154,7 +165,8 @@ async def serve_stdio_async(settings, simulator=None):
     The client closing stdin ends its live episode with the reason session_closed. A stop signal (SIGINT,
     SIGTERM) ends every live episode with the reason server_stopped (scored, its simulator stopped, recorded) and
     then ends the process: the SDK reads stdin in a worker thread that no cancel interrupts, so the process exits
-    without waiting for that read. A second stop signal exits at once, with code 1."""
+    without waiting for that read. A second stop signal, more than SAME_STOP_S after the first, exits at once,
+    with code 1."""
     from mcp.server.stdio import stdio_server
 
     pool = make_pool(settings, simulator, AGAIN_STDIO)
@@ -170,7 +182,10 @@ async def serve_stdio_async(settings, simulator=None):
         os._exit(0)
 
     def on_signal(sig):
-        signals.append(sig)
+        now = time.monotonic()
+        if signals and now - signals[0] <= SAME_STOP_S:
+            return
+        signals.append(now)
         if len(signals) == 1:
             pool.spawn(stop())
         else:
