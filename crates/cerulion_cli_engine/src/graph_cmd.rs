@@ -28218,7 +28218,7 @@ process_groups:
                                              a replay still detects a change";
 
     /// One WARN line per list, each naming its variables (a name's invalid
-    /// byte escaped) and no other field, and no line carrying a value: not the
+    /// byte escaped) with no `artifact` field, and no line carrying a value: not the
     /// plain value of the left-out name, not the withheld value, not the
     /// secret-named value that is not UTF-8.
     #[cfg(unix)]
