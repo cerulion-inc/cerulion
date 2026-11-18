@@ -1537,7 +1537,7 @@ fn doorbell_ring_during_park_is_attributed_to_doorbell_counter() {
         "rings carry no data — the wake is record-only and must not fire the consumer"
     );
     // Without a CPU monitor-wait primitive (macOS always; Linux and Android
-    // hosts without WAITPKG or WFE) the park's idle is a KERNEL BLOCK on the
+    // hosts with no WAITPKG, MWAITX or WFE) the park's idle is a KERNEL BLOCK on the
     // doorbell's wake word rather than a pacing nap. This graph carries no
     // barrier participant and no credit edge, so the shared wake-word block
     // counter is attributable to the doorbell rung alone, which makes it the seam
@@ -2003,7 +2003,7 @@ fn degraded_default_policy_parks_fires_and_delivers() {
     );
     // Loud-over-silent tier pin — degraded tier only: the tier
     // line is gated on `!monitor_wait_available()` inside `monitor_wait_block`,
-    // so on a REAL-primitive machine (x86 WAITPKG / aarch64 WFE) the park runs the
+    // so on a REAL-primitive machine (x86 WAITPKG or MWAITX / aarch64 WFE) the park runs the
     // true CPU monitor-wait and the line NEVER fires — asserting it there would
     // fail on every host that has the primitive. The park-entry + delivery-oracle
     // asserts above stay UNCONDITIONAL (portable across hosts); only the two log pins
@@ -2059,7 +2059,7 @@ fn degraded_default_policy_parks_fires_and_delivers() {
 /// `OnceLock` — an in-process env A/B is impossible.
 ///
 /// DEGRADED tier only (runtime-gated, the file's machine-portability discipline):
-/// on a real-primitive machine (x86 WAITPKG / aarch64 WFE) `performed == true` and
+/// on a real-primitive machine (x86 WAITPKG or MWAITX / aarch64 WFE) `performed == true` and
 /// the nap arm never runs (the counter stays 0), so the shape is
 /// unobservable there — skip.
 ///
@@ -2141,9 +2141,9 @@ fn degraded_sleep_shape_honors_park_recheck() {
 /// no unusable-latch — `os_sync_naps == naps`, so routing the nap back through
 /// `thread::sleep` fails HERE while every fire/delivery pin stays green — the
 /// mutation seam), and NEVER os_sync-paced otherwise (`os_sync_naps == 0`: a
-/// pre-14.4 Mac, `CERULION_PARK_OS_SYNC=0`, Linux-without-WAITPKG). Both arms
+/// pre-14.4 Mac, `CERULION_PARK_OS_SYNC=0`, Linux with no CPU monitor-wait primitive). Both arms
 /// in one runtime-gated body (the file's machine-portability discipline); on a
-/// real-primitive machine (x86 WAITPKG / aarch64 WFE) the `!performed` arm never
+/// real-primitive machine (x86 WAITPKG or MWAITX / aarch64 WFE) the `!performed` arm never
 /// runs — skip, both counters are structurally 0 there.
 ///
 /// FIRE/DATA assertions are deliberately ABSENT here (the firewall pins live
@@ -2212,7 +2212,7 @@ fn degraded_nap_tier_matches_the_resolved_os_sync_availability() {
 // The park loop's YIELD after a hardware slice (the same-core starvation
 // defense).
 //
-// A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS scheduler, so a park
+// A `UMWAIT`/`MWAITX`/`WFE`-parked thread is RUNNING to the OS scheduler, so a park
 // that slices without yielding holds its core for the whole idle — a
 // co-located runnable peer (graph processes > cores under the
 // multi-process default) gets it only at CFS wakeup granularity (measured on
@@ -2242,7 +2242,7 @@ fn degraded_nap_tier_matches_the_resolved_os_sync_availability() {
 
 /// Counter pin: every completed park-loop slice is
 /// counted by `park_slices`, on EVERY tier (macOS runs the degraded
-/// sleep tier; a WAITPKG/WFE machine runs the hardware tier — both slice, both
+/// sleep tier; a WAITPKG/MWAITX/WFE machine runs the hardware tier; both slice, both
 /// count), and only the hardware slices yield: this source-less ticker has no
 /// doorbell, barrier or credit word, so every slice is a hardware park or a
 /// nap, and `park_core_yields == park_slices - park_recheck_naps` on every
@@ -2494,7 +2494,7 @@ fn the_native_park_slice_yields_the_core() {
     assert!(
         loop_body.contains("std::thread::yield_now()"),
         "monitor_wait_block must yield the core INSIDE the recheck loop, \
-         after every hardware park slice (a UMWAIT/WFE-parked thread is \
+         after every hardware park slice (a UMWAIT/MWAITX/WFE-parked thread is \
          RUNNING to the scheduler, so a non-yielding park starves a \
          co-located peer for a CFS tick)"
     );
@@ -4144,8 +4144,9 @@ mod box_same_core {
     }
 
     /// Median duration of a bare timer-bounded hardware park requesting a
-    /// 20µs slice — the machine's REAL park quantum. On x86 `UMWAIT` honors the
-    /// TSC deadline so this reads ~the requested slice; on aarch64 base
+    /// 20µs slice: the machine's REAL park quantum. On x86 `UMWAIT` honors the
+    /// TSC deadline (and `MWAITX` its relative TSC-rate timer) so this reads
+    /// ~the requested slice; on aarch64 base
     /// `WFE` has no timeout operand and parks ONE generic-timer event-stream
     /// period per call (machine-specific; a Jetson measures ~131µs — a same-core
     /// round-trip costs ~2-3 of them), which is therefore the wake QUANTUM
@@ -4188,7 +4189,9 @@ mod box_same_core {
     /// x86 measured p50 47.758µs (~147x) and a Jetson p50 344.142µs.
     ///
     /// PLATFORM bound (calibrated from measurement): x86 `UMWAIT`
-    /// honors the 20µs TSC deadline ⇒ p50 < 100µs, unchanged. aarch64 base
+    /// honors the 20µs TSC deadline ⇒ p50 < 100µs, unchanged. `MWAITX` honors
+    /// the same slice as a relative timer and takes the same x86 bound, which
+    /// was calibrated on `UMWAIT`. aarch64 base
     /// `WFE` has NO timeout operand — a bounded wait rides the generic-timer
     /// event stream, whose period is machine-specific (kernel target ~100µs,
     /// power-of-two divider of CNTFRQ; a Jetson measures ~131µs — a measured
@@ -4219,7 +4222,7 @@ mod box_same_core {
     /// so the only thing that can hold the core is the park under test — one
     /// runtime, one mechanism, no second park to confound the attribution.
     ///
-    /// Hardware-only (`--ignored`): needs real WAITPKG/WFE silicon + exclusive
+    /// Hardware-only (`--ignored`): needs real WAITPKG/MWAITX/WFE silicon + exclusive
     /// use of one core (skips loudly on a Linux machine with no primitive — the
     /// degraded nap tier releases the core, so the hazard is absent). On a
     /// machine with the primitive the run must RIDE the hardware arm: zero degraded nap
