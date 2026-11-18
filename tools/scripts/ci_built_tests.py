@@ -217,14 +217,18 @@ def unit_kind(files):
     return 'build'
 
 
-def compiled_units(fingerprints, since):
-    """[('crate (kind)', mtime_ns)] for each unit cargo compiled since `since`."""
+def compiled_units(profile_dir, since):
+    """[('crate (kind)', mtime_ns)] for each unit cargo compiled or build script
+    cargo ran since `since`: `.fingerprint/*` and `build/*` each date one in an
+    `invoked.timestamp`."""
     units = []
-    for d in sorted(os.listdir(fingerprints)) if os.path.isdir(fingerprints) else []:
-        stamp = os.path.join(fingerprints, d, 'invoked.timestamp')
-        if os.path.exists(stamp) and os.stat(stamp).st_mtime_ns >= since:
-            kind = unit_kind(os.listdir(os.path.join(fingerprints, d)))
-            units.append((f'{d.rsplit("-", 1)[0]} ({kind})', os.stat(stamp).st_mtime_ns))
+    for sub in ('.fingerprint', 'build'):
+        top = os.path.join(profile_dir, sub)
+        for d in sorted(os.listdir(top)) if os.path.isdir(top) else []:
+            stamp = os.path.join(top, d, 'invoked.timestamp')
+            if os.path.exists(stamp) and os.stat(stamp).st_mtime_ns >= since:
+                kind = 'build script run' if sub == 'build' else unit_kind(os.listdir(os.path.join(top, d)))
+                units.append((f'{d.rsplit("-", 1)[0]} ({kind})', os.stat(stamp).st_mtime_ns))
     return units
 
 
@@ -232,7 +236,8 @@ def attribute(units, phases, slack_ns):
     """(units per declared step, library builds per crate, units outside every step)."""
     counts, libs, stray = {p['name']: 0 for p in phases}, {}, []
     for name, t in units:
-        home = [p for p in phases if p['begin'] - slack_ns <= t <= p['end'] + slack_ns]
+        home = ([p for p in phases if p['begin'] <= t <= p['end']]
+                or [p for p in phases if p['begin'] - slack_ns <= t <= p['end'] + slack_ns])
         if not home:
             stray.append(name)
             continue
@@ -317,7 +322,7 @@ def cmd_phase(name, cmd):
 
 
 def cmd_record(argv):
-    exe, seq = os.path.realpath(argv[0]), time.time_ns()
+    exe, seq = os.path.realpath(argv[0]), time.monotonic_ns()
     with open(os.path.join(os.environ['CI_BUILT_TESTS_RECORD_DIR'], f'{seq}.json'), 'w') as f:
         json.dump({'executable': exe, 'cwd': os.getcwd(), 'env': dict(os.environ), 'seq': seq}, f)
     return 0
@@ -445,7 +450,7 @@ def cmd_doctests():
 
 def cmd_reclaim():
     """The pre-existing `find -executable -delete`, keeping binaries still to run."""
-    ran = {r['executable'] for r in read_lines('ran.jsonl')}
+    ran = {r['executable'] for r in read_lines('ran.jsonl') if r['whole']}
     keep = {b['executable'] for g in load_groups().values() for b in g['binaries']} - ran
     deps, removed = os.path.join(target_dir(), 'debug', 'deps'), 0
     for name in sorted(os.listdir(deps)) if os.path.isdir(deps) else []:
@@ -484,7 +489,7 @@ def cmd_audit(floor, not_run):
         bad.append(f'{len(built)} test binaries were built, below this leg\'s floor of {floor}')
     elif floor is not None and not full:
         print('floor: not applied, the selection left packages out of this leg')
-    units = compiled_units(os.path.join(target_dir(), 'debug', '.fingerprint'), min(p['begin'] for p in phases))
+    units = compiled_units(os.path.join(target_dir(), 'debug'), min(p['begin'] for p in phases))
     counts, libs, stray = attribute(units, phases, SLACK_NS)
     for name, n in counts.items():
         print(f'compiled units, {name}: {n}')
@@ -587,18 +592,23 @@ def self_test():
     check('attribution', attribute([('x (build)', 150), ('y (test)', 350), ('z (build)', 250),
                                     ('x (build)', 205), ('v (build)', 395)], phases, 10),
           ({'w': 2, 'b': 2}, {'x': 2, 'v': 1}, ['z (build)']))
+    close = [{'name': 'a', 'begin': 100, 'end': 200}, {'name': 'b', 'begin': 205, 'end': 300}]
+    check('a unit inside a step belongs to it, not to a neighbour within the slack',
+          attribute([('x (build)', 210)], close, 50)[0], {'a': 0, 'b': 1})
     check('unit kinds', [unit_kind(f) for f in (['lib-x', 'lib-x.json'], ['test-lib-x'],
                                                  ['build-script-build-script-build'],
                                                  ['run-build-script-build-script-build'])],
           ['build', 'test', 'build script', 'build script run'])
     with tempfile.TemporaryDirectory() as tmp:
-        for d, t in (('old-1', 50), ('new-2', 150), ('build-dep-3', 160), ('fresh-4', None)):
+        for d, t in (('.fingerprint/old-1', 50), ('.fingerprint/new-2', 150), ('.fingerprint/build-dep-3', 160),
+                     ('.fingerprint/fresh-4', None), ('build/ring-5', 170), ('build/zstd-6', 20)):
             os.makedirs(os.path.join(tmp, d))
             open(os.path.join(tmp, d, 'lib-x'), 'w').close()
             if t is not None:
                 open(os.path.join(tmp, d, 'invoked.timestamp'), 'w').close()
                 os.utime(os.path.join(tmp, d, 'invoked.timestamp'), ns=(t, t))
-        check('compiled units', sorted(compiled_units(tmp, 100)), [('build-dep (build)', 160), ('new (build)', 150)])
+        check('compiled units', sorted(compiled_units(tmp, 100)),
+              [('build-dep (build)', 160), ('new (build)', 150), ('ring (build script run)', 170)])
 
     good = ("""jobs:
   t:
