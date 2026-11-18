@@ -192,12 +192,12 @@ jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
   # that care: a checkout with full history plus a workspace resolve.
   #
-  # FOUR CLASSES, in two directions. `packaging` only ever makes `deb-smoke` RUN
-  # on a pull request it would otherwise skip. `code`, `docs` and `pkgs` are the
-  # test-impact selection and they SKIP test steps, so every rule behind them is
-  # fail-closed. The rules, the reason token each one emits and a `--self-test`
-  # table live in `tools/scripts/ci_changed_paths.sh`, and `lint` runs that
-  # table.
+  # FIVE CLASSES, in two directions. `packaging` only ever makes `deb-smoke` RUN
+  # on a pull request it would otherwise skip, and `python` the macOS leg of
+  # `python-client`. `code`, `docs` and `pkgs` are the test-impact selection
+  # and they SKIP test steps, so every rule behind them is fail-closed. The
+  # rules, the reason token each one emits and a `--self-test` table live in
+  # `tools/scripts/ci_changed_paths.sh`, and `lint` runs that table.
   #
   # PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` there
   # is no pull request to diff, and the classifier answers with EVERY package
@@ -220,6 +220,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       packaging: ${{ steps.classify.outputs.packaging }}
+      python: ${{ steps.classify.outputs.python }}
       code: ${{ steps.classify.outputs.code }}
       docs: ${{ steps.classify.outputs.docs }}
       pkgs: ${{ steps.classify.outputs.pkgs }}
@@ -300,6 +301,7 @@ jobs:
             > "$RUNNER_TEMP/classes.txt"
           cat "$RUNNER_TEMP/classes.txt"
           packaging=$(sed -n 's/^packaging=//p' "$RUNNER_TEMP/classes.txt")
+          python=$(sed -n 's/^python=//p' "$RUNNER_TEMP/classes.txt")
           code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
           docs=$(sed -n 's/^docs=//p' "$RUNNER_TEMP/classes.txt")
           pkgs=$(sed -n 's/^pkgs=//p' "$RUNNER_TEMP/classes.txt")
@@ -307,9 +309,9 @@ jobs:
           # output is the empty string in every job that consults it: `== 'true'`
           # is then false on every event, and `fromJSON('')` is an expression
           # error that fails the step rather than running it.
-          for value in "$packaging" "$code" "$docs" "$pkgs"; do
+          for value in "$packaging" "$python" "$code" "$docs" "$pkgs"; do
             if [ -z "$value" ]; then
-              echo "the classifier produced no value for one of its four classes" >&2
+              echo "the classifier produced no value for one of its five classes" >&2
               exit 1
             fi
           done
@@ -320,6 +322,7 @@ jobs:
           # while reading as a selected step.
           {
             echo "packaging=$packaging"
+            echo "python=$python"
             echo "code=$code"
             echo "docs=$docs"
             echo "pkgs=$pkgs"
@@ -4851,7 +4854,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # The Linux leg runs on every event. The macOS leg runs on a push to
+        # `main`, on a dispatch, and on a pull request that touches
+        # `crates/cerulion_py` (the classifier's `python` class); not on other
+        # pull requests and not in the merge queue. Neither leg is a required
+        # context. A change elsewhere that breaks only the macOS leg shows on
+        # `main`'s push run, the same commit the queue passed.
+        os: ${{ fromJSON((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && needs.changes.outputs.python == 'true')) && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.

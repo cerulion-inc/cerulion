@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci_changed_paths.sh: classify a pull request's changed paths for ci.yml.
 #
-# Reads one path per line on stdin and writes the four classes as
+# Reads one path per line on stdin and writes the five classes as
 # `<class>=<value>` lines on stdout, one per line, alongside a `selection:` line
 # that names the rule that fired. The caller reads the classes BY NAME, which is
 # how ci.yml invokes it:
@@ -11,7 +11,7 @@
 #     > "$RUNNER_TEMP/classes.txt"
 #   code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
 #
-# and then writes each of `packaging`, `code`, `docs` and `pkgs` to
+# and then writes each of `packaging`, `python`, `code`, `docs` and `pkgs` to
 # `$GITHUB_OUTPUT` under its own literal name. Reading by name is what keeps the
 # `selection:` lines OUT of `$GITHUB_OUTPUT`: they are for the reader of the job
 # log, they carry no `<name>=<value>` shape, and piping this whole stream into
@@ -22,13 +22,14 @@
 # ci.yml takes the base from that first parent. Otherwise `$BASE` is `base.sha`
 # itself.
 #
-# FOUR CLASSES, and two directions. `packaging` only ever ADDS work: it runs a
-# push-only job on a pull request that touches its inputs. `code`, `docs` and
-# `pkgs` do the opposite: ci.yml gates test steps on them, so a rule that is too
-# NARROW skips a test the change could have broken, and skips it silently. Every
-# rule below is therefore fail-closed: an unclassifiable path, an event that is
-# not a pull request, a switch this script cannot read, or a selector that
-# refuses, all select EVERYTHING.
+# FIVE CLASSES, and two directions. `packaging` and `python` only ever ADD
+# work: each runs work that would otherwise skip a pull request, on one that
+# touches its inputs. `code`, `docs` and `pkgs` do the opposite: ci.yml gates
+# test steps on them, so a rule that is too NARROW skips a test the change
+# could have broken, and skips it silently. Every rule below is therefore
+# fail-closed: an unclassifiable path, an event that is not a pull request, a
+# switch this script cannot read, or a selector that refuses, all select
+# EVERYTHING.
 #
 # `packaging` is the inputs of the `deb-smoke` job (Debian and APT package
 # smoke). That job is push-only because it is 22 minutes of compression-bound
@@ -51,6 +52,12 @@
 # far too often to put every documentation pull request behind a 22-minute job,
 # and a pull request that deletes it and nothing else is still caught by `main`'s
 # push run.
+#
+# `python` is a path under `crates/cerulion_py/`, the Python client's own
+# workspace. The macOS leg of the `python-client` job runs on a push to `main`
+# and a dispatch, and on a pull request only when this class is true; the
+# Linux leg runs on every event. A change elsewhere that breaks the macOS leg
+# surfaces on `main`'s push run.
 #
 # `code`, `docs`, `pkgs`: the test-impact selection. THE RULES, IN THIS ORDER.
 #
@@ -98,9 +105,9 @@
 # the workflow diffs with `--no-renames` so that renaming a listed input away
 # still matches on the name it had.
 #
-# Unreadable or empty input yields `packaging=false`; the selection classes then
-# read the empty change as what it is, `code=false` and `pkgs=[]`, on a pull
-# request and every member on everything else.
+# Unreadable or empty input yields `packaging=false` and `python=false`; the
+# selection classes then read the empty change as what it is, `code=false` and
+# `pkgs=[]`, on a pull request and every member on everything else.
 #
 # `--self-test` runs the tables below and exits nonzero on the first miss.
 set -euo pipefail
@@ -143,6 +150,9 @@ docs/legal/
 LICENSE
 .github/workflows/apt-repo.yml
 '
+
+# The `python` class: the Python client's workspace.
+PYTHON_PREFIX='crates/cerulion_py/'
 
 # The shared trees rule 5 names, one per line, as `<prefix>|<doc-pin root>`.
 SHARED_TREES='
@@ -427,7 +437,7 @@ select_packages() {
 }
 
 classify() {
-    local packaging=false path lines code docs touched reason pkgs
+    local packaging=false python=false path lines code docs touched reason pkgs
     local input
     input=$(cat)
     while IFS= read -r path; do
@@ -435,6 +445,7 @@ classify() {
         if matches_packaging "$path"; then
             packaging=true
         fi
+        case "$path" in "$PYTHON_PREFIX"*) python=true ;; esac
     done <<< "$input"
 
     lines=$(printf '%s\n' "$input" | classify_touched)
@@ -446,9 +457,10 @@ classify() {
 
     # THE REASON, on its own line with the fixed `selection:` prefix, and NOT as
     # a `<name>=<value>` output: it is for the reader of the log, and the step
-    # that consumes this writes only the four named classes to `$GITHUB_OUTPUT`.
+    # that consumes this writes only the five named classes to `$GITHUB_OUTPUT`.
     printf 'selection: reason=%s\n' "$reason"
     printf 'packaging=%s\n' "$packaging"
+    printf 'python=%s\n' "$python"
     printf 'code=%s\n' "$code"
     printf 'docs=%s\n' "$docs"
     printf 'pkgs=%s\n' "$pkgs"
@@ -457,8 +469,8 @@ classify() {
 self_test() {
     local fails=0
     # EVERY CASE THIS SUITE JUDGES, counted in one place: the packaging rows,
-    # the class rows, the shared-tree loop, the live pipeline rows and the two
-    # emergency-stop rows. The count is the witness the last line carries, and
+    # the python rows, the class rows, the shared-tree loop, the live pipeline
+    # rows and the two emergency-stop rows. The count is the witness the last line carries, and
     # it is what the nested run below is judged on, so a suite that stops
     # judging rows reports a smaller number rather than the same `OK`.
     local cases=0
@@ -502,6 +514,36 @@ crates/cerulion_core/src/wire.rs;README.md|false
             fails=$((fails + 1))
         fi
     done <<< "$packaging_cases"
+
+    # ---- the python table ---------------------------------------------------
+    # `<input paths>|<expected python>`; `;` separates paths. The class ignores
+    # the event and the switch: the workflow decides by event.
+    local python_cases='
+crates/cerulion_py/src/lib.rs|true
+crates/cerulion_py/Cargo.lock|true
+crates/cerulion_py/tests/test_pubsub.py|true
+crates/cerulion_core/src/wire.rs;crates/cerulion_py/pyproject.toml|true
+crates/cerulion_py|false
+crates/cerulion_python/src/lib.rs|false
+crates/cerulion_core/src/wire.rs|false
+.github/workflows/ci.yml|false
+docs/python.md|false
+|false
+'
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        cases=$((cases + 1))
+        paths=${line%|*}
+        want=${line##*|}
+        got=$(printf '%s\n' "${paths//;/$'\n'}" \
+              | GITHUB_EVENT_NAME=pull_request CI_SELECTION=off classify \
+              | sed -n 's/^python=//p')
+        if [ "$got" != "$want" ]; then
+            printf 'ci_changed_paths self-test: %s -> python=%s, wanted python=%s\n' \
+                "${paths:-<empty>}" "$got" "$want" >&2
+            fails=$((fails + 1))
+        fi
+    done <<< "$python_cases"
 
     # ---- the selection rules ----------------------------------------------
     # `<event>;<switch>;<paths>|<code>|<docs>|<touched>`, `,` separating paths.

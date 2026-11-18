@@ -583,11 +583,17 @@ scratch on every run. It lists no `needs:`, so a pull request starts it beside `
 than after it.
 
 The `changes` job classifies a pull request's changed paths (rules and a
-`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into four
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into five
 outputs. `packaging` only ever makes a job RUN that would otherwise skip: a pull request
 that touches the packaging inputs themselves runs the 22-minute Debian and APT smoke,
 because those are the only pull requests that can break it and "caught on the merge to
-main" means a revert rather than a red check. EVERY job that `needs:` the classifier opens
+main" means a revert rather than a red check. `python` does the same for the macOS leg of
+`python-client`: true when a path under `crates/cerulion_py/` changed. That job's matrix
+carries the macOS leg on a push to `main`, on a dispatch and on a pull request where `python`
+is true, and the Linux leg on every event; a merge-queue run and any other pull request get the
+Linux leg alone. Neither leg is a required context. A change elsewhere that breaks only the
+macOS leg shows on `main`'s push run of the commit the queue passed; a dispatch of `ci.yml` on
+a branch (`gh workflow run ci.yml --ref <branch>`) runs the leg before merge. EVERY job that `needs:` the classifier opens
 its job-level `if:` with `!cancelled()`, not `deb-smoke` alone: `needs:` by itself lets a
 failed classifier skip a dependant, and a skipped required context reads as satisfied.
 `test-linux`, `test-macos`, `crate-tests` and `viz-tests` carry the bare call; `deb-smoke`
