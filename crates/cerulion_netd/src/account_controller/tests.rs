@@ -198,6 +198,8 @@ fn serving_ready_waits_out_a_brief_holder_and_keeps_every_outbound_pin() {
         .collect();
     assert_eq!(live, [wan.clone(), lan.clone()]);
     let mut state = controller.state.lock().unwrap();
+    // The locked branch ran the restoration: it consumed the handover.
+    assert!(state.handover.is_none());
     assert!(controller.pending_keys(&state).unwrap().is_empty());
     controller
         .retire_pending(&mut state, &mut registry)

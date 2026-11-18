@@ -183,8 +183,8 @@ impl AccountWanController {
     }
 
     /// Observable state (Principle #3): serving starts that cancelled their live
-    /// outbound WAN pins, naming each loss, because the controller state stayed
-    /// held by another operation.
+    /// outbound WAN pins, and returned an error naming the first, because the
+    /// controller state stayed held by another operation.
     pub fn restoration_busy_cancellations(&self) -> u64 {
         self.restoration_busy_cancellations.load(Ordering::Relaxed)
     }
@@ -573,10 +573,10 @@ impl AccountWanController {
         Ok(Some(state.identity_generation))
     }
 
-    /// Apply an identity loaded at generation `loaded_at`. An identity installed,
-    /// synchronized or cleared during the load was written by that operation from
-    /// its own read, so this older load is dropped and the next refresh reads again;
-    /// a cleared identity still reports that it needs an install.
+    /// Apply an identity loaded at generation `loaded_at`. An identity written
+    /// during the load (an install, a renewed proof or a clear) supersedes it, so
+    /// this older load is dropped and the next refresh reads again; a cleared
+    /// identity still reports that it needs an install.
     fn refresh_apply(
         &self,
         registry: &mut DemandRegistry,

@@ -327,9 +327,10 @@ impl AccountWanController {
         }
     }
 
-    /// Cancel and name every live WAN pin of a serving start that could not take
-    /// the state. begin_serving already retired the previous endpoint; registry
-    /// retirement observes these cancelled pins independently.
+    /// Cancel every live WAN pin of a serving start that could not take the
+    /// state, and return an error naming the first. begin_serving already retired
+    /// the previous endpoint; registry retirement then reports each loss to its
+    /// holders.
     fn cancel_busy_restoration(&self) -> Result<(), String> {
         let mut first = None;
         for (key, pin) in self.pins()?.iter_mut() {

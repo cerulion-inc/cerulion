@@ -5958,6 +5958,7 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_netd (selected: $SELECTED)"
+
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
     needs: [lint, changes]
