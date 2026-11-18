@@ -14,7 +14,9 @@
 #         matches. It installs nothing and needs only python3.
 #
 # sim and bench run install.sh first when install.sh --check finds a step missing, so the simulator and the
-# benchmark scenes are installed once. The install's progress goes to stderr: stdout stays the MCP stream.
+# benchmark scenes are installed once. The install's progress goes to stderr: stdout stays the MCP stream. The
+# install runs in this folder with no stdin, as its own process group, and a stop that reaches this script
+# (SIGINT, SIGTERM or SIGHUP) is passed on to all of it.
 #
 # --home DIR  where this folder is copied, once, byte for byte, to run from there, because the install writes inside
 #             the folder it runs from: always after --packaged, else only when this user cannot write to this folder.
@@ -117,6 +119,57 @@ print("verify: ok, this folder holds the code the benchmark measured")
   *) usage ;;
 esac
 
+# A stop that reaches this script alone, as cerulion forwards one, would otherwise be lost: bash acts on a signal
+# only once the command it waits on returns, and that command never got the signal. So the install and its check run
+# as their own process group (run_stoppable), and the trap sends the signal to that whole group; once the install has
+# ended the script exits with 128 + the signal's number. A stop at any other point ends the script as soon as the
+# command running then returns, and a copy it cut short is removed.
+CHILD=
+STARTING=
+STOPPED=
+STOP_SIGNAL=
+PARTIAL=
+pass_stop() {  # to CHILD's whole group
+  kill -s "$STOP_SIGNAL" -- "-$CHILD" 2>/dev/null || true
+  kill -s CONT -- "-$CHILD" 2>/dev/null || true  # a member stopped by the terminal acts on it too
+}
+on_stop() {  # SIGNAL CODE
+  STOP_SIGNAL=$1
+  STOPPED=$2
+  if [ -n "$CHILD" ]; then
+    pass_stop
+    return 0
+  fi
+  # While run_stoppable starts its command, the stop is passed on as soon as the command's group exists.
+  [ -n "$STARTING" ] || exit "$2"
+}
+trap 'on_stop INT 130' INT
+trap 'on_stop TERM 143' TERM
+trap 'on_stop HUP 129' HUP
+trap '[ -z "$PARTIAL" ] || rm -rf "$PARTIAL"' EXIT
+
+# run_stoppable CMD...: run CMD in this folder, so its Python imports nothing from the directory cerulion was
+# started in, as its own process group with no stdin (over stdio, stdin is the MCP stream the server reads). With
+# no terminal to answer on, git fails where it would ask for a login (GIT_TERMINAL_PROMPT=0) instead of waiting.
+# Returns CMD's code, or the stop's code once a stopped CMD has ended.
+run_stoppable() {
+  STARTING=1
+  set -m
+  (cd "$HERE" && export GIT_TERMINAL_PROMPT=0 && exec "$@") </dev/null &
+  CHILD=$!
+  set +m
+  STARTING=
+  [ -z "$STOPPED" ] || pass_stop
+  local code=0
+  wait "$CHILD" || code=$?
+  while [ -n "$STOPPED" ] && kill -0 "$CHILD" 2>/dev/null; do
+    code=0
+    wait "$CHILD" || code=$?
+  done
+  CHILD=
+  return "${STOPPED:-$code}"
+}
+
 if [ "$RUN_FROM" != "$HERE" ]; then
   if [ ! -f "$RUN_FROM/rcp.sh" ]; then
     if [ -n "$PACKAGED" ]; then
@@ -126,11 +179,12 @@ if [ "$RUN_FROM" != "$HERE" ]; then
       echo "$HERE is read-only for this user: copying it once to $RUN_FROM, where the install goes" >&2
     fi
     mkdir -p "$(dirname "$RUN_FROM")"
-    TMP=$RUN_FROM.partial.$$
-    rm -rf "$TMP"
-    cp -R "$HERE" "$TMP"
-    chmod -R u+w "$TMP"
-    if [ -e "$RUN_FROM" ]; then rm -rf "$TMP"; else mv "$TMP" "$RUN_FROM"; fi
+    PARTIAL=$RUN_FROM.partial.$$
+    rm -rf "$PARTIAL"
+    cp -R "$HERE" "$PARTIAL"
+    chmod -R u+w "$PARTIAL"
+    if [ -e "$RUN_FROM" ]; then rm -rf "$PARTIAL"; else mv "$PARTIAL" "$RUN_FROM"; fi
+    PARTIAL=
   fi
   exec bash "$RUN_FROM/rcp.sh" "$VERB" "$@"
 fi
@@ -144,9 +198,10 @@ fi
   exit 2
 }
 
-if ! bash "$HERE/install.sh" --check >/dev/null 2>&1; then
+if ! run_stoppable bash "$HERE/install.sh" --check >/dev/null 2>&1; then
+  [ -z "$STOPPED" ] || exit "$STOPPED"
   echo "First run: installing the simulator and the benchmark scenes into $HERE, once." >&2
-  bash "$HERE/install.sh" >&2 || {
+  run_stoppable bash "$HERE/install.sh" >&2 || {
     code=$?
     echo "the install stopped (exit $code); run the same command again to resume it" >&2
     exit "$code"
@@ -155,7 +210,9 @@ fi
 PY=$HERE/venv/bin/python
 
 if [ "$VERB" = bench ]; then
-  exec "$PY" -m cerulion_harness run-cell "$@"
+  # -P: the directory cerulion was started in, where the results go, is not on the module path, so nothing in it
+  # is imported in place of the harness's own modules.
+  exec "$PY" -P -m cerulion_harness run-cell "$@"
 fi
 set -- "$TRANSPORT"
 [ -z "$ADDR" ] || set -- "$@" "$ADDR"

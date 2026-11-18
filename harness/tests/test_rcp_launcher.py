@@ -12,19 +12,24 @@ import hashlib
 import os
 import pathlib
 import shutil
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 LAUNCHER = pathlib.Path(__file__).resolve().parent.parent / "rcp.sh"
 
 # install.sh: `--check` answers from the file `installed`; a run writes it,
 # prints a progress line and exits with the code in `install-exit` (0 when
-# there is none). Every run appends its words to install-runs.txt.
+# there is none). Every run appends its words to install-runs.txt and the
+# folder it runs in to install-cwd.txt.
 INSTALL = """#!/usr/bin/env bash
 here=$(cd "$(dirname "$0")" && pwd -P)
 printf '%s\\n' "${*:-<none>}" >> "$here/install-runs.txt"
+pwd -P >> "$here/install-cwd.txt"
 if [ "${1:-}" = --check ]; then [ -f "$here/installed" ]; exit $?; fi
 echo "INSTALL-PROGRESS"
 code=0
@@ -52,8 +57,33 @@ VERIFY = """def verify(home):
 """
 
 
+# A step the install runs in the foreground, as it runs uv, git and curl: it
+# writes its pid to step.pid and sleeps. A stop must end it.
+STEP = 'bash -c \'echo $$ > "$1/step.pid"; exec sleep 30\' _ "$here"'
+
+# install.sh whose run is one such step; its check finds the install missing.
+INSTALL_WITH_A_STEP = """#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")" && pwd -P)
+printf '%s\\n' "${*:-<none>}" >> "$here/install-runs.txt"
+if [ "${1:-}" = --check ]; then exit 1; fi
+""" + STEP + """
+: > "$here/installed"
+"""
+
+# install.sh whose check is one such step.
+CHECK_WITH_A_STEP = """#!/usr/bin/env bash
+here=$(cd "$(dirname "$0")" && pwd -P)
+printf '%s\\n' "${*:-<none>}" >> "$here/install-runs.txt"
+if [ "${1:-}" = --check ]; then """ + STEP + """; exit 1; fi
+: > "$here/installed"
+"""
+
+# The code a launcher stopped by each signal exits with: 128 + its number.
+STOPS = [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)]
+
+
 # What the stand-ins above write into the folder they run from.
-STAND_IN_OUTPUTS = {"installed", "install-runs.txt", "python-ran.txt", "verified.txt"}
+STAND_IN_OUTPUTS = {"installed", "install-runs.txt", "install-cwd.txt", "python-ran.txt", "verified.txt"}
 
 
 def write(path, text, mode=0o644):
@@ -101,6 +131,57 @@ def is_root():
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
+def sigint_deliverable():
+    """In the launcher: SIGINT at its default, as cerulion starts it, whatever this test process was handed."""
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+
+def is_zombie(pid):
+    """Whether pid has exited and waits to be reaped."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:
+        pass
+    ps = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, text=True)
+    return ps.stdout.strip().startswith("Z")
+
+
+def ended(pid, within=5.0):
+    """Whether process pid has ended within `within` seconds."""
+    deadline = time.monotonic() + within
+    while True:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):
+            return True
+        if is_zombie(pid):
+            return True
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.05)
+
+
+def wait_for(path, within=10.0):
+    """The text of path once it holds a line, or None after `within` seconds."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if path.exists() and path.read_text().strip():
+            return path.read_text().strip()
+        time.sleep(0.05)
+    return None
+
+
+def python_with_safe_path():
+    """A python3 of 3.11 or later, which has -P as the install's Python 3.12 has, or None."""
+    for python in [sys.executable] + [shutil.which(f"python3.{minor}") for minor in range(11, 20)]:
+        too_old = "import sys; sys.exit(sys.version_info < (3, 11))"
+        if python and subprocess.run([python, "-c", too_old]).returncode == 0:
+            return python
+    return None
+
+
 class Launcher(unittest.TestCase):
     def setUp(self):
         self.tmp = pathlib.Path(tempfile.mkdtemp()).resolve()
@@ -124,16 +205,39 @@ class Launcher(unittest.TestCase):
         os.chmod(self.tmp, 0o755)
         shutil.rmtree(self.tmp)
 
-    def run_launcher(self, *words, env=None, folder=None, home=None, packaged=False):
+    def run_launcher(self, *words, env=None, folder=None, home=None, packaged=False, stdin=None):
         flags = ["--home", str(home or self.home)] + (["--packaged"] if packaged else [])
-        return self.run_raw(*flags, *words, env=env, folder=folder)
+        return self.run_raw(*flags, *words, env=env, folder=folder, stdin=stdin)
 
-    def run_raw(self, *argv, env=None, folder=None):
+    def run_raw(self, *argv, env=None, folder=None, stdin=None):
         folder = folder or self.harness
         return subprocess.run(
             ["bash", str(folder / "rcp.sh"), *argv],
-            cwd=self.tmp, env={**self.env, **(env or {})},
+            cwd=self.tmp, env={**self.env, **(env or {})}, input=stdin,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+
+    def start_launcher(self, *words, env=None, packaged=False):
+        """The launcher started as cerulion starts it, left running; a test signals it and reads what it said."""
+        flags = ["--home", str(self.home)] + (["--packaged"] if packaged else [])
+        launcher = subprocess.Popen(
+            ["bash", str(self.harness / "rcp.sh"), *flags, *words],
+            cwd=self.tmp, env={**self.env, **(env or {})}, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, preexec_fn=sigint_deliverable)
+
+        def stop_leftovers():
+            if launcher.poll() is None:
+                launcher.kill()
+                launcher.communicate()
+        self.addCleanup(stop_leftovers)
+        return launcher
+
+    def kill_at_cleanup(self, pid):
+        def kill():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        self.addCleanup(kill)
 
     def copied(self, home):
         """The copy's bytes without what the stand-ins wrote into it once it ran."""
@@ -189,7 +293,7 @@ class Launcher(unittest.TestCase):
         run = self.run_launcher("bench", "--model", "my model", "--base-url", "https://example.test/v1",
                                 "--key-env", "MY_KEY", "--out", "out dir", env={"MY_KEY": "k"})
         self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(self.python_ran()[1:], ["-m", "cerulion_harness", "run-cell", "--model", "my model",
+        self.assertEqual(self.python_ran()[1:], ["-P", "-m", "cerulion_harness", "run-cell", "--model", "my model",
                                                  "--base-url", "https://example.test/v1", "--key-env", "MY_KEY",
                                                  "--out", "out dir"])
 
@@ -293,7 +397,7 @@ class Launcher(unittest.TestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertNotIn("copying", second.stderr)
         self.assertTrue((self.home / "copied-once").exists(), "the second run made a new copy")
-        self.assertEqual(self.python_ran(self.home)[1:4], ["-m", "cerulion_harness", "run-cell"])
+        self.assertEqual(self.python_ran(self.home)[1:5], ["-P", "-m", "cerulion_harness", "run-cell"])
         self.assertEqual(self.install_runs(self.home), ["--check", "<none>", "--check"])
         (self.home / "venv" / "bin" / "python").unlink()
         verify = self.run_launcher("verify", packaged=True)
@@ -378,6 +482,119 @@ class Launcher(unittest.TestCase):
                 run = self.run_launcher(*words)
                 self.assertEqual(run.returncode, 2, run.stderr)
                 self.assertIn("usage: rcp.sh", run.stderr)
+
+    def test_a_stop_sent_to_the_launcher_alone_ends_the_install_and_the_step_it_runs(self):
+        # cerulion forwards a stop to the launcher's pid only; the install and its step never get it from anyone
+        # else.
+        write(self.harness / "install.sh", INSTALL_WITH_A_STEP, 0o755)
+        for sig, code in STOPS:
+            with self.subTest(signal=sig.name):
+                for name in ("install-runs.txt", "step.pid"):
+                    (self.harness / name).unlink(missing_ok=True)
+                launcher = self.start_launcher("sim")
+                step = wait_for(self.harness / "step.pid")
+                self.assertIsNotNone(step, "the install's step never started")
+                self.kill_at_cleanup(int(step))
+                launcher.send_signal(sig)
+                try:
+                    _out, err = launcher.communicate(timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.fail(f"{sig.name}: the launcher kept waiting for an install that never got the stop")
+                self.assertEqual(launcher.returncode, code, err)
+                self.assertIn(f"the install stopped (exit {code}); run the same command again to resume it", err)
+                self.assertTrue(ended(int(step)), f"{sig.name}: the install's step outlived the stop")
+                self.assertFalse((self.harness / "installed").exists(), "the stopped install went on")
+                self.assertFalse((self.harness / "python-ran.txt").exists(), "the server started after a stop")
+                self.assertEqual(self.install_runs(), ["--check", "<none>"])
+
+    def test_a_stop_during_the_install_check_ends_the_run_before_any_install(self):
+        write(self.harness / "install.sh", CHECK_WITH_A_STEP, 0o755)
+        for sig, code in STOPS:
+            with self.subTest(signal=sig.name):
+                for name in ("install-runs.txt", "step.pid"):
+                    (self.harness / name).unlink(missing_ok=True)
+                launcher = self.start_launcher("sim")
+                step = wait_for(self.harness / "step.pid")
+                self.assertIsNotNone(step, "the check's step never started")
+                self.kill_at_cleanup(int(step))
+                launcher.send_signal(sig)
+                try:
+                    _out, err = launcher.communicate(timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.fail(f"{sig.name}: the launcher kept waiting for a check that never got the stop")
+                self.assertEqual(launcher.returncode, code, err)
+                self.assertTrue(ended(int(step)), f"{sig.name}: the check's step outlived the stop")
+                self.assertNotIn("First run", err)
+                self.assertEqual(self.install_runs(), ["--check"], "the install ran after a stop")
+                self.assertFalse((self.harness / "python-ran.txt").exists())
+
+    def test_a_stop_during_the_copy_ends_the_run_and_leaves_no_partial_copy(self):
+        # cp on PATH is one that says it started, then takes a second before it copies.
+        tools = self.tmp / "tools"
+        started = self.tmp / "copy-started"
+        real_cp = shutil.which("cp")
+        write(tools / "cp", f'#!/usr/bin/env bash\necho started > "{started}"\nsleep 1\nexec "{real_cp}" "$@"\n', 0o755)
+        env = {"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"}
+        before = tree(self.harness)
+        for sig, code in STOPS:
+            with self.subTest(signal=sig.name):
+                started.unlink(missing_ok=True)
+                launcher = self.start_launcher("sim", env=env, packaged=True)
+                self.assertIsNotNone(wait_for(started), "the copy never started")
+                launcher.send_signal(sig)
+                _out, err = launcher.communicate(timeout=20)
+                self.assertEqual(launcher.returncode, code, err)
+                self.assertEqual(sorted(p.name for p in self.home.parent.iterdir()), [],
+                                 "a copy, whole or partial, was left behind")
+                self.assertEqual(tree(self.harness), before)
+                self.assertFalse((self.home / "python-ran.txt").exists())
+
+    def test_the_install_runs_in_the_harness_folder_with_no_terminal_input_and_never_reads_the_mcp_stream(self):
+        # Over stdio the client's first bytes may arrive while the install runs: they are the server's to read.
+        install = INSTALL.replace('echo "INSTALL-PROGRESS"',
+                                  'echo "INSTALL-PROGRESS"\ncat > "$here/install-stdin.txt"\n'
+                                  'echo "${GIT_TERMINAL_PROMPT:-unset}" > "$here/install-git-prompt.txt"')
+        write(self.harness / "install.sh", install, 0o755)
+        write(self.harness / "venv" / "bin" / "python",
+              PYTHON.replace('echo "PY-OUT"', 'cat > "$here/python-stdin.txt"\necho "PY-OUT"'), 0o755)
+        run = self.run_launcher("sim", stdin="MCP-FIRST-BYTES\n")
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual((self.harness / "install-stdin.txt").read_text(), "", "the install read the MCP stream")
+        self.assertEqual((self.harness / "python-stdin.txt").read_text(), "MCP-FIRST-BYTES\n")
+        self.assertEqual((self.harness / "install-git-prompt.txt").read_text(), "0\n",
+                         "with no terminal to answer on, git must fail where it would ask")
+        self.assertEqual((self.harness / "install-cwd.txt").read_text().splitlines(),
+                         [str(self.harness), str(self.harness)], "the check and the install ran in another folder")
+        for name in ("installed", "install-cwd.txt"):
+            (self.harness / name).unlink()
+        packaged = self.run_launcher("sim", packaged=True, stdin="")
+        self.assertEqual(packaged.returncode, 0, packaged.stderr)
+        self.assertEqual((self.home / "install-cwd.txt").read_text().splitlines(), [str(self.home), str(self.home)])
+
+    def test_bench_imports_nothing_from_the_directory_it_starts_in(self):
+        python = python_with_safe_path()
+        if python is None:
+            self.skipTest("needs a python3 of 3.11 or later, as the install's venv is")
+        venv_python = self.harness / "venv" / "bin" / "python"
+        venv_python.unlink()
+        venv_python.symlink_to(python)
+        write(self.harness / "src" / "cerulion_harness" / "__main__.py",
+              "import os, sys\n"
+              "with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'bench-ran.txt'),"
+              " 'w') as f:\n"
+              "    f.write(' '.join(sys.argv[1:]))\n")
+        # The directory bench starts in, where its results go, holds a package of the same name.
+        write(self.tmp / "cerulion_harness" / "__init__.py", "")
+        write(self.tmp / "cerulion_harness" / "__main__.py",
+              f"open({str(self.tmp / 'caller-ran.txt')!r}, 'w').write('the caller package ran')\n")
+        (self.harness / "installed").touch()
+        # The install's .pth puts src/ on the venv's path; PYTHONPATH stands in for it here.
+        run = self.run_launcher("bench", "--model", "m", "--base-url", "https://example.test/v1",
+                                env={"OPENAI_API_KEY": "k", "PYTHONPATH": str(self.harness / "src")})
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse((self.tmp / "caller-ran.txt").exists(), "bench ran the package of the directory it started in")
+        self.assertEqual((self.harness / "bench-ran.txt").read_text(),
+                         "run-cell --model m --base-url https://example.test/v1")
 
 
 if __name__ == "__main__":

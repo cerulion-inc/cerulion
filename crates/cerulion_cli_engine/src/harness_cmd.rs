@@ -17,8 +17,13 @@
 //!    the release packages install it beside `cerulion`, `cerulion-netd` and
 //!    the other programs. Canonicalized, so a link to `cerulion` in a `bin`
 //!    directory still reaches the folder beside the real binary.
-//! 3. `harness/` in the current directory or the nearest directory above it:
-//!    a source checkout.
+//! 3. `harness/` at the root of the Cerulion source checkout the
+//!    canonicalized binary sits in: the nearest of the binary's directory and
+//!    the folders above it that holds [`CHECKOUT_MARKER`] ([`checkout_root`]),
+//!    so a binary `cargo run` or `cargo build` made in a checkout finds that
+//!    checkout's harness. The search stops at that root, and the current
+//!    directory is never searched, so a folder the user runs `cerulion` in (a
+//!    downloaded repository) cannot supply a harness, whatever files it holds.
 //!
 //! A folder holds a harness when both [`LAUNCHER`] and [`INSTALL_SCRIPT`] are
 //! files in it.
@@ -42,6 +47,11 @@ pub const HARNESS_DIR_ENV: &str = "CERULION_HARNESS_DIR";
 
 /// The folder's name beside the binary and in a source checkout.
 pub const HARNESS_FOLDER: &str = "harness";
+
+/// The file, relative to a folder, that makes the folder the root of a
+/// Cerulion source checkout: the manifest of the package that builds
+/// `cerulion`.
+pub const CHECKOUT_MARKER: &str = "crates/cerulion_cli/Cargo.toml";
 
 /// The launcher both verbs run, relative to the folder.
 pub const LAUNCHER: &str = "rcp.sh";
@@ -117,7 +127,8 @@ pub enum HarnessSource {
     /// that same folder), a release package's: never written, it runs from
     /// its copy.
     Packaged,
-    /// A source checkout's folder (rung 3): it runs in place.
+    /// The folder of the source checkout the binary sits in (rung 3): it runs
+    /// in place.
     Checkout,
 }
 
@@ -135,6 +146,15 @@ fn holds_harness(dir: &Path) -> bool {
     dir.join(LAUNCHER).is_file() && dir.join(INSTALL_SCRIPT).is_file()
 }
 
+/// The root of the Cerulion source checkout `exe_dir` sits in: the nearest of
+/// `exe_dir` and the folders above it that holds [`CHECKOUT_MARKER`], or
+/// `None` when none does.
+pub fn checkout_root(exe_dir: &Path) -> Option<&Path> {
+    exe_dir
+        .ancestors()
+        .find(|dir| dir.join(CHECKOUT_MARKER).is_file())
+}
+
 /// Whether `a` and `b` resolve to the same folder; `false` when either cannot
 /// be resolved.
 fn same_folder(a: &Path, b: &Path) -> bool {
@@ -147,10 +167,10 @@ fn same_folder(a: &Path, b: &Path) -> bool {
 /// The harness folder, searched in the module docs' order, and the kind of
 /// folder it is.
 ///
-/// `env_dir` is the value of [`HARNESS_DIR_ENV`] (`None` = unset), `exe_dir`
-/// the directory of the canonicalized running binary (`None` when it cannot
-/// be read) and `cwd` the current directory. Reads the filesystem; spawns
-/// nothing.
+/// `env_dir` is the value of [`HARNESS_DIR_ENV`] (`None` = unset) and
+/// `exe_dir` the directory of the canonicalized running binary (`None` when it
+/// cannot be read). No current directory is an input: a folder the user only
+/// runs `cerulion` in is never searched. Reads the filesystem; spawns nothing.
 ///
 /// # Errors
 ///
@@ -159,7 +179,6 @@ fn same_folder(a: &Path, b: &Path) -> bool {
 pub fn find_harness_dir(
     env_dir: Option<&OsStr>,
     exe_dir: Option<&Path>,
-    cwd: &Path,
 ) -> CliResult<FoundHarness> {
     let beside = exe_dir.map(|dir| dir.join(HARNESS_FOLDER));
     if let Some(named) = env_dir.filter(|value| !value.is_empty()) {
@@ -191,45 +210,56 @@ pub fn find_harness_dir(
             source: HarnessSource::Packaged,
         });
     }
-    for above in cwd.ancestors() {
-        let dir = above.join(HARNESS_FOLDER);
-        if holds_harness(&dir) {
-            return Ok(FoundHarness {
-                dir,
-                source: HarnessSource::Checkout,
-            });
-        }
+    let root = exe_dir.and_then(checkout_root);
+    if let Some(dir) = root
+        .map(|root| root.join(HARNESS_FOLDER))
+        .filter(|dir| holds_harness(dir))
+    {
+        return Ok(FoundHarness {
+            dir,
+            source: HarnessSource::Checkout,
+        });
     }
     let beside = match beside {
         Some(dir) => format!("'{}'", dir.display()),
         None => "beside the cerulion binary (its path could not be read)".to_string(),
     };
+    let checkout = match (exe_dir, root) {
+        (_, Some(root)) => format!(
+            "'{}', the harness folder of the Cerulion source checkout the binary sits in, which \
+             lacks {LAUNCHER} or {INSTALL_SCRIPT}",
+            root.join(HARNESS_FOLDER).display()
+        ),
+        (Some(exe_dir), None) => format!(
+            "a Cerulion source checkout around the binary, but neither '{}' nor any folder above \
+             it holds {CHECKOUT_MARKER}",
+            exe_dir.display()
+        ),
+        (None, None) => {
+            "a Cerulion source checkout around the binary (its path could not be read)".to_string()
+        }
+    };
     Err(CliError::Validation(format!(
         "no Cerulion harness found. Looked at (1) {HARNESS_DIR_ENV}, which is unset, (2) \
-         {beside}, where the release packages install it, and (3) a '{HARNESS_FOLDER}' folder \
-         in '{}' or any directory above it, as in a source checkout. Reinstall Cerulion, run \
-         this inside a checkout of https://github.com/cerulion-inc/cerulion, or set \
-         {HARNESS_DIR_ENV} to a harness folder",
-        cwd.display()
+         {beside}, where the release packages install it, and (3) {checkout}. The current \
+         directory is never searched. Reinstall Cerulion, run a cerulion built in a checkout of \
+         https://github.com/cerulion-inc/cerulion, or set {HARNESS_DIR_ENV} to a harness folder"
     )))
 }
 
-/// [`find_harness_dir`] for this process: its environment, its binary and its
-/// current directory.
+/// [`find_harness_dir`] for this process: its environment and its binary.
 ///
 /// # Errors
 ///
-/// As [`find_harness_dir`], or an unreadable current directory.
+/// As [`find_harness_dir`].
 pub fn find_harness_dir_here() -> CliResult<FoundHarness> {
     let exe_dir = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
-    let cwd = std::env::current_dir()?;
     find_harness_dir(
         std::env::var_os(HARNESS_DIR_ENV).as_deref(),
         exe_dir.as_deref(),
-        &cwd,
     )
 }
 
@@ -323,6 +353,26 @@ mod tests {
         std::fs::write(dir.join(INSTALL_SCRIPT), "").expect("install.sh");
     }
 
+    /// Make `dir` the root of a Cerulion source checkout: the marker, empty.
+    fn checkout_at(dir: &Path) {
+        let marker = dir.join(CHECKOUT_MARKER);
+        std::fs::create_dir_all(marker.parent().expect("the marker's folder"))
+            .expect("crates/cerulion_cli/");
+        std::fs::write(marker, "").expect("the marker");
+    }
+
+    /// A scratch tree, refused when it sits inside a Cerulion checkout: the
+    /// search walks up from it and would find that checkout.
+    fn scratch() -> tempfile::TempDir {
+        let root = tempfile::tempdir().expect("a scratch tree");
+        assert_eq!(
+            checkout_root(root.path()),
+            None,
+            "the temporary folder sits inside a Cerulion checkout; set TMPDIR outside it"
+        );
+        root
+    }
+
     fn message(result: CliResult<FoundHarness>) -> String {
         match result {
             Err(CliError::Validation(message)) => message,
@@ -331,31 +381,29 @@ mod tests {
     }
 
     /// Three places that each hold a harness: the variable's folder, the
-    /// folder beside the binary and a checkout around the current directory.
+    /// folder beside the binary and the root of the checkout the binary sits
+    /// in.
     struct ThreeRungs {
         _root: tempfile::TempDir,
         named: PathBuf,
         exe_dir: PathBuf,
         checkout: PathBuf,
-        cwd: PathBuf,
     }
 
     fn three_rungs() -> ThreeRungs {
-        let root = tempfile::tempdir().expect("a scratch tree");
+        let root = scratch();
         let named = root.path().join("named-harness");
         harness_at(&named);
-        let exe_dir = root.path().join("opt/cerulion/bin");
-        harness_at(&exe_dir.join(HARNESS_FOLDER));
         let checkout = root.path().join("checkout");
+        checkout_at(&checkout);
         harness_at(&checkout.join(HARNESS_FOLDER));
-        let cwd = checkout.join("docs/guides");
-        std::fs::create_dir_all(&cwd).expect("a folder inside the checkout");
+        let exe_dir = checkout.join("target/debug");
+        harness_at(&exe_dir.join(HARNESS_FOLDER));
         ThreeRungs {
             _root: root,
             named,
             exe_dir,
             checkout,
-            cwd,
         }
     }
 
@@ -371,7 +419,7 @@ mod tests {
     fn the_variable_wins_then_the_folder_beside_the_binary_then_the_checkout() {
         let t = three_rungs();
         assert_eq!(
-            find_harness_dir(Some(t.named.as_os_str()), Some(&t.exe_dir), &t.cwd).expect("found"),
+            find_harness_dir(Some(t.named.as_os_str()), Some(&t.exe_dir)).expect("found"),
             FoundHarness {
                 dir: t.named.clone(),
                 source: HarnessSource::Named
@@ -379,21 +427,21 @@ mod tests {
             "rung 1: the variable, the user's own folder"
         );
         assert_eq!(
-            find_harness_dir(None, Some(&t.exe_dir), &t.cwd).expect("found"),
+            find_harness_dir(None, Some(&t.exe_dir)).expect("found"),
             FoundHarness {
                 dir: t.exe_dir.join("harness"),
                 source: HarnessSource::Packaged
             },
-            "rung 2: beside the binary, over a checkout around the current directory"
+            "rung 2: beside the binary, over the checkout it sits in"
         );
         std::fs::remove_file(t.exe_dir.join(HARNESS_FOLDER).join(LAUNCHER)).expect("drop rung 2");
         assert_eq!(
-            find_harness_dir(None, Some(&t.exe_dir), &t.cwd).expect("found"),
+            find_harness_dir(None, Some(&t.exe_dir)).expect("found"),
             FoundHarness {
                 dir: t.checkout.join("harness"),
                 source: HarnessSource::Checkout
             },
-            "rung 3: the checkout above the current directory"
+            "rung 3: the root of the checkout the binary sits in"
         );
     }
 
@@ -401,10 +449,9 @@ mod tests {
     fn a_variable_naming_the_folder_beside_the_binary_is_still_packaged() {
         let t = three_rungs();
         let beside = t.exe_dir.join(HARNESS_FOLDER);
-        let spelled_otherwise = t.exe_dir.join("../bin/harness/.");
+        let spelled_otherwise = t.exe_dir.join("../debug/harness/.");
         for named in [&beside, &spelled_otherwise] {
-            let got =
-                find_harness_dir(Some(named.as_os_str()), Some(&t.exe_dir), &t.cwd).expect("found");
+            let got = find_harness_dir(Some(named.as_os_str()), Some(&t.exe_dir)).expect("found");
             assert_eq!(got.source, HarnessSource::Packaged, "{}", named.display());
             assert_eq!(
                 &got.dir, named,
@@ -413,10 +460,10 @@ mod tests {
         }
         #[cfg(unix)]
         {
-            let link = t.cwd.join("my-harness");
+            let link = t.checkout.join("my-harness");
             std::os::unix::fs::symlink(&beside, &link).expect("a link to the packaged folder");
             assert_eq!(
-                find_harness_dir(Some(link.as_os_str()), Some(&t.exe_dir), &t.cwd)
+                find_harness_dir(Some(link.as_os_str()), Some(&t.exe_dir))
                     .expect("found")
                     .source,
                 HarnessSource::Packaged,
@@ -424,7 +471,7 @@ mod tests {
             );
         }
         assert_eq!(
-            find_harness_dir(Some(t.named.as_os_str()), None, &t.cwd)
+            find_harness_dir(Some(t.named.as_os_str()), None)
                 .expect("found")
                 .source,
             HarnessSource::Named,
@@ -436,8 +483,8 @@ mod tests {
     fn finding_twice_gives_the_same_folder_and_kind() {
         let t = three_rungs();
         for env in [None, Some(t.named.as_os_str())] {
-            let first = find_harness_dir(env, Some(&t.exe_dir), &t.cwd).expect("found");
-            let second = find_harness_dir(env, Some(&t.exe_dir), &t.cwd).expect("found");
+            let first = find_harness_dir(env, Some(&t.exe_dir)).expect("found");
+            let second = find_harness_dir(env, Some(&t.exe_dir)).expect("found");
             assert_eq!(first, second);
         }
     }
@@ -445,11 +492,10 @@ mod tests {
     #[test]
     fn a_variable_naming_a_missing_folder_refuses_and_never_falls_through() {
         let t = three_rungs();
-        let missing = t.cwd.join("no-such-folder");
+        let missing = t.checkout.join("no-such-folder");
         let said = message(find_harness_dir(
             Some(missing.as_os_str()),
             Some(&t.exe_dir),
-            &t.cwd,
         ));
         assert_eq!(
             said,
@@ -464,12 +510,8 @@ mod tests {
     #[test]
     fn a_variable_naming_a_folder_without_a_harness_refuses_and_never_falls_through() {
         let t = three_rungs();
-        let empty = t.cwd.clone();
-        let said = message(find_harness_dir(
-            Some(empty.as_os_str()),
-            Some(&t.exe_dir),
-            &t.cwd,
-        ));
+        let empty = t.checkout.clone();
+        let said = message(find_harness_dir(Some(empty.as_os_str()), Some(&t.exe_dir)));
         assert_eq!(
             said,
             format!(
@@ -486,7 +528,7 @@ mod tests {
         let t = three_rungs();
         let empty = OsString::new();
         assert_eq!(
-            find_harness_dir(Some(empty.as_os_str()), Some(&t.exe_dir), &t.cwd).expect("found"),
+            find_harness_dir(Some(empty.as_os_str()), Some(&t.exe_dir)).expect("found"),
             FoundHarness {
                 dir: t.exe_dir.join("harness"),
                 source: HarnessSource::Packaged
@@ -496,48 +538,118 @@ mod tests {
 
     #[test]
     fn nothing_found_names_all_three_places_it_looked() {
-        let root = tempfile::tempdir().expect("an empty tree");
+        let root = scratch();
         let exe_dir = root.path().join("bin");
-        let said = message(find_harness_dir(None, Some(&exe_dir), root.path()));
+        let said = message(find_harness_dir(None, Some(&exe_dir)));
         assert_eq!(
             said,
             format!(
                 "no Cerulion harness found. Looked at (1) CERULION_HARNESS_DIR, which is \
-                 unset, (2) '{}', where the release packages install it, and (3) a 'harness' \
-                 folder in '{}' or any directory above it, as in a source checkout. Reinstall \
-                 Cerulion, run this inside a checkout of \
+                 unset, (2) '{}', where the release packages install it, and (3) a Cerulion \
+                 source checkout around the binary, but neither '{}' nor any folder above it \
+                 holds crates/cerulion_cli/Cargo.toml. The current directory is never \
+                 searched. Reinstall Cerulion, run a cerulion built in a checkout of \
                  https://github.com/cerulion-inc/cerulion, or set CERULION_HARNESS_DIR to a \
                  harness folder",
                 exe_dir.join("harness").display(),
-                root.path().display()
+                exe_dir.display()
             )
         );
-        let unread = message(find_harness_dir(None, None, root.path()));
+        let unread = message(find_harness_dir(None, None));
         assert!(
             unread.contains(
-                "(2) beside the cerulion binary (its path could not be read), where the release"
+                "(2) beside the cerulion binary (its path could not be read), where the release \
+                 packages install it, and (3) a Cerulion source checkout around the binary (its \
+                 path could not be read). The current directory is never searched."
             ),
             "{unread}"
         );
     }
 
     #[test]
+    fn a_harness_above_the_binary_without_the_checkout_marker_is_never_taken() {
+        // A binary `cargo install` put in ~/.cargo/bin, with a `harness/`
+        // folder in the home folder above it: no checkout root, no harness.
+        let root = scratch();
+        let home = root.path().join("home");
+        harness_at(&home.join(HARNESS_FOLDER));
+        let exe_dir = home.join(".cargo/bin");
+        std::fs::create_dir_all(&exe_dir).expect("the binary's folder");
+        let said = message(find_harness_dir(None, Some(&exe_dir)));
+        assert!(
+            said.contains(&format!(
+                "(3) a Cerulion source checkout around the binary, but neither '{}' nor any \
+                 folder above it holds crates/cerulion_cli/Cargo.toml.",
+                exe_dir.display()
+            )),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn the_checkout_search_stops_at_the_nearest_root_above_the_binary() {
+        // A checkout inside a folder that is a checkout root too: the nearest
+        // root is the binary's checkout, and its harness, which lacks
+        // install.sh, is named; the outer checkout's harness is never taken.
+        let root = scratch();
+        let outer = root.path();
+        checkout_at(outer);
+        harness_at(&outer.join(HARNESS_FOLDER));
+        let inner = outer.join("work/cerulion");
+        checkout_at(&inner);
+        std::fs::create_dir_all(inner.join(HARNESS_FOLDER)).expect("the inner harness/");
+        std::fs::write(inner.join(HARNESS_FOLDER).join(LAUNCHER), "").expect("rcp.sh alone");
+        let exe_dir = inner.join("target/release");
+        std::fs::create_dir_all(&exe_dir).expect("the binary's folder");
+        assert_eq!(checkout_root(&exe_dir), Some(inner.as_path()));
+        let said = message(find_harness_dir(None, Some(&exe_dir)));
+        assert!(
+            said.contains(&format!(
+                "(3) '{}', the harness folder of the Cerulion source checkout the binary sits \
+                 in, which lacks rcp.sh or install.sh. The current directory is never searched.",
+                inner.join("harness").display()
+            )),
+            "{said}"
+        );
+    }
+
+    #[test]
     fn a_folder_with_one_marker_or_a_marker_that_is_a_folder_holds_no_harness() {
         for only in [LAUNCHER, INSTALL_SCRIPT] {
-            let root = tempfile::tempdir().expect("a tree");
+            let root = scratch();
+            checkout_at(root.path());
             let harness = root.path().join("harness");
             std::fs::create_dir_all(&harness).expect("harness/");
             std::fs::write(harness.join(only), "").expect("one marker");
+            let exe_dir = root.path().join("target/debug");
             assert!(
-                find_harness_dir(None, None, root.path()).is_err(),
+                find_harness_dir(None, Some(&exe_dir)).is_err(),
                 "{only} alone"
             );
         }
-        let root = tempfile::tempdir().expect("a tree");
+        let root = scratch();
+        checkout_at(root.path());
         let harness = root.path().join("harness");
         std::fs::create_dir_all(harness.join(LAUNCHER)).expect("rcp.sh/ as a folder");
         std::fs::create_dir_all(harness.join(INSTALL_SCRIPT)).expect("install.sh/ as a folder");
-        assert!(find_harness_dir(None, None, root.path()).is_err());
+        assert!(find_harness_dir(None, Some(&root.path().join("target/debug"))).is_err());
+        let root = scratch();
+        std::fs::create_dir_all(root.path().join(CHECKOUT_MARKER))
+            .expect("Cargo.toml/ as a folder");
+        harness_at(&root.path().join(HARNESS_FOLDER));
+        let exe_dir = root.path().join("target/debug");
+        assert_eq!(checkout_root(&exe_dir), None, "a marker that is a folder");
+        assert!(find_harness_dir(None, Some(&exe_dir)).is_err());
+    }
+
+    #[test]
+    fn this_repository_is_a_checkout_root_by_its_marker() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        assert!(
+            repo.join(CHECKOUT_MARKER).is_file(),
+            "{CHECKOUT_MARKER} names no file of this repository"
+        );
+        assert!(repo.join(HARNESS_FOLDER).join(LAUNCHER).is_file());
     }
 
     #[test]

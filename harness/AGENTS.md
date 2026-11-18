@@ -5,14 +5,22 @@ and `cerulion rcp bench` run it; the user guide is `docs/harness.md`, the folder
 
 ## Contract with the CLI (`crates/cerulion_cli_engine/src/harness_cmd.rs`)
 - The CLI finds this folder (`CERULION_HARNESS_DIR`, then beside the canonicalized binary, then
-  a checkout) by two marker files, `rcp.sh` and `install.sh`. Renaming either breaks the search.
+  the root of the checkout the binary sits in, proven by `crates/cerulion_cli/Cargo.toml`; never
+  the current directory) by two marker files, `rcp.sh` and `install.sh`. Renaming any of the
+  three breaks the search. A test that runs the built binary without `CERULION_HARNESS_DIR`
+  finds this checkout's own harness: set the variable, or run a link to the binary from outside
+  the checkout (`login_gate_e2e_test` does both).
 - It runs `bash rcp.sh --home DIR [--packaged] sim [--http ADDR] [--task NAME]`, `... bench --model M
   [--base-url URL] [--key-env NAME] [--cell ID] [--out DIR]` or `... verify`, with the terminal
   attached, and exits with the script's code. A flag added on one side is added on the other
   and in `harness/tests/test_rcp_launcher.py`.
 - `rcp.sh` maps them to `install.sh` (`--check` first; the install's stdout goes to stderr),
   `venv/bin/python playground --stdio|--http ADDR [--state NAME]`,
-  `venv/bin/python -m cerulion_harness run-cell ...` and `python -m cerulion_harness.verify`.
+  `venv/bin/python -P -m cerulion_harness run-cell ...` and `python -m cerulion_harness.verify`.
+- The check and the install run in this folder as their own process group with no stdin and
+  `GIT_TERMINAL_PROMPT=0`; the launcher passes a SIGINT, SIGTERM or SIGHUP it gets to that whole
+  group, then exits 128 + the signal's number. Nothing in the directory `cerulion` started in
+  is imported: the install runs here, and `run-cell` runs under `-P`.
 - STDOUT of `sim` is the MCP stream: nothing else may print there, the install included.
 - The install writes inside the folder it runs from; nothing may write into the folder a release
   package installs. `--home DIR` is where the folder is copied once, byte for byte, and run from:

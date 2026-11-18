@@ -92,7 +92,24 @@ fn run_cerulion_at(
     extra_env: &[(&str, &str)],
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    run_binary_at(
+        Path::new(env!("CARGO_BIN_EXE_cerulion")),
+        home,
+        cwd,
+        extra_env,
+        args,
+    )
+}
+
+/// [`run_cerulion_at`] with the `cerulion` binary at `bin`.
+fn run_binary_at(
+    bin: &Path,
+    home: &Path,
+    cwd: &Path,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
         .env_remove("CERULION_LOGIN_GATE")
@@ -715,4 +732,60 @@ fn a_harness_folder_that_does_not_exist_is_named_and_nothing_runs() {
         )),
         "stderr={stderr}"
     );
+}
+
+#[test]
+fn a_harness_in_the_directory_cerulion_runs_in_never_runs() {
+    // A downloaded folder dressed as a Cerulion checkout (the checkout marker
+    // and a `harness/` with both file names) whose launcher records that it
+    // ran. Every form run inside it, signed in, with CERULION_HARNESS_DIR
+    // unset, runs nothing from it. The binary runs from a hard link (a copy
+    // where the file system refuses one) outside any checkout, so the folder
+    // beside it and the checkout it sits in hold no harness either.
+    let bin_dir = tempfile::tempdir().unwrap();
+    let bin_dir_real = std::fs::canonicalize(bin_dir.path()).unwrap();
+    assert_eq!(
+        cerulion_cli_engine::harness_cmd::checkout_root(&bin_dir_real),
+        None,
+        "the temporary folder sits inside a Cerulion checkout; set TMPDIR outside it"
+    );
+    let bin = bin_dir.path().join("cerulion");
+    let built = env!("CARGO_BIN_EXE_cerulion");
+    if std::fs::hard_link(built, &bin).is_err() {
+        std::fs::copy(built, &bin).unwrap();
+    }
+    let download = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(download.path().join("crates/cerulion_cli")).unwrap();
+    std::fs::write(download.path().join("crates/cerulion_cli/Cargo.toml"), "").unwrap();
+    let harness = download.path().join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    recording_harness(&harness);
+    let cwd = download.path().join("docs");
+    std::fs::create_dir_all(&cwd).unwrap();
+    for args in HARNESS_FORMS {
+        let home = tempfile::tempdir().unwrap();
+        auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
+        let (code, stdout, stderr) = run_binary_at(
+            &bin,
+            home.path(),
+            &cwd,
+            &[("CERULION_NETWORK", "off"), ("CERULION_HARNESS_DIR", "")],
+            args,
+        );
+        assert!(
+            !harness.join("ran.txt").exists(),
+            "{args:?}: the downloaded folder's launcher ran; stderr={stderr}"
+        );
+        assert_eq!(code, Some(1), "{args:?}: stderr={stderr}");
+        assert!(stdout.is_empty(), "{args:?}: stdout={stdout}");
+        assert!(
+            stderr.contains(&format!(
+                "(3) a Cerulion source checkout around the binary, but neither '{}' nor any \
+                 folder above it holds crates/cerulion_cli/Cargo.toml. The current directory is \
+                 never searched.",
+                bin_dir_real.display()
+            )),
+            "{args:?}: stderr={stderr}"
+        );
+    }
 }

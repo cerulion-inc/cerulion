@@ -62,8 +62,9 @@ cerulion rcp bench --model YOUR_MODEL
 The first `cerulion rcp --sim` or `cerulion rcp bench` installs, once: the simulator's Python environment, the
 LIBERO and LIBERO-PRO benchmark trees at their pinned revisions with every pinned data file checked against its
 SHA-256, and the episode server's Python environment. Its progress goes to stderr, so over stdio the MCP stream
-on stdout stays clean. A later run checks the install and starts in seconds. An install that stops (a lost
-connection, Ctrl+C) resumes where it stopped the next time you run the command.
+on stdout stays clean. A later run checks the install and starts in seconds. Ctrl+C, or a SIGTERM or SIGHUP
+sent to `cerulion`, stops the install and the programs it runs, and `cerulion` exits 130. An install that
+stops (a lost connection, Ctrl+C) resumes where it stopped the next time you run the command.
 
 The install also makes sure the simulated robot has a calibration record for this machine. Linux on x86-64
 finds the shipped one. On another platform the robot measures itself once, about a minute, and stores the
@@ -134,9 +135,13 @@ The harness is the `harness/` folder of the Cerulion repository (see [harness/RE
    harness, is an error; the search never falls through to the places below.
 2. `harness/` beside the `cerulion` binary, where the release packages install it. A link to `cerulion` in a
    `bin` directory still reaches the folder beside the real binary.
-3. `harness/` in the current directory or the nearest directory above it, as in a source checkout.
+3. `harness/` at the root of the Cerulion source checkout the `cerulion` binary sits in: the nearest folder above
+   the binary that holds `crates/cerulion_cli/Cargo.toml`. So a `cerulion` that `cargo run` or `cargo build` made
+   in a checkout finds that checkout's harness; one built into a target folder outside the checkout
+   (`CARGO_TARGET_DIR`) does not, and needs `CERULION_HARNESS_DIR`.
 
-When none holds a harness, the error names all three places.
+The current directory is never searched, so a folder you run `cerulion` in, such as a repository you downloaded,
+cannot supply a harness. When none of the three holds a harness, the error names where it looked.
 
 The install writes inside the folder the harness runs from. Nothing writes into the folder the release packages
 install, even when your user can write there: the first run copies it once, byte for byte, to `harness/<version>`

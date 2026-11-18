@@ -14,8 +14,9 @@ cerulion rcp bench --verify                      # the code here is the code the
 
 The release packages install this folder beside the `cerulion` binary, and nothing writes into it there: the
 first run copies it once to `harness/<version>` under the Cerulion config directory and runs from the copy. In a
-source checkout, run the same commands anywhere inside the checkout, or point `CERULION_HARNESS_DIR` at this
-folder; both run it in place while your user can write to it.
+source checkout, a `cerulion` built there (`cargo run -p cerulion_cli -- rcp --sim`, or `target/debug/cerulion`)
+finds this folder from any directory; for any other `cerulion`, point `CERULION_HARNESS_DIR` at it. Both run it
+in place while your user can write to it. The current directory is never searched for a harness.
 
 ## What is in it
 
