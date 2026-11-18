@@ -653,6 +653,23 @@ future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
 
+## Cargo timing reports and runner hardware
+
+Every `ci.yml` job that compiles with cargo commands written in the workflow passes
+`--timings` to each cargo build, check, clippy, doc and test command (the `cerulion_core`
+shards through `CI_TEST_SHARD_EXTRA`), prints the runner's architecture, CPU model, core
+count and memory right after checkout, and uploads one artifact per job and matrix leg named
+`cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7 days. It holds
+`runner.txt` (the hardware lines) and one `cargo-timing-<time>.html` report per cargo
+command, under the path of the target directory it came from (`target/cargo-timings/`,
+`examples/go2/target/cargo-timings/`). Download it from the run's summary page or with
+`gh run download <run id> --pattern 'cargo-timings-*'`. The collect and upload steps run
+under `always()`, so a red or timed-out job still uploads; the collect step moves the reports
+out of the job's target directories before any cache save, so no cache archive carries one;
+and only the upload carries `continue-on-error: true`. `deb-smoke` and
+`stable-node-compiler-skew` build inside scripts and `fuzz` and `miri` through cargo plugins,
+so those four carry none of these steps.
+
 ## Scheduled workflows
 
 Five workflows run on a clock, and none of them reports a required status context.
