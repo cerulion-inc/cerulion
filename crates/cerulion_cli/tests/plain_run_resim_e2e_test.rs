@@ -2646,6 +2646,24 @@ fn live_run_manifest(home: &Path) -> serde_json::Value {
     serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("{} is JSON: {e}", path.display()))
 }
 
+/// [`live_run_manifest`], once it carries `key`.
+///
+/// A run logs its window-recorder decision and then amends `run.json` with it,
+/// so a read right after the log line can land before the amendment. Each
+/// amendment is an atomic rename, so this re-reads the manifest until `key` is
+/// there or [`READY_DEADLINE`] passes, and returns the last read either way:
+/// the caller's assertion names a manifest that never gained the key.
+fn live_run_manifest_with(home: &Path, key: &str) -> serde_json::Value {
+    let start = Instant::now();
+    loop {
+        let manifest = live_run_manifest(home);
+        if manifest.get(key).is_some() || start.elapsed() >= READY_DEADLINE {
+            return manifest;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// **The declined-plane refusal, arm 5 — the RUN's half:** a real `graph run` writes its
 /// window-recorder decision into `run.json`, so a later attach can read it.
 ///
@@ -2686,7 +2704,7 @@ fn a_run_writes_its_window_recorder_decision_into_run_json() {
         log.contains(r#"window="own_recorder""#),
         "this arm needs a run that really started its window recorder:\n{log}"
     );
-    let manifest = live_run_manifest(&home);
+    let manifest = live_run_manifest_with(&home, "state_ring_consumer");
     let standing = manifest["state_ring_consumer"].as_str().unwrap_or_else(|| {
         panic!(
             "a run must record its window-recorder decision where a later attach can read it \
@@ -2725,7 +2743,7 @@ fn a_run_writes_its_window_recorder_decision_into_run_json() {
         log_off.contains(r#"window="switched_off""#),
         "this half needs the kill switch to have really taken the recorder off:\n{log_off}"
     );
-    let manifest_off = live_run_manifest(&home_off);
+    let manifest_off = live_run_manifest_with(&home_off, "state_ring_consumer");
     let none = manifest_off["state_ring_consumer"]
         .as_str()
         .unwrap_or_else(|| panic!("the switched-off run states its decision too: {manifest_off}"));
