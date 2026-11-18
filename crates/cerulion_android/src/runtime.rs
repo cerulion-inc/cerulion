@@ -1709,6 +1709,9 @@ fn build_into(
             plan.recorded_graph_topics.as_ref(),
         )
         .map_err(|error| EmbedError::Graph(error.to_string()))?;
+        // This process owns the run: it reports what its one build left out
+        // of the nodes' environment.
+        graph_runtime.node_env_left_out().warn();
         // The trace keeps the newest fires up to `graph run`'s default
         // `--trace-limit`, so the trace of a graph that runs for days stops
         // growing.
