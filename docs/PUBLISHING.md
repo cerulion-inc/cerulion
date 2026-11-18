@@ -153,11 +153,15 @@ Run from the workspace root, in order:
 - [ ] The shipped programs: every release archive, the Debian package and the
       Homebrew formula carry `cerulion`, `cerulion-netd`, `cerulion-connectd`
       and `cerulion-remoted`, and from 2.1.0 the agent harness tree `harness/`
-      beside them, copied from the tagged tree. `./tools/scripts/install.sh --self-test`,
-      `./tools/scripts/test_render_homebrew_formula.sh` and, on Linux,
-      `./tools/scripts/test_build_deb.sh` check the three lists; the install
+      beside them, staged from the tagged tree by `tools/scripts/stage_harness.sh`,
+      which leaves out its development files (its tests, ignore files and
+      coding-agent instruction files) and removes group and other write. `./tools/scripts/install.sh --self-test`,
+      `./tools/scripts/test_render_homebrew_formula.sh`,
+      `./tools/scripts/stage_harness.sh --self-test` and, on Linux,
+      `./tools/scripts/test_build_deb.sh` check the lists; the install
       smoke of `release-artifacts.yml` checks the installed release, the
-      harness tree byte for byte against the tag's.
+      harness tree byte for byte against what the tag's script stages, and
+      that the installed CLI verifies the harness beside it.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
       access for all twenty-two publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up

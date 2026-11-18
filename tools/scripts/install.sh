@@ -2450,7 +2450,7 @@ EOF
         done
         printf '%s\n' 'license' > "$harness_stage/LICENSE"
         case "$1" in
-            first|second|link|nested)
+            first|second|link|nested|loose)
                 mkdir -p "$harness_stage/harness/sim"
                 printf '%s\n' "$1 readme" > "$harness_stage/harness/README.md"
                 printf '%s\n' '#!/bin/sh' > "$harness_stage/harness/sim/run.sh"
@@ -2474,6 +2474,13 @@ EOF
 [ -z "${CERULION_SELF_TEST_RUST_SENTINEL:-}" ] || : > "$CERULION_SELF_TEST_RUST_SENTINEL"
 exit 0
 RUST_EOF
+        fi
+        if [ "$1" = loose ]; then
+            # A tree any user could write, as an archive made under umask 000
+            # carries it.
+            chmod 0777 "$harness_stage/harness" "$harness_stage/harness/sim" \
+                "$harness_stage/harness/sim/run.sh"
+            chmod 0666 "$harness_stage/harness/README.md"
         fi
         if [ "$1" = nested ]; then
             # The archive's own tree holds a harness/ entry, which no
@@ -2540,7 +2547,7 @@ RUST_EOF
         fi
         harness_assert_clean "$2" "$3"
     }
-    for harness_shape in first second none link file toplink nested; do
+    for harness_shape in first second none link file toplink nested loose; do
         harness_archive "$harness_shape"
     done
 
@@ -2574,6 +2581,39 @@ RUST_EOF
         die "self-test: an archive tree holding harness/harness was refused: $(cat "$harness_root/nested-error")"
     [ "$(cat "$harness_root/nested-install/harness/harness/inner.txt")" = inner ] ||
         die "self-test: an archive tree holding harness/harness lost its inner tree"
+
+    # Under umask 000, from an archive whose tree any user could write, the
+    # installed tree and the directory the install creates carry no group or
+    # other write: `cerulion rcp` takes the harness beside the CLI only when no
+    # user but its owner can write either. The extracted archive is the
+    # control that the fixture is that loose.
+    harness_loose_control="$harness_root/loose-control"
+    mkdir -p "$harness_loose_control"
+    (umask 000 && tar -xzf "$harness_root/fixture-loose/v0.1.0/$signal_archive_name" \
+        -C "$harness_loose_control")
+    [ -n "$(find "$harness_loose_control" -perm -0002 -print)" ] ||
+        die "self-test: the loose harness fixture extracts with no entry others can write"
+    harness_loose_dir="$harness_root/loose-install"
+    (umask 000 && harness_install loose "$harness_loose_dir" loose) ||
+        die "self-test: the install of a loose harness tree failed: $(cat "$harness_root/loose-error")"
+    if [ -n "$(find "$harness_loose_dir" -prune \( -perm -0020 -o -perm -0002 \) -print)" ]; then
+        die "self-test: the install directory created under umask 000 is writable by group or others"
+    fi
+    harness_loose_writable=$(find "$harness_loose_dir/harness" \( -perm -0020 -o -perm -0002 \) -print)
+    [ -z "$harness_loose_writable" ] ||
+        die "self-test: group or others can write the installed $harness_loose_writable"
+    [ -x "$harness_loose_dir/harness/sim/run.sh" ] ||
+        die "self-test: the loose harness install dropped an executable bit"
+    # An install directory others can already write is left as it is and named.
+    harness_open_dir="$harness_root/open-install"
+    mkdir -p "$harness_open_dir"
+    chmod 0777 "$harness_open_dir"
+    harness_install first "$harness_open_dir" open ||
+        die "self-test: the install into a directory others can write failed: $(cat "$harness_root/open-error")"
+    grep -Fq "other users can write $harness_open_dir, so cerulion rcp will not use the harness installed there" \
+        "$harness_root/open-error" ||
+        die "self-test: the install did not name a directory others can write: $(cat "$harness_root/open-error")"
+    chmod 0755 "$harness_open_dir"
 
     # The move of the staged tree fails, before it moves and after it, and a
     # TERM arrives just after it: each rolls the binaries and the previous
@@ -4198,7 +4238,22 @@ else
     printf '%s\n' 'warning: this older release archive does not include automatic Rust/Cargo setup' >&2
 fi
 
+# `cerulion rcp` takes the harness beside the CLI only when no user but its
+# owner can write the CLI's directory or the harness, so a directory this run
+# creates gets no group or other write whatever the umask, and one that others
+# can already write is named.
+install_dir_existed=0
+if [ -d "$install_dir" ]; then
+    install_dir_existed=1
+fi
 mkdir -p "$install_dir"
+if [ "$install_dir_existed" -eq 0 ]; then
+    chmod go-w "$install_dir" ||
+        die "could not set the mode of $install_dir"
+elif [ "$archive_harness" -eq 1 ] && [ -n "$(find "$install_dir" -prune -perm -0002 -print 2>/dev/null)" ]; then
+    printf 'warning: other users can write %s, so cerulion rcp will not use the harness installed there\n' \
+        "$install_dir" >&2
+fi
 lock_path="$install_dir/.cerulion-install.lock"
 lock_temp_path=
 lock_claim_identity=
@@ -4521,6 +4576,9 @@ done
 if [ "$archive_harness" -eq 1 ]; then
     run_foreground cp -R "$archive_dir/harness" "$transaction_dir/staged/harness" ||
         die "could not stage harness"
+    # No group or other write, whatever the umask and the archive's modes.
+    chmod -R go-w "$transaction_dir/staged/harness" ||
+        die "could not set the modes of the staged harness"
 fi
 # An archive without cerulion-remoted removes the one a later release left in
 # the install directory, so the directory holds the programs of one release.

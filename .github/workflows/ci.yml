@@ -433,8 +433,8 @@ jobs:
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
           # build_deb.sh refuses an archive without the agent harness, which
-          # the release archive copies from the tree too.
-          cp -R harness "$stage/harness"
+          # the release archive stages from the tree with the same script.
+          tools/scripts/stage_harness.sh harness "$stage/harness"
           chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
           deb=$(tools/scripts/build_deb.sh "$archive" amd64 "$RUNNER_TEMP/debs")
@@ -764,6 +764,11 @@ jobs:
           fi
           ruby --version
           ./tools/scripts/test_render_homebrew_formula.sh
+
+      # Every release package ships the harness that stage_harness.sh stages,
+      # so the paths it leaves out and the modes it sets are checked here.
+      - name: Harness staging self-test
+        run: ./tools/scripts/stage_harness.sh --self-test
 
       - name: Crates.io wait guard self-test
         run: ./tools/scripts/test_wait_for_crates_io.sh

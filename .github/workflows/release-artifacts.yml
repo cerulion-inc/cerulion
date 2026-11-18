@@ -308,10 +308,11 @@ jobs:
           chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           # The agent harness ships beside the binaries on every target: the
           # CLI resolves `harness/` in its own directory, the sibling rule the
-          # rmw library and cerulion-connectd follow. The copy is the tagged
+          # rmw library and cerulion-connectd follow. The source is the tagged
           # commit's tree exactly (no untracked, ignored or changed file), and
-          # holds regular files and directories only, the one shape
-          # build_deb.sh and install.sh accept.
+          # stage_harness.sh copies it without its development files, refuses
+          # any entry that is not a regular file or directory, and removes
+          # group and other write.
           if [ ! -d harness ] || [ -L harness ]; then
             echo "::error::the tagged tree has no harness/ directory to ship beside the CLI"
             exit 1
@@ -322,13 +323,7 @@ jobs:
             printf '%s\n' "$stray"
             exit 1
           fi
-          odd=$(find harness ! -type f ! -type d -print)
-          if [ -n "$odd" ]; then
-            echo "::error::harness/ holds entries that are not regular files or directories:"
-            printf '%s\n' "$odd"
-            exit 1
-          fi
-          cp -R harness "$stage/harness"
+          tools/scripts/stage_harness.sh harness "$stage/harness"
           case "$TARGET" in
             *-unknown-linux-gnu)
               rmw="$RUNNER_TEMP/rmw/librmw_cerulion.so"
@@ -761,21 +756,38 @@ jobs:
             done
           fi
           # Every archive of a tag whose tree holds harness/ carries it, and
-          # the installer places it beside the CLI byte for byte. A tag cut
-          # before harness/ existed carries none.
+          # the installer places it beside the CLI byte for byte: the tree the
+          # tag's stage_harness.sh stages from it. A tag cut before harness/
+          # existed carries none.
           if [ -d source-checkout/harness ]; then
             if [ ! -d "$RUNNER_TEMP/cerulion-bin/harness" ] || [ -L "$RUNNER_TEMP/cerulion-bin/harness" ]; then
               echo "::error::the installer did not place harness/ beside the CLI"
               exit 1
             fi
-            diff -r source-checkout/harness "$RUNNER_TEMP/cerulion-bin/harness" ||
-              { echo "::error::the installed harness/ differs from the tagged tree's"; exit 1; }
+            want="$RUNNER_TEMP/harness-want"
+            source-checkout/tools/scripts/stage_harness.sh source-checkout/harness "$want"
+            diff -r "$want" "$RUNNER_TEMP/cerulion-bin/harness" ||
+              { echo "::error::the installed harness/ differs from the tag's staged harness"; exit 1; }
             # diff compares bytes only; the executable files must match too.
-            (cd source-checkout/harness && find . -type f -perm -0100 | LC_ALL=C sort) > "$RUNNER_TEMP/harness-exec.want"
+            (cd "$want" && find . -type f -perm -0100 | LC_ALL=C sort) > "$RUNNER_TEMP/harness-exec.want"
             (cd "$RUNNER_TEMP/cerulion-bin/harness" && find . -type f -perm -0100 | LC_ALL=C sort) > "$RUNNER_TEMP/harness-exec.got"
             diff "$RUNNER_TEMP/harness-exec.want" "$RUNNER_TEMP/harness-exec.got" ||
-              { echo "::error::the installed harness/ marks other files executable than the tagged tree"; exit 1; }
+              { echo "::error::the installed harness/ marks other files executable than the tag's staged harness"; exit 1; }
           fi
+
+      # The installed harness is the one the benchmark measured. With no
+      # CERULION_HARNESS_DIR and no source checkout around the install
+      # directory, `cerulion rcp bench --verify` can only find the harness
+      # beside the installed CLI; it hashes the measured code there against
+      # the harness's provenance manifests, installs nothing and needs only
+      # python3. A tag cut before harness/ existed has nothing to verify.
+      - name: Verify the installed harness
+        run: |
+          if [ ! -d source-checkout/harness ]; then
+            echo "$TAG predates the harness; nothing to verify"
+            exit 0
+          fi
+          env -u CERULION_HARNESS_DIR "$RUNNER_TEMP/cerulion-bin/cerulion" rcp bench --verify
 
       # release.yml publishes on the SAME tag push and verifies all 20 crates
       # before uploading — measured 30 min on a cold hosted runner — so the
