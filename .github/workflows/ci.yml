@@ -2874,9 +2874,9 @@ jobs:
                ! -name 'build_script_build*' -delete || true
           df -h / || true
 
-      # BUILD ONCE. Each package step below used to be its own `cargo test -p`,
-      # and every one re-resolved features and rebuilt the crates the shard's
-      # packages share. This step compiles them in ONE cargo invocation; each
+      # BUILD ONCE. A `cargo test -p` per package resolves features for that
+      # package alone and so rebuilds the crates the shard's packages share.
+      # This step compiles them in ONE cargo invocation; each
       # step then runs its prebuilt binaries through `ci_built_tests.py run`,
       # one process per binary, with the arguments, environment, working
       # directory, order and fail-fast rule `cargo test` gives them. A package
@@ -2895,6 +2895,7 @@ jobs:
             2) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_heaphook cerulion_macros test_node_macro_cdylib +cerulion_cli_engine cerulion_android cerulion_discovery cerulion_msgio ;;
             3) python3 -B tools/scripts/ci_built_tests.py build --group packages rmw_cerulion native_ros2_messages cerulion_bag cerulion_wireclient cerulion_connectd cerulion_netd --features cerulion_netd/wan ;;
           esac
+          df -h / || true
 
       # ---------------------------------------------------------------
       # THE NON-CORE PACKAGES, one shard each.
@@ -3370,18 +3371,21 @@ jobs:
       # The packages' doctests, over the same package set as the build, so they
       # link the libraries it compiled. Then the audit: every built binary ran,
       # the shard built at least its floor of test binaries when the selection
-      # kept every package (the count a full run builds today), and nothing
+      # kept every package (the count a full run builds), and nothing
       # compiled outside a declared build step.
       - name: Doctests of this shard's packages
         run: python3 -B tools/scripts/ci_built_tests.py doctests
-      # `mdns_beacon_test` builds with its package and no step runs it: its one
-      # arm is `#[ignore]`d (it needs real multicast), and no step ran it before.
+      # Three `cerulion_android` binaries build with their package and no step
+      # here runs them: `mdns_beacon_test`'s one arm is `#[ignore]`d (it needs
+      # real multicast), `embedded_remote_plane_test` runs in `local-transport`
+      # and `jni_java_test` in `android-check`.
       - name: Every built test binary ran and nothing rebuilt
         run: |
           case "${{ matrix.shard }}" in
             0) set -- --floor 27 ;;
             1) set -- --floor 67 ;;
-            2) set -- --floor 121 --not-run cerulion_android:mdns_beacon_test ;;
+            2) set -- --floor 121 --not-run cerulion_android:mdns_beacon_test \
+                 --not-run cerulion_android:embedded_remote_plane_test --not-run cerulion_android:jni_java_test ;;
             3) set -- --floor 114 ;;
           esac
           python3 -B tools/scripts/ci_built_tests.py audit "$@"

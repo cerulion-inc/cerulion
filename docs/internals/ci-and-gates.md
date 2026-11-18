@@ -571,10 +571,13 @@ unchanged. A Lint step runs `check-workflow .github/workflows/ci.yml`.
 
 * **Groups.** One unified build changes some packages' features: a package's tests link a
   shared crate with the union of what every package of the group enables. The unions in
-  these legs are additive or inert seams (`test-helpers`, `test-seams`, `live` on
-  `cerulion_dds`, `wan` on `cerulion_netd` (library side), a second rustls provider beside
-  the ring one every client installs). The one that switches behavior is `cerulion_viz`'s
-  `decoder-from-source`, so `cerulion_vizd` builds in a group of its own on macOS shard 2.
+  these legs are additive APIs or test seams that stay inert until a test arms them: among
+  them `test-helpers` and `test-seams`, `jazzy` and `live` on `cerulion_dds`, `default` and
+  `wan` on `cerulion_netd`'s library (macOS shard 1 links it into the `cerulion_cli_engine`,
+  `cerulion_cli_tui` and `cerulion_connectd` tests), `test-util` on tokio, and a second
+  rustls provider beside the ring one every client installs. The one that switches
+  behavior is `cerulion_viz`'s `decoder-from-source`, so `cerulion_vizd` builds in a group
+  of its own on macOS shard 2.
 * **Doctests here.** No package of these legs carries an executing doctest that a missing
   `--test-threads=1` would change: their examples are `text` or `ignore` blocks, or the
   `rust` blocks of `native_ros2_messages`, which ran unflagged before.
