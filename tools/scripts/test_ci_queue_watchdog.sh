@@ -5,7 +5,10 @@
 # and answers `gh api <path>` from a per-case answer directory: the answer to
 # the Nth call of a method, path and fields is the file `<key>.<N>` when it
 # exists, else `<key>`, and an answer starting `FAIL:` is an error on stderr
-# with exit 1. A `-f` or `-F` field is part of the key, except `query=`, which
+# with exit 1; one starting `BODYFAIL:` prints the rest on stdout, as `gh`
+# prints a GraphQL error body, and exits 1. Past 2000 calls every call fails,
+# so a read loop that never ends fails its case instead of hanging it. A `-f`
+# or `-F` field is part of the key, except `query=`, which
 # the shim records as `query=<query>` and writes to the case's `query` file; a
 # call with a field and no `-X` is a POST, as `gh api` sends it.
 # `sleep` returns at once, records its argument, and ends the script past 500
@@ -15,7 +18,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=38
+CASES_EXPECTED=42
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-watchdog-test.XXXXXX")
@@ -58,6 +61,10 @@ for a in "$@"; do
     line="${line:+$line }$a"
 done
 printf '%s\n' "$line" >> "$FAKE_GH_CALLS"
+if [ "$(grep -c . "$FAKE_GH_CALLS")" -gt 2000 ]; then
+    printf 'fake gh: more than 2000 calls\n' >&2
+    exit 98
+fi
 [ "$1" = api ] || { printf 'fake gh: unexpected invocation: %s\n' "$*" >&2; exit 99; }
 shift
 method=
@@ -91,6 +98,11 @@ if [ ! -f "$answer" ]; then
 fi
 if [ "$(head -c 5 "$answer")" = FAIL: ]; then
     cat "$answer" >&2
+    exit 1
+fi
+if [ "$(head -c 9 "$answer")" = BODYFAIL: ]; then
+    tail -c +10 "$answer"
+    printf 'gh: the answer carries errors\n' >&2
     exit 1
 fi
 cat "$answer"
@@ -572,6 +584,9 @@ run_json completed '"success"' | answer GET "$RUN"
 run_case
 expect_status 0
 expect_output 'run 555 completed (success); nothing to cancel'
+expect_output "commit $SHA is a live entry of the main merge queue; it is read every poll"
+[ "$(grep -Fc 'is a live entry of the main merge queue' <<< "$output")" -eq 1 ] ||
+    fail "$case_name: the live entry is said more than once"
 expect_calls "api $LIST" "api $JOBS" "$QUEUE_CALL" "api $JOBS" "$QUEUE_CALL" "api $JOBS" "api $RUN"
 expect_cancels 0
 expect_sleeps 60 60
@@ -600,6 +615,25 @@ expect_calls "api $LIST" "api $JOBS" "$QUEUE_CALL" "api $COMPARE" "api $JOBS" "$
 expect_cancels 0
 expect_sleeps 60 60
 ok 'a batch dead on one poll and live on the next is not cancelled'
+
+# Dead, live, dead: the live poll starts the count again, so the second dead
+# poll is the first of a new count and nothing is cancelled.
+new_case dead_live_dead
+queue_page false MQ "$OTHER" | answer POST "$QUEUE" 1
+queue_page false MQ "$OTHER" | answer POST "$QUEUE" 3
+compare_json ahead | answer GET "$COMPARE"
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 2
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 3
+jobs 'Lint|completed|success' | answer GET "$JOBS"
+run_json completed '"success"' | answer GET "$RUN"
+run_case
+expect_status 0
+expect_calls "api $LIST" "api $JOBS" "$QUEUE_CALL" "api $COMPARE" "api $JOBS" "$QUEUE_CALL" \
+    "api $JOBS" "$QUEUE_CALL" "api $COMPARE" "api $JOBS" "api $RUN"
+expect_cancels 0
+expect_sleeps 60 60 60
+ok 'dead, live, dead cancels nothing'
 
 # Dead on two polls in a row, the second after main moved on: cancel once,
 # naming the commit, and exit 0.
@@ -659,7 +693,7 @@ ok 'a batch in main is never cancelled'
 # The queue read fails on every poll: retried, said, and nothing is cancelled
 # however many polls it lasts.
 new_case queue_read_fails
-printf 'FAIL: GraphQL: Resource not accessible by integration\n' | answer POST "$QUEUE"
+printf 'FAIL: gh: Something went wrong while executing your query. This may be the result of a timeout\n' | answer POST "$QUEUE"
 compare_json ahead | answer GET "$COMPARE"
 jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
 jobs 'Lint|in_progress|null' | answer GET "$JOBS" 2
@@ -668,7 +702,7 @@ jobs 'Lint|completed|success' | answer GET "$JOBS"
 run_json completed '"success"' | answer GET "$RUN"
 run_case
 expect_status 0
-expect_output 'the main merge queue read failed three times; this poll decides nothing: FAIL: GraphQL: Resource not accessible by integration'
+expect_output 'the main merge queue read failed three times; this poll decides nothing: FAIL: gh: Something went wrong'
 expect_queue_reads 9
 expect_compares 0
 expect_cancels 0
@@ -712,6 +746,57 @@ expect_cancels 0
 expect_sleeps 10 10 60 10 10 60
 ok 'a compare that keeps failing cancels nothing'
 
+# The job token is refused the queue read: not retried, said once, the queue
+# not read again, and a failed required job still cancels the run.
+new_case queue_read_refused
+printf 'FAIL: gh: Resource not accessible by integration\n' | answer POST "$QUEUE"
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 2
+jobs 'Lint|completed|failure' | answer GET "$JOBS"
+: | answer POST "$CANCEL"
+run_case
+expect_status 0
+expect_output 'the job token may not read the main merge queue: FAIL: gh: Resource not accessible by integration'
+expect_output 'the queue is not read again in this run and nothing is cancelled for it; a failed required job still cancels run 555'
+expect_output 'required job "Lint" ended failure; cancelling run 555'
+expect_calls "api $LIST" "api $JOBS" "$QUEUE_CALL" "api $JOBS" "api $JOBS" "api -X POST $CANCEL"
+expect_sleeps 60 60
+ok 'a queue read refused to the job token turns the dead check off'
+
+# A GraphQL error body of type FORBIDDEN is a refusal too; one of another
+# type is retried as a failed read.
+new_case queue_read_forbidden_body
+printf 'BODYFAIL:{"data":{"repository":{"mergeQueue":null}},"errors":[{"type": "FORBIDDEN","message":"no"}]}\n' |
+    answer POST "$QUEUE" 2
+printf 'BODYFAIL:{"errors":[{"type":"RATE_LIMITED","message":"API rate limit exceeded"}]}\n' | answer POST "$QUEUE" 1
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 2
+jobs 'Lint|completed|success' | answer GET "$JOBS"
+run_json completed '"success"' | answer GET "$RUN"
+run_case
+expect_status 0
+expect_output 'the job token may not read the main merge queue: gh: the answer carries errors'
+expect_queue_reads 2
+expect_cancels 0
+expect_sleeps 10 60 60
+ok 'a FORBIDDEN error body is a refusal and a rate limit is not'
+
+# The job token is refused the compare: not retried, and the check turns off.
+new_case compare_refused
+queue_page false MQ "$OTHER" | answer POST "$QUEUE"
+printf 'FAIL: gh: Resource not accessible by integration (HTTP 403)\n' | answer GET "$COMPARE"
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 2
+jobs 'Lint|completed|success' | answer GET "$JOBS"
+run_json completed '"success"' | answer GET "$RUN"
+run_case
+expect_status 0
+expect_output "the job token may not compare main with $SHA: FAIL: gh: Resource not accessible by integration (HTTP 403)"
+expect_calls "api $LIST" "api $JOBS" "$QUEUE_CALL" "api $COMPARE" "api $JOBS" "api $JOBS" "api $RUN"
+expect_cancels 0
+expect_sleeps 60 60
+ok 'a compare refused to the job token turns the dead check off'
+
 # The entry is on the second page: the first page's cursor reads it, and the
 # compare is never asked.
 new_case entry_on_page_two
@@ -743,7 +828,8 @@ ok 'a commit on no page of the queue reads as dead'
 
 # Answers missing a field the decision reads decide nothing: no merge queue,
 # an entry with no head commit field, a page with no flag, a next page with
-# no cursor, a body that is not JSON.
+# no cursor, a head commit with no oid, an oid that is not a string, a body
+# that is not JSON.
 new_case queue_answer_malformed
 printf '{"data":{"repository":{"mergeQueue":null}}}\n' | answer POST "$QUEUE" 1
 printf '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":false},"nodes":[{}]}}}}}\n' |
@@ -751,27 +837,31 @@ printf '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage
 printf '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{},"nodes":[]}}}}}\n' | answer POST "$QUEUE" 3
 printf '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[]}}}}}\n' |
     answer POST "$QUEUE" 4
+printf '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":false},"nodes":[{"headCommit":{}}]}}}}}\n' |
+    answer POST "$QUEUE" 5
+printf '{"data":{"repository":{"mergeQueue":{"entries":{"pageInfo":{"hasNextPage":false},"nodes":[{"headCommit":{"oid":1}}]}}}}}\n' |
+    answer POST "$QUEUE" 6
 printf 'not json\n' | answer POST "$QUEUE"
 compare_json ahead | answer GET "$COMPARE"
-jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
-jobs 'Lint|in_progress|null' | answer GET "$JOBS" 2
-jobs 'Lint|in_progress|null' | answer GET "$JOBS" 3
-jobs 'Lint|in_progress|null' | answer GET "$JOBS" 4
-jobs 'Lint|in_progress|null' | answer GET "$JOBS" 5
+for n in 1 2 3 4 5 6 7; do
+    jobs 'Lint|in_progress|null' | answer GET "$JOBS" "$n"
+done
 jobs 'Lint|completed|success' | answer GET "$JOBS"
 run_json completed '"success"' | answer GET "$RUN"
 run_case
 expect_status 0
 expect_output 'the main merge queue answer carries no entry list, head commit, page flag or cursor; this poll decides nothing'
-[ "$(grep -Fc 'this poll decides nothing' <<< "$output")" -eq 5 ] || fail "$case_name: expected five polls that decide nothing"
-expect_queue_reads 5
+[ "$(grep -Fc 'this poll decides nothing' <<< "$output")" -eq 7 ] || fail "$case_name: expected seven polls that decide nothing"
+expect_queue_reads 7
 expect_compares 0
 expect_cancels 0
 ok 'a queue answer missing a field decides nothing'
 
-# A compare with a status the watch does not know decides nothing.
+# A compare with a status the watch does not know, or a body that is not
+# JSON, decides nothing.
 new_case compare_status_unknown
 queue_page false MQ "$OTHER" | answer POST "$QUEUE"
+printf '<html>unicorn</html>\n' | answer GET "$COMPARE" 1
 printf '{"message":"Not Found","status":"404"}\n' | answer GET "$COMPARE"
 jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
 jobs 'Lint|in_progress|null' | answer GET "$JOBS" 2
@@ -782,7 +872,9 @@ expect_status 0
 expect_output "the compare of main with $SHA carries no known status; this poll decides nothing"
 expect_compares 2
 expect_cancels 0
-ok 'a compare with an unknown status decides nothing'
+[ "$(grep -Fc 'carries no known status; this poll decides nothing' <<< "$output")" -eq 2 ] ||
+    fail "$case_name: expected two polls that decide nothing"
+ok 'a compare with an unknown status or a body that is not JSON decides nothing'
 
 # A queue whose pages never end is read ten pages deep, then decides nothing.
 new_case endless_pages

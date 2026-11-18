@@ -34,13 +34,18 @@
 # separate reads, so a batch that moves or merges between them can read as dead
 # once. A read that fails three times, and an answer missing a field the
 # decision reads, decide nothing for that poll and start the count of dead
-# polls again, so no run of failed reads becomes a cancel.
+# polls again, so no run of failed reads becomes a cancel. A queue or compare
+# answer refusing the job token (`Resource not accessible`, or a GraphQL error
+# of type FORBIDDEN or INSUFFICIENT_SCOPES) is not retried: it is said once,
+# the queue is not read again in that run, and nothing is cancelled for it,
+# while a failed required job still cancels the run. The first queue read
+# that finds the commit says so once, so the log shows the read works.
 #
-# Each poll is one jobs read and one queue read, plus the run read once no job
-# is left running and the compare while the commit is no entry's head commit.
-# The REST reads come out of the job token's hourly request budget that every
-# job of this repository shares; the queue read is GraphQL, counted against a
-# budget of its own.
+# Each poll is one jobs read, plus the run read once no job is left running;
+# until the batch has merged, one queue read per page of 100 entries; and the
+# compare while the commit is no entry's head commit. The REST reads come out
+# of the job token's hourly REST budget, the queue reads out of its hourly
+# GraphQL budget; each is per repository and shared by every job of it.
 #
 # A failed required context fails the queue batch on its own. What the rest of
 # the run then adds is its runner minutes, and its hold on its concurrency
@@ -106,13 +111,25 @@ trap 'rm -f "$err_file"' EXIT
 
 # `gh api` with three attempts, 10 s apart: a run can last two hours, and one
 # server error must not end the watch. Prints the answer on stdout; after the third
-# failure it returns 1 with the error in err_file.
+# failure it returns 1 with the error in err_file. With `--refusal-ends` first,
+# an answer refusing the job token is not retried: it returns 3 at once.
 api_try() {
-    local out attempt=1
+    local out attempt=1 refusal_ends=no
+    local refusal='Resource not accessible|"type": *"(FORBIDDEN|INSUFFICIENT_SCOPES)"'
+    if [ "${1:-}" = --refusal-ends ]; then
+        refusal_ends=yes
+        shift
+    fi
     while :; do
         if out=$(gh api "$@" 2> "$err_file"); then
             printf '%s\n' "$out"
             return 0
+        fi
+        # Two reads with no pipe: under pipefail, `grep -q` ending a pipe early
+        # can fail the writer ahead of it, and the refusal would read as none.
+        if [ "$refusal_ends" = yes ] &&
+            { grep -Eq "$refusal" <<< "$out" || grep -Eq "$refusal" "$err_file"; }; then
+            return 3
         fi
         [ "$attempt" -lt 3 ] || return 1
         attempt=$((attempt + 1))
@@ -225,10 +242,11 @@ end'
 owner=${repository%%/*}
 name=${repository#*/}
 
-# Sets `batch` to `live`, `merged` or `dead`, or to `unread` after saying which
-# read failed or carried no answer.
+# Sets `batch` to `live`, `merged` or `dead`; to `refused` after saying which
+# read refused the job token; or to `unread` after saying which read failed or
+# carried no answer.
 read_batch() {
-    local cursor='' page verdict pages=0
+    local cursor='' page verdict pages=0 rc
     local -a args
     batch=unread
     while :; do
@@ -239,7 +257,13 @@ read_batch() {
         pages=$((pages + 1))
         args=(graphql -f query="$queue_query" -f owner="$owner" -f name="$name" -f branch="$base")
         [ -z "$cursor" ] || args+=(-f after="$cursor")
-        if ! page=$(api_try "${args[@]}"); then
+        if page=$(api_try --refusal-ends "${args[@]}"); then rc=0; else rc=$?; fi
+        if [ "$rc" -eq 3 ]; then
+            say "the job token may not read the ${base} merge queue: $(tr '\n' ' ' < "$err_file")"
+            batch=refused
+            return 0
+        fi
+        if [ "$rc" -ne 0 ]; then
             say "the ${base} merge queue read failed three times; this poll decides nothing: $(tr '\n' ' ' < "$err_file")"
             return 0
         fi
@@ -261,7 +285,13 @@ read_batch() {
                 ;;
         esac
     done
-    if ! page=$(api_try "repos/${repository}/compare/${base}...${sha}?per_page=1"); then
+    if page=$(api_try --refusal-ends "repos/${repository}/compare/${base}...${sha}?per_page=1"); then rc=0; else rc=$?; fi
+    if [ "$rc" -eq 3 ]; then
+        say "the job token may not compare ${base} with ${sha}: $(tr '\n' ' ' < "$err_file")"
+        batch=refused
+        return 0
+    fi
+    if [ "$rc" -ne 0 ]; then
         say "the compare of ${base} with ${sha} failed three times; this poll decides nothing: $(tr '\n' ' ' < "$err_file")"
         return 0
     fi
@@ -278,6 +308,7 @@ read_batch() {
 
 dead_polls=0
 queue_read=yes
+seen_live=no
 while :; do
     page=$(api "repos/${repository}/actions/runs/${run_id}/jobs?filter=latest&per_page=${MAX_JOBS}")
     total=$(jq -r '.total_count // 0' <<< "$page")
@@ -305,13 +336,19 @@ while :; do
             live)
                 if [ "$dead_polls" -gt 0 ]; then
                     say "commit ${sha} is a live entry of the ${base} merge queue again; nothing to cancel"
+                elif [ "$seen_live" = no ]; then
+                    say "commit ${sha} is a live entry of the ${base} merge queue; it is read every poll"
                 fi
+                seen_live=yes
                 dead_polls=0
                 ;;
             merged)
                 say "commit ${sha} is in ${base}: its batch merged, so the queue is not read again"
                 queue_read=no
-                dead_polls=0
+                ;;
+            refused)
+                say "the queue is not read again in this run and nothing is cancelled for it; a failed required job still cancels run ${run_id}"
+                queue_read=no
                 ;;
             dead)
                 dead_polls=$((dead_polls + 1))

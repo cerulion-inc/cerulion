@@ -26,7 +26,8 @@ on:
   merge_group:
 
 # `actions: write` lists the run's jobs and cancels the run; `contents: read`
-# reads the merge queue and compares the base branch with the queue commit.
+# reads the merge queue and compares the base branch with the queue commit. A
+# refused queue read or compare turns only the dead batch check off.
 permissions:
   contents: read
   actions: write
