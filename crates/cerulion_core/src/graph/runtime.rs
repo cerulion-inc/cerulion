@@ -4233,6 +4233,11 @@ pub struct GraphRuntime {
     /// rather than guaranteeing one. Recorded once at build, on the open's
     /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
+    /// How many of this graph's data-trigger and sync input topics a writer
+    /// outside it can write, whatever the doorbell policy and whether its
+    /// registry opened: the armed line, when there is one, is among them.
+    /// Recorded once at build.
+    doorbell_outside_topics: usize,
     /// How many of this graph's own publishers armed a doorbell, which under an
     /// active policy is every topic it publishes: a ring reaches whoever is
     /// blocked on the page, and this build cannot name those consumers. Recorded
@@ -10411,6 +10416,34 @@ impl GraphRuntime {
         // failed open is non-fatal: the live loop then falls back to the
         // timer-only park (the ≤100µs recheck still bounds wake latency). Built
         // BEFORE `config` is moved into `Self` so the warn can read the identity.
+        // The data-trigger and sync inputs a publisher outside this graph can
+        // write, whatever the doorbell policy: the period-park refuses a
+        // runtime that has one with no doorbell wake word to end its naps.
+        let mut topics: Vec<String> = data_trigger_bindings
+            .iter()
+            .map(|b| b.topic.to_string())
+            .collect();
+        topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
+        // Which of them a publisher outside this graph can write, read
+        // off the provisioning this build already RESOLVED per topic rather
+        // than re-derived from the node list. `topic_is_writable_from_outside`
+        // is true for a topic in the graph's `multi_publisher_topics` opt-in,
+        // asked of the config directly whatever its provisioning, and for a
+        // topic whose provisioning is `External`, which is every topic absent
+        // from `owned_topic_configs` since that map holds exactly the topics
+        // with an in-graph producer.
+        let armable: std::collections::BTreeSet<String> = topics
+            .iter()
+            .filter(|t| {
+                let provisioning = owned_topic_configs
+                    .get(t.as_str())
+                    .map(|c| c.publisher_provisioning)
+                    .unwrap_or(PublisherProvisioning::External);
+                topic_is_writable_from_outside(&config, t, provisioning)
+            })
+            .cloned()
+            .collect();
+        let doorbell_outside_topics = armable.len();
         let mut doorbell_armed_topic: Option<String> = None;
         let doorbell_registry = if policy.doorbell() {
             debug_assert!(
@@ -10418,30 +10451,6 @@ impl GraphRuntime {
                 "an active doorbell policy must carry a non-empty ns (the CLI \
                  resolver sets default_namespace())"
             );
-            let mut topics: Vec<String> = data_trigger_bindings
-                .iter()
-                .map(|b| b.topic.to_string())
-                .collect();
-            topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            // Which of them a publisher outside this graph can write, read
-            // off the provisioning this build already RESOLVED per topic rather
-            // than re-derived from the node list. `topic_is_writable_from_outside`
-            // is true for a topic in the graph's `multi_publisher_topics` opt-in,
-            // asked of the config directly whatever its provisioning, and for a
-            // topic whose provisioning is `External`, which is every topic absent
-            // from `owned_topic_configs` since that map holds exactly the topics
-            // with an in-graph producer.
-            let armable: std::collections::BTreeSet<String> = topics
-                .iter()
-                .filter(|t| {
-                    let provisioning = owned_topic_configs
-                        .get(t.as_str())
-                        .map(|c| c.publisher_provisioning)
-                        .unwrap_or(PublisherProvisioning::External);
-                    topic_is_writable_from_outside(&config, t, provisioning)
-                })
-                .cloned()
-                .collect();
             let rung = rung_topics(&topics, &armable);
             if rung.armed.is_none() {
                 // No declared topic of this graph is writable from outside it, so
@@ -10562,6 +10571,7 @@ impl GraphRuntime {
             )),
             doorbell_registry,
             doorbell_armed_topic,
+            doorbell_outside_topics,
             producer_doorbells_armed,
             producer_doorbells_planned,
             // Park-entry routing counter (see field doc) — starts at 0.
@@ -14502,9 +14512,17 @@ impl GraphRuntime {
             barrier: self.barrier_participant.is_some(),
             credit_edges: !self.credit_park_edges.is_empty(),
             fd_sources,
+            outside_inputs: self.doorbell_outside_topics > 0,
             armed_line: self.has_armed_line(),
             data_wake: self.data_wake_rung(),
         }
+    }
+
+    /// Test seam: the reason a requested period-park would not engage on this
+    /// runtime (the `reason` field of its warning), or `None` where it would.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn period_park_refusal_for_test(&self) -> Option<&'static str> {
+        super::period_park::refusal(self.period_park_gate(false)).map(|r| r.as_str())
     }
 
     /// Test seam over [`Self::data_wake_rung`], the decision the wait policy

@@ -17,12 +17,102 @@
 #[path = "period_park_support/mod.rs"]
 mod support;
 
-use cerulion_core::graph::PeriodParkStats;
-use serial_test::serial;
+use std::sync::Arc;
 use std::time::Duration;
+
+use cerulion_core::graph::node::NodeEntry;
+use cerulion_core::graph::{GraphRuntime, PeriodParkStats};
+use cerulion_core::prelude::*;
+use cerulion_core::{MonitorWaitPolicy, RealClock};
+use indexmap::IndexMap;
+use native_ros2_messages::geometry_msgs::Vector3;
+use serial_test::serial;
 use support::{
-    applies_to_a_foreign_consumer, engages_here, ticker_run, two_runtimes, DUE_PARK_TIMEOUT,
+    applies_to_a_foreign_consumer, config, engages_here, input, node, ticker_run, transport,
+    two_runtimes, DUE_PARK_TIMEOUT,
 };
+
+/// A data-triggered node that reads its input and does nothing else.
+#[cerulion_node]
+#[derive(Default)]
+struct Sink {
+    #[input(trigger)]
+    inp: Vector3,
+}
+
+#[cerulion_node_impl]
+impl Sink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Ok(())
+    }
+}
+
+/// The reason a requested period-park would not engage on a runtime whose one
+/// node reads `feed` (a topic another graph writes), with the doorbell on or off.
+fn refusal_reading(tag: &str, feed: &str, doorbell: bool) -> Option<&'static str> {
+    let mgr = transport(
+        &format!("ppk_{tag}"),
+        cerulion_core::testing::iceoryx_test_config(),
+        Arc::new(RealClock),
+    );
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "sink".to_string(),
+        Box::new(SinkEntry::with_state(Sink::default())),
+    );
+    let mut rt = GraphRuntime::build_live_with_schema_hashes_and_policy(
+        config(
+            &format!("ppk_{tag}"),
+            &format!("ppk{tag}"),
+            vec![node("sink", "sink", vec![input(feed)], vec![])],
+        ),
+        factories,
+        &mgr,
+        Arc::new(RealClock),
+        None,
+        MonitorWaitPolicy::new(true, doorbell, format!("ppk{}{tag}", std::process::id())),
+    )
+    .expect("build the graph");
+    rt.set_period_park_for_test(Some(true));
+    let reason = rt.period_park_refusal_for_test();
+    rt.shutdown();
+    drop(mgr);
+    reason
+}
+
+/// An input written from outside the runtime with no doorbell wake word (the
+/// doorbell off) refuses the period-park with `no_data_wake`, as its warning
+/// says: no line is armed, so nothing could end a nap on that input. The gate
+/// counts the inputs written from outside at build, whatever the doorbell
+/// policy. Builds only; every host (one without a monitor-wait primitive
+/// refuses on that term first).
+#[test]
+#[serial]
+fn an_input_written_from_outside_with_the_doorbell_off_refuses_the_period_park() {
+    let first = |rest: Option<&'static str>| {
+        if engages_here() {
+            rest
+        } else {
+            Some("no_monitor_wait_primitive")
+        }
+    };
+    assert_eq!(
+        refusal_reading("dboff", "/ppk/dboff/feed", false),
+        first(Some("no_data_wake"))
+    );
+    // The doorbell on: the input's line is armed, and the wake word decides.
+    let on = refusal_reading("dbon", "/ppk/dbon/feed", true);
+    if engages_here() {
+        let want = if applies_to_a_foreign_consumer() {
+            None
+        } else {
+            Some("no_data_wake")
+        };
+        assert_eq!(on, want);
+    } else {
+        assert_eq!(on, Some("no_monitor_wait_primitive"));
+    }
+}
 
 /// A ring from another runtime ends the consumer's kernel nap at once: every
 /// frame is read in order, no wait ends on its long park timeout, and a ring

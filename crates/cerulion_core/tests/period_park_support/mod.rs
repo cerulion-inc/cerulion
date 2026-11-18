@@ -38,7 +38,7 @@ pub fn applies_to_a_foreign_consumer() -> bool {
     engages_here() && cerulion_core::doorbell::wake_word_block_primitive_available()
 }
 
-fn transport(
+pub fn transport(
     name: &str,
     ix: iceoryx2::config::Config,
     clock: Arc<dyn Clock>,
@@ -55,7 +55,7 @@ fn transport(
     .expect("create a transport node on the shared iceoryx2 config")
 }
 
-fn node(id: &str, node_type: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
+pub fn node(id: &str, node_type: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>) -> NodeDef {
     NodeDef {
         isolate: None,
         params: Default::default(),
@@ -77,7 +77,7 @@ fn out(topic: Option<&str>) -> OutputDef {
     }
 }
 
-fn input(source: &str) -> InputDef {
+pub fn input(source: &str) -> InputDef {
     InputDef {
         name: "inp".to_string(),
         source: source.to_string(),
@@ -85,7 +85,7 @@ fn input(source: &str) -> InputDef {
     }
 }
 
-fn config(identity: &str, prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
+pub fn config(identity: &str, prefix: &str, nodes: Vec<NodeDef>) -> GraphConfig {
     GraphConfig {
         level_assignments: None,
         network: None,

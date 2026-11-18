@@ -95,7 +95,10 @@ pub(crate) struct Gate {
     pub(crate) credit_edges: bool,
     /// The park polls an external fd source.
     pub(crate) fd_sources: bool,
-    /// An input topic is written from outside this runtime.
+    /// An input topic is written from outside this runtime, whatever the
+    /// doorbell policy.
+    pub(crate) outside_inputs: bool,
+    /// The doorbell armed a line for such an input.
     pub(crate) armed_line: bool,
     /// The doorbell wake word can end a kernel nap on that line.
     pub(crate) data_wake: bool,
@@ -149,7 +152,7 @@ pub(crate) fn refusal(g: Gate) -> Option<NotEngaged> {
         Some(NotEngaged::CreditEdge)
     } else if g.fd_sources {
         Some(NotEngaged::FdSource)
-    } else if g.armed_line && !g.data_wake {
+    } else if g.outside_inputs && !(g.armed_line && g.data_wake) {
         Some(NotEngaged::NoDataWake)
     } else {
         None
@@ -558,6 +561,7 @@ mod tests {
             barrier: false,
             credit_edges: false,
             fd_sources: false,
+            outside_inputs: true,
             armed_line: true,
             data_wake: true,
         }
@@ -622,12 +626,30 @@ mod tests {
         assert_eq!(refusal(open_gate()), None);
         assert_eq!(
             refusal(Gate {
+                outside_inputs: false,
                 armed_line: false,
                 data_wake: false,
                 ..open_gate()
             }),
             None,
             "no input written from outside needs no wake word"
+        );
+        // An input written from outside with the doorbell off (or its registry
+        // failed to open): no line armed, so nothing can end a nap on it.
+        assert_eq!(
+            refusal(Gate {
+                armed_line: false,
+                data_wake: false,
+                ..open_gate()
+            }),
+            Some(NotEngaged::NoDataWake)
+        );
+        assert_eq!(
+            refusal(Gate {
+                armed_line: false,
+                ..open_gate()
+            }),
+            Some(NotEngaged::NoDataWake)
         );
         for (g, reason, text) in one_refusal_per_term() {
             assert_eq!(refusal(g), Some(reason), "{text}");
@@ -645,6 +667,7 @@ mod tests {
             barrier: true,
             credit_edges: true,
             fd_sources: true,
+            outside_inputs: true,
             armed_line: true,
             data_wake: false,
         };
@@ -771,11 +794,20 @@ mod tests {
         assert!(admits(open_gate()));
         assert!(
             admits(Gate {
+                outside_inputs: false,
                 armed_line: false,
                 data_wake: false,
                 ..open_gate()
             }),
             "no input written from outside: nothing to wake a nap"
+        );
+        assert!(
+            !admits(Gate {
+                armed_line: false,
+                data_wake: false,
+                ..open_gate()
+            }),
+            "an input written from outside with the doorbell off: no wake word"
         );
         let closed = [
             (
