@@ -3109,6 +3109,12 @@ struct CleanupGate {
     /// pass returns (the test seam waits on it).
     #[cfg(any(test, feature = "test-helpers"))]
     in_pass: bool,
+    /// `true` from the lock hold that enters a timed wait until the thread
+    /// takes the lock back, so a reader that holds the lock and sees it set
+    /// holds it while the thread is inside `wait_timeout` (a unit test reads
+    /// it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_wait: bool,
 }
 
 /// Ends the pass [`DeadNodeCleanupShared::wait_period`] started when dropped,
@@ -3142,6 +3148,8 @@ impl DeadNodeCleanupShared {
                 period_changes: 0,
                 #[cfg(any(test, feature = "test-helpers"))]
                 in_pass: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_wait: false,
             }),
             wake: std::sync::Condvar::new(),
             #[cfg(any(test, feature = "test-helpers"))]
@@ -3177,12 +3185,20 @@ impl DeadNodeCleanupShared {
             }
             #[cfg(any(test, feature = "test-helpers"))]
             let changes = gate.period_changes;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = true;
+            }
             let period = Duration::from_millis(gate.period_ms);
             let (guard, timeout) = self
                 .wake
                 .wait_timeout(gate, period)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             gate = guard;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = false;
+            }
             if gate.stopped {
                 return None;
             }
@@ -23051,22 +23067,29 @@ mod dead_node_cleanup_schedule_tests {
         worker.join().expect("reclaim thread");
     }
 
-    /// The test holds the schedule lock for 100 ms with no pass under way, so
-    /// the thread's 20 ms wait runs out before it takes the lock back (unless
-    /// the thread had not yet re-entered its wait when the test took the
-    /// lock), and the park lands first: the condvar reports a timeout, and the
-    /// park must still win.
+    /// The test keeps the schedule lock only once it sees the thread inside
+    /// its 20 ms wait after a pass, then holds it for 100 ms, so that wait
+    /// runs out before the thread takes the lock back and the park lands
+    /// first: the condvar reports a timeout, and the park must still win.
     #[test]
     fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
         let (shared, passes, worker) = start_counting(20);
         wait_for_passes(&passes, 1);
-        let mut gate = shared.lock_gate();
-        while gate.in_pass {
-            gate = shared
-                .pass_done
-                .wait(gate)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
+        let deadline = Instant::now() + HANG_GUARD;
+        let gate = loop {
+            let gate = shared.lock_gate();
+            // A pass already ran, so the wait the thread sits in follows a
+            // pass, and the thread released the lock only inside it.
+            if gate.in_wait {
+                break gate;
+            }
+            drop(gate);
+            assert!(
+                Instant::now() < deadline,
+                "the thread never re-entered its wait after a pass"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
         std::thread::sleep(Duration::from_millis(100));
         // The lock is held and no pass is under way, so none can start or
         // count until the park below releases the lock: this is the count the
