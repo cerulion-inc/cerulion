@@ -535,6 +535,10 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 
+`remoted-rcp-repeat` runs `cerulion_remoted`'s `rcp::tests::` module 20 times in a row on one
+runner, on every event but a merge-queue batch, and fails a run that passed no test; it reports
+no required context.
+
 `examples` opens with a lockfile WALK: `cargo metadata --locked` over every tracked
 `Cargo.lock` outside the root (the benches, the examples, the Python wheel, the Android sample
 runtime; floor 13), ahead of any build step that could rewrite one, so a dependency change under

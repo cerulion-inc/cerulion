@@ -5873,6 +5873,85 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
+  # The remoted rcp unit tests, the whole `rcp::tests::` module run 20 times
+  # in a row on one runner: the module's tests run in parallel and load the
+  # tokio runtime the way a busy runner does, so a test that waits on a
+  # scheduling margin fails here even when a single run passes. A run counts
+  # only when libtest reports at least one passed test and none failed. It
+  # runs on every event but a merge-queue batch, whose pull request ran it
+  # already; every step past the checkout is gated on `cerulion_remoted`
+  # being in the classifier's selection. It reports no required context; the
+  # `cerulion_remoted` step of `crate-tests` is the one a merge waits for.
+  remoted-rcp-repeat:
+    name: remoted rcp tests, 20 runs (ubuntu-latest)
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The iroh tree needs link headroom on the stock runner.
+      - name: Free disk space
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /usr/local/share/powershell \
+                      /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install Rust toolchain
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-crates-${{ runner.os }}-main-
+            cargo-crates-${{ runner.os }}-
+
+      - name: cerulion_remoted rcp tests, 20 runs
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        run: |
+          set -euo pipefail
+          for run in $(seq 1 20); do
+            echo "rcp tests: run $run of 20"
+            log="$RUNNER_TEMP/rcp-run-$run.log"
+            cargo test -p cerulion_remoted --lib -- rcp::tests:: 2>&1 | tee "$log"
+            if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$log"; then
+              echo "rcp tests: run $run of 20 ran no test or failed one"
+              exit 1
+            fi
+          done
+
+      - name: selection marker, cerulion_remoted
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
+
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
     needs: [lint, changes]
