@@ -32,6 +32,9 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 SELF = os.path.abspath(__file__)
 SKIP_ENV = {'PWD', 'OLDPWD', 'SHLVL', '_'}
 SLACK_NS = 200_000_000
+# what `reclaim` never deletes: libraries (shared ones by name, whatever their
+# mode, `.so.N` included) and cargo's metadata
+KEPT_FILE = re.compile(r'\.(so|dylib|dll)(\.\d+)*$|\.(rlib|rmeta|d|a|lib)$')
 # libtest arguments that still run every test of a binary
 WHOLE_RUN_ARGS = {'--nocapture', '--show-output', '--include-ignored', '-q', '--quiet'}
 
@@ -293,9 +296,10 @@ def workflow_complaints(text):
                 for leg, arm in re.findall(r'^\s+(\d+)\) (.*?);;', st, re.M | re.S):
                     for cmd in re.findall(r'ci_built_tests\.py build (.*)', arm):
                         toks = cmd.split()
-                        feats = [toks[i + 1] for i, t in enumerate(toks) if t == '--features']
+                        feats = [f for i, t in enumerate(toks) if t == '--features'
+                                 for f in toks[i + 1].replace(',', ' ').split()]
                         for t in toks:
-                            if not t.startswith('-') and t not in feats and toks[toks.index(t) - 1] != '--group':
+                            if (not t.startswith('-') and toks[toks.index(t) - 1] not in ('--group', '--features')):
                                 built[int(leg)][t.lstrip('+')] = (t.startswith('+'), feats)
             for line in st.splitlines():
                 if re.search(r'\bcargo (test|build|nextest|check)\b', line) and not re.match(r'\s+- name:', line) \
@@ -308,7 +312,8 @@ def workflow_complaints(text):
                 gate = re.findall(r"contains\(fromJSON\(needs\.changes\.outputs\.pkgs\), '([^']+)'\)", cond)
                 if gate and gate != [pkg]:
                     out.append(f'{job}: the `{pkg}` step is gated on {gate}')
-                feats = [f if '/' in f else f'{pkg}/{f}' for f in re.findall(r'--features[ =](\S+)', rest)]
+                feats = [f if '/' in f else f'{pkg}/{f}' for v in re.findall(r'--features[ =](\S+)', rest)
+                         for f in v.split(',') if f]
                 for leg in [int(x) for x in re.findall(r'matrix\.shard == (\d+)', cond)] or legs:
                     ran[leg][pkg] = (not gate, feats)
         for leg in legs:
@@ -408,6 +413,11 @@ def cmd_build(group, features, specs):
             entry['binaries'].append(dict(artifacts[r['executable']], package=r['env'].get('CARGO_PKG_NAME'),
                                           cwd=r['cwd'], delta=env_delta(os.environ, r['env'], [runner])))
         entry['native_dirs'] = sorted(native)
+    else:
+        # Nothing to build is still a declared step, so a job whose selection
+        # names none of its packages audits clean.
+        now = time.time_ns()
+        append('phases.jsonl', {'name': f'build {group}', 'begin': now, 'end': now})
     groups[group] = entry
     with open(state_path('groups.json'), 'w') as f:
         json.dump(groups, f, indent=1, sort_keys=True)
@@ -465,7 +475,7 @@ def cmd_reclaim():
     for name in sorted(os.listdir(deps)) if os.path.isdir(deps) else []:
         path = os.path.join(deps, name)
         if (os.path.isfile(path) and not os.path.islink(path) and os.access(path, os.X_OK)
-                and not name.endswith(('.so', '.rlib', '.rmeta', '.d'))
+                and not KEPT_FILE.search(name)
                 and not name.startswith('build_script_build') and os.path.realpath(path) not in keep):
             os.remove(path)
             removed += 1
@@ -644,6 +654,8 @@ def self_test():
         run: python3 ci_built_tests.py audit --floor 3
 """)
     check('wiring: a consistent job', workflow_complaints(good), [])
+    check('wiring: comma feature lists compare as sets', workflow_complaints(
+        good.replace('--features b/w', '--features b/v,b/w').replace('--features w --', '--features v,w --')), [])
     for name, bad, want in (
             ('a + on a gated step', good.replace('+a b', 'a +b'), 2),
             ('a package no step runs', good.replace('build --group g c', 'build --group g c d'), 1),
@@ -653,6 +665,8 @@ def self_test():
             ('a run before the build', good.replace('      - name: Build', '      - name: e\n        run: python3 '
                                                      'ci_built_tests.py run -- cargo test -p a\n      - name: Build'), 2),
             ('no audit', good.split('      - name: Audit')[0], 1),
+            ('a feature list the build splits but lacks one of', good.replace('--features w -- --test-threads=1',
+                                                                              '--features w,v -- --test-threads=1'), 1),
             ('an audit before the last run', good.replace('      - name: c\n', '      - name: Audit\n        run: '
                                                           'python3 ci_built_tests.py audit\n      - name: c\n')
              .split('      - name: Audit\n        run: python3 ci_built_tests.py audit --floor 3')[0], 1),
@@ -731,7 +745,7 @@ def end_to_end(check, refused):
             check('end to end: an unknown --not-run entry', cmd_audit(2, {'pkg:gone'}), 1)
             refused('end to end: a feature the build lacks', lambda: cmd_run('cargo test -p pkg --features g'.split()))
             deps = os.path.join(tmp, 'target', 'debug', 'deps')
-            for name in ('stale-1', 'lib.rlib', 'one_test-2'):
+            for name in ('stale-1', 'lib.rlib', 'one_test-2', 'libfix.dylib', 'libfix.so.1'):
                 path = os.path.join(deps, name)
                 with open(path, 'w') as f:
                     f.write('#!/bin/sh\n')
@@ -741,7 +755,7 @@ def end_to_end(check, refused):
             with open(state_path('groups.json'), 'w') as f:
                 json.dump(groups, f)
             check('end to end: reclaim keeps what is still to run', (cmd_reclaim(), sorted(os.listdir(deps))),
-                  (0, ['lib.rlib', 'one_test-2']))
+                  (0, ['lib.rlib', 'libfix.dylib', 'libfix.so.1', 'one_test-2']))
             check('end to end: a binary run only under a filter has not run', cmd_audit(2, set()), 1)
             check('end to end: a run with --ignored is no whole run', cmd_run(
                 'cargo test -p pkg --test one_test -- --ignored'.split()), 0)
@@ -757,6 +771,10 @@ def end_to_end(check, refused):
             os.environ.update(RUNNER_TEMP=os.path.join(tmp, 'second'), FAKE_DOCTEST_FAILS='1')
             shutil.rmtree(os.path.join(tmp, 'rustdoctest'))
             refused('end to end: a failing doctest fails the build', lambda: cmd_build('g', [], ['pkg']))
+            os.environ.update(RUNNER_TEMP=os.path.join(tmp, 'third'), CI_SELECTED_PACKAGES='[]')
+            check('end to end: a selection naming no package builds nothing',
+                  (cmd_build('g', [], ['pkg']), load_groups()['g']['binaries']), (0, []))
+            check('end to end: and audits clean', cmd_audit(2, set()), 0)
         except SystemExit:
             check('end to end: no mode stopped the run', sys.stderr.getvalue().strip()[-300:], '')
         finally:
