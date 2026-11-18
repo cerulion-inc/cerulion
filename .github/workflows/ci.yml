@@ -4498,7 +4498,7 @@ jobs:
           key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   crate-tests:
     name: Crate tests (${{ matrix.os }})
-    needs: [lint, changes]
+    needs: [changes]
     # `!cancelled()` is load bearing, and it is the only job-level condition
     # this file's coverage walk sanctions. `needs:` makes the classifier a
     # prerequisite on every event, and GitHub SKIPS a dependent when its
@@ -4508,13 +4508,10 @@ jobs:
     # `needs.changes.outputs.pkgs` is the empty string, every gated step's
     # `fromJSON('')` is an expression error, the step fails and the job reds.
     #
-    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
-    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
-    # per-dependency form, so a red `lint` no longer skips this job either. That
-    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
-    # required context and a red one still blocks the pull request, and this job
-    # reports its own result rather than being waved through as a skip. What
-    # `needs: [lint]` still buys is the ordering.
+    # NO `lint` in `needs:`: a `lint` verdict is not a data dependency for a
+    # test job, so this job starts beside `lint`, as `test-linux` and
+    # `test-macos` do. `Lint` is its own required context, and a red one still
+    # blocks the pull request.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
@@ -5536,18 +5533,9 @@ jobs:
     permissions:
       contents: read
       actions: write
-    needs: [lint]
-    # `!cancelled()` is load bearing, and it is the only job-level condition
-    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
-    # dependency fails and a skipped required context counts as SATISFIED, so
-    # without this guard a red `lint` waves the pull request through with this
-    # job's context never run. With it the job runs on its own terms and
-    # reports its own result. `Lint` is its own required context and a red one
-    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
-    # The cost is the runner minutes this job spends on a change whose lint is
-    # already red, which is what a context that reports beats a context that is
-    # waved through.
-    if: ${{ !cancelled() }}
+    # No `needs:`, so no job-level condition: this job starts beside `lint`
+    # rather than after it, and nothing it depends on can skip it. `Lint` is
+    # its own required context, and a red one still blocks the pull request.
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
     # `cargo doc --workspace` takes about twice that, and 15 became a coin flip:
@@ -5647,18 +5635,9 @@ jobs:
     permissions:
       contents: read
       actions: write
-    needs: [lint]
-    # `!cancelled()` is load bearing, and it is the only job-level condition
-    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
-    # dependency fails and a skipped required context counts as SATISFIED, so
-    # without this guard a red `lint` waves the pull request through with this
-    # job's context never run. With it the job runs on its own terms and
-    # reports its own result. `Lint` is its own required context and a red one
-    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
-    # The cost is the runner minutes this job spends on a change whose lint is
-    # already red, which is what a context that reports beats a context that is
-    # waved through.
-    if: ${{ !cancelled() }}
+    # No `needs:`, so no job-level condition: this job starts beside `lint`
+    # rather than after it, and nothing it depends on can skip it. `Lint` is
+    # its own required context, and a red one still blocks the pull request.
     timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -5873,16 +5852,9 @@ jobs:
   # matrix is ubuntu-only. `fail-fast: false` so one lane's failure still
   # reports the other's.
   #
-  # `needs: [lint]`. This job COMPILES
-  # the rerun SDK tree (257 crates, ~7 min measured). Gating it behind `lint` costs
-  # nothing on a healthy PR (the critical path is the ~hour-long `test-linux` /
-  # `test-macos` jobs, which are gated too). It no longer saves a runner on a red
-  # `lint`: the `!cancelled()` guard below lifts the short-circuit over the whole
-  # `needs:` set, so this job runs and reports its own result, and the dependency
-  # buys the ordering alone. NB for anyone comparing: `demos-go2`,
-  # `msrv`, `examples` and `cross-aarch64-linux` also compile source and are NOT
-  # gated — "every compile job is gated" is not the house rule; this one is
-  # gated because it is expensive AND nothing waits on its result.
+  # Not behind `lint`. This job compiles the rerun SDK tree (257 crates, ~7 min
+  # measured) and waits only for the classifier, about a minute; a `lint`
+  # verdict is not a data dependency for it.
   #
   # NOT folded into `test-linux` on purpose — and the reason is the OPPOSITE
   # of comfortable: that job keeps OUTGROWING its ceiling. (The macOS half IS
@@ -5947,7 +5919,7 @@ jobs:
           key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
-    needs: [lint, changes]
+    needs: [changes]
     # `!cancelled()` is load bearing, and it is the only job-level condition
     # this file's coverage walk sanctions. `needs:` makes the classifier a
     # prerequisite on every event, and GitHub SKIPS a dependent when its
@@ -5957,13 +5929,10 @@ jobs:
     # `needs.changes.outputs.pkgs` is the empty string, every gated step's
     # `fromJSON('')` is an expression error, the step fails and the job reds.
     #
-    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
-    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
-    # per-dependency form, so a red `lint` no longer skips this job either. That
-    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
-    # required context and a red one still blocks the pull request, and this job
-    # reports its own result rather than being waved through as a skip. What
-    # `needs: [lint]` still buys is the ordering.
+    # NO `lint` in `needs:`: a `lint` verdict is not a data dependency for a
+    # test job, so this job starts beside `lint`, as `test-linux` and
+    # `test-macos` do. `Lint` is its own required context, and a red one still
+    # blocks the pull request.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
