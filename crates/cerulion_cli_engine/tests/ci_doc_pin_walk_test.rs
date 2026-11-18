@@ -161,7 +161,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod ci_test_line;
-use ci_test_line::line_runs_tests_of;
+use ci_test_line::{line_runs_tests_of, logical_lines};
 
 /// The shared directory trees a test may read from outside its own crate.
 ///
@@ -1625,6 +1625,14 @@ fn line_names_package(line: &str, package: &str) -> bool {
     !line.trim().starts_with(MARKER_PREFIX) && line_runs_tests_of(line, package)
 }
 
+/// Does any line of `lines`, read as the shell reads them (a `\` continuation
+/// joined to the line it continues), name `package`?
+fn lines_name_package<'a>(lines: impl IntoIterator<Item = &'a str>, package: &str) -> bool {
+    logical_lines(lines)
+        .iter()
+        .any(|l| line_names_package(l, package))
+}
+
 // ---------------------------------------------------------------------------
 // THE GATE
 // ---------------------------------------------------------------------------
@@ -1771,7 +1779,7 @@ fn every_doc_pin_marker_sits_in_the_job_that_runs_its_package() {
                 ));
                 continue;
             };
-            if !block.lines().any(|l| line_names_package(l, package)) {
+            if !lines_name_package(block.lines(), package) {
                 complaints.push(format!(
                     "  {job}: `{line}` but no step in this job runs \
                      `{package}`; move the marker beside the step that does"
@@ -3993,7 +4001,7 @@ fn gated_doc_pin_markers(lines: &[&str]) -> Vec<(usize, String, String)> {
         };
         let gated = (0..step_at.len()).any(|k| {
             let body = &lines[step_at[k]..step_end(k)];
-            body.iter().any(|l| line_names_package(l, package))
+            lines_name_package(body.iter().copied(), package)
                 && body.iter().any(|l| line_gates_package(l, package))
         });
         if gated {
@@ -4037,9 +4045,7 @@ fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
                 .iter()
                 .position(|&s| s == j)
                 .expect("j is a step start");
-            lines[j..step_end(k)]
-                .iter()
-                .any(|l| line_names_package(l, &package))
+            lines_name_package(lines[j..step_end(k)].iter().copied(), &package)
         });
         if !names_it {
             out.push(format!(

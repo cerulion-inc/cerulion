@@ -160,7 +160,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 mod ci_test_line;
-use ci_test_line::line_runs_tests_of;
+use ci_test_line::{line_runs_tests_of, logical_lines};
 
 /// Packages that have tests and are deliberately NOT named in a CI test step.
 ///
@@ -1333,7 +1333,11 @@ fn pr_blocking_workflow_texts() -> BTreeMap<String, String> {
 fn workflows_name(texts: &BTreeMap<String, String>, pkg: &str) -> Option<String> {
     texts
         .iter()
-        .find(|(_, text)| text.lines().any(|l| line_runs_tests_of(l, pkg)))
+        .find(|(_, text)| {
+            logical_lines(text.lines())
+                .iter()
+                .any(|l| line_runs_tests_of(l, pkg))
+        })
         .map(|(file, _)| file.clone())
 }
 
@@ -3083,8 +3087,9 @@ fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
             "alpha",
             false,
         ),
-        // A step NAME that mentions nextest is not an invocation.
-        ("      - name: alpha tests (cargo nextest)", "alpha", false),
+        // A step's `name:` is a label, not an invocation.
+        ("      - name: cargo nextest run -p alpha", "alpha", false),
+        ("        name: cargo test -p alpha", "alpha", false),
         // Steps that run none of the package's ordinary tests.
         ("        run: cargo test -p alpha --doc", "alpha", false),
         ("        run: cargo test --doc -p alpha", "alpha", false),
@@ -3101,6 +3106,7 @@ fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
             "alpha",
             true,
         ),
+        ("        run: cargo test -p alpha -- --doc", "alpha", true),
         // Each shell command is read on its own: a `--doc` command does not
         // cancel the run beside it, and a `-p` of a build command is not a test.
         (
@@ -3120,6 +3126,37 @@ fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
         ),
         (
             "        run: cd examples/x && cargo test -p alpha --lib -- --test-threads=1",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p alpha || cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "beta",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "alpha",
+            false,
+        ),
+        // A `;` glued to a word still ends the command.
+        (
+            "        run: cargo build -p alpha; cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha; cargo build -p beta",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p x && ./tools/scripts/ci_test_shard.sh alpha 0 4",
             "alpha",
             true,
         ),
@@ -3144,6 +3181,19 @@ fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
     .into_iter()
     .collect();
     assert!(workflows_name(&doc_only, "doconly").is_none());
+
+    // A `\` continuation belongs to the command it continues, so a flag on
+    // the next line counts, and so does a package named there.
+    let continued: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "        run: |\n          cargo test -p norun \\\n            --no-run\n          \
+         cargo nextest run --profile ci \\\n            -p later\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(workflows_name(&continued, "norun").is_none());
+    assert!(workflows_name(&continued, "later").is_some());
 }
 
 /// The `shard:` matrix is read in BOTH YAML list forms, and per JOB.

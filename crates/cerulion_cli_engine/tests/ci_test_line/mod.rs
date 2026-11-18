@@ -7,10 +7,30 @@
 //! carry its own copy of the answer. The reader lives here once, so a runner
 //! form one gate learns is a form the other reads too.
 
-/// Does ONE workflow line run the tests of `pkg`?
+/// The lines of `lines` as the shell reads them: a line ending in `\` is
+/// joined to the next, so a flag on a continuation line belongs to the
+/// command it continues.
+pub fn logical_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut pending: Option<String> = None;
+    for line in lines {
+        let mut joined = pending.take().unwrap_or_default();
+        joined.push_str(line);
+        match joined.trim_end().strip_suffix('\\') {
+            Some(head) => pending = Some(format!("{head} ")),
+            None => out.push(joined),
+        }
+    }
+    out.extend(pending);
+    out
+}
+
+/// Does ONE logical workflow line (see [`logical_lines`]) run the tests of
+/// `pkg`?
 ///
-/// The line is split into shell commands at whole-token `&&`, `||`, `|` and
-/// `;`, and each command is read on its own. Three forms credit a package:
+/// A step's `name:` line is a label, never a command. Any other line is split
+/// into shell commands at `&&`, `||`, `|` and `;`, and each command is read on
+/// its own. Three forms credit a package:
 ///
 ///   * `cargo test … -p a -p b …`: every `-p` / `--package` occurrence counts,
 ///     in every spelling cargo accepts (`-p x`, `-px`, `--package x`,
@@ -31,6 +51,14 @@
 /// and `cerulion_vizd` apart: a plain `contains` would report `cerulion_viz`
 /// covered by the `cerulion_vizd` step and vice versa.
 pub fn line_runs_tests_of(line: &str, pkg: &str) -> bool {
+    if line
+        .trim_start()
+        .trim_start_matches("- ")
+        .starts_with("name:")
+    {
+        return false;
+    }
+    let line = line.replace(';', " ; ");
     let tokens: Vec<&str> = line.split_whitespace().collect();
     tokens
         .split(|t| matches!(*t, "&&" | "||" | "|" | ";"))

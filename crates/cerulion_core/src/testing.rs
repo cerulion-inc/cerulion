@@ -1227,17 +1227,23 @@ pub enum TraceSinkOutcome {
 ///
 /// With a subscriber installed, every enabled `tracing` call site evaluates
 /// its field expressions and formats its event, so a field that panics, or
-/// indexes out of range, fails the test that reaches it. Under
-/// `cargo test -- --test-threads=1` the first `#[traced_test]` in a binary
-/// installs such a subscriber for the rest of the process. nextest runs each
-/// test in its own process, where a test without `#[traced_test]` has no
-/// subscriber and its log fields are never evaluated. A shared fixture calls
-/// this to put the subscriber back.
+/// indexes out of range, fails the test that reaches it. Under `cargo test`
+/// the first `#[traced_test]` in a binary installs such a subscriber for every
+/// later test in that process. nextest runs each test in its own process,
+/// where a test without `#[traced_test]` has no subscriber and its log fields
+/// are never evaluated. A shared fixture calls this to put the subscriber
+/// back.
 ///
 /// Nothing is installed in any other process: there, tests can share the
 /// process, and a global subscriber set by one test makes a later
-/// `#[traced_test]` panic when it sets its own. An existing global subscriber is never replaced, so a
-/// `#[traced_test]` test that calls a fixture calling this keeps its capture.
+/// `#[traced_test]` panic when it sets its own. A process the test spawns
+/// inherits [`NEXTEST_EXECUTION_MODE_ENV`], so a child that runs several tests
+/// in one process removes it first. An existing global subscriber is never
+/// replaced, so a `#[traced_test]` test that calls a fixture calling this
+/// keeps its capture.
+///
+/// The subscriber allocates and formats on every event, so allocation-counting
+/// and wall-clock timing binaries do not call it.
 pub fn install_nextest_trace_sink() -> TraceSinkOutcome {
     if std::env::var_os(NEXTEST_EXECUTION_MODE_ENV).as_deref()
         != Some(std::ffi::OsStr::new(NEXTEST_PROCESS_PER_TEST))
@@ -2367,6 +2373,33 @@ mod robust_ratio_tests {
             NEXTEST_EXECUTION_MODE_ENV, NEXTEST_PROCESS_PER_TEST,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// Set by [`run_child`]: an arm run without it (`--ignored`, or nextest
+        /// `--run-ignored`) returns at once instead of judging an environment
+        /// it was not given.
+        const CHILD_ENV: &str = "CERULION_TRACE_SINK_CHILD";
+
+        /// The line a child arm prints as its last act, so the parent can
+        /// tell an arm that ran to the end from one that returned early.
+        const CHILD_DONE: &str = "trace sink child arm done";
+
+        /// How long a child arm may take before the parent kills it.
+        const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+        /// `true` when this arm was launched by [`run_child`].
+        fn launched_by_parent() -> bool {
+            std::env::var_os(CHILD_ENV).is_some()
+        }
+
+        /// A TRACE subscriber that writes nowhere, for the arms that set one
+        /// themselves.
+        fn sink_subscriber() -> impl tracing::Subscriber + Send + Sync {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish()
+        }
 
         /// How many times a [`Probe`] field was formatted in this process.
         static FORMATTED: AtomicUsize = AtomicUsize::new(0);
@@ -2387,8 +2420,8 @@ mod robust_ratio_tests {
 
         /// Runs the `#[ignore]`d child arm `name` alone in a fresh process of
         /// this test binary, with [`NEXTEST_EXECUTION_MODE_ENV`] set to `mode`,
-        /// or removed for `None`.
-        fn run_child(name: &str, mode: Option<&str>) {
+        /// or removed for `None`, and returns what the child printed.
+        fn run_child(name: &str, mode: Option<&str>) -> String {
             let module = module_path!()
                 .strip_prefix("cerulion_core::")
                 .expect("a crate-rooted module path");
@@ -2401,41 +2434,62 @@ mod robust_ratio_tests {
                 "--ignored",
                 "--nocapture",
                 "--test-threads=1",
-            ]);
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
             match mode {
                 Some(mode) => cmd.env(NEXTEST_EXECUTION_MODE_ENV, mode),
                 None => cmd.env_remove(NEXTEST_EXECUTION_MODE_ENV),
             };
-            let out = cmd
-                .output()
+            let mut child = cmd
+                .spawn()
                 .unwrap_or_else(|e| panic!("spawn the child arm `{test}`: {e}"));
-            let stdout = String::from_utf8_lossy(&out.stdout);
+            let started = Instant::now();
+            while child.try_wait().expect("poll the child arm").is_none() {
+                if started.elapsed() > CHILD_DEADLINE {
+                    let _ = child.kill();
+                    panic!("child arm `{test}` ran past {CHILD_DEADLINE:?}");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let out = child.wait_with_output().expect("collect the child arm");
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(
                 out.status.success(),
                 "child arm `{test}` failed ({}):\n{stdout}\n{stderr}",
                 out.status
             );
-            // libtest exits 0 when `--exact` matches no test, so a zero exit
-            // alone does not prove the arm ran.
+            // libtest exits 0 when `--exact` matches no test, and an arm that
+            // returned early also passes, so neither a zero exit nor the
+            // pass count alone proves the arm ran to its end.
             assert!(
                 stdout.contains("test result: ok. 1 passed"),
                 "child arm `{test}` did not run exactly one test:\n{stdout}\n{stderr}"
             );
+            assert!(
+                stdout.contains(CHILD_DONE),
+                "child arm `{test}` did not reach its end:\n{stdout}\n{stderr}"
+            );
+            format!("{stdout}{stderr}")
         }
 
         /// Twice, in two fresh processes: the outcome depends on the
         /// environment only, never on the run.
         #[test]
         fn one_test_per_process_installs_the_sink_and_formats_every_enabled_event() {
-            run_child(
-                "child_installs_the_sink_and_formats",
-                Some(NEXTEST_PROCESS_PER_TEST),
-            );
-            run_child(
-                "child_installs_the_sink_and_formats",
-                Some(NEXTEST_PROCESS_PER_TEST),
-            );
+            for _ in 0..2 {
+                let printed = run_child(
+                    "child_installs_the_sink_and_formats",
+                    Some(NEXTEST_PROCESS_PER_TEST),
+                );
+                // The sink formats every event and writes none of them out.
+                assert!(
+                    !printed.contains("trace sink probe"),
+                    "the sink wrote an event to the child's output:\n{printed}"
+                );
+            }
         }
 
         /// Unset (libtest), and set to a mode that is not one test per
@@ -2460,12 +2514,10 @@ mod robust_ratio_tests {
         #[test]
         #[ignore = "self-re-exec child of one_test_per_process_installs_the_sink_and_formats_every_enabled_event"]
         fn child_installs_the_sink_and_formats() {
-            assert!(
-                !tracing::dispatcher::has_been_set(),
-                "a fresh process starts with no global subscriber"
-            );
+            if !launched_by_parent() {
+                return;
+            }
             assert_eq!(install_nextest_trace_sink(), TraceSinkOutcome::Installed);
-            assert!(tracing::dispatcher::has_been_set());
 
             tracing::info!(probe = %Probe, "trace sink probe at info");
             assert_eq!(formatted(), 1, "the sink did not format an INFO field");
@@ -2484,33 +2536,41 @@ mod robust_ratio_tests {
             assert_eq!(install_nextest_trace_sink(), TraceSinkOutcome::AlreadySet);
             tracing::info!(probe = %Probe, "trace sink probe after a second install");
             assert_eq!(formatted(), after_trace + 1);
+            println!("{CHILD_DONE}");
         }
 
         #[test]
         #[ignore = "self-re-exec child of a_process_that_may_run_other_tests_gets_nothing"]
         fn child_installs_nothing_in_a_shared_process() {
+            if !launched_by_parent() {
+                return;
+            }
             assert_eq!(
                 install_nextest_trace_sink(),
                 TraceSinkOutcome::SharedProcess
             );
-            // Still unset, so a later `#[traced_test]` in this process can set
-            // its own subscriber without panicking.
-            assert!(!tracing::dispatcher::has_been_set());
             tracing::info!(probe = %Probe, "trace sink probe with no subscriber");
             assert_eq!(formatted(), 0, "a field was formatted with no subscriber");
+            // Nothing global was set, so a later `#[traced_test]` in this
+            // process can still set its own subscriber.
+            assert!(tracing::subscriber::set_global_default(sink_subscriber()).is_ok());
+            println!("{CHILD_DONE}");
         }
 
         #[test]
         #[ignore = "self-re-exec child of an_existing_traced_test_capture_is_kept"]
         #[tracing_test::traced_test]
         fn child_keeps_the_traced_test_capture() {
-            assert!(tracing::dispatcher::has_been_set());
+            if !launched_by_parent() {
+                return;
+            }
             assert_eq!(install_nextest_trace_sink(), TraceSinkOutcome::AlreadySet);
             tracing::info!(probe = %Probe, "trace sink probe beside a capture");
             assert!(
                 logs_contain("trace sink probe beside a capture"),
                 "the capture lost an event after the sink was asked to install"
             );
+            println!("{CHILD_DONE}");
         }
     }
 }
