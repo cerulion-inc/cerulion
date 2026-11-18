@@ -43,7 +43,8 @@ pub use error::{ErrorKind, OpsProtoError, OpsProtoResult};
 pub use inventory::Inventory;
 pub use protocol::{
     decode, encode, negotiate_version, read_frame, write_frame, HandshakeReply, Hello, Request,
-    Response, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    Response, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, MIN_SESSION_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 pub use recording::{
     verify_recording, verify_recording_prefix, RecordingChain, RecordingEvent, RecordingPayload,
