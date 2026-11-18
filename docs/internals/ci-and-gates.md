@@ -524,6 +524,11 @@ Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the sh
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
 what it built. There is no shared archive of test binaries and no job that builds one.
 
+`netd-owner-pair-transition-repeat` runs `cerulion_netd`'s owner pair serving transition
+test 20 times in a row on one runner, on every event but a merge-queue batch, with every
+step past the checkout gated on `cerulion_netd`'s selection; it reports no required context,
+and the `cerulion_netd` step of `test-linux` shard 3 is the one a merge waits for.
+
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
 runs the visualization tree in two lanes, Linux only: the library lane PARALLEL (every
