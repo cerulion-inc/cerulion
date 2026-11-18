@@ -689,6 +689,29 @@ future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
 
+## Cargo timing reports and runner hardware
+
+Every `ci.yml` job that compiles with cargo commands written in the workflow passes
+`--timings` to each cargo build, check, clippy, doc and test command (the `cerulion_core`
+shards through `CI_TEST_SHARD_EXTRA`), prints the runner's architecture, CPU model, core
+count and memory right after checkout, and uploads one artifact per job and matrix leg named
+`cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7 days. It holds
+`runner.txt` (the hardware lines, present even when the path selection skipped every cargo
+step) and one `cargo-timing-<timestamp>-<hash>.html` report per cargo command, under the path
+of the target directory it came from (`target/cargo-timings/`,
+`examples/go2/target/cargo-timings/`). Download it from the run's summary page or with
+`gh run download <run id> --pattern 'cargo-timings-*'`. The collect and upload steps run
+under `always()`, so a red or timed-out job still uploads. The collect step moves the reports
+out of the job's target directories before any cache save and deletes one it cannot move; it
+fails the job only when it can neither move nor delete a report, or passes its 2 minute step
+timeout, and a failed job saves no cache, so no cache archive carries a report. Only the upload
+carries `continue-on-error: true` (with a 5 minute step timeout). Artifact names spell a shard
+leg as `shard-<n>`, for example `cargo-timings-test-linux-shard-0-attempt-1`.
+`ci_cache_policy_check.py` holds the steps in place (TIMINGS_REPORTS, below).
+`deb-smoke` and `stable-node-compiler-skew` build inside scripts and `fuzz` and `miri` through
+cargo plugins, so those four carry none of these steps, and a `cargo install` tool build
+writes no report.
+
 ## Scheduled workflows
 
 Five workflows run on a clock, and none of them reports a required status context.
@@ -924,7 +947,12 @@ prune, under the prune's own condition (R9); nothing shadows the policy in a job
 cannot narrow, so it clears the whole namespace -- lives only in a job whose `if:` can never be
 true on a pull request, either a `github.event_name != 'pull_request'` conjunct or an allowlist of
 events naming none (R11); a key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
-the
+a job that passes `--timings` in a step carries `Collect the cargo timing reports` under
+`if: always()` with no `continue-on-error`, running the one script the checker holds, directly
+followed by `Upload the cargo timing reports` under `if: always()` with `continue-on-error: true`,
+both after its last `--timings` step and before its save, the collect list naming every target
+directory its cache steps archive, and a job with neither the flag nor the steps carries neither;
+no job- or workflow-level `env` passes the flag (TIMINGS_REPORTS); the
 combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and a job whose
 steps the reader cannot enumerate -- a reusable-workflow call, or one carrying no `steps:` -- is
 refused rather than passed in silence. The `Lint` step "Cache save policy" runs the prune
