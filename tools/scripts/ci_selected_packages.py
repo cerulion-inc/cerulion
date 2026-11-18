@@ -525,7 +525,7 @@ OBSERVATION_ERROR_CASES = [
 # moves to with=9 without=4; `cerulion_heaphook` is unchanged.
 #
 # `node_macro_ui` joins it: its pass-program runner joins `examples` onto the
-# target directory, which the walk records as observing that tree, so `go2_tf`
+# profile directory, which the walk records as observing that tree, so `go2_tf`
 # moves to with=10 without=4.
 #
 # Dropping the union from the closure shrinks both, which is the mutant these
