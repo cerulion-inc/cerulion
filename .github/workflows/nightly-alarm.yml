@@ -1,0 +1,44 @@
+name: Nightly full run alarm
+
+# Reports, on the issue `nightly.yml` writes, when that workflow is not active,
+# or when no run of it is in progress and none reached a result on `main` in
+# the last 26 hours. A scheduled run can be dropped, a nightly can fail before
+# it records anything, and a workflow can be disabled, with nothing reported
+# anywhere: a separate file keeps this check alive when `nightly.yml` itself is
+# the problem. At most one write a day (`tools/scripts/nightly_full_run.sh
+# alarm`).
+#
+# Neither trigger is reachable from a fork: `schedule` and `workflow_dispatch`
+# only ever run on a branch of this repository.
+on:
+  workflow_dispatch:
+  schedule:
+    # Every six hours at minute 47, off the hour.
+    - cron: "47 */6 * * *"
+
+# `actions: read` lists the nightly's runs; `issues: write` records a finding.
+permissions:
+  contents: read
+  actions: read
+  issues: write
+
+# A group of its own: in the nightly's group a queued alarm would replace a
+# queued nightly. While a nightly is in progress the alarm writes nothing, so
+# the two do not write to the issue at once.
+concurrency:
+  group: nightly-full-run-alarm
+  cancel-in-progress: false
+
+jobs:
+  alarm:
+    name: The nightly full run is on schedule
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Check the nightly's runs and record a finding on one issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: tools/scripts/nightly_full_run.sh alarm
