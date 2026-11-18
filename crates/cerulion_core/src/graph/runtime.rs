@@ -3300,168 +3300,6 @@ impl Drop for DeadNodeCleanupThread {
     }
 }
 
-#[cfg(test)]
-mod dead_node_cleanup_schedule_tests {
-    use super::*;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-
-    /// How long a negative check watches for a pass that must not start. A
-    /// broken schedule shows within it; a correct one can never fail it, since
-    /// the parked period is an hour.
-    const QUIET_WINDOW: Duration = Duration::from_millis(200);
-
-    /// Guards a hang only: every wait below ends as soon as its condition holds.
-    const HANG_GUARD: Duration = Duration::from_secs(10);
-
-    const PARKED_MS: u64 = 3_600_000;
-
-    /// The reclaim loop on its own thread, counting passes.
-    fn start_counting(
-        period_ms: u64,
-    ) -> (
-        Arc<DeadNodeCleanupShared>,
-        Arc<AtomicU64>,
-        std::thread::JoinHandle<()>,
-    ) {
-        let shared = Arc::new(DeadNodeCleanupShared::new(period_ms));
-        let passes = Arc::new(AtomicU64::new(0));
-        let worker = {
-            let (shared, passes) = (Arc::clone(&shared), Arc::clone(&passes));
-            std::thread::spawn(move || {
-                shared.run_passes(|| {
-                    passes.fetch_add(1, Ordering::Relaxed);
-                })
-            })
-        };
-        (shared, passes, worker)
-    }
-
-    fn wait_for_passes(passes: &AtomicU64, at_least: u64) {
-        let deadline = Instant::now() + HANG_GUARD;
-        while passes.load(Ordering::Relaxed) < at_least {
-            assert!(
-                Instant::now() < deadline,
-                "no pass ran within {HANG_GUARD:?}"
-            );
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    #[test]
-    fn passes_keep_running_at_a_short_period() {
-        let (shared, passes, worker) = start_counting(5);
-        wait_for_passes(&passes, 3);
-        shared.stop();
-        worker.join().expect("reclaim thread");
-    }
-
-    /// The test holds the schedule lock for 100 ms with no pass under way, so
-    /// the thread's 20 ms wait runs out before it takes the lock back (unless
-    /// the thread had not yet re-entered its wait when the test took the
-    /// lock), and the park lands first: the condvar reports a timeout, and the
-    /// park must still win.
-    #[test]
-    fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
-        let (shared, passes, worker) = start_counting(20);
-        wait_for_passes(&passes, 1);
-        let mut gate = shared.lock_gate();
-        while gate.in_pass {
-            gate = shared
-                .pass_done
-                .wait(gate)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        // The lock is held and no pass is under way, so none can start or
-        // count until the park below releases the lock: this is the count the
-        // park must keep.
-        let parked = passes.load(Ordering::Relaxed);
-        shared.change_period(gate, PARKED_MS);
-        std::thread::sleep(QUIET_WINDOW);
-        assert_eq!(
-            passes.load(Ordering::Relaxed),
-            parked,
-            "a pass started under the old period after the park returned"
-        );
-        shared.stop();
-        worker.join().expect("reclaim thread");
-    }
-
-    /// A park issued while a pass runs returns only once that pass has ended,
-    /// so a count read after the park already holds it.
-    #[test]
-    fn a_park_returns_only_after_the_pass_under_way_ends() {
-        let shared = Arc::new(DeadNodeCleanupShared::new(1));
-        let (started_tx, started_rx) = mpsc::channel::<()>();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let worker = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                shared.run_passes(|| {
-                    let _ = started_tx.send(());
-                    let _ = release_rx.recv();
-                })
-            })
-        };
-        started_rx
-            .recv_timeout(HANG_GUARD)
-            .expect("the first pass starts");
-        let (parked_tx, parked_rx) = mpsc::channel::<()>();
-        let parker = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                shared.set_period_ms(PARKED_MS);
-                parked_tx.send(()).expect("test thread listening");
-            })
-        };
-        // The park has stored the new period and now waits on the pass.
-        let deadline = Instant::now() + HANG_GUARD;
-        while shared.lock_gate().period_changes == 0 {
-            assert!(Instant::now() < deadline, "the park never took the lock");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(
-            parked_rx.recv_timeout(QUIET_WINDOW),
-            Err(RecvTimeoutError::Timeout),
-            "the park returned while a pass was still running"
-        );
-        release_tx.send(()).expect("pass waiting for release");
-        parked_rx
-            .recv_timeout(HANG_GUARD)
-            .expect("the park returns once the pass ends");
-        parker.join().expect("parker");
-        assert_eq!(
-            started_rx.recv_timeout(QUIET_WINDOW),
-            Err(RecvTimeoutError::Timeout),
-            "another pass started after the park"
-        );
-        drop(release_tx);
-        shared.stop();
-        worker.join().expect("reclaim thread");
-    }
-
-    /// A pass that panics still ends, so a later park does not wait for it.
-    #[test]
-    fn a_pass_that_panics_still_ends() {
-        let shared = Arc::new(DeadNodeCleanupShared::new(1));
-        let worker = {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || shared.run_passes(|| panic!("reclaim pass panicked")))
-        };
-        assert!(worker.join().is_err(), "the pass panicked");
-        assert!(!shared.lock_gate().in_pass, "the panicked pass ended");
-        shared.set_period_ms(PARKED_MS);
-    }
-
-    #[test]
-    fn a_stop_ends_a_parked_wait() {
-        let (shared, passes, worker) = start_counting(PARKED_MS);
-        shared.stop();
-        worker.join().expect("reclaim thread");
-        assert_eq!(passes.load(Ordering::Relaxed), 0);
-    }
-}
-
 /// What a runtime holds once a recorder has ARMED it — the checkpoint
 /// arm word, shared with every other consumer of the same attach.
 ///
@@ -23155,5 +22993,167 @@ mod fire_site_tests {
             ),
             (7, 10, 2, FireCause::Period, FireFlags::TICK_ERROR, 0b101)
         );
+    }
+}
+
+#[cfg(test)]
+mod dead_node_cleanup_schedule_tests {
+    use super::*;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    /// How long a negative check watches for a pass that must not start. A
+    /// broken schedule shows within it; a correct one can never fail it, since
+    /// the parked period is an hour.
+    const QUIET_WINDOW: Duration = Duration::from_millis(200);
+
+    /// Guards a hang only: every wait below ends as soon as its condition holds.
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+
+    const PARKED_MS: u64 = 3_600_000;
+
+    /// The reclaim loop on its own thread, counting passes.
+    fn start_counting(
+        period_ms: u64,
+    ) -> (
+        Arc<DeadNodeCleanupShared>,
+        Arc<AtomicU64>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let shared = Arc::new(DeadNodeCleanupShared::new(period_ms));
+        let passes = Arc::new(AtomicU64::new(0));
+        let worker = {
+            let (shared, passes) = (Arc::clone(&shared), Arc::clone(&passes));
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    passes.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        (shared, passes, worker)
+    }
+
+    fn wait_for_passes(passes: &AtomicU64, at_least: u64) {
+        let deadline = Instant::now() + HANG_GUARD;
+        while passes.load(Ordering::Relaxed) < at_least {
+            assert!(
+                Instant::now() < deadline,
+                "no pass ran within {HANG_GUARD:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn passes_keep_running_at_a_short_period() {
+        let (shared, passes, worker) = start_counting(5);
+        wait_for_passes(&passes, 3);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// The test holds the schedule lock for 100 ms with no pass under way, so
+    /// the thread's 20 ms wait runs out before it takes the lock back (unless
+    /// the thread had not yet re-entered its wait when the test took the
+    /// lock), and the park lands first: the condvar reports a timeout, and the
+    /// park must still win.
+    #[test]
+    fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
+        let (shared, passes, worker) = start_counting(20);
+        wait_for_passes(&passes, 1);
+        let mut gate = shared.lock_gate();
+        while gate.in_pass {
+            gate = shared
+                .pass_done
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        // The lock is held and no pass is under way, so none can start or
+        // count until the park below releases the lock: this is the count the
+        // park must keep.
+        let parked = passes.load(Ordering::Relaxed);
+        shared.change_period(gate, PARKED_MS);
+        std::thread::sleep(QUIET_WINDOW);
+        assert_eq!(
+            passes.load(Ordering::Relaxed),
+            parked,
+            "a pass started under the old period after the park returned"
+        );
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A park issued while a pass runs returns only once that pass has ended,
+    /// so a count read after the park already holds it.
+    #[test]
+    fn a_park_returns_only_after_the_pass_under_way_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                })
+            })
+        };
+        started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the first pass starts");
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let parker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.set_period_ms(PARKED_MS);
+                parked_tx.send(()).expect("test thread listening");
+            })
+        };
+        // The park has stored the new period and now waits on the pass.
+        let deadline = Instant::now() + HANG_GUARD;
+        while shared.lock_gate().period_changes == 0 {
+            assert!(Instant::now() < deadline, "the park never took the lock");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            parked_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "the park returned while a pass was still running"
+        );
+        release_tx.send(()).expect("pass waiting for release");
+        parked_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the park returns once the pass ends");
+        parker.join().expect("parker");
+        assert_eq!(
+            started_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "another pass started after the park"
+        );
+        drop(release_tx);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A pass that panics still ends, so a later park does not wait for it.
+    #[test]
+    fn a_pass_that_panics_still_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.run_passes(|| panic!("reclaim pass panicked")))
+        };
+        assert!(worker.join().is_err(), "the pass panicked");
+        assert!(!shared.lock_gate().in_pass, "the panicked pass ended");
+        shared.set_period_ms(PARKED_MS);
+    }
+
+    #[test]
+    fn a_stop_ends_a_parked_wait() {
+        let (shared, passes, worker) = start_counting(PARKED_MS);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+        assert_eq!(passes.load(Ordering::Relaxed), 0);
     }
 }
