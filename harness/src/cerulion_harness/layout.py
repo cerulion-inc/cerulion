@@ -10,7 +10,8 @@ Every path is inside the harness folder, the folder that holds this package's sr
                             machine
     macos/                  the macOS simulator launcher (Apple's OpenGL)
     bx/                     written by install.sh: the simulator environment and the benchmark scenes; and the
-                            plain setup's tree, built by measured/assemble.py the first time a run needs it
+                            plain setup's trees (bx/trees/plain/DIGEST, one for each state of their sources),
+                            each built by measured/assemble.py the first time a run needs it
     venv/                   written by install.sh: the episode server environment (Python 3.12)
 """
 import hashlib
@@ -29,7 +30,7 @@ VENV_PYTHON = os.path.join(HARNESS, "venv", "bin", "python")
 RECORDS = os.path.join(HARNESS, "body_records")
 MEASURED = os.path.join(HARNESS, "measured")
 RCP_TREE = os.path.join(MEASURED, "rcp")
-PLAIN_TREE = os.path.join(BX, "trees", "plain")
+PLAIN_TREES = os.path.join(BX, "trees", "plain")
 MACOS_ENVHOST = os.path.join(HARNESS, "macos", "envhost_macos.sh")
 STAMP = ".assembled-from"
 
@@ -74,24 +75,34 @@ def source_digest(measured, builder):
     return h.hexdigest()
 
 
-def plain_tree(measured=MEASURED, dest=PLAIN_TREE):
-    """The plain setup's code tree, built by measured/assemble.py under dest the first time it is needed, and built
-    again only when what it is built from changed (a stamp in dest holds source_digest). Returns dest. Raises
-    FileNotFoundError when the builder or a tree is missing and ValueError when the builder refuses."""
+def _stamped(tree, digest):
+    """tree holds a stamp that names digest."""
+    try:
+        with open(os.path.join(tree, STAMP), encoding="utf-8") as f:
+            return f.read().strip() == digest
+    except OSError:
+        return False
+
+
+def plain_tree(measured=MEASURED, trees=PLAIN_TREES):
+    """The plain setup's code tree of the current sources: trees/DIGEST, DIGEST the first 16 hex digits of
+    source_digest (a stamp in the tree holds all of it). The first run that needs it builds it with
+    measured/assemble.py in a folder of its own and renames that folder into place whole; no tree in place is
+    written over or removed, so an episode that runs from one keeps it while other runs build theirs. Two runs
+    that build the same tree at once both use the one renamed into place first. Changed sources get a new tree
+    beside the earlier ones; while no run is going, trees/ may be removed whole. Returns the tree's path. Raises
+    FileNotFoundError when the builder or a tree is missing, and ValueError when the builder refuses or
+    trees/DIGEST holds something else."""
     builder = assembler(measured)
     try:
         digest = source_digest(measured, builder)
     except builder.AssemblyError as exc:
         raise ValueError(str(exc)) from None
-    try:
-        with open(os.path.join(dest, STAMP), encoding="utf-8") as f:
-            if f.read().strip() == digest:
-                return dest
-    except OSError:
-        pass
-    parent = os.path.dirname(dest)
-    os.makedirs(parent, exist_ok=True)
-    tmp = tempfile.mkdtemp(prefix=".plain.", dir=parent)
+    dest = os.path.join(trees, digest[:16])
+    if _stamped(dest, digest):
+        return dest
+    os.makedirs(trees, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=".building.", dir=trees)
     try:
         try:
             builder.assemble_plain(measured, tmp)
@@ -99,10 +110,16 @@ def plain_tree(measured=MEASURED, dest=PLAIN_TREE):
             raise ValueError(str(exc)) from None
         with open(os.path.join(tmp, STAMP), "w", encoding="utf-8") as f:
             f.write(digest + "\n")
-        if os.path.isdir(dest):
-            shutil.rmtree(dest)
-        os.replace(tmp, dest)
-    except BaseException:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise
+        try:
+            os.rename(tmp, dest)   # refused when dest is a folder that holds anything: it is left as it is
+        except OSError:
+            if _stamped(dest, digest):
+                pass   # another run renamed the same tree into place first: that one is used
+            elif os.path.lexists(dest):
+                raise ValueError(f"{dest} holds files that are not the plain tree of these sources: remove "
+                                 f"that folder") from None
+            else:
+                raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)   # after the rename nothing is left here; else the unused copy
     return dest

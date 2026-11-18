@@ -2,13 +2,15 @@
 """The plain setup's code tree, which run-cell builds once with measured/assemble.py and reuses while its sources
 are unchanged. Standard library only. The measured folder here is a hand-written fixture with a small builder of
 the same interface (tree_files, ABSENT_LIST, AssemblyError, assemble_plain), so what is tested is when the tree
-is built, where it goes and what a refusal leaves, not the measured builder's own rules."""
+is built, where it goes, what a refusal leaves and that a tree in place is never changed, not the measured
+builder's own rules."""
 import hashlib
 import os
 import pathlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 
@@ -70,7 +72,7 @@ class PlainTree(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.measured = os.path.join(self.tmp.name, "measured")
-        self.dest = os.path.join(self.tmp.name, "bx", "trees", "plain")
+        self.trees = os.path.join(self.tmp.name, "bx", "trees", "plain")
         write(self.measured, "assemble.py", BUILDER)
         write(self.measured, "rcp/a.py", "a = 1\n")
         write(self.measured, "rcp/pkg/b.py", "b = 'rcp'\n")
@@ -81,52 +83,97 @@ class PlainTree(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def build(self, dest=None):
-        return layout.plain_tree(self.measured, dest or self.dest)
+    def build(self, trees=None):
+        return layout.plain_tree(self.measured, trees or self.trees)
 
     def test_the_tree_is_what_the_builder_wrote_plus_the_stamp(self):
-        self.assertEqual(self.build(), self.dest)
-        got = listing(self.dest)
+        tree = self.build()
+        self.assertEqual(os.path.dirname(tree), self.trees)
+        self.assertRegex(os.path.basename(tree), r"^[0-9a-f]{16}$")
+        got = listing(tree)
         self.assertTrue(got.pop(layout.STAMP))
         self.assertEqual(got, {"a.py": sha("a = 1\n"), "pkg/b.py": sha("b = 'plain'\n")})
+        with open(os.path.join(tree, layout.STAMP), encoding="utf-8") as f:
+            stamp = f.read().strip()
+        self.assertRegex(stamp, r"^[0-9a-f]{64}$")
+        self.assertTrue(stamp.startswith(os.path.basename(tree)))
 
     def test_a_built_tree_is_reused_while_its_sources_are_unchanged(self):
-        self.build()
-        write(self.dest, "kept.txt", "only a reuse keeps this file")
-        self.build()
-        self.assertTrue(os.path.exists(os.path.join(self.dest, "kept.txt")))
+        tree = self.build()
+        write(tree, "kept.txt", "only a reuse keeps this file")
+        self.assertEqual(self.build(), tree)
+        self.assertTrue(os.path.exists(os.path.join(tree, "kept.txt")))
 
-    def test_any_changed_source_builds_the_tree_again(self):
+    def test_any_changed_source_builds_a_new_tree_and_leaves_the_old_one_as_it_was(self):
         for rel, text in (("plain-overlay/pkg/b.py", "b = 'plain, changed'\n"), ("rcp/a.py", "a = 2\n"),
                           ("plain-absent.txt", "pkg/c.py\n\n"), ("assemble.py", BUILDER + "\n# changed\n")):
-            self.build()
-            write(self.dest, "kept.txt", "only a reuse keeps this file")
+            old = self.build()
+            write(old, "kept.txt", "an episode runs from this tree")
+            before = listing(old)
             write(self.measured, rel, text)
-            self.build()
-            self.assertFalse(os.path.exists(os.path.join(self.dest, "kept.txt")), rel)
+            new = self.build()
+            self.assertNotEqual(new, old, rel)
+            self.assertEqual(listing(old), before, rel)
+            self.assertFalse(os.path.exists(os.path.join(new, "kept.txt")), rel)
 
     def test_run_output_inside_the_rcp_tree_does_not_count_as_a_change(self):
-        self.build()
-        write(self.dest, "kept.txt", "only a reuse keeps this file")
+        tree = self.build()
+        write(tree, "kept.txt", "only a reuse keeps this file")
         write(self.measured, "rcp/runs/derived_mjcf/robot.xml", "<a derived model/>")
         write(self.measured, "rcp/pkg/__pycache__/b.cpython-312.pyc", "bytecode")
-        self.build()
-        self.assertTrue(os.path.exists(os.path.join(self.dest, "kept.txt")))
+        self.assertEqual(self.build(), tree)
+        self.assertTrue(os.path.exists(os.path.join(tree, "kept.txt")))
 
     def test_two_builds_are_byte_identical(self):
-        one = listing(self.build(os.path.join(self.tmp.name, "one")))
-        two = listing(self.build(os.path.join(self.tmp.name, "two")))
-        self.assertEqual(one, two)
+        one = self.build(os.path.join(self.tmp.name, "one"))
+        two = self.build(os.path.join(self.tmp.name, "two"))
+        self.assertEqual(os.path.basename(one), os.path.basename(two))
+        self.assertEqual(listing(one), listing(two))
+
+    def test_two_runs_that_build_at_once_both_use_the_first_tree_and_it_is_never_replaced(self):
+        # While this run builds its copy, another run builds the same tree, renames it into place and starts an
+        # episode in it. This run then finds the place taken by that tree, uses it, and drops its own copy.
+        real = layout.assembler(self.measured)
+        first = {}
+        test = self
+
+        class Racing:
+            ABSENT_LIST, AssemblyError, tree_files = real.ABSENT_LIST, real.AssemblyError, real.tree_files
+
+            @staticmethod
+            def assemble_plain(measured, dest):
+                with mock.patch.object(layout, "assembler", lambda m: real):
+                    first["tree"] = layout.plain_tree(test.measured, test.trees)
+                write(first["tree"], "in-use.txt", "an episode runs from this tree")
+                first["listing"] = listing(first["tree"])
+                real.assemble_plain(measured, dest)
+
+        with mock.patch.object(layout, "assembler", lambda m: Racing):
+            got = self.build()
+        self.assertEqual(got, first["tree"])
+        self.assertEqual(listing(got), first["listing"])
+        self.assertEqual(os.listdir(self.trees), [os.path.basename(got)])
+
+    def test_a_folder_in_the_place_of_the_tree_that_is_not_it_is_refused_and_left_alone(self):
+        tree = self.build()
+        os.unlink(os.path.join(tree, layout.STAMP))
+        write(tree, "other.txt", "not a tree this builder made")
+        before = listing(tree)
+        with self.assertRaises(ValueError) as ctx:
+            self.build()
+        self.assertIn("not the plain tree of these sources", str(ctx.exception))
+        self.assertEqual(listing(tree), before)
+        self.assertEqual(os.listdir(self.trees), [os.path.basename(tree)])
 
     def test_a_refusal_is_a_value_error_and_leaves_the_old_tree_and_no_partial_one(self):
-        self.build()
-        before = listing(self.dest)
+        tree = self.build()
+        before = listing(tree)
         write(self.measured, "plain-absent.txt", "refuse\n")
         with self.assertRaises(ValueError) as ctx:
             self.build()
         self.assertIn("the absent list says refuse", str(ctx.exception))
-        self.assertEqual(listing(self.dest), before)
-        self.assertEqual(sorted(os.listdir(os.path.dirname(self.dest))), ["plain"])
+        self.assertEqual(listing(tree), before)
+        self.assertEqual(os.listdir(self.trees), [os.path.basename(tree)])
 
     def test_a_missing_tree_is_a_value_error_from_the_builder(self):
         os.rename(os.path.join(self.measured, "plain-overlay"), os.path.join(self.measured, "elsewhere"))

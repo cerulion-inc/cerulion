@@ -63,7 +63,39 @@ class InstallScript(unittest.TestCase):
             path.parent.mkdir(parents=True)
             path.write_text("#!/bin/sh\n", encoding="utf-8")
             path.chmod(0o755)
-        (self.copy / "bx/LIBERO-PRO/libero/libero").mkdir(parents=True)
+        for tree in ("LIBERO", "LIBERO-PRO"):
+            (self.copy / "bx" / tree / "libero/libero").mkdir(parents=True)
+
+    def run_with_stand_ins(self):
+        """install.sh with stand-ins on PATH: uv records its words and makes an environment as uv does (refusing an
+        existing folder); git fails, so a run that reaches the fetch stops there and reaches no network; ldconfig
+        lists the CPU renderer. Returns (the words uv was given, the finished run)."""
+        mac_gl = "macos/cerulion_harness_macos_gl.py"
+        (self.copy / mac_gl).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HARNESS / mac_gl, self.copy / mac_gl)
+        tools = pathlib.Path(self.tmp.name) / "tools"
+        tools.mkdir()
+        log = pathlib.Path(self.tmp.name) / "uv.log"
+        (tools / "uv").write_text(
+            '#!/bin/sh\n'
+            'echo "$*" >> "$UV_LOG"\n'
+            '[ "$1" = venv ] || exit 0\n'
+            'for env; do :; done\n'
+            '[ -e "$env" ] && { echo "A virtual environment already exists at $env" >&2; exit 2; }\n'
+            'mkdir -p "$env/bin" "$env/site"\n'
+            'printf \'#!/bin/sh\\n[ "$1" = -c ] && echo "%s/site"\\nexit 0\\n\' "$env" > "$env/bin/python"\n'
+            'chmod +x "$env/bin/python"\n', encoding="utf-8")
+        (tools / "git").write_text('#!/bin/sh\necho "git stand-in: no network in this test" >&2\nexit 1\n',
+                                   encoding="utf-8")
+        (tools / "ldconfig").write_text('#!/bin/sh\necho "libOSMesa.so.8 (libc6) => /usr/lib/libOSMesa.so.8"\n',
+                                        encoding="utf-8")
+        for tool in ("uv", "git", "ldconfig"):
+            (tools / tool).chmod(0o755)
+        env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", UV_LOG=str(log))
+        done = subprocess.run(["bash", str(self.copy / "install.sh")], stdin=subprocess.DEVNULL, env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        words = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        return words, done
 
     def test_help_prints_the_usage(self):
         done = self.run_script("--help")
@@ -106,50 +138,65 @@ class InstallScript(unittest.TestCase):
                          [f"not installed: the episode server environment ({self.copy}/venv)"])
 
     @unittest.skipUnless(SUPPORTED, "the script runs on macOS on Apple silicon and Linux on x86-64 or arm64")
+    def test_check_names_the_scenes_when_one_benchmark_tree_is_gone(self):
+        for tree in ("LIBERO", "LIBERO-PRO"):
+            with self.subTest(tree=tree):
+                shutil.rmtree(self.copy / "bx", ignore_errors=True)
+                shutil.rmtree(self.copy / "venv", ignore_errors=True)
+                self.install_everything_by_stamp()
+                shutil.rmtree(self.copy / "bx" / tree)
+                done = self.run_script("--check")
+                self.assertEqual(done.returncode, 1)
+                self.assertEqual(done.stdout.strip().splitlines(),
+                                 [f"not installed: the benchmark scenes ({self.copy}/bx)"])
+
+    @unittest.skipUnless(SUPPORTED, "the script runs on macOS on Apple silicon and Linux on x86-64 or arm64")
     def test_an_environment_whose_interpreter_is_gone_is_made_again(self):
         # Both Python environments exist, but their interpreters are links to a Python that was removed. A stand-in
         # uv on PATH refuses to make an environment over an existing folder, as uv does, and records its words.
-        # The scenes are current, so the run reaches no network.
+        # The scenes are current, so the run reaches no network, and step 2 does not run: the new simulator
+        # environment gets LIBERO from the fetched tree in step 1.
         self.stamp("scenes", sha_of(self.copy, "benchmarks/fetch.sh", "benchmarks/LIBERO-PRO-data.files.txt",
                                     "benchmarks/LIBERO-PRO-data.sha256"))
-        (self.copy / "bx/LIBERO-PRO/libero/libero").mkdir(parents=True)
+        for tree in ("LIBERO", "LIBERO-PRO"):
+            (self.copy / "bx" / tree / "libero/libero").mkdir(parents=True)
         gone = pathlib.Path(self.tmp.name) / "removed-python"
         for env in ("bx/libero-env", "venv"):
             (self.copy / env / "bin").mkdir(parents=True)
             (self.copy / env / "bin/python").symlink_to(gone)
-        mac_gl = "macos/cerulion_harness_macos_gl.py"
-        (self.copy / mac_gl).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(HARNESS / mac_gl, self.copy / mac_gl)
-        tools = pathlib.Path(self.tmp.name) / "tools"
-        tools.mkdir()
-        log = pathlib.Path(self.tmp.name) / "uv.log"
-        (tools / "uv").write_text(
-            '#!/bin/sh\n'
-            'echo "$*" >> "$UV_LOG"\n'
-            '[ "$1" = venv ] || exit 0\n'
-            'for env; do :; done\n'
-            '[ -e "$env" ] && { echo "A virtual environment already exists at $env" >&2; exit 2; }\n'
-            'mkdir -p "$env/bin" "$env/site"\n'
-            'printf \'#!/bin/sh\\n[ "$1" = -c ] && echo "%s/site"\\nexit 0\\n\' "$env" > "$env/bin/python"\n'
-            'chmod +x "$env/bin/python"\n', encoding="utf-8")
-        # The renderer check reads ldconfig; this stand-in lists the renderer, as a machine that has it does.
-        (tools / "ldconfig").write_text('#!/bin/sh\necho "libOSMesa.so.8 (libc6) => /usr/lib/libOSMesa.so.8"\n',
-                                        encoding="utf-8")
-        for tool in ("uv", "ldconfig"):
-            (tools / tool).chmod(0o755)
-        env = dict(os.environ, PATH=f"{tools}{os.pathsep}{os.environ['PATH']}", UV_LOG=str(log))
-        done = subprocess.run(["bash", str(self.copy / "install.sh")], stdin=subprocess.DEVNULL, env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        words, done = self.run_with_stand_ins()
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        words = log.read_text(encoding="utf-8").splitlines()
         self.assertIn(f"venv --python 3.10 {self.copy}/bx/libero-env", words)
         self.assertIn(f"venv --python 3.12 {self.copy}/venv", words)
+        sim_py = f"{self.copy}/bx/libero-env/bin/python"
+        libero = (f"pip install --python {sim_py} --no-deps -e {self.copy}/bx/LIBERO "
+                  f"--config-settings editable_mode=compat")
+        self.assertEqual(words.count(libero), 1, words)
+        # After the environment is made and its pinned packages are in it.
+        self.assertGreater(words.index(libero), words.index(f"venv --python 3.10 {self.copy}/bx/libero-env"))
+        self.assertGreater(words.index(libero), words.index(
+            f"pip install --python {sim_py} -r {self.copy}/requirements/sim-py310.txt"))
+        self.assertIn("[2/4] the benchmark scenes at their pinned revisions (about 1.6 GB)\n      installed",
+                      done.stdout)
         for env_dir in ("bx/libero-env", "venv"):
             python = self.copy / env_dir / "bin/python"
             self.assertFalse(python.is_symlink(), env_dir)
             self.assertTrue(os.access(python, os.X_OK), env_dir)
         self.assertEqual((self.copy / "venv/site/cerulion_harness.pth").read_text(encoding="utf-8").strip(),
                          f"{self.copy}/src")
+
+    @unittest.skipUnless(SUPPORTED, "the script runs on macOS on Apple silicon and Linux on x86-64 or arm64")
+    def test_with_scenes_to_fetch_the_simulator_step_leaves_the_libero_install_to_the_fetch(self):
+        # A LIBERO tree is there but the scenes step is not current (no stamp: an earlier fetch stopped part way):
+        # step 1 installs no LIBERO from it, and step 2 fetches again (the git stand-in stops it there).
+        (self.copy / "bx/LIBERO/libero/libero").mkdir(parents=True)
+        words, done = self.run_with_stand_ins()
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("[2/4] the benchmark scenes", done.stdout)
+        self.assertNotIn("installed", done.stdout.split("[2/4]")[1])
+        self.assertIn(f"pip install --python {self.copy}/bx/libero-env/bin/python -r "
+                      f"{self.copy}/requirements/sim-py310.txt", words)
+        self.assertEqual([w for w in words if " -e " in w], [], words)
 
     @unittest.skipUnless(SUPPORTED, "the script runs on macOS on Apple silicon and Linux on x86-64 or arm64")
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "root can write any folder")

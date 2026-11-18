@@ -126,6 +126,9 @@ class Endpoint(unittest.TestCase):
     def setUp(self):
         self.seen = []
         self.answer = (200, b'{"choices": []}')
+        self.answer_headers = {}
+        # A second server: any request that reaches it, with the key it carried.
+        self.elsewhere = []
         test = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -134,6 +137,8 @@ class Endpoint(unittest.TestCase):
                 test.seen.append((self.path, self.headers.get("Authorization"), json.loads(body)))
                 code, text = test.answer
                 self.send_response(code)
+                for name, value in test.answer_headers.items():
+                    self.send_header(name, value)
                 self.send_header("Content-Length", str(len(text)))
                 self.end_headers()
                 self.wfile.write(text)
@@ -141,9 +146,25 @@ class Endpoint(unittest.TestCase):
             def log_message(self, *a):
                 pass
 
+        class Elsewhere(http.server.BaseHTTPRequestHandler):
+            def answer(self):
+                test.elsewhere.append((self.command, self.path, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            do_GET = do_POST = answer
+
+            def log_message(self, *a):
+                pass
+
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Elsewhere)
+        for server in (self.server, self.other):
+            threading.Thread(target=server.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/v1"
+        self.other_url = f"http://127.0.0.1:{self.other.server_address[1]}/v1/chat/completions"
         # A proxy that does not exist: the loopback endpoint must be reached directly.
         self.env = mock.patch.dict(os.environ, {"TEST_KEY": KEY, "http_proxy": "http://127.0.0.1:9",
                                                 "HTTP_PROXY": "http://127.0.0.1:9"}, clear=True)
@@ -151,8 +172,9 @@ class Endpoint(unittest.TestCase):
 
     def tearDown(self):
         self.env.stop()
-        self.server.shutdown()
-        self.server.server_close()
+        for server in (self.server, self.other):
+            server.shutdown()
+            server.server_close()
 
     def ns(self, url=None):
         return args("--base-url", url or self.url, "--key-env", "TEST_KEY")
@@ -177,9 +199,29 @@ class Endpoint(unittest.TestCase):
             self.assertNotIn(KEY, text)
 
     def test_any_other_answer_is_left_to_the_episode(self):
-        for code in (400, 429, 500, 503):
+        for code in (300, 400, 429, 500, 503):
             self.answer = (code, b"busy")
             self.assertIsNone(cli.endpoint_refusal(self.ns()), code)
+
+    def test_a_redirect_is_reported_and_never_followed_so_the_key_reaches_no_other_server(self):
+        for code in (301, 302, 303, 307, 308):
+            self.seen.clear()
+            self.answer, self.answer_headers = (code, b""), {"Location": self.other_url}
+            text = cli.endpoint_refusal(self.ns())
+            self.assertEqual(text, f"HTTP {code}: the endpoint redirects to {self.other_url}. A redirect is not "
+                                   f"followed, so the key goes only to the URL given: pass the address it "
+                                   f"redirects to as --base-url")
+            self.assertEqual(len(self.seen), 1, code)
+            self.assertEqual(self.elsewhere, [], code)
+
+    def test_a_redirect_is_named_as_a_whole_address_with_the_key_masked(self):
+        for location, named in (("/v2/chat/completions", f"{self.url[:-len('/v1')]}/v2/chat/completions"),
+                                (f"{self.other_url}?key={KEY}", f"{self.other_url}?key=[KEY]")):
+            self.answer, self.answer_headers = (302, b""), {"Location": location}
+            text = cli.endpoint_refusal(self.ns())
+            self.assertTrue(text.startswith(f"HTTP 302: the endpoint redirects to {named}. "), text)
+            self.assertNotIn(KEY, text)
+        self.assertEqual(self.elsewhere, [])
 
     def test_an_address_where_nothing_listens_is_reported(self):
         sock = socket.socket()

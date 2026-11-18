@@ -14,7 +14,10 @@ sets, lets the model work within the budget, and scores the episode with the ben
 Both setups get the same start state, the same budget (80 model replies, 900 control steps), temperature 1.0 and
 one tool call per reply. The model endpoint is any OpenAI-compatible chat completions URL that supports tools and
 images. The URL is read from --base-url or OPENAI_BASE_URL; the key is read from the environment variable named by
---key-env (default OPENAI_API_KEY) and is sent only to that URL.
+--key-env (default OPENAI_API_KEY) and is sent only to that URL: urllib follows no redirect in run-cell or in the
+episode's Python processes that start with run-cell's PYTHONPATH, its driver and model client among them
+(redirects.py), and unless --no-endpoint-check is given, an endpoint that answers the test request with a
+redirect is named before any episode starts.
 """
 import argparse
 import json
@@ -27,9 +30,10 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
-from cerulion_harness import layout, prices
+from cerulion_harness import layout, prices, redirects
 
 DEFAULT_CELL = "pro_spatial_swap_t00_i00"
 DEVELOPMENT_CELLS = [
@@ -64,8 +68,9 @@ def cell_line(cell_id):
 def endpoint_refusal(ns):
     """One small request before any simulator starts. Returns the endpoint's own refusal as text when it answers
     401, 402, 403 or 404 (a wrong key, an account that may not call it, a wrong URL or model name), or says so
-    when the address cannot be reached at all (its name does not resolve, or nothing listens there), else None:
-    every other answer or failure is left to the episode, which retries for itself."""
+    when the address cannot be reached at all (its name does not resolve, or nothing listens there), or names the
+    address when it answers with a redirect, which is not followed: the key goes to the URL given and to no other.
+    Else None: every other answer or failure is left to the episode, which retries for itself."""
     url = ns.base_url.rstrip("/")
     url = url if url.endswith("/chat/completions") else url + "/chat/completions"
     key = os.environ[ns.key_env]
@@ -73,7 +78,8 @@ def endpoint_refusal(ns):
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
     local = any(h in url.split("/")[2] for h in ("127.0.0.1", "localhost", "[::1]")) if "://" in url else False
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({})) if local else urllib.request.build_opener()
+    handlers = [redirects.Refuse()] + ([urllib.request.ProxyHandler({})] if local else [])
+    opener = urllib.request.build_opener(*handlers)
     try:
         with opener.open(req, timeout=120) as reply:
             reply.read()
@@ -81,6 +87,12 @@ def endpoint_refusal(ns):
         if exc.code in (401, 402, 403, 404):
             text = exc.read(4000).decode("utf-8", "replace").replace(key, "[KEY]")
             return f"HTTP {exc.code}: {' '.join(text.split())[:600]}"
+        if exc.code in redirects.REDIRECT_CODES:
+            location = exc.headers.get("Location")
+            where = urllib.parse.urljoin(url, location) if location else "no address"
+            where = " ".join(where.replace(key, "[KEY]").split())[:300]
+            return (f"HTTP {exc.code}: the endpoint redirects to {where}. A redirect is not followed, so the key "
+                    f"goes only to the URL given: pass the address it redirects to as --base-url")
     except urllib.error.URLError as exc:
         if isinstance(exc.reason, (socket.gaierror, ConnectionRefusedError)):
             return f"the address could not be reached ({type(exc.reason).__name__}: {exc.reason})"
@@ -120,6 +132,9 @@ def group_dir(ns, arm, out_dir):
 def run_arm(ns, arm, out_dir, cells_file, tree):
     spec = ARMS[arm]
     env = layout.simulator_env(dict(os.environ, **THREADS))
+    # First on the path: each Python process of the episode that starts with this PYTHONPATH (the driver, and the
+    # model client it starts) runs episode_site/sitecustomize.py first, which makes urllib follow no redirect.
+    env["PYTHONPATH"] = os.pathsep.join((redirects.SITE, env["PYTHONPATH"]))
     if arm == "plain":
         env["RCPX_NATIVE_VARIANT"] = "gripper=ramp"
     else:
@@ -228,6 +243,7 @@ def cmd_run_cell(ns):
     if refused:
         print(refused[1], file=sys.stderr)
         return refused[0]
+    redirects.refuse_everywhere()   # this process sends the key too: it follows no redirect from here on
     trees = {"rcp": layout.RCP_TREE}
     if "plain" in arms:
         try:

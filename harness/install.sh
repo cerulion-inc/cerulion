@@ -69,13 +69,16 @@ SERVER_IN=$(printf '%s\n' "$(sha256_of "$HARNESS/requirements/server-py312.txt")
 current() {  # NAME DIGEST: the step's stamp matches
   [ -f "$BX/.step-$1" ] && [ "$(cat "$BX/.step-$1")" = "$2" ]
 }
+scenes_here() {  # both benchmark trees are in place
+  [ -d "$BX/LIBERO/libero/libero" ] && [ -d "$BX/LIBERO-PRO/libero/libero" ]
+}
 
 if [ -n "$CHECK" ]; then
   missing=0
   if ! { current sim "$SIM_IN" && [ -x "$SIM_PY" ]; }; then
     echo "not installed: the simulator environment ($BX/libero-env)"; missing=1
   fi
-  if ! { current scenes "$SCENES_IN" && [ -d "$BX/LIBERO-PRO/libero/libero" ]; }; then
+  if ! { current scenes "$SCENES_IN" && scenes_here; }; then
     echo "not installed: the benchmark scenes ($BX)"; missing=1
   fi
   if ! { current server "$SERVER_IN" && [ -x "$VENV_PY" ]; }; then
@@ -151,12 +154,17 @@ else
     "$UV" pip install --python "$SIM_PY" --no-deps --index-url https://download.pytorch.org/whl/cpu \
       -r "$HARNESS/requirements/sim-torch-cpu.txt"
   fi
+  # LIBERO itself is installed into this environment from its fetched tree: by step 2 when it fetches the
+  # scenes, and here when the scenes are installed and current, since step 2 then does not run.
+  if current scenes "$SCENES_IN" && scenes_here; then
+    "$UV" pip install --python "$SIM_PY" --no-deps -e "$BX/LIBERO" --config-settings editable_mode=compat
+  fi
   echo "$SIM_IN" > "$BX/.step-sim"
   took "$t"
 fi
 
 echo "[2/4] the benchmark scenes at their pinned revisions (about 1.6 GB)"
-if current scenes "$SCENES_IN" && [ -d "$BX/LIBERO-PRO/libero/libero" ]; then
+if current scenes "$SCENES_IN" && scenes_here; then
   echo "      installed"
 else
   t=$(date +%s)

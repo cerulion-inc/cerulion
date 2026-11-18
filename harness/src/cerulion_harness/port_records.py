@@ -86,7 +86,8 @@ def identity_here(probe, work, wait_s):
 def main(argv=None):
     p = argparse.ArgumentParser(prog="python -m cerulion_harness.port_records", description=__doc__.split("\n\n")[0])
     p.add_argument("--probe", action="store_true", help="print this machine's keys and write nothing")
-    p.add_argument("--work", default="/tmp/rbp", help="scratch folder; keep it short (unix socket paths)")
+    p.add_argument("--work", default="/tmp/rbp", help="scratch folder; keep it short (unix socket paths). Each run "
+                                                      "makes and removes its own folder inside it")
     p.add_argument("--wait", type=float, default=1800.0, help="seconds to wait for a simulator start")
     ns = p.parse_args(argv)
     if not os.path.isfile(layout.SIM_PYTHON):
@@ -103,10 +104,11 @@ def main(argv=None):
     os.chdir(layout.RCP_TREE)
     sys.path.insert(0, layout.RCP_TREE)
     os.makedirs(ns.work, exist_ok=True)
+    scratch = tempfile.mkdtemp(prefix="r", dir=ns.work)
     rows, wrote, problems = [], 0, 0
     try:
         for probe, source in PROBES:
-            ident, key = identity_here(probe, ns.work, ns.wait)
+            ident, key = identity_here(probe, scratch, ns.wait)
             row = {"start_state": probe, "key_here": key, "body_sha1_here": ident["body_sha1"],
                    "measured_record": source, "record_found_here": os.path.isfile(os.path.join(records,
                                                                                                key + ".json"))}
@@ -128,7 +130,11 @@ def main(argv=None):
             row["wrote"] = key + ".json"
             wrote += 1
     finally:
-        shutil.rmtree(ns.work, ignore_errors=True)
+        shutil.rmtree(scratch, ignore_errors=True)   # only the folder this run made: what else is in --work stays
+        try:
+            os.rmdir(ns.work)   # --work itself goes only when nothing else is in it
+        except OSError:
+            pass
     print(json.dumps({"rows": rows, "written": wrote, "problems": problems}, indent=2))
     return 1 if problems else 0
 
