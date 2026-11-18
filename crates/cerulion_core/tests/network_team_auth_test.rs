@@ -6,8 +6,9 @@
 //!
 //! What each test pins, on both links:
 //! - a robot's frames reach a viewer;
-//! - a viewer's frames never reach a robot, and an operator's do; a robot
-//!   that routes puts to every role still drops a viewer's put on ingress;
+//! - a robot declares no subscriber to a viewer and a viewer's frames never
+//!   reach it, while an operator's do; a robot that declares its subscribers
+//!   to every role still drops a viewer's put on ingress;
 //! - a viewer's demand liveliness token and its query on `cerulion_q/**`
 //!   reach the robot, and the robot's reply comes back;
 //! - a machine whose leaf comes from another team's CA never links, while a
@@ -18,16 +19,32 @@
 //! - a leaf a retired CA signed with a current-generation robot name fails the
 //!   data session, while a data session that anchors the retired CA admits it;
 //! - a leaf the next generation's CA signed with a current-generation robot
-//!   name fails the data session in both directions and links but carries
-//!   nothing on the cross-generation session, while a genuine next-generation
-//!   robot exchanges frames with a current one over the cross sessions;
+//!   name fails the data session in both directions, and links but has every
+//!   put dropped on the cross-generation session, while a genuine
+//!   next-generation robot exchanges frames with a current one over the cross
+//!   sessions;
 //! - a viewer gateway pulls a robot topic, and a robot gateway that dials an
 //!   operator pulls the operator's topic, through the full demand path;
 //! - a `tcp/`, `udp/...?rel=1` or `#`-config locator fails the open naming
 //!   the locator, and team credentials together with certificate files fail
 //!   the open;
 //! - the config's `Debug` and serialized forms carry no key material.
+//!
+//! A refused handshake is judged by the handshake itself: the dialing side
+//! tries it once inside its open ([`dial_once`]), the open succeeds, and the
+//! session holds no peer as the open returns, beside a dial to the same
+//! listener that holds one. A dropped put is judged by an in-order sentinel
+//! ([`puts_then_query`]): the sender puts once it holds the receiver's
+//! declarations, then sends a query the receiver admits on the same session,
+//! and only the query arrives, beside a sender whose frames arrive ahead of
+//! its query.
+//!
+//! A session that dials a listener drops before the listener does (locals
+//! drop in reverse order of binding), so it closes while its peer is up:
+//! closing a `quic/` session whose peer has already closed can wait out
+//! zenoh's 10 s default session close timeout.
 
+use std::sync::atomic::AtomicU64;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +52,7 @@ use cerulion_core::transport::team_auth::access_control;
 use cerulion_core::transport::test_ca::TestTeam;
 use cerulion_core::{NetworkAuth, NetworkConfig, NetworkManager, NetworkTls, TeamAuth, WireHeader};
 use cerulion_pairing::team::TeamRole;
+use zenoh::qos::CongestionControl;
 use zenoh::Wait;
 
 const LINKS: [&str; 2] = ["quic", "tls"];
@@ -75,6 +93,38 @@ fn pair(link: &str, server: TeamAuth, client: TeamAuth) -> (NetworkManager, Netw
     let (s, locator) = listen(link, server);
     let c = manager(client, vec![], vec![locator]);
     (s, c)
+}
+
+/// The zenoh config of a data session holding `auth` that dials `locator`.
+fn dialer_config(auth: TeamAuth, locator: &str) -> zenoh::Config {
+    manager(auth, vec![], vec![locator.to_string()])
+        .zenoh_config_for_test()
+        .expect("config builds")
+}
+
+/// Open `config` with each connect locator tried once inside the open, and
+/// report whether the session holds a peer as the open returns.
+///
+/// `connect/retry` with `period_init_ms: 0` takes zenoh's single-attempt
+/// branch: each handshake runs to its end before the open returns, and no
+/// background connector dials again. `open/return_conditions/connect_scouted:
+/// false` returns without waiting out the scouting delay. Every other key is
+/// the session's own, `connect/exit_on_failure` included, so the open itself
+/// must succeed whether the peer accepts the handshake or refuses it. With no
+/// listen locator and scouting off, a session that holds no peer here never
+/// gets one.
+fn dial_once(mut config: zenoh::Config, what: &str) -> (zenoh::Session, bool) {
+    config
+        .insert_json5("connect/retry", "{ period_init_ms: 0 }")
+        .expect("connect retry set");
+    config
+        .insert_json5("open/return_conditions/connect_scouted", "false")
+        .expect("return condition set");
+    let session = zenoh::open(config).wait().unwrap_or_else(|e| {
+        panic!("{what}: the open succeeds whether the peer accepts or refuses: {e}")
+    });
+    let peer = session.info().peers_zid().wait().next().is_some();
+    (session, peer)
 }
 
 fn linked(m: &NetworkManager, budget: Duration) -> bool {
@@ -125,6 +175,168 @@ fn deliver(from: &NetworkManager, to: &NetworkManager, topic: &str, budget: Dura
     got
 }
 
+/// A sending machine: its zenoh session, and its put of one frame on a topic.
+trait Sender {
+    fn zenoh_session(&self) -> &zenoh::Session;
+    fn put_frame(&self, topic: &str, frame: Vec<u8>);
+}
+
+impl Sender for NetworkManager {
+    fn zenoh_session(&self) -> &zenoh::Session {
+        self.session().expect("sender session opens")
+    }
+
+    fn put_frame(&self, topic: &str, frame: Vec<u8>) {
+        self.publish_to_network(topic, frame)
+            .expect("the put itself never fails on a live session");
+    }
+}
+
+impl Sender for zenoh::Session {
+    fn zenoh_session(&self) -> &zenoh::Session {
+        self
+    }
+
+    /// The put `publish_to_network` makes for a reliable topic.
+    fn put_frame(&self, topic: &str, frame: Vec<u8>) {
+        self.put(NetworkManager::data_key(topic), frame)
+            .congestion_control(CongestionControl::Block)
+            .wait()
+            .expect("the put itself never fails on a live session");
+    }
+}
+
+/// The frames [`puts_then_query`] puts before its query.
+const FRAMES: u64 = 3;
+
+/// The prefix of the keys [`puts_then_query`] queries: under `cerulion_q/**`,
+/// where the generated policy takes a query from every role.
+const SENTINEL_PREFIX: &str = "cerulion_q/sentinel";
+
+static NEXT_KEY: AtomicU64 = AtomicU64::new(0);
+
+/// One arrival at the receiving side of [`puts_then_query`].
+#[derive(Debug, PartialEq)]
+enum Arrival {
+    /// A frame on the data key, by its sequence number.
+    Frame(u64),
+    /// The query sent after the frames.
+    Query,
+}
+
+/// What [`puts_then_query`] saw.
+#[derive(Debug, PartialEq)]
+struct Landing {
+    /// The sender held a route to the receiver's subscriber when it put.
+    routed: bool,
+    /// What reached the receiver, in arrival order, up to the query.
+    arrived: Vec<Arrival>,
+}
+
+impl Landing {
+    /// Every frame routed and admitted, in order, ahead of the query.
+    fn delivered() -> Landing {
+        Landing {
+            routed: true,
+            arrived: (0..FRAMES)
+                .map(Arrival::Frame)
+                .chain([Arrival::Query])
+                .collect(),
+        }
+    }
+
+    /// The frames routed to the receiver and dropped on its ingress.
+    fn dropped_on_ingress() -> Landing {
+        Landing {
+            routed: true,
+            arrived: vec![Arrival::Query],
+        }
+    }
+
+    /// No route to the receiver's subscriber, so no frame left the sender.
+    fn never_routed() -> Landing {
+        Landing {
+            routed: false,
+            arrived: vec![Arrival::Query],
+        }
+    }
+}
+
+/// Put [`FRAMES`] frames from `from` on a fresh data key `to` subscribes,
+/// then send one query on a fresh [`SENTINEL_PREFIX`] key `to` serves, on the
+/// same session, and report what reached `to` up to that query.
+///
+/// `to` declares its subscriber before its queryable, so the two declarations
+/// reach `from` in that order on zenoh's one control-priority channel. `from`
+/// puts once it sees the queryable, so a subscriber declaration `to` sent is
+/// applied by then and `routed` reads the route the frames take. The frames
+/// and the query both ride zenoh's data priority, reliable and blocking, so
+/// they share one transmit queue and one link (on `quic/`, the data
+/// priority's stream), and `to` hands each to its callback in arrival order:
+/// it passes every frame through its ingress rules before the query. A
+/// landing without frames is a verdict on the frames, not a window that
+/// closed early; [`Landing::delivered`] holds that order on every run. Panics
+/// when `from` does not see the queryable, or the query does not arrive,
+/// within 10 s.
+fn puts_then_query(from: &dyn Sender, to: &zenoh::Session) -> Landing {
+    let n = NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let topic = format!("/team/sentinel_{n}");
+    let key = NetworkManager::data_key(&topic);
+    let query_key = format!("{SENTINEL_PREFIX}/{n}");
+    let (tx, rx) = mpsc::channel();
+    let frames = tx.clone();
+    let _sub = to
+        .declare_subscriber(key.clone())
+        .callback(move |s| {
+            let _ = frames.send(Some(s.payload().to_bytes().into_owned()));
+        })
+        .wait()
+        .unwrap();
+    let _queryable = to
+        .declare_queryable(query_key.clone())
+        .callback(move |_| {
+            let _ = tx.send(None);
+        })
+        .wait()
+        .unwrap();
+    let session = from.zenoh_session();
+    let publisher = session.declare_publisher(key).wait().unwrap();
+    let querier = session.declare_querier(query_key).wait().unwrap();
+    let seen = querier.matching_listener().wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match seen
+            .recv_deadline(deadline)
+            .expect("matching listener open")
+        {
+            Some(status) if status.matching() => break,
+            Some(_) => {}
+            None => panic!("the sender sees the receiver's queryable within 10 s"),
+        }
+    }
+    let routed = publisher.matching_status().wait().unwrap().matching();
+    for seq in 0..FRAMES {
+        from.put_frame(&topic, frame(seq));
+    }
+    querier.get().callback(|_| {}).wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut arrived = Vec::new();
+    loop {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Some(f)) => {
+                assert_eq!(f.len(), WireHeader::SIZE + 8, "the frame arrives verbatim");
+                let seq = u64::from_le_bytes(f[WireHeader::SIZE..].try_into().unwrap());
+                arrived.push(Arrival::Frame(seq));
+            }
+            Ok(None) => {
+                arrived.push(Arrival::Query);
+                return Landing { routed, arrived };
+            }
+            Err(_) => panic!("the query reaches the receiver within 10 s, after {arrived:?}"),
+        }
+    }
+}
+
 #[test]
 fn a_robot_delivers_to_a_viewer_on_both_links() {
     let acme = TestTeam::new("acme", 1);
@@ -159,9 +371,10 @@ fn only_a_writer_role_delivers_to_a_robot() {
             "{link}: viewer links"
         );
         assert_eq!(
-            deliver(&viewer, &robot, "/team/cmd_vel", Duration::from_secs(5)),
-            0,
-            "{link}: a viewer's frames never reach the robot"
+            puts_then_query(&viewer, robot.session().unwrap()),
+            Landing::never_routed(),
+            "{link}: the robot declares no subscriber to a viewer, and a viewer's frames never \
+             reach it"
         );
         let (robot, operator) = pair(
             link,
@@ -172,9 +385,10 @@ fn only_a_writer_role_delivers_to_a_robot() {
             linked(&operator, Duration::from_secs(10)),
             "{link}: operator links"
         );
-        assert!(
-            deliver(&operator, &robot, "/team/cmd_vel", Duration::from_secs(10)) > 0,
-            "{link}: an operator's frames reach the robot"
+        assert_eq!(
+            puts_then_query(&operator, robot.session().unwrap()),
+            Landing::delivered(),
+            "{link}: an operator's frames reach the robot, in order, ahead of its query"
         );
     }
 }
@@ -264,33 +478,14 @@ fn robot_declaring_to_all(link: &str, auth: TeamAuth) -> (zenoh::Session, String
     (zenoh::open(config).wait().expect("robot opens"), locator)
 }
 
-/// Frames a raw session holding `auth`'s credentials, with its own policy
-/// off, puts to `robot` within `budget`.
-fn raw_put_count(robot: &zenoh::Session, auth: TeamAuth, locator: &str, budget: Duration) -> usize {
-    let m = manager(auth, vec![], vec![locator.to_string()]);
-    let mut config = m.zenoh_config_for_test().expect("config builds");
+/// A session holding `auth`'s credentials with its own policy off, dialing
+/// `locator`.
+fn raw_dialer(auth: TeamAuth, locator: &str) -> zenoh::Session {
+    let mut config = dialer_config(auth, locator);
     config
         .insert_json5("access_control/enabled", "false")
         .expect("policy off");
-    let raw = zenoh::open(config).wait().expect("raw session opens");
-    let (tx, rx) = mpsc::channel();
-    let key = NetworkManager::data_key("/team/cmd_vel");
-    let _sub = robot
-        .declare_subscriber(key.clone())
-        .callback(move |_| {
-            let _ = tx.send(());
-        })
-        .wait()
-        .unwrap();
-    let deadline = Instant::now() + budget;
-    let mut got = 0;
-    while Instant::now() < deadline && got == 0 {
-        raw.put(key.clone(), frame(0)).wait().unwrap();
-        while rx.recv_timeout(Duration::from_millis(50)).is_ok() {
-            got += 1;
-        }
-    }
-    got
+    zenoh::open(config).wait().expect("raw session opens")
 }
 
 #[test]
@@ -298,24 +493,17 @@ fn a_robot_drops_a_viewer_put_on_ingress() {
     let acme = TestTeam::new("acme", 1);
     for link in LINKS {
         let (robot, locator) = robot_declaring_to_all(link, acme.machine(TeamRole::Robot, 1));
-        assert!(
-            raw_put_count(
-                &robot,
-                acme.machine(TeamRole::Operator, 3),
-                &locator,
-                Duration::from_secs(10)
-            ) > 0,
-            "{link}: an operator's raw put arrives"
-        );
+        let operator = raw_dialer(acme.machine(TeamRole::Operator, 3), &locator);
         assert_eq!(
-            raw_put_count(
-                &robot,
-                acme.machine(TeamRole::Viewer, 2),
-                &locator,
-                Duration::from_secs(10)
-            ),
-            0,
-            "{link}: the robot's ingress rules drop a viewer's put it routed to"
+            puts_then_query(&operator, &robot),
+            Landing::delivered(),
+            "{link}: an operator's raw puts arrive, in order, ahead of its query"
+        );
+        let viewer = raw_dialer(acme.machine(TeamRole::Viewer, 2), &locator);
+        assert_eq!(
+            puts_then_query(&viewer, &robot),
+            Landing::dropped_on_ingress(),
+            "{link}: the robot's ingress rules drop a viewer's puts it routed to"
         );
     }
 }
@@ -325,22 +513,17 @@ fn a_machine_of_another_team_never_links() {
     let acme = TestTeam::new("acme", 1);
     let rival = TestTeam::new("rival", 1);
     for link in LINKS {
-        let (robot, locator) = listen(link, acme.machine(TeamRole::Robot, 1));
-        let member = manager(
-            acme.machine(TeamRole::Viewer, 2),
-            vec![],
-            vec![locator.clone()],
+        let (_robot, locator) = listen(link, acme.machine(TeamRole::Robot, 1));
+        let (_member, peer) = dial_once(
+            dialer_config(acme.machine(TeamRole::Viewer, 2), &locator),
+            &format!("{link}: a team machine"),
         );
-        assert!(
-            linked(&member, Duration::from_secs(10)),
-            "{link}: a team machine links to the listener"
+        assert!(peer, "{link}: a team machine links to the listener");
+        let (_outsider, peer) = dial_once(
+            dialer_config(rival.machine(TeamRole::Owner, 2), &locator),
+            &format!("{link}: a machine of another team"),
         );
-        let outsider = manager(rival.machine(TeamRole::Owner, 2), vec![], vec![locator]);
-        assert!(
-            !linked(&outsider, Duration::from_secs(3)),
-            "{link}: a leaf from another team's CA never links"
-        );
-        drop(robot);
+        assert!(!peer, "{link}: a leaf from another team's CA never links");
     }
 }
 
@@ -377,7 +560,7 @@ fn the_previous_generation_gets_the_bundle_session_only() {
     let g1_only = TeamAuth::new(&key, &leaf, g1.anchors(None)).expect("g1 credentials");
     for link in LINKS {
         let robot_auth = g2.machine(TeamRole::Robot, 1);
-        let (robot, data_locator) = listen(link, robot_auth.clone());
+        let (_robot, data_locator) = listen(link, robot_auth.clone());
         let lane_locator = format!("{link}/127.0.0.1:{}", free_port());
         let lane = bundle_manager(robot_auth, vec![lane_locator.clone()], vec![]);
         let ls = lane.session().expect("the bundle listener opens");
@@ -396,9 +579,20 @@ fn the_previous_generation_gets_the_bundle_session_only() {
             .wait()
             .unwrap();
 
-        let old_data = manager(holds_next.clone(), vec![], vec![data_locator]);
+        let (_member, peer) = dial_once(
+            dialer_config(g2.machine(TeamRole::Viewer, 2), &data_locator),
+            &format!("{link}: a g2 machine"),
+        );
         assert!(
-            !linked(&old_data, Duration::from_secs(3)),
+            peer,
+            "{link}: a g2 machine links to the robot's data session"
+        );
+        let (_old_data, peer) = dial_once(
+            dialer_config(holds_next.clone(), &data_locator),
+            &format!("{link}: a g1 machine on the data session"),
+        );
+        assert!(
+            !peer,
             "{link}: the robot's data session does not trust the retired g1 CA"
         );
         let err = bundle_manager(g1_only.clone(), vec![], vec![lane_locator.clone()])
@@ -445,7 +639,6 @@ fn the_previous_generation_gets_the_bundle_session_only() {
             0,
             "{link}: no frames cross the bundle session"
         );
-        drop(robot);
     }
 }
 
@@ -462,6 +655,18 @@ fn forged_session(
     listen: Vec<String>,
     connect: Vec<String>,
 ) -> zenoh::Session {
+    zenoh::open(forged_config(auth, leaf_der, listen, connect))
+        .wait()
+        .expect("forged dialer opens")
+}
+
+/// The zenoh config [`forged_session`] opens.
+fn forged_config(
+    auth: TeamAuth,
+    leaf_der: &[u8],
+    listen: Vec<String>,
+    connect: Vec<String>,
+) -> zenoh::Config {
     let m = manager(auth, listen, connect);
     let mut config = m.zenoh_config_for_test().expect("config builds");
     let leaf = format!("\"{}\"", TestTeam::pem_base64("CERTIFICATE", &[leaf_der]));
@@ -473,7 +678,7 @@ fn forged_session(
     config
         .insert_json5("access_control/enabled", "false")
         .unwrap();
-    zenoh::open(config).wait().expect("forged dialer opens")
+    config
 }
 
 /// Count frames `from` puts that reach a subscriber on `to` within `budget`.
@@ -508,16 +713,27 @@ fn a_retired_ca_cannot_sign_its_way_into_the_data_session() {
     let forged = g1.forged_leaf(2, TeamRole::Robot, &attacker_key);
     for link in LINKS {
         let robot_auth = g2.machine(TeamRole::Robot, 1);
-        let (robot, locator) = listen(link, robot_auth.clone());
-        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &locator);
-        assert!(
-            !raw_linked(&attacker, Duration::from_secs(3)),
-            "{link}: the data session refuses a leaf a retired CA signed"
+        let (_robot, locator) = listen(link, robot_auth.clone());
+        let (_member, peer) = dial_once(
+            dialer_config(g2.machine(TeamRole::Viewer, 2), &locator),
+            &format!("{link}: a g2 machine"),
         );
-        assert_eq!(
-            raw_deliver(&attacker, robot.session().unwrap(), Duration::from_secs(2)),
-            0,
-            "{link}"
+        assert!(
+            peer,
+            "{link}: a g2 machine links to the robot's data session"
+        );
+        let (_attacker, peer) = dial_once(
+            forged_config(
+                g2.machine(TeamRole::Viewer, 7),
+                &forged,
+                vec![],
+                vec![locator],
+            ),
+            &format!("{link}: the forged dialer"),
+        );
+        assert!(
+            !peer,
+            "{link}: the data session refuses a leaf a retired CA signed"
         );
 
         // Control: the same robot session with the retired CA added back to
@@ -533,9 +749,17 @@ fn a_retired_ca_cannot_sign_its_way_into_the_data_session() {
             .insert_json5("transport/link/tls/root_ca_certificate_base64", &roots)
             .unwrap();
         let exposed = zenoh::open(config).wait().expect("exposed robot opens");
-        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &exposed_locator);
+        let (attacker, peer) = dial_once(
+            forged_config(
+                g2.machine(TeamRole::Viewer, 7),
+                &forged,
+                vec![],
+                vec![exposed_locator],
+            ),
+            &format!("{link}: the forged dialer"),
+        );
         assert!(
-            raw_linked(&attacker, Duration::from_secs(10)),
+            peer,
             "{link}: with the retired CA as an anchor the forged leaf links"
         );
         assert!(
@@ -547,32 +771,26 @@ fn a_retired_ca_cannot_sign_its_way_into_the_data_session() {
         // dials is refused by the dialer's anchors, and accepted by a dialer
         // whose anchors include the retired CA.
         let forged_locator = format!("{link}/127.0.0.1:{}", free_port());
-        let forged_listener = forged_session(
+        let _forged_listener = forged_session(
             g2.machine(TeamRole::Viewer, 7),
             &forged,
             vec![forged_locator.clone()],
             vec![],
         );
-        let dialer = manager(
-            g2.machine(TeamRole::Robot, 1),
-            vec![],
-            vec![forged_locator.clone()],
+        let (_dialer, peer) = dial_once(
+            dialer_config(g2.machine(TeamRole::Robot, 1), &forged_locator),
+            &format!("{link}: a robot's data dialer"),
         );
         assert!(
-            !linked(&dialer, Duration::from_secs(3)),
+            !peer,
             "{link}: a robot's data session refuses a listener a retired CA signed"
         );
-        let m = manager(g2.machine(TeamRole::Robot, 1), vec![], vec![forged_locator]);
-        let mut config = m.zenoh_config_for_test().unwrap();
+        let mut config = dialer_config(g2.machine(TeamRole::Robot, 1), &forged_locator);
         config
             .insert_json5("transport/link/tls/root_ca_certificate_base64", &roots)
             .unwrap();
-        let exposed_dialer = zenoh::open(config).wait().expect("exposed dialer opens");
-        assert!(
-            raw_linked(&exposed_dialer, Duration::from_secs(10)),
-            "{link}: a dialer anchoring the retired CA accepts it"
-        );
-        drop(forged_listener);
+        let (_exposed_dialer, peer) = dial_once(config, &format!("{link}: the exposed dialer"));
+        assert!(peer, "{link}: a dialer anchoring the retired CA accepts it");
     }
 }
 
@@ -587,22 +805,38 @@ fn cross_manager(auth: TeamAuth, listen: Vec<String>, connect: Vec<String>) -> N
     manager
 }
 
-/// A raw session from `m`'s config with `policy` (the session's generated
-/// policy) plus one rule that declares subscribers to any peer. A peer of any
-/// name then routes puts to it, and its ingress rules decide what arrives.
-fn declaring_to_any(m: &NetworkManager, policy: serde_json::Value) -> zenoh::Session {
+/// `m`'s zenoh config with `policy` (the generated policy the caller passes) plus
+/// rules for any peer: subscribers on `cerulion_w2/**` are declared to it, and
+/// a [`puts_then_query`] queryable under [`SENTINEL_PREFIX`] is declared to it
+/// and takes its query. A peer of any name then routes puts to the session,
+/// its ingress rules decide which arrive, and the query that follows them
+/// arrives.
+fn declaring_to_any(m: &NetworkManager, policy: serde_json::Value) -> zenoh::Config {
     let mut config = m.zenoh_config_for_test().expect("config builds");
     let mut acl = policy;
-    acl["rules"]
-        .as_array_mut()
-        .unwrap()
-        .push(serde_json::json!({
-            "id": "test_declare_to_any",
-            "permission": "allow",
-            "flows": ["egress"],
-            "messages": ["declare_subscriber"],
-            "key_exprs": ["cerulion_w2/**"],
-        }));
+    let sentinel = format!("{SENTINEL_PREFIX}/**");
+    let rules = acl["rules"].as_array_mut().unwrap();
+    rules.push(serde_json::json!({
+        "id": "test_declare_to_any",
+        "permission": "allow",
+        "flows": ["egress"],
+        "messages": ["declare_subscriber"],
+        "key_exprs": ["cerulion_w2/**"],
+    }));
+    rules.push(serde_json::json!({
+        "id": "test_sentinel_to_any",
+        "permission": "allow",
+        "flows": ["egress"],
+        "messages": ["declare_queryable"],
+        "key_exprs": [sentinel],
+    }));
+    rules.push(serde_json::json!({
+        "id": "test_sentinel_from_any",
+        "permission": "allow",
+        "flows": ["ingress"],
+        "messages": ["query"],
+        "key_exprs": [sentinel],
+    }));
     acl["subjects"]
         .as_array_mut()
         .unwrap()
@@ -612,20 +846,20 @@ fn declaring_to_any(m: &NetworkManager, policy: serde_json::Value) -> zenoh::Ses
         .unwrap()
         .push(serde_json::json!({
             "id": "test_policy_any",
-            "rules": ["test_declare_to_any"],
+            "rules": ["test_declare_to_any", "test_sentinel_to_any", "test_sentinel_from_any"],
             "subjects": ["test_any"],
         }));
     config
         .insert_json5("access_control", &acl.to_string())
         .unwrap();
-    zenoh::open(config).wait().expect("session opens")
+    config
 }
 
 /// The next generation's CA key mints `robot.g2` for a key of its own. A g2
 /// robot's data session refuses that leaf in both directions; its
-/// cross-generation session, which anchors the next CA, links it and denies
-/// every message, since `robot.g2` is not a next-generation name. A genuine
-/// g3 robot, rotated and holding g2 as its previous generation, exchanges
+/// cross-generation session, which anchors the next CA, links it and drops
+/// its puts, since `robot.g2` is not a next-generation name. A genuine g3
+/// robot, rotated and holding g2 as its previous generation, exchanges
 /// frames with the g2 robot over the cross sessions.
 #[test]
 fn a_next_ca_cannot_claim_a_current_generation_name() {
@@ -638,18 +872,29 @@ fn a_next_ca_cannot_claim_a_current_generation_name() {
 
         // 1. The data listener refuses the forged leaf at the handshake.
         let (data, data_locator) = listen(link, robot.clone());
-        let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &data_locator);
+        let (_attacker, peer) = dial_once(
+            forged_config(
+                g2.machine(TeamRole::Viewer, 7),
+                &forged,
+                vec![],
+                vec![data_locator.clone()],
+            ),
+            &format!("{link}: the forged dialer"),
+        );
         assert!(
-            !raw_linked(&attacker, Duration::from_secs(3)),
+            !peer,
             "{link}: the data session refuses a leaf the next CA signed"
         );
-        assert_eq!(
-            raw_deliver(&attacker, data.session().unwrap(), Duration::from_secs(2)),
-            0,
-            "{link}"
+        // Control: a genuine g2 viewer dialing the same data listener links,
+        // and the robot's frames reach it.
+        let (_member, peer) = dial_once(
+            dialer_config(g2.machine(TeamRole::Viewer, 2), &data_locator),
+            &format!("{link}: a g2 machine"),
         );
-        // Control: the robot's frames reach a genuine g2 viewer that dials the
-        // same data listener.
+        assert!(
+            peer,
+            "{link}: a g2 machine links to the robot's data session"
+        );
         let viewer = manager(g2.machine(TeamRole::Viewer, 2), vec![], vec![data_locator]);
         assert!(
             deliver(&data, &viewer, "/team/telemetry", Duration::from_secs(10)) > 0,
@@ -660,7 +905,12 @@ fn a_next_ca_cannot_claim_a_current_generation_name() {
         // and drops its puts, even with subscribers declared to any peer.
         let cross_locator = format!("{link}/127.0.0.1:{}", free_port());
         let cross_m = cross_manager(robot.clone(), vec![cross_locator.clone()], vec![]);
-        let cross = declaring_to_any(&cross_m, robot.cross_access_control().unwrap());
+        let cross = zenoh::open(declaring_to_any(
+            &cross_m,
+            robot.cross_access_control().unwrap(),
+        ))
+        .wait()
+        .expect("cross session opens");
         // The forged dialer's own data anchors (g2) verify the robot's g2 leaf.
         let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &cross_locator);
         assert!(
@@ -668,22 +918,25 @@ fn a_next_ca_cannot_claim_a_current_generation_name() {
             "{link}: the cross session completes the handshake with a next-CA chain"
         );
         assert_eq!(
-            raw_deliver(&attacker, &cross, Duration::from_secs(5)),
-            0,
-            "{link}: and denies every put from a current-generation name"
+            puts_then_query(&attacker, &cross),
+            Landing::dropped_on_ingress(),
+            "{link}: and drops every put from a current-generation name"
         );
         // Control: the same forged dialer against a cross session whose
         // policy names generation 2 instead (the policy a data session has)
-        // gets its put through, so the 0 above is the name mismatch.
+        // gets its puts through, so the drop above is the name mismatch.
         let wrong_locator = format!("{link}/127.0.0.1:{}", free_port());
         let wrong_m = cross_manager(robot.clone(), vec![wrong_locator.clone()], vec![]);
-        let wrong = declaring_to_any(&wrong_m, access_control(robot.team(), 2));
+        let wrong = zenoh::open(declaring_to_any(&wrong_m, access_control(robot.team(), 2)))
+            .wait()
+            .expect("cross session opens");
         let attacker = forged_dialer(g2.machine(TeamRole::Viewer, 7), &forged, &wrong_locator);
-        assert!(
-            raw_deliver(&attacker, &wrong, Duration::from_secs(10)) > 0,
-            "{link}: control, a cross session naming g2 takes the forged robot's put"
+        assert_eq!(
+            puts_then_query(&attacker, &wrong),
+            Landing::delivered(),
+            "{link}: control, a cross session naming g2 takes the forged robot's puts"
         );
-        // Control: a genuine g3 robot's raw put reaches the same cross
+        // Control: a genuine g3 robot's raw puts reach the same cross
         // session, and the frame path works both ways over the cross pair.
         let g3_robot = g3.machine_after_rotation(TeamRole::Robot, 4);
         let g3_m = cross_manager(g3_robot.clone(), vec![], vec![cross_locator]);
@@ -692,9 +945,10 @@ fn a_next_ca_cannot_claim_a_current_generation_name() {
             .insert_json5("access_control/enabled", "false")
             .unwrap();
         let g3_raw = zenoh::open(g3_config).wait().unwrap();
-        assert!(
-            raw_deliver(&g3_raw, &cross, Duration::from_secs(10)) > 0,
-            "{link}: control, a g3 robot's put reaches the g2 cross session"
+        assert_eq!(
+            puts_then_query(&g3_raw, &cross),
+            Landing::delivered(),
+            "{link}: control, a g3 robot's puts reach the g2 cross session"
         );
         let pair_locator = format!("{link}/127.0.0.1:{}", free_port());
         let old_side = cross_manager(robot.clone(), vec![pair_locator.clone()], vec![]);
@@ -728,28 +982,37 @@ fn a_next_ca_cannot_claim_a_current_generation_name() {
             vec![forged_locator.clone()],
             vec![],
         );
-        let data_dialer = manager(robot.clone(), vec![], vec![forged_locator.clone()]);
+        let (_data_dialer, peer) = dial_once(
+            dialer_config(robot.clone(), &forged_locator),
+            &format!("{link}: a robot's data dialer"),
+        );
         assert!(
-            !linked(&data_dialer, Duration::from_secs(3)),
+            !peer,
             "{link}: a robot's data dialer refuses a listener the next CA signed"
         );
         let forged_dialer_locator = forged_locator.clone();
         let cross_dialer_m = cross_manager(robot.clone(), vec![], vec![forged_locator]);
-        let cross_dialer = declaring_to_any(&cross_dialer_m, robot.cross_access_control().unwrap());
-        assert!(
-            raw_linked(&cross_dialer, Duration::from_secs(10)),
-            "{link}: the cross dialer completes the handshake"
+        let (cross_dialer, peer) = dial_once(
+            declaring_to_any(&cross_dialer_m, robot.cross_access_control().unwrap()),
+            &format!("{link}: a robot's cross dialer"),
         );
+        assert!(peer, "{link}: the cross dialer completes the handshake");
         assert_eq!(
-            raw_deliver(&forged_listener, &cross_dialer, Duration::from_secs(5)),
-            0,
+            puts_then_query(&forged_listener, &cross_dialer),
+            Landing::dropped_on_ingress(),
             "{link}: and drops every put from the forged listener"
         );
         let wrong_dialer_m = cross_manager(robot.clone(), vec![], vec![forged_dialer_locator]);
-        let wrong_dialer = declaring_to_any(&wrong_dialer_m, access_control(robot.team(), 2));
-        assert!(
-            raw_deliver(&forged_listener, &wrong_dialer, Duration::from_secs(10)) > 0,
-            "{link}: control, a cross dialer naming g2 takes the forged listener's put"
+        let wrong_dialer = zenoh::open(declaring_to_any(
+            &wrong_dialer_m,
+            access_control(robot.team(), 2),
+        ))
+        .wait()
+        .expect("cross dialer opens");
+        assert_eq!(
+            puts_then_query(&forged_listener, &wrong_dialer),
+            Landing::delivered(),
+            "{link}: control, a cross dialer naming g2 takes the forged listener's puts"
         );
     }
 }
