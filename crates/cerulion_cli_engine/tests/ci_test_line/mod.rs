@@ -3,22 +3,27 @@
 //!
 //! `ci_test_coverage_test` (is every package with tests run by some step?) and
 //! `ci_doc_pin_walk_test` (is every doc-reading binary's package run beside its
-//! marker?) ask the same question of the same workflow lines, and each used to
-//! carry its own copy of the answer. The reader lives here once, so a runner
-//! form one gate learns is a form the other reads too.
+//! marker?) both ask it of workflow lines, so both read it through this one
+//! module: a runner form one gate credits, the other credits too.
+//!
+//! The reader splits on whitespace and does not parse shell quoting, so a `|`
+//! or `;` inside a quoted argument (a nextest `-E` filter, say) splits the
+//! command there.
 
-/// The lines of `lines` as the shell reads them: a line ending in `\` is
-/// joined to the next, so a flag on a continuation line belongs to the
-/// command it continues.
+/// The lines of `lines` as the shell reads them: a line whose last character
+/// is `\` is joined to the next, so a flag on a continuation line belongs to
+/// the command it continues. A `#` comment line is never joined: the shell
+/// does not continue a comment.
 pub fn logical_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut out = Vec::new();
     let mut pending: Option<String> = None;
     for line in lines {
         let mut joined = pending.take().unwrap_or_default();
         joined.push_str(line);
-        match joined.trim_end().strip_suffix('\\') {
-            Some(head) => pending = Some(format!("{head} ")),
-            None => out.push(joined),
+        let comment = line.trim_start().starts_with('#');
+        match joined.strip_suffix('\\') {
+            Some(head) if !comment => pending = Some(format!("{head} ")),
+            _ => out.push(joined),
         }
     }
     out.extend(pending);

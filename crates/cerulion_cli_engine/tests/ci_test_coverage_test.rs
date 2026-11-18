@@ -3194,6 +3194,17 @@ fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
     .collect();
     assert!(workflows_name(&continued, "norun").is_none());
     assert!(workflows_name(&continued, "later").is_some());
+
+    // A `\` followed by a space escapes the space and continues nothing, and
+    // a comment is never continued.
+    assert_eq!(
+        logical_lines(["cargo test -p a \\ ", "--no-run"]),
+        vec!["cargo test -p a \\ ".to_string(), "--no-run".to_string()]
+    );
+    assert_eq!(
+        logical_lines(["# note \\", "cargo test -p a"]),
+        vec!["# note \\".to_string(), "cargo test -p a".to_string()]
+    );
 }
 
 /// The `shard:` matrix is read in BOTH YAML list forms, and per JOB.

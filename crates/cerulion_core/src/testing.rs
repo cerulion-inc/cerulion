@@ -2445,21 +2445,42 @@ mod robust_ratio_tests {
             let mut child = cmd
                 .spawn()
                 .unwrap_or_else(|e| panic!("spawn the child arm `{test}`: {e}"));
+            // Both pipes drain on their own threads while this one polls, so
+            // a child that prints more than a pipe holds cannot stall.
+            fn drain<R: std::io::Read + Send + 'static>(
+                pipe: Option<R>,
+            ) -> std::thread::JoinHandle<String> {
+                std::thread::spawn(move || {
+                    let mut text = String::new();
+                    if let Some(mut pipe) = pipe {
+                        let _ = pipe.read_to_string(&mut text);
+                    }
+                    text
+                })
+            }
+            let stdout = drain(child.stdout.take());
+            let stderr = drain(child.stderr.take());
             let started = Instant::now();
-            while child.try_wait().expect("poll the child arm").is_none() {
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll the child arm") {
+                    break status;
+                }
                 if started.elapsed() > CHILD_DEADLINE {
                     let _ = child.kill();
-                    panic!("child arm `{test}` ran past {CHILD_DEADLINE:?}");
+                    let _ = child.wait();
+                    panic!(
+                        "child arm `{test}` ran past {CHILD_DEADLINE:?}:\n{}\n{}",
+                        stdout.join().unwrap_or_default(),
+                        stderr.join().unwrap_or_default()
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(10));
-            }
-            let out = child.wait_with_output().expect("collect the child arm");
-            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&out.stderr);
+            };
+            let stdout = stdout.join().expect("the stdout drain");
+            let stderr = stderr.join().expect("the stderr drain");
             assert!(
-                out.status.success(),
-                "child arm `{test}` failed ({}):\n{stdout}\n{stderr}",
-                out.status
+                status.success(),
+                "child arm `{test}` failed ({status}):\n{stdout}\n{stderr}"
             );
             // libtest exits 0 when `--exact` matches no test, and an arm that
             // returned early also passes, so neither a zero exit nor the

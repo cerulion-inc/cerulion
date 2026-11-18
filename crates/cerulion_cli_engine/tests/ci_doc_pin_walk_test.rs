@@ -2216,9 +2216,24 @@ fn a_two_space_comment_does_not_open_a_job_and_a_marker_never_names_its_own_pack
         "      - run: cargo nextest run --profile ci -p pkg -E 'not kind(lib)'",
         "pkg"
     ));
-    // A doctest-only step runs none of the package's test binaries.
+    // A doctest-only step runs none of the package's unit or integration
+    // test binaries.
     assert!(!line_names_package(
         "      - run: cargo test -p pkg --doc",
+        "pkg"
+    ));
+    // A step's lines are read as the shell reads them: a `-p` on a
+    // continuation line names the package, and a `--no-run` there means the
+    // command runs nothing.
+    assert!(lines_name_package(
+        [
+            "      - run: cargo nextest run --profile ci \\",
+            "          -p pkg",
+        ],
+        "pkg"
+    ));
+    assert!(!lines_name_package(
+        ["      - run: cargo test -p pkg \\", "          --no-run"],
         "pkg"
     ));
     // Whole-token matching, which is what keeps a name off its own prefix.

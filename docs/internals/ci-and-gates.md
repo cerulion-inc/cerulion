@@ -637,8 +637,10 @@ on the root workspace, which makes coverage a hand list.
 `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` is the walk that holds it, counting only
 steps and jobs that can actually fail a pull request. A step credits the packages a
 `cargo test` or `cargo nextest run` command names with `-p`, or the one `ci_test_shard.sh` takes;
-a command carrying `--doc` or `--no-run` credits none, because it runs none of the package's unit
-or integration tests. The walk drives
+a command whose cargo flags (those before a bare `--`) carry `--doc` or `--no-run` credits none,
+because it runs none of the package's unit or integration tests. Each shell command of a line is
+read on its own, a `\` continuation joins the line it continues, and a step's `name:` never
+counts. `ci_doc_pin_walk_test` reads workflow lines through the same reader. The walk drives
 `tools/scripts/ci_test_shard.sh --check` to prove the shard partition is TOTAL and DISJOINT, so a
 broken split is a local red rather than a silent gap.
 
