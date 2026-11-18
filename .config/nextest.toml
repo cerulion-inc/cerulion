@@ -128,7 +128,7 @@ test-group = 'default-namespace'
 # from one particular sibling, so they claim every runner slot instead of
 # joining a mutex group.
 #
-# SIX are whole-file `#![cfg(not(debug_assertions))]` and so run only in the
+# SEVEN are whole-file `#![cfg(not(debug_assertions))]` and so run only in the
 # release latency lanes. SIX are DEBUG-OK and therefore gate EVERY pull
 # request - `cross_thread_rtt_test`, `flat_latency_test`,
 # `gateway_egress_congestion_iox2_test`, `ingress_publish_raw_notify_iox2_test`,
@@ -152,6 +152,7 @@ filter = '''
 + binary(=live_exact_deadline_iox2_test)
 + binary(=period_decompose_bench_test)
 + binary(=period_park_iox2_test)
++ binary(=period_park_latency_test)
 + binary(=streaming_latency_bench_test)
 '''
 threads-required = 'num-cpus'

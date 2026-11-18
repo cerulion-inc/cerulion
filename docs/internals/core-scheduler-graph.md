@@ -360,7 +360,7 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   runs the normal park. `period_park::refusal` is the pure gate: the first failing term in a
   fixed order (`no_monitor_wait_primitive`, `park_off`, `barrier`, `credit_edge`, `fd_source`,
   `no_data_wake`), and `announce` logs it once per runtime as `period park requested but not
-  engaged`. On aarch64 (`WFE`) no data arrival has been predicted yet, so a data wait there is naps alone. Record-only like every park path; pins in `period_park_iox2_test`.
+  engaged`. On aarch64 (`WFE`) no data arrival has been predicted yet, so a data wait there is naps alone. Record-only like every park path; pins in `period_park_iox2_test` (counts and order) and `period_park_latency_test` (its wall-clock bounds, release only, on Linux).
 - iceoryx2 events cannot be monitor-waited (they are sockets; see the transport
   dossier), hence the SHM DOORBELL: a cache-line-aligned atomic per topic; the publisher
   rings AFTER the iceoryx2 send; where the CPU carries a monitor-wait primitive the

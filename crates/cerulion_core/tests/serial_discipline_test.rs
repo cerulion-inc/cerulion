@@ -702,9 +702,13 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
     ),
     (
         "period_park_iox2_test",
-        "bounds how long after its write a frame is read across a kernel nap \
-         and judges a 1 kHz grid against wall time; DEBUG-OK, so it gates every \
-         PR, and a loaded runner stretches both",
+        "runs live consumers and a 1 kHz ticker for counts and order only; \
+         DEBUG-OK, so it gates every PR, and a loaded runner slows its live runs",
+    ),
+    (
+        "period_park_latency_test",
+        "release-only: the period-park's frame delays and its 1 kHz grid against \
+         wall time",
     ),
     (
         "streaming_latency_bench_test",
