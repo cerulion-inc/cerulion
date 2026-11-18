@@ -1304,8 +1304,8 @@ pub enum NodeAction {
         /// Hard opt-out from the live-loop monitor-wait park, on every target;
         /// no environment variable can re-enable it. Without this flag the park
         /// is on by default everywhere.
-        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
-        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// AMD MWAITX, Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost; elsewhere it is a bounded
         /// park that never busy-spins. This flag restores the blocking wait on
@@ -1443,8 +1443,8 @@ pub enum GraphAction {
         /// Hard opt-out from the live-loop monitor-wait park, on every target;
         /// no environment variable can re-enable it. Without this flag, on the
         /// live (real or external) clock the park is on by default everywhere.
-        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
-        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// AMD MWAITX, Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost; elsewhere it is a bounded
         /// park that never busy-spins. This flag restores the blocking wait on

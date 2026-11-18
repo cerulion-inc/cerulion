@@ -367,8 +367,9 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   same layout with a futex word: the publisher bumps the counter, reads `parked`, and
   only while a consumer holds a claim bumps the word and issues a shared `FUTEX_WAKE`,
   so a host whose consumers park in hardware pays one increment and one load per ring.
-- Platform park ladder (runtime-detected): x86 WAITPKG (UMWAIT) / AMD MWAITX where
-  present; ARM WFE + event stream (WFE bypasses cpuidle entirely; it architecturally
+- Platform park ladder (runtime-detected): x86 WAITPKG (UMWAIT), else AMD MWAITX
+  (`MONITORX` then `MWAITX`, hint 0xF0, relative TSC-rate timer clamped to 1..=u32::MAX)
+  where present; ARM WFE + event stream (WFE bypasses cpuidle entirely; it architecturally
   cannot hit the cache-flushing deep C-state); no-primitive targets (macOS included) run
   the park default-ON in a degraded chunked short-sleep-recheck: never a busy-spin,
   never a long single sleep (macOS timer-coalesces long sleeps; only a short final sleep
@@ -383,7 +384,7 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   (https://github.com/cerulion-inc/cerulion/issues/755). Units are opt in: the planner
   (`graph::executor::derive_units`) runs a process as one unit unless the graph's profile or a
   node's `isolate: true` splits it.
-- The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/WFE-parked thread is RUNNING
+- The hardware park is OS-COOPERATIVE (it yields to a same-core peer): a UMWAIT/MWAITX/WFE-parked thread is RUNNING
   to the scheduler, so `monitor_wait_block` slices the hardware arm at the shared 20 µs
   `monitor_wait::PARK_RECHECK` (the REQUESTED slice; on aarch64 the effective slice is
   one event-stream period, next bullet; rmw's `park_block` uses the same constant) and ends
@@ -444,7 +445,7 @@ this section is the opt-out's machinery.)
   `barrier_level_gate_subprocess_iox2_test`, which merges the two processes' traces and
   asserts them against the same hand oracle. It is `#[ignore]`'d and runs on demand on
   any Unix with `-- --ignored`, over a real `MAP_SHARED` page and the host's own park
-  shape (x86 WAITPKG, aarch64 WFE, or the macOS sleep-recheck); the CI gate is the
+  shape (x86 WAITPKG or MWAITX, aarch64 WFE, or the macOS sleep-recheck); the CI gate is the
   in-process sibling).
 - **The MID-LEVEL barrier covers the one edge the DAG does not model.** The level-boundary
   barrier orders edges that CROSS a boundary; a plain non-trigger `#[input]` whose consumer
