@@ -5,9 +5,9 @@ A `cargo test -p X` step per package resolves features for X alone, so each step
 rebuilds the crates X shares with the leg's other packages. `build` compiles a
 group of packages in ONE `cargo test --no-run`, then runs `cargo test` over the
 same packages (it compiles nothing) with this script as cargo's target runner,
-recording the environment and working directory cargo gives each test binary;
-cargo runs the packages' doctests at the end of that run, against the libraries
-the build compiled. `run -- cargo test -p X ...` then runs the prebuilt binaries
+recording the environment and working directory cargo gives each test binary
+the build listed; cargo then runs the packages' doctests, which rustdoc hands to
+the same runner and which it runs, against the libraries the build compiled. `run -- cargo test -p X ...` then runs the prebuilt binaries
 that command selects: one process per binary, cargo's order, cargo's
 environment, the same arguments, cargo's fail-fast rule. `audit` fails when a
 built binary had no unfiltered run, when a full leg built fewer binaries than
@@ -31,7 +31,7 @@ import time
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 SELF = os.path.abspath(__file__)
 SKIP_ENV = {'PWD', 'OLDPWD', 'SHLVL', '_'}
-SLACK_NS = 2_000_000_000
+SLACK_NS = 200_000_000
 # libtest arguments that still run every test of a binary
 WHOLE_RUN_ARGS = {'--nocapture', '--show-output', '--include-ignored', '-q', '--quiet'}
 
@@ -333,7 +333,18 @@ def cmd_phase(name, cmd):
 
 
 def cmd_record(argv):
+    """Record a test binary the build listed; run anything else for real. Cargo
+    hands rustdoc the same runner (`--test-runtool`), so a doctest arrives here
+    too, and it runs."""
     exe, seq = os.path.realpath(argv[0]), time.monotonic_ns()
+    with open(os.environ['CI_BUILT_TESTS_ARTIFACTS']) as f:
+        listed = set(json.load(f))
+    if exe not in listed:
+        env = {k: v for k, v in os.environ.items() if not k.startswith('CI_BUILT_TESTS_')}
+        if os.environ.get('CI_BUILT_TESTS_DYLD') and 'DYLD_FALLBACK_LIBRARY_PATH' not in env:
+            env['DYLD_FALLBACK_LIBRARY_PATH'] = os.environ['CI_BUILT_TESTS_DYLD']
+        sys.stdout.flush()
+        os.execve(argv[0], argv, env)
     with open(os.path.join(os.environ['CI_BUILT_TESTS_RECORD_DIR'], f'{seq}.json'), 'w') as f:
         json.dump({'executable': exe, 'cwd': os.getcwd(), 'env': dict(os.environ), 'seq': seq}, f)
     return 0
@@ -379,7 +390,14 @@ def cmd_build(group, features, specs):
         runner = 'CARGO_TARGET_' + host_triple().upper().replace('-', '_') + '_RUNNER'
         if runner in os.environ or any(c.isspace() for c in sys.executable + SELF):
             die(f'{runner} is already set, or a path holds whitespace a cargo runner cannot carry')
-        env = dict(os.environ, CI_BUILT_TESTS_RECORD_DIR=record_dir)
+        with open(state_path(f'artifacts-{group}.json'), 'w') as f:
+            json.dump(sorted(artifacts), f)
+        env = dict(os.environ, CI_BUILT_TESTS_RECORD_DIR=record_dir,
+                   CI_BUILT_TESTS_ARTIFACTS=state_path(f'artifacts-{group}.json'))
+        if sys.platform == 'darwin':
+            env['CI_BUILT_TESTS_DYLD'] = cargo_dylib_path(
+                sorted(native), target_dir(), rustc('--print', 'sysroot').strip(), host_triple(),
+                os.environ.get('DYLD_FALLBACK_LIBRARY_PATH', ''), os.environ.get('HOME', ''))
         env[runner] = f'{sys.executable} -B {SELF} record'
         if subprocess.run(['cargo', 'test'] + args, env=env, cwd=ROOT).returncode != 0:
             die(f'group {group}: the recording run or the doctests failed')
@@ -481,7 +499,7 @@ def cmd_audit(floor, not_run):
         print('floor: not applied, the selection left packages out of this leg')
     profile = os.path.join(target_dir(), 'debug')
     if not os.path.isdir(os.path.join(profile, '.fingerprint')):
-        die(f'{profile}/.fingerprint does not exist, so no compile could be dated')
+        bad.append(f'{profile}/.fingerprint does not exist, so no compile could be dated')
     units = compiled_units(profile, min(p['begin'] for p in phases))
     counts, libs, stray = attribute(units, phases, SLACK_NS)
     for name, n in counts.items():
@@ -639,6 +657,9 @@ def self_test():
             ('a run before the build', good.replace('      - name: Build', '      - name: e\n        run: python3 '
                                                      'ci_built_tests.py run -- cargo test -p a\n      - name: Build'), 2),
             ('no audit', good.split('      - name: Audit')[0], 1),
+            ('an audit before the last run', good.replace('      - name: c\n', '      - name: Audit\n        run: '
+                                                          'python3 ci_built_tests.py audit\n      - name: c\n')
+             .split('      - name: Audit\n        run: python3 ci_built_tests.py audit --floor 3')[0], 1),
             ('a gated audit', good.replace('      - name: Audit\n', '      - name: Audit\n        if: always()\n'), 1)):
         check(f'wiring: {name}', len(workflow_complaints(bad)), want)
     end_to_end(check, refused)
@@ -662,7 +683,12 @@ elif a[:1] == ['test']:
     for exe in exes:
         env = dict(os.environ, CARGO_PKG_NAME='pkg', FROM_CARGO='yes')
         subprocess.run(runner + [exe, 'x'], env=env, cwd=os.path.join(tmp, 'pkg'), check=True)
-    open(os.path.join(tmp, 'trace'), 'a').write('doctests ' + ' '.join(a) + '\\n')
+    doctest = os.path.join(tmp, 'rustdoctest', 'rust_out')
+    os.makedirs(os.path.dirname(doctest))
+    with open(doctest, 'w') as f:
+        f.write('#!/bin/sh\\necho "doctest $CI_BUILT_TESTS_RECORD_DIR" >> "$FAKE_TMP/trace"\\n')
+    os.chmod(doctest, 0o755)
+    subprocess.run(runner + [doctest], check=True)
 """
 
 
@@ -691,8 +717,8 @@ def end_to_end(check, refused):
         try:
             cmd_phase('workspace', ['true'])
             check('end to end: build', cmd_build('g', ['pkg/f'], ['pkg']), 0)
-            check('end to end: the recording ran no test, then the doctests', trace(),
-                  ['doctests test --locked -p pkg --features pkg/f'])
+            check('end to end: the recording ran no test, and a doctest ran without the runner env',
+                  trace(), ['doctest '])
             check('end to end: one test, serial', cmd_run('cargo test -p pkg --test one_test -- --test-threads=1'
                                                          .split()), 0)
             check('end to end: whole package, filter, cargo env and cwd',
