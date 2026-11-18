@@ -73,6 +73,8 @@ fn busy_serving_without_wan_readers_keeps_lan_readers_and_reports_no_loss() {
         controller.begin_serving().unwrap();
         let mut state = controller.state.lock().unwrap();
         assert!(controller.serving_ready().is_ok());
+        assert_eq!(controller.restoration_contentions(), 1);
+        assert_eq!(controller.restoration_busy_cancellations(), 0);
         assert!(controller.pending_keys(&state).unwrap().is_empty());
         let mut registry = DemandRegistry::new(Instant::now());
         controller
@@ -112,6 +114,8 @@ fn serving_ready_cancels_each_wan_pin_without_waiting_for_a_busy_controller() {
         error.contains("arm") && error.contains("/vector"),
         "{error}"
     );
+    assert_eq!(controller.restoration_contentions(), 1);
+    assert_eq!(controller.restoration_busy_cancellations(), 1);
     assert_eq!(
         controller.pending_keys(&state).unwrap(),
         BTreeSet::from([wan.clone()])

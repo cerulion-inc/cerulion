@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -102,6 +103,8 @@ pub struct AccountWanController {
     paired: Mutex<HashMap<String, WanRobot>>,
     pins: Mutex<BTreeMap<TopicKey, Pin>>,
     state: Mutex<State>,
+    restoration_contentions: AtomicU64,
+    restoration_busy_cancellations: AtomicU64,
 }
 
 impl AccountWanController {
@@ -148,7 +151,22 @@ impl AccountWanController {
                 handover: None,
                 busy_since: None,
             }),
+            restoration_contentions: AtomicU64::new(0),
+            restoration_busy_cancellations: AtomicU64::new(0),
         })
+    }
+
+    /// Observable state (Principle #3): serving starts that found the controller
+    /// state held by another operation when they came to restore outbound readers.
+    pub fn restoration_contentions(&self) -> u64 {
+        self.restoration_contentions.load(Ordering::Relaxed)
+    }
+
+    /// Observable state (Principle #3): serving starts that cancelled their live
+    /// outbound WAN pins, naming each loss, because the controller state stayed
+    /// held by another operation.
+    pub fn restoration_busy_cancellations(&self) -> u64 {
+        self.restoration_busy_cancellations.load(Ordering::Relaxed)
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>, String> {

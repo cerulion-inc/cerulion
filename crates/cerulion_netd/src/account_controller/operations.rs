@@ -332,6 +332,7 @@ impl MirrorPlane for AccountWanController {
                 return Err("account robot controller state is poisoned".into());
             }
             Err(TryLockError::WouldBlock) => {
+                self.restoration_contentions.fetch_add(1, Ordering::Relaxed);
                 // begin_serving already retired the previous endpoint. Do not
                 // wait for unrelated metadata I/O before supervising the child.
                 // Registry retirement observes these canceled pins independently.
@@ -344,6 +345,10 @@ impl MirrorPlane for AccountWanController {
                             key.robot, key.topic
                         ));
                     }
+                }
+                if first.is_some() {
+                    self.restoration_busy_cancellations
+                        .fetch_add(1, Ordering::Relaxed);
                 }
                 return first.map_or(Ok(()), Err);
             }
