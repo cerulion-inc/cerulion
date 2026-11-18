@@ -223,8 +223,9 @@ range, and on no other surface, a trailer passes when all of these hold:
   `<id>+<slug>[bot]`, at `users.noreply.github.com` and no longer domain;
 - the identity is on record. A person is on record when that exact name and address, as
   written (no mailmap), author a commit reachable from the start of the scanned range: on
-  a pull request, the base branch tip the event names; on the merge queue, the commit the
-  batch is built on; on a push to `main`, the previous tip. An app is on record the same
+  a pull request, the base the pull request's merge ref sits on, or the event's base when
+  that ref is stale; on the merge queue, the commit the batch is built on; on a push to
+  `main`, the previous tip. An app is on record the same
   way, or when it authors the very commit that carries the trailer, and its name must be
   its own login (`<slug>[bot]`).
 
@@ -331,7 +332,10 @@ reads: a `@person` entry does not read a commit's author or committer name, or t
 a co-author trailer on record (see Co-author trailers above), because that name is the
 person's own forge identity. A `@never` entry reads everywhere an untagged entry does,
 both of those names included: use it for a person who is named on no surface at all,
-their own commit identity included. The grammar is strict and there is exactly one
+their own commit identity included. No allowlist waiver can name `private@never`. Because
+`never` is also an ordinary word, it is a tag only as the whitespace separated `@never`
+suffix; spelled bare or glued after an at sign it is part of the entry, so
+`text:now or never` is a literal that ends in that word. The grammar is strict and there is exactly one
 shape per line: blank; a comment (`#` first); or one entry, `word:<literal>`,
 `text:<literal>` or `<regex>`, then optionally whitespace and the tag, then optionally
 whitespace, `#` and a comment. Anything else refuses the whole run with exit 3, naming

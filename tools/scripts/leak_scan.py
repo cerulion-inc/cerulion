@@ -158,6 +158,11 @@ WITHHELD = '(text withheld: a private pattern touches this line)'
 # included. A `person` entry stands down on an author or committer name and on
 # the name in a co-author trailer on record; a `never` entry stands down nowhere.
 TAGS = ('host', 'device', 'person', 'login', 'lan', 'nickname', 'slug', 'hygiene', 'never')
+# Tags that are also ordinary words. One counts as a tag only as the whitespace
+# separated `@<tag>` suffix; spelled bare or glued inside an entry it is part of
+# the entry (`text:now or never` is a literal), so a list line that loaded
+# before the tag existed still loads the same way.
+WORD_TAGS = frozenset(('never',))
 # The generic classes whose matched text IS the address, host, login or path
 # segment. Their value prints only where the private tier is loaded AND the
 # output is a terminal (text format): with no tier the scanner cannot know the
@@ -1314,7 +1319,8 @@ def _expand_word(lit):
 INLINE_COMMENT_RX = re.compile(r'\s+#(?:\s|$).*')
 TRAILING_TAG_RX = re.compile(r'\s+@(\S+)$')
 PREFIX_RX = re.compile(r'(word|text):', re.I)
-GLUED_TAG_RX = re.compile(r'@(?:' + '|'.join(TAGS) + r')$', re.I)
+GLUED_TAG_RX = re.compile(r'@(?:' + '|'.join(t for t in TAGS if t not in WORD_TAGS) + r')$',
+                          re.I)
 # The two KEYS. A key is an entry like any other: it counts in the index, it
 # compiles to a pattern that is HARD in every mode, and its value never prints.
 # `tracker-host:` additionally tells the reference class that a link to that
@@ -1347,7 +1353,7 @@ def _entry_fault(body):
     if GLUED_TAG_RX.search(body):
         return 'the tag needs whitespace before it'
     tokens = body.split()
-    if len(tokens) > 1 and tokens[-1].lower() in TAGS:
+    if len(tokens) > 1 and tokens[-1].lower() in TAGS and tokens[-1].lower() not in WORD_TAGS:
         return 'a tag starts with @'
     m = PREFIX_RX.match(body)
     if m and m.group(1) not in ('word', 'text'):
@@ -1693,6 +1699,9 @@ def parse_allow(text, class_ids, hard_ids):
             if not (cls.startswith('private@') and cls[8:] in TAGS):
                 raise Usage('allowlist line %d: a private waiver must name a category '
                             '(private@<tag>); a bare private waiver is refused' % lineno)
+            if cls == 'private@never':
+                raise Usage('allowlist line %d: a never entry stands down nowhere, so no '
+                            'waiver can name it' % lineno)
         elif cls not in class_ids:
             raise Usage('allowlist line %d: unknown class %s' % (lineno, cls))
         if len(reason) < 12:
@@ -2748,7 +2757,7 @@ def run_messages(sc, git, args, env):
     if args.range:
         a, b = git.check_range(args.range)
         fmt = '%H%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x01'
-        data = git.text(['log', '--format=' + fmt, a + '..' + b])
+        data = git.text(['log', '--no-show-signature', '--format=' + fmt, a + '..' + b])
         recs = [r for r in data.split('\x01') if r.strip()]
         if not recs and args.require_commits:
             raise NoRun('zero commits in the range on a pull request event')
@@ -3653,7 +3662,7 @@ R_WITHDRAWN = 'qz' + 'rkv-withdrawn'     # 410: taken down, and still a not-foun
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_WITHDRAWN): 410, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 291
+EXPECTED_ARMS = 294
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -4469,7 +4478,7 @@ def self_test(out, base_env, argv0):
                         dict(penv, LEAK_PATTERNS=private_env))
         arm('messages-private-redacted', not any(PW.lower() in ln.lower() for ln in lines))
         # --- messages: the one co-author trailer that passes ----------------------------
-        # A scratch repository whose base history puts ten identities on record.
+        # A scratch repository whose base history puts eleven identities on record.
         # Each case is one commit on top of `base`, scanned as `base..<commit>` with the
         # tier loaded, so PERSON is a @person name, SU a @login and PW a @host the
         # tier knows. The bot `keeper` authors the LAST base commit, which is the one
@@ -4489,6 +4498,8 @@ def self_test(out, base_env, argv0):
         co_dash = '4247+' + 'dashname' + '@' + FORGE_NOREPLY
         never_name = 'Quillon' + ' ' + 'Varr'                    # a @never entry below
         co_never = '4248+' + 'qvarr' + '@' + FORGE_NOREPLY
+        ov_name = 'Ysolde ' + OVERLAY_WORDS[1].capitalize()      # a REPORT-only word
+        co_ov = '4249+' + 'ovname' + '@' + FORGE_NOREPLY
         mapped = '9999+' + 'mapped' + '@' + FORGE_NOREPLY        # only a mailmap says so
         keeper = 'keeper' + '[bot]'
         keeper_addr = '99+' + keeper + '@' + FORGE_NOREPLY       # a bot on record
@@ -4504,7 +4515,7 @@ def self_test(out, base_env, argv0):
         for who, addr in ((PERSON, co_a), (second, co_b), (PERSON, co_login),
                           (second, co_named), (PERSON, co_evil), (pct_name, co_pct),
                           (ops_name, co_ops), (dash_name, co_dash), (never_name, co_never),
-                          (keeper, keeper_addr)):
+                          (ov_name, co_ov), (keeper, keeper_addr)):
             Git(repo_co, dict(env, GIT_AUTHOR_NAME=who, GIT_AUTHOR_EMAIL=addr)).run(
                 ['commit', '-q', '--allow-empty', '-m', 'feat: from ' + addr.split('+')[0]])
         gco.run(['tag', 'base'])
@@ -4633,6 +4644,14 @@ def self_test(out, base_env, argv0):
             rc == EXIT_HIT and body_hits(lines) == {('private#1@host', 4)}
             and counted(lines, 1), 'rc=%d %s %s' % (rc, sorted(body_hits(lines)),
                                                    summary(lines)))
+        # a REPORT-only finding on a trailer that passed leaves it counted: only a
+        # HARD finding holds a trailer back
+        rc, lines = co_scan('fix: x\n\n' + tr + ov_name + ' <' + co_ov + '>\n')
+        arm('coauthor-a-report-on-a-passed-trailer-keeps-it-counted',
+            rc == EXIT_OK and not hits(lines) and counted(lines, 1)
+            and any(c == 'overlay-word' and p.startswith('commit:') and n == 3
+                    for c, p, n in hits(lines, 'REPORT')),
+            'rc=%d %s' % (rc, summary(lines)))
         # on record in the raw text, and a person in the decoded view: judged in full
         rc, lines = co_scan('fix: x\n\n' + tr + pct_name + ' <' + co_pct + '>\n')
         arm('coauthor-a-line-another-view-reads-differently-is-judged-in-full',
@@ -4649,6 +4668,38 @@ def self_test(out, base_env, argv0):
             and any(c == 'private#4@never' and p.endswith('author name')
                     for c, p, n in hits(l2)),
             'rc=%d %s %s' % (rc, sorted(body_hits(lines)), sorted(hits(l2))))
+        # `never` is also an ordinary word, so it is a tag only as the `@never`
+        # suffix: an entry ending in the bare word, or in it glued after an at
+        # sign, loads as before, as a literal
+        word_never = never_name.split()[0] + ' Never'
+        try:
+            loads = parse_private('text:now or never\nword:' + word_never + '\nword:'
+                                  + never_name + ' @never\nword:' + never_name + ' @NEVER\n'
+                                  + 'text:x@never\n')
+        except NoRun:
+            loads = []
+        try:
+            parse_private('word:' + never_name + ' person\n')
+            bare_person = 'loaded'
+        except NoRun:
+            bare_person = 'refused'
+        arm('private-a-word-tag-counts-only-as-its-suffix',
+            [p.tag for p in loads] == [None, None, 'never', 'never', None]
+            and loads[0].rx.search('it is now or never') is not None
+            and loads[4].rx.search('mail x@never here') is not None
+            and loads[1].rx.search('met ' + word_never.lower() + ' today') is not None
+            and bare_person == 'refused', '%s %s' % ([p.tag for p in loads], bare_person))
+        # a waiver cannot name a @never entry, which stands down nowhere
+        ids = set(c.id for c in build_classes())
+        try:
+            parse_allow('docs/x.md | private@never | a reason long enough\n', ids, set())
+            never_waiver = 'accepted'
+        except Usage:
+            never_waiver = 'refused'
+        arm('allow-a-never-waiver-is-refused-and-a-person-waiver-is-not',
+            never_waiver == 'refused' and len(parse_allow(
+                'docs/x.md | private@person | a reason long enough\n', ids, set())) == 1,
+            never_waiver)
         # a depth-one clone holds the last base commit only: what it holds is on
         # record, and what only the deeper history held stays a finding
         shallow = os.path.join(tmp, 'repo-co-shallow')
