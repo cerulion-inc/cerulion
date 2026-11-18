@@ -508,7 +508,7 @@ fn rekey_retires_only_changed_robot_and_preserves_other_robot_delivery() {
     let manager = replacement.fixture.manager.clone();
     let topic = topic_a.clone();
     let stop = producers.stop.clone();
-    producers.handles.push(std::thread::spawn(move || {
+    let replacement_producer = std::thread::spawn(move || {
         let mut publisher = manager
             .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
             .unwrap();
@@ -518,7 +518,13 @@ fn rekey_retires_only_changed_robot_and_preserves_other_robot_delivery() {
             sequence += 1;
             std::thread::sleep(Duration::from_millis(5));
         }
-    }));
+    });
+    wait_for_one_producer(
+        &replacement.fixture.manager,
+        &topic_a,
+        &replacement_producer,
+    );
+    producers.handles.push(replacement_producer);
     desk.install(login.snapshot(&[(RobotId([5; 32]), &replacement), (RobotId([6; 32]), &b)]));
     assert_eq!(desk.daemon.active_demand_count(), 1);
     assert_oracle_and_gap_free(&collect_frames(&desk.manager, &topic_b, 3));
