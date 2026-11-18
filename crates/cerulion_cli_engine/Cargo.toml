@@ -110,7 +110,10 @@ indexmap = "2.8"
 # Discovery ladder: pure-Rust mDNS-SD service discovery for the
 # primary discovery rung (`mdns_discovery::browse_rung`) — by design.
 # No C deps; advertises + browses `_cerulion._tcp` on the LAN.
-mdns-sd = "0.20"
+# Held at 0.20.1: from 0.20.2 a responder multicasts a record at most once a
+# second, longer than the 800 ms and 1 s browse windows, so a browse that
+# starts just after another one can hear nothing.
+mdns-sd = "=0.20.1"
 # The `_cerulion._tcp` ADVERTISE half, extracted so `cerulion-netd`
 # (which now hosts the robot serving plane) runs the SAME beacon.
 # `cerulion_cli_engine` depends on `cerulion_netd`, so the beacon could not live

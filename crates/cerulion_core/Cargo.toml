@@ -217,8 +217,8 @@ x509-parser = "0.18"
 # checks its leaf and issuing CA certificates with the same code that issues them.
 cerulion_pairing = { workspace = true }
 # PEM text for the in-memory certificates and key a team session hands zenoh
-# (`*_base64` keys). Standard base64 with padding reads the same in every
-# version, so zenoh-link-commons decodes it with its own base64 0.22.
+# (`*_base64` keys). base64 0.22 and 0.23 read standard padded base64 the
+# same, so zenoh's QUIC and TLS links decode it with their own base64 0.22.
 base64 = "0.23"
 # Clears the in-memory PKCS#8 key of a team session on drop.
 zeroize = "1"
