@@ -72,15 +72,8 @@ fn act_reads_refuse_mirrors_and_reserved_channels() {
         "/__cerulion/observers/x/y",
         "__cerulion/x",
     ] {
-        for handler in [
-            &TopicSnapshotVerb as &dyn VerbHandler,
-            &TopicEchoOnceVerb,
-            &publish,
-            &call,
-        ] {
-            let error = handler
-                .execute(&json!({"topic": topic, "service": topic, "timeout_s": 0}))
-                .unwrap_err();
+        for (handler, args) in well_formed(&publish, &call, topic) {
+            let error = handler.execute(&args).unwrap_err();
             let expected = if topic == "/act_verbs_test/mirror" {
                 format!("unavailable: '{topic}' is a network mirror of another robot; read it on its source robot")
             } else {
@@ -95,28 +88,164 @@ fn act_reads_refuse_mirrors_and_reserved_channels() {
     }
 }
 
+/// One well-formed request for each act verb on `topic` (`service-call` names
+/// it as its service), so a refusal comes from the topic, never the arguments.
+fn well_formed<'a>(
+    publish: &'a TopicPublishVerb,
+    call: &'a ServiceCallVerb,
+    topic: &str,
+) -> [(&'a dyn VerbHandler, serde_json::Value); 4] {
+    [
+        (&TopicSnapshotVerb, json!({"topic": topic, "timeout_s": 0})),
+        (&TopicEchoOnceVerb, json!({"topic": topic, "timeout_s": 0})),
+        (publish, json!({"topic": topic, "type": "std_msgs/String"})),
+        (
+            call,
+            json!({"service": topic, "type": "demo_srvs/srv/Ping", "timeout_s": 0}),
+        ),
+    ]
+}
+
+/// The refusal every act verb gives a well-formed request on a topic a
+/// producing run excludes from network egress.
+fn excluded_refusal(topic: &str) -> String {
+    format!(
+        "unavailable: Remote access policy for topic '{topic}' refused: the producing run \
+         excludes this topic from network egress; remote access is refused"
+    )
+}
+
 #[test]
 #[serial]
 fn act_refusals_preserve_the_excluded_topic_context() {
+    store();
     let manager = cerulion_core::TransportManager::get_or_init().unwrap();
     let topic = "/act_verbs_test/excluded";
     let _exclusion = manager.exclude_remote_topic(topic).unwrap();
     let publish = TopicPublishVerb::new(lease());
     let call = ServiceCallVerb::new(lease());
-    for handler in [
-        &TopicSnapshotVerb as &dyn VerbHandler,
-        &TopicEchoOnceVerb,
-        &publish,
-        &call,
+    for (handler, args) in well_formed(&publish, &call, topic) {
+        let error = handler.execute(&args).unwrap_err();
+        assert!(
+            matches!(error, CerudError::Verb(ref message) if message == &excluded_refusal(topic)),
+            "{}: {error}",
+            handler.name()
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn a_malformed_request_on_an_excluded_topic_is_a_usage_error() {
+    store();
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let topic = "/act_verbs_test/excluded_usage";
+    let _exclusion = manager.exclude_remote_topic(topic).unwrap();
+    let publish = TopicPublishVerb::new(lease());
+    let call = ServiceCallVerb::new(lease());
+    // The exclusion holds: each verb's well-formed request is refused by it.
+    for (handler, args) in well_formed(&publish, &call, topic) {
+        let error = handler.execute(&args).unwrap_err();
+        assert!(
+            matches!(error, CerudError::Verb(ref message) if message == &excluded_refusal(topic)),
+            "{}: {error}",
+            handler.name()
+        );
+    }
+    // The same topic with one malformed argument: the usage error, never the
+    // policy that would refuse the topic.
+    for (handler, args, usage) in [
+        (
+            &publish as &dyn VerbHandler,
+            json!({"topic": topic}),
+            "missing string argument `type`".to_string(),
+        ),
+        (
+            &publish,
+            json!({"topic": topic, "type": "std_msgs/String", "times": 0}),
+            "`times` must be an integer of at least 1".to_string(),
+        ),
+        (
+            &publish,
+            json!({"topic": topic, "type": "std_msgs/String", "message": 5}),
+            "`message` must be a JSON object or a JSON/YAML string".to_string(),
+        ),
+        (
+            &publish,
+            json!({"topic": topic, "type": "std_msgs/String", "rate_hz": "fast"}),
+            "`rate_hz` must be a number".to_string(),
+        ),
+        (
+            &publish,
+            json!({"topic": topic, "type": "nope_msgs/msg/Nope"}),
+            format!(
+                "unknown message type 'nope_msgs/Nope' on this robot: not a built-in ROS 2 \
+                 type and not in the {SCHEMAS_DIR_ENV} store"
+            ),
+        ),
+        (
+            &call,
+            json!({"service": topic}),
+            "missing string argument `type`".to_string(),
+        ),
+        (
+            &call,
+            json!({"service": topic, "type": "demo_srvs/srv/Ping", "timeout_s": -1}),
+            "`timeout_s` must be a number of seconds from 0 to 60".to_string(),
+        ),
+        (
+            &TopicSnapshotVerb,
+            json!({"topic": topic, "quality": 0}),
+            "`quality` must be an integer from 1 to 100".to_string(),
+        ),
+        (
+            &TopicEchoOnceVerb,
+            json!({"topic": topic, "timeout_s": "soon"}),
+            "`timeout_s` must be a number of seconds from 0 to 60".to_string(),
+        ),
     ] {
-        let error = handler
-            .execute(&json!({"topic":topic,"service":topic,"timeout_s":0}))
-            .unwrap_err();
+        let error = handler.execute(&args).unwrap_err();
+        assert!(
+            matches!(error, CerudError::Verb(ref message) if message == &format!("usage: {usage}")),
+            "{} {args}: {error}",
+            handler.name()
+        );
+    }
+}
+
+#[test]
+#[serial]
+fn an_engaged_estop_is_the_refusal_on_an_excluded_topic() {
+    store();
+    let manager = cerulion_core::TransportManager::get_or_init().unwrap();
+    let topic = "/act_verbs_test/excluded_estop";
+    let _exclusion = manager.exclude_remote_topic(topic).unwrap();
+    let engaged = lease();
+    engaged.lock().unwrap().engage_estop("test");
+    let publish = TopicPublishVerb::new(engaged.clone());
+    let call = ServiceCallVerb::new(engaged);
+    for (handler, args) in [
+        (
+            &publish as &dyn VerbHandler,
+            json!({"topic": topic, "type": "std_msgs/String"}),
+        ),
+        (
+            &publish,
+            json!({"topic": topic, "type": "std_msgs/String", "times": 0}),
+        ),
+        (
+            &call,
+            json!({"service": topic, "type": "demo_srvs/srv/Ping", "timeout_s": 0}),
+        ),
+        (&call, json!({"service": topic})),
+    ] {
+        let error = handler.execute(&args).unwrap_err();
         assert!(
             matches!(error, CerudError::Verb(ref message) if message == &format!(
-                "unavailable: Remote access policy for topic '{topic}' refused: the producing run excludes this topic from network egress; remote access is refused"
+                "unavailable: the robot's e-stop is engaged, so {} is refused",
+                handler.name()
             )),
-            "{}: {error}",
+            "{} {args}: {error}",
             handler.name()
         );
     }
