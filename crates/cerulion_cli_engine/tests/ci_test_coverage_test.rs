@@ -6483,11 +6483,10 @@ fn all_workflow_texts() -> BTreeMap<String, String> {
 }
 
 // ---------------------------------------------------------------------------
-// The harness class: the classifier per path and per event, and the job it
-// runs.
+// The harness path rule, per path and per event, and the harness job.
 // ---------------------------------------------------------------------------
 
-/// The job id of the job the `harness` class runs.
+/// The job id of the job that checks the `harness/` folder.
 const HARNESS_JOB: &str = "harness";
 
 /// What one classifier run printed: the `selection: reason=` token and every
@@ -6549,43 +6548,42 @@ fn run_classifier(event: &str, switch: &str, paths: &[&str]) -> ClassifierAnswer
     }
 }
 
-/// The harness class rule, evaluated per path and per event against
+/// The harness path rule, evaluated per path and per event against
 /// hand-written answers.
 ///
 /// A harness-only change selects no package on a pull request AND on a merge
 /// group; a harness path beside any other path selects every package; a
-/// `push` or a dispatch selects every package whatever it touched; the switch
-/// stops the rule on both events it applies to; and `harness` is true on every
-/// run that selects every package.
+/// `push` or a dispatch selects every package whatever it touched; and the
+/// switch stops the rule on both events it applies to.
 ///
-/// Each row is `<event>|<switch>|<paths>|<harness>|<code>|<pkgs>|<reason>`,
+/// Each row is `<event>|<switch>|<paths>|<code>|<pkgs>|<reason>`,
 /// `,` separating paths. `<pkgs>` is `[]`, `every` for the array a `push` run
 /// prints, or a package name: neither of those, and holding that package.
 #[cfg(unix)]
 #[test]
-fn the_harness_class_rule_is_evaluated_per_path_and_per_event() {
+fn the_harness_path_rule_is_evaluated_per_path_and_per_event() {
     const ROWS: &[&str] = &[
-        "pull_request|on|harness/install.sh|true|false|[]|harness",
-        "pull_request|on|harness/install.sh,harness/tests/test_pins.py|true|false|[]|harness",
-        "pull_request|on|harness/README.md|true|false|[]|docs:md,harness",
+        "pull_request|on|harness/install.sh|false|[]|harness",
+        "pull_request|on|harness/install.sh,harness/tests/test_pins.py|false|[]|harness",
+        "pull_request|on|harness/README.md|false|[]|docs:md,harness",
         "pull_request|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
-         |true|true|every|harness-mixed",
-        "pull_request|on|harness/install.sh,README.md|true|true|every|harness-mixed",
-        "pull_request|on|harness/Cargo.toml|true|true|every|workspace-input:Cargo.toml",
-        "pull_request|on|harnessx/install.sh|true|true|every|unknown-path",
+         |true|every|harness-mixed",
+        "pull_request|on|harness/install.sh,README.md|true|every|harness-mixed",
+        "pull_request|on|harness/Cargo.toml|true|every|workspace-input:Cargo.toml",
+        "pull_request|on|harnessx/install.sh|true|every|unknown-path",
         "pull_request|on|crates/cerulion_viz/bin/cerulion_vizd/src/harness/mod.rs\
-         |false|true|cerulion_vizd|crates:cerulion_vizd",
-        "pull_request|on||false|false|[]|none",
-        "pull_request|off|harness/install.sh|true|true|every|switch:off",
-        "merge_group|on|harness/install.sh|true|false|[]|harness",
+         |true|cerulion_vizd|crates:cerulion_vizd",
+        "pull_request|on||false|[]|none",
+        "pull_request|off|harness/install.sh|true|every|switch:off",
+        "merge_group|on|harness/install.sh|false|[]|harness",
         "merge_group|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
-         |true|true|every|event:merge_group",
+         |true|every|event:merge_group",
         "merge_group|on|crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
-         |true|true|every|event:merge_group",
-        "merge_group|on||true|true|every|event:merge_group",
-        "merge_group|off|harness/install.sh|true|true|every|switch:off",
-        "push|on|harness/install.sh|true|true|every|event:push",
-        "workflow_dispatch|on|harness/install.sh|true|true|every|event:workflow_dispatch",
+         |true|every|event:merge_group",
+        "merge_group|on||true|every|event:merge_group",
+        "merge_group|off|harness/install.sh|true|every|switch:off",
+        "push|on|harness/install.sh|true|every|event:push",
+        "workflow_dispatch|on|harness/install.sh|true|every|event:workflow_dispatch",
     ];
 
     // The whole-workspace array, read once off a run every rule answers with
@@ -6605,8 +6603,8 @@ fn the_harness_class_rule_is_evaluated_per_path_and_per_event() {
     let mut complaints = Vec::new();
     for row in ROWS {
         let fields: Vec<&str> = row.split('|').collect();
-        let [event, switch, paths, harness, code, pkgs, reason] = fields[..] else {
-            panic!("the row `{row}` does not carry seven fields");
+        let [event, switch, paths, code, pkgs, reason] = fields[..] else {
+            panic!("the row `{row}` does not carry six fields");
         };
         let paths: Vec<&str> = paths.split(',').filter(|p| !p.is_empty()).collect();
         let got = run_classifier(event, switch, &paths);
@@ -6621,12 +6619,10 @@ fn the_harness_class_rule_is_evaluated_per_path_and_per_event() {
                     && got_pkgs.contains(&format!("\"{package}\""))
             }
         };
-        if class("harness") != harness || class("code") != code || !pkgs_ok || got.reason != reason
-        {
+        if class("code") != code || !pkgs_ok || got.reason != reason {
             complaints.push(format!(
-                "  [{event} {switch}] {paths:?}: harness={} code={} reason={} pkgs={got_pkgs}; \
-                 wanted harness={harness} code={code} reason={reason} pkgs {pkgs}",
-                class("harness"),
+                "  [{event} {switch}] {paths:?}: code={} reason={} pkgs={got_pkgs}; \
+                 wanted code={code} reason={reason} pkgs {pkgs}",
                 class("code"),
                 got.reason
             ));
@@ -6639,82 +6635,43 @@ fn the_harness_class_rule_is_evaluated_per_path_and_per_event() {
     );
 }
 
-/// The `harness` job reports on every event: its one job condition is the
-/// guard, it carries no matrix, and the class gates its STEPS, with only the
-/// literal `false` skipping them.
+/// The `harness` job runs its checks on every event: no `needs:`, no job
+/// condition, no matrix and no step condition, so nothing the classifier
+/// answers can skip a check of the folder.
 #[test]
-fn the_harness_job_runs_on_every_event_and_its_class_gates_only_steps() {
+fn the_harness_job_runs_its_checks_on_every_event() {
     let texts = workflow_texts();
     let ci = texts
         .get("ci.yml")
         .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
-    let jobs = jobs_of(ci);
-    let block = |id: &str| {
-        jobs.iter()
-            .find(|(name, _)| name == id)
-            .map(|(_, block)| block.clone())
-            .unwrap_or_else(|| panic!("ci.yml carries no `{id}` job"))
-    };
+    let job = jobs_of(ci)
+        .into_iter()
+        .find(|(name, _)| name == HARNESS_JOB)
+        .map(|(_, block)| block)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{HARNESS_JOB}` job"));
 
-    let classifier = block(SELECTION_JOB);
-    for wiring in [
-        "harness: ${{ steps.classify.outputs.harness }}",
-        "harness=$(sed -n 's/^harness=//p' \"$RUNNER_TEMP/classes.txt\")",
-        "echo \"harness=$harness\"",
-    ] {
-        assert!(
-            classifier.contains(wiring),
-            "the `{SELECTION_JOB}` job does not carry `{wiring}`: the `harness` output \
-             would be the empty string on every event"
-        );
-    }
-
-    let job = block(HARNESS_JOB);
     assert!(
-        matches!(job_if_of(&job), Some(Ok(cond)) if cond.trim() == JOB_IF_NOT_CANCELLED),
-        "the `{HARNESS_JOB}` job's condition must be exactly `{JOB_IF_NOT_CANCELLED}`: \
-         anything else can skip it"
+        job_if_of(&job).is_none(),
+        "the `{HARNESS_JOB}` job carries a job condition, which can skip it"
     );
     assert!(
-        job_needs_of(&job).iter().any(|n| n == SELECTION_JOB),
-        "the `{HARNESS_JOB}` job does not need `{SELECTION_JOB}`"
+        job_needs_of(&job).is_empty(),
+        "the `{HARNESS_JOB}` job lists `needs:`: a failed dependency skips it"
     );
     assert!(
         !job.lines().any(|l| l.trim() == "strategy:"),
         "the `{HARNESS_JOB}` job carries a matrix: a matrix job reports per-leg names"
     );
-
     let steps = step_blocks(&job);
-    let (class_step, checks) = steps
-        .split_first()
-        .unwrap_or_else(|| panic!("the `{HARNESS_JOB}` job has no steps"));
-    let class_text = class_step.join("\n");
-    assert_eq!(step_id_of(class_step).as_deref(), Some("class"));
-    assert_eq!(
-        step_if_of(class_step),
-        Ok(None),
-        "the class step itself must always run"
-    );
-    for wiring in [
-        "HARNESS: ${{ needs.changes.outputs.harness }}",
-        "if [ \"$HARNESS\" = \"false\" ]; then",
-        "echo \"run=false\" >> \"$GITHUB_OUTPUT\"",
-        "echo \"run=true\" >> \"$GITHUB_OUTPUT\"",
-    ] {
-        assert!(
-            class_text.contains(wiring),
-            "the class step does not carry `{wiring}`"
-        );
-    }
     assert!(
-        checks.len() >= 2,
-        "the `{HARNESS_JOB}` job has no checks after its class step"
+        steps.len() >= 2,
+        "the `{HARNESS_JOB}` job has no check after its checkout"
     );
-    for step in checks {
+    for step in &steps {
         assert_eq!(
             step_if_of(step),
-            Ok(Some("steps.class.outputs.run == 'true'".to_string())),
-            "`{}` is not gated on the class step",
+            Ok(None),
+            "`{}` carries a step condition, which can skip a check",
             step_name_of(step).unwrap_or_else(|| "<unnamed>".to_string())
         );
     }

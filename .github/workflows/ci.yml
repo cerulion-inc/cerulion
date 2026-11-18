@@ -192,9 +192,8 @@ jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
   # that care: a checkout with full history plus a workspace resolve.
   #
-  # FIVE CLASSES, in two directions. `packaging` only ever makes `deb-smoke` RUN
-  # on a pull request it would otherwise skip, and `harness` only ever makes the
-  # `harness` job's checks run. `code`, `docs` and `pkgs` are the
+  # FOUR CLASSES, in two directions. `packaging` only ever makes `deb-smoke` RUN
+  # on a pull request it would otherwise skip. `code`, `docs` and `pkgs` are the
   # test-impact selection and they SKIP test steps, so every rule behind them is
   # fail-closed. The rules, the reason token each one emits and a `--self-test`
   # table live in `tools/scripts/ci_changed_paths.sh`, and `lint` runs that
@@ -226,7 +225,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       packaging: ${{ steps.classify.outputs.packaging }}
-      harness: ${{ steps.classify.outputs.harness }}
       code: ${{ steps.classify.outputs.code }}
       docs: ${{ steps.classify.outputs.docs }}
       pkgs: ${{ steps.classify.outputs.pkgs }}
@@ -326,7 +324,6 @@ jobs:
             > "$RUNNER_TEMP/classes.txt"
           cat "$RUNNER_TEMP/classes.txt"
           packaging=$(sed -n 's/^packaging=//p' "$RUNNER_TEMP/classes.txt")
-          harness=$(sed -n 's/^harness=//p' "$RUNNER_TEMP/classes.txt")
           code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
           docs=$(sed -n 's/^docs=//p' "$RUNNER_TEMP/classes.txt")
           pkgs=$(sed -n 's/^pkgs=//p' "$RUNNER_TEMP/classes.txt")
@@ -334,9 +331,9 @@ jobs:
           # output is the empty string in every job that consults it: `== 'true'`
           # is then false on every event, and `fromJSON('')` is an expression
           # error that fails the step rather than running it.
-          for value in "$packaging" "$harness" "$code" "$docs" "$pkgs"; do
+          for value in "$packaging" "$code" "$docs" "$pkgs"; do
             if [ -z "$value" ]; then
-              echo "the classifier produced no value for one of its five classes" >&2
+              echo "the classifier produced no value for one of its four classes" >&2
               exit 1
             fi
           done
@@ -347,7 +344,6 @@ jobs:
           # while reading as a selected step.
           {
             echo "packaging=$packaging"
-            echo "harness=$harness"
             echo "code=$code"
             echo "docs=$docs"
             echo "pkgs=$pkgs"
@@ -5085,78 +5081,91 @@ jobs:
   # THE HARNESS FOLDER (`harness/`): Python, shell and data that no Rust package
   # builds, checked on Linux alone. Nothing in it compiles; the checks are
   # shellcheck and the standard library's test runner, both on the runner image,
-  # so the job installs and fetches nothing.
+  # so the job installs and fetches nothing and takes seconds.
   #
-  # IT RUNS AND REPORTS ON EVERY EVENT. The job-level condition is the bare
-  # `!cancelled()` every dependant of the classifier carries, and the class
-  # gates STEPS: the first step reads `harness` through `env:` and only the
-  # literal `false` skips the checks, so a failed classification, which leaves
-  # the output empty, runs them. The class is `false` only on a pull request
-  # that touches no `harness/` path and selects a narrow set.
+  # EVERY EVENT, EVERY PULL REQUEST. No `needs:`, no job condition and no step
+  # condition: the classifier narrows the Rust test steps for a harness-only
+  # change, and nothing narrows this job, so a test here that reads a path
+  # outside the folder still runs on the change that touches that path.
   #
   # NO FOLDER, NOTHING TO CHECK. With no tracked file under `harness/` the check
   # step says so and passes. With one, it shellchecks every tracked `*.sh` under
-  # the folder and runs `harness/tests` when that holds a `test_*.py`; a run
-  # that judged no script and no test fails, and so does one where the test
-  # runner ran none.
+  # the folder and runs every tracked `test_*.py` under it, at any depth, one
+  # module per file, so a file no `discover` would reach (a folder without
+  # `__init__.py`) still runs. A tracked test file that holds no test fails, and
+  # so does a run that judged no script and no test. Every `git ls-files` runs as
+  # its own command, so a git failure fails the step instead of reading as an
+  # empty folder.
   harness:
     name: Harness (Linux)
-    needs: [changes]
-    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
-      - name: Read the harness class
-        id: class
-        env:
-          HARNESS: ${{ needs.changes.outputs.harness }}
-        run: |
-          set -euo pipefail
-          if [ "$HARNESS" = "false" ]; then
-            echo "selection: harness=false, no harness path changed and the selection is narrow; the checks are skipped"
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "selection: harness=${HARNESS:-<empty>}, the checks run"
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        if: steps.class.outputs.run == 'true'
 
       - name: Harness scripts and tests
-        if: steps.class.outputs.run == 'true'
         run: |
           set -euo pipefail
-          tracked=$(git ls-files -- harness | grep -c . || true)
+          git ls-files -z -- harness > "$RUNNER_TEMP/harness-files.lst"
+          tracked=$(tr -cd '\0' < "$RUNNER_TEMP/harness-files.lst" | wc -c)
+          tracked=$((tracked))
           if [ "$tracked" -eq 0 ]; then
             echo "harness: no tracked file under harness/, nothing to check"
             exit 0
           fi
           judged=0
-          # `git ls-files` is the population, so a tracked script cannot sit
-          # where a `find` does not reach. A pathspec `*` matches across `/`:
-          # this is every tracked `*.sh` at any depth under the folder.
-          scripts=$(git ls-files -- 'harness/*.sh' | grep -c . || true)
+          git ls-files -z -- ':(glob)harness/**/*.sh' > "$RUNNER_TEMP/harness-scripts.lst"
+          scripts=$(tr -cd '\0' < "$RUNNER_TEMP/harness-scripts.lst" | wc -c)
+          scripts=$((scripts))
           if [ "$scripts" -gt 0 ]; then
             shellcheck --version
-            git ls-files -z -- 'harness/*.sh' | xargs -0 shellcheck -x
+            xargs -0 shellcheck -x < "$RUNNER_TEMP/harness-scripts.lst"
             echo "harness: shellchecked ${scripts} script(s)"
             judged=$((judged + scripts))
           fi
-          if [ -n "$(git ls-files -- 'harness/tests/test_*.py')" ]; then
+          git ls-files -z -- ':(glob)harness/**/test_*.py' > "$RUNNER_TEMP/harness-tests.lst"
+          tests=$(tr -cd '\0' < "$RUNNER_TEMP/harness-tests.lst" | wc -c)
+          tests=$((tests))
+          if [ "$tests" -gt 0 ]; then
             python3 --version
-            python3 -B -m unittest discover -s harness/tests -v 2> "$RUNNER_TEMP/harness-tests.txt" \
-              || { cat "$RUNNER_TEMP/harness-tests.txt"; exit 1; }
-            cat "$RUNNER_TEMP/harness-tests.txt"
-            # `Ran 0 tests` exits 0 too, so the count is read off the log.
-            ran=$(sed -n 's/^Ran \([0-9][0-9]*\) tests\{0,1\} in .*/\1/p' "$RUNNER_TEMP/harness-tests.txt")
-            if [ -z "$ran" ] || [ "$ran" -lt 1 ]; then
-              echo "::error::harness/tests holds a test_*.py and the test runner ran ${ran:-no} test(s)"
-              exit 1
-            fi
-            judged=$((judged + ran))
+            # One module per tracked file, loaded by path under a name built
+            # from that path, so two files sharing a base name stay apart. The
+            # file's own folder goes on `sys.path` first, as `discover` would
+            # put it.
+            python3 -B - "$RUNNER_TEMP/harness-tests.lst" <<'PY'
+          import importlib.util
+          import os
+          import sys
+          import unittest
+
+          with open(sys.argv[1], encoding="utf-8") as listing:
+              paths = [p for p in listing.read().split("\0") if p]
+          suite = unittest.TestSuite()
+          empty = []
+          for path in paths:
+              sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
+              name = path[: -len(".py")].replace("/", ".")
+              spec = importlib.util.spec_from_file_location(name, path)
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[name] = module
+              spec.loader.exec_module(module)
+              found = unittest.defaultTestLoader.loadTestsFromModule(module)
+              print(f"harness: {path} holds {found.countTestCases()} test(s)")
+              if found.countTestCases() == 0:
+                  empty.append(path)
+              suite.addTests(found)
+          if empty:
+              print("::error::tracked test file(s) holding no test: " + ", ".join(empty))
+              sys.exit(1)
+          result = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)
+          if result.testsRun != suite.countTestCases():
+              print(f"::error::collected {suite.countTestCases()} test(s) and ran {result.testsRun}")
+              sys.exit(1)
+          sys.exit(0 if result.wasSuccessful() else 1)
+          PY
+            judged=$((judged + tests))
           fi
           if [ "$judged" -eq 0 ]; then
             echo "::error::harness/ tracks ${tracked} file(s) and this step judged no script and no test"

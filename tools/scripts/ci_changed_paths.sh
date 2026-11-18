@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ci_changed_paths.sh: classify a pull request's changed paths for ci.yml.
 #
-# Reads one path per line on stdin and writes the five classes as
+# Reads one path per line on stdin and writes the four classes as
 # `<class>=<value>` lines on stdout, one per line, alongside a `selection:` line
 # that names the rule that fired. The caller reads the classes BY NAME, which is
 # how ci.yml invokes it:
@@ -11,7 +11,7 @@
 #     > "$RUNNER_TEMP/classes.txt"
 #   code=$(sed -n 's/^code=//p' "$RUNNER_TEMP/classes.txt")
 #
-# and then writes each of `packaging`, `harness`, `code`, `docs` and `pkgs` to
+# and then writes each of `packaging`, `code`, `docs` and `pkgs` to
 # `$GITHUB_OUTPUT` under its own literal name. Reading by name is what keeps the
 # `selection:` lines OUT of `$GITHUB_OUTPUT`: they are for the reader of the job
 # log, they carry no `<name>=<value>` shape, and piping this whole stream into
@@ -24,17 +24,14 @@
 # target branch, so the diff holds the group and every group queued ahead of it
 # that has not merged yet.
 #
-# FIVE CLASSES, and two directions. `packaging` only ever ADDS work: it runs a
-# push-only job on a pull request that touches its inputs. `harness` only ever
-# adds work too: it runs the `harness` job's checks, and it is true when a path
-# under `harness/` changed or when every package is selected, since a workflow
-# or a `tools/` edit can break that job without touching the folder. `code`,
-# `docs` and `pkgs` do the opposite: ci.yml gates test steps on them, so a rule
-# that is too NARROW skips a test the change could have broken, and skips it
-# silently. Every rule below is therefore fail-closed: an unclassifiable path,
-# an event that is not a pull request (a harness-only merge group aside), a
-# harness path beside any other path, a switch this script cannot read, or a
-# selector that refuses, all select EVERYTHING.
+# FOUR CLASSES, and two directions. `packaging` only ever ADDS work: it runs a
+# push-only job on a pull request that touches its inputs. `code`, `docs` and
+# `pkgs` do the opposite: ci.yml gates test steps on them, so a rule that is too
+# NARROW skips a test the change could have broken, and skips it silently. Every
+# rule below is therefore fail-closed: an unclassifiable path, an event that is
+# not a pull request (a harness-only merge group aside), a harness path beside
+# any other path, a switch this script cannot read, or a selector that refuses,
+# all select EVERYTHING.
 #
 # `packaging` is the inputs of the `deb-smoke` job (Debian and APT package
 # smoke). That job is push-only because it is 22 minutes of compression-bound
@@ -96,7 +93,8 @@
 #      touched, and nothing else. The folder is Python, shell and data that no
 #      Rust package builds, so a harness-only change selects no package a
 #      marker does not name and every per-package test step skips, on every
-#      runner. The `harness` class carries it.
+#      runner. The folder's own checks are the `harness` job, which runs on
+#      every event whatever this script answers.
 #   7. Anything else selects everything.
 #
 # `pkgs` is the selector's answer over the touched set: the reverse cargo
@@ -115,8 +113,8 @@
 # still matches on the name it had.
 #
 # Unreadable or empty input yields `packaging=false`; the selection classes then
-# read the empty change as what it is, `code=false`, `pkgs=[]` and
-# `harness=false`, on a pull request and every member on everything else.
+# read the empty change as what it is, `code=false` and `pkgs=[]`, on a pull
+# request and every member on everything else.
 #
 # `--self-test` runs the tables below and exits nonzero on the first miss.
 set -euo pipefail
@@ -180,9 +178,9 @@ matches_packaging() {
     return 1
 }
 
-# The harness tree, one prefix, read by rule 6, by the mixed-change rule and by
-# the `harness` class, so the three cannot disagree on what is inside it. Its
-# doc-pin root is the prefix without the separator.
+# The harness tree, one prefix, read by rule 6 and by the mixed-change rule, so
+# the two cannot disagree on what is inside it. Its doc-pin root is the prefix
+# without the separator.
 HARNESS_PREFIX='harness/'
 HARNESS_ROOT=${HARNESS_PREFIX%/}
 
@@ -492,16 +490,13 @@ select_packages() {
 }
 
 classify() {
-    local packaging=false harness=false path lines code docs touched reason pkgs
+    local packaging=false path lines code docs touched reason pkgs
     local input
     input=$(cat)
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         if matches_packaging "$path"; then
             packaging=true
-        fi
-        if matches_harness "$path"; then
-            harness=true
         fi
     done <<< "$input"
 
@@ -511,18 +506,12 @@ classify() {
     touched=$(printf '%s\n' "$lines" | sed -n 's/^touched=//p')
     reason=$(printf '%s\n' "$lines" | sed -n 's/^reason=//p')
     pkgs=$(select_packages "$touched")
-    # Everything selected runs the harness checks too: a change that can break
-    # every job can break that one.
-    if [ "$touched" = "$EVERY" ]; then
-        harness=true
-    fi
 
     # THE REASON, on its own line with the fixed `selection:` prefix, and NOT as
     # a `<name>=<value>` output: it is for the reader of the log, and the step
-    # that consumes this writes only the five named classes to `$GITHUB_OUTPUT`.
+    # that consumes this writes only the four named classes to `$GITHUB_OUTPUT`.
     printf 'selection: reason=%s\n' "$reason"
     printf 'packaging=%s\n' "$packaging"
-    printf 'harness=%s\n' "$harness"
     printf 'code=%s\n' "$code"
     printf 'docs=%s\n' "$docs"
     printf 'pkgs=%s\n' "$pkgs"
@@ -576,42 +565,6 @@ crates/cerulion_core/src/wire.rs;README.md|false
             fails=$((fails + 1))
         fi
     done <<< "$packaging_cases"
-
-    # ---- the harness class ------------------------------------------------
-    # `<event>;<input paths>|<expected harness>`; `,` separates paths. A path
-    # under the tree is true, alone or beside another change; a docs page about
-    # it, a crate directory of the same name and a longer top-level name are
-    # judged as what they are; every run that selects everything is true.
-    local harness_cases='
-pull_request;harness/install.sh|true
-pull_request;harness/benchmarks/fetch.sh,harness/README.md|true
-pull_request;harness/install.sh,README.md|true
-pull_request;docs/harness.md|false
-pull_request;crates/cerulion_core/src/harness/install.sh|false
-pull_request;harnessx/install.sh|true
-pull_request;README.md|false
-pull_request;.github/workflows/ci.yml|true
-pull_request;|false
-merge_group;harness/install.sh|true
-merge_group;crates/cerulion_core/src/wire.rs|true
-push;crates/cerulion_core/src/wire.rs|true
-'
-    while IFS= read -r line; do
-        [ -n "$line" ] || continue
-        cases=$((cases + 1))
-        head=${line%|*}
-        event=${head%%;*}
-        paths=${head#*;}
-        want=${line##*|}
-        got=$(printf '%s\n' "${paths//,/$'\n'}" \
-              | GITHUB_EVENT_NAME=$event CI_SELECTION=on classify \
-              | sed -n 's/^harness=//p')
-        if [ "$got" != "$want" ]; then
-            printf 'ci_changed_paths self-test: [%s] %s -> harness=%s, wanted harness=%s\n' \
-                "$event" "${paths:-<empty>}" "$got" "$want" >&2
-            fails=$((fails + 1))
-        fi
-    done <<< "$harness_cases"
 
     # ---- the selection rules ----------------------------------------------
     # `<event>;<switch>;<paths>|<code>|<docs>|<touched>`, `,` separating paths.
