@@ -524,15 +524,15 @@ OBSERVATION_ERROR_CASES = [
 # members): its `hot_path_dependency_gate` walks `examples/go2`, so `go2_tf`
 # moves to with=9 without=4; `cerulion_heaphook` is unchanged.
 #
-# `node_macro_ui` joins it: its pass-program runner joins `examples` onto the
-# profile directory, which the walk records as observing that tree, so `go2_tf`
-# moves to with=10 without=4.
+# `node_macro_ui` and `test_node_macro_cdylib` join it: their pass-program
+# runners join `examples` onto the profile directory, which the walk records as
+# observing that tree, so `go2_tf` moves to with=11 without=4.
 #
 # Dropping the union from the closure shrinks both, which is the mutant these
 # rows exist to kill.
 LIVE_OBSERVATION_ORACLE = {
     'cerulion_heaphook': (6, 1),
-    'go2_tf': (10, 4),
+    'go2_tf': (11, 4),
 }
 
 # `name | document | touched | dev edges followed | expected closure`.

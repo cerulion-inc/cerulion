@@ -23,3 +23,18 @@ workspace = true
 
 [dev-dependencies]
 trybuild = "1"
+
+# The context-helper programs, as examples: `cargo test` builds each one with
+# the default `cdylib` feature and no `cfg(test)`, as trybuild's pass mode did,
+# and the lib's `context_compile_tests` runs it.
+[[example]]
+name = "pass_annotated_context_helper"
+path = "tests/ui/annotated_context_helper.rs"
+
+[[example]]
+name = "pass_data_only_helpers"
+path = "tests/ui/data_only_helpers.rs"
+
+[[example]]
+name = "pass_qualified_context_helper"
+path = "tests/ui/qualified_context_helper.rs"

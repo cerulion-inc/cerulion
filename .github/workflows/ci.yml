@@ -3369,7 +3369,7 @@ jobs:
 
       - name: node context helper compile tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: cargo test --timings -p test_node_macro_cdylib --lib
+        run: cargo test --timings -p test_node_macro_cdylib
       - name: selection marker, test_node_macro_cdylib
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
         env:
@@ -4409,7 +4409,7 @@ jobs:
 
       - name: node context helper compile tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: cargo test --timings -p test_node_macro_cdylib --lib
+        run: cargo test --timings -p test_node_macro_cdylib
       - name: selection marker, test_node_macro_cdylib
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
         env:

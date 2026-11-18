@@ -3468,6 +3468,8 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // tree, which holds that member. The edge is not real, and it adds this
     // package to the selection when go2_tf_source or go2_tf changes.
     ("node_macro_ui", "go2_tf_source", "crate-path"),
+    // The same join, in test_node_macro_cdylib's context-helper runner.
+    ("test_node_macro_cdylib", "go2_tf_source", "crate-path"),
     // heaphook's own unit test reads `../cerulion_heaphook/src`.
     ("rmw_cerulion", "cerulion_heaphook", "crate-path"),
     // rmw_adopt_take_linux_test loads `libcerulion_heaphook.so` out of the
