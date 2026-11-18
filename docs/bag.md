@@ -1159,12 +1159,12 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 9.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 9; a
+`recorder.json` stamps 10.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 10; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Five encodings set the number; the last two, read identity and batch
-frames, have their own section below. Every kind-6 record carries a
+in it. Six encodings set the number; the last three, read identity, batch
+frames and checkpoint stops, have their own sections below. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
@@ -1174,14 +1174,16 @@ makes, an empty boundary drain's `none` record included, and reading a `drain`
 role on a `none` record as that empty consult is what `trace_format` 7 means,
 and producer annotations on every edge (before every read of a multi-writer
 edge, once per writer run on a single-writer one) are what `trace_format` 8
-means, and a `batch_frame` record for each frame a multi-frame read consumed
-besides the one it served is what `trace_format` 9 means.
+means, a `batch_frame` record for each frame a multi-frame read consumed
+besides the one it served is what `trace_format` 9 means, and a stopped flag in
+every complete checkpoint part of a node the scheduler had stopped is what
+`trace_format` 10 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
 decodes as one occurrence each), since read identity every such bag is
-format 8, and since batch frames every such bag is format 9. A bag
+format 8, since batch frames format 9, and since checkpoint stops format 10. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -1349,6 +1351,33 @@ terminal verdict prints a line only for best effort, `reads: best effort, no
 read identity (<reason>)`, because that narrows what the verdict covers. A
 resim without `--verify` keeps each consumer's queue so a changed node's own
 frames reach its in-rank consumers.
+
+### Checkpoint stops (`trace_format` 10)
+
+A format 10 recording states, in every complete checkpoint part, whether the
+scheduler had stopped the node at that boundary: a node that returned
+`NodeError::Fatal` carries the stopped flag in its framework section (section
+version 5, bit 0 of the flags byte after the epoch floor), and a complete part
+without it states a running node. A resim of a bag that begins after a
+checkpoint keeps each node it states as stopped stopped: the node is not
+fired, each `block` slot it held as a consumer starts released, the schedule
+check expects no fire of it, and it is left out of the pre-anchor frame cap,
+the backlog check and `anchor_pending_fires`; a topic only stopped nodes
+produce needs no sequence seed. `resume.stopped_at_anchor` in the
+`--report` JSON names those nodes. A bag that fires such a node in the steps
+the resim executes contradicts itself and is refused before the first replayed
+step (`bag internal consistency check failed`, exit 2).
+
+The flag is a positive claim at any format, so a part that carries it states
+the stop on a bag below 10 too. Below 10 a part without it states nothing, and
+so does a node with no complete part at any format (a node that saves no
+state, or a skipped or torn part): the resumed replay judges such a node as it
+did before format 10. A reader below 10 reads past the flag and would judge a
+node stopped before the checkpoint as one that owed fires, so the stamp moves
+and that reader refuses the bag. A later section version can define more flag
+bits, which this build reads past; a change to what they mean for a resim
+comes with a new `trace_format`, which this build refuses with "upgrade to
+replay it".
 
 ### The kind-6 annotations ride INSIDE the record kind
 
