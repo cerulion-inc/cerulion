@@ -44,7 +44,9 @@ while IFS= read -r rel; do
   [ -n "$rel" ] || continue
   mkdir -p "$DEST/$(dirname "$rel")"
   if [ ! -s "$DEST/$rel" ]; then
-    curl -fsSL --retry 5 --retry-delay 5 -o "$DEST/$rel" "$DATA_URL/$rel"
+    # Written beside the file and moved into place whole, so a stopped download never stands as the file.
+    curl -fsSL --retry 5 --retry-delay 5 -o "$DEST/$rel.part" "$DATA_URL/$rel"
+    mv -f "$DEST/$rel.part" "$DEST/$rel"
   fi
   n=$((n + 1))
   if [ $((n % 40)) -eq 0 ] || [ "$n" -eq "$TOTAL" ]; then echo "      $n of $TOTAL"; fi

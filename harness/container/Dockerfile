@@ -6,10 +6,10 @@
 #   docker run --rm -e OPENAI_BASE_URL -e OPENAI_API_KEY -v "$PWD/out:/out" cerulion-harness \
 #       run-cell --model YOUR_MODEL_NAME
 #
-# docker build picks the platform of the machine it runs on (on a Mac with Apple silicon: linux/arm64). The
-# image runs the same install.sh a machine without a container runs; on a platform other than x86-64 that
-# includes the robot's one-time self-test for the default start state's body (python -m
-# cerulion_harness.body_record says why).
+# harness/.dockerignore keeps what install.sh writes out of the build context. docker build picks the platform
+# of the machine it runs on (on a Mac with Apple silicon: linux/arm64). The image runs the same install.sh a
+# machine without a container runs; on a platform other than x86-64 that includes the robot's one-time
+# self-test for the default start state's body (python -m cerulion_harness.body_record says why).
 FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive

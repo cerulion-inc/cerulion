@@ -92,10 +92,15 @@ fi
 for tool in git curl; do
   command -v "$tool" >/dev/null || { echo "missing: $tool (install it, then run this again)" >&2; exit 2; }
 done
-if [ "$OS" = Linux ] && command -v ldconfig >/dev/null && ! ldconfig -p | grep -q 'libOSMesa\.so'; then
-  echo "missing: the CPU renderer libOSMesa, which the simulator renders with (Ubuntu:" \
-    "sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0)" >&2
-  exit 2
+if [ "$OS" = Linux ] && command -v ldconfig >/dev/null; then
+  # The whole list is read before it is searched: grep -q on a pipe can end the writer early under pipefail.
+  LIBS=$(ldconfig -p 2>/dev/null || true)
+  case "$LIBS" in
+    *libOSMesa.so*) ;;
+    *) echo "missing: the CPU renderer libOSMesa, which the simulator renders with (Ubuntu:" \
+         "sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0)" >&2
+       exit 2 ;;
+  esac
 fi
 NEED_KB=$((5 * 1024 * 1024))
 if ! { current sim "$SIM_IN" && current scenes "$SCENES_IN" && current server "$SERVER_IN"; }; then
