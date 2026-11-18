@@ -51,7 +51,7 @@ workspace = true
 # Pure-Rust mDNS-SD. No C deps; advertises `_cerulion._tcp` on the LAN.
 # SAME version as `cerulion_cli_engine`'s dep (its `resolve_robot_eid` browses
 # with it), so every Cerulion mDNS caller speaks one protocol implementation.
-mdns-sd = "0.20"
+mdns-sd = "0.21"
 # Parse `cerulion_remoted`'s PUBLIC beacon-facts JSON
 # (`eid`/`iroh_port`/`claimable` TXT enrichment).
 serde = { version = "1", features = ["derive"] }
