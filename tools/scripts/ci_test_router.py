@@ -37,10 +37,18 @@ one of ITS inputs. Its inputs are:
      whole package directory when it names none or computes one) and the
      literal paths it opens.
   3. Every binary it spawns, cdylib it loads, and nested cargo build it runs,
-     with the full inputs of each, TRANSITIVELY: a spawn found in library code
-     belongs to every binary that links that library, and a spawned binary
-     brings its own sources and its own spawns. A binary's name is a spawn
-     where `Command` or an `exec` sits in the same file.
+     with the full inputs of each, TRANSITIVELY. A spawn found in LIBRARY code
+     belongs to every binary that links that library:
+     `crates/cerulion_netd/src/client.rs` spawns `cerulion-netd`,
+     `crates/cerulion_cli_engine/src/viz_client.rs` spawns `cerulion-vizd`,
+     and `crates/cerulion_cli_engine/src/doctor/daemons.rs` looks for
+     `cerulion-remoted` beside the running executable. A spawned binary brings
+     its own sources (`crates/cerulion_netd/src/main.rs`) and its own spawns.
+     `crates/cerulion_android/src/runtime.rs` runs its recorder, gateway and
+     graph as threads named like daemons: library code the closure carries,
+     not a spawn. A binary's name is a spawn where `Command`, an `exec`, or
+     `current_exe` sits in the same file, or where a `const` or `static` bound
+     to it is named in a file of the context that runs a command.
   4. The files it reads at run time: the observation edges in
      `tools/ci/observation_edges.tsv` and the doc-pin markers in `ci.yml`,
      narrowed to the binaries whose own sources carry the edge's shape, plus
@@ -59,11 +67,20 @@ crate reference a macro from another crate expands to, and a file a test finds
 through `PATH` are not edges here either. The shadow period and the escape
 scorer are what measure those misses.
 
-MEMBER MANIFESTS. A member's `Cargo.toml` change selects every binary of that
-member and of every package whose library depends on it, every binary of a
+MEMBER MANIFESTS. A member's `Cargo.toml` change selects every binary of every
+package whose test build includes that member (its normal, build and EVERY
+dev-dependency closure, not the per-binary refinement), every binary of a
 package that shares a `cargo test` command with one in `ci.yml`, and every
 binary that spawns or loads a workspace artifact, because `ci.yml` builds those
 with `cargo build --workspace` and features unify across the workspace there.
+That is why a `crates/cerulion_cli_engine/Cargo.toml` change selects all of
+`cerulion_core` (core dev-depends on cli_engine, and cli_engine's features merge
+into the core library every core test links), while a cli_engine `.rs` change
+selects only the core binaries that name cli_engine. No comment-only refinement
+applies to a member manifest: `crates/cerulion_macros/src/crate_root.rs` reads the
+CONSUMER's `Cargo.toml` with `std::fs` while it expands, so the manifest's bytes
+are a compile input of every crate that expands the macro, and rustc's dep-info
+does not record that read.
 
 GLOBAL INPUTS select everything:
 
@@ -150,7 +167,7 @@ EVERYTHING = 'all'
 EDGE_KINDS = ('crate-path', 'dlopen', 'whole-tree', 'unattributable')
 
 # Words in code that make a string naming a workspace binary a SPAWN.
-SPAWN_WORDS = frozenset(('Command', 'exec', 'execv', 'execvp', 'execve',
+SPAWN_WORDS = frozenset(('Command', 'current_exe', 'exec', 'execv', 'execvp', 'execve',
                          'posix_spawn', 'cargo_bin'))
 # Words that make a test read its own package tree at run time.
 OWN_TREE_WORDS = frozenset(('read_dir', 'canonicalize', 'current_dir', 'WalkDir',
@@ -1662,14 +1679,34 @@ class Router:
         return None
 
     def context_behaviour_of(self, parts, package_name, library):
-        """Union of the per-file behaviours of `[(path, portion)]`."""
+        """Union of the per-file behaviours of `[(path, portion)]`.
+
+        A binary's name bound to a `const` or `static` in one file and handed
+        to `Command` in another is a spawn too: the binding's NAME is followed
+        into every file of the context that runs a command.
+        """
         out = new_behaviour()
+        consts = {}
+        command_words = set()
         for path, portion in sorted(parts):
             if not path.endswith('.rs'):
                 continue
             for scan in self.scans(path):
                 part = self.file_behaviour(scan, portion, package_name, library)
                 merge_behaviour(out, part)
+                for name, value in scan.consts:
+                    target = self.bin_name_in(value)
+                    if target is not None:
+                        consts[name] = target
+                if portion == 'test':
+                    words = scan.words_test
+                else:
+                    words = portion_words(scan, portion)
+                if words & SPAWN_WORDS:
+                    command_words |= words
+        for name, target in sorted(consts.items()):
+            if name in command_words:
+                out['spawns'].add(self.bin_names[target])
         return out
 
     def derive_behaviours(self):
@@ -2091,6 +2128,10 @@ class Router:
                          for path, reason in sorted(set(self.global_triggers))]
         manifest_affected = {}
         for dirty in sorted(self.manifest_dirty):
+            for name in sorted(self.packages):
+                if dirty in self.full_test_closure(name):
+                    manifest_affected.setdefault(name, 'manifest %s (test build of %s)'
+                                                 % (self.manifest_dirty[dirty], name))
             for group in self.test_groups:
                 members = set(group)
                 reach = set()
@@ -2872,9 +2913,11 @@ FX_ENGINE = frozenset(('fx_engine', 'fx_engine::engine_api_test', 'fx_core::engi
                        'fx_cli::cli_e2e_test', 'fx_cli::load_fixture_test',
                        'fx_cli::node_build_test'))
 # Every binary that spawns or loads a workspace artifact: the engine's linkers
-# (fx-vizd), fx_bagd's library unit tests (a cfg(test) spawn of fx-netd), and
+# (fx-vizd, fx-netd), fx_netd's (its library spawns fx-netd through a const),
+# fx_bagd's library unit tests (a cfg(test) spawn of fx-netd), and
 # fx_android's test, which loads the fixture cdylib.
-FX_ARTIFACT = FX_ENGINE | frozenset(('fx_bagd', 'fx_android::runtime_test'))
+FX_ARTIFACT = FX_ENGINE | frozenset(('fx_netd', 'fx_netd::bin/fx-netd', 'fx_bagd',
+                                     'fx_android::runtime_test'))
 FX_CORE_UNITS = frozenset(('fx_core', 'fx_core::doc_test', 'fx_core::doctest/fx_core',
                            'fx_core::engine_test', 'fx_core::fixture_test',
                            'fx_core::plain_test', 'fx_core::walk_test'))
@@ -2924,6 +2967,38 @@ FX_ROWS = [
      ['crates/fx_core/data/table.txt'], {}, {},
      FX_CORE_LINKERS | FX_ALWAYS,
      [('fx_bagd', 'links fx_core: source crates/fx_core/data/table.txt')], FX_FOREIGN),
+    ('hole 3: a dev-dependency source selects only the binaries that name it',
+     ['crates/fx_engine/src/viz_client.rs'], {}, {},
+     FX_ENGINE | FX_ALWAYS,
+     [('fx_core::engine_test', 'links fx_engine')], FX_FOREIGN),
+    ('hole 3: a dev-dependency manifest selects every binary of the package that dev-depends',
+     ['crates/fx_engine/Cargo.toml'], {}, {},
+     FX_ENGINE | FX_CORE_UNITS | FX_ARTIFACT | FX_ALWAYS,
+     [('fx_core::plain_test', 'manifest crates/fx_engine/Cargo.toml (test build of fx_core)'),
+      ('fx_netd', 'manifest crates/fx_engine/Cargo.toml (workspace-built artifact)')], FX_FOREIGN),
+    ('hole 1: a daemon binary spawned from library code selects every linker, transitively',
+     ['crates/fx_netd/src/main.rs'], {}, {},
+     FX_ENGINE | FX_ALWAYS | {'fx_netd', 'fx_netd::bin/fx-netd', 'fx_bagd'},
+     [('fx_cli::cli_e2e_test', 'spawns fx-netd'), ('fx_core::engine_test', 'spawns fx-netd'),
+      ('fx_bagd', 'spawns fx-netd')], FX_FOREIGN),
+    ('hole 1: a binary named by a const beside Command selects the spawners',
+     ['crates/fx_vizd/src/main.rs'], {}, {},
+     FX_ENGINE | FX_ALWAYS | {'fx_vizd::bin/fx-vizd'},
+     [('fx_cli::bin/cerulion', 'spawns fx-vizd')], FX_FOREIGN),
+    ('hole 1: a thread named like a daemon is a link, not a spawn',
+     ['crates/fx_bagd/src/lib.rs'], {}, {},
+     FX_ALWAYS | {'fx_bagd', 'fx_bagd::bin/fx-bagd', 'fx_android', 'fx_android::runtime_test'},
+     [('fx_android::runtime_test', 'links fx_bagd')], FX_FOREIGN),
+    ('hole 1: the thread-named binary itself is spawned by nobody',
+     ['crates/fx_bagd/src/main.rs'], {}, {},
+     FX_ALWAYS | {'fx_bagd::bin/fx-bagd'}, [], FX_FOREIGN),
+    ('hole 2: a consumer manifest the proc macro reads selects the consumer',
+     ['crates/fx_user/Cargo.toml'], {}, {},
+     FX_ALWAYS | FX_ARTIFACT | FX_ALPHA | {'fx_user', 'fx_user::user_test', 'fx_beta'},
+     [('fx_user::user_test', 'manifest crates/fx_user/Cargo.toml'),
+      ('fx_alpha::alpha_test', 'manifest crates/fx_user/Cargo.toml (test build of fx_alpha)'),
+      ('fx_beta', 'manifest crates/fx_user/Cargo.toml (shares a cargo test command)')],
+     FX_FOREIGN),
     ('a proc-macro source selects its users and the library that includes it',
      ['crates/fx_macros/src/parse.rs'], {}, {},
      FX_ALWAYS | FX_ENGINE | {'fx_macros', 'cerulion', 'fx_user', 'fx_user::user_test',
