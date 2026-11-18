@@ -418,6 +418,15 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   a unified binding's standalone listener is drained in `drain_level`'s Unified arm
   (events-then-samples), else one stale event per publish self-sustains a free-run under
   the multi-process split (`unified_stale_wake_park_test`; removing the drain fails it).
+- Lost-wake rule (per-set Sync): `drain_level`'s Sync pass empties every per-set listener
+  of a node at the node's first binding, before the node's one align pass reads its
+  queues (events-then-samples, as in the Unified arm), and later bindings of the node leave
+  their listener alone. A frame published after the align pass keeps its notification, so
+  the next idle wait wakes on it; emptying a later binding's listener after the pass would
+  lose that wake, and the park or WaitSet would sleep its full timeout
+  (`a_frame_landing_after_a_joins_align_pass_*` in `monitor_wait_park_iox2_test`). The walk
+  relies on a node's Sync bindings being contiguous (`sync_bindings_contiguous`, checked
+  at build in debug builds).
 - The park WATCHES external fds on every tier (`park_poll_fd_ready`, record-only; the
   pre-step sweep still does the drain+fire); a barrier participant idles in
   `monitor_wait_block` regardless of park policy (opt-out honored via sleep-recheck);
