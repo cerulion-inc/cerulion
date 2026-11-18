@@ -564,6 +564,22 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 * **Reclaim.** `reclaim` deletes the executables in `target/debug/deps` except the prebuilt
   binaries a later step still runs.
 
+Every `test-linux` and `test-macos` leg uses it: the step `Build this shard's package tests
+once` builds the leg's packages, every package step runs through `run`, and the leg ends
+with the doctests and the audit. `cerulion_core` keeps its own build in its shard step,
+unchanged. A Lint step runs `check-workflow .github/workflows/ci.yml`.
+
+* **Groups.** One unified build changes some packages' features: a package's tests link a
+  shared crate with the union of what every package of the group enables. The unions in
+  these legs are additive or inert seams (`test-helpers`, `test-seams`, `live` on
+  `cerulion_dds`, `wan` on `cerulion_netd` (library side), a second rustls provider beside
+  the ring one every client installs). The one that switches behavior is `cerulion_viz`'s
+  `decoder-from-source`, so `cerulion_vizd` builds in a group of its own on macOS shard 2.
+* **Doctests here.** No package of these legs carries an executing doctest that a missing
+  `--test-threads=1` would change: their examples are `text` or `ignore` blocks, or the
+  `rust` blocks of `native_ros2_messages`, which ran unflagged before.
+* **Disk.** The pre-wan reclaim on Linux shard 3 runs `reclaim`.
+
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
 runs the visualization tree in two lanes, Linux only: the library lane PARALLEL (every
