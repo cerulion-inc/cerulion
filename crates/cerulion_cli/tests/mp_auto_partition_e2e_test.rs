@@ -1649,12 +1649,12 @@ fn a_three_worker_run_beside_non_utf8_variables_prints_each_environment_warning_
         (
             "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
              compare them",
-            r#"artifact=run_directory names=["CER_E2E_PROBE_NAME_\xFF"]"#,
+            r#"names=["CER_E2E_PROBE_NAME_\xFF"]"#,
         ),
         (
             "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
              utf8 false; a replay still detects a change",
-            r#"artifact=run_directory names=["CERULION_E2E_PROBE_LATIN1"]"#,
+            r#"names=["CERULION_E2E_PROBE_LATIN1"]"#,
         ),
     ] {
         let lines: Vec<&str> = log.lines().filter(|l| l.contains(message)).collect();

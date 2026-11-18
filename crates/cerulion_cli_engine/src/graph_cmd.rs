@@ -17471,14 +17471,12 @@ pub(crate) fn render_env_json(
 /// the same mode, so it holds the same entries, and that render logs nothing.
 ///
 /// The messages are constant. The names ride the `names` field, where each
-/// byte of a name that is not valid UTF-8 prints escaped (`CER_\xFF`), and
-/// `artifact` names the run directory. No value is printed, because a value
-/// may be a secret.
+/// byte of a name that is not valid UTF-8 prints escaped (`CER_\xFF`). No
+/// value is printed, because a value may be a secret.
 #[cfg(unix)]
 fn warn_run_env_json(render: &EnvJsonRender) {
     if !render.left_out_names.is_empty() {
         tracing::warn!(
-            artifact = %"run_directory",
             names = ?render.left_out_names,
             "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
              compare them"
@@ -17486,7 +17484,6 @@ fn warn_run_env_json(render: &EnvJsonRender) {
     }
     if !render.withheld_not_utf8.is_empty() {
         tracing::warn!(
-            artifact = %"run_directory",
             names = ?render.withheld_not_utf8,
             "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
              utf8 false; a replay still detects a change"
@@ -28220,8 +28217,8 @@ process_groups:
                                              recorded as their FNV-1a 64 hash with utf8 false; \
                                              a replay still detects a change";
 
-    /// One WARN line per list, each naming the artifact and its variables (a
-    /// name's invalid byte escaped), and no line carrying a value: not the
+    /// One WARN line per list, each naming its variables (a name's invalid
+    /// byte escaped) and no other field, and no line carrying a value: not the
     /// plain value of the left-out name, not the withheld value, not the
     /// secret-named value that is not UTF-8.
     #[cfg(unix)]
@@ -28251,7 +28248,7 @@ process_groups:
                 {
                     [line]
                         if line.contains(" WARN ")
-                            && line.contains("artifact=run_directory")
+                            && !line.contains("artifact")
                             && line.contains(names) => {}
                     other => {
                         return Err(format!(

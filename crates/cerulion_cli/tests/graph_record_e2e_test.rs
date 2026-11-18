@@ -743,7 +743,7 @@ fn record_e2e_with_non_utf8_variables_writes_one_env_json_to_the_bag_and_the_run
          compare them",
     );
     assert!(
-        left_out.contains("artifact=run_directory")
+        !left_out.contains("artifact")
             && left_out.contains(r#"names=["CER_E2E_PROBE_NAME_\xFE", "CER_E2E_PROBE_NAME_\xFF"]"#),
         "{left_out}"
     );
@@ -752,7 +752,7 @@ fn record_e2e_with_non_utf8_variables_writes_one_env_json_to_the_bag_and_the_run
          utf8 false; a replay still detects a change",
     );
     assert!(
-        withheld.contains("artifact=run_directory")
+        !withheld.contains("artifact")
             && withheld.contains(r#"names=["CERULION_E2E_PROBE_LATIN1"]"#),
         "{withheld}"
     );
