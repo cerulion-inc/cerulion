@@ -1,0 +1,5 @@
+list,model,arm,column_complete,finished,scored,unscored,not_finished,solved,solved_wilson_low,solved_wilson_high,clean,clean_wilson_low,clean_wilson_high,false_claims,mean_requests,mean_steps,mean_operator_s,mean_usd_list,usd_sum,mean_tokens_in,mean_tokens_cached,mean_tokens_out,paired_cells,with_only,without_only,both,neither,sign_p_solved
+list2,Gemini 3.8 Flash,without,1,400,400,0,0,101,0.2124,0.2973,52,0.1005,0.1665,147,54.725,521.0,776.8998,1.6071,642.8354,4175695.3925,2677080.51,75292.3525,400,211,16,85,88,1.3864665355924218e-44
+list2,Gemini 3.8 Flash,with,1,400,400,0,0,296,0.6949,0.7806,274,0.6379,0.7286,52,26.865,242.66,255.7247,0.3918,156.7258,1605501.185,1306986.8875,18641.2675,400,211,16,85,88,1.3864665355924218e-44
+list2,GPT-6 Astra,without,1,400,400,0,0,289,0.6767,0.7641,160,0.3532,0.4487,89,34.215,339.2075,818.6317,5.3868,2154.7228,548962.785,60647.23,8860.085,400,57,52,237,54,0.701811182064683
+list2,GPT-6 Astra,with,1,400,400,0,0,294,0.6897,0.7759,259,0.5995,0.6927,57,15.52,257.145,235.0677,2.1329,853.1587,626533.375,468705.4325,1718.24,400,57,52,237,54,0.701811182064683
