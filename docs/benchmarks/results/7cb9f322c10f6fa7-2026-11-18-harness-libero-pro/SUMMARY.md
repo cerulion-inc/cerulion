@@ -1,8 +1,8 @@
 # Summary of the grid: 100 start states, 15 models, both arms
 
-Computed by recompute.py from episodes.csv, unscored.csv and not_finished.csv as read at 2026-11-18T16:16:24Z. recompute.py computes this file again from the CSV files; with --check it writes nothing and says whether this file still matches them.
+Computed by recompute.py from episodes.csv, unscored.csv and not_finished.csv as read at 2026-11-18T17:23:40Z. recompute.py computes this file again from the CSV files; with --check it writes nothing and says whether this file still matches them.
 
-THE GRID WAS STILL RUNNING AT THIS READ. 14 of 15 models had finished all 100 start states in both arms. A model marked * is incomplete: its counts are of the start states that had ended, with n printed, and it gets no verdict. Start states that end first are the short episodes, so an incomplete row is not a fair sample of its list. Incomplete: Claude Haiku 5.5 (58 without, 59 with).
+THE GRID WAS STILL RUNNING AT THIS READ. 14 of 15 models had finished all 100 start states in both arms. A model marked * is incomplete: its counts are of the start states that had ended, with n printed, and it gets no verdict. Start states that end first are the short episodes, so an incomplete row is not a fair sample of its list. Incomplete: Claude Haiku 5.5 (64 without, 65 with).
 
 Every start state here is a new start state of a task row that Cerulion was developed on at other start states. The tasks themselves are not new to it.
 
@@ -12,15 +12,15 @@ Arms: `without` is the same model on a published three-tool interface; `with` is
 
 Declared: Gemini 3.8 Flash, SOLVED within the 900-step budget, with Cerulion against without, paired by start state on the grid's 100 start states, exact two-sided sign test on the discordant start states, alpha 0.05, no correction. One test.
 
-Result (complete): with Cerulion 73 of 100 (63.6 to 80.7 percent), without 25 of 100 (17.5 to 34.3 percent). Solved with only: 52. Solved without only: 4. Both: 21. Neither: 23. Exact two-sided sign test p = 1.1e-11. Difference 48.0 points (Newcombe 95 for paired rates: 35.7 to 57.9).
+Result (complete): with Cerulion 73 of 100 (63.6 to 80.7 percent), without 25 of 100 (17.5 to 34.3 percent). Solved with only: 52. Solved without only: 4. Both: 21. Neither: 23. Exact two-sided sign test p = 1.10e-11. Difference 48.0 points (Newcombe 95 for paired rates: 35.7 to 57.9).
 
 The test passes at 0.05.
 
 ## The two secondary tests, declared with it (alpha 0.05 each, apart from the per-model family)
 
-1. GPT-6 Astra, CLEAN (solved at or before the suite's published step limit, with no protocol break, no problem row and no false claim): with Cerulion 61 of 100 (51.2 to 70.0), without 44 of 100 (34.7 to 53.8); with only 26, without only 9, p = 0.006. Its SOLVED counts, to be read with it: 70 against 71 (with only 13, without only 14, p = 1).
+1. GPT-6 Astra, CLEAN (solved at or before the suite's published step limit, with no protocol break, no problem row and no false claim): with Cerulion 61 of 100 (51.2 to 70.0), without 44 of 100 (34.7 to 53.8); with only 26, without only 9, p = 0.00599. Its SOLVED counts, to be read with it: 70 against 71 (with only 13, without only 14, p = 1).
 
-2. Fewer false claims, pooled over every model that ran both arms, one sign test over all discordant pairs of (model, start state) (INCOMPLETE: it pools the pairs ended so far): a false claim without Cerulion only on 203 pairs, with Cerulion only on 124 pairs, p = 1.5e-05. The rate per unsolved episode is in the table below for each model and arm.
+2. Fewer false claims, pooled over every model that ran both arms, one sign test over all discordant pairs of (model, start state) (INCOMPLETE: it pools the pairs ended so far): a false claim without Cerulion only on 203 pairs, with Cerulion only on 126 pairs, p = 2.58e-05. The rate per unsolved episode is in the table below for each model and arm.
 
 ## Every model, both arms
 
@@ -34,8 +34,8 @@ The test passes at 0.05.
 | Claude Opus 5.5 | with Cerulion | 100 | 75 | 65.7 to 82.5 | 67 | 57.3 to 75.4 | 5 | 0.20 | 2 | 0 |
 | Claude Sonnet 5.5 | without Cerulion | 100 | 16 | 10.1 to 24.4 | 7 | 3.4 to 13.7 | 16 | 0.19 | 0 | 0 |
 | Claude Sonnet 5.5 | with Cerulion | 100 | 49 | 39.4 to 58.7 | 36 | 27.3 to 45.8 | 22 | 0.43 | 0 | 0 |
-| Claude Haiku 5.5* | without Cerulion | 58 | 3 | 1.8 to 14.1 | 1 | 0.3 to 9.1 | 3 | 0.05 | 0 | 42 |
-| Claude Haiku 5.5* | with Cerulion | 59 | 24 | 29.1 to 53.4 | 16 | 17.4 to 39.6 | 10 | 0.29 | 0 | 41 |
+| Claude Haiku 5.5* | without Cerulion | 64 | 4 | 2.5 to 15.0 | 1 | 0.3 to 8.3 | 3 | 0.05 | 0 | 36 |
+| Claude Haiku 5.5* | with Cerulion | 65 | 27 | 30.4 to 53.7 | 18 | 18.3 to 39.6 | 13 | 0.34 | 0 | 35 |
 | Claude Fable 5.2 | without Cerulion | 100 | 10 | 5.5 to 17.4 | 6 | 2.8 to 12.5 | 4 | 0.04 | 0 | 0 |
 | Claude Fable 5.2 | with Cerulion | 100 | 82 | 73.3 to 88.3 | 67 | 57.3 to 75.4 | 9 | 0.50 | 2 | 0 |
 | Gemini 4 Carbon | without Cerulion | 100 | 82 | 73.3 to 88.3 | 71 | 61.5 to 79.0 | 7 | 0.39 | 10 | 0 |
@@ -67,41 +67,41 @@ The family is every model that ran, the main test's model included, however each
 
 | model | paired start states | with only | without only | both | neither | difference, points (Newcombe 95) | exact p | Holm threshold | verdict |
 |---|---|---|---|---|---|---|---|---|---|
-| Gemini 3.8 Flash | 100 | 52 | 4 | 21 | 23 | +48.0 (35.7 to 57.9) | 1.1e-11 | 0.0038 | established |
+| Gemini 3.8 Flash | 100 | 52 | 4 | 21 | 23 | +48.0 (35.7 to 57.9) | 1.10e-11 | 0.0038 | established |
 | GPT-6 Astra | 100 | 13 | 14 | 57 | 16 | -1.0 (-11.1 to 9.1) | 1 | 0.0500 | no difference shown |
-| Claude Opus 5.5 | 100 | 46 | 3 | 29 | 22 | +43.0 (31.4 to 52.7) | 7e-11 | 0.0042 | established |
-| Claude Sonnet 5.5 | 100 | 43 | 10 | 6 | 41 | +33.0 (19.6 to 44.8) | 5.6e-06 | 0.0056 | established |
-| Claude Haiku 5.5* | 58 | 23 | 2 | 1 | 32 | +36.2 (21.2 to 49.6) | 1.9e-05 | 0.0063 | incomplete at the read of 2026-11-18T16:16:24Z: 58 of 100 |
-| Claude Fable 5.2 | 100 | 73 | 1 | 9 | 17 | +72.0 (61.0 to 79.5) | 7.9e-21 | 0.0033 | established |
+| Claude Opus 5.5 | 100 | 46 | 3 | 29 | 22 | +43.0 (31.4 to 52.7) | 6.98e-11 | 0.0042 | established |
+| Claude Sonnet 5.5 | 100 | 43 | 10 | 6 | 41 | +33.0 (19.6 to 44.8) | 5.55e-06 | 0.0056 | established |
+| Claude Haiku 5.5* | 64 | 25 | 2 | 2 | 35 | +35.9 (21.9 to 48.6) | 5.65e-06 | 0.0063 | incomplete at the read of 2026-11-18T17:23:40Z: 64 of 100 |
+| Claude Fable 5.2 | 100 | 73 | 1 | 9 | 17 | +72.0 (61.0 to 79.5) | 7.94e-21 | 0.0033 | established |
 | Gemini 4 Carbon | 100 | 13 | 19 | 63 | 5 | -6.0 (-17.0 to 5.1) | 0.377 | 0.0167 | no difference shown |
-| Gemini 4 Argon | 100 | 29 | 8 | 55 | 8 | +21.0 (9.5 to 31.8) | 0.00075 | 0.0071 | established |
-| Gemini 4 Hydrogen | 100 | 48 | 8 | 31 | 13 | +40.0 (26.8 to 51.2) | 4.7e-08 | 0.0050 | established |
+| Gemini 4 Argon | 100 | 29 | 8 | 55 | 8 | +21.0 (9.5 to 31.8) | 7.53e-04 | 0.0071 | established |
+| Gemini 4 Hydrogen | 100 | 48 | 8 | 31 | 13 | +40.0 (26.8 to 51.2) | 4.69e-08 | 0.0050 | established |
 | GPT-6.2 Astra | 100 | 10 | 14 | 67 | 9 | -4.0 (-13.6 to 5.6) | 0.541 | 0.0250 | no difference shown |
-| GPT-6.2 Sol | 100 | 26 | 12 | 47 | 15 | +14.0 (2.1 to 25.3) | 0.034 | 0.0100 | points up, not established |
+| GPT-6.2 Sol | 100 | 26 | 12 | 47 | 15 | +14.0 (2.1 to 25.3) | 0.0336 | 0.0100 | points up, not established |
 | GPT-6.1 Sol | 100 | 22 | 13 | 46 | 19 | +9.0 (-2.5 to 20.1) | 0.175 | 0.0125 | no difference shown |
-| GPT-6 Luna | 100 | 29 | 0 | 0 | 71 | +29.0 (20.2 to 38.5) | 3.7e-09 | 0.0045 | established |
-| Grok 4.7 | 100 | 51 | 2 | 2 | 45 | +49.0 (37.6 to 58.8) | 3.2e-13 | 0.0036 | established |
-| GPT-6.1 Terra | 100 | 27 | 10 | 47 | 16 | +17.0 (5.4 to 28.0) | 0.008 | 0.0083 | established (column added after the first rows were seen) |
+| GPT-6 Luna | 100 | 29 | 0 | 0 | 71 | +29.0 (20.2 to 38.5) | 3.73e-09 | 0.0045 | established |
+| Grok 4.7 | 100 | 51 | 2 | 2 | 45 | +49.0 (37.6 to 58.8) | 3.18e-13 | 0.0036 | established |
+| GPT-6.1 Terra | 100 | 27 | 10 | 47 | 16 | +17.0 (5.4 to 28.0) | 0.00763 | 0.0083 | established (column added after the first rows were seen) |
 
 ### CLEAN
 
 | model | paired start states | with only | without only | both | neither | difference, points (Newcombe 95) | exact p | Holm threshold | verdict |
 |---|---|---|---|---|---|---|---|---|---|
-| Gemini 3.8 Flash | 100 | 60 | 2 | 8 | 30 | +58.0 (46.3 to 67.1) | 8.5e-16 | 0.0036 | established |
-| GPT-6 Astra | 100 | 26 | 9 | 35 | 30 | +17.0 (5.7 to 27.5) | 0.006 | 0.0167 | established |
-| Claude Opus 5.5 | 100 | 59 | 3 | 8 | 30 | +56.0 (43.9 to 65.5) | 1.7e-14 | 0.0038 | established |
-| Claude Sonnet 5.5 | 100 | 34 | 5 | 2 | 59 | +29.0 (17.7 to 39.5) | 2.4e-06 | 0.0083 | established |
-| Claude Haiku 5.5* | 58 | 16 | 1 | 0 | 41 | +25.9 (13.1 to 38.7) | 0.00027 | 0.0125 | incomplete at the read of 2026-11-18T16:16:24Z: 58 of 100 |
-| Claude Fable 5.2 | 100 | 62 | 1 | 5 | 32 | +61.0 (49.8 to 69.8) | 1.4e-17 | 0.0033 | established |
-| Gemini 4 Carbon | 100 | 17 | 30 | 41 | 12 | -13.0 (-25.7 to 0.3) | 0.079 | 0.0250 | no difference shown |
-| Gemini 4 Argon | 100 | 50 | 7 | 18 | 25 | +43.0 (29.9 to 53.9) | 4.2e-09 | 0.0056 | established |
-| Gemini 4 Hydrogen | 100 | 49 | 2 | 6 | 43 | +47.0 (35.7 to 56.7) | 1.2e-12 | 0.0042 | established |
+| Gemini 3.8 Flash | 100 | 60 | 2 | 8 | 30 | +58.0 (46.3 to 67.1) | 8.47e-16 | 0.0036 | established |
+| GPT-6 Astra | 100 | 26 | 9 | 35 | 30 | +17.0 (5.7 to 27.5) | 0.00599 | 0.0167 | established |
+| Claude Opus 5.5 | 100 | 59 | 3 | 8 | 30 | +56.0 (43.9 to 65.5) | 1.72e-14 | 0.0038 | established |
+| Claude Sonnet 5.5 | 100 | 34 | 5 | 2 | 59 | +29.0 (17.7 to 39.5) | 2.43e-06 | 0.0083 | established |
+| Claude Haiku 5.5* | 64 | 18 | 1 | 0 | 45 | +26.6 (14.4 to 38.7) | 7.63e-05 | 0.0125 | incomplete at the read of 2026-11-18T17:23:40Z: 64 of 100 |
+| Claude Fable 5.2 | 100 | 62 | 1 | 5 | 32 | +61.0 (49.8 to 69.8) | 1.39e-17 | 0.0033 | established |
+| Gemini 4 Carbon | 100 | 17 | 30 | 41 | 12 | -13.0 (-25.7 to 0.3) | 0.0789 | 0.0250 | no difference shown |
+| Gemini 4 Argon | 100 | 50 | 7 | 18 | 25 | +43.0 (29.9 to 53.9) | 4.24e-09 | 0.0056 | established |
+| Gemini 4 Hydrogen | 100 | 49 | 2 | 6 | 43 | +47.0 (35.7 to 56.7) | 1.18e-12 | 0.0042 | established |
 | GPT-6.2 Astra | 100 | 15 | 11 | 43 | 31 | +4.0 (-5.9 to 13.7) | 0.557 | 0.0500 | no difference shown |
-| GPT-6.2 Sol | 100 | 37 | 9 | 23 | 31 | +28.0 (15.4 to 39.2) | 4.1e-05 | 0.0100 | established |
-| GPT-6.1 Sol | 100 | 42 | 6 | 19 | 33 | +36.0 (23.7 to 46.6) | 1e-07 | 0.0071 | established |
-| GPT-6 Luna | 100 | 25 | 0 | 0 | 75 | +25.0 (16.7 to 34.3) | 6e-08 | 0.0063 | established |
-| Grok 4.7 | 100 | 45 | 1 | 0 | 54 | +44.0 (33.3 to 53.9) | 1.3e-12 | 0.0045 | established |
-| GPT-6.1 Terra | 100 | 42 | 2 | 20 | 36 | +40.0 (29.0 to 49.4) | 1.1e-10 | 0.0050 | established (column added after the first rows were seen) |
+| GPT-6.2 Sol | 100 | 37 | 9 | 23 | 31 | +28.0 (15.4 to 39.2) | 4.06e-05 | 0.0100 | established |
+| GPT-6.1 Sol | 100 | 42 | 6 | 19 | 33 | +36.0 (23.7 to 46.6) | 1.01e-07 | 0.0071 | established |
+| GPT-6 Luna | 100 | 25 | 0 | 0 | 75 | +25.0 (16.7 to 34.3) | 5.96e-08 | 0.0063 | established |
+| Grok 4.7 | 100 | 45 | 1 | 0 | 54 | +44.0 (33.3 to 53.9) | 1.34e-12 | 0.0045 | established |
+| GPT-6.1 Terra | 100 | 42 | 2 | 20 | 36 | +40.0 (29.0 to 49.4) | 1.13e-10 | 0.0050 | established (column added after the first rows were seen) |
 
 Tally over the 14 complete columns, printed whole: with Cerulion solved more start states in 11, fewer in 3, the same number in 0. Fewer: GPT-6 Astra (70 against 71, p = 1); Gemini 4 Carbon (76 against 82, p = 0.377); GPT-6.2 Astra (77 against 81, p = 0.541).
 
@@ -109,25 +109,25 @@ Tally over the 14 complete columns, printed whole: with Cerulion solved more sta
 
 | model | paired start states | false claim without only | with only | exact p |
 |---|---|---|---|---|
-| Gemini 3.8 Flash | 100 | 20 | 6 | 0.009 |
-| GPT-6 Astra | 100 | 18 | 8 | 0.076 |
-| Claude Opus 5.5 | 100 | 14 | 3 | 0.013 |
+| Gemini 3.8 Flash | 100 | 20 | 6 | 0.00936 |
+| GPT-6 Astra | 100 | 18 | 8 | 0.0755 |
+| Claude Opus 5.5 | 100 | 14 | 3 | 0.0127 |
 | Claude Sonnet 5.5 | 100 | 12 | 18 | 0.362 |
-| Claude Haiku 5.5* | 58 | 3 | 10 | 0.092 |
+| Claude Haiku 5.5* | 64 | 3 | 12 | 0.0352 |
 | Claude Fable 5.2 | 100 | 4 | 9 | 0.267 |
 | Gemini 4 Carbon | 100 | 6 | 5 | 1 |
-| Gemini 4 Argon | 100 | 23 | 4 | 0.00031 |
-| Gemini 4 Hydrogen | 100 | 20 | 3 | 0.00049 |
+| Gemini 4 Argon | 100 | 23 | 4 | 3.11e-04 |
+| Gemini 4 Hydrogen | 100 | 20 | 3 | 4.88e-04 |
 | GPT-6.2 Astra | 100 | 9 | 7 | 0.804 |
-| GPT-6.2 Sol | 100 | 17 | 6 | 0.035 |
-| GPT-6.1 Sol | 100 | 20 | 6 | 0.009 |
+| GPT-6.2 Sol | 100 | 17 | 6 | 0.0347 |
+| GPT-6.1 Sol | 100 | 20 | 6 | 0.00936 |
 | GPT-6 Luna | 100 | 12 | 14 | 0.845 |
-| Grok 4.7 | 100 | 6 | 15 | 0.078 |
+| Grok 4.7 | 100 | 6 | 15 | 0.0784 |
 | GPT-6.1 Terra | 100 | 19 | 10 | 0.136 |
 
 ## Means per scored episode
 
-| model | arm | scored episodes | replies | control steps | operator seconds | USD, list price | tokens in | of which cached | tokens out | USD per solved start state |
+| model | arm | scored episodes | replies | control steps | wall seconds | USD, list price | tokens in | of which cached | tokens out | USD per solved start state |
 |---|---|---|---|---|---|---|---|---|---|---|
 | Gemini 3.8 Flash | without Cerulion | 100 | 55.9 | 538.8 | 846.6 | 1.666 | 4,147,296 | 2,556,882 | 75,171 | 6.67 |
 | Gemini 3.8 Flash | with Cerulion | 100 | 25.6 | 224.8 | 258.7 | 0.348 | 1,434,994 | 1,179,094 | 18,020 | 0.48 |
@@ -137,8 +137,8 @@ Tally over the 14 complete columns, printed whole: with Cerulion solved more sta
 | Claude Opus 5.5 | with Cerulion | 98 | 15.5 | 258.6 | 278.1 | 2.762 | 928,309 | 457,259 | 15,770 | 3.61 |
 | Claude Sonnet 5.5 | without Cerulion | 100 | 56.2 | 609.6 | 533.2 | 3.509 | 1,232,207 | 3,411 | 43,649 | 21.93 |
 | Claude Sonnet 5.5 | with Cerulion | 100 | 19.6 | 347.4 | 204.9 | 1.905 | 1,183,123 | 495,965 | 13,801 | 3.89 |
-| Claude Haiku 5.5* | without Cerulion | 58 | 64.8 | 660.3 | 1,056.2 | 0.251 | 1,749,353 | 3,417 | 66,107 | 4.86 |
-| Claude Haiku 5.5* | with Cerulion | 59 | 20.6 | 318.8 | 338.8 | 0.095 | 1,171,263 | 541,579 | 17,871 | 0.23 |
+| Claude Haiku 5.5* | without Cerulion | 64 | 64.9 | 655.5 | 1,061.9 | 0.252 | 1,760,591 | 3,385 | 65,564 | 4.04 |
+| Claude Haiku 5.5* | with Cerulion | 65 | 19.9 | 312.7 | 321.4 | 0.090 | 1,120,365 | 524,291 | 16,944 | 0.22 |
 | Claude Fable 5.2 | without Cerulion | 100 | 11.0 | 76.2 | 250.4 | 1.503 | 105,983 | 21,397 | 16,328 | 15.03 |
 | Claude Fable 5.2 | with Cerulion | 98 | 14.7 | 246.3 | 414.4 | 5.501 | 866,206 | 439,253 | 28,604 | 6.57 |
 | Gemini 4 Carbon | without Cerulion | 90 | 16.0 | 200.4 | 1,887.3 | 2.239 | 860,416 | 58,429 | 62,950 | 2.46 |
@@ -160,7 +160,7 @@ Tally over the 14 complete columns, printed whole: with Cerulion solved more sta
 | GPT-6.1 Terra | without Cerulion | 100 | 49.8 | 481.0 | 773.9 | 1.104 | 1,105,381 | 80,638 | 15,115 | 1.94 |
 | GPT-6.1 Terra | with Cerulion | 100 | 17.6 | 307.7 | 220.0 | 0.286 | 754,473 | 506,409 | 2,526 | 0.39 |
 
-Operator seconds are wall clock from the operator's start to its end, tool execution and failed requests included. USD is the model's reported token counts of the scored attempt at the list prices of prices.csv on the date in that file; cached input is priced at the cached rate; simulator compute is not included; nothing here is a billed amount. Tokens in counts every prompt token, cached ones included; tokens out counts reasoning tokens.
+Wall seconds are wall clock from the episode's start to its end, tool execution and failed requests included. USD is the model's reported token counts of the scored attempt at the list prices of prices.csv on the date in that file; cached input is priced at the cached rate; simulator compute is not included; nothing here is a billed amount. Tokens in counts every prompt token, cached ones included; tokens out counts reasoning tokens.
 
 ## Episodes that ended without a score
 

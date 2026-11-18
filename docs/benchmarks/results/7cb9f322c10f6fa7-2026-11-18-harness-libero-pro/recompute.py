@@ -2,13 +2,15 @@
 """Recompute every count, interval and test of this package from its CSV files.
 
 Reads cells.csv, episodes.csv, unscored.csv and not_finished.csv in this folder and writes summary.csv,
-paired.csv and SUMMARY.md. If extension_list2/ is present it does the same there (plus task_rows.csv), by that
-list's own rules. The rules are in RULES.md. Standard library only.
+paired.csv and SUMMARY.md. For the extension's lists present (extension_list2/, extension_libero10/) it does the
+same there (plus task_rows.csv), with the one family of twelve tests the extension's rule fixes over both lists;
+for extension_libero10_development/ it writes counts only. The rules are in RULES.md. Standard library only.
 
 usage: recompute.py [--name NAME] [--check]
   --check  writes nothing; exits 1 if the files on disk differ from what the CSV files give
 """
 import argparse, csv, json, math, os, sys
+from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ALPHA = 0.05
@@ -79,7 +81,9 @@ def pct(iv):
 
 
 def fp(p):
-    return "" if p is None else (f"{p:.2g}" if p < 0.001 else f"{p:.3f}".rstrip("0").rstrip("."))
+    """An exact p as every table of this package prints it: three significant digits, or two decimals of a power
+    of ten under 0.001."""
+    return "" if p is None else (f"{p:.2e}" if p < 0.001 else f"{p:.3g}")
 
 
 def fnum(v, d=1):
@@ -122,7 +126,7 @@ class Column:
                 "clean_wilson": wilson(sum(int(e["clean"]) for e in sc), n),
                 "false_claims": fc, "false_claims_per_unsolved": (fc / (n - solved)) if n - solved else None,
                 "unsolved": n - solved,
-                "requests": mean("requests"), "steps": mean("steps"), "operator_s": mean("operator_s"),
+                "requests": mean("requests"), "steps": mean("steps"), "wall_s": mean("wall_s"),
                 "usd": mean("usd_list"), "usd_sum": tot("usd_list"),
                 "usd_per_solved": (tot("usd_list") / solved) if solved else None,
                 "tokens_in": mean("tokens_in"), "tokens_cached": mean("tokens_cached"),
@@ -180,14 +184,14 @@ def arm_table(cols, name, N):
 
 
 def means_table(cols, name):
-    L = ["| model | arm | scored episodes | replies | control steps | operator seconds | USD, list price | "
+    L = ["| model | arm | scored episodes | replies | control steps | wall seconds | USD, list price | "
          "tokens in | of which cached | tokens out | USD per solved start state |",
          "|---|---|---|---|---|---|---|---|---|---|---|"]
     for c in cols:
         for arm in ("without", "with"):
             s = c.stats(arm)
             L.append(f"| {c.model}{'' if c.complete else '*'} | {arm} {name} | {s['scored']} | {fnum(s['requests'])} | "
-                     f"{fnum(s['steps'])} | {fnum(s['operator_s'])} | {fnum(s['usd'], 3)} | {fnum(s['tokens_in'], 0)} | "
+                     f"{fnum(s['steps'])} | {fnum(s['wall_s'])} | {fnum(s['usd'], 3)} | {fnum(s['tokens_in'], 0)} | "
                      f"{fnum(s['tokens_cached'], 0)} | {fnum(s['tokens_out'], 0)} | "
                      f"{'none solved' if s['usd_per_solved'] is None else fnum(s['usd_per_solved'], 2)} |")
     return L
@@ -230,7 +234,7 @@ def summary_rows(cols, fam, list_name):
                          "solved_wilson_high": r4(w[1]), "clean": s["clean"], "clean_wilson_low": r4(cw[0]),
                          "clean_wilson_high": r4(cw[1]), "false_claims": s["false_claims"],
                          "mean_requests": r4(s["requests"]), "mean_steps": r4(s["steps"]),
-                         "mean_operator_s": r4(s["operator_s"]), "mean_usd_list": r4(s["usd"]),
+                         "mean_wall_s": r4(s["wall_s"]), "mean_usd_list": r4(s["usd"]),
                          "usd_sum": r4(s["usd_sum"]), "mean_tokens_in": r4(s["tokens_in"]),
                          "mean_tokens_cached": r4(s["tokens_cached"]), "mean_tokens_out": r4(s["tokens_out"]),
                          "paired_cells": pr["pairs"], "with_only": pr["with_only"],
@@ -243,7 +247,7 @@ def summary_rows(cols, fam, list_name):
 
 SUM_HEAD = ["list", "model", "arm", "column_complete", "finished", "scored", "unscored", "not_finished", "solved",
             "solved_wilson_low", "solved_wilson_high", "clean", "clean_wilson_low", "clean_wilson_high",
-            "false_claims", "mean_requests", "mean_steps", "mean_operator_s", "mean_usd_list", "usd_sum",
+            "false_claims", "mean_requests", "mean_steps", "mean_wall_s", "mean_usd_list", "usd_sum",
             "mean_tokens_in", "mean_tokens_cached", "mean_tokens_out", "paired_cells", "with_only", "without_only",
             "both", "neither", "sign_p_solved", "holm_threshold", "verdict_solved"]
 PAIR_HEAD = ["list", "model", "measure", "column_complete", "paired_cells", "with_only", "without_only", "both",
@@ -378,7 +382,7 @@ def grid(name, check, changed):
         L.append(f"| {c.model}{'' if c.complete else '*'} | {pr['pairs']} | {pr['without_only']} | "
                  f"{pr['with_only']} | {fp(pr['p'])} |")
     L += ["", "## Means per scored episode", ""] + means_table(cols, name) + [""]
-    L += ["Operator seconds are wall clock from the operator's start to its end, tool execution and failed "
+    L += ["Wall seconds are wall clock from the episode's start to its end, tool execution and failed "
           "requests included. USD is the model's reported token counts of the scored attempt at the list prices of "
           "prices.csv on the date in that file; cached input is priced at the cached rate; simulator compute is "
           "not included; nothing here is a billed amount. Tokens in counts every prompt token, cached ones "
@@ -399,133 +403,984 @@ def grid(name, check, changed):
     return cols
 
 
-def extension(name, check, changed, grid_cols):
-    folder = os.path.join(HERE, "extension_list2")
-    if not os.path.isdir(folder):
-        return
-    cells, cols, uns = columns(folder)
-    N = len(cells)
-    info = json.load(open(os.path.join(folder, "list_info.json")))
-    READ["list2"] = info["read"]
-    fam = {key: holm({c.model: c.paired(key)["p"] for c in cols}) for key, _ in MEASURES}
-    TESTS, STRICT = 12, ALPHA / 12
-    write(os.path.join(folder, "summary.csv"), csv_text(SUM_HEAD[:-2], [
-        {k: v for k, v in r.items() if k in SUM_HEAD[:-2]} for r in summary_rows(cols, fam, "list2")]), check, changed)
-    prs = paired_rows(cols, {}, "list2", settled=False)
-    for r in prs:
-        r["holm_threshold"] = r4(STRICT)
-        r["passes_holm"] = None
-    write(os.path.join(folder, "paired.csv"), csv_text(PAIR_HEAD, prs), check, changed)
-    rows_of = {}
-    for c in cells:
-        rows_of.setdefault(c["task_row"], []).append(c["cell"])
+# ---------------------------------------------------------------- the extension: three lists, one family of twelve
+
+EXT = [("list2", "extension_list2", "list 2", "LIBERO-PRO"),
+       ("libero10", "extension_libero10", "the LIBERO-10 list", "LIBERO-10")]
+DEV = ("libero10_development", "extension_libero10_development")
+FAMILY_MODELS = [MAIN_MODEL, CLEAN_MODEL]
+WORD = dict(MEASURES)
+
+
+p3 = fp                                  # the extension prints every p as the grid does
+
+
+def w1(iv):
+    return "" if iv is None else f"{100 * iv[0]:.1f} to {100 * iv[1]:.1f}"
+
+
+def d2(f, g, n):
+    """A difference in points, printed to two decimals (on 400 start states it is an exact quarter point)."""
+    return f"{float(Fraction(100 * (f - g), n)):+.2f}"
+
+
+def nc1(iv):
+    return f"{100 * iv[0]:+.1f} to {100 * iv[1]:+.1f}"
+
+
+def r3(a, b):
+    return "" if not b else f"{a / b:.3f}"
+
+
+def usd2(v):
+    return f"{v:.2f}"
+
+
+class ExtList:
+    """One list of the extension: its cells, its two model columns, its unscored, lost, refused and stopped attempts."""
+
+    def __init__(self, key, folder, label, bench):
+        self.key, self.label, self.bench = key, label, bench
+        self.folder = os.path.join(HERE, folder)
+        self.cells, cols, self.uns = columns(self.folder)
+        self.by = {c.model: c for c in cols}
+        self.cols = [self.by[m] for m in FAMILY_MODELS if m in self.by] + [c for c in cols
+                                                                           if c.model not in FAMILY_MODELS]
+        self.info = json.load(open(os.path.join(self.folder, "list_info.json")))
+        self.lost = load(self.folder, "lost_attempts.csv")
+        self.refused = load(self.folder, "refusals.csv")
+        self.stopped = load(self.folder, "stopped_attempts.csv")
+        self.eps = load(self.folder, "episodes.csv")
+        self.N = len(self.cells)
+        self.rows = {}
+        for c in self.cells:
+            self.rows.setdefault(c["task_row"], []).append(c["cell"])
+        self.task_of = {c["cell"]: int(c["task"]) for c in self.cells}
+        self.complete = bool(self.cols) and all(c.complete for c in self.cols)
+
+    def count(self, col, arm, key, cells=None):
+        return sum(col.val(arm, x, key) for x in (cells if cells is not None else [c["cell"] for c in self.cells]))
+
+    def rowlevel(self, col, key):
+        more = fewer = 0
+        for cs in self.rows.values():
+            a, b = self.count(col, "with", key, cs), self.count(col, "without", key, cs)
+            more += a > b
+            fewer += a < b
+        return {"rows": len(self.rows), "more": more, "fewer": fewer, "tied": len(self.rows) - more - fewer,
+                "p": sign_p(more, fewer)}
+
+    def money(self, col, arm):
+        sc = list(col.arm[arm]["scored"].values())
+        lost = [x for x in self.lost if x["model"] == col.model and x["arm"] == arm]
+        n = len(self.cells)
+        rows_usd = sum(float(e["usd_list"]) for e in sc)
+        lost_usd = sum(float(x["usd_list"]) for x in lost)
+        solved = sum(int(e["solved"]) for e in sc)
+        tin = sum(int(e["tokens_in"]) for e in sc)
+        return {"scored": len(sc), "requests": sum(int(e["requests"]) for e in sc),
+                "failed": sum(int(e["failed_requests"]) for e in sc),
+                "mean_requests": sum(int(e["requests"]) for e in sc) / len(sc),
+                "mean_steps": sum(int(e["steps"]) for e in sc) / len(sc),
+                "mean_wall_s": sum(float(e["wall_s"]) for e in sc) / len(sc),
+                "tokens_in": tin, "cached_share": sum(int(e["tokens_cached"]) for e in sc) / tin if tin else None,
+                "tokens_out": sum(int(e["tokens_out"]) for e in sc), "usd_rows": rows_usd, "lost_n": len(lost),
+                "usd_lost": lost_usd, "usd_cell": (rows_usd + lost_usd) / n,
+                "usd_solved": (rows_usd + lost_usd) / solved if solved else None,
+                "rate_mean": rows_usd / sum(float(e["wall_s"]) for e in sc),
+                "rate_max": max(float(e["usd_list"]) / float(e["wall_s"]) for e in sc if float(e["wall_s"]))}
+
+
+def family(lists):
+    """The twelve tests (two models x the two lists x three measures), Holm's step-down at 0.05. Settled only when
+    all four columns are complete."""
+    tests = []
+    for m in FAMILY_MODELS:
+        for L in lists:
+            col = L.by.get(m)
+            if col is None:
+                continue
+            for key, word in MEASURES:
+                pr = col.paired(key)
+                tests.append({"model": m, "list": L, "col": col, "key": key, "word": word, "pr": pr,
+                              "with": L.count(col, "with", key), "without": L.count(col, "without", key),
+                              "so": col.paired(key, scored_only=True), "row": L.rowlevel(col, key)})
+    settled = len(lists) == len(EXT) and len(tests) == 12 and all(L.complete for L in lists)
+    order = sorted(tests, key=lambda t: t["pr"]["p"] if t["pr"]["p"] is not None else 2.0)
+    alive = True
+    for rank, t in enumerate(order, 1):
+        t["rank"], t["threshold"] = rank, ALPHA / (len(order) - rank + 1)
+        alive = alive and t["pr"]["p"] is not None and t["pr"]["p"] <= t["threshold"]
+        t["passes"] = alive
+        f, g = t["pr"]["with_only"], t["pr"]["without_only"]
+        t["ahead"] = (f < g) if t["key"] == "false_claim" else (f > g)
+        t["even"] = f == g
+        r = t["row"]
+        t["row_ahead"] = r["fewer"] if t["key"] == "false_claim" else r["more"]
+        t["row_behind"] = r["more"] if t["key"] == "false_claim" else r["fewer"]
+        t["clause"] = (t["passes"] and settled and r["p"] is not None and r["p"] > ALPHA)
+        if not settled:
+            t["verdict"] = "family not settled"
+        elif t["passes"]:
+            t["verdict"] = ("established on the extension list" if t["ahead"] else
+                            "established on the extension list AGAINST Cerulion")
+            if t["key"] == "false_claim" and t["ahead"]:
+                t["verdict"] += " (fewer with Cerulion)"
+        elif t["pr"]["p"] is not None and t["pr"]["p"] <= ALPHA:
+            t["verdict"] = ("points up, not established" if t["ahead"] else "points down, not established")
+        else:
+            t["verdict"] = "no difference shown"
+        if t["clause"]:
+            t["verdict"] += f", on {t['row_ahead']} of the {r['rows']} {unit_of(t['list'])}"
+    return order, settled
+
+
+def list_name(L):
+    return "list 2 (LIBERO-PRO)" if L.key == "list2" else L.bench
+
+
+def unit_of(L):
+    return "tasks" if L.bench == "LIBERO-10" else "task rows"
+
+
+S2_LINE = ("- The 400-cell lists were added after the first rows of the 100-cell grid had been scored and seen. The "
+           "100-cell test declared beforehand remains the primary result. That test is the grid's main test, in "
+           "../SUMMARY.md.")
+
+
+def s_lines(name, libero10=False, pool=False):
+    L = [f"- These are new start states of task rows {name} was developed on at other start states. They are not "
+         f"unseen tasks.",
+         S2_LINE]
+    if libero10:
+        L.append(f"- LIBERO-10's ten tasks are the ones {name} was developed and gated on; these are 40 other start "
+                 f"states of each. Supporting evidence, not a second benchmark.")
+    if pool:
+        L.append("- With any number that pools two lists: " + POOL_CAVEAT)
+    return L
+
+
+# How the LIBERO-10 list and its development start states ran when two machines stopped. The rows carry no machine,
+# so these counts are stated here, not computed: the episodes moved, the machines they moved to, the start states
+# whose two arms then ran on two machines hours apart, and the episodes of one model and arm run at once.
+L10_MOVED = {"episodes": 141, "list": 105, "development": 36, "machines": 3}
+L10_SPLIT = [("GPT-6 Astra", "l10_t06_i44"), ("GPT-6 Astra", "l10_t02_i29"), ("Gemini 3.8 Flash", "l10_t06_i29")]
+L10_AT_ONCE = {"machines": 2, "model": "GPT-6 Astra", "episodes": 4, "allowed": 2}
+L10_LAST_SECONDS = [("Gemini 3.8 Flash", "without", "l10_t06_i29"), ("Gemini 3.8 Flash", "without", "l10_t05_i30")]
+
+POOL_CAVEAT = ("a pool of two lists: 100 cells whose first rows had been seen when the other 400 were added; "
+               "25 task rows, 20 start states each, six suite by perturbation columns; not the published 10 tasks "
+               "x 50 of one column.")
+FIELD_500 = ("500 start states an arm is the field's count for trained policies; 25 task rows x 20 start states over "
+             "six columns here, 10 tasks x 50 in one column there")
+
+
+def l10_size_line(L10):
+    per = {}
+    for c in L10.cells:
+        per[int(c["task"])] = per.get(int(c["task"]), 0) + 1
+    full = 40 * len(per)
+    return (f"The LIBERO-10 list holds {min(per.values())} to {max(per.values())} start states a task, {L10.N} in all: "
+            f"{full - L10.N} of the {full} start states 10 to 49 had been named by earlier files and were left out, "
+            f"not replaced.")
+
+
+def family_table(order, settled):
+    L = ["| Holm rank | model | list | measure | with (Wilson 95) | without (Wilson 95) | difference, points "
+         "(Newcombe 95) | with only | without only | exact p | Holm threshold | met | verdict |",
+         "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for t in order:
+        pr, n = t["pr"], t["list"].N
+        L.append(f"| {t['rank']} | {t['model']} | {list_name(t['list'])} | {t['word']} | {t['with']} of {n} "
+                 f"({w1(wilson(t['with'], n))}) | {t['without']} of {n} ({w1(wilson(t['without'], n))}) | "
+                 f"{d2(pr['with_only'], pr['without_only'], pr['pairs'])} ({nc1(pr['newcombe'])}) | {pr['with_only']} | "
+                 f"{pr['without_only']} | {p3(pr['p'])} | 0.05 / {len(order) - t['rank'] + 1} = {t['threshold']:.5f} | "
+                 f"{'yes' if t['passes'] else 'no'} | {t['verdict']} |")
+    passed = [t for t in order if t["passes"]]
+    first_fail = next((t for t in order if not t["passes"]), None)
+    L += ["", f"Holm's step-down: the {len(passed)} smallest p values each meet their threshold, in order"
+          + (f"; test {first_fail['rank']} ({first_fail['model']}, {first_fail['word']} on {list_name(first_fail['list'])}, "
+             f"p {p3(first_fail['pr']['p'])}) misses its threshold {first_fail['threshold']:.5f} and stops the rest."
+             if first_fail else ".")
+          + (" The family is settled: every start state of both lists has ended in both arms of both models."
+             if settled else " The family is NOT settled: a column is incomplete, so no test carries a verdict.")]
+    against = [t for t in passed if not t["ahead"]]
+    up = [t for t in order if not t["passes"] and t["pr"]["p"] is not None and t["pr"]["p"] <= ALPHA]
+    L.append(f"Tests passing against Cerulion: {len(against)}. Tests at or under 0.05 that miss Holm: {len(up)}.")
+    return L
+
+
+def bad_news(name, lists, order, grid_cols):
+    """The lines that qualify the family's numbers, each computed from the CSV files of this package."""
+    by = {(t["model"], t["list"].key, t["key"]): t for t in order}
+    P, L10 = {L.key: L for L in lists}.get("list2"), {L.key: L for L in lists}.get("libero10")
+    out = []
+    if L10 and CLEAN_MODEL in L10.by and MAIN_MODEL in L10.by:
+        a, f = L10.by[CLEAN_MODEL], L10.by[MAIN_MODEL]
+        ref = [r for r in L10.refused]
+        tasks = sorted({L10.task_of[r["cell"]] for r in ref})
+        on = [c["cell"] for c in L10.cells if int(c["task"]) in tasks]
+        off = [c["cell"] for c in L10.cells if int(c["task"]) not in tasks]
+        tw = " and ".join(str(x) for x in tasks)
+        t = by.get((CLEAN_MODEL, "libero10", "solved"))
+        if t and t["clause"]:
+            out.append(f"- {CLEAN_MODEL}'s LIBERO-10 SOLVED pass comes from tasks {tw}. It passes Holm at the start-state level "
+                       f"({t['with']} against {t['without']} of {L10.N}, p {p3(t['pr']['p'])}), but by task "
+                       f"{name} is ahead on {t['row_ahead']} of the 10 and behind on {t['row_behind']} (task-level p "
+                       f"{p3(t['row']['p'])}), so a sentence may only say \"on {t['row_ahead']} of the 10 tasks\". The "
+                       f"whole start-state difference is on tasks {tw}: without {name} {L10.count(a, 'without', 'solved', on)} "
+                       f"of {len(on)} solved, with {name} {L10.count(a, 'with', 'solved', on)} of {len(on)}. On the other "
+                       f"{10 - len(tasks)} tasks, with {name} {L10.count(a, 'with', 'solved', off)} and without "
+                       f"{L10.count(a, 'without', 'solved', off)} of {len(off)} (exploratory: no test, not a finding). "
+                       f"{MAIN_MODEL} without {name} also solved {L10.count(f, 'without', 'solved', on)} of {len(on)} on "
+                       f"tasks {tw}, with no refusal, so those tasks are at zero for the published interface with both "
+                       f"models.")
+        hl = {r["cell"] for r in ref}
+        un = {u["cell"] for u in L10.uns if u["model"] == CLEAN_MODEL and u["arm"] == "without"}
+        later = sorted(hl - un)
+        sc = a.arm["without"]["scored"]
+        dev = load(os.path.join(HERE, DEV[1]), "refusals.csv")
+        per_task = "; ".join(
+            f"task {k}: {sum(1 for r in ref if L10.task_of[r['cell']] == k)} attempts over "
+            f"{len({r['cell'] for r in ref if L10.task_of[r['cell']] == k})} start states" for k in tasks)
+        models = {r["model"] for r in ref + dev}
+        arms = {r["arm"] for r in ref + dev}
+        out.append(f"- The provider's image filter refused {CLEAN_MODEL}'s arm without {name} on exactly those "
+                   f"tasks: HTTP 400 \"Image processing blocked due to content policy violation\" in {len(ref)} attempts "
+                   f"over {len(hl)} start states of the LIBERO-10 list ({per_task}), and {len(dev)} more attempts over "
+                   f"{len({r['cell'] for r in dev})} of the development start states (refusals.csv in each folder). "
+                   + ("Every one is of that model and arm: no attempt with " + name + " and no attempt of any other "
+                      "model carries it. " if models == {CLEAN_MODEL} and arms == {"without"} else "")
+                   + f"Of those {len(hl)} start states, {len(hl & un)} ended unscored after 3 attempts (failures for "
+                   f"that arm in every test) and {len(later)} were scored on a later attempt or past the refusals: "
+                   f"{sum(int(sc[c]['solved']) for c in later)} of the {len(later)} solved, "
+                   f"{sum(int(sc[c]['false_claim']) for c in later)} of them ended on a false claim. With {name}, "
+                   f"{L10.count(a, 'with', 'solved', sorted(hl))} of the {len(hl)} were solved. No start state was run "
+                   f"again for it: the requests reached the provider and were answered.")
+        t = by.get((CLEAN_MODEL, "libero10", "false_claim"))
+        if t:
+            s = a.stats("with"), a.stats("without")
+            out.append(f"- {CLEAN_MODEL}'s LIBERO-10 FALSE CLAIM pass also comes from tasks {tw}: {t['with']} against "
+                       f"{t['without']} of {L10.N} (p {p3(t['pr']['p'])}), but by task {name} has fewer on "
+                       f"{t['row_ahead']} of the 10 and more on {t['row_behind']} (task-level p {p3(t['row']['p'])}). Per "
+                       f"unsolved episode {name} is not lower: {r3(s[0]['false_claims'], s[0]['unsolved'])} against "
+                       f"{r3(s[1]['false_claims'], s[1]['unsolved'])} (or "
+                       f"{r3(s[1]['false_claims'], s[1]['scored'] - s[1]['solved'])} on scored rows only). Outside "
+                       f"tasks {tw}: with {name} {L10.count(a, 'with', 'false_claim', off)} and without "
+                       f"{L10.count(a, 'without', 'false_claim', off)} false claims (exploratory).")
+        t = by.get((CLEAN_MODEL, "libero10", "clean"))
+        if t and t["clause"]:
+            r = t["row"]
+            out.append(f"- {CLEAN_MODEL}'s LIBERO-10 CLEAN pass holds on {t['row_ahead']} of the 10 tasks only (ahead "
+                       f"{r['more']}, behind {r['fewer']}, tied {r['tied']}, task-level p {p3(r['p'])}): a sentence must "
+                       f"say \"on {t['row_ahead']} of the 10 tasks\".")
+        t = by.get((MAIN_MODEL, "libero10", "false_claim"))
+        if t:
+            s = f.stats("with"), f.stats("without")
+            out.append(f"- {MAIN_MODEL} on LIBERO-10: {t['verdict']} in false claims ({t['with']} against "
+                       f"{t['without']} of {L10.N}, p {p3(t['pr']['p'])}), and per unsolved episode {name} claims "
+                       f"falsely {'MORE' if s[0]['false_claims'] / s[0]['unsolved'] > s[1]['false_claims'] / s[1]['unsolved'] else 'less'} "
+                       f"often ({r3(s[0]['false_claims'], s[0]['unsolved'])} against "
+                       f"{r3(s[1]['false_claims'], s[1]['unsolved'])}).")
+    if L10 and L10.stopped and all(m in L10.by for m, _, _ in L10_LAST_SECONDS):
+        cells = {c["cell"] for c in L10.cells}
+        assert all(c in cells for _, c in L10_SPLIT) and all(c in cells for _, _, c in L10_LAST_SECONDS)
+        stops = len({s["machine_stopped"] for s in L10.stopped})
+        last = [(m, arm, c) for m, arm, c in L10_LAST_SECONDS if not L10.by[m].val(arm, c, "solved")]
+        split = {}
+        for m, c in L10_SPLIT:
+            split.setdefault(m, []).append(c)
+        lm = {}
+        for m, arm, c in L10_LAST_SECONDS:
+            lm.setdefault(f"{m} {arm} {name}", []).append(c)
+        solved_last = len(L10_LAST_SECONDS) - len(last)
+        dev_stopped = load(os.path.join(HERE, DEV[1]), "stopped_attempts.csv")
+        out.append(f"- The LIBERO-10 list ran under changed conditions: {stops} machines stopped during its run, with "
+                   f"{len(L10.stopped)} attempts running (../extension_libero10/stopped_attempts.csv, priced under the cost "
+                   f"table of ../extension_libero10/SUMMARY.md), and "
+                   f"the {L10_MOVED['episodes']} episodes they had not ended ({L10_MOVED['list']} of the LIBERO-10 list, "
+                   f"{L10_MOVED['development']} of its development start states) ran from attempt 1 ("
+                   f"{len(L10.stopped) + len(dev_stopped)} of them again) on {L10_MOVED['machines']} other machines "
+                   f"hours later. For {len(L10_SPLIT)} start states this put the "
+                   f"two arms of a model on two machines hours apart ("
+                   + ", ".join(f"{m} {' and '.join(cs)}" for m, cs in split.items())
+                   + f"), and {L10_AT_ONCE['machines']} machines then ran up to {L10_AT_ONCE['episodes']} "
+                   f"{L10_AT_ONCE['model']} episodes at once where the protocol allowed {L10_AT_ONCE['allowed']} a "
+                   f"machine. A row "
+                   f"written in a stopped machine's last seconds and never copied off cannot be ruled out; the "
+                   f"{len(L10_LAST_SECONDS)} start states that could hold one ("
+                   + "; ".join(f"{k}, {' and '.join(cs)}" for k, cs in lm.items())
+                   + ") ran again and " + ("were not solved." if not solved_last else
+                                           f"{solved_last} of them were solved."))
+    if P and MAIN_MODEL in P.by:
+        f = P.by[MAIN_MODEL]
+        s = f.stats("with"), f.stats("without")
+        if s[0]["false_claims"] < s[1]["false_claims"] and \
+                s[0]["false_claims"] / s[0]["unsolved"] >= s[1]["false_claims"] / s[1]["unsolved"]:
+            out.append(f"- {MAIN_MODEL}'s fewer false claims on list 2 are because {name} solved more, not because "
+                       f"the model was more candid when it failed: per unsolved episode "
+                       f"{r3(s[0]['false_claims'], s[0]['unsolved'])} with {name} against "
+                       f"{r3(s[1]['false_claims'], s[1]['unsolved'])} without.")
+    if P and CLEAN_MODEL in P.by:
+        a = P.by[CLEAN_MODEL]
+        t = by.get((CLEAN_MODEL, "list2", "solved"))
+        g = {c.model: c for c in (grid_cols or [])}.get(CLEAN_MODEL)
+        if t and not t["passes"]:
+            parts = [f"- {CLEAN_MODEL} SOLVED: {t['verdict']} on list 2 ({t['with']} against {t['without']} of "
+                     f"{P.N}, p {p3(t['pr']['p'])}; the expected result at this count, RULES.md section 7)"]
+            if g and g.complete:
+                gw, go = g.stats("with")["solved"], g.stats("without")["solved"]
+                pw, po = gw + t["with"], go + t["without"]
+                parts.append(f", none in the two lists together ({pw} against {po} of {P.N + len(g.cells)}; "
+                             f"{FIELD_500}), none on "
+                             f"the grid's {len(g.cells)} ({gw} against {go})")
+            r = t["row"]
+            worst = sorted(((P.count(a, "without", "solved", cs) - P.count(a, "with", "solved", cs), row,
+                             P.count(a, "with", "solved", cs), P.count(a, "without", "solved", cs), len(cs))
+                            for row, cs in P.rows.items()), reverse=True)
+            behind = [x for x in worst if x[0] > 0]
+            gt = [c["cell"] for c in P.cells if c["suite"] == "libero_goal" and c["perturbation"] == "task"]
+            parts.append(f". By task row {name} is behind on {r['fewer']} of the {r['rows']}, by up to "
+                         f"{behind[0][0]} start states of {behind[0][4]} ("
+                         + "; ".join(f"{x[1]}: {x[2]} against {x[3]}" for x in behind[:2])
+                         + f"), and on the Goal by task column {name} solved "
+                         f"{P.count(a, 'with', 'solved', gt)} and without {P.count(a, 'without', 'solved', gt)} of "
+                         f"{len(gt)} (exploratory).")
+            if L10 and CLEAN_MODEL in L10.by:
+                b = L10.by[CLEAN_MODEL]
+                beh = [(k, cs) for k, cs in sorted(L10.rows.items(), key=lambda kv: L10.task_of[kv[1][0]])
+                       if L10.count(b, "with", "solved", cs) < L10.count(b, "without", "solved", cs)]
+                parts.append(f" With {CLEAN_MODEL} on LIBERO-10 {name} is behind on tasks "
+                             + ", ".join(f"{L10.task_of[cs[0]]} ({L10.count(b, 'with', 'solved', cs)} against "
+                                         f"{L10.count(b, 'without', 'solved', cs)})" for _, cs in beh) + ".")
+            out.append("".join(parts))
+    if P and MAIN_MODEL in P.by and CLEAN_MODEL in P.by:
+        pr = P.by[MAIN_MODEL].paired("solved", other=P.by[CLEAN_MODEL])
+        if pr["p"] is not None and pr["p"] > ALPHA:
+            out.append(f"- {MAIN_MODEL} with {name} against {CLEAN_MODEL} without: \"as many\" on list 2 is \"no "
+                       f"difference shown\" ({P.count(P.by[MAIN_MODEL], 'with', 'solved')} against "
+                       f"{P.count(P.by[CLEAN_MODEL], 'without', 'solved')} of {P.N}, p {p3(pr['p'])}), not shown equal.")
+    return out
+
+
+def replicated_section(name, P, order, grid_cols):
+    """How list 2 relates to the grid's tests: a statement is said once, and 'replicated' only where both pass."""
+    g = {c.model: c for c in (grid_cols or [])}
+    by = {(t["model"], t["list"].key, t["key"]): t for t in order}
+    gdone = bool(grid_cols) and all(c.complete for c in grid_cols)
+    held = "and it held on 400 further start states (a list added after the first grid rows were seen)"
+    L = ["| question | the grid's test, grid 100 | list 2's test (Holm) | what may be said |", "|---|---|---|---|"]
+    rep = []
+
+    def ext(m, key):
+        t = by.get((m, "list2", key))
+        return t, ("passes" if t and t["passes"] else "does not pass")
+
+    rows = []
+    gm = g.get(MAIN_MODEL)
+    if gm and gm.complete:
+        pr = gm.paired("solved")
+        ok = pr["p"] is not None and pr["p"] <= ALPHA and pr["with_only"] > pr["without_only"]
+        rows.append((f"{MAIN_MODEL} SOLVED", f"the main test: {gm.stats('with')['solved']} against "
+                     f"{gm.stats('without')['solved']} of {len(gm.cells)} (with only {pr['with_only']}, without only "
+                     f"{pr['without_only']}), p {p3(pr['p'])}: {'passes' if ok else 'does not pass'} at 0.05", ok,
+                     ext(MAIN_MODEL, "solved")))
+    ga = g.get(CLEAN_MODEL)
+    if ga and ga.complete:
+        pr = ga.paired("clean")
+        ok = pr["p"] is not None and pr["p"] <= ALPHA and pr["with_only"] > pr["without_only"]
+        rows.append((f"{CLEAN_MODEL} CLEAN", f"declared secondary: {ga.stats('with')['clean']} against "
+                     f"{ga.stats('without')['clean']} ({pr['with_only']} against {pr['without_only']}), p "
+                     f"{p3(pr['p'])}: {'passes' if ok else 'does not pass'} at 0.05", ok, ext(CLEAN_MODEL, "clean")))
+        pr = ga.paired("solved")
+        famp = holm({c.model: c.paired("solved")["p"] for c in grid_cols}).get(CLEAN_MODEL)
+        ok = bool(gdone and famp and famp[1])
+        rows.append((f"{CLEAN_MODEL} SOLVED", f"in the per-model family: {ga.stats('with')['solved']} against "
+                     f"{ga.stats('without')['solved']} ({pr['with_only']} against {pr['without_only']}), p "
+                     f"{p3(pr['p'])}" + (": cannot pass at any threshold" if pr["p"] is not None and pr["p"] > ALPHA
+                                         else ""), ok, ext(CLEAN_MODEL, "solved")))
+    if gm and gm.complete:
+        pr = gm.paired("clean")
+        strict = ALPHA / len(grid_cols)
+        famp = holm({c.model: c.paired("clean")["p"] for c in grid_cols}).get(MAIN_MODEL)
+        ok = bool(gdone and famp and famp[1])
+        txt = (f"in the grid's CLEAN family, " + ("settled" if gdone else "not settled while the grid runs") +
+               f"; {gm.stats('with')['clean']} against {gm.stats('without')['clean']} ({pr['with_only']} against "
+               f"{pr['without_only']}), p {p3(pr['p'])}"
+               + (f", under 0.05 / {len(grid_cols)}, the strictest threshold that family can set"
+                  if pr["p"] is not None and pr["p"] <= strict else ""))
+        rows.append((f"{MAIN_MODEL} CLEAN", txt, ok, ext(MAIN_MODEL, "clean")))
+    for q, gtxt, gok, (t, etxt) in rows:
+        if gok and t and t["passes"]:
+            say = f"the statement, then \"{held}\""
+            rep.append(q)
+        elif gok:
+            say = "the statement stands, and the same sentence carries \"it did not hold on the 400-cell extension list\" with its counts and p"
+        elif t and t["passes"]:
+            say = ("when the grid's test is settled and passes: the statement, then \"" + held + "\"; until then, "
+                   "no upgrade") if "not settled" in gtxt else "no upgrade: the grid's rule decides"
+        else:
+            say = "no statement; both printed"
+        L.append(f"| {q} | {gtxt} | {etxt} | {say} |")
+    fc = "; ".join(f"{m} {g[m].stats('with')['false_claims']} against {g[m].stats('without')['false_claims']}"
+                   for m in FAMILY_MODELS if m in g and g[m].complete)
+    fcx = all(by.get((m, "list2", "false_claim"), {}).get("passes") for m in FAMILY_MODELS)
+    L.append(f"| FALSE CLAIM, a model | the grid's test pools every model and is " +
+             ("settled" if gdone else "not settled while the grid runs") + f"; the grid's per-model counts ({fc}) "
+             f"are not a grid test | {'passes for both models' if fcx else 'see the family table'} | this list's own "
+             f"sentences only |")
+    L += ["", "\"Replicated\" may be said only where both columns read passes: " + (" and ".join(rep) if rep else "none")
+          + ". Not of " + ", ".join(f"{t['model']} {t['word']}" for t in order if t["list"].key == "list2"
+                                    and t["passes"] and f"{t['model']} {t['word']}" not in rep)
+          + " from this list. One effect is one statement: the grid's test and this list's test on the same model "
+          "and measure are one finding, their p values are never combined, and nothing is confirmed twice."]
+    return L
+
+
+def scored_pairs_table(L, order):
+    T = ["| model | measure | pairs | with | without | with only | without only | exact p | difference (Newcombe 95) | "
+         "under the same Holm threshold | start states left out |", "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for t in order:
+        if t["list"] is not L:
+            continue
+        s = t["so"]
+        out = sorted({u["cell"] for u in L.uns if u["model"] == t["model"]},
+                     key=lambda c: next(i for i, x in enumerate(L.cells) if x["cell"] == c))
+        T.append(f"| {t['model']} | {t['word']} | {s['pairs']} | {s['both'] + s['with_only']} | "
+                 f"{s['both'] + s['without_only']} | {s['with_only']} | {s['without_only']} | {p3(s['p'])} | "
+                 f"{d2(s['with_only'], s['without_only'], s['pairs'])} ({nc1(s['newcombe'])}) | "
+                 f"{'yes' if s['p'] is not None and s['p'] <= t['threshold'] else 'no'} | {', '.join(out) or 'none'} |")
+    return T
+
+
+def row_table(L, order):
+    unit = "task rows" if L.bench != "LIBERO-10" else "tasks"
+    T = [f"| model | measure | {unit} | with more | with fewer | tied | exact p on untied | start-state test | "
+         f"the sentence must say |", "|---|---|---|---|---|---|---|---|---|"]
+    for t in order:
+        if t["list"] is not L:
+            continue
+        r = t["row"]
+        must = (f"on {t['row_ahead']} of the {r['rows']} {unit} (with more {r['more']}, fewer {r['fewer']}, tied "
+                f"{r['tied']}); not \"across the suite\"" if t["clause"] else "no extra clause")
+        T.append(f"| {t['model']} | {t['word']} | {r['rows']} | {r['more']} | {r['fewer']} | {r['tied']} | "
+                 f"{p3(r['p'])} | {'passes Holm' if t['passes'] else 'does not pass'} | {must} |")
+    return T
+
+
+def every_row_table(L):
+    unit = "task row" if L.bench != "LIBERO-10" else "task"
+    head = [f"{'Flash' if m == MAIN_MODEL else 'Astra'} {w}" for m in FAMILY_MODELS for _, w in MEASURES]
+    T = [f"| {unit} | start states | " + " | ".join(head) + " |", "|---|---|" + "---|" * len(head)]
+    rows = list(L.rows.items())
+    if L.bench == "LIBERO-10":
+        rows.sort(key=lambda kv: L.task_of[kv[1][0]])
+    for row, cs in rows:
+        vals = [f"{L.count(L.by[m], 'with', k, cs)} / {L.count(L.by[m], 'without', k, cs)}"
+                for m in FAMILY_MODELS for k, _ in MEASURES]
+        T.append(f"| {row} | {len(cs)} | " + " | ".join(vals) + " |")
+    return T
+
+
+def arms_table(L, name):
+    T = ["| model | arm | start states | scored | unscored | solved (Wilson 95) | clean (Wilson 95) | false claims "
+         "(Wilson 95) | false claims per unsolved episode | the same, scored rows only |",
+         "|---|---|---|---|---|---|---|---|---|---|"]
+    for c in L.cols:
+        for arm in ("with", "without"):
+            s = c.stats(arm)
+            n = s["finished"]
+            T.append(f"| {c.model}{'' if c.complete else '*'} | {arm} {name} | {n} | {s['scored']} | {s['unscored']} | "
+                     f"{s['solved']} ({w1(wilson(s['solved'], n))}) | {s['clean']} ({w1(wilson(s['clean'], n))}) | "
+                     f"{s['false_claims']} ({w1(wilson(s['false_claims'], n))}) | {s['false_claims']} of "
+                     f"{s['unsolved']} ({r3(s['false_claims'], s['unsolved'])}) | {s['false_claims']} of "
+                     f"{s['scored'] - s['solved']} ({r3(s['false_claims'], s['scored'] - s['solved'])}) |")
+    return T
+
+
+def money_table(L, name):
+    T = ["| model | arm | mean requests | mean control steps | requests answered | failed requests, each sent again | "
+         "tokens in (cached share) | tokens out | USD, scored rows | attempts in no row, USD | USD a start state | "
+         "USD a solved start state | mean seconds an episode |", "|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
+    for c in L.cols:
+        for arm in ("with", "without"):
+            m = L.money(c, arm)
+            T.append(f"| {c.model} | {arm} {name} | {m['mean_requests']:.1f} | {m['mean_steps']:.1f} | "
+                     f"{m['requests']} | {m['failed']} | {m['tokens_in']:,} ({100 * m['cached_share']:.1f} percent) | "
+                     f"{m['tokens_out']:,} | {usd2(m['usd_rows'])} | {m['lost_n']}, {usd2(m['usd_lost'])} | "
+                     f"{m['usd_cell']:.2f} | {'none solved' if m['usd_solved'] is None else format(m['usd_solved'], '.2f')} | "
+                     f"{m['mean_wall_s']:.1f} |")
+    return T
+
+
+def cross_lines(L, name):
+    if not (MAIN_MODEL in L.by and CLEAN_MODEL in L.by):
+        return []
+    T = ["| measure | " + f"{MAIN_MODEL} with {name} (Wilson 95) | {CLEAN_MODEL} without (Wilson 95) | difference, "
+         "points (Newcombe 95) | first only | second only | exact p | wording |", "|---|---|---|---|---|---|---|---|"]
+    for key, word in MEASURES[:2]:
+        pr = L.by[MAIN_MODEL].paired(key, other=L.by[CLEAN_MODEL])
+        a, b = L.count(L.by[MAIN_MODEL], "with", key), L.count(L.by[CLEAN_MODEL], "without", key)
+        wd = ("no difference shown" if pr["p"] is None or pr["p"] > ALPHA else
+              f"differs (p {p3(pr['p'])}; a pair named beforehand, outside the corrected family)")
+        T.append(f"| {word} | {a} of {L.N} ({w1(wilson(a, L.N))}) | {b} of {L.N} ({w1(wilson(b, L.N))}) | "
+                 f"{d2(pr['with_only'], pr['without_only'], pr['pairs'])} ({nc1(pr['newcombe'])}) | {pr['with_only']} | "
+                 f"{pr['without_only']} | {p3(pr['p'])} | {wd} |")
+    return T
+
+
+def stopped_lines(L, name):
+    if not L.stopped:
+        return []
+    mean = high = 0.0
+    for s in L.stopped:
+        col = L.by[s["model"]]
+        m = L.money(col, s["arm"])
+        mean += m["rate_mean"] * int(s["ran_at_most_s"])
+        high += m["rate_max"] * int(s["ran_at_most_s"])
+    # the episode's scored row after the stop: its attempt number is the rerun's, counted again from 1
+    later = [L.by[s["model"]].arm[s["arm"]]["scored"].get(s["cell"]) for s in L.stopped]
+    scored = [e for e in later if e]
+    on1 = sum(1 for e in scored if int(e["attempt"]) == 1)
+    rerun = (f"each start state ran again from attempt 1 on another machine ({len(scored)} of the {len(L.stopped)} "
+             f"were then scored, all on that attempt 1)" if scored and on1 == len(scored) else
+             f"each start state ran again on another machine ({len(scored)} of the {len(L.stopped)} were then "
+             f"scored, {on1} of them on attempt 1)")
+    return [f"{len(L.stopped)} attempts were running when their machine stopped and left no token count on any copy "
+            f"(stopped_attempts.csv, with the longest each can have run). They are in no row and in no total above, "
+            f"and {rerun}. Priced at the mean spend a second of their model and arm on this list (the USD of its scored "
+            f"rows over their seconds), they come to about {mean:.0f} USD; at the highest spend a second of any scored "
+            f"row of their model and arm, about {high:.0f} USD. No row bounds them."]
+
+
+def sentences(name, lists, order, grid_cols, this):
+    """The sentences the reading rule allows for this list's results, filled from the counts above."""
+    by = {(t["model"], t["list"].key, t["key"]): t for t in order}
+    P, L10 = {L.key: L for L in lists}.get("list2"), {L.key: L for L in lists}.get("libero10")
+    P_this, L10_this = (P if this is P else None), (L10 if this is L10 else None)
+    out = []
+
+    def ab(t):
+        return f"{t['with']} against {t['without']}"
+
+    if P_this:
+        t = by.get((MAIN_MODEL, "list2", "solved"))
+        g = {c.model: c for c in (grid_cols or [])}.get(MAIN_MODEL)
+        if t and t["passes"] and t["ahead"]:
+            line = (f"- {MAIN_MODEL} SOLVED, list 2: \"With {MAIN_MODEL}, on {P.N} further start states, {name} solved "
+                    f"{t['with']} of {P.N} and the plain interface {t['without']} of {P.N} (exact paired test p "
+                    f"{p3(t['pr']['p'])}; {name} only {t['pr']['with_only']}, plain only {t['pr']['without_only']}).\"")
+            if g and g.complete:
+                gp = g.paired("solved")
+                if gp["p"] is not None and gp["p"] <= ALPHA and gp["with_only"] > gp["without_only"]:
+                    line += " The main test passed: \"The 100-cell result held on 400 further start states.\""
+            out.append(line)
+            if g and g.complete and P.by[MAIN_MODEL].complete:
+                a1, a2 = g.paired("solved"), P.by[MAIN_MODEL].paired("solved")
+                arms, ok = [], True
+                for side in ("with_only", "without_only"):
+                    k1, k2 = a1["both"] + a1[side], a2["both"] + a2[side]
+                    x1, x2 = wilson(k1, a1["pairs"]), wilson(k2, a2["pairs"])
+                    ok = ok and not (x1[1] < x2[0] or x2[1] < x1[0])
+                    arms.append((k1 + k2, a1["pairs"] + a2["pairs"]))
+                if ok:
+                    (kw, n), (ko, _) = arms
+                    out.append(f"- The two lists together, {MAIN_MODEL} SOLVED: \"Over {n} start states an arm (two "
+                               f"lists), {name} solved {kw} of {n} ({w1(wilson(kw, n))} percent) and the plain "
+                               f"interface {ko} of {n} ({w1(wilson(ko, n))} percent).\" No p in this sentence; with "
+                               f"the pool's line, \"{POOL_CAVEAT}\", and \"{FIELD_500}.\"")
+        elif t:
+            out.append(f"- {MAIN_MODEL} SOLVED, list 2: \"With {MAIN_MODEL}, the gain did not hold on the "
+                       f"400-cell extension list: {ab(t)} of {P.N} (p {p3(t['pr']['p'])}).\"")
+        t = by.get((CLEAN_MODEL, "list2", "clean"))
+        ts = by.get((CLEAN_MODEL, "list2", "solved"))
+        if t and ts:
+            if t["passes"] and t["ahead"]:
+                out.append(f"- {CLEAN_MODEL} CLEAN, list 2, with its SOLVED counts: \"With {CLEAN_MODEL}, more of "
+                           f"{name}'s solves came inside the published step limit: {ab(t)} of {P.N} (p "
+                           f"{p3(t['pr']['p'])}); it solved {ab(ts)} of {P.N} (p {p3(ts['pr']['p'])}).\"")
+            else:
+                out.append(f"- {CLEAN_MODEL} CLEAN, list 2: \"With {CLEAN_MODEL}, the step-limit gain was not "
+                           f"established on 400 further start states ({ab(t)}, p {p3(t['pr']['p'])}).\"")
+        if ts and not ts["passes"]:
+            out.append(f"- {CLEAN_MODEL} SOLVED, list 2: \"With {CLEAN_MODEL}, {name} did not solve more start states "
+                       f"({ab(ts)} of {P.N}, p {p3(ts['pr']['p'])}). A difference this small could not be shown at "
+                       f"this count.\"")
+        for m in FAMILY_MODELS:
+            t = by.get((m, "list2", "false_claim"))
+            if t and t["passes"] and t["ahead"]:
+                s = t["col"].stats("with"), t["col"].stats("without")
+                notlower = s[0]["false_claims"] / s[0]["unsolved"] >= s[1]["false_claims"] / s[1]["unsolved"]
+                out.append(f"- {m} FALSE CLAIM, list 2: \"Fewer episodes ended with the model wrongly saying it had "
+                           f"succeeded: {ab(t)} of {P.N} (p {p3(t['pr']['p'])})"
+                           + (", because it solved more, not because the model was more candid when it failed"
+                              if notlower else "") + f".\" Beside it: {s[0]['false_claims']} of {s[0]['unsolved']} "
+                           f"unsolved ({r3(s[0]['false_claims'], s[0]['unsolved'])}) against {s[1]['false_claims']} of "
+                           f"{s[1]['unsolved']} ({r3(s[1]['false_claims'], s[1]['unsolved'])}).")
+        if MAIN_MODEL in P.by and CLEAN_MODEL in P.by:
+            pr = P.by[MAIN_MODEL].paired("solved", other=P.by[CLEAN_MODEL])
+            a, b = P.count(P.by[MAIN_MODEL], "with", "solved"), P.count(P.by[CLEAN_MODEL], "without", "solved")
+            out.append(f"- The cross-model pair, list 2: \"{MAIN_MODEL} with {name} solved {a} of {P.N}; {CLEAN_MODEL} "
+                       f"without it solved {b} of {P.N} ("
+                       + (f"no difference shown, p {p3(pr['p'])}" if pr["p"] > ALPHA else
+                          f"differs, p {p3(pr['p'])}; a pair named beforehand, outside the corrected family") + ").\"")
+        rl = []
+        for m in FAMILY_MODELS:
+            for key, word in MEASURES:
+                t = by.get((m, "list2", key))
+                if t:
+                    r = t["row"]
+                    rl.append(f"{m} {word}{' (fewer)' if key == 'false_claim' else ''}: \"{name} ahead on "
+                              f"{t['row_ahead']} of {r['rows']} task rows, behind on {t['row_behind']}, tied on "
+                              f"{r['tied']}\"")
+        out.append("- Task-row reads, list 2: " + "; ".join(rl) + ".")
+    if L10_this:
+        for m in FAMILY_MODELS:
+            for key, word in MEASURES:
+                t = by.get((m, "libero10", key))
+                if not t:
+                    continue
+                r = t["row"]
+                if t["passes"] and t["ahead"]:
+                    clause = ""
+                    if t["clause"]:
+                        side = ("fewer on", "more on") if key == "false_claim" else ("ahead on", "behind on")
+                        clause = (f", on {t['row_ahead']} of the 10 tasks ({name} {side[0]} {t['row_ahead']}, "
+                                  f"{side[1]} {t['row_behind']}, tied on {r['tied']})")
+                    if key == "false_claim":
+                        s = t["col"].stats("with"), t["col"].stats("without")
+                        notlower = s[0]["false_claims"] / s[0]["unsolved"] >= s[1]["false_claims"] / s[1]["unsolved"]
+                        line = (f"- {m} FALSE CLAIM, LIBERO-10, with the LIBERO-10 line: \"On LIBERO-10, the same "
+                                f"direction on {L10.N} other start states of its ten tasks: fewer episodes ended with the "
+                                f"model wrongly saying it had succeeded{clause}: {ab(t)} (p {p3(t['pr']['p'])})"
+                                + (", because it solved more, not because the model was more candid when it failed"
+                                   if notlower else "") + f".\" Beside it: {s[0]['false_claims']} of "
+                                f"{s[0]['unsolved']} unsolved ({r3(s[0]['false_claims'], s[0]['unsolved'])}) against "
+                                f"{s[1]['false_claims']} of {s[1]['unsolved']} "
+                                f"({r3(s[1]['false_claims'], s[1]['unsolved'])}), and the bad news on tasks 4 and 6.")
+                    else:
+                        line = (f"- {m} {word}, LIBERO-10, with the LIBERO-10 line: \"On LIBERO-10, the same direction "
+                                f"on {L10.N} other start states of its ten tasks{clause}: {ab(t)} (p "
+                                f"{p3(t['pr']['p'])}).\"")
+                        if m == CLEAN_MODEL and key == "solved":
+                            ps = by.get((CLEAN_MODEL, "list2", "solved"))
+                            line += (" Never without, in the same place, the bad news on tasks 4 and 6 and the "
+                                     "image filter")
+                            if ps and not ps["passes"]:
+                                line += (f", and the LIBERO-PRO null beside it: \"With {CLEAN_MODEL}, {name} did not "
+                                         f"solve more start states ({ab(ps)} of {P.N if P else ''}, p "
+                                         f"{p3(ps['pr']['p'])}).\"")
+                            else:
+                                line += "."
+                    out.append(line)
+                elif not t["passes"]:
+                    out.append(f"- {m} {word}, LIBERO-10, with the LIBERO-10 line: \"On LIBERO-10, no difference "
+                               f"shown for {m} ({ab(t)} of {L10.N}, p {p3(t['pr']['p'])}).\""
+                               if t["verdict"] == "no difference shown" else
+                               f"- {m} {word}, LIBERO-10: {t['verdict']} ({ab(t)} of {L10.N}, p {p3(t['pr']['p'])}).")
+        if MAIN_MODEL in L10.by and CLEAN_MODEL in L10.by:
+            parts = []
+            for key, word in MEASURES[:2]:
+                pr = L10.by[MAIN_MODEL].paired(key, other=L10.by[CLEAN_MODEL])
+                a, b = L10.count(L10.by[MAIN_MODEL], "with", key), L10.count(L10.by[CLEAN_MODEL], "without", key)
+                parts.append(f"{word} {a} against {b} of {L10.N}, " + (
+                    "no difference shown" if pr["p"] > ALPHA else
+                    f"differs (p {p3(pr['p'])}; a pair named beforehand, outside the corrected family)"))
+            out.append(f"- The cross-model pair, LIBERO-10, with the LIBERO-10 line: " + "; ".join(parts) + ".")
+        rl = []
+        for m in FAMILY_MODELS:
+            for key, word in MEASURES:
+                t = by.get((m, "libero10", key))
+                if t:
+                    r = t["row"]
+                    rl.append(f"{m} {word}{' (fewer)' if key == 'false_claim' else ''}: \"{name} ahead on "
+                              f"{t['row_ahead']} of 10 tasks, behind on {t['row_behind']}, tied on {r['tied']}\"")
+        out.append("- Task reads, LIBERO-10, with the LIBERO-10 line: " + "; ".join(rl) + ".")
+    return out
+
+
+NOT_SAID = ("Not said, whatever these rows show: that the tasks are new, held back or never developed on; \"the full "
+            "LIBERO-PRO benchmark\", \"500 a suite\", \"the full LIBERO-10 suite\" or \"LIBERO-10 at 500\"; that the "
+            "extension's existence or size was declared before the grid's rows (its reading rule was fixed before its "
+            "own rows; its decision came after the first grid rows were seen); \"confirmed twice\" or any combined "
+            "p; anything resting on the pooled p; any comparison verb, multiple or rank against a published system; "
+            "\"{name} helps strong models solve more\" (GPT-6 Astra SOLVED did not pass on LIBERO-PRO, its LIBERO-10 "
+            "pass is on 5 of the 10 tasks, and LIBERO-10 alone may not carry it); \"{name} stops false claims\" or "
+            "\"makes the model honest\"; \"LIBERO-10 confirms it on a "
+            "second benchmark\"; any development number in a headline, chart of results, pool or test; anything about "
+            "another model from these lists; any split of these rows worded as a finding, the tasks 4 and 6 reading "
+            "included.")
+
+
+def ext_summary_csv(L, order, folder):
+    rows = []
+    for c in L.cols:
+        for arm in ("without", "with"):
+            s = c.stats(arm)
+            w, cw = s["solved_wilson"] or (None, None), s["clean_wilson"] or (None, None)
+            rows.append({"list": L.key, "model": c.model, "arm": arm, "column_complete": int(c.complete),
+                         "finished": s["finished"], "scored": s["scored"], "unscored": s["unscored"],
+                         "not_finished": s["left"], "solved": s["solved"], "solved_wilson_low": r4(w[0]),
+                         "solved_wilson_high": r4(w[1]), "clean": s["clean"], "clean_wilson_low": r4(cw[0]),
+                         "clean_wilson_high": r4(cw[1]), "false_claims": s["false_claims"],
+                         "mean_requests": r4(s["requests"]), "mean_steps": r4(s["steps"]),
+                         "mean_wall_s": r4(s["wall_s"]), "mean_usd_list": r4(s["usd"]),
+                         "usd_sum": r4(s["usd_sum"]), "mean_tokens_in": r4(s["tokens_in"]),
+                         "mean_tokens_cached": r4(s["tokens_cached"]), "mean_tokens_out": r4(s["tokens_out"]),
+                         **{k: v for k, v in c.paired("solved").items() if k in ("both", "with_only", "without_only",
+                                                                                  "neither")},
+                         "paired_cells": c.paired("solved")["pairs"], "sign_p_solved": c.paired("solved")["p"]})
+    return csv_text(SUM_HEAD[:-2], rows)
+
+
+def ext_paired_csv(L, order):
+    rows = []
+    for t in order:
+        if t["list"] is not L:
+            continue
+        pr, nc = t["pr"], t["pr"]["newcombe"] or (None, None)
+        rows.append({"list": L.key, "model": t["model"], "measure": t["key"], "column_complete": int(t["col"].complete),
+                     "paired_cells": pr["pairs"], "with_only": pr["with_only"], "without_only": pr["without_only"],
+                     "both": pr["both"], "neither": pr["neither"], "difference": r4(pr["diff"]),
+                     "newcombe_low": r4(nc[0]), "newcombe_high": r4(nc[1]), "sign_p": pr["p"],
+                     "holm_threshold": r4(t["threshold"]), "passes_holm": int(t["passes"]), "verdict": t["verdict"]})
+    return csv_text(PAIR_HEAD, rows)
+
+
+def ext_task_rows_csv(L):
     tr = []
-    for col in cols:
-        for row, cs in rows_of.items():
+    for col in L.cols:
+        for row, cs in L.rows.items():
             d = {"model": col.model, "task_row": row, "start_states": len(cs)}
             for arm in ("with", "without"):
                 for key, _ in MEASURES:
-                    d[f"{key}_{arm}"] = sum(col.val(arm, c, key) for c in cs)
+                    d[f"{key}_{arm}"] = L.count(col, arm, key, cs)
             tr.append(d)
-    write(os.path.join(folder, "task_rows.csv"), csv_text(
-        ["model", "task_row", "start_states"] + [f"{k}_{a}" for a in ("with", "without") for k, _ in MEASURES], tr),
-        check, changed)
-    L = [f"# Summary of list 2: {N} further start states, {len(cols)} models, both arms", "",
-         f"Computed by ../recompute.py from this folder's CSV files as read at {info['read']}. Every start state of "
-         f"this list has ended in both arms of both models.", "",
-         "Read these three lines before any number here:", "",
-         f"- These are new start states of task rows {name} was developed on at other start states. The tasks "
-         f"themselves are not new to it.",
-         f"- This {N}-start-state list was added after the first rows of the 100-start-state grid had been scored "
-         f"and seen. The 100-start-state test declared beforehand remains the main result.",
-         "- The reading rule for this list was fixed before its first row. It has a family of twelve tests: two "
-         "models, this list and a second list on another suite, three measures. Holm's step-down at 0.05 over "
-         f"the twelve; the strictest threshold is 0.05 / 12 = {STRICT:.5f}. The second list is not in this "
-         "package, so no test here carries a family verdict. A p at or under the strictest threshold passes "
-         "whatever the other tests show.", "",
-         "## Every model, both arms", ""] + arm_table(cols, name, N) + ["",
-         "## The six tests on this list", "",
-         "Exact two-sided sign test on the discordant start states, paired by start state. For FALSE CLAIM the "
-         "favourable side is fewer.", "",
-         "| model | measure | with | without | with only | without only | difference, points (Newcombe 95) | "
-         "exact p | at or under 0.05 / 12 | scored pairs only: with only, without only, p | task rows: with "
-         "ahead, behind, tied, p |", "|---|---|---|---|---|---|---|---|---|---|---|"]
-    for c in cols:
-        for key, word in MEASURES:
-            pr, so = c.paired(key), c.paired(key, scored_only=True)
-            w = sum(c.val("with", x["cell"], key) for x in cells)
-            p = sum(c.val("without", x["cell"], key) for x in cells)
-            up = dn = 0
-            for row, cs in rows_of.items():
-                a, b = sum(c.val("with", x, key) for x in cs), sum(c.val("without", x, key) for x in cs)
-                up += a > b; dn += a < b
-            L.append(f"| {c.model} | {word} | {w} of {N} | {p} of {N} | {pr['with_only']} | {pr['without_only']} | "
-                     f"{100 * pr['diff']:+.1f} ({pct(pr['newcombe'])}) | {fp(pr['p'])} | "
-                     f"{'yes' if pr['p'] is not None and pr['p'] <= STRICT else 'no'} | {so['with_only']}, "
-                     f"{so['without_only']}, {fp(so['p'])} | {up}, {dn}, {len(rows_of) - up - dn}, {fp(sign_p(up, dn))} |")
-    L += ["", f"The task row columns count the {len(rows_of)} task rows where the arm with {name} has more of the "
-          "measure, fewer, and the same; start states of one task row are not independent, so read the row counts "
-          "beside the start-state test. Every row is in task_rows.csv.", "",
-          "## False claims per unsolved episode", "",
-          "| model | arm | false claims | unsolved episodes | per unsolved episode |", "|---|---|---|---|---|"]
+    return csv_text(["model", "task_row", "start_states"] + [f"{k}_{a}" for a in ("with", "without")
+                                                            for k, _ in MEASURES], tr)
+
+
+def unscored_lines(L, name):
+    if not L.uns:
+        return ["None."]
+    lost = {}
+    for x in L.lost:
+        lost.setdefault((x["model"], x["arm"], x["cell"]), []).append(x)
+    T = ["| model | arm | start state | attempts | reason | USD of its attempts |", "|---|---|---|---|---|---|"]
+    for u in L.uns:
+        T.append(f"| {u['model']} | {u['arm']} {name} | {u['cell']} | {u['attempts']} | {u['reason']} | "
+                 f"{float(u['usd_attempts']):.2f} |")
+    n_arm = {}
+    for u in L.uns:
+        n_arm[(u["model"], u["arm"])] = n_arm.get((u["model"], u["arm"]), 0) + 1
+    most = max(n_arm.values())
+    T += ["", f"Each one is a failure for its arm: not solved, not clean, no false claim. It stays in the count "
+          f"({L.N}), enters the paired tests as a failure, and the scored-pairs table prints every test without it; "
+          f"the first verdict rules. The most unscored in one arm is {most} of {L.N} "
+          f"({100 * most / L.N:.1f} percent), under the 5 percent at which a column's heading would carry the count."]
+    return T
+
+
+def write_ext_list(L, lists, order, settled, name, grid_cols, check, changed):
+    P = {x.key: x for x in lists}.get("list2")
+    write(os.path.join(L.folder, "summary.csv"), ext_summary_csv(L, order, L.folder), check, changed)
+    write(os.path.join(L.folder, "paired.csv"), ext_paired_csv(L, order), check, changed)
+    write(os.path.join(L.folder, "task_rows.csv"), ext_task_rows_csv(L), check, changed)
+    l10 = {x.key: x for x in lists}.get("libero10")
+    title = (f"# Summary of list 2: {L.N} further start states of LIBERO-PRO, {len(L.cols)} models, both arms"
+             if L.key == "list2" else
+             f"# Summary of the LIBERO-10 list: {L.N} start states, {len(L.cols)} models, both arms")
+    done = "Every start state of this list has ended in both arms of both models." if L.complete else \
+        ("THIS LIST WAS STILL RUNNING AT THIS READ: " + "; ".join(
+            f"{c.model} ({c.stats('without')['finished']} without, {c.stats('with')['finished']} with)"
+            for c in L.cols if not c.complete) + ".")
+    T = [title, "", f"Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the "
+         f"other extension folders, as read at {L.info['read']}. {done} The two arms: `with` is the model on {name}'s tools; `without`, "
+         f"the plain interface, is the same model on the published three-tool interface.", "",
+         "Read these lines before any number here:", ""]
+    news = bad_news(name, lists, order, grid_cols)
+    T += s_lines(name, libero10=True, pool=(L.key == "list2" or any(FIELD_500 in x for x in news)))
+    if l10:
+        T += ["", l10_size_line(l10)]
+    T += ["", "## Bad news first", ""] + news
+    T += ["", "## Every model, both arms", ""] + arms_table(L, name)
+    T += ["", "Wilson intervals are over the start states of the list (scored plus unscored). A false claim is an "
+          "episode that ends with the model saying it succeeded on a start state that was not solved; per unsolved "
+          "episode divides them by the arm's start states that were not solved (unscored counted as not solved)."]
+    T += ["", "## The family of twelve tests (two models, two lists, three measures), Holm's step-down at 0.05", "",
+          "Exact two-sided sign test on the discordant start states, paired by start state, one model and one list "
+          "each; fixed with the reading rule before the first row of either extension list. For FALSE CLAIM the "
+          "favourable side is fewer. The LIBERO-10 rows carry the LIBERO-10 line above and the bad news on its tasks "
+          "4 and 6.", ""]
+    T += family_table(order, settled)
+    T += ["", "## The same tests on this list, scored pairs only (the first verdict rules)", ""] + scored_pairs_table(L, order)
+    T += ["", f"## The {unit_of(L)} as the unit (descriptive, in no family)", "",
+          f"Start states of one {'task row' if L.bench != 'LIBERO-10' else 'task'} are not independent, so the count "
+          f"of {unit_of(L)} where the arm with {name} has more of the measure, fewer and the same is printed beside "
+          f"every test, with an exact sign test on the untied ones. Where a start-state test passes Holm but this p "
+          f"is above 0.05, a sentence must give the count.", ""] + row_table(L, order)
+    T += ["", f"Every {'task row' if L.bench != 'LIBERO-10' else 'task'}, both models (with / without, of the "
+          f"start states in it; printed whole, rows at zero included; also in task_rows.csv). A split read off this "
+          f"table is exploratory, not a finding.", ""] + every_row_table(L)
+    if L.key == "list2":
+        T += ["", "## By suite and perturbation column (counts and Wilson 95 only, no test)", "",
+              "| column | tasks | start states | model | arm | solved (Wilson 95) | clean (Wilson 95) | false claims "
+              "(Wilson 95) |", "|---|---|---|---|---|---|---|---|"]
+        groups = {}
+        for x in L.cells:
+            groups.setdefault((x["suite"], x["perturbation"]), []).append(x)
+        for (suite, pert), xs in groups.items():
+            cs = [x["cell"] for x in xs]
+            colname = f"{suite.replace('libero_', '').capitalize()} by {'position' if pert == 'swap' else 'task'}"
+            for c in L.cols:
+                for arm in ("with", "without"):
+                    k = [L.count(c, arm, key, cs) for key, _ in MEASURES]
+                    T.append(f"| {colname} | {len({x['task'] for x in xs})} | {len(cs)} | {c.model} | {arm} {name} | "
+                             + " | ".join(f"{v} ({w1(wilson(v, len(cs)))})" for v in k) + " |")
+        g = {c.model: c for c in (grid_cols or [])}
+        gp = [x["cell"] for x in L.cells if x["suite"] == "libero_goal" and x["perturbation"] == "swap"]
+        T += ["", "## Goal by position, the one column holding all ten tasks: this list, the grid's part, and the two "
+              "together", "", "With the pool's line: " + POOL_CAVEAT, "",
+              "| model | arm | list 2: solved, clean (Wilson 95) | the grid: solved, clean (Wilson 95) | together: "
+              "solved, clean (Wilson 95) | the two parts' intervals overlap |", "|---|---|---|---|---|---|"]
+        for c in L.cols:
+            gc = g.get(c.model)
+            if not gc or not gc.complete:
+                T.append(f"| {c.model} | | | the grid column is not complete: no pool | | |")
+                continue
+            gg = [x["cell"] for x in gc.cells if x["suite"] == "libero_goal" and x["perturbation"] == "swap"]
+            for arm in ("with", "without"):
+                part = []
+                ov = []
+                for cs, col in ((gp, c), (gg, gc)):
+                    part.append(", ".join(f"{col_count(col, arm, k, cs)} ({w1(wilson(col_count(col, arm, k, cs), len(cs)))})"
+                                          for k in ("solved", "clean")))
+                tot = []
+                for k in ("solved", "clean"):
+                    a1, a2 = col_count(c, arm, k, gp), col_count(gc, arm, k, gg)
+                    w_a, w_b = wilson(a1, len(gp)), wilson(a2, len(gg))
+                    ov.append(not (w_a[1] < w_b[0] or w_b[1] < w_a[0]))
+                    tot.append(f"{a1 + a2} ({w1(wilson(a1 + a2, len(gp) + len(gg)))})" if ov[-1] else
+                               "the two lists disagree: not pooled")
+                T.append(f"| {c.model} | {arm} {name} | {part[0]} | {part[1]} | {', '.join(tot)} | solved "
+                         f"{'yes' if ov[0] else 'NO'}, clean {'yes' if ov[1] else 'NO'} |")
+        T += ["", f"Goal by position here: {len(gp)} start states of list 2 and the grid's "
+              f"{len([x for x in (g.get(MAIN_MODEL).cells if g.get(MAIN_MODEL) else []) if x['suite'] == 'libero_goal' and x['perturbation'] == 'swap'])}, "
+              f"20 start states a task over the two lists."]
+        T += ["", "## The two lists together, 500 start states an arm (an estimate, not a test)", "",
+              "With the pool's line: " + POOL_CAVEAT + " " + FIELD_500 + ". No "
+              "sentence rests on the pooled p; where a test is needed, the grid's main test or this list's own test "
+              "is cited.", "",
+              "| model | measure | with, of 500 (Wilson 95) | without, of 500 (Wilson 95) | difference, points "
+              "(Newcombe 95) | with only | without only | pooled p (contains the main test's 100 start states; not an "
+              "independent test; not in any family) |", "|---|---|---|---|---|---|---|---|"]
+        parts = ["| model | measure | the grid: with (Wilson 95) | the grid: without (Wilson 95) | list 2: with "
+                 "(Wilson 95) | list 2: without (Wilson 95) | the parts' intervals overlap: with, without |",
+                 "|---|---|---|---|---|---|---|"]
+        for c in L.cols:
+            gc = g.get(c.model)
+            if not gc or not gc.complete:
+                T.append(f"| {c.model} | | the grid column is not complete: no pool | | | | | |")
+                continue
+            for key, word in MEASURES:
+                a1, a2 = gc.paired(key), c.paired(key)
+                e, f, gg2, h = (a1[k] + a2[k] for k in ("both", "with_only", "without_only", "neither"))
+                n = e + f + gg2 + h
+                kw1, ko1 = a1["both"] + a1["with_only"], a1["both"] + a1["without_only"]
+                kw2, ko2 = a2["both"] + a2["with_only"], a2["both"] + a2["without_only"]
+                ovs = []
+                for k1, k2 in ((kw1, kw2), (ko1, ko2)):
+                    x1, x2 = wilson(k1, a1["pairs"]), wilson(k2, a2["pairs"])
+                    ovs.append(not (x1[1] < x2[0] or x2[1] < x1[0]))
+                cw = f"{e + f} ({w1(wilson(e + f, n))})" if ovs[0] else "the two lists disagree: not pooled"
+                co = f"{e + gg2} ({w1(wilson(e + gg2, n))})" if ovs[1] else "the two lists disagree: not pooled"
+                T.append(f"| {c.model} | {word} | {cw} | {co} | {d2(f, gg2, n)} ({nc1(newcombe_paired(e, f, gg2, h))}) | "
+                         f"{f} | {gg2} | {p3(sign_p(f, gg2))} |")
+                parts.append(f"| {c.model} | {word} | {kw1} ({w1(wilson(kw1, a1['pairs']))}) | {ko1} "
+                             f"({w1(wilson(ko1, a1['pairs']))}) | {kw2} ({w1(wilson(kw2, a2['pairs']))}) | {ko2} "
+                             f"({w1(wilson(ko2, a2['pairs']))}) | {'yes' if ovs[0] else 'NO'}, "
+                             f"{'yes' if ovs[1] else 'NO'} |")
+        T += ["", "The two parts apart:", ""] + parts
+        T += ["", "## How list 2 relates to the grid's tests (no statement counted twice)", "",
+              "The grid's tests are read on the grid's 100 start states only, by the grid's rule; no list 2 start "
+              "state enters them, and no grid start state enters the family above.", ""]
+        T += replicated_section(name, L, order, grid_cols)
+    T += ["", f"## The one cross-model pair named beforehand: {MAIN_MODEL} with {name} against {CLEAN_MODEL} without "
+          "(descriptive, outside the corrected family)", ""] + cross_lines(L, name)
+    T += ["", "## Requests, steps, tokens and cost (means over scored rows; USD at the list prices of ../prices.csv)",
+          ""] + money_table(L, name)
+    T += ["", "USD a start state and USD a solved start state count the scored rows and the attempts in no row "
+          "(lost_attempts.csv) over all start states of the arm, or over its solved ones. USD is list price only, not "
+          "a billed amount; part of the gap between the arms is caching (the cached share of input tokens), not only "
+          "fewer requests. Seconds are wall clock from the episode's start to its end and include the time an endpoint "
+          "stalled or refused requests; a failed request was sent again inside its episode."]
+    st = stopped_lines(L, name)
+    if st:
+        T += [""] + st
+    T += ["", "## Episodes that ended without a score", ""] + unscored_lines(L, name)
+    T += ["", "## What these numbers allow a sentence to say", "",
+          "Each sentence after the lines at the top of this file, with the LIBERO-10 line wherever a LIBERO-10 number "
+          f"is in it, and with the bad news beside the numbers it qualifies. LIBERO-10 sentences carry {l10.N if l10 else 395}, "
+          "the size of that list.", ""] + sentences(name, lists, order, grid_cols, L)
+    T += ["", NOT_SAID.format(name=name), ""]
+    write(os.path.join(L.folder, "SUMMARY.md"), "\n".join(T), check, changed)
+
+
+def col_count(col, arm, key, cells):
+    return sum(col.val(arm, x, key) for x in cells)
+
+
+def development(name, check, changed):
+    folder = os.path.join(HERE, DEV[1])
+    if not os.path.isdir(folder):
+        return
+    cells, cols, uns = columns(folder)
+    info = json.load(open(os.path.join(folder, "list_info.json")))
+    cols = [c for m in FAMILY_MODELS for c in cols if c.model == m] + [c for c in cols if c.model not in FAMILY_MODELS]
+    N = len(cells)
+    rows = []
     for c in cols:
         for arm in ("without", "with"):
             s = c.stats(arm)
-            L.append(f"| {c.model} | {arm} {name} | {s['false_claims']} | {s['unsolved']} | "
-                     f"{'' if s['false_claims_per_unsolved'] is None else format(s['false_claims_per_unsolved'], '.2f')} |")
-    L += ["", "## By suite and perturbation (counts and intervals only, no test)", "",
-          "| model | suite, perturbation | start states | with: solved (Wilson 95) | without: solved (Wilson 95) |",
-          "|---|---|---|---|---|"]
-    groups = {}
-    for x in cells:
-        groups.setdefault(f"{x['suite']}, {x['perturbation']}", []).append(x["cell"])
+            rows.append({"list": "libero10_development", "model": c.model, "arm": arm,
+                         "column_complete": int(c.complete), "finished": s["finished"], "scored": s["scored"],
+                         "unscored": s["unscored"], "not_finished": s["left"], "solved": s["solved"],
+                         "clean": s["clean"], "false_claims": s["false_claims"]})
+    write(os.path.join(folder, "summary.csv"), csv_text(
+        ["list", "model", "arm", "column_complete", "finished", "scored", "unscored", "not_finished", "solved",
+         "clean", "false_claims"], rows), check, changed)
+    done = all(c.complete for c in cols)
+    T = [f"# Development cells, not a result: {N} LIBERO-10 start states, {len(cols)} models, both arms", "",
+         f"Computed by ../recompute.py from this folder's CSV files as read at {info['read']}. "
+         + ("Every start state here has ended in both arms of both models." if done else
+            "NOT EVERY START STATE HERE HAD ENDED AT THIS READ."), "",
+         "Read this line before any number here:", "", S2_LINE, "",
+         f"These are start states 0 to 3 of each LIBERO-10 task, the start states {name} was developed on. They are "
+         f"in no test, no pool, no headline and no chart, and nothing here is a result: counts only.", "",
+         "## Development cells, not a result", "",
+         "| model | arm | solved | clean | false claims | unscored | scored |", "|---|---|---|---|---|---|---|"]
     for c in cols:
-        for gname, cs in groups.items():
-            a, b = sum(c.val("with", x, "solved") for x in cs), sum(c.val("without", x, "solved") for x in cs)
-            L.append(f"| {c.model} | {gname} | {len(cs)} | {a} ({pct(wilson(a, len(cs)))}) | {b} ({pct(wilson(b, len(cs)))}) |")
-    by = {c.model: c for c in cols}
-    if MAIN_MODEL in by and CLEAN_MODEL in by:
-        L += ["", f"## The one cross-model pair named beforehand (outside the family): {MAIN_MODEL} with {name} "
-              f"against {CLEAN_MODEL} without", ""]
-        for key, word in MEASURES[:2]:
-            pr = by[MAIN_MODEL].paired(key, other=by[CLEAN_MODEL])
-            a = sum(by[MAIN_MODEL].val("with", x["cell"], key) for x in cells)
-            b = sum(by[CLEAN_MODEL].val("without", x["cell"], key) for x in cells)
-            L.append(f"- {word}: {a} of {N} against {b} of {N}; first only {pr['with_only']}, second only "
-                     f"{pr['without_only']}, p = {fp(pr['p'])} ("
-                     f"{'no difference shown' if pr['p'] is None or pr['p'] > ALPHA else 'differs; outside the corrected family'}).")
-    L += ["", "## Means per scored episode", ""] + means_table(cols, name) + [""]
-    # the pool of 500
-    g = {c.model: c for c in (grid_cols or [])}
-    L += ["## The two lists together (an estimate, not a test)", "",
-          "A pool of two lists: 100 start states whose first rows had been seen when the other 400 were added; 25 "
-          "task rows, 20 start states each, six suite by perturbation columns; not the published 10 tasks x 50 of "
-          "one column.", ""]
-    L += ["| model | measure | arm | grid 100 (Wilson 95) | list 2 (Wilson 95) | together (Wilson 95) | with only, "
-          "without only | difference, points (Newcombe 95) | pooled p (contains the main test's 100 start states; "
-          "not an independent test; not in any family) |", "|---|---|---|---|---|---|---|---|---|"]
-    for c in cols:
-        gc = g.get(c.model)
-        if not gc or not gc.complete:
-            L.append(f"| {c.model} | | | the grid column is not complete: no pool | | | | | |")
-            continue
-        for key, word in MEASURES:
-            a1, a2 = gc.paired(key), c.paired(key)
-            e, f, gg, h = (a1[k] + a2[k] for k in ("both", "with_only", "without_only", "neither"))
-            n = e + f + gg + h
-            for arm, k in (("with", e + f), ("without", e + gg)):
-                k1 = sum(gc.val(arm, x["cell"], key) for x in gc.cells)
-                k2 = sum(c.val(arm, x["cell"], key) for x in cells)
-                w1, w2 = wilson(k1, len(gc.cells)), wilson(k2, N)
-                apart = w1[1] < w2[0] or w2[1] < w1[0]
-                both = "the two lists disagree: not pooled" if apart else f"{k} of {n} ({pct(wilson(k, n))})"
-                tail = (f"{f}, {gg} | {100 * (f - gg) / n:+.1f} ({pct(newcombe_paired(e, f, gg, h))}) | "
-                        f"{fp(sign_p(f, gg))}") if arm == "with" else " | | "
-                L.append(f"| {c.model} | {word} | {arm} {name} | {k1} of {len(gc.cells)} ({pct(w1)}) | "
-                         f"{k2} of {N} ({pct(w2)}) | {both} | {tail} |")
-    L += ["", "## Episodes that ended without a score", "",
-          ("None." if not uns else "; ".join(f"{u['model']} {u['arm']} {u['cell']}: {u['reason']}" for u in uns)), ""]
-    write(os.path.join(folder, "SUMMARY.md"), "\n".join(L), check, changed)
+        for arm in ("with", "without"):
+            s = c.stats(arm)
+            T.append(f"| {c.model} | {arm} {name} | {s['solved']} of {N} | {s['clean']} of {N} | "
+                     f"{s['false_claims']} of {N} | {s['unscored']} | {s['scored']} |")
+    T += ["", "The sentence the reading rule allows, and nothing else: " + "; ".join(
+        f"\"On {N} development start states (not a result): {c.stats('with')['solved']} against "
+        f"{c.stats('without')['solved']}.\" ({c.model})" for c in cols) + ".", ""]
+    if uns:
+        T += ["Ended without a score (a failure for its arm in the counts above): " + "; ".join(
+            f"{u['model']} {u['arm']} {name} {u['cell']}, {u['attempts']} attempts: {u['reason']}" for u in uns)
+            + ".", ""]
+    write(os.path.join(folder, "SUMMARY.md"), "\n".join(T), check, changed)
+
+
+def extension(name, check, changed, grid_cols):
+    lists = [ExtList(*e) for e in EXT if os.path.isdir(os.path.join(HERE, e[1]))]
+    if lists:
+        order, settled = family(lists)
+        for L in lists:
+            write_ext_list(L, lists, order, settled, name, grid_cols, check, changed)
+    development(name, check, changed)
 
 
 def main():
@@ -537,7 +1392,7 @@ def main():
     cols = grid(ns.name, ns.check, changed)
     extension(ns.name, ns.check, changed, cols)
     # the cell list's own hash, recomputed from cells.csv
-    for folder in (HERE, os.path.join(HERE, "extension_list2")):
+    for folder in [HERE] + [os.path.join(HERE, e[1]) for e in EXT] + [os.path.join(HERE, DEV[1])]:
         if os.path.exists(os.path.join(folder, "cells.csv")):
             import hashlib
             bad = 0

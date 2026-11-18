@@ -1,4 +1,4 @@
-list,cell,arm,model,attempt,solved,clean,claimed_success,false_claim,first_success_step,step_limit,requests,steps,operator_s,usd_list,price_date,tokens_in,tokens_cached,tokens_cache_write,tokens_out,failed_requests,operator_end,problems
+list,cell,arm,model,attempt,solved,clean,claimed_success,false_claim,first_success_step,step_limit,requests,steps,wall_s,usd_list,price_date,tokens_in,tokens_cached,tokens_cache_write,tokens_out,failed_requests,ended_by,problems
 list2,pro_goal_swap_t00_i14,with,Gemini 3.8 Flash,1,0,0,1,1,,300,46,339,353.3,0.657366,2026-11-17,2695367,2173415,0,27439,0,claim,0
 list2,pro_goal_swap_t00_i14,without,Gemini 3.8 Flash,1,0,0,1,1,,300,63,373,886.6,1.281602,2026-11-17,5931520,5272636,0,104531,0,claim,0
 list2,pro_goal_swap_t01_i14,with,Gemini 3.8 Flash,1,0,0,1,1,,300,79,864,587.7,1.142517,2026-11-17,7100877,6460424,0,47372,0,claim,0

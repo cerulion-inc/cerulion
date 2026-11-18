@@ -1,13 +1,13 @@
-# The reading rules, as frozen before the rows
+# The reading rules, each as frozen before the rows of its own lists
 
-This file is the public text of two rule files that were written and frozen before the rows they read. It says
-how the numbers in this package are to be read, what may be said from them and what may not. SUMMARY.md and
-extension_list2/SUMMARY.md apply it; recompute.py computes every count and test it names.
+This file is the public text of two rule files, each written and frozen before the rows of its own lists. It says
+how the numbers in this package are to be read, what may be said from them and what may not. SUMMARY.md and the
+SUMMARY.md of each extension folder apply it; recompute.py computes every count and test it names.
 
 | rule file | covers | frozen (UTC) | SHA-256 of the frozen file | what existed at that time |
 |---|---|---|---|---|
 | the grid's rule | the 100 start states, every model | 2026-11-17T20:49:34Z | 07ecb185801e6c00611441b70cb2beca21b8c931bee48ff3bcc4f1b1f1b657a2 | no grid row; the list of 100 start states was frozen at 21:22:04Z and the first scored episode with Cerulion started at 21:25:40Z |
-| the extension's rule | list 2 (400 further start states) and one more list | 2026-11-17T21:58:06Z | 39353a2dacdb5234b654d6002e75caa340070dccb3207901da9eecd89a38f0f7 | no extension list and no extension row; list 2 was frozen at 22:12:37Z. The first rows of the grid HAD been seen (section 7) |
+| the extension's rule | list 2 (400 further start states), the LIBERO-10 list and its 40 development start states | 2026-11-17T21:58:06Z | 39353a2dacdb5234b654d6002e75caa340070dccb3207901da9eecd89a38f0f7 | no extension list and no extension row; the three lists were frozen at 22:12:37Z. The first rows of the grid HAD been seen (section 7) |
 
 What this public text changes against the frozen files: file names, folder names, machine names and the working
 names of the people and stages that wrote them are removed; Cerulion is the product's name; sections that
@@ -22,12 +22,14 @@ be checked against this table.
 - Task row: one task of one suite under one perturbation. The lists hold 25 task rows.
 - The two arms. `without`: the model on a published three-tool interface (one move tool, done, give up; the
   prompt and tool texts of arXiv 2610.30051, word for word). `with`: the same model on the Cerulion harness's tools.
-- Shared by both arms: the start states, the environment seed (142 plus the start state), the operator seed 1,
-  80 model replies, one tool call a reply, 900 control steps (45 simulated seconds), temperature 1.0, high
-  reasoning effort, a 90 minute clock, the benchmark's own success predicate read after the episode. Zero-shot:
-  an empty store, nothing learned on any task carried in. One episode a start state an arm.
+- Shared by both arms: the start states, the environment seed (142 plus the start state), the sampling seed 1
+  sent with each model request (the endpoint of the four Claude models refused the seed field, so it was
+  dropped and every request that endpoint answered ran without a seed), 80 model replies, one tool call a reply, 900 control steps (45 simulated
+  seconds), temperature 1.0, high reasoning effort, a 90 minute clock, the benchmark's own success predicate
+  read after the episode. Zero-shot: an empty store, nothing learned on any task carried in. One episode a
+  start state an arm.
 - SOLVED: the benchmark's success predicate true within the 900-step budget.
-- CLEAN: solved at or before the published step limit of the suite (Goal 300, Spatial 220, Object 280), with no
+- CLEAN: solved at or before the published step limit of the suite (Goal 300, Spatial 220, Object 280, LIBERO-10 520), with no
   protocol break, no problem row and no false claim.
 - FALSE CLAIM: the episode ends with the model saying it succeeded on a start state that was not solved.
 - Unscored: an episode that ended without a score after the retry rule (section 4 (d)).
@@ -124,11 +126,11 @@ What must hold for each statement:
 ## 6. Cost and time
 
 USD is the model's reported token counts at list price from one dated table (prices.csv), cached input at the
-cached rate; nothing is a billed amount; simulator compute is not included. Seconds are the operator's wall
+cached rate; nothing is a billed amount; simulator compute is not included. Seconds are the episode's wall
 clock and include the time an endpoint stalled or refused requests, so a statement about speed in wall seconds
 is read with that in mind.
 
-## 7. The extension: 400 further start states for two models
+## 7. The extension: further start states for two models
 
 Said before its rows:
 
@@ -148,8 +150,9 @@ Said before its rows:
 
 What it is: Gemini 3.8 Flash and GPT-6 Astra only, both arms exactly as the grid runs them. List 2 is the same
 25 task rows, for each row the next 16 lowest stored start states that nothing had named. A further list on
-LIBERO-10 (ten tasks x start states 10 to 49, and 40 development start states printed apart and in no test) is
-part of the same rule; it is in this package only once it is complete. No count is cut or grown by any result.
+LIBERO-10 is part of the same rule: its ten tasks x start states 10 to 49, where a start state that something had
+named is left out and not replaced (the count for that task falls and is printed), and 40 development start
+states (0 to 3 of each task) printed apart and in no test. No count is cut or grown by any result.
 
 The numbers and how each is read:
 
@@ -158,6 +161,7 @@ The numbers and how each is read:
 | list 2 alone, a model | 400 | its own list, read alone; the extension's test list for this benchmark |
 | the two lists together, a model | 500 = the grid's 100 + list 2's 400 | a declared secondary that makes an estimate: rates, Wilson intervals, the difference with its interval. No statement rests on its p |
 | the LIBERO-10 list alone, a model | up to 400 | its own list, read alone; supporting only, never a second independent benchmark |
+| the LIBERO-10 development start states, a model | 40 | development: counts only, under the heading "development cells, not a result" |
 
 Never formed: list 2 or the pool with any earlier list; this benchmark pooled with LIBERO-10; the two models
 pooled for SOLVED or CLEAN.
@@ -174,7 +178,8 @@ For each test: both arms' counts and Wilson 95 intervals, the difference in poin
 interval, the discordant counts, the exact p, the threshold, the verdict; the same test on scored pairs only;
 and the task-row count (rows where the arm with Cerulion has more, fewer, the same; exact sign test on the untied
 rows). If a start-state test passes Holm but its task-row p is above 0.05, the statement must give the row
-counts and may not say "across the benchmark".
+counts ("on k of the 25 task rows", or "on k of the 10 tasks" on LIBERO-10) and may not say "across the
+benchmark" or "across the suite".
 
 How the extension relates to the grid's tests (no statement counted twice). The grid's tests are read on the
 grid's start states only. No extension start state enters them; no grid start state enters the extension family.
@@ -182,7 +187,7 @@ grid's start states only. No extension start state enters them; no grid start st
 | the grid's test | the extension's test on the same question | what may be said |
 |---|---|---|
 | passes | passes | the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)" |
-| passes | does not pass | the statement stands, and the same sentence carries "it did not hold on the 400-start-state extension list (counts, p)" |
+| passes | does not pass | the statement stands, and the same sentence carries "it did not hold on the 400-cell extension list (counts, p)" |
 | does not pass | passes | no upgrade: the grid's rule decides. The extension result may be printed after the sentence that the declared 100-start-state test did not pass |
 | does not pass | does not pass | no statement; both printed |
 
@@ -190,7 +195,7 @@ One effect is one statement: the grid's test and the extension's test are never 
 their p values are never multiplied or combined (the two lists share all 25 task rows, the snapshot, the
 calibration records and the day).
 
-The pool: printed for each model and measure with its caveat every time: "a pool of two lists: 100 start states
+The pool: printed for each model and measure with its caveat every time: "a pool of two lists: 100 cells
 whose first rows had been seen when the other 400 were added; 25 task rows, 20 start states each, six suite by
 perturbation columns; not the published 10 tasks x 50 of one column". Beside the pool, always, the two parts
 apart. If an arm's rates on the two parts have Wilson 95 intervals that do not overlap, the pooled rate is not
@@ -212,19 +217,27 @@ dropped after any of its rows is seen.
 
 Said wherever an extension number appears, before the number:
 
-- "These are new start states of task rows the Cerulion harness was developed on at other start states." The frozen sentence
-  adds that the tasks are not new ones.
-- "The 400-start-state lists were added after the first rows of the 100-start-state grid had been scored and
-  seen. The 100-start-state test declared beforehand remains the main result."
+- "These are new start states of task rows the Cerulion harness was developed on at other start states. They
+  are not unseen tasks."
+- "The 400-cell lists were added after the first rows of the 100-cell grid had been scored and seen. The
+  100-cell test declared beforehand remains the primary result."
+- With any LIBERO-10 number: "LIBERO-10's ten tasks are the ones the Cerulion harness was developed and gated on;
+  these are 40 other start states of each. Supporting evidence, not a second benchmark."
 - With any pooled 500: the pool's caveat, word for word.
 - With any number published by others: "Other systems report these under their own protocols; ours is not
   measured under any of them." Two tables under two headings, never one chart, no difference, ratio or rank
   across them.
 
+On LIBERO-10 a test that passes reads "On LIBERO-10, the same direction on N other start states of its ten tasks:
+a against b (p)", and one that does not, "On LIBERO-10, no difference shown for the model (a against b of N, p)".
+The development start states read "On 40 development start states (not a result): a against b." and nothing
+else.
+
 Not said, whatever the rows show: that the tasks are new, held back or never developed on; that this is the
 full benchmark, its standard protocol or 50 trials a task; that the extension's existence or size was declared
-before the grid's rows (its reading rule was; its decision was not); that anything was confirmed twice or
-replicated independently; anything resting on the pooled p; any comparison verb, multiple or rank against a
+before the grid's rows (its reading rule was fixed before its own rows; its decision came after the first grid
+rows were seen); that anything was confirmed twice or replicated independently; anything resting on the pooled p; any comparison verb, multiple or rank against a
 published policy or system; that Cerulion helps strong models solve more, from a test that did not pass; that
-Cerulion stops false claims; that LIBERO-10 is a second benchmark; any number from an incomplete column without
-its n; any split found in the rows afterwards worded as a finding.
+Cerulion stops false claims; that LIBERO-10 is a second benchmark; any development number in a headline, chart of
+results, pool or test; any number from an incomplete column without its n; any split found in the rows afterwards
+worded as a finding.

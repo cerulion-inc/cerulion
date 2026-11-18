@@ -1,4 +1,4 @@
-list,cell,arm,model,attempt,solved,clean,claimed_success,false_claim,first_success_step,step_limit,requests,steps,operator_s,usd_list,price_date,tokens_in,tokens_cached,tokens_cache_write,tokens_out,failed_requests,operator_end,problems
+list,cell,arm,model,attempt,solved,clean,claimed_success,false_claim,first_success_step,step_limit,requests,steps,wall_s,usd_list,price_date,tokens_in,tokens_cached,tokens_cache_write,tokens_out,failed_requests,ended_by,problems
 grid,pro_goal_swap_t00_i06,with,Gemini 3.8 Flash,1,0,0,1,1,,300,29,140,481.0,0.492475,2026-11-17,1442997,1019310,0,26203,0,claim,0
 grid,pro_goal_swap_t00_i06,without,Gemini 3.8 Flash,1,0,0,1,1,,300,77,635,1075.1,1.526463,2026-11-17,7834483,7057315,0,110477,4,claim,0
 grid,pro_goal_swap_t01_i06,with,Gemini 3.8 Flash,1,1,0,0,0,398,300,43,398,430.9,0.720084,2026-11-17,3292385,2833264,0,43533,0,episode_ended,0
@@ -904,8 +904,20 @@ grid,pro_goal_swap_t05_i08,without,Claude Haiku 5.5,1,0,0,0,0,,300,51,782,1026.3
 grid,pro_goal_swap_t06_i08,with,Claude Haiku 5.5,1,1,0,0,0,306,300,24,306,694.9,0.106679,2026-11-17,1217744,463018,754646,15420,11,episode_ended,0
 grid,pro_goal_swap_t06_i08,without,Claude Haiku 5.5,1,1,0,0,0,680,300,55,680,769.2,0.186947,2026-11-17,1272944,3061,1269663,56373,14,episode_ended,0
 grid,pro_goal_swap_t07_i08,with,Claude Haiku 5.5,1,0,0,0,0,,300,27,701,722.6,0.147718,2026-11-17,1469665,386936,1082633,17020,19,claim,0
+grid,pro_goal_swap_t07_i08,without,Claude Haiku 5.5,1,0,0,0,0,,300,74,698,1607.5,0.316769,2026-11-17,2235473,3049,2232128,75386,32,claim,0
 grid,pro_goal_swap_t08_i08,with,Claude Haiku 5.5,1,1,1,0,0,130,300,4,130,54.2,0.007940,2026-11-17,168321,124963,43346,2542,1,episode_ended,0
 grid,pro_goal_swap_t08_i08,without,Claude Haiku 5.5,1,0,0,0,0,,300,71,706,1170.1,0.291483,2026-11-17,2033768,3055,2030429,75241,25,claim,0
+grid,pro_goal_swap_t09_i09,with,Claude Haiku 5.5,1,1,1,0,0,150,300,17,150,175.0,0.042216,2026-11-17,781260,538836,242374,13051,2,episode_ended,0
+grid,pro_goal_swap_t09_i09,without,Claude Haiku 5.5,1,1,0,0,0,318,300,30,318,645.4,0.061161,2026-11-17,402847,3059,399668,22319,17,episode_ended,0
+grid,pro_spatial_swap_t00_i05,with,Claude Haiku 5.5,1,0,0,1,1,,220,8,160,68.1,0.015380,2026-11-17,351121,259699,91398,2712,1,claim,0
+grid,pro_spatial_swap_t00_i05,without,Claude Haiku 5.5,1,0,0,0,0,,220,77,652,1039.6,0.327350,2026-11-17,2354333,3090,2350935,66842,20,claim,0
+grid,pro_spatial_swap_t01_i05,with,Claude Haiku 5.5,1,1,0,0,0,323,220,15,323,186.8,0.054833,2026-11-17,680919,302728,378141,9066,4,episode_ended,0
+grid,pro_spatial_swap_t01_i05,without,Claude Haiku 5.5,1,0,0,0,0,,220,74,600,1249.1,0.309136,2026-11-17,2198910,3084,2195530,69269,26,claim,0
+grid,pro_spatial_swap_t02_i05,with,Claude Haiku 5.5,1,1,1,0,0,148,220,3,148,107.3,0.006534,2026-11-17,125031,82538,42483,794,3,episode_ended,0
+grid,pro_spatial_swap_t02_i05,without,Claude Haiku 5.5,1,0,0,0,0,,220,72,574,1096.3,0.289364,2026-11-17,2054212,3076,2050848,65896,24,claim,0
+grid,pro_spatial_task_t00_i05,with,Claude Haiku 5.5,1,0,0,1,1,,220,27,439,305.8,0.097685,2026-11-17,1381685,727877,653724,17364,5,claim,0
+grid,pro_spatial_task_t01_i05,with,Claude Haiku 5.5,1,0,0,1,1,,220,9,298,60.2,0.027276,2026-11-17,399215,214074,185111,3986,0,claim,0
+grid,pro_spatial_task_t01_i05,without,Claude Haiku 5.5,1,0,0,0,0,,220,70,810,1065.0,0.276910,2026-11-17,1969571,3084,1966207,62150,19,claim,0
 grid,pro_goal_swap_t00_i06,with,Claude Fable 5.2,1,0,0,1,1,,300,24,145,299.4,6.135400,2026-11-17,1327448,793438,533936,15919,1,claim,0
 grid,pro_goal_swap_t00_i06,without,Claude Fable 5.2,1,0,0,0,0,,300,24,115,711.0,3.246831,2026-11-17,213592,105067,108429,53519,0,stopped_calling_tools,0
 grid,pro_goal_swap_t01_i06,with,Claude Fable 5.2,1,1,0,0,0,498,300,15,498,132.9,3.074842,2026-11-17,735562,456021,279495,4708,0,episode_ended,0

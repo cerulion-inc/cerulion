@@ -1,7 +1,7 @@
 list,model,measure,column_complete,paired_cells,with_only,without_only,both,neither,difference,newcombe_low,newcombe_high,sign_p,holm_threshold,passes_holm,verdict
-list2,Gemini 3.8 Flash,solved,1,400,211,16,85,88,0.4875,0.4284,0.5405,1.3864665355924218e-44,0.0042,,family not settled
-list2,Gemini 3.8 Flash,clean,1,400,236,14,38,112,0.555,0.4965,0.6067,3.4641026882319247e-53,0.0042,,family not settled
-list2,Gemini 3.8 Flash,false_claim,1,400,26,121,26,227,-0.2375,-0.2913,-0.1821,7.513515312204095e-16,0.0042,,family not settled
-list2,GPT-6 Astra,solved,1,400,57,52,237,54,0.0125,-0.0386,0.0635,0.701811182064683,0.0042,,family not settled
-list2,GPT-6 Astra,clean,1,400,123,24,136,117,0.2475,0.1922,0.3002,3.1772595880751415e-17,0.0042,,family not settled
-list2,GPT-6 Astra,false_claim,1,400,26,58,31,285,-0.08,-0.1246,-0.0357,0.0006279472715818218,0.0042,,family not settled
+list2,Gemini 3.8 Flash,clean,1,400,236,14,38,112,0.555,0.4965,0.6067,3.4641026882319247e-53,0.005,1,established on the extension list
+list2,Gemini 3.8 Flash,solved,1,400,211,16,85,88,0.4875,0.4284,0.5405,1.3864665355924218e-44,0.0056,1,established on the extension list
+list2,GPT-6 Astra,clean,1,400,123,24,136,117,0.2475,0.1922,0.3002,3.1772595880751415e-17,0.0063,1,established on the extension list
+list2,Gemini 3.8 Flash,false_claim,1,400,26,121,26,227,-0.2375,-0.2913,-0.1821,7.513515312204095e-16,0.0083,1,established on the extension list (fewer with Cerulion)
+list2,GPT-6 Astra,false_claim,1,400,26,58,31,285,-0.08,-0.1246,-0.0357,0.0006279472715818218,0.0125,1,established on the extension list (fewer with Cerulion)
+list2,GPT-6 Astra,solved,1,400,57,52,237,54,0.0125,-0.0386,0.0635,0.701811182064683,0.025,0,no difference shown

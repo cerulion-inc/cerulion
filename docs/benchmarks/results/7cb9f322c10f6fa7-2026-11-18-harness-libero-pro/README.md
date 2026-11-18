@@ -8,8 +8,17 @@ The benchmark: simulated robot manipulation tasks from LIBERO-PRO, each run twic
 harness's tools. Same simulator, same start state, same budget, same scorer. Fifteen models, 100 start states
 each, one episode a start state an arm.
 
-The start states are new start states of 25 task rows that the Cerulion harness was developed on at other start
-states. The tasks themselves are not new to it.
+The LIBERO-PRO start states are new start states of 25 task rows that the Cerulion harness was developed on at
+other start states; the tasks themselves are not new to it.
+
+Two of the models, Gemini 3.8 Flash and GPT-6 Astra, also ran further start states the same way. The 400-cell
+lists were added after the first rows of the 100-cell grid had been scored and seen. The 100-cell test declared
+beforehand remains the primary result. One list holds 400 further start states of the same 25
+LIBERO-PRO task rows. The other is on LIBERO-10. LIBERO-10's ten tasks are the ones the Cerulion harness was
+developed and gated on; these are 40 other start states of each (here 38 to 40 a task, 395 in all: five that
+earlier files had named were left out, not replaced). Supporting evidence, not a second benchmark. A further 40
+LIBERO-10 start states, 0 to 3 of each task, are ones the harness was developed on: development cells, not a
+result, printed apart as counts only.
 
 ![Success rate per model, without and with Cerulion, ordered by the success rate without it, with the factor of
 improvement at the right of each row.](../../../media/harness-success-rate.svg)
@@ -27,9 +36,16 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
   every model and arm with intervals, the paired counts and exact tests, cost and time per episode. It states
   at its top when the rows were read, and names every model whose start states had not all ended then, with its
   counts.
-- [RULES.md](RULES.md): the reading rules, frozen before the rows.
-- recompute.py: computes SUMMARY.md, summary.csv and paired.csv again from the CSV files, with Python 3 and its
-  standard library only. With `--check` it writes nothing and says whether the files still match.
+- [extension_list2/SUMMARY.md](extension_list2/SUMMARY.md) and
+  [extension_libero10/SUMMARY.md](extension_libero10/SUMMARY.md): the two further lists of the two models, read
+  as one family of twelve tests by the extension's rule, with the lines that must be read before any of their
+  numbers and the bad news beside the numbers it qualifies.
+- [extension_libero10_development/SUMMARY.md](extension_libero10_development/SUMMARY.md): development cells, not
+  a result. Counts only.
+- [RULES.md](RULES.md): the reading rules, each frozen before the rows of its own lists.
+- recompute.py: computes every SUMMARY.md, summary.csv, paired.csv and task_rows.csv again from the CSV files,
+  with Python 3 and its standard library only. With `--check` it writes nothing and says whether the files still
+  match.
 
 ## Files
 
@@ -46,14 +62,18 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 | SUMMARY.md | the same as text |
 | list_info.json | when the rows were read, the list's hashes and its freeze time |
 | transcripts/ | six whole episodes as text: the model's messages, the tool calls and their answers, and the names of the camera frames the model received (the images are not in this package) |
-| extension_list2/ | the same files for a second list of 400 further start states run by two of the models (its own SUMMARY.md says how it is read) |
+| extension_list2/ | the same files for list 2, 400 further start states of the same 25 task rows run by two of the models, with task_rows.csv (its own SUMMARY.md says how it is read) |
+| extension_libero10/ | the same files for the LIBERO-10 list, 395 start states (10 to 49 of each of its ten tasks, less five that earlier files had named) run by the same two models |
+| extension_libero10_development/ | the 40 LIBERO-10 development start states (0 to 3 of each task) of the same two models: development cells, not a result; counts only |
+| refusals.csv | in each extension folder: every attempt in which the model endpoint answered HTTP 400 "Image processing blocked due to content policy violation", with how many requests it refused, whether that attempt was the scored one, and `before_rerun` as in lost_attempts.csv |
+| stopped_attempts.csv | in each extension folder: every attempt that was running when its machine stopped and left no token count on any copy, with its start (for an attempt after a failed one, the earliest it can have started), the machine's stop and the longest it can have run; such an attempt is in no other file and in no total |
 | recompute.py | the script |
 
 ## Columns of episodes.csv
 
 | column | meaning |
 |---|---|
-| list | `grid`, or `list2` in extension_list2/ |
+| list | `grid`; `list2` in extension_list2/, `libero10` in extension_libero10/, `libero10_development` in extension_libero10_development/ |
 | cell | the start state's id: suite, perturbation, task and start state, as in cells.csv |
 | arm | `without` or `with` Cerulion |
 | model | the model's public name |
@@ -63,9 +83,10 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 | claimed_success | 1 if the model ended by saying it had succeeded |
 | false_claim | 1 if it said so on a start state that was not solved |
 | first_success_step | the control step at which the predicate first held, empty if never |
+| step_limit | the suite's published step limit for the start state, as in cells.csv (the limit `clean` is read against) |
 | requests | model replies used (budget 80) |
 | steps | control steps used (budget 900) |
-| operator_s | wall clock seconds from the operator's start to its end, tool execution and failed requests included |
+| wall_s | wall clock seconds from the episode's start to its end, tool execution and failed requests included |
 | usd_list | the scored attempt's reported token counts at list price; not a billed amount; simulator compute not included |
 | price_date | the date the price row was read |
 | tokens_in | prompt tokens over the episode, cached ones included |
@@ -73,15 +94,17 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 | tokens_cache_write | of those, the tokens the endpoint reported as written to its cache (priced at the write rate where the table has one) |
 | tokens_out | output tokens, reasoning tokens included |
 | failed_requests | requests the endpoint refused or dropped; each was sent again |
-| operator_end | how the operator ended: the model's claim, the episode ending under it, the model no longer calling tools, or a budget |
+| ended_by | how the episode ended: the model's claim, the episode ending under it, the model no longer calling tools, or a budget |
 | problems | rows the scorer flagged (an episode with one is not clean) |
 
 ## How the episodes ran
 
 - Both arms: 80 model replies, one tool call a reply, 900 control steps, temperature 1.0, high reasoning
   effort, the last 4 images kept in context, a 90 minute clock, environment seed 142 plus the start state,
-  operator seed 1. Zero-shot: nothing learned on any task is carried in. The score is the benchmark's own
-  success predicate, read from the simulator's log after the episode. The model never sees it.
+  sampling seed 1 sent with each model request. The endpoint of the four Claude models refused the seed field,
+  so it was dropped and every request that endpoint answered ran without a seed. Zero-shot: nothing learned on
+  any task is carried in. The score is the benchmark's own success predicate, read from the simulator's log
+  after the episode. The model never sees it.
 - `without`: three tools (move_to, done, give_up) and the prompt of arXiv 2610.30051, word for word.
 - `with`: the Cerulion harness's 44 tools. This arm also reads a record of the robot's own calibration, which
   the other arm does not have.
@@ -126,7 +149,22 @@ is in cells.csv, and the success predicate was false at reset on every one.
   `before_rerun` 1.
 - Providers gave no version string beyond the model's name.
 - Wall clock seconds include time an endpoint stalled or refused requests.
-- RULES.md section 7 also names a list on LIBERO-10. It is not in this package.
+- On the LIBERO-10 list the provider's image filter refused GPT-6 Astra's `without` arm, and only that arm, on
+  tasks 4 and 6 (HTTP 400, "Image processing blocked due to content policy violation"). No start state was run
+  again for it: the requests reached the provider and were answered. GPT-6 Astra's LIBERO-10 SOLVED and FALSE
+  CLAIM results come from those two tasks; extension_libero10/SUMMARY.md prints this beside every number it
+  qualifies.
+- Two of the machines also stopped during the extension's run. The episodes they had not ended, all on the
+  LIBERO-10 list and its development start states, ran from attempt 1 on three other machines hours later; for
+  3 start states this put the two arms of a model on two machines hours apart (GPT-6 Astra l10_t06_i44 and
+  l10_t02_i29, Gemini 3.8 Flash l10_t06_i29), and two machines then ran up to 4 GPT-6 Astra episodes at once
+  where the protocol allowed 2 a machine. The attempts that were running when the machines stopped are in
+  extension_libero10/stopped_attempts.csv and in no total; that SUMMARY.md prices them at the spend a second of
+  their model and arm, and no row bounds them. A row written in a stopped machine's last seconds and never
+  copied off cannot be ruled out; the two start states that could hold one (Gemini 3.8 Flash, `without`,
+  l10_t06_i29 and l10_t05_i30) ran again and were not solved.
+- The 40 development start states are the ones the Cerulion harness was developed on. They are in no test, no
+  pool, no headline and no chart.
 
 ## What was removed
 

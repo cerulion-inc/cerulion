@@ -11,9 +11,9 @@ grid,Claude Opus 5.5,false_claim,1,100,3,14,2,81,-0.11,-0.1947,-0.0312,0.0127258
 grid,Claude Sonnet 5.5,solved,1,100,43,10,6,41,0.33,0.1963,0.4481,5.550520889130439e-06,0.0056,1,established
 grid,Claude Sonnet 5.5,clean,1,100,34,5,2,59,0.29,0.1774,0.3954,2.4299079086631536e-06,0.0083,1,established
 grid,Claude Sonnet 5.5,false_claim,1,100,18,12,4,66,0.06,-0.0478,0.1667,0.361594608053565,,,no difference shown
-grid,Claude Haiku 5.5,solved,0,58,23,2,1,32,0.3621,0.2116,0.496,1.9431114196777344e-05,0.0063,1,incomplete at the read of 2026-11-18T16:16:24Z: 58 of 100
-grid,Claude Haiku 5.5,clean,0,58,16,1,0,41,0.2586,0.1307,0.3867,0.000274658203125,0.0125,1,incomplete at the read of 2026-11-18T16:16:24Z: 58 of 100
-grid,Claude Haiku 5.5,false_claim,0,58,10,3,0,45,0.1207,-0.0029,0.2456,0.09228515625,,,incomplete at the read of 2026-11-18T16:16:24Z: 58 of 100
+grid,Claude Haiku 5.5,solved,0,64,25,2,2,35,0.3594,0.2192,0.4857,5.647540092468262e-06,0.0063,1,incomplete at the read of 2026-11-18T17:23:40Z: 64 of 100
+grid,Claude Haiku 5.5,clean,0,64,18,1,0,45,0.2656,0.1444,0.3874,7.62939453125e-05,0.0125,1,incomplete at the read of 2026-11-18T17:23:40Z: 64 of 100
+grid,Claude Haiku 5.5,false_claim,0,64,12,3,0,49,0.1406,0.0223,0.2601,0.03515625,,,incomplete at the read of 2026-11-18T17:23:40Z: 64 of 100
 grid,Claude Fable 5.2,solved,1,100,73,1,9,17,0.72,0.6098,0.7947,7.940933880509066e-21,0.0033,1,established
 grid,Claude Fable 5.2,clean,1,100,62,1,5,32,0.61,0.4982,0.6976,1.3877787807814457e-17,0.0033,1,established
 grid,Claude Fable 5.2,false_claim,1,100,9,4,0,87,0.05,-0.024,0.1277,0.266845703125,,,no difference shown
