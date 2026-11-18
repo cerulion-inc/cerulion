@@ -572,6 +572,18 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
         "a REMOTE SERVICE's response body, not a document anybody authors. Denying an unknown key here is a self-inflicted outage: the account service adding a field would break every CLI already in the field, and the CLI reads only the keys it names. Forward-compat is the requirement, silence the correct behaviour",
     ),
     (
+        "cerulion_cli_engine/src/robot_bootstrap.rs",
+        "RobotAccessChallenge",
+        Classification::ExemptWithReason,
+        "a REMOTE SERVICE's response body, not a document anybody authors. Denying an unknown key here is a self-inflicted outage: the account service adding a field would break every CLI already in the field, and the CLI reads only the keys it names. Forward-compat is the requirement, silence the correct behaviour",
+    ),
+    (
+        "cerulion_cli_engine/src/robot_bootstrap.rs",
+        "ErrorBody",
+        Classification::ExemptWithReason,
+        "a REMOTE SERVICE's response body, not a document anybody authors. Denying an unknown key here is a self-inflicted outage: the account service adding a field would break every CLI already in the field, and the CLI reads only the keys it names. Forward-compat is the requirement, silence the correct behaviour",
+    ),
+    (
         "cerulion_cli_engine/src/login_cmd.rs",
         "ErrorBody",
         Classification::ExemptWithReason,

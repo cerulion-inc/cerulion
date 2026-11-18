@@ -1814,6 +1814,30 @@ struct ReplayFirePlan {
     mismatches: u64,
 }
 
+/// The live loop's next wake, split by whether it may wait for it exactly
+/// ([`Scheduler::next_fire_split`]). Both are nanoseconds from the `now` they
+/// were read at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct NextFire {
+    /// The soonest Period deadline still ahead, unmoved by a throttle window or
+    /// a `block` hold. Never 0.
+    pub(crate) deadline_ns: Option<u64>,
+    /// The soonest of every other pending fire: 0 for a node due now (a Period
+    /// node past its deadline included), or a throttle window or `block`
+    /// release still to run.
+    pub(crate) poll_ns: Option<u64>,
+}
+
+impl NextFire {
+    /// The soonest of the two: what [`Scheduler::ns_until_next_fire`] reports.
+    pub(crate) fn soonest(self) -> Option<u64> {
+        match (self.deadline_ns, self.poll_ns) {
+            (Some(d), Some(p)) => Some(d.min(p)),
+            (d, p) => d.or(p),
+        }
+    }
+}
+
 /// Deterministic scheduler for node execution.
 ///
 /// Nodes are evaluated in insertion order (`IndexMap`) at each `step()` call.
@@ -2242,69 +2266,100 @@ impl Scheduler {
     /// `pending_data_count` deliberately cannot describe — see that field).
     /// Either way the node is due NOW, and `Some(0)` clamps to the loop's 1 ms
     /// floor: the remainder drains at the poll cadence, never a busy-spin.
+    ///
+    /// The live loop reads the same value in two halves (`next_fire_split`):
+    /// this is the sooner of them.
     pub fn ns_until_next_fire(&self, now_ns: u64) -> Option<u64> {
-        self.nodes
-            .values()
-            .filter(|n| !n.disabled)
-            .filter_map(|n| {
-                let due = match &n.policy {
-                    TriggerPolicy::Period { .. } => {
-                        n.next_fire_ns.map(|nf| nf.saturating_sub(now_ns))
-                    }
-                    TriggerPolicy::Data if n.pending_data_count > 0 || n.data_backlog_hint => {
-                        Some(0)
-                    }
-                    // A Sync node holding a COMPLETE aligned set it has
-                    // not fired is due NOW, exactly as a Data node holding a
-                    // popped-but-unfired frame is. Without this arm a carried set
-                    // waits for an unrelated publish to wake the loop, or for the
-                    // 250 ms liveliness cap, where Data recovers at the 1 ms floor.
-                    TriggerPolicy::Sync { .. } if n.sync_backlog_hint => Some(0),
-                    // An External node whose mark the last step left set owes
-                    // a fire that a pre-fire check (a full `block` slot or
-                    // `throttle_ms`) deferred. For a doorbell or pipe source
-                    // nothing rings for it again: the sweep drained the source
-                    // when it set the mark. A device fd source stays ready
-                    // until the node reads it. Either way the node is due NOW,
-                    // so the throttle window and the `block` hold below bound
-                    // the wait at the instant it can fire. An unmarked
-                    // External node owes nothing and adds no deadline.
-                    TriggerPolicy::External if n.external_triggered => Some(0),
-                    _ => None,
-                }?;
-                // A node that is DUE but THROTTLE-DEFERRED
-                // cannot run until its rate cap expires, so its real deadline is
-                // the LATER of the two. Without this the arms above report
-                // `Some(0)` for the whole throttle window — the node is due by
-                // every signal the scheduler can see — and the loop polls at its
-                // 1 ms floor, deciding to defer again each time.
-                //
-                // `max`, not "replace": the throttle bounds when the node MAY
-                // fire, it never brings a later deadline forward. A Period node
-                // cannot reach this arm anyway (`throttle_ms` and `period_ms`
-                // are mutually exclusive at the macro), so in practice this
-                // lifts a `Some(0)` to the remaining window.
-                let due = match n.throttle_remaining_ns(now_ns) {
-                    Some(remaining) => due.max(remaining),
-                    None => due,
-                };
-                // A node held by a full `block` slot is due by the same
-                // signals and cannot run either. It runs at the earliest
-                // `block_timeout_ms` release of its full slots, or after a
-                // drain or a release, each of which wakes the loop itself (the
-                // consumer drains on this level loop, or the peer's drain
-                // rings the credit park). A slot the loop may not wait on, or
-                // whose stall clock the next evaluation must start, keeps the
-                // node due.
-                match n.block_hold.as_ref().map(|hold| hold()) {
-                    None | Some(crate::scheduler::block::BlockHold::Clear) => Some(due),
-                    Some(crate::scheduler::block::BlockHold::Until(at_ns)) => {
-                        Some(due.max(at_ns.saturating_sub(now_ns)))
-                    }
-                    Some(crate::scheduler::block::BlockHold::UntilWake) => None,
+        self.next_fire_split(now_ns).soonest()
+    }
+
+    /// [`Self::ns_until_next_fire`] split by what the live loop may wait for
+    /// exactly. [`NextFire::deadline_ns`] is the soonest Period deadline that
+    /// lies ahead of `now_ns` and that no throttle window or `block` hold
+    /// moved: the loop waits to it exactly. [`NextFire::poll_ns`] is the
+    /// soonest of every other pending fire (a node due now, a Period node past
+    /// its deadline, a throttle window, a `block_timeout_ms` release): the loop
+    /// keeps its 1 ms poll floor for those. PURE READ, same reads as
+    /// [`Self::ns_until_next_fire`].
+    pub(crate) fn next_fire_split(&self, now_ns: u64) -> NextFire {
+        let mut next = NextFire::default();
+        let soonest = |slot: &mut Option<u64>, ns: u64| {
+            *slot = Some(slot.map_or(ns, |cur| cur.min(ns)));
+        };
+        for (ns, exact) in self.nodes.values().filter(|n| !n.disabled).filter_map(|n| {
+            // `ahead`: a Period node whose own deadline is still in the future.
+            let mut ahead = false;
+            let due = match &n.policy {
+                TriggerPolicy::Period { .. } => n.next_fire_ns.map(|nf| {
+                    ahead = nf > now_ns;
+                    nf.saturating_sub(now_ns)
+                }),
+                TriggerPolicy::Data if n.pending_data_count > 0 || n.data_backlog_hint => Some(0),
+                // A Sync node holding a COMPLETE aligned set it has
+                // not fired is due NOW, exactly as a Data node holding a
+                // popped-but-unfired frame is. Without this arm a carried set
+                // waits for an unrelated publish to wake the loop, or for the
+                // 250 ms liveliness cap, where Data recovers at the 1 ms floor.
+                TriggerPolicy::Sync { .. } if n.sync_backlog_hint => Some(0),
+                // An External node whose mark the last step left set owes
+                // a fire that a pre-fire check (a full `block` slot or
+                // `throttle_ms`) deferred. For a doorbell or pipe source
+                // nothing rings for it again: the sweep drained the source
+                // when it set the mark. A device fd source stays ready
+                // until the node reads it. Either way the node is due NOW,
+                // so the throttle window and the `block` hold below bound
+                // the wait at the instant it can fire. An unmarked
+                // External node owes nothing and adds no deadline.
+                TriggerPolicy::External if n.external_triggered => Some(0),
+                _ => None,
+            }?;
+            // A node that is DUE but THROTTLE-DEFERRED
+            // cannot run until its rate cap expires, so its real deadline is
+            // the LATER of the two. Without this the arms above report
+            // `Some(0)` for the whole throttle window (the node is due by
+            // every signal the scheduler can see), and the loop polls at its
+            // 1 ms floor, deciding to defer again each time.
+            //
+            // `max`, not "replace": the throttle bounds when the node MAY
+            // fire, it never brings a later deadline forward. A Period node
+            // cannot reach this arm anyway (`throttle_ms` and `period_ms`
+            // are mutually exclusive at the macro), so in practice this
+            // lifts a `Some(0)` to the remaining window.
+            let due = match n.throttle_remaining_ns(now_ns) {
+                Some(remaining) if remaining > due => {
+                    ahead = false;
+                    remaining
                 }
-            })
-            .min()
+                _ => due,
+            };
+            // A node held by a full `block` slot is due by the same
+            // signals and cannot run either. It runs at the earliest
+            // `block_timeout_ms` release of its full slots, or after a
+            // drain or a release, each of which wakes the loop itself (the
+            // consumer drains on this level loop, or the peer's drain
+            // rings the credit park). A slot the loop may not wait on, or
+            // whose stall clock the next evaluation must start, keeps the
+            // node due.
+            match n.block_hold.as_ref().map(|hold| hold()) {
+                None | Some(crate::scheduler::block::BlockHold::Clear) => Some((due, ahead)),
+                Some(crate::scheduler::block::BlockHold::Until(at_ns)) => {
+                    let release = at_ns.saturating_sub(now_ns);
+                    Some(if release > due {
+                        (release, false)
+                    } else {
+                        (due, ahead)
+                    })
+                }
+                Some(crate::scheduler::block::BlockHold::UntilWake) => None,
+            }
+        }) {
+            if exact {
+                soonest(&mut next.deadline_ns, ns);
+            } else {
+                soonest(&mut next.poll_ns, ns);
+            }
+        }
+        next
     }
 
     /// The gating clock's current time (ns) — the domain every `next_fire_ns`
@@ -12357,5 +12412,218 @@ mod align_driver_tests {
             "a@0 is provably in no set: UNMATCHABLE, not PASSED-OVER. A \
              descent-first matcher reaches the same set counting (0, 1)"
         );
+    }
+}
+
+#[cfg(test)]
+mod next_fire_split_tests {
+    use super::*;
+    use crate::scheduler::block::BlockHold;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const PERIOD_NS: u64 = 1_000_000;
+
+    fn scheduler() -> Scheduler {
+        Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()))
+    }
+
+    fn add(s: &mut Scheduler, id: &str, policy: TriggerPolicy) {
+        s.add_node(NodeConfig {
+            id: id.to_string(),
+            policy,
+            callback: Box::new(|| {}),
+        })
+        .unwrap();
+    }
+
+    fn period() -> TriggerPolicy {
+        TriggerPolicy::Period {
+            interval: Duration::from_nanos(PERIOD_NS),
+            max_catchup: None,
+        }
+    }
+
+    #[test]
+    fn a_period_deadline_still_ahead_is_the_exact_half() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        let next = s.next_fire_split(0);
+        assert_eq!(next.deadline_ns, Some(PERIOD_NS));
+        assert_eq!(next.poll_ns, None);
+        let next = s.next_fire_split(400_000);
+        assert_eq!(
+            next.deadline_ns,
+            Some(600_000),
+            "the time left, not a floor"
+        );
+        assert_eq!(s.ns_until_next_fire(400_000), Some(600_000));
+    }
+
+    #[test]
+    fn a_period_node_past_its_deadline_is_the_poll_half() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        let next = s.next_fire_split(PERIOD_NS);
+        assert_eq!(
+            next.deadline_ns, None,
+            "a deadline reached is not still ahead"
+        );
+        assert_eq!(next.poll_ns, Some(0));
+        let next = s.next_fire_split(PERIOD_NS + 1);
+        assert_eq!((next.deadline_ns, next.poll_ns), (None, Some(0)));
+    }
+
+    #[test]
+    fn a_hold_that_moves_a_period_deadline_makes_it_a_poll() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        let release_at = Arc::new(AtomicU64::new(5_000_000));
+        let wake_only = Arc::new(AtomicBool::new(false));
+        let (at, wake) = (Arc::clone(&release_at), Arc::clone(&wake_only));
+        s.set_block_hold("tick", move || {
+            if wake.load(Ordering::Relaxed) {
+                BlockHold::UntilWake
+            } else {
+                BlockHold::Until(at.load(Ordering::Relaxed))
+            }
+        })
+        .unwrap();
+        // The release (5 ms) is later than the deadline (1 ms): it is what the
+        // node waits for, and it is a poll.
+        let next = s.next_fire_split(0);
+        assert_eq!((next.deadline_ns, next.poll_ns), (None, Some(5_000_000)));
+        // A release earlier than the deadline moves nothing: still exact.
+        release_at.store(500_000, Ordering::Relaxed);
+        let next = s.next_fire_split(0);
+        assert_eq!((next.deadline_ns, next.poll_ns), (Some(PERIOD_NS), None));
+        // Held until a wake: no deadline at all.
+        wake_only.store(true, Ordering::Relaxed);
+        assert_eq!(s.next_fire_split(0), NextFire::default());
+        assert_eq!(s.ns_until_next_fire(0), None);
+    }
+
+    /// `throttle_ms` and `period_ms` are exclusive at the macro, but the
+    /// scheduler API takes a throttle on any node: a throttle window that ends
+    /// after a Period deadline is what the node waits for, and it is a poll.
+    #[test]
+    fn a_throttle_that_moves_a_period_deadline_makes_it_a_poll() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        s.set_throttle_ns("tick", 5_000_000).unwrap();
+        s.step(Duration::from_nanos(PERIOD_NS));
+        assert_eq!(s.node_handle("tick").unwrap().fire_count(), 1);
+        // Fired at 1 ms; its next deadline is 2 ms, the throttle ends at 6 ms.
+        let next = s.next_fire_split(1_200_000);
+        assert_eq!((next.deadline_ns, next.poll_ns), (None, Some(4_800_000)));
+    }
+
+    /// A throttle window that ends before the Period deadline, or exactly at
+    /// it, moves nothing: the deadline stays the exact half.
+    #[test]
+    fn a_throttle_that_ends_by_the_deadline_leaves_it_exact() {
+        for (throttle_ns, now_ns, left_ns) in [
+            (300_000, 1_100_000, 900_000),
+            (PERIOD_NS, 1_200_000, 800_000),
+        ] {
+            let mut s = scheduler();
+            add(&mut s, "tick", period());
+            s.set_throttle_ns("tick", throttle_ns).unwrap();
+            s.step(Duration::from_nanos(PERIOD_NS));
+            let next = s.next_fire_split(now_ns);
+            assert_eq!(
+                (next.deadline_ns, next.poll_ns),
+                (Some(left_ns), None),
+                "throttle {throttle_ns} ns at {now_ns} ns"
+            );
+        }
+    }
+
+    /// A `block` release at exactly the Period deadline moves nothing either.
+    #[test]
+    fn a_hold_released_at_the_deadline_leaves_it_exact() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        s.set_block_hold("tick", || BlockHold::Until(PERIOD_NS))
+            .unwrap();
+        let next = s.next_fire_split(250_000);
+        assert_eq!((next.deadline_ns, next.poll_ns), (Some(750_000), None));
+    }
+
+    #[test]
+    fn a_due_data_node_beside_a_period_deadline_reports_both_halves() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        add(&mut s, "sink", TriggerPolicy::Data);
+        s.signal_data("sink").unwrap();
+        let next = s.next_fire_split(250_000);
+        assert_eq!(next.deadline_ns, Some(750_000));
+        assert_eq!(next.poll_ns, Some(0), "a due node is a poll");
+        assert_eq!(next.soonest(), Some(0));
+        assert_eq!(s.ns_until_next_fire(250_000), Some(0));
+    }
+
+    /// A Data or Sync node owes a fire only while it holds a backlog: idle, it
+    /// adds nothing to either half; with its backlog flag set it is due now.
+    #[test]
+    fn a_data_or_sync_node_is_due_only_while_it_holds_a_backlog() {
+        let mut s = scheduler();
+        add(&mut s, "sink", TriggerPolicy::Data);
+        add(
+            &mut s,
+            "join",
+            TriggerPolicy::Sync {
+                inputs: vec!["/a".to_string(), "/b".to_string()],
+                window: None,
+            },
+        );
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire::default(),
+            "idle: nothing owed"
+        );
+        s.nodes.get_mut("join").expect("join").sync_backlog_hint = true;
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire {
+                deadline_ns: None,
+                poll_ns: Some(0)
+            },
+            "a carried complete set is due now"
+        );
+        s.nodes.get_mut("join").expect("join").sync_backlog_hint = false;
+        s.nodes.get_mut("sink").expect("sink").data_backlog_hint = true;
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire {
+                deadline_ns: None,
+                poll_ns: Some(0)
+            },
+            "a frame held at the carry cap is due now"
+        );
+    }
+
+    #[test]
+    fn soonest_is_the_smaller_half_or_either_alone() {
+        let both = NextFire {
+            deadline_ns: Some(7),
+            poll_ns: Some(3),
+        };
+        assert_eq!(both.soonest(), Some(3));
+        let both = NextFire {
+            deadline_ns: Some(2),
+            poll_ns: Some(3),
+        };
+        assert_eq!(both.soonest(), Some(2));
+        let only = NextFire {
+            deadline_ns: Some(9),
+            poll_ns: None,
+        };
+        assert_eq!(only.soonest(), Some(9));
+        let only = NextFire {
+            deadline_ns: None,
+            poll_ns: Some(4),
+        };
+        assert_eq!(only.soonest(), Some(4));
+        assert_eq!(NextFire::default().soonest(), None);
     }
 }

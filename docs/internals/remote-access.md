@@ -222,6 +222,16 @@ Load-bearing boundary contracts:
   session id, recording chain head and event count; validating its shape does
   not verify the recording. `session_test.rs` pins the frame bytes and refusal
   boundaries. `OpsClient` continues to issue ordinary verb calls.
+- **Ops session negotiation** keeps the `cerulion/ops/1` ALPN and negotiates the
+  message version inside Hello. Ordinary ops accept versions 1 and 2; an absent
+  session field means ordinary ops, and that mode is omitted when encoding.
+  Shell and exec require version 2 plus a service that supports their execution.
+  `cerud::server::OpsServer` rejects either command mode before acknowledgement or
+  verb dispatch. `OpsClient` rejects a chosen version outside its offered range
+  or the build's supported range. Rust clients constructing Hello literals must
+  add `session: SessionKind::Ops` or use `Hello::current()`; the re-export from
+  `cerud::protocol` has the same field. A version-1 ordinary client still
+  negotiates version 1 and receives the same request/response envelopes.
 - **Session audit commitments** use a domain-separated SHA-256 chain over the
   canonical event JSON documented in `cerulion_ops_proto::recording`. The builder
   requires exactly one initial Started event, monotonic timestamps and no event
