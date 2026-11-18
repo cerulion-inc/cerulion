@@ -196,7 +196,9 @@ impl RawServices {
             .manager
             .as_ref()
             .ok_or(HostServiceError::MissingCapability)?;
-        let local_scope = manager.retain_local_topic_scope(topic)?;
+        // A node creates the port on its executor thread: never wait there.
+        let local_scope =
+            manager.retain_local_topic_scope(topic, crate::transport::TeardownWait::Never)?;
         let publisher = manager.create_ingress_publisher_with(topic, capacity, strategy)?;
         self.admit()?;
         let index = *next;
