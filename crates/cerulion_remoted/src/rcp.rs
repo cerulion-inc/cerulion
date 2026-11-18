@@ -3589,9 +3589,12 @@ mod tests {
         Answer,
     }
 
-    /// A loopback rcpd that plays `script` on its connections in order and
-    /// answers as rcpd does past it. Each request's kind (its JSON-RPC
-    /// method, or `DELETE`) and whole text go on the receiver as it is read.
+    /// A loopback rcpd that plays `script`, in order, on each connection that
+    /// sends at least one byte, and answers as rcpd does past it. Each
+    /// request's kind (its JSON-RPC method, or `DELETE`) and whole text go on
+    /// the receiver as it is read. A connection that closes before its first
+    /// byte, as one an attempt drops when its head timeout passes before its
+    /// request is written, takes no turn and puts nothing on the receiver.
     struct ScriptedRcpd {
         addr: SocketAddr,
         requests: mpsc::UnboundedReceiver<(String, String)>,
@@ -3628,6 +3631,9 @@ mod tests {
                             Ok(n) => buf.extend_from_slice(&chunk[..n]),
                         }
                     };
+                    if request.is_empty() {
+                        continue;
+                    }
                     let body: Value = request
                         .split("\r\n\r\n")
                         .nth(1)
@@ -4014,6 +4020,30 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_connection_closed_before_its_first_byte_is_no_request_and_takes_no_turn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stand_in = ScriptedRcpd::start(vec![Turn::Lost]).await;
+        drop(tokio::net::TcpStream::connect(stand_in.addr).await.unwrap());
+        let mut conn = tokio::net::TcpStream::connect(stand_in.addr).await.unwrap();
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\ncontent-length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        conn.write_all(request.as_bytes()).await.unwrap();
+        let mut reply = String::new();
+        within("rcpd answers", conn.read_to_string(&mut reply))
+            .await
+            .unwrap();
+        assert_eq!(stand_in.next().await, ("initialize".to_string(), request));
+        assert_eq!(
+            reply,
+            "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+        );
+        assert!(stand_in.requests_so_far().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn an_attempt_that_gets_no_head_ends_at_the_head_timeout() {
         let dir = tempfile::tempdir().unwrap();
         let mut stand_in = ScriptedRcpd::start(vec![Turn::Hold]).await;
@@ -4021,8 +4051,10 @@ mod tests {
         rcpd.target.head_timeout = Duration::from_millis(100);
         assert!(rcpd.send(&[1; 32]));
         assert_eq!(stand_in.next().await.0, "initialize");
-        // The first connection stays open with no head; the next attempt
-        // starts anyway.
+        // The first request's connection stays open with no head; the next
+        // attempt starts anyway. Any attempt whose 100 ms passes before its
+        // request is written closes a connection with no byte, for which the
+        // stand-in records nothing and plays no turn.
         assert_eq!(stand_in.next().await.0, "initialize");
         until_delivered(&rcpd).await;
     }
