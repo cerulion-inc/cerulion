@@ -5058,7 +5058,9 @@ jobs:
       # within 2 ms across a kernel nap, one on a second input within about one
       # nap, and a 1 kHz node on its grid under the park. A loaded PR runner
       # stretches each, so they run here; the shards pin the same runs' counts
-      # and order. A green run prints each arm's measured figures.
+      # and order. The bounds are judged only where the period-park engages (a
+      # CPU monitor-wait primitive: WAITPKG on x86); elsewhere each arm prints
+      # that its bounds were not judged. A green run prints its figures.
       - name: Period-park latency test (release mode)
         run: cargo test -p cerulion_core --test period_park_latency_test --release -- --nocapture --test-threads=1
 

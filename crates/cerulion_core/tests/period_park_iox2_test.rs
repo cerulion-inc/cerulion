@@ -6,7 +6,9 @@
 //! facts the period-park is gated on: it engages only where the CPU carries a
 //! monitor-wait primitive (and, for an input written from another runtime, the
 //! doorbell has a wake word). On any other host the arm asserts the switch did
-//! nothing, so the binary runs a real test everywhere.
+//! nothing, so the binary runs a real test everywhere. The refusal arm judges a
+//! runtime's wiring alone, with the CPU's monitor-wait primitive taken as held,
+//! so it asserts the same reasons on every host.
 //!
 //! Every arm here judges counts and order, never wall time: how long after its
 //! write a frame is read, and whether a 1 kHz node keeps its grid, are measured
@@ -73,8 +75,7 @@ fn refusal_reading(tag: &str, feed: &str, doorbell: bool) -> Option<&'static str
         MonitorWaitPolicy::new(true, doorbell, format!("ppk{}{tag}", std::process::id())),
     )
     .expect("build the graph");
-    rt.set_period_park_for_test(Some(true));
-    let reason = rt.period_park_refusal_for_test();
+    let reason = rt.period_park_wiring_refusal_for_test();
     rt.shutdown();
     drop(mgr);
     reason
@@ -84,34 +85,22 @@ fn refusal_reading(tag: &str, feed: &str, doorbell: bool) -> Option<&'static str
 /// doorbell off) refuses the period-park with `no_data_wake`, as its warning
 /// says: no line is armed, so nothing could end a nap on that input. The gate
 /// counts the inputs written from outside at build, whatever the doorbell
-/// policy. Builds only; every host (one without a monitor-wait primitive
-/// refuses on that term first).
+/// policy. Builds only, and the wiring is judged on every host: the seam takes
+/// the CPU's monitor-wait primitive as held.
 #[test]
 #[serial]
 fn an_input_written_from_outside_with_the_doorbell_off_refuses_the_period_park() {
-    let first = |rest: Option<&'static str>| {
-        if engages_here() {
-            rest
-        } else {
-            Some("no_monitor_wait_primitive")
-        }
-    };
     assert_eq!(
         refusal_reading("dboff", "/ppk/dboff/feed", false),
-        first(Some("no_data_wake"))
+        Some("no_data_wake")
     );
     // The doorbell on: the input's line is armed, and the wake word decides.
-    let on = refusal_reading("dbon", "/ppk/dbon/feed", true);
-    if engages_here() {
-        let want = if applies_to_a_foreign_consumer() {
-            None
-        } else {
-            Some("no_data_wake")
-        };
-        assert_eq!(on, want);
+    let want = if cerulion_core::doorbell::wake_word_block_primitive_available() {
+        None
     } else {
-        assert_eq!(on, Some("no_monitor_wait_primitive"));
-    }
+        Some("no_data_wake")
+    };
+    assert_eq!(refusal_reading("dbon", "/ppk/dbon/feed", true), want);
 }
 
 /// A ring from another runtime ends the consumer's kernel nap at once: every

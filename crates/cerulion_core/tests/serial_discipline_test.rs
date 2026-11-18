@@ -648,8 +648,8 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
 /// assumed. A grep for the cfg ANYWHERE in the file would call
 /// `cross_thread_rtt_test` and `flat_latency_test` release-only; both are
 /// deliberately DEBUG-OK (their metric is a RATIO, which is build-mode
-/// invariant) and gate every pull request. That makes those two the members
-/// this fence matters most for — the release-only five run on push-to-main lanes
+/// invariant) and gate every pull request. The DEBUG-OK members are the ones
+/// this fence matters most for; the release-only seven run on push-to-main lanes
 /// where little else is competing for the machine.
 const TIMING_INVENTORY: &[(&str, &str)] = &[
     (

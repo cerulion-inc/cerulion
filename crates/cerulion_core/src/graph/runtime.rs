@@ -4237,7 +4237,7 @@ pub struct GraphRuntime {
     /// outside it can write, whatever the doorbell policy and whether its
     /// registry opened: the armed line, when there is one, is among them.
     /// Recorded once at build.
-    doorbell_outside_topics: usize,
+    outside_input_topics: usize,
     /// How many of this graph's own publishers armed a doorbell, which under an
     /// active policy is every topic it publishes: a ring reaches whoever is
     /// blocked on the page, and this build cannot name those consumers. Recorded
@@ -10406,16 +10406,6 @@ impl GraphRuntime {
             scheduler.external_policy_node_count(),
         )?;
 
-        // Under an active doorbell policy, build the CONSUMER-side
-        // doorbell registry over this graph's data-trigger + sync input topics,
-        // ordered by `rung_topics` so the armed slot holds a topic a publisher
-        // outside this graph (another process, or another executor unit of this
-        // process) can write. `monitor_wait_block` arms the
-        // hardware monitor on the armed line's address, taken by topic, and
-        // poll-all-scans the registry for non-primary rings. A
-        // failed open is non-fatal: the live loop then falls back to the
-        // timer-only park (the ≤100µs recheck still bounds wake latency). Built
-        // BEFORE `config` is moved into `Self` so the warn can read the identity.
         // The data-trigger and sync inputs a publisher outside this graph can
         // write, whatever the doorbell policy: the period-park refuses a
         // runtime that has one with no doorbell wake word to end its naps.
@@ -10443,7 +10433,17 @@ impl GraphRuntime {
             })
             .cloned()
             .collect();
-        let doorbell_outside_topics = armable.len();
+        let outside_input_topics = armable.len();
+        // Under an active doorbell policy, build the CONSUMER-side
+        // doorbell registry over this graph's data-trigger + sync input topics,
+        // ordered by `rung_topics` so the armed slot holds a topic a publisher
+        // outside this graph (another process, or another executor unit of this
+        // process) can write. `monitor_wait_block` arms the
+        // hardware monitor on the armed line's address, taken by topic, and
+        // poll-all-scans the registry for non-primary rings. A
+        // failed open is non-fatal: the live loop then falls back to the
+        // timer-only park (the ≤100µs recheck still bounds wake latency). Built
+        // BEFORE `config` is moved into `Self` so the warn can read the identity.
         let mut doorbell_armed_topic: Option<String> = None;
         let doorbell_registry = if policy.doorbell() {
             debug_assert!(
@@ -10571,7 +10571,7 @@ impl GraphRuntime {
             )),
             doorbell_registry,
             doorbell_armed_topic,
-            doorbell_outside_topics,
+            outside_input_topics,
             producer_doorbells_armed,
             producer_doorbells_planned,
             // Park-entry routing counter (see field doc) — starts at 0.
@@ -14488,10 +14488,10 @@ impl GraphRuntime {
     /// park waits for can end a kernel nap, or has none: the monitor-wait park
     /// is active and real on this host, no barrier or credit word is waited on,
     /// no external fd is polled, and a data input written from outside this
-    /// runtime (an armed line) is covered by the doorbell wake word. With no
-    /// armed line every input is written by this runtime's own nodes inside its
-    /// own step, and the loop top sees it before any nap. Anywhere else the park
-    /// runs as it does with the switch off.
+    /// runtime has an armed line and the doorbell wake word. With no such input
+    /// every input is written by this runtime's own nodes inside its own step,
+    /// and the loop top sees it before any nap. Anywhere else the park runs as
+    /// it does with the switch off.
     fn period_park_applies(&self, sources: &[(waitset::WaitSource<'_>, Arc<str>)]) -> bool {
         super::period_park::admits(
             self.period_park_gate(
@@ -14512,17 +14512,23 @@ impl GraphRuntime {
             barrier: self.barrier_participant.is_some(),
             credit_edges: !self.credit_park_edges.is_empty(),
             fd_sources,
-            outside_inputs: self.doorbell_outside_topics > 0,
+            outside_inputs: self.outside_input_topics > 0,
             armed_line: self.has_armed_line(),
             data_wake: self.data_wake_rung(),
         }
     }
 
     /// Test seam: the reason a requested period-park would not engage on this
-    /// runtime (the `reason` field of its warning), or `None` where it would.
+    /// runtime's wiring (the `reason` field of its warning), or `None` where it
+    /// would, with the host's CPU monitor-wait primitive taken as held, so the
+    /// wiring is judged on every host.
     #[cfg(any(test, feature = "test-helpers"))]
-    pub fn period_park_refusal_for_test(&self) -> Option<&'static str> {
-        super::period_park::refusal(self.period_park_gate(false)).map(|r| r.as_str())
+    pub fn period_park_wiring_refusal_for_test(&self) -> Option<&'static str> {
+        super::period_park::refusal(super::period_park::Gate {
+            primitive: true,
+            ..self.period_park_gate(false)
+        })
+        .map(|r| r.as_str())
     }
 
     /// Test seam over [`Self::data_wake_rung`], the decision the wait policy

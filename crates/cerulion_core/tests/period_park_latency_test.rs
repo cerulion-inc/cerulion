@@ -19,7 +19,10 @@
 //! --nocapture --test-threads=1`), and no pull-request shard does, because a
 //! loaded shared runner delays a wake and stretches every bound. The counts
 //! and the order of the same runs are pinned on every pull request by
-//! `period_park_iox2_test`. A green run prints each arm's measured figures.
+//! `period_park_iox2_test`. A green run prints each arm's measured figures, or,
+//! on a host where the period-park does not engage (no CPU monitor-wait
+//! primitive, such as an x86 CPU without WAITPKG), that its bounds were not
+//! judged.
 
 #![cfg(all(not(debug_assertions), target_os = "linux"))]
 
@@ -75,6 +78,9 @@ fn a_ring_from_another_runtime_is_read_within_two_milliseconds() {
             "the slowest frame was read {worst:?} after it was written"
         );
     } else {
+        println!(
+            "period-park ring: bounds not judged: the period-park does not engage on this host"
+        );
         assert_eq!(c.stats, PeriodParkStats::default());
     }
 }
@@ -117,6 +123,9 @@ fn a_frame_on_a_second_input_is_read_within_about_one_nap() {
             "the slowest was read {worst:?} after"
         );
     } else {
+        println!(
+            "period-park second input: bounds not judged: the period-park does not engage on this host"
+        );
         assert_eq!(c.stats, PeriodParkStats::default());
     }
 }
@@ -149,6 +158,9 @@ fn a_period_node_under_the_period_park_stays_on_its_grid() {
             "the median gap is {med:?}"
         );
     } else {
+        println!(
+            "period-park grid: bounds not judged: the period-park does not engage on this host"
+        );
         assert_eq!(stats, PeriodParkStats::default());
     }
 }
