@@ -21,24 +21,56 @@ fn run_wsd(args: &[OsString]) -> Output {
         .expect("spawn cerulion-wsd")
 }
 
-#[test]
-fn an_argument_that_is_not_utf8_where_no_path_is_taken_is_refused_with_the_usage() {
-    let out = run_wsd(&[OsString::from_vec(b"\xFFrobot".to_vec())]);
+/// `cerulion-wsd <args>` exits 2 with `line`, a blank line and the usage on
+/// stderr, and nothing on stdout.
+fn assert_refused_with_usage(args: &[OsString], line: &str) {
+    let out = run_wsd(args);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stderr.contains("panicked at"), "a panic:\n{stderr}");
     assert_eq!(out.status.code(), Some(2), "{stderr}");
-    let (line, usage) = stderr
-        .split_once("\n\n")
-        .expect("the refusal line, a blank line, then the usage");
+    let lines: Vec<&str> = stderr.lines().take(6).collect();
     assert_eq!(
-        line,
-        "cerulion-wsd: argument 1 is not valid UTF-8: \"\\xFFrobot\""
-    );
-    assert!(
-        usage.starts_with("cerulion-wsd: the local workspace daemon.") && usage.contains("USAGE:"),
-        "the usage follows the blank line:\n{stderr}"
+        lines,
+        [
+            line,
+            "",
+            "cerulion-wsd: the local workspace daemon.",
+            "",
+            "USAGE:",
+            "    cerulion-wsd [--socket <path>] [--help]",
+        ],
+        "the refusal line, a blank line, then the usage:\n{stderr}"
     );
     assert!(out.stdout.is_empty(), "nothing on stdout: {out:?}");
+}
+
+#[test]
+fn an_argument_that_is_not_utf8_where_no_path_is_taken_is_refused_with_the_usage() {
+    assert_refused_with_usage(
+        &[OsString::from_vec(b"\xFFrobot".to_vec())],
+        "cerulion-wsd: argument 1 is not valid UTF-8: \"\\xFFrobot\"",
+    );
+}
+
+/// A flag name that is not valid UTF-8, first and after a socket path, gets
+/// the same refusal, not the line for an unrecognized or unexpected argument.
+#[test]
+fn a_flag_name_that_is_not_utf8_is_refused_with_its_position_and_the_usage() {
+    assert_refused_with_usage(
+        &[
+            OsString::from_vec(b"--s\xF6cket".to_vec()),
+            OsString::from("/tmp/x.sock"),
+        ],
+        "cerulion-wsd: argument 1 is not valid UTF-8: \"--s\\xF6cket\"",
+    );
+    assert_refused_with_usage(
+        &[
+            OsString::from("--socket"),
+            OsString::from("/tmp/x.sock"),
+            OsString::from_vec(b"--h\xE9lp".to_vec()),
+        ],
+        "cerulion-wsd: argument 3 is not valid UTF-8: \"--h\\xE9lp\"",
+    );
 }
 
 #[test]

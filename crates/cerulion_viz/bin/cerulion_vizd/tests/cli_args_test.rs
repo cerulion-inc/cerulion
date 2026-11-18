@@ -90,24 +90,41 @@ fn an_unknown_arg_exits_nonzero_with_usage_on_stderr() {
     );
 }
 
+/// `cerulion-vizd <arg>` exits 2 with `line`, a blank line and the usage on
+/// stderr, and nothing on stdout.
+fn assert_refused_with_usage(arg: &[u8], line: &str) {
+    use std::os::unix::ffi::OsStringExt as _;
+    let (code, stdout, stderr) = run_vizd_os(&[OsString::from_vec(arg.to_vec())]);
+    assert!(!stderr.contains("panicked at"), "a panic:\n{stderr}");
+    assert_eq!(code, 2, "stderr:\n{stderr}");
+    let lines: Vec<&str> = stderr.lines().take(6).collect();
+    assert_eq!(lines.len(), 6, "stderr:\n{stderr}");
+    assert_eq!(lines[..2], [line, ""], "stderr:\n{stderr}");
+    assert!(lines[2].starts_with("cerulion-vizd "), "stderr:\n{stderr}");
+    assert_eq!(
+        lines[3..],
+        ["", "USAGE:", "    cerulion-vizd [--help]"],
+        "the usage follows the blank line:\n{stderr}"
+    );
+    assert!(stdout.is_empty(), "nothing on stdout:\n{stdout}");
+}
+
 /// An argument that is not valid UTF-8 is refused with its position and bytes,
 /// a blank line and the usage on stderr, exit 2, and no panic.
 #[test]
 fn an_argument_that_is_not_utf8_is_refused_with_its_position_and_the_usage() {
-    use std::os::unix::ffi::OsStringExt as _;
-    let (code, stdout, stderr) = run_vizd_os(&[OsString::from_vec(b"\xFFrobot".to_vec())]);
-    assert!(!stderr.contains("panicked at"), "a panic:\n{stderr}");
-    assert_eq!(code, 2, "stderr:\n{stderr}");
-    let (line, usage) = stderr
-        .split_once("\n\n")
-        .expect("the refusal line, a blank line, then the usage");
-    assert_eq!(
-        line,
-        "cerulion-vizd: argument 1 is not valid UTF-8: \"\\xFFrobot\""
+    assert_refused_with_usage(
+        b"\xFFrobot",
+        "cerulion-vizd: argument 1 is not valid UTF-8: \"\\xFFrobot\"",
     );
-    assert!(
-        usage.starts_with("cerulion-vizd ") && usage.contains("USAGE:"),
-        "the usage follows the blank line:\n{stderr}"
+}
+
+/// A flag name that is not valid UTF-8 gets the same refusal, not the line for
+/// an unrecognized argument.
+#[test]
+fn a_flag_name_that_is_not_utf8_is_refused_with_its_position_and_the_usage() {
+    assert_refused_with_usage(
+        b"--h\xE9lp",
+        "cerulion-vizd: argument 1 is not valid UTF-8: \"--h\\xE9lp\"",
     );
-    assert!(stdout.is_empty(), "nothing on stdout:\n{stdout}");
 }
