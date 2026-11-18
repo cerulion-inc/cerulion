@@ -22,6 +22,13 @@
 //!
 //! A folder holds a harness when both [`LAUNCHER`] and [`INSTALL_SCRIPT`] are
 //! files in it.
+//!
+//! The install writes inside the folder the launcher runs from. Nothing writes
+//! into the folder beside the binary, a release package's, whichever rung
+//! found it ([`HarnessSource::Packaged`]): [`plan`] passes [`PACKAGED_FLAG`]
+//! for it, and the launcher copies it once to the copy home ([`copy_home`])
+//! and installs and runs there. Any other folder runs in place, and the
+//! launcher copies it the same way only when this user cannot write to it.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -45,6 +52,11 @@ pub const INSTALL_SCRIPT: &str = "install.sh";
 
 /// The shell the launcher is written for.
 const SHELL: &str = "bash";
+
+/// The launcher flag, after `--home DIR`, that says the folder is a release
+/// package's: the launcher runs from the copy at `DIR` even when this user can
+/// write to the folder.
+pub const PACKAGED_FLAG: &str = "--packaged";
 
 /// How long the sim server has to stop after the forwarded SIGINT: it scores
 /// and stops the simulator of every live episode, waits for a simulator that is
@@ -94,12 +106,46 @@ pub struct BenchArgs {
     pub out: Option<PathBuf>,
 }
 
+/// Which kind of folder the search found, and so whether the launcher may
+/// write into it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessSource {
+    /// The folder [`HARNESS_DIR_ENV`] names (rung 1), the user's own: it runs
+    /// in place.
+    Named,
+    /// The folder beside the canonicalized binary (rung 2, or rung 1 naming
+    /// that same folder), a release package's: never written, it runs from
+    /// its copy.
+    Packaged,
+    /// A source checkout's folder (rung 3): it runs in place.
+    Checkout,
+}
+
+/// A harness folder and the kind of folder it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FoundHarness {
+    /// The folder.
+    pub dir: PathBuf,
+    /// Which kind of folder it is.
+    pub source: HarnessSource,
+}
+
 /// Whether `dir` holds a harness: both marker files are files there.
 fn holds_harness(dir: &Path) -> bool {
     dir.join(LAUNCHER).is_file() && dir.join(INSTALL_SCRIPT).is_file()
 }
 
-/// The harness folder, searched in the module docs' order.
+/// Whether `a` and `b` resolve to the same folder; `false` when either cannot
+/// be resolved.
+fn same_folder(a: &Path, b: &Path) -> bool {
+    matches!(
+        (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+        (Ok(a), Ok(b)) if a == b
+    )
+}
+
+/// The harness folder, searched in the module docs' order, and the kind of
+/// folder it is.
 ///
 /// `env_dir` is the value of [`HARNESS_DIR_ENV`] (`None` = unset), `exe_dir`
 /// the directory of the canonicalized running binary (`None` when it cannot
@@ -114,7 +160,8 @@ pub fn find_harness_dir(
     env_dir: Option<&OsStr>,
     exe_dir: Option<&Path>,
     cwd: &Path,
-) -> CliResult<PathBuf> {
+) -> CliResult<FoundHarness> {
+    let beside = exe_dir.map(|dir| dir.join(HARNESS_FOLDER));
     if let Some(named) = env_dir.filter(|value| !value.is_empty()) {
         let dir = PathBuf::from(named);
         if !dir.is_dir() {
@@ -132,16 +179,25 @@ pub fn find_harness_dir(
                 dir.display()
             )));
         }
-        return Ok(dir);
+        let source = match beside.as_deref() {
+            Some(beside) if same_folder(&dir, beside) => HarnessSource::Packaged,
+            _ => HarnessSource::Named,
+        };
+        return Ok(FoundHarness { dir, source });
     }
-    let beside = exe_dir.map(|dir| dir.join(HARNESS_FOLDER));
     if let Some(dir) = beside.as_deref().filter(|dir| holds_harness(dir)) {
-        return Ok(dir.to_path_buf());
+        return Ok(FoundHarness {
+            dir: dir.to_path_buf(),
+            source: HarnessSource::Packaged,
+        });
     }
     for above in cwd.ancestors() {
         let dir = above.join(HARNESS_FOLDER);
         if holds_harness(&dir) {
-            return Ok(dir);
+            return Ok(FoundHarness {
+                dir,
+                source: HarnessSource::Checkout,
+            });
         }
     }
     let beside = match beside {
@@ -164,7 +220,7 @@ pub fn find_harness_dir(
 /// # Errors
 ///
 /// As [`find_harness_dir`], or an unreadable current directory.
-pub fn find_harness_dir_here() -> CliResult<PathBuf> {
+pub fn find_harness_dir_here() -> CliResult<FoundHarness> {
     let exe_dir = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .ok()
@@ -177,9 +233,10 @@ pub fn find_harness_dir_here() -> CliResult<PathBuf> {
     )
 }
 
-/// Where the launcher keeps its own copy of a harness folder it cannot write
-/// to (a system package): `harness/<version>` under the Cerulion config
-/// directory `config_dir`, one copy per release.
+/// Where the launcher keeps its own copy of a harness folder it must not
+/// write to (a release package's, or one this user cannot write to):
+/// `harness/<version>` under the Cerulion config directory `config_dir`, one
+/// copy per release.
 pub fn copy_home(config_dir: &Path) -> PathBuf {
     config_dir
         .join(HARNESS_FOLDER)
@@ -206,22 +263,27 @@ fn push_opt(argv: &mut Vec<String>, flag: &str, value: Option<&str>) {
     }
 }
 
-/// The launcher command line for `verb`, with the harness folder `dir` and
-/// the copy home `home` ([`copy_home`]). PURE.
+/// The launcher command line for `verb`, with the harness folder `harness`
+/// and the copy home `home` ([`copy_home`]). PURE.
 ///
-/// `bash <dir>/rcp.sh --home <home> <sim|bench|verify> [flags]`: the flags are
-/// spelled as the launcher reads them, one word each.
+/// `bash <dir>/rcp.sh --home <home> [--packaged] <sim|bench|verify> [flags]`:
+/// [`PACKAGED_FLAG`] for a [`HarnessSource::Packaged`] folder only, and the
+/// flags spelled as the launcher reads them, one word each.
 ///
 /// # Errors
 ///
 /// A path that is not UTF-8: the spawn plan carries its arguments as text.
-pub fn plan(verb: &HarnessVerb, dir: &Path, home: &Path) -> CliResult<ConnectPlan> {
-    let launcher = dir.join(LAUNCHER);
+pub fn plan(verb: &HarnessVerb, harness: &FoundHarness, home: &Path) -> CliResult<ConnectPlan> {
+    let launcher = harness.dir.join(LAUNCHER);
     let mut argv = vec![
         as_text(&launcher, "the harness launcher")?.to_string(),
         "--home".to_string(),
         as_text(home, "the harness copy folder")?.to_string(),
     ];
+    match harness.source {
+        HarnessSource::Packaged => argv.push(PACKAGED_FLAG.to_string()),
+        HarnessSource::Named | HarnessSource::Checkout => {}
+    }
     match verb {
         HarnessVerb::Sim { http, task } => {
             argv.push("sim".to_string());
@@ -261,7 +323,7 @@ mod tests {
         std::fs::write(dir.join(INSTALL_SCRIPT), "").expect("install.sh");
     }
 
-    fn message(result: CliResult<PathBuf>) -> String {
+    fn message(result: CliResult<FoundHarness>) -> String {
         match result {
             Err(CliError::Validation(message)) => message,
             other => panic!("wanted a refusal, got {other:?}"),
@@ -297,25 +359,87 @@ mod tests {
         }
     }
 
+    /// A plan's harness: `dir`, found as `source`.
+    fn found(dir: &str, source: HarnessSource) -> FoundHarness {
+        FoundHarness {
+            dir: PathBuf::from(dir),
+            source,
+        }
+    }
+
     #[test]
     fn the_variable_wins_then_the_folder_beside_the_binary_then_the_checkout() {
         let t = three_rungs();
         assert_eq!(
             find_harness_dir(Some(t.named.as_os_str()), Some(&t.exe_dir), &t.cwd).expect("found"),
-            t.named,
-            "rung 1: the variable"
+            FoundHarness {
+                dir: t.named.clone(),
+                source: HarnessSource::Named
+            },
+            "rung 1: the variable, the user's own folder"
         );
         assert_eq!(
             find_harness_dir(None, Some(&t.exe_dir), &t.cwd).expect("found"),
-            t.exe_dir.join("harness"),
+            FoundHarness {
+                dir: t.exe_dir.join("harness"),
+                source: HarnessSource::Packaged
+            },
             "rung 2: beside the binary, over a checkout around the current directory"
         );
         std::fs::remove_file(t.exe_dir.join(HARNESS_FOLDER).join(LAUNCHER)).expect("drop rung 2");
         assert_eq!(
             find_harness_dir(None, Some(&t.exe_dir), &t.cwd).expect("found"),
-            t.checkout.join("harness"),
+            FoundHarness {
+                dir: t.checkout.join("harness"),
+                source: HarnessSource::Checkout
+            },
             "rung 3: the checkout above the current directory"
         );
+    }
+
+    #[test]
+    fn a_variable_naming_the_folder_beside_the_binary_is_still_packaged() {
+        let t = three_rungs();
+        let beside = t.exe_dir.join(HARNESS_FOLDER);
+        let spelled_otherwise = t.exe_dir.join("../bin/harness/.");
+        for named in [&beside, &spelled_otherwise] {
+            let got =
+                find_harness_dir(Some(named.as_os_str()), Some(&t.exe_dir), &t.cwd).expect("found");
+            assert_eq!(got.source, HarnessSource::Packaged, "{}", named.display());
+            assert_eq!(
+                &got.dir, named,
+                "the folder is named as the variable spells it"
+            );
+        }
+        #[cfg(unix)]
+        {
+            let link = t.cwd.join("my-harness");
+            std::os::unix::fs::symlink(&beside, &link).expect("a link to the packaged folder");
+            assert_eq!(
+                find_harness_dir(Some(link.as_os_str()), Some(&t.exe_dir), &t.cwd)
+                    .expect("found")
+                    .source,
+                HarnessSource::Packaged,
+                "a link to the packaged folder"
+            );
+        }
+        assert_eq!(
+            find_harness_dir(Some(t.named.as_os_str()), None, &t.cwd)
+                .expect("found")
+                .source,
+            HarnessSource::Named,
+            "no binary path to compare with: the variable's folder is the user's own"
+        );
+    }
+
+    #[test]
+    fn finding_twice_gives_the_same_folder_and_kind() {
+        let t = three_rungs();
+        for env in [None, Some(t.named.as_os_str())] {
+            let first = find_harness_dir(env, Some(&t.exe_dir), &t.cwd).expect("found");
+            let second = find_harness_dir(env, Some(&t.exe_dir), &t.cwd).expect("found");
+            assert_eq!(first, second);
+        }
     }
 
     #[test]
@@ -363,7 +487,10 @@ mod tests {
         let empty = OsString::new();
         assert_eq!(
             find_harness_dir(Some(empty.as_os_str()), Some(&t.exe_dir), &t.cwd).expect("found"),
-            t.exe_dir.join("harness")
+            FoundHarness {
+                dir: t.exe_dir.join("harness"),
+                source: HarnessSource::Packaged
+            }
         );
     }
 
@@ -426,14 +553,14 @@ mod tests {
 
     #[test]
     fn sim_runs_the_launcher_under_bash_on_stdio_or_http() {
-        let dir = Path::new("/opt/cerulion/bin/harness");
+        let harness = found("/src/cerulion/harness", HarnessSource::Checkout);
         let home = Path::new("/cfg/.cerulion/harness/2.1.0");
         let stdio = plan(
             &HarnessVerb::Sim {
                 http: None,
                 task: None,
             },
-            dir,
+            &harness,
             home,
         )
         .expect("a plan");
@@ -441,7 +568,7 @@ mod tests {
         assert_eq!(
             stdio.argv,
             [
-                "/opt/cerulion/bin/harness/rcp.sh",
+                "/src/cerulion/harness/rcp.sh",
                 "--home",
                 "/cfg/.cerulion/harness/2.1.0",
                 "sim"
@@ -452,7 +579,7 @@ mod tests {
                 http: Some("127.0.0.1:8765".to_string()),
                 task: Some("open-drawer".to_string()),
             },
-            dir,
+            &harness,
             home,
         )
         .expect("a plan");
@@ -460,6 +587,57 @@ mod tests {
             http.argv[3..],
             ["sim", "--http", "127.0.0.1:8765", "--task", "open-drawer"]
         );
+    }
+
+    #[test]
+    fn only_the_packaged_folder_is_told_to_run_from_its_copy() {
+        let home = Path::new("/cfg/.cerulion/harness/2.1.0");
+        let sim = HarnessVerb::Sim {
+            http: None,
+            task: None,
+        };
+        let bench = HarnessVerb::Bench(BenchArgs {
+            model: "m".to_string(),
+            ..BenchArgs::default()
+        });
+        let packaged = found("/opt/cerulion/bin/harness", HarnessSource::Packaged);
+        for (verb, words) in [
+            (&sim, &["sim"][..]),
+            (&bench, &["bench", "--model", "m"][..]),
+            (&HarnessVerb::Verify, &["verify"][..]),
+        ] {
+            let mut want = vec![
+                "/opt/cerulion/bin/harness/rcp.sh",
+                "--home",
+                "/cfg/.cerulion/harness/2.1.0",
+                "--packaged",
+            ];
+            want.extend_from_slice(words);
+            assert_eq!(
+                plan(verb, &packaged, home).expect("a plan").argv,
+                want,
+                "{verb:?}"
+            );
+        }
+        for source in [HarnessSource::Named, HarnessSource::Checkout] {
+            let in_place = found("/home/me/harness", source);
+            for verb in [&sim, &bench, &HarnessVerb::Verify] {
+                let argv = plan(verb, &in_place, home).expect("a plan").argv;
+                assert_eq!(
+                    argv[..3],
+                    [
+                        "/home/me/harness/rcp.sh",
+                        "--home",
+                        "/cfg/.cerulion/harness/2.1.0"
+                    ],
+                    "{source:?} {verb:?}"
+                );
+                assert!(
+                    !argv.iter().any(|word| word == PACKAGED_FLAG),
+                    "{source:?} {verb:?}: {argv:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -471,7 +649,8 @@ mod tests {
             cell: Some("pro_spatial_swap_t00_i00".to_string()),
             out: Some(PathBuf::from("/data/bench out")),
         });
-        let plan = plan(&verb, Path::new("harness"), Path::new("/h")).expect("a plan");
+        let in_place = found("harness", HarnessSource::Checkout);
+        let plan = plan(&verb, &in_place, Path::new("/h")).expect("a plan");
         assert_eq!(
             plan.argv,
             [
@@ -496,7 +675,7 @@ mod tests {
             ..BenchArgs::default()
         });
         assert_eq!(
-            super::plan(&bare, Path::new("harness"), Path::new("/h"))
+            super::plan(&bare, &in_place, Path::new("/h"))
                 .expect("a plan")
                 .argv,
             ["harness/rcp.sh", "--home", "/h", "bench", "--model", "m"]
@@ -505,8 +684,8 @@ mod tests {
 
     #[test]
     fn verify_runs_the_launcher_with_no_flags() {
-        let plan =
-            plan(&HarnessVerb::Verify, Path::new("harness"), Path::new("/h")).expect("a plan");
+        let in_place = found("harness", HarnessSource::Named);
+        let plan = plan(&HarnessVerb::Verify, &in_place, Path::new("/h")).expect("a plan");
         assert_eq!(plan.argv, ["harness/rcp.sh", "--home", "/h", "verify"]);
     }
 
@@ -516,6 +695,11 @@ mod tests {
         use std::os::unix::ffi::OsStrExt;
         let bad = Path::new(OsStr::from_bytes(b"/src/\xff/harness"));
         let good = Path::new("/src/harness");
+        let bad_harness = FoundHarness {
+            dir: bad.to_path_buf(),
+            source: HarnessSource::Packaged,
+        };
+        let good_harness = found("/src/harness", HarnessSource::Packaged);
         let out = HarnessVerb::Bench(BenchArgs {
             model: "m".to_string(),
             out: Some(bad.to_path_buf()),
@@ -523,14 +707,14 @@ mod tests {
         });
         let cases = [
             (
-                plan(&HarnessVerb::Verify, bad, good),
+                plan(&HarnessVerb::Verify, &bad_harness, good),
                 "the harness launcher '",
             ),
             (
-                plan(&HarnessVerb::Verify, good, bad),
+                plan(&HarnessVerb::Verify, &good_harness, bad),
                 "the harness copy folder '",
             ),
-            (plan(&out, good, good), "the --out folder '"),
+            (plan(&out, &good_harness, good), "the --out folder '"),
         ];
         for (refused, opens_with) in cases {
             match refused {
@@ -555,9 +739,16 @@ mod tests {
             http: Some("127.0.0.1:8765".to_string()),
             task: None,
         };
-        let first = plan(&verb, Path::new("/h/harness"), Path::new("/c")).expect("a plan");
-        let second = plan(&verb, Path::new("/h/harness"), Path::new("/c")).expect("a plan");
-        assert_eq!(first.bin, second.bin);
-        assert_eq!(first.argv, second.argv);
+        for source in [
+            HarnessSource::Named,
+            HarnessSource::Packaged,
+            HarnessSource::Checkout,
+        ] {
+            let harness = found("/h/harness", source);
+            let first = plan(&verb, &harness, Path::new("/c")).expect("a plan");
+            let second = plan(&verb, &harness, Path::new("/c")).expect("a plan");
+            assert_eq!(first.bin, second.bin);
+            assert_eq!(first.argv, second.argv);
+        }
     }
 }

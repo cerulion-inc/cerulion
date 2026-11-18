@@ -214,16 +214,17 @@ pub(crate) fn run_harness(verb: &harness_cmd::HarnessVerb) -> ExitCode {
     }
 }
 
-/// The launcher plan for `verb`: the harness folder this process finds and
-/// the copy home under this machine's Cerulion config directory.
+/// The launcher plan for `verb`: the harness folder this process finds, the
+/// kind of folder it is, and the copy home under this machine's Cerulion
+/// config directory.
 fn harness_plan(
     verb: &harness_cmd::HarnessVerb,
 ) -> cerulion_cli_engine::error::CliResult<connect_cmd::ConnectPlan> {
-    let dir = harness_cmd::find_harness_dir_here()?;
+    let harness = harness_cmd::find_harness_dir_here()?;
     let config = cerulion_cli_engine::auth::cerulion_config_dir().ok_or_else(|| {
         cerulion_cli_engine::error::CliError::Validation(
             "no home directory to keep the harness in; set CERULION_HOME".to_string(),
         )
     })?;
-    harness_cmd::plan(verb, &dir, &harness_cmd::copy_home(&config))
+    harness_cmd::plan(verb, &harness, &harness_cmd::copy_home(&config))
 }

@@ -3,9 +3,9 @@
 # The program `cerulion rcp --sim` and `cerulion rcp bench` run. cerulion finds this folder and starts this script
 # under bash with the terminal attached:
 #
-#   rcp.sh [--home DIR] sim [--http ADDR] [--task NAME]
-#   rcp.sh [--home DIR] bench --model MODEL [--base-url URL] [--key-env NAME] [--cell ID] [--out DIR]
-#   rcp.sh [--home DIR] verify
+#   rcp.sh [--home DIR [--packaged]] sim [--http ADDR] [--task NAME]
+#   rcp.sh [--home DIR [--packaged]] bench --model MODEL [--base-url URL] [--key-env NAME] [--cell ID] [--out DIR]
+#   rcp.sh [--home DIR [--packaged]] verify
 #
 # sim     serves the harness's MCP tools with a simulated robot (playground/): over stdio, or over streamable HTTP
 #         at ADDR. --task NAME picks the task the robot is set up for (the server's --state).
@@ -16,28 +16,39 @@
 # sim and bench run install.sh first when install.sh --check finds a step missing, so the simulator and the
 # benchmark scenes are installed once. The install's progress goes to stderr: stdout stays the MCP stream.
 #
-# --home DIR  where this folder is copied, once, when this user cannot write to it (a system package), because the
-#             install writes inside the folder it runs from. cerulion passes harness/<version> under its own config
-#             directory, so each release keeps its own copy.
+# --home DIR  where this folder is copied, once, byte for byte, to run from there, because the install writes inside
+#             the folder it runs from: always after --packaged, else only when this user cannot write to this folder.
+#             cerulion passes harness/<version> under its own config directory, so each release keeps its own copy.
+# --packaged  this folder is the one a release package installs beside cerulion, which nothing writes into, so sim
+#             and bench run from the copy even when this user can write here. cerulion passes it for that folder only.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd -P)
-USAGE="usage: rcp.sh [--home DIR] sim [--http ADDR] [--task NAME] | bench --model MODEL [...] | verify"
+USAGE="usage: rcp.sh [--home DIR [--packaged]] sim [--http ADDR] [--task NAME] | bench --model MODEL [...] | verify"
 usage() { echo "$USAGE" >&2; exit 2; }
 
 COPY_HOME=
+PACKAGED=
 if [ "${1:-}" = --home ]; then
   [ $# -ge 2 ] || usage
   COPY_HOME=$2
   shift 2
+  if [ "${1:-}" = --packaged ]; then
+    [ -n "$COPY_HOME" ] || usage
+    PACKAGED=1
+    shift
+  fi
 fi
 [ $# -ge 1 ] || usage
 VERB=$1
 shift
 
-# The folder sim and bench run from: this one, or its copy when this user cannot write here.
+# The folder sim and bench run from: this one, or its copy when this folder is a release package's or this user
+# cannot write here. A copy that exists already is named by its resolved path, so a --home that names this very
+# folder compares equal to it below.
 RUN_FROM=$HERE
-if [ ! -w "$HERE" ] && [ -n "$COPY_HOME" ]; then
+if [ -n "$COPY_HOME" ] && { [ -n "$PACKAGED" ] || [ ! -w "$HERE" ]; }; then
   RUN_FROM=$COPY_HOME
+  [ ! -d "$RUN_FROM" ] || RUN_FROM=$(cd "$RUN_FROM" && pwd -P)
 fi
 
 # sim's flags, as the server reads them (--task is the server's --state).
@@ -108,7 +119,12 @@ esac
 
 if [ "$RUN_FROM" != "$HERE" ]; then
   if [ ! -f "$RUN_FROM/rcp.sh" ]; then
-    echo "$HERE is read-only for this user: copying it once to $RUN_FROM, where the install goes" >&2
+    if [ -n "$PACKAGED" ]; then
+      echo "$HERE is a release package's folder, which nothing writes into: copying it once to $RUN_FROM, where" \
+        "the install goes" >&2
+    else
+      echo "$HERE is read-only for this user: copying it once to $RUN_FROM, where the install goes" >&2
+    fi
     mkdir -p "$(dirname "$RUN_FROM")"
     TMP=$RUN_FROM.partial.$$
     rm -rf "$TMP"
@@ -118,6 +134,10 @@ if [ "$RUN_FROM" != "$HERE" ]; then
   fi
   exec bash "$RUN_FROM/rcp.sh" "$VERB" "$@"
 fi
+[ -z "$PACKAGED" ] || {
+  echo "--home names $HERE itself, a release package's folder, which nothing writes into; name another folder" >&2
+  exit 2
+}
 [ -w "$HERE" ] || {
   echo "this user cannot write to $HERE, where the install goes; run it through cerulion rcp, which names a" \
     "folder to copy it to, or point CERULION_HARNESS_DIR at a copy you own" >&2

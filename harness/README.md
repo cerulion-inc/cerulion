@@ -12,8 +12,10 @@ cerulion rcp bench --model YOUR_MODEL            # one benchmark task, with and 
 cerulion rcp bench --verify                      # the code here is the code the benchmark measured
 ```
 
-The release packages install this folder beside the `cerulion` binary. In a source checkout, run the same
-commands anywhere inside the checkout, or point `CERULION_HARNESS_DIR` at this folder.
+The release packages install this folder beside the `cerulion` binary, and nothing writes into it there: the
+first run copies it once to `harness/<version>` under the Cerulion config directory and runs from the copy. In a
+source checkout, run the same commands anywhere inside the checkout, or point `CERULION_HARNESS_DIR` at this
+folder; both run it in place while your user can write to it.
 
 ## What is in it
 
@@ -33,8 +35,9 @@ commands anywhere inside the checkout, or point `CERULION_HARNESS_DIR` at this f
 | `tests/` | standard-library tests that need no simulator and no network |
 
 The install writes `bx/` (the simulator environment and the benchmark trees), `venv/` (the episode server's
-environment) and `out/` (what the sim server keeps of each episode) inside this folder, and git ignores all
-three. Nothing of the benchmark's scenes is committed here: they are fetched and checked against their pins.
+environment) and `out/` (what the sim server keeps of each episode) inside the folder it runs from: this folder
+in a source checkout, the copy for a release package. Git ignores all three. Nothing of the benchmark's scenes is
+committed here: they are fetched and checked against their pins.
 
 The measured code keeps the package names it ran under, `rcpx` and `bench`, so that it stays byte for byte the
 code the benchmark measured. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](../docs/rcp.md).

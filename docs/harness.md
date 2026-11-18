@@ -72,10 +72,10 @@ record; a task with another robot body does the same the first time you use it, 
 | Requirement | |
 |---|---|
 | Hosts | macOS on Apple silicon; Linux on x86-64 or arm64. Windows is not supported. |
-| Tools | `git` and `curl`. `uv` is used from `PATH`, or a pinned copy is fetched into the harness folder. |
+| Tools | `git` and `curl`. `uv` is used from `PATH`, or a pinned copy is fetched into the folder the harness runs from. |
 | Linux | the CPU renderer: `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0` on Ubuntu |
 | GPU | none: the simulator renders on the CPU on Linux and through Apple's OpenGL on macOS |
-| Disk | about 4 GB in the harness folder |
+| Disk | about 4 GB in the folder the harness runs from (see [Where the harness lives](#where-the-harness-lives)) |
 
 The published results were measured on Linux x86-64. On macOS the pictures are rendered by Apple's OpenGL and
 differ slightly from the measured ones, so an episode there is a try of the harness, not a reproduction of a
@@ -136,6 +136,12 @@ The harness is the `harness/` folder of the Cerulion repository (see [harness/RE
    `bin` directory still reaches the folder beside the real binary.
 3. `harness/` in the current directory or the nearest directory above it, as in a source checkout.
 
-When none holds a harness, the error names all three places. The install writes inside the harness folder. When
-your user cannot write there (a system package), the first run copies the folder once to `harness/<version>`
-under the Cerulion config directory (`~/.cerulion`, or `CERULION_HOME`) and runs from that copy.
+When none holds a harness, the error names all three places.
+
+The install writes inside the folder the harness runs from. Nothing writes into the folder the release packages
+install, even when your user can write there: the first run copies it once, byte for byte, to `harness/<version>`
+under the Cerulion config directory (`~/.cerulion`, or `CERULION_HOME`), and the install and every later run of
+that version use the copy, also when `CERULION_HARNESS_DIR` names the installed folder. A new version makes its
+own copy and leaves the old one in place; delete an old version's folder to free its space. Any other folder, one
+that `CERULION_HARNESS_DIR` names or a source checkout's, runs in place and the install writes inside it; when your
+user cannot write there, the first run copies it the same way.
