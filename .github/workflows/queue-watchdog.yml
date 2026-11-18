@@ -25,9 +25,11 @@ name: Queue run watchdog
 on:
   merge_group:
 
-# `actions: write` lists the run's jobs and cancels the run; `contents: read`
-# reads the merge queue and compares the base branch with the queue commit. A
-# refused queue read or compare turns only the dead batch check off.
+# `actions: write` lists the run's jobs and cancels the run. `contents: read`
+# is granted for the merge queue read and the compare; no GitHub page names
+# the permission the job token needs for `repository.mergeQueue`, so a batch's
+# log shows whether it is enough. A refused queue read or compare is said once
+# and turns only the dead batch check off.
 permissions:
   contents: read
   actions: write

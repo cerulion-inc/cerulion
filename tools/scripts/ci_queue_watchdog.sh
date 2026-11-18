@@ -42,8 +42,8 @@
 # that finds the commit says so once, so the log shows the read works.
 #
 # Each poll is one jobs read, plus the run read once no job is left running;
-# until the batch has merged, one queue read per page of 100 entries; and the
-# compare while the commit is no entry's head commit. The REST reads come out
+# until the batch has merged or a read is refused, one queue read per page of
+# 100 entries, and the compare while the commit is no entry's head commit. The REST reads come out
 # of the job token's hourly REST budget, the queue reads out of its hourly
 # GraphQL budget; each is per repository and shared by every job of it.
 #
@@ -55,7 +55,8 @@
 # The required names are the rows of <required-contexts-file>
 # (tools/ci/required_contexts.txt), `#` lines and blank lines skipped. Three of
 # them are reported by `leak-guard.yml`, never by a `ci.yml` job, so a failure
-# there cancels nothing here.
+# there cancels nothing through the jobs read; it takes the batch out of the
+# queue, and the dead batch check cancels the run two polls later.
 #
 # REFUSALS, exit 2 with one message each: a wrong argument count; an unreadable
 # file or one naming no context; `jq` absent; no repository, commit or base

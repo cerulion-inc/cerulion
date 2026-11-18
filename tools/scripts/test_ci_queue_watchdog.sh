@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=42
+CASES_EXPECTED=43
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-watchdog-test.XXXXXX")
@@ -796,6 +796,22 @@ expect_calls "api $LIST" "api $JOBS" "$QUEUE_CALL" "api $COMPARE" "api $JOBS" "a
 expect_cancels 0
 expect_sleeps 60 60
 ok 'a compare refused to the job token turns the dead check off'
+
+# An INSUFFICIENT_SCOPES error body on the compare is a refusal too, and a
+# failed required job still cancels the run after it.
+new_case compare_insufficient_scopes
+queue_page false MQ "$OTHER" | answer POST "$QUEUE"
+printf 'BODYFAIL:{"message":"x","errors":[{"type":"INSUFFICIENT_SCOPES","message":"y"}]}\n' | answer GET "$COMPARE"
+jobs 'Lint|in_progress|null' | answer GET "$JOBS" 1
+jobs 'Lint|completed|failure' | answer GET "$JOBS"
+: | answer POST "$CANCEL"
+run_case
+expect_status 0
+expect_output "the job token may not compare main with $SHA: gh: the answer carries errors"
+expect_output 'required job "Lint" ended failure; cancelling run 555'
+expect_calls "api $LIST" "api $JOBS" "$QUEUE_CALL" "api $COMPARE" "api $JOBS" "api -X POST $CANCEL"
+expect_sleeps 60
+ok 'an INSUFFICIENT_SCOPES compare body is a refusal and a failed job still cancels'
 
 # The entry is on the second page: the first page's cursor reads it, and the
 # compare is never asked.
