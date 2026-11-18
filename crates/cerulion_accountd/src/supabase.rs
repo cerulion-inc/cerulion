@@ -252,10 +252,9 @@ impl SupabaseVerifier {
                     .as_deref()
                     .filter(|secret| !secret.is_empty())
                     .ok_or(AccountdError::Unauthorized("invalid supabase token"))?;
-                (
-                    Algorithm::HS256,
-                    DecodingKey::from_secret(secret.as_bytes()),
-                )
+                let key = DecodingKey::from_secret(secret.as_bytes())
+                    .map_err(|_| AccountdError::Unauthorized("invalid supabase token"))?;
+                (Algorithm::HS256, key)
             }
             Algorithm::ES256 | Algorithm::RS256 => {
                 let kid = header

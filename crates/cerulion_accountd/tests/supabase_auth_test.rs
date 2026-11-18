@@ -234,7 +234,7 @@ fn token_with_kid(
         "role": role
     });
     let key = if algorithm == Algorithm::HS256 {
-        EncodingKey::from_secret(b"legacy-secret")
+        EncodingKey::from_secret(b"legacy-secret").expect("a non-empty HMAC fixture key")
     } else {
         let der = base64::engine::general_purpose::STANDARD
             .decode(PRIVATE_KEY_DER_B64)
@@ -293,9 +293,8 @@ fn token(algorithm: Algorithm, subject: &str, issuer: &str, audience: &str, exp:
     )
 }
 
-fn hs256_token(subject: &str, secret: &[u8]) -> String {
-    let header = Header::new(Algorithm::HS256);
-    let claims = serde_json::json!({
+fn hs256_claims(subject: &str) -> serde_json::Value {
+    serde_json::json!({
         "sub": subject,
         "email": "person@example.com",
         "exp": 20_000,
@@ -303,8 +302,43 @@ fn hs256_token(subject: &str, secret: &[u8]) -> String {
         "iss": ISSUER,
         "aud": AUDIENCE,
         "role": "authenticated"
-    });
-    encode(&header, &claims, &EncodingKey::from_secret(secret)).expect("signed HS256 fixture token")
+    })
+}
+
+/// HMAC-SHA256 with an EMPTY key. The key pads to 64 zero bytes, so the
+/// inner and outer pads are the bare ipad and opad bytes.
+fn hmac_sha256_empty_key(message: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let inner = Sha256::new()
+        .chain_update([0x36u8; 64])
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update([0x5cu8; 64])
+        .chain_update(inner)
+        .finalize()
+        .to_vec()
+}
+
+/// An HS256 token signed with an EMPTY key, built by hand: jsonwebtoken
+/// refuses to sign with an empty HMAC key, but any client can send one.
+fn hs256_token_with_empty_key(subject: &str) -> String {
+    let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"HS256"}"#);
+    let claims = URL_SAFE_NO_PAD.encode(hs256_claims(subject).to_string());
+    let signing_input = format!("{header}.{claims}");
+    let signature = hmac_sha256_empty_key(signing_input.as_bytes());
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+#[test]
+fn the_empty_key_hmac_matches_the_published_vector() {
+    // HMAC-SHA256 of the empty message under the empty key.
+    let tag = hmac_sha256_empty_key(b"");
+    let hex: String = tag.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex,
+        "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad"
+    );
 }
 
 async fn spawn(
@@ -1001,7 +1035,7 @@ async fn empty_hs256_secret_rejects_hs256_tokens() {
     let response = reqwest::Client::new()
         .post(format!("{addr}/v1/auth/supabase/exchange"))
         .json(&serde_json::json!({
-            "access_token": hs256_token("empty-secret-sub", b"")
+            "access_token": hs256_token_with_empty_key("empty-secret-sub")
         }))
         .send()
         .await
