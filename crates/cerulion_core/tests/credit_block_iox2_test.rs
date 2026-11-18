@@ -2513,6 +2513,71 @@ fn prc_a_peer_drain_wakes_a_credit_blocked_producers_park() {
     );
 }
 
+/// A Period producer held by a FULL cross-process slot is due on every pass
+/// and defers again each time. The live loop sizes its wait for it at no less
+/// than the 1 ms poll, so its wakes stay at the poll's rate: the exact
+/// Period-deadline wait is for a deadline still ahead, never for a node that is
+/// due and cannot fire. Counted over a wall window of the production live step.
+#[test]
+#[serial]
+fn prc_a_held_period_producer_polls_no_faster_than_the_millisecond_floor() {
+    const WINDOW: Duration = Duration::from_millis(200);
+    const POLL: Duration = Duration::from_millis(1);
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("heldpoll", "consumer", "inp", DEPTH as u32);
+
+    let clock = Arc::new(VirtualClock::new());
+    let bind = [binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        DEPTH,
+        CreditRole::Producer,
+    )];
+    let mgr = manager("cb_heldpoll_p", ix, Arc::clone(&clock));
+    let (cfg, fac) = producer_graph("cbhp");
+    let mut rt = GraphRuntime::build_live_free_run(
+        cfg,
+        fac,
+        &mgr,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        None,
+        forced_park_policy(),
+        CrossProcessWiring::with_credit(None, &bind),
+    )
+    .expect("build the producer context with its credit binding");
+
+    // Full slot, and the producer's deadline passed: due, and deferred.
+    w.producer_side.record_published_n(DEPTH);
+    clock.set(10 * PERIOD_MS * 1_000_000);
+    rt.step(Duration::from_millis(PERIOD_MS));
+    let fires = |rt: &GraphRuntime| {
+        rt.node_handle("producer")
+            .expect("the producer's handle")
+            .fire_count()
+    };
+    assert_eq!(fires(&rt), 0, "the full slot defers the producer");
+
+    let started = std::time::Instant::now();
+    let mut passes: u64 = 0;
+    while started.elapsed() < WINDOW {
+        let wait = rt.live_timeout_for_test();
+        assert!(
+            wait >= POLL,
+            "a held, past-due Period producer waits {wait:?}: faster than the {POLL:?} poll"
+        );
+        rt.run_live_step_once_for_test(wait);
+        passes += 1;
+    }
+    let bound = WINDOW.as_millis() as u64 / POLL.as_millis() as u64 + 1;
+    assert!(
+        passes <= bound,
+        "{passes} live passes in {WINDOW:?}: more than the {bound} a {POLL:?} poll allows"
+    );
+    assert!(passes > 0, "the live step ran");
+    assert_eq!(fires(&rt), 0, "still held: nothing fired");
+}
+
 /// THE NO-FALSE-WAKE CONTROL — and the reason the predicate is gated on
 /// was-full-at-park-entry rather than on the word's state alone.
 ///

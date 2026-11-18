@@ -12,12 +12,15 @@
 //! payload bytes. Payloads are JSON. A hard [`MAX_FRAME_BYTES`] cap bounds a
 //! hostile/garbled length prefix.
 //!
-//! # Handshake (version negotiation, day one)
+//! # Handshake
 //!
 //! On connect the client sends a [`Hello`] carrying the inclusive version
-//! range it supports. The server replies with [`HandshakeReply::Ack`] naming
-//! the chosen version (the highest common) or [`HandshakeReply::Reject`] if
-//! there is no overlap, refused before any verb runs.
+//! range it supports and the [`SessionKind`] it requests. Ordinary ops support
+//! versions 1 and 2; shell and exec require version 2. The server replies with
+//! [`HandshakeReply::Ack`] naming the highest common version for that session,
+//! or [`HandshakeReply::Reject`] before any verb runs if there is no overlap.
+//! A common version does not grant execution: the service must also support and
+//! authorize the requested session. An ordinary ops service rejects shell and exec.
 
 use std::fmt::Display;
 use std::io::{Read, Write};
@@ -26,12 +29,19 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorKind, OpsProtoError, OpsProtoResult};
+pub use crate::session::{
+    ClientFrame, ExecRequest, ExitReason, OutputStream, ServerFrame, SessionExit, SessionKind,
+    ShellRequest, WindowSize, MAX_DATA_BYTES, MAX_SESSION_FRAME_BYTES,
+};
 
 /// The newest protocol version this build speaks.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 
-/// The oldest protocol version this build still accepts.
+/// The oldest protocol version accepted for ordinary request/response ops.
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
+
+/// The oldest protocol version accepted for shell and exec sessions.
+pub const MIN_SESSION_PROTOCOL_VERSION: u16 = 2;
 
 /// Hard cap on a single frame's payload (16 MiB). A declared length above this
 /// is rejected without allocating the buffer.
@@ -88,12 +98,21 @@ pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> OpsProtoResult<T> {
     serde_json::from_slice(bytes).map_err(|e| OpsProtoError::Decode(e.to_string()))
 }
 
-/// The client's opening message: the inclusive protocol-version range it
-/// supports.
+/// The client's opening message: its supported version range and session mode.
+/// When constructing this value directly, use [`SessionKind::Ops`] for ordinary
+/// verbs. [`Hello::current`] supplies that mode and this build's version range.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Hello {
     pub min_version: u16,
     pub max_version: u16,
+    /// The mode of this connection. Ordinary ops omit this field on the wire.
+    #[serde(default, skip_serializing_if = "is_ordinary_ops")]
+    pub session: SessionKind,
+}
+
+fn is_ordinary_ops(session: &SessionKind) -> bool {
+    matches!(session, SessionKind::Ops)
 }
 
 impl Hello {
@@ -102,6 +121,7 @@ impl Hello {
         Hello {
             min_version: MIN_PROTOCOL_VERSION,
             max_version: PROTOCOL_VERSION,
+            session: SessionKind::Ops,
         }
     }
 }
