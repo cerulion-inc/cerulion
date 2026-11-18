@@ -8,14 +8,14 @@
   </a>
 </p>
 
-**Cerulion (YC S24) is the operating system for physical AI: an open-source, zero-copy robot runtime that records runs, replays failures against new code, and reaches your robots from anywhere. It's ROS 2 compatible.**
+**Cerulion (YC S24) is the harness for physical AI: the tools and body knowledge a general model needs to work a robot it was never trained on. It is built on an open-source, zero-copy robot runtime that records runs, replays failures against new code, and reaches your robots from anywhere, and it is ROS 2 compatible.**
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
 [![crates.io: cerulion_cli 2.0.0](https://img.shields.io/badge/crates.io-cerulion__cli%202.0.0-brightgreen.svg)](https://crates.io/crates/cerulion_cli)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docs](https://img.shields.io/badge/docs-docs.cerulion.com-blue.svg)](https://docs.cerulion.com)
 
-**[Install](#install) · [Run the example](#quickstart-run-record-and-verify) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack) · [Architecture](#how-it-fits-together) · [Docs](https://docs.cerulion.com) · [Guides](https://docs.cerulion.com/cerulion/guides)**
+**[Install](#install) · [Try the harness](#try-the-harness) · [Run the example](#quickstart-run-record-and-verify) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack) · [Architecture](#how-it-fits-together) · [Docs](https://docs.cerulion.com) · [Guides](https://docs.cerulion.com/cerulion/guides)**
 
 ![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
 
@@ -80,6 +80,24 @@ Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and l
 Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them. The compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. To bring a workspace from Cerulion 1.0, follow the migration steps in the [2.0.0 release notes](./CHANGELOG.md#200---2026-11-12). They move its `=1.0.0` pins to `=2.0.0` and finish with one `cerulion node build <node>` per node. The [installation details](docs/install.md) cover the toolchain setup.
 
 </details>
+
+## Try the harness
+
+Give your own model the Cerulion harness's tools on a simulated robot, through Cerulion's MCP server. Experimental.
+
+```bash
+cerulion login                                   # once, on this machine
+cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
+claude mcp add --transport http cerulion http://127.0.0.1:8765/mcp
+```
+
+Then ask your model for a task, for example "Put the bowl on the plate." The first `cerulion rcp --sim` installs the simulator and the benchmark scenes once, which takes minutes. To rerun a task of the published benchmark with and without the harness against your own OpenAI-compatible endpoint, set `OPENAI_BASE_URL` and `OPENAI_API_KEY` and run:
+
+```bash
+cerulion rcp bench --model YOUR_MODEL
+```
+
+The [harness guide](docs/harness.md) covers what the harness is, what the benchmark measured and how `cerulion rcp bench --verify` proves the code is the measured code.
 
 ## Quickstart: Run, record and verify
 
