@@ -114,8 +114,9 @@ env:
   #
   # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
   # token being the key text between `cargo-` and the scope segment with any
-  # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
-  # `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`,
+  # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`, the test
+  # shards above 0 as `Linux-shard1` to `Linux-shard3` and `macOS-shard1`,
+  # `macOS-shard2`, `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`,
   # `period-park-X64`, `period-park-ARM64`, and
   # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
   # hash>`, whose header hash is a cache generation rather than part of the
@@ -2484,19 +2485,18 @@ jobs:
         with:
           toolchain: stable
 
-      # ONE SAVER, CHOSEN RATHER THAN RACED. All four legs of this matrix share
-      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES
-      # a key at save time: whichever leg finishes first wins, the other three
-      # upload a multi-gigabyte archive that is then rejected ("another job may
-      # be creating this cache"), and the archive that lands is whichever leg's
-      # `target/` happened to be newest — arbitrary, and different run to run.
-      # Shard 0 saves; shards 1-3 restore only.
+      # A KEY PER SHARD, ONE WRITER PER KEY. `actions/cache` RESERVES a key at
+      # save time, so legs sharing one key race and all but the first upload a
+      # multi-gigabyte archive that is then rejected. Each leg has a key of its
+      # own instead (below), so once its namespace may save, each keeps what its
+      # own tests built: with shard 0's archive the only one, shards 1-3 rebuilt
+      # the third-party crates shard 0 never builds on every run.
       #
-      # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a store limit,
-      # and one archive per shard per OS per lockfile would have the shards
-      # evicting each other AND every other job's namespace. One archive, one
-      # writer.
+      # SHARD 3 WOULD SAVE UNDER DISK PRESSURE. Its save would follow the wan step,
+      # which has entered with 824 MB free, and `actions/cache` writes the
+      # compressed archive to the runner's temp directory on `/` first; a tar
+      # that fails there is a warning, not a red. Read "Report free disk after
+      # the wan step" on a run before naming `Linux-shard3` in the policy.
       #
       # BRANCH-QUALIFIED (`main` on a push to `main`, `pr` on every other ref),
       # from a measured failure rather than a theory. On a run on `main` EVERY
@@ -2512,66 +2512,32 @@ jobs:
       # own, and it had done neither for two days. With the ref in the key the
       # two never contend. `restore-keys` lists a run's own qualified prefix,
       # then the `main` prefix (a pull request or merge-queue build reads
-      # `main`'s archive when it has none of its own), then the legacy bare
-      # prefix so the first runs after this change still restore the existing
-      # archives instead of building cold; the bare prefix decays on its own
-      # once nothing writes it. Two consequences a reader should expect: the
-      # first run on `main` after this change builds cold and saves; and a
-      # pull-request or merge-queue run now SAVES on every run (its key can
-      # never equal `main`'s, so it never skips as an exact hit), which adds
-      # upload volume against the repository's cache store.
+      # `main`'s archive when it has none of its own), then shard 0's own two,
+      # then the legacy bare prefix.
       #
-      # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
-      # is a defensible one rather than the best one. It carries `--lib` and
-      # the doctests, so it builds the `cerulion_core` rlib every other leg
-      # also needs — its `target/` is never a strict subset of a bare leg's.
-      # That is the whole claim.
+      # (`lint`, `docs` and `netd-wan` have their own namespaces and fall
+      # through their `restore-keys` to shard 0's archive, `cargo-Linux-main-`.
+      # The trim before each save keeps only the units that shard's own cargo
+      # commands read.)
       #
-      # It is explicitly NOT the deepest tree, and a maintainer weighing the
-      # "move the cache save off shard 0" lever named in the package-map table
-      # should not read it as one. MEASURED against the map below: shard 1's
-      # package tree is a strict SUPERSET of shard 0's (`cerulion_cli` depends
-      # on `cli_engine`, `bagd`, `bag`, `cli_tui` and `dds`), and shard 3's
-      # union is the largest of the four because it alone compiles the ~390-crate
-      # iroh tree. If cache CONTENT ever becomes the deciding factor, shard 3
-      # is the leg to measure — but note it would then also be paying the save
-      # tail on top of the wan step's disk pressure. (Re-derived at the
-      # shard rebalance: shard 0 now carries only `bagd` beside `--lib`, and
-      # `cerulion_cli` depends on `bagd`, so shard 1's tree is still a strict
-      # superset of shard 0's (`rmw_cerulion` rides shard 3). If the package
-      # map moves again, re-derive this
-      # rather than trusting it.)
-      # (Shard 0 is the SOLE saver of `cargo-Linux-`. `lint`, `docs` and
-      # `netd-wan` used to share this key and whichever finished first wrote it;
-      # they have their own namespaces now and fall through their `restore-keys`
-      # to this one. The trim before the save keeps only the units shard 0's own
-      # cargo commands read, so a unit only those jobs or shards 1-3 build is
-      # compiled by them on every run.)
-      - name: Cache cargo, shard 0 saves (restore)
+      # THE KEY. Shard 0's is `cargo-<os>-<scope>-<lock hash>`; shard k > 0 adds
+      # `-shard<k>` after the runner OS. A shard with no archive of its own yet
+      # starts from shard 0's (the `-<scope>-` and `-main-` restore keys after
+      # its own). Shards above 0 save only when the save policy names their
+      # namespace (`Linux-shard1`, `macOS-shard2`, ...) or is `all`; the default
+      # names `Linux` and `macOS`, shard 0's, so until then only shard 0 saves.
+      - name: Cache cargo, per-shard archive (restore)
         id: cache-restore-1
-        if: matrix.shard == 0
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
-            cargo-${{ runner.os }}-main-
-            cargo-${{ runner.os }}-
-
-      - name: Restore cargo (shards 1-3, no save)
-        if: matrix.shard != 0
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-main-
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
@@ -2583,13 +2549,12 @@ jobs:
       # `tools/scripts/ci_cache_trim_target.sh`. Same gate as the save, less the
       # prune's output, and on `main` only: a pull-request run builds only its
       # selected packages, so a trim there would save that narrower graph.
-      - name: Cache cargo, shard 0 saves (age the restored fingerprints)
+      - name: Cache cargo, per-shard archive (age the restored fingerprints)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -2822,11 +2787,10 @@ jobs:
       #     `target/debug/build/`, whose entries are hardlinks to these, and a
       #     hardlink means deleting one copy frees no blocks anyway.
       #
-      # Cache cost, restated now that shard 0 is the sole saver of
-      # `cargo-Linux-` (3.18 GB measured 2026-09-28, this job's own `target/`
-      # included): the save step runs at the END of this job, after this
-      # reclaim, so the executables removed here are not in the archive the next
-      # run restores. Cargo relinks them from the `.rlib`/`.rmeta` artefacts
+      # Cache cost, restated for the per-shard archives (shard 0's was 3.18 GB
+      # measured 2026-09-28, this job's own `target/` included): the save step
+      # runs at the END of this job, after this reclaim, so the executables
+      # removed here are not in the archive the next run restores. Cargo relinks them from the `.rlib`/`.rmeta` artefacts
       # that stay, which is the cost this reclaim already accepted.
       #
       # TWO placements, not one. Before the wan step alone would fix the five
@@ -2950,9 +2914,9 @@ jobs:
       #
       # RE-MEASURE BEFORE RE-TILTING. This is an n=6 median table taken on one
       # runner class, and the macOS twin is a different machine with its own
-      # map. Shard 0's cache SAVE is a real post-job cost this table does not
-      # model (11.8-13.8 min observed on macOS), so a re-measure should read
-      # shard 0 first. The per-binary walls need `final-status-level = "pass"`
+      # map. A shard's cache SAVE is a real post-job cost this table does not
+      # model (11.8-13.8 min observed for shard 0 on macOS), so a re-measure
+      # should read the saving shards first. The per-binary walls need `final-status-level = "pass"`
       # in `.config/nextest.toml` (the final block names every test with its
       # wall); the step walls are the jobs API.
       #
@@ -3376,45 +3340,42 @@ jobs:
       # (older generations a key roll restored, unused scaffold targets under
       # `target/tmp`) and `incremental/`, and prints the size before and after.
       # Deletes nothing when access times do not update or nothing was read.
-      - name: Cache cargo, shard 0 saves (trim units this run did not use)
+      - name: Cache cargo, per-shard archive (trim units this run did not use)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh trim target
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
-      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+      - name: Cache cargo, per-shard archive (prune the namespace to the current key)
         id: cache-prune
         if: >-
-          matrix.shard == 0
-          && github.event_name != 'merge_group'
+          github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
-      # Saved as the LAST step so a green shard 0 stores what it built, and
+      # Saved as the LAST step so a green shard stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
-      - name: Cache cargo, shard 0 saves (save)
+      - name: Cache cargo, per-shard archive (save)
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
-          && matrix.shard == 0
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
@@ -3565,86 +3526,34 @@ jobs:
         with:
           toolchain: stable
 
-      # ONE SAVER, CHOSEN RATHER THAN RACED. All three legs of this matrix share
-      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES
-      # a key at save time: whichever leg finishes first wins, the other uploads
-      # a multi-gigabyte archive that is then rejected ("another job may be
-      # creating this cache"), and the archive that lands is whichever leg's
-      # `target/` happened to be newest — arbitrary, and different run to run.
-      # Shard 0 saves; shards 1-2 restore only. (This job runs three shards; the
-      # Linux twin above runs four, and its copy of this block says "four".)
-      #
-      # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a store limit,
-      # and one archive per shard per OS per lockfile would have the shards
-      # evicting each other AND every other job's namespace. One archive, one
-      # writer.
+      # A KEY PER SHARD, ONE WRITER PER KEY, as in the Linux twin above (which
+      # runs four shards; this job runs three): each leg restores, and once its
+      # namespace may save saves, under a key of its own, so each keeps the
+      # third-party build its own tests read.
       #
       # BRANCH-QUALIFIED (`main` on a push to `main`, `pr` on every other ref),
-      # from a measured failure rather than a theory. On a run on `main` EVERY
-      # caching job restored nothing ("Cache not found for input keys") and was
-      # then refused at save ("Unable to reserve cache with key ... another job
-      # may be creating this cache") -- including the two crate-test jobs, whose
-      # keys no other job in the run writes, so a race between this run's own
-      # jobs cannot be the cause. The store meanwhile held entries under those
-      # same keys, all created from pull-request and merge-queue refs. A key is
-      # reserved once per repository, and a run on `main` may restore only
-      # entries created on `main`: so while a pull request holds the key for the
-      # current lockfile, `main` can neither read that archive nor write its
-      # own, and it had done neither for two days. With the ref in the key the
-      # two never contend. `restore-keys` lists a run's own qualified prefix,
-      # then the `main` prefix (a pull request or merge-queue build reads
-      # `main`'s archive when it has none of its own), then the legacy bare
-      # prefix so the first runs after this change still restore the existing
-      # archives instead of building cold; the bare prefix decays on its own
-      # once nothing writes it. Two consequences a reader should expect: the
-      # first run on `main` after this change builds cold and saves; and a
-      # pull-request or merge-queue run now SAVES on every run (its key can
-      # never equal `main`'s, so it never skips as an exact hit), which adds
-      # upload volume against the repository's cache store.
+      # for the measured failure the Linux twin's copy of this block records.
+      # `restore-keys` lists a run's own qualified prefix, then the `main`
+      # prefix, then shard 0's own two, then the legacy bare prefix.
       #
-      # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
-      # is a defensible one rather than the best one. It carries `--lib` and
-      # the doctests, so it builds the `cerulion_core` rlib every other leg
-      # also needs — its `target/` is never a strict subset of a bare leg's.
-      # That is the whole claim.
-      #
-      # RE-DERIVED against the 3-way map below rather than carried over: shard 0
-      # now runs `cerulion_cli`, whose tree covers `cli_engine`, `bagd`, `bag`,
-      # `cli_tui` and `dds`, so its `target/` is the broadest of the three on
-      # everything except the two specialist trees (the ~390-crate iroh tree on
-      # shard 1, the rerun tree on shard 2, both of which `cargo build
-      # --workspace` builds on every leg anyway). That makes shard 0 a better
-      # saver under this map than under the 2-way one, not merely a defensible
-      # one. If the package map moves again, re-derive this rather than
-      # trusting it.
-      # (Shard 0 is the SOLE saver of `cargo-macOS-`: no other job on this
-      # runner writes that key.)
-      - name: Cache cargo, shard 0 saves (restore)
+      # THE KEY. Shard 0's is `cargo-<os>-<scope>-<lock hash>`; shard k > 0 adds
+      # `-shard<k>` after the runner OS. A shard with no archive of its own yet
+      # starts from shard 0's (the `-<scope>-` and `-main-` restore keys after
+      # its own). Shards above 0 save only when the save policy names their
+      # namespace (`Linux-shard1`, `macOS-shard2`, ...) or is `all`; the default
+      # names `Linux` and `macOS`, shard 0's, so until then only shard 0 saves.
+      - name: Cache cargo, per-shard archive (restore)
         id: cache-restore-1
-        if: matrix.shard == 0
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
-            cargo-${{ runner.os }}-main-
-            cargo-${{ runner.os }}-
-
-      - name: Restore cargo (shards 1-2, no save)
-        if: matrix.shard != 0
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-main-
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
@@ -3656,13 +3565,12 @@ jobs:
       # `tools/scripts/ci_cache_trim_target.sh`. Same gate as the save, less the
       # prune's output, and on `main` only: a pull-request run builds only its
       # selected packages, so a trim there would save that narrower graph.
-      - name: Cache cargo, shard 0 saves (age the restored fingerprints)
+      - name: Cache cargo, per-shard archive (age the restored fingerprints)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -4443,45 +4351,42 @@ jobs:
       # (older generations a key roll restored, unused scaffold targets under
       # `target/tmp`) and `incremental/`, and prints the size before and after.
       # Deletes nothing when access times do not update or nothing was read.
-      - name: Cache cargo, shard 0 saves (trim units this run did not use)
+      - name: Cache cargo, per-shard archive (trim units this run did not use)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh trim target
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
-      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+      - name: Cache cargo, per-shard archive (prune the namespace to the current key)
         id: cache-prune
         if: >-
-          matrix.shard == 0
-          && github.event_name != 'merge_group'
+          github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
-      # Saved as the LAST step so a green shard 0 stores what it built, and
+      # Saved as the LAST step so a green shard stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
-      - name: Cache cargo, shard 0 saves (save)
+      - name: Cache cargo, per-shard archive (save)
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
-          && matrix.shard == 0
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   crate-tests:
     name: Crate tests (${{ matrix.os }})
     needs: [lint, changes]

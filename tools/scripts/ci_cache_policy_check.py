@@ -1006,6 +1006,7 @@ def check_text(path, text):
 
             cond = norm(step.cond)
             _check_namespace_gate(add, step, key)
+            _check_one_writer(add, job, step, key, cond)
 
             # R2.
             if MAIN_ONLY_CLAUSE not in cond:
@@ -1114,6 +1115,37 @@ def _check_tool_cache(add, steps, index, step, key):
                 "TOOL_CACHE",
                 "tool-cache save step %r does not carry %s" % (label, wanted),
             )
+
+
+def _job_declares_shard_matrix(job):
+    strategy = job.node.get("strategy") if job.node.has("strategy") else None
+    if not isinstance(strategy, Map) or not strategy.has("matrix"):
+        return False
+    matrix = strategy.get("matrix")
+    return isinstance(matrix, Map) and matrix.has("shard")
+
+
+def _check_one_writer(add, job, step, key, cond):
+    """R12. A lockfile-keyed save in a sharded job has ONE writer per archive.
+
+    `actions/cache` reserves a key at save time, so shards sharing one key race:
+    all but the first upload an archive that is refused, and which shard's build
+    lands is arbitrary. A save in a job whose matrix declares `shard` therefore
+    either runs on shard 0 alone (the `matrix.shard == 0` conjunct) or puts the
+    shard in its key, so every shard writes an archive of its own.
+    """
+    if not _job_declares_shard_matrix(job):
+        return
+    conjuncts, _ = split_conjuncts(cond)
+    if SHARD_CLAUSE in conjuncts or "matrix.shard" in key:
+        return
+    add(
+        step.line,
+        "R12_ONE_WRITER",
+        "save step %r in sharded job %s neither runs on shard 0 alone (`%s`) nor puts "
+        "`matrix.shard` in its key, so every shard races for one archive"
+        % (step.label(), job.job_id, SHARD_CLAUSE),
+    )
 
 
 def _check_namespace_gate(add, step, key):
@@ -1821,6 +1853,27 @@ def _mutants():
     """
     clean = CLEAN_WORKFLOW
     out = []
+
+    # R12: the sharded job's save loses `matrix.shard == 0` (from the prune too,
+    # so R3 still pairs them) and keeps the shared key: every shard races.
+    shared = _mut(clean, "          matrix.shard == 0\n          && github.event_name != 'merge_group'\n",
+                  "          github.event_name != 'merge_group'\n")
+    shared = _mut(shared, "          && matrix.shard == 0\n", "", total=1)
+    out.append(("R12 sharded save on a shared key with no shard clause", shared, {"R12_ONE_WRITER"}))
+    # The near-miss: the same gates with the shard in the key, a namespace per
+    # shard and the gate naming it, is one writer per archive and passes.
+    seg = "${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}"
+    per_shard = shared.replace(
+        "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}",
+        "cargo-${{ runner.os }}" + seg + "-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}",
+    )
+    per_shard = _mut(
+        per_shard,
+        "contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))",
+        "contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, "
+        "matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))",
+    )
+    out.append(("R12 near-miss: a key per shard", per_shard, set()))
 
     # R1: the lint job's token no longer matches its own key template.
     out.append((
