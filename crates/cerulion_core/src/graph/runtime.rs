@@ -4399,6 +4399,11 @@ pub struct GraphRuntime {
     /// the `#[cfg(any(test, feature = "test-helpers"))]`
     /// [`Self::set_single_park_for_test`] (gate the SETTER, not the field).
     single_park_override: Option<bool>,
+    /// Test seam: a closure the Sync drain runs right after a node's align
+    /// pass; see [`Self::set_sync_align_hook_for_test`]. Test and test-helpers
+    /// builds only (`GraphRuntime` never crosses an FFI boundary).
+    #[cfg(any(test, feature = "test-helpers"))]
+    sync_align_hook: Option<Box<dyn FnMut() + Send>>,
     /// Wake sources collected from `external`-policy ingress (driver)
     /// nodes — one per node whose [`NodeEntry::external_source`] returned an
     /// [`ExternalSource::Fd`] / [`ExternalSource::Blocking`]. Populated ONCE at
@@ -10581,6 +10586,8 @@ impl GraphRuntime {
             park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
             credit_baseline_full_override: None,
             single_park_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            sync_align_hook: None,
             // External ingress sources are collected lazily at run_live
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
@@ -14730,6 +14737,16 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_single_park_for_test(&mut self, forced: Option<bool>) {
         self.single_park_override = forced;
+    }
+
+    /// Test seam: run `hook` in the step's drain right after each per-set Sync
+    /// node's align pass has read every one of its inputs, before the rest of
+    /// that node's bindings are walked. A frame the hook publishes then lands
+    /// after the pass that read the node's queues, at a fixed point in the
+    /// drain. `None` removes it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_sync_align_hook_for_test(&mut self, hook: Option<Box<dyn FnMut() + Send>>) {
+        self.sync_align_hook = hook;
     }
 
     /// Holistic-review L6 (test seam): is a WaitSet reactor currently
@@ -20331,6 +20348,10 @@ impl GraphRuntime {
                         error = %e,
                         "sync alignment skipped (node absent from the scheduler)"
                     );
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(hook) = self.sync_align_hook.as_mut() {
+                    hook();
                 }
                 continue;
             }
