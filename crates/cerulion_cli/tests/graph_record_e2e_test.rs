@@ -641,9 +641,10 @@ fn env_names_left_out(recorder_json: &[u8]) -> Option<u64> {
 /// valid UTF-8 starts, records frames and exits exactly 0 on Ctrl-C. The run
 /// directory and the bag carry the same `env.json`: each such value as its
 /// FNV-1a 64 hash over the raw bytes, marked `utf8: false`, and no key for
-/// either name; each `recorder.json` counts the two names left out. Each of the three places that reads the environment (the graph build,
-/// the run directory's `env.json`, the bag's) prints each of its warnings
-/// once, naming the variables and never a value.
+/// either name; each `recorder.json` counts the two names left out. The run
+/// prints each warning once, naming the variables and never a value: the
+/// node-environment line for its graph build, and each `env.json` line for
+/// the run directory's render, though the bag's `env.json` is rendered too.
 #[test]
 #[serial]
 fn record_e2e_with_non_utf8_variables_writes_one_env_json_to_the_bag_and_the_run_directory() {
@@ -720,21 +721,16 @@ fn record_e2e_with_non_utf8_variables_writes_one_env_json_to_the_bag_and_the_run
     );
 
     let log = String::from_utf8_lossy(&std::fs::read(&stderr_path).expect("stderr")).into_owned();
-    let only_warn_line = |message: &str, artifact: Option<&str>| -> String {
-        let lines: Vec<&str> = log
-            .lines()
-            .filter(|l| l.contains(message))
-            .filter(|l| artifact.is_none_or(|a| l.contains(&format!("artifact={a}"))))
-            .collect();
+    let only_warn_line = |message: &str| -> String {
+        let lines: Vec<&str> = log.lines().filter(|l| l.contains(message)).collect();
         match lines.as_slice() {
             [line] if line.contains(" WARN ") => (*line).to_string(),
-            other => panic!("one WARN line for {message:?} ({artifact:?}): {other:#?}"),
+            other => panic!("one WARN line for {message:?}: {other:#?}"),
         }
     };
     let node_env = only_warn_line(
         "node environment: variables whose name or value is not valid UTF-8 are left out, so \
          ctx.env and ctx.env_str return the default for them",
-        None,
     );
     assert!(
         node_env.contains(
@@ -742,26 +738,24 @@ fn record_e2e_with_non_utf8_variables_writes_one_env_json_to_the_bag_and_the_run
         ),
         "{node_env}"
     );
-    for artifact in ["run_directory", "recording"] {
-        let left_out = only_warn_line(
-            "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
-             compare them",
-            Some(artifact),
-        );
-        assert!(
-            left_out.contains(r#"names=["CER_E2E_PROBE_NAME_\xFE", "CER_E2E_PROBE_NAME_\xFF"]"#),
-            "{left_out}"
-        );
-        let withheld = only_warn_line(
-            "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
-             utf8 false; a replay still detects a change",
-            Some(artifact),
-        );
-        assert!(
-            withheld.contains(r#"names=["CERULION_E2E_PROBE_LATIN1"]"#),
-            "{withheld}"
-        );
-    }
+    let left_out = only_warn_line(
+        "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
+         compare them",
+    );
+    assert!(
+        left_out.contains("artifact=run_directory")
+            && left_out.contains(r#"names=["CER_E2E_PROBE_NAME_\xFE", "CER_E2E_PROBE_NAME_\xFF"]"#),
+        "{left_out}"
+    );
+    let withheld = only_warn_line(
+        "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
+         utf8 false; a replay still detects a change",
+    );
+    assert!(
+        withheld.contains("artifact=run_directory")
+            && withheld.contains(r#"names=["CERULION_E2E_PROBE_LATIN1"]"#),
+        "{withheld}"
+    );
     for absent in [
         "panicked",
         NOT_UTF8_NAME_PROBE_VALUE,

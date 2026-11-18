@@ -6651,7 +6651,11 @@ pub fn graph_run(
     let _run_descriptor = {
         match render_effective_graph_yaml(&embed_config) {
             Ok(graph_yaml) => {
-                let env_json = render_process_env_json(record_env, EnvJsonArtifact::RunDirectory);
+                // This process owns the run and renders the run directory's
+                // `env.json` before it records, so the run's `env.json`
+                // warnings print here, once.
+                let env_json = render_env_json(record_env, std::env::vars_os());
+                warn_run_env_json(&env_json);
                 run_env_names_left_out = env_json.left_out_names.len();
                 crate::run_dir::begin_run_descriptor(crate::run_dir::RunDescriptorSpec {
                     // The chain census THIS run's graph implies, under the
@@ -17107,9 +17111,9 @@ fn validate_record_flags(time_source: TimeSource, skip_validate: bool) -> CliRes
 /// a JSON key must be text. In [`RecordEnvMode::Allowlist`] and
 /// [`RecordEnvMode::All`] a value that is not valid UTF-8 is stored as
 /// `{"fnv64": "<hex>", "redacted": true, "utf8": false}`, its FNV-1a 64 hash
-/// over the raw bytes. A warning names each variable left out, and each
-/// variable whose value the mode would otherwise have recorded verbatim; no
-/// warning prints a value.
+/// over the raw bytes. A run warns once per list, naming each variable left
+/// out and each variable whose value the mode would otherwise have recorded
+/// verbatim; no warning prints a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RecordEnvMode {
     /// The DEFAULT: record every variable NAME; record VALUES only for names
@@ -17457,50 +17461,24 @@ pub(crate) fn render_env_json(
     }
 }
 
-/// Which artifact an `env.json` render is written to, as the `artifact`
-/// field of its warnings names it.
-#[cfg(unix)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnvJsonArtifact {
-    /// The run directory's `env.json`.
-    RunDirectory,
-    /// A `--record` bag's `env.json` attachment.
-    Recording,
-}
-
-#[cfg(unix)]
-impl EnvJsonArtifact {
-    fn as_str(self) -> &'static str {
-        match self {
-            EnvJsonArtifact::RunDirectory => "run_directory",
-            EnvJsonArtifact::Recording => "recording",
-        }
-    }
-}
-
-/// Render `env.json` for `mode` from this process's environment
-/// (`std::env::vars_os()`, which never panics) and warn about each variable
-/// it could not store as the mode asks ([`warn_env_json_render`]). The caller
-/// writes the bytes and stamps the count of names left out into the same
-/// artifact's `recorder.json`.
-#[cfg(unix)]
-fn render_process_env_json(mode: RecordEnvMode, artifact: EnvJsonArtifact) -> EnvJsonRender {
-    let render = render_env_json(mode, std::env::vars_os());
-    warn_env_json_render(&render, artifact);
-    render
-}
-
-/// Warn once per list that `render` left a variable out or stored a hash in
-/// place of the text its mode keeps, or do nothing when both lists are empty.
+/// Warn once per list that the run directory's `env.json` render left a
+/// variable out or stored a hash in place of the text its mode keeps, or do
+/// nothing when both lists are empty.
+///
+/// `graph_run`, the process that owns the run, calls it once, for the run
+/// directory's render, which every Unix run makes before it records. A
+/// `--record` bag's `env.json` is rendered from the same environment under
+/// the same mode, so it holds the same entries, and that render logs nothing.
 ///
 /// The messages are constant. The names ride the `names` field, where each
-/// byte of a name that is not valid UTF-8 prints escaped (`CER_\xFF`). No
-/// value is printed, because a value may be a secret.
+/// byte of a name that is not valid UTF-8 prints escaped (`CER_\xFF`), and
+/// `artifact` names the run directory. No value is printed, because a value
+/// may be a secret.
 #[cfg(unix)]
-fn warn_env_json_render(render: &EnvJsonRender, artifact: EnvJsonArtifact) {
+fn warn_run_env_json(render: &EnvJsonRender) {
     if !render.left_out_names.is_empty() {
         tracing::warn!(
-            artifact = %artifact.as_str(),
+            artifact = %"run_directory",
             names = ?render.left_out_names,
             "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
              compare them"
@@ -17508,7 +17486,7 @@ fn warn_env_json_render(render: &EnvJsonRender, artifact: EnvJsonArtifact) {
     }
     if !render.withheld_not_utf8.is_empty() {
         tracing::warn!(
-            artifact = %artifact.as_str(),
+            artifact = %"run_directory",
             names = ?render.withheld_not_utf8,
             "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
              utf8 false; a replay still detects a change"
@@ -18337,7 +18315,10 @@ fn prepare_recording_inputs(spec: RecordingInputSpec<'_>) -> CliResult<Recording
     // (see `RecordEnvMode`). Loud about the fidelity
     // trade in the non-default modes (extracted + `#[traced_test]`-pinned).
     warn_record_env_mode(record_env);
-    let env_json = render_process_env_json(record_env, EnvJsonArtifact::Recording);
+    // The same environment under the same mode as the run directory's
+    // `env.json`, whose render `graph_run` warned about once, so this
+    // render logs nothing.
+    let env_json = render_env_json(record_env, std::env::vars_os());
     std::fs::write(&paths.env_json, &env_json.bytes)
         .map_err(|e| CliError::Validation(format!("recording: write env.json: {e}")))?;
     // recorder.json: the recording host's arch/os/
@@ -28256,7 +28237,7 @@ process_groups:
                 raw_var(b"CERULION_KEPT", b"kept"),
             ],
         );
-        warn_env_json_render(&render, EnvJsonArtifact::RunDirectory);
+        warn_run_env_json(&render);
         logs_assert(|lines: &[&str]| {
             for (message, names) in [
                 (ENV_JSON_LEFT_OUT_WARNING, r#"names=["CER_\xFF"]"#),
@@ -28306,7 +28287,7 @@ process_groups:
                 raw_var(b"CERULION_KEPT", b"kept"),
             ],
         );
-        warn_env_json_render(&render, EnvJsonArtifact::Recording);
+        warn_run_env_json(&render);
         assert!(!logs_contain("env.json:"));
     }
 
@@ -30186,7 +30167,9 @@ process_groups:
     /// profile`, and the supervisor after its planning build and before it
     /// spawns any worker. Hand-written counts over the comment- and
     /// literal-stripped source: the worker builds and reports nothing, so a
-    /// 3-worker run prints the line once, not four times.
+    /// 3-worker run prints the line once, not four times. The e2e that counts
+    /// the line on a real 3-worker run (`mp_auto_partition_e2e_test`) is
+    /// Linux-only.
     #[test]
     fn the_run_owner_reports_the_node_environment_once_and_a_worker_never_does() {
         const REPORT: &str = ".node_env_left_out().warn()";
@@ -30240,6 +30223,56 @@ process_groups:
             5,
             "no other path in this file reports"
         );
+    }
+
+    /// The run's `env.json` warnings print once per run, from `graph_run`,
+    /// the process that owns the run, for the run directory's render. A
+    /// recorded run renders `env.json` again for the bag, in
+    /// `prepare_recording_inputs`, which the single-process and the
+    /// supervisor recording share, and that render logs nothing. Hand-written
+    /// counts over the comment- and literal-stripped source; the e2e that
+    /// counts the lines on a real recording is `graph_record_e2e_test`.
+    #[cfg(unix)]
+    #[test]
+    fn the_run_env_json_warnings_print_once_from_graph_run() {
+        fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+            fn_body(src, sig).unwrap_or_else(|| panic!("`{sig}` must still exist"))
+        }
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let run = body(&src, "pub fn graph_run(");
+        let render = run
+            .find("render_env_json(")
+            .expect("graph_run renders the run directory's env.json");
+        let warn = run
+            .find("warn_run_env_json(")
+            .expect("graph_run warns about it");
+        let describe = run
+            .find("begin_run_descriptor(")
+            .expect("graph_run writes the run directory");
+        assert!(
+            render < warn && warn < describe,
+            "the warning follows the render and precedes the run directory"
+        );
+        assert_eq!(run.matches("render_env_json(").count(), 1);
+        assert_eq!(run.matches("warn_run_env_json(").count(), 1);
+        let bag = body(&src, "fn prepare_recording_inputs(");
+        assert_eq!(
+            bag.matches("render_env_json(").count(),
+            1,
+            "the bag's render"
+        );
+        assert_eq!(bag.matches("warn_run_env_json(").count(), 0, "logs nothing");
+        for path in [
+            "fn graph_run_supervisor(",
+            "fn start_supervisor_recording(",
+            "fn graph_run_worker(",
+        ] {
+            assert_eq!(
+                body(&src, path).matches("warn_run_env_json(").count(),
+                0,
+                "{path}"
+            );
+        }
     }
 
     /// The checked rank → ring-header-rank conversion.
@@ -34681,11 +34714,7 @@ process_groups:
                 crate::multiprocess::ExecutionMode::Lockstep,
             ),
             graph_yaml: render_effective_graph_yaml(&pre.config).expect("render"),
-            env_json: render_process_env_json(
-                RecordEnvMode::Allowlist,
-                EnvJsonArtifact::RunDirectory,
-            )
-            .bytes,
+            env_json: render_env_json(RecordEnvMode::Allowlist, std::env::vars_os()).bytes,
         })
         .expect("run dir");
 

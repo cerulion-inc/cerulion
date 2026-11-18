@@ -23,8 +23,9 @@ User-facing recording docs live in `docs/bag.md`.
   `graph.yaml` and `env.json` for replay.
 - The bag's `env.json` attachment and the run directory's `env.json` are
   rendered by one pure function, `graph_cmd::render_env_json`, over
-  `std::env::vars_os()` (`render_process_env_json` reads the environment and
-  warns). A name that is not valid UTF-8 is left out, and under `allowlist` and
+  `std::env::vars_os()`. The function logs nothing: `graph_run`, which owns
+  the run, warns once from the run directory's render, and the bag's render
+  of the same environment under the same mode warns nothing. A name that is not valid UTF-8 is left out, and under `allowlist` and
   `all` a value that is not valid UTF-8 is stored as
   `{"fnv64": "<hex>", "redacted": true, "utf8": false}`, hashed over its raw
   bytes; `replay_engine::compare_env_against` reads `fnv64` from any object,
