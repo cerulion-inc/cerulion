@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import ipaddress
 import logging
+import math
 import os
 import signal
 import sys
@@ -61,6 +62,14 @@ def http_names(host, port):
             hosts.insert(0, f"{shown}:{port}")
         return f"http://{shown}:{port}", hosts
     return f"http://{shown}:{port}", [f"{shown}:{port}"]
+
+
+def keep_alive_s(pool):
+    """How long an idle client connection is kept open, in whole seconds, read when the server starts: the
+    episode's idle limit, or the episode clock when no idle limit is set. A client that keeps one connection
+    between its calls finds it open until the idle limit would end its episode."""
+    limit = pool.idle_limit()[0]
+    return math.ceil(limit if limit is not None else pool.s.clock_s)
 
 
 def build_http_app(settings, host, port, simulator=None):
@@ -156,6 +165,7 @@ def serve_http(settings, addr):
 
     log.info("serving MCP at %s/mcp; the start page is %s/", settings.public_url, settings.public_url)
     Server(uvicorn.Config(app, host=host, port=port, log_level="info",
+                          timeout_keep_alive=keep_alive_s(app.pool),
                           timeout_graceful_shutdown=settings.stop_grace_s)).run()
 
 

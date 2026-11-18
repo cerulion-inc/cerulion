@@ -31,7 +31,9 @@ The transcript and the pictures of every episode are kept in `~/.cerulion/sim/ep
 `CERULION_HOME` when that is set).
 
 Over HTTP each MCP session gets its own episode; `?state=LABEL` on the URL picks the start state, and
-`&episode=N` a second episode for a client that keeps no session. The pages beside `/mcp`:
+`&episode=N` a second episode for a client that keeps no session. An idle client connection is kept open for the
+idle limit (the episode clock when no limit is set), so a client can keep one connection between turns. The
+pages beside `/mcp`:
 
 | path | what |
 |---|---|

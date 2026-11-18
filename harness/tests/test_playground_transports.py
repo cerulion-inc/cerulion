@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The sim server as a program, over stdio and over HTTP, against the fixture snapshot (a stand-in launcher and
 bridge: no simulator runs). These need the MCP SDK in the interpreter that runs them (the harness's own venv);
-without it they are skipped. The command line's refusals need nothing and always run."""
+without it they are skipped. The command line's refusals and the connection keep-alive need nothing and always
+run."""
 import importlib.util
 import json
 import os
@@ -16,11 +17,13 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from http.client import HTTPConnection
 
-from playground_support import FIXTURE, HARNESS, Folder, write_settings
+from playground_support import FIXTURE, HARNESS, FakeSim, Folder, write_settings
 
-from playground.app import AddressError, http_names, parse_addr
-from playground.pool import AGAIN_HTTP, AGAIN_STDIO
+from playground.app import AddressError, http_names, keep_alive_s, parse_addr
+from playground.pool import AGAIN_HTTP, AGAIN_STDIO, make_pool
+from playground.settings import Settings
 
 HAS_MCP = importlib.util.find_spec("mcp") is not None and importlib.util.find_spec("starlette") is not None
 SERVER = os.path.join(HARNESS, "playground")
@@ -39,6 +42,13 @@ def call(n, name, arguments=None):
 
 def tool_doc(result):
     return json.loads(result["content"][0]["text"])
+
+
+def answer_of(message, content_type, body):
+    """The response to message in a /mcp answer body: one JSON document, or the data lines of an event stream."""
+    docs = [json.loads(line[5:]) for line in body.splitlines() if line.startswith("data:")] if \
+        content_type.startswith("text/event-stream") else ([json.loads(body)] if body else [])
+    return next((d for d in docs if message and d.get("id") == message.get("id")), None)
 
 
 class Run:
@@ -255,10 +265,18 @@ class Http:
                 status, got, body = r.status, dict(r.headers), r.read().decode()
         except urllib.error.HTTPError as exc:
             return exc.code, {}, None
-        docs = [json.loads(line[5:]) for line in body.splitlines() if line.startswith("data:")] if \
-            got.get("content-type", "").startswith("text/event-stream") else ([json.loads(body)] if body else [])
-        answer = next((d for d in docs if message and d.get("id") == message.get("id")), None)
-        return status, {k.lower(): v for k, v in got.items()}, answer
+        got = {k.lower(): v for k, v in got.items()}
+        return status, got, answer_of(message, got.get("content-type", ""), body)
+
+    def mcp_on(self, conn, message, session=None):
+        """POST message to /mcp over the caller's own connection, which stays open for the next request."""
+        headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+        if session:
+            headers["mcp-session-id"] = session
+        conn.request("POST", "/mcp", body=json.dumps(message).encode(), headers=headers)
+        r = conn.getresponse()
+        body, got = r.read().decode(), {k.lower(): v for k, v in r.getheaders()}
+        return r.status, got, answer_of(message, got.get("content-type", ""), body)
 
 
 @unittest.skipUnless(HAS_MCP, "the MCP SDK is not in this interpreter (the harness venv has it)")
@@ -314,6 +332,30 @@ class StreamableHttp(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_MCP, "the MCP SDK is not in this interpreter (the harness venv has it)")
+class StreamableHttpKeptConnection(unittest.TestCase):
+    def test_a_client_reuses_one_connection_after_a_turn_longer_than_five_seconds(self):
+        # uvicorn closes a connection idle for 5 s unless told otherwise. A model's turn between two calls can take
+        # longer, and an MCP client, or a forwarder in front of the server, sends the next call over the
+        # connection it already holds.
+        http = Http(self)
+        conn = HTTPConnection("127.0.0.1", http.port, timeout=60)
+        self.addCleanup(conn.close)
+        status, headers, init = http.mcp_on(conn, initialize())
+        self.assertEqual(status, 200)
+        session = headers["mcp-session-id"]
+        self.assertEqual(http.mcp_on(conn, {"jsonrpc": "2.0", "method": "notifications/initialized"}, session)[0],
+                         202)
+        self.assertIsNotNone(conn.sock)
+        local = conn.sock.getsockname()
+        time.sleep(6)
+        status, _, look = http.mcp_on(conn, call(2, "look"), session)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(conn.sock)
+        self.assertEqual(conn.sock.getsockname(), local)              # the same connection, not a new one
+        self.assertEqual(tool_doc(look["result"]), {"ok": True, "frames": ["frames/look001.png"]})
+
+
+@unittest.skipUnless(HAS_MCP, "the MCP SDK is not in this interpreter (the harness venv has it)")
 class StreamableHttpStop(unittest.TestCase):
     def test_a_repeat_of_the_stop_signal_within_a_second_is_the_same_stop(self):
         os.environ["FAKE_SIM_STOP_S"] = "2"
@@ -364,6 +406,39 @@ class CommandLine(unittest.TestCase):
         rc, out, _ = self.run_cli("--check", "--settings", write_settings(self.folder))
         self.assertEqual((rc, json.loads(out)["ready"]), (2, False))
         self.assertIn("'soup-in-basket'", json.loads(out)["problem"])
+
+
+class KeepAlive(unittest.TestCase):
+    def setUp(self):
+        self.folder = Folder()
+        self.addCleanup(self.folder.remove)
+
+    def pool(self, **changes):
+        return make_pool(Settings(write_settings(self.folder, **changes), platform="linux"), FakeSim())
+
+    def test_an_idle_connection_is_kept_for_the_idle_limit_rounded_up_to_a_whole_second(self):
+        pool = self.pool()
+        self.assertEqual(pool.idle_limit()[0], 430.2)                          # 10 x 43.02 s, the shipped rule
+        self.assertEqual(keep_alive_s(pool), 431)
+        pool = self.pool(idle_s=4.5)
+        self.assertEqual(keep_alive_s(pool), 5)
+        pool = self.pool(idle_s=60)
+        self.assertEqual(keep_alive_s(pool), 60)
+
+    def test_the_keep_alive_reads_the_idle_limit_a_longer_history_gives(self):
+        pool = self.pool()
+        pool.s.idle_reap = dict(pool.s.idle_reap, gaps_counted=3)
+        pool.history.record({"id": "ep000001", "state": "x", "verdict": None}, [10.0, 20.0, 30.0, 50.0])
+        pool.gaps_changed()
+        self.assertEqual(pool.idle_limit()[0], 500.0)
+        self.assertEqual(keep_alive_s(pool), 500)
+
+    def test_with_no_idle_limit_an_idle_connection_is_kept_for_the_episode_clock(self):
+        pool = self.pool(idle_reap=None)
+        self.assertEqual(pool.idle_limit(), (None, "no idle limit is set"))
+        self.assertEqual(keep_alive_s(pool), 5400)
+        pool = self.pool(idle_reap=None, clock_s=1200.5)
+        self.assertEqual(keep_alive_s(pool), 1201)
 
 
 class Addresses(unittest.TestCase):
