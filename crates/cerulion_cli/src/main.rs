@@ -992,19 +992,22 @@ fn connect_exit_code(command: Commands) -> ExitCode {
 }
 
 /// A clap parse error (a usage error, or `--help` / `--version` output),
-/// printed and exited as clap does it, except an argument that is not valid
-/// UTF-8 in a text field: clap's line for that names no argument, so the
-/// refusal from [`not_utf8_args`] prints in its place, with clap's usage-error
-/// code, 2.
+/// printed and exited as clap does it, except a usage error that refused an
+/// argument that is not valid UTF-8 (in a text field, in the place of a verb
+/// or a flag name, past the last argument a verb takes, or as a value given to
+/// a flag that takes none): clap's text for that names no position, so the
+/// refusal prints in its place, with clap's usage-error code, 2.
+/// [`not_utf8_args::refusal_for_parse_error`] decides, and while another
+/// argument holds a typed U+FFFD it replaces only the text-field error.
 fn exit_on_parse_error(e: clap::Error) -> ExitCode {
-    if e.kind() == clap::error::ErrorKind::InvalidUtf8 {
-        let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-        if let Some(refusal) = not_utf8_args::refusal(&args) {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    match not_utf8_args::refusal_for_parse_error(&e, &args) {
+        Some(refusal) => {
             eprint!("{refusal}");
-            return ExitCode::from(2);
+            ExitCode::from(2)
         }
+        None => e.exit(),
     }
-    e.exit()
 }
 
 /// The raw-argv half of the `cerulion ros2` pass-through: recognize

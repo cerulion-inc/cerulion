@@ -64,12 +64,13 @@ not create one.
 
 An argument that is not valid UTF-8, such as a file name in a non-UTF-8 locale,
 is taken as given where a verb takes a path, and `ros2 run` / `ros2 launch`
-forward it to `ros2` unchanged. Where a verb takes text, `cerulion` refuses the
-command line with exit 2 and one `Error: argument N is not valid UTF-8: "caf\xE9"`
-line per such argument, `N` counted from 1 after `cerulion`, then a line saying
-what to do. The parser does not say which argument it refused, so a path
-argument that is not valid UTF-8 is named too. In the place of a verb or flag
-name, such an argument is an unrecognized verb or flag, exit 2.
+forward it to `ros2` unchanged. Anywhere else, such as where a verb takes text
+or in the place of a verb or flag name, `cerulion` refuses the command line with
+exit 2 and one `Error: argument N is not valid UTF-8: "caf\xE9"` line per such
+argument, `N` counted from 1 after `cerulion`, then a line saying what to do.
+The parser does not say which argument it refused, so a path argument that is
+not valid UTF-8 is named too. A usage error about another argument, such as an
+unknown flag, keeps the parser's own message.
 
 ### `cerulion workspace`
 
