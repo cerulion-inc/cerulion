@@ -57,7 +57,9 @@
 //! state, where a notify returns success without touching the doorbell. That
 //! registration reads as reached for as long as it survives. A consumer that
 //! was draining when it died leaves the state idle and IS seen, which is the
-//! common shape; the blind one is a consumer that was already not draining.
+//! common shape. Two are blind: a consumer that was already not draining, and
+//! one that died inside a drain after a notify had marked the state notified
+//! and before the drain stored the idle state.
 //!
 //! # Race windows (both directions, and what absorbs each)
 //!

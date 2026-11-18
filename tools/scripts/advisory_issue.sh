@@ -187,7 +187,7 @@ gh auth status >/dev/null 2>&1 ||
 if ! labels=$(gh label list --limit 200 --json name --jq '.[].name' 2>&1); then
     die "gh refused the label listing: ${labels}" 2
 fi
-printf '%s\n' "$labels" | grep -Fxq "$LABEL" ||
+grep -Fxq -- "$LABEL" <<<"$labels" ||
     die "the repository carries no \`${LABEL}\` label: .github/labels.yml declares it and the label sync creates it" 2
 
 if ! listing=$(gh issue list --state open --label "$LABEL" --limit 200 \

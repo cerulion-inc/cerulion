@@ -201,7 +201,7 @@ fn assert_clean_panics_on_leaked_and_passes_otherwise() {
 /// A guard whose "worker" subtree appears LATE, over a real process group.
 ///
 /// The pgrep the guard uses is `pgrep -P <child> -f run-worker`, so the fixture
-/// spawns a group leader that — after a delay — forks a CHILD whose command line
+/// spawns a group leader that, after GO, forks a CHILD whose command line
 /// carries that needle. A copied script name is used rather than `exec -a`, which
 /// is a bash builtin: a `/bin/sh` that is dash would not have it.
 /// The token `worker_pids_of` greps for in a child's argv.
@@ -216,10 +216,12 @@ fn guard_with_a_late_worker(
 ) -> (ChildGuard, std::path::PathBuf, std::process::ChildStdin) {
     let worker = dir.join(WORKER_NEEDLE);
     let ready = dir.join("worker-arrived");
-    // NO `exec`: an `exec sleep 30` REPLACES this process and the "run-worker"
-    // name is lost from its command line, so `pgrep -f run-worker` then matched
-    // only the PARENT (whose argv carries the script path) and never a child.
-    // Keeping the script process alive is what puts the needle on a child.
+    // Park this script in a shell builtin, so it keeps its "run-worker" argv
+    // without starting a sleep grandchild that could outlive its killed parent.
+    // The test keeps the GO pipe writer open until this worker has been reaped.
+    // The supervisor saves the input on fd 3 before starting an asynchronous
+    // list: POSIX shells otherwise replace a background command's stdin with
+    // /dev/null before applying its explicit redirections.
     //
     // The worker PUBLISHES ITS OWN ARRIVAL before it settles, and the order is
     // what makes the file a sound witness: the `exec` that gives this process its
@@ -228,7 +230,7 @@ fn guard_with_a_late_worker(
     // in the right direction, never ahead of the thing it stands for.
     fresh_executable::install_script(
         &worker,
-        "#!/bin/sh\n: > \"$CER_WORKER_ARRIVED\"\nsleep 30\n",
+        "#!/bin/sh\n: > \"$CER_WORKER_ARRIVED\"\nread _finish\n",
     );
     // THE NEEDLE MUST NOT APPEAR IN THE SUPERVISOR'S OWN ARGV, so the worker path
     // and the witness path travel in the ENVIRONMENT rather than in `-c`.
@@ -245,7 +247,8 @@ fn guard_with_a_late_worker(
     // on a loaded machine, that was 2 failures in 24 runs.
     //
     // With the paths in the environment the supervisor's argv is
-    // `read _go; "$CER_WORKER" & wait` — no pre-exec child can inherit a matching
+    // `exec 3<&0; read _go; "$CER_WORKER" <&3 3<&- & exec 3<&-; wait`:
+    // no pre-exec child can inherit a matching
     // command line, so the window is closed BY CONSTRUCTION rather than by timing.
     // Every other `spawn_group_leader` fixture in this tree was checked: their
     // supervisor is the real `cerulion` binary (`graph run <graph> ...`), whose
@@ -266,7 +269,7 @@ fn guard_with_a_late_worker(
     // until then. There is no timing anywhere in the arm.
     let mut cmd = Command::new("sh");
     cmd.arg("-c")
-        .arg("read _go; \"$CER_WORKER\" & wait")
+        .arg("exec 3<&0; read _go; \"$CER_WORKER\" <&3 3<&- & exec 3<&-; wait")
         .env("CER_WORKER", &worker)
         .env("CER_WORKER_ARRIVED", &ready)
         .stdin(Stdio::piped())
@@ -357,7 +360,7 @@ fn a_late_appearing_worker_is_noted_through_the_cached_path() {
     use std::io::Write as _;
     go.write_all(b"go\n").expect("release the supervisor");
     go.flush().expect("flush the GO");
-    drop(go);
+    // Keep stdin open: the worker blocks in its builtin read until killed.
 
     // RENDEZVOUS ON THE WORKER'S OWN EVIDENCE — a file it creates once and never
     // removes. A pid set from `pgrep` is a TRANSIENT (see the fixture's note); a
@@ -369,6 +372,10 @@ fn a_late_appearing_worker_is_noted_through_the_cached_path() {
     }
     let workers = worker_pids_of(guard.id());
     assert_eq!(workers.len(), 1, "one late worker, got {workers:?}");
+    assert!(
+        !pid_is_gone(workers[0]),
+        "the arrived worker must stay live while its input writer is open"
+    );
 
     // A LATER poll through the same cached path must now find it. Under the
     // reverted fix the empty set is already cached and this notes nothing.
@@ -394,6 +401,19 @@ fn a_late_appearing_worker_is_noted_through_the_cached_path() {
         OrphanVerdict::Clean { checked: 1 },
         "the same noted set reads Clean once the worker is gone"
     );
+
+    // The worker is reaped above. Keep its input pipe open while its supervisor
+    // finishes waiting, so EOF cannot be what made the worker disappear.
+    let supervisor_pid = guard.id();
+    let _status = guard
+        .wait_bounded(Duration::from_secs(10))
+        .expect("the supervisor must reap its worker and exit");
+    assert!(
+        pid_is_gone(supervisor_pid),
+        "the fixture supervisor must be reaped, pid {supervisor_pid} survived"
+    );
+    drop(go);
+    assert_eq!(guard.finish(), OrphanVerdict::Clean { checked: 1 });
 }
 
 /// A `single_process` guard stays `NotChecked` — correct by design.

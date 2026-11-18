@@ -846,7 +846,9 @@ async fn run_reader_over_uni(tag: &str, good: usize, bad: usize) -> (u64, u64) {
             }
         })
         .await;
-        assert!(manager.is_network_mirror(&topic).unwrap());
+        assert!(manager
+            .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+            .unwrap());
     }
     let _ = send.finish();
 
