@@ -1176,7 +1176,7 @@ and producer annotations on every edge (before every read of a multi-writer
 edge, once per writer run on a single-writer one) are what `trace_format` 8
 means, a `batch_frame` record for each frame a multi-frame read consumed
 besides the one it served is what `trace_format` 9 means, and a stopped flag in
-the checkpoint part of every node the scheduler had stopped is what
+every complete checkpoint part of a node the scheduler had stopped is what
 `trace_format` 10 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
@@ -1364,9 +1364,9 @@ fired, each `block` slot it held as a consumer starts released, the schedule
 check expects no fire of it, and it is left out of the pre-anchor frame cap,
 the backlog check and `anchor_pending_fires`; a topic only stopped nodes
 produce needs no sequence seed. `resume.stopped_at_anchor` in the
-`--report` JSON names those nodes. A bag that fires such a node after its
-checkpoint contradicts itself and is refused before the first replayed step
-(`RecordingInconsistent`, exit 2).
+`--report` JSON names those nodes. A bag that fires such a node in the steps
+the resim executes contradicts itself and is refused before the first replayed
+step (`bag internal consistency check failed`, exit 2).
 
 The flag is a positive claim at any format, so a part that carries it states
 the stop on a bag below 10 too. Below 10 a part without it states nothing, and

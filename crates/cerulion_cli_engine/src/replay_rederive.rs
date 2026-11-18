@@ -2226,10 +2226,10 @@ fn verify_period(
     }
 
     // A node the checkpoint states as stopped owes no fire at any judged
-    // step, so it needs no phase anchor: its first recorded fire is a
-    // finding.
-    if let Some(at_anchor @ StopPoint::AtAnchor { .. }) = stop {
-        for step in steps.iter().filter(|step| at_anchor.is_after(step.step)) {
+    // step (every step of a resumed slice comes after the checkpoint), so it
+    // needs no phase anchor: its first recorded fire is a finding.
+    if let Some(StopPoint::AtAnchor { .. }) = stop {
+        for step in steps {
             if recorded_fire_after_stop(node, step, Decider::Period, true, report) {
                 return;
             }

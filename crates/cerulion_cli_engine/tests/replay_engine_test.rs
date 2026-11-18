@@ -26794,14 +26794,45 @@ fn two_reports(
     (a, b)
 }
 
+/// [`two_reports`] through [`replay`], for a lockstep or unstamped bag.
+fn two_replay_reports(
+    dir: &tempfile::TempDir,
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>> + Copy,
+) -> (Vec<u8>, Vec<u8>) {
+    let read = |leg: &str| {
+        let path = dir.path().join(format!("replay_report_{leg}.json"));
+        replay(bag, make, None, Some(path.clone())).expect("the resume runs");
+        std::fs::read(&path).expect("the report is written")
+    };
+    (read("a"), read("b"))
+}
+
+/// The section a recorder writes for the stopped `block` sink at the anchor:
+/// its served cursor (frame 2, which its stopping fire read) and the
+/// recording's own pending count there, one arrival signal it never consumes.
+fn stopped_block_sink_section(rec: &Recording) -> NodeFrameworkState {
+    let pending = rec.pending_after[LS_SINK][(LS_FIRST_STEP - 1) as usize];
+    assert_eq!(
+        pending, 1,
+        "PRECONDITION: the stopped sink holds one arrival signal it never consumes"
+    );
+    NodeFrameworkState {
+        pending_data_count: pending,
+        input_service: Some([("inp".to_string(), Some(2u32))].into_iter().collect()),
+        stopped: true,
+        ..Default::default()
+    }
+}
+
 /// A unified `consume = latest` sink stopped at its third frame (step 2), the
 /// step before a resumed pass's anchor, in a bag whose checkpoint states it
 /// stopped (trace format 10). Its drain pops a frame at every step of the
 /// slice, and the resumed replay keeps it stopped and owes it nothing: a
 /// neutral `--resim all` reports no fire-schedule observation and passes, and
 /// `resume.stopped_at_anchor` names the sink, which is restored from its part
-/// and never reaches `node_failures`. One INFO line names the sink and the
-/// anchor step. The flag is read at every format, so the same bag stamped 9
+/// and never reaches `node_failures`. Each resumed run that reaches the
+/// restore logs one INFO line naming the sink and the anchor step. The flag is read at every format, so the same bag stamped 9
 /// replays the same. `--verify` still refuses the bag before its first step:
 /// the stop does not open the counter's writer run the bag begins inside.
 /// Two `--report` runs are byte-identical.
@@ -26812,11 +26843,25 @@ fn a_fatal_unified_latest_sink_stopped_before_the_anchor_stays_stopped_in_a_resu
     let dir = tempfile::tempdir().unwrap();
     let make = || unified_factories(SinkFailure::Fatal(2.0));
     let rec = stopped_at_two_reference("stopping_unified_sink_node", make);
-    let section = stopped_section();
+    let (_, drained) = ls_sink_records(
+        &rec,
+        cerulion_core::read_outcome::ReadOutcomeKind::DrainedBatch,
+        ReadSiteRole::Drain,
+    );
+    assert_eq!(
+        drained,
+        (0..LS_STEPS as u64).collect::<Vec<_>>(),
+        "PRECONDITION: the boundary drain pops a frame for the sink at every step"
+    );
+    // The recording's own pending count for the sink at the anchor.
+    let section = NodeFrameworkState {
+        pending_data_count: rec.pending_after[LS_SINK][(LS_FIRST_STEP - 1) as usize],
+        ..stopped_section()
+    };
     assert_eq!(
         section.encoded_len(),
         43,
-        "PRECONDITION: the pinned stopped-only section"
+        "PRECONDITION: the pinned length of a stopped section with no table"
     );
     let part = part_with_section(&StoppingUnifiedSinkNode::default(), &section);
     for (name, recorder_json) in [
@@ -26886,15 +26931,18 @@ fn a_fatal_unified_latest_sink_stopped_before_the_anchor_stays_stopped_in_a_resu
             .iter()
             .filter(|l| l.contains("keeps it stopped and releases its block slots"))
             .collect();
-        if kept.is_empty() {
-            return Err("no line says the resume keeps the sink stopped".to_string());
-        }
-        match kept.iter().all(|l| {
-            l.contains("INFO") && l.contains("node_id=sink") && l.contains("anchor_step=3")
-        }) {
-            true => Ok(()),
-            false => Err(format!(
-                "every keep line is INFO and names the sink and step 3: {kept:?}"
+        // Two resumed resims and two report runs reach the restore; the
+        // `--verify` replay is refused before it.
+        let named = kept.iter().all(|l| {
+            l.split_whitespace().any(|t| t == "INFO")
+                && l.contains("node_id=sink")
+                && l.contains("anchor_step=3")
+        });
+        match (kept.len(), named) {
+            (4, true) => Ok(()),
+            _ => Err(format!(
+                "expected four INFO keep lines naming the sink and step 3, got {}: {kept:?}",
+                kept.len()
             )),
         }
     });
@@ -26902,9 +26950,9 @@ fn a_fatal_unified_latest_sink_stopped_before_the_anchor_stays_stopped_in_a_resu
 
 /// A per-message FIFO sink pacing the counter through a `block` input of depth
 /// 2, stopped at its third frame (step 2), in a bag whose checkpoint states it
-/// stopped with its served cursor (the 55-byte section the 1-A1 vectors pin).
-/// The resumed replay keeps it stopped and releases its slot, so the drain's
-/// pops owe it nothing and the counter is not held: a neutral `--resim all`
+/// stopped with its served cursor (the 55-byte shape `state_restore_test`
+/// pins). The resumed replay keeps it stopped and releases its slot, so nothing
+/// is owed for it and the counter is not held: a neutral `--resim all`
 /// passes with no `rederivation_notes` at all (no finding, no live credit
 /// mirror note), which is exactly what the same recording replayed from its
 /// start reports. Two `--report` runs are byte-identical.
@@ -26914,12 +26962,9 @@ fn a_fatal_fifo_block_sink_stopped_before_the_anchor_is_judged_as_from_start() {
     let dir = tempfile::tempdir().unwrap();
     let make = || block_sink_factories(SinkFailure::Fatal(2.0));
     let rec = stopped_at_two_reference("stopping_block_sink_node", make);
-    // The stopping fire served frame 2, the last frame the sink's tick read.
-    let section = NodeFrameworkState {
-        input_service: Some([("inp".to_string(), Some(2u32))].into_iter().collect()),
-        stopped: true,
-        ..Default::default()
-    };
+    // The stopping fire served frame 2, the last frame the sink's tick read,
+    // and the stopped sink holds the one arrival signal it never consumes.
+    let section = stopped_block_sink_section(&rec);
     assert_eq!(
         section.encoded_len(),
         55,
@@ -27192,6 +27237,7 @@ fn a_lockstep_period_node_stopped_before_the_anchor_fires_nowhere_in_the_resume(
     );
     let records = state_records(CHECKPOINT_RUN, LS_FIRST_STEP - 1, 1, &part);
     let mut windowed = make_mid_run(&rec, 0);
+    windowed.stage_rows = rec.stage_rows.clone();
     windowed
         .messages
         .get_mut("/tick/ticker/out")
@@ -27207,6 +27253,11 @@ fn a_lockstep_period_node_stopped_before_the_anchor_fires_nowhere_in_the_resume(
     let outcome = replay(&bag, ticker_factories, None, None).expect("the lockstep resume runs");
     assert!(outcome.passed, "{outcome:?}");
     assert!(
+        outcome.rederivation_notes.is_empty(),
+        "{:?}",
+        outcome.rederivation_notes
+    );
+    assert!(
         outcome.trace_divergence.is_none(),
         "{:?}",
         outcome.trace_divergence
@@ -27217,6 +27268,8 @@ fn a_lockstep_period_node_stopped_before_the_anchor_fires_nowhere_in_the_resume(
         .as_ref()
         .expect("a mid-run bag reports its resume");
     assert_eq!(resume.stopped_at_anchor, vec!["ticker".to_string()]);
+    let (a, b) = two_replay_reports(&dir, &bag, ticker_factories);
+    assert_eq!(a, b, "two resims of one bag write one report");
 }
 
 /// The `block` sink bag of the FIFO arm stamped LOCKSTEP, where the pre-fire
@@ -27229,12 +27282,10 @@ fn a_lockstep_block_consumer_stopped_before_the_anchor_holds_no_producer() {
     let dir = tempfile::tempdir().unwrap();
     let make = || block_sink_factories(SinkFailure::Fatal(2.0));
     let rec = stopped_at_two_reference("stopping_block_sink_node", make);
-    let section = NodeFrameworkState {
-        input_service: Some([("inp".to_string(), Some(2u32))].into_iter().collect()),
-        stopped: true,
-        ..Default::default()
-    };
-    let part = part_with_section(&StoppingBlockSinkNode::default(), &section);
+    let part = part_with_section(
+        &StoppingBlockSinkNode::default(),
+        &stopped_block_sink_section(&rec),
+    );
     let bag = write_stop_resumed_bag(
         &dir,
         "block_lockstep.mcap",
@@ -27254,18 +27305,8 @@ fn a_lockstep_block_consumer_stopped_before_the_anchor_holds_no_producer() {
         outcome.resume.as_ref().map(|r| r.stopped_at_anchor.clone()),
         Some(vec![LS_SINK.to_string()])
     );
-    let reports: Vec<Vec<u8>> = ["a", "b"]
-        .iter()
-        .map(|leg| {
-            let path = dir.path().join(format!("block_lockstep_{leg}.json"));
-            replay(&bag, make, None, Some(path.clone())).expect("the resume runs");
-            std::fs::read(&path).expect("the report is written")
-        })
-        .collect();
-    assert_eq!(
-        reports[0], reports[1],
-        "two resims of one bag write one report"
-    );
+    let (a, b) = two_replay_reports(&dir, &bag, make);
+    assert_eq!(a, b, "two resims of one bag write one report");
 }
 
 /// A per-message FIFO relay that stops itself on a frame at or past
@@ -27368,7 +27409,7 @@ fn a_stopped_data_node_with_pending_arrivals_claims_no_backlog() {
         ..Default::default()
     };
     let bag = dir.path().join("stopped_backlog.mcap");
-    write_checkpoint_bag(
+    write_checkpoint_bag_with_capture(
         &mid,
         &bag,
         &state_records(
@@ -27384,6 +27425,10 @@ fn a_stopped_data_node_with_pending_arrivals_claims_no_backlog() {
             Some(0),
         )),
         None,
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::Lockstep,
+        )),
     );
     let outcome = replay(&bag, make, None, None).expect("the resume admits the bag");
     let resume = outcome
@@ -27402,13 +27447,16 @@ fn a_stopped_data_node_with_pending_arrivals_claims_no_backlog() {
         resume.anchor_pending_fires
     );
     assert!(outcome.passed, "{outcome:?}");
+    let (a, b) = two_replay_reports(&dir, &bag, make);
+    assert_eq!(a, b, "two resims of one bag write one report");
 }
 
 /// Two FIFO relays of one external topic: `running`, and `stopped`, which
 /// stopped on the first frame. The checkpoint states `running`'s served cursor
-/// and `stopped`'s stop. The stopped relay reads none of the pre-anchor band,
-/// so `running`'s cursor alone caps the band: the resume skips exactly the
-/// frames `running` had read, and no note names `stopped`.
+/// and `stopped`'s stop. The stopped relay read only the band's first frame,
+/// and a stopped node's cursor caps nothing, so `running`'s cursor alone caps
+/// the band: the resume skips exactly the frames `running` had read, and no
+/// note names `stopped`.
 #[test]
 #[serial]
 fn a_stopped_fifo_co_consumer_does_not_cap_a_running_consumers_pre_anchor_band() {
@@ -27434,8 +27482,15 @@ fn a_stopped_fifo_co_consumer_does_not_cap_a_running_consumers_pre_anchor_band()
         "PRECONDITION: the running relay had read past the stopped relay's one frame: \
          {running_prefix} of {band:?}"
     );
+    assert_eq!(
+        band.first(),
+        Some(&0),
+        "PRECONDITION: the stopped relay's stopping fire read the band's first frame"
+    );
     let anchor_step = CP_FIRST_STEP - 1;
-    let section = |cursor: u32, stopped: bool| NodeFrameworkState {
+    // Each relay's served cursor and the recording's own pending count.
+    let section = |id: &str, cursor: u32, stopped: bool| NodeFrameworkState {
+        pending_data_count: rec.pending_after[id][anchor_step as usize],
         input_service: Some([("inp".to_string(), Some(cursor))].into_iter().collect()),
         stopped,
         ..Default::default()
@@ -27446,14 +27501,17 @@ fn a_stopped_fifo_co_consumer_does_not_cap_a_running_consumers_pre_anchor_band()
         0,
         &part_with_section(
             &StoppingFifoRelayNode::default(),
-            &section(running_cursor, false),
+            &section("running", running_cursor, false),
         ),
     );
     records.extend(state_records(
         CHECKPOINT_RUN,
         anchor_step,
         1,
-        &part_with_section(&StoppingFifoRelayNode::default(), &section(0, true)),
+        &part_with_section(
+            &StoppingFifoRelayNode::default(),
+            &section("stopped", 0, true),
+        ),
     ));
     let mid = make_mid_run(&rec, CP_FIRST_STEP);
     let bag = dir.path().join("co_consumer.mcap");
@@ -27488,6 +27546,8 @@ fn a_stopped_fifo_co_consumer_does_not_cap_a_running_consumers_pre_anchor_band()
         resume.service_cursor_notes
     );
     assert!(outcome.passed, "{outcome:?}");
+    let (a, b) = two_replay_reports(&dir, &bag, make);
+    assert_eq!(a, b, "two resims of one bag write one report");
 }
 
 /// A sink stopped before the anchor whose checkpoint holds a `CaptureFailed`

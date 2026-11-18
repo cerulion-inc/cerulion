@@ -8360,8 +8360,10 @@ struct SuffixFireScan {
     tie_commits: BTreeMap<String, usize>,
     /// Set when a FIRE record in either window could not be resolved to a node
     /// id (an out-of-range rank or `node_idx`). The recording is corrupt and
-    /// the validators refuse it a moment later; until then every count derived
-    /// here is unusable, so the caller falls back to the timestamp-only split.
+    /// the validators refuse it a moment later; until then the tie-band
+    /// counts are unusable, so the caller falls back to the timestamp-only
+    /// split. [`Self::executed`] and [`Self::first_fire`] stay exact for every
+    /// FIRE record that does resolve.
     unresolved_fire: bool,
 }
 
@@ -8624,9 +8626,8 @@ fn resolve_resume(
     // reads; a bag without framework sections states none), and what they
     // state about each graph node's stop. A node the checkpoint states
     // as stopped fires no more, so a fire of it in the steps this replay
-    // executes is a recording that contradicts itself. A fire record that
-    // names no node leaves that scan incomplete, and the validator that owns
-    // it refuses the bag a moment later.
+    // executes is a recording that contradicts itself, even when the scan
+    // also met a fire record it could not resolve to a node.
     let blobs = anchors.blobs_at(anchor.run_id, anchor.step);
     let framework = decode_framework_sections(&blobs)?;
     let stops = resolve_anchor_stops(
@@ -8635,10 +8636,8 @@ fn resolve_resume(
         &framework,
         every_stop_flagged,
     );
-    if !fires.unresolved_fire {
-        if let Some(refusal) = stopped_fire_refusal(&stops, &fires.first_fire, anchor.step) {
-            return Err(refusal);
-        }
+    if let Some(refusal) = stopped_fire_refusal(&stops, &fires.first_fire, anchor.step) {
+        return Err(refusal);
     }
 
     // A re-executed topic whose recording is lossy cannot have its
