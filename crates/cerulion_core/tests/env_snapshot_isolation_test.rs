@@ -520,7 +520,7 @@ fn env_snapshot_build_succeeds_with_a_non_utf8_name_and_keeps_its_neighbours() {
     );
 }
 
-/// The environment of the next three arms: a name that is not valid UTF-8, a
+/// The environment of the next two arms: a name that is not valid UTF-8, a
 /// secret-named value that is not, and a UTF-8 neighbour.
 const MIXED_VARS: &[(&[u8], &[u8])] = &[
     (b"CER_TEST_ENV_ISO_NAME_\xff", b"plainvalue"),
