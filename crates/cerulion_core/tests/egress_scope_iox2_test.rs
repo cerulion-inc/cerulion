@@ -94,7 +94,12 @@ fn an_export_tap_pins_local_source_identity_until_after_its_data_port_drops() {
     let mirror = producer
         .create_remote_ingress_injector("/source_role", 11, MaxSliceLen::const_new(128))
         .unwrap();
-    assert!(remote.is_network_mirror("/source_role").unwrap());
+    assert!(remote
+        .is_network_mirror(
+            "/source_role",
+            cerulion_core::transport::TeardownWait::Bounded
+        )
+        .unwrap());
     assert!(matches!(
         remote.create_remote_data_only_subscriber("/source_role"),
         Err(cerulion_core::TransportError::LocalObservationLease { .. })
@@ -142,11 +147,31 @@ fn exclusion_is_namespace_scoped_and_drop_restores_remote_admission() {
     )
     .unwrap();
     let scope = producer.exclude_remote_topic("/same_name").unwrap();
-    assert!(!remote.remote_topic_allowed("/same_name").unwrap());
-    assert!(other.remote_topic_allowed("/same_name").unwrap());
-    assert!(remote.remote_topic_allowed("/other_topic").unwrap());
+    assert!(!remote
+        .remote_topic_allowed(
+            "/same_name",
+            cerulion_core::transport::TeardownWait::Bounded
+        )
+        .unwrap());
+    assert!(other
+        .remote_topic_allowed(
+            "/same_name",
+            cerulion_core::transport::TeardownWait::Bounded
+        )
+        .unwrap());
+    assert!(remote
+        .remote_topic_allowed(
+            "/other_topic",
+            cerulion_core::transport::TeardownWait::Bounded
+        )
+        .unwrap());
     drop(scope);
-    assert!(remote.remote_topic_allowed("/same_name").unwrap());
+    assert!(remote
+        .remote_topic_allowed(
+            "/same_name",
+            cerulion_core::transport::TeardownWait::Bounded
+        )
+        .unwrap());
 }
 
 #[test]
@@ -224,7 +249,9 @@ fn a_wrong_topic_attribute_cannot_authorize_remote_access() {
         .open_or_create_with_attributes(&verifier)
         .unwrap();
     let remote = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
-    assert!(remote.remote_topic_allowed("/private").is_err());
+    assert!(remote
+        .remote_topic_allowed("/private", cerulion_core::transport::TeardownWait::Bounded)
+        .is_err());
     assert!(remote
         .create_remote_data_only_subscriber("/private")
         .is_err());
@@ -245,7 +272,9 @@ fn full_registration_names_and_utf8_boundaries_preserve_scope_identity() {
             drop(remote.acquire_remote_topic_lease(&topic).unwrap());
             let scope = producer.exclude_remote_topic(&topic).unwrap();
             assert!(remote.acquire_remote_topic_lease(&topic).is_err());
-            assert!(!remote.remote_topic_allowed(&topic).unwrap());
+            assert!(!remote
+                .remote_topic_allowed(&topic, cerulion_core::transport::TeardownWait::Bounded)
+                .unwrap());
             drop(scope);
             assert!(remote.acquire_remote_topic_lease(&topic).is_ok());
         }
@@ -295,7 +324,9 @@ fn a_hex_looking_ascii_identity_cannot_impersonate_encoded_topic_bytes() {
                 kind == Some("hex")
             );
             assert_eq!(
-                manager.remote_topic_allowed(topic).is_ok(),
+                manager
+                    .remote_topic_allowed(topic, cerulion_core::transport::TeardownWait::Bounded)
+                    .is_ok(),
                 kind == Some("hex")
             );
             assert!(manager.acquire_remote_topic_lease("2fc3a9").is_ok());
@@ -339,7 +370,9 @@ fn a_matching_first_attribute_cannot_hide_a_different_topic_tail() {
         .open_or_create_with_attributes(&attributes)
         .unwrap();
     let remote = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
-    assert!(remote.remote_topic_allowed(&topic).is_err());
+    assert!(remote
+        .remote_topic_allowed(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .is_err());
     assert!(remote.acquire_remote_topic_lease(&topic).is_err());
     assert!(remote.list_topics().unwrap().is_empty());
 }
@@ -357,10 +390,14 @@ fn service_family_exclusion_refuses_requests_and_all_per_client_replies() {
         service::reply_topic("/private_service", &[0x42; 16]),
     ] {
         assert!(remote.acquire_remote_topic_lease(&topic).is_err());
-        assert!(!remote.remote_topic_allowed(&topic).unwrap());
+        assert!(!remote
+            .remote_topic_allowed(&topic, cerulion_core::transport::TeardownWait::Bounded)
+            .unwrap());
         let canonical = format!("/{topic}");
         assert!(remote.acquire_remote_topic_lease(&canonical).is_err());
-        assert!(!remote.remote_topic_allowed(&canonical).unwrap());
+        assert!(!remote
+            .remote_topic_allowed(&canonical, cerulion_core::transport::TeardownWait::Bounded)
+            .unwrap());
     }
     assert!(producer.list_topics().unwrap().is_empty());
 }
