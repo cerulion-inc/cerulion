@@ -526,7 +526,8 @@ request and a merge-queue batch both run on `test-linux` shard 2; the macOS shar
 `-E !binary(=macro_compile_fail_test)` to nextest through `CI_TEST_SHARD_EXTRA`, and macOS
 shard 2 skips the context helper step with a line saying where it runs. `ci_test_coverage_test`
 requires every test binary a shard step filters out that way to run in another job's shard step
-that does not filter it, and refuses any other filter spelling in that variable. What both suites check is mostly
+that does not filter it, and refuses any other filter spelling, and a multi-line value, in that
+variable. What both suites check is mostly
 this repository's own `compile_error!` wording, so a difference that shows only on macOS can
 merge, and shows on `main`'s push run of the commit the queue passed.
 

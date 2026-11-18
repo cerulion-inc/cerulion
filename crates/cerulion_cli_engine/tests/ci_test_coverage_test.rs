@@ -1883,6 +1883,16 @@ fn shard_exclusion_gaps(text: &str, files: &BTreeSet<String>) -> (Vec<String>, u
             .lines()
             .filter(|l| l.trim_start().starts_with("CI_TEST_SHARD_EXTRA:"))
         {
+            // A block scalar carries its value on the lines below, which this
+            // reader does not follow, so the form itself is refused.
+            let value = line.trim_start()["CI_TEST_SHARD_EXTRA:".len()..].trim_start();
+            if value.starts_with('>') || value.starts_with('|') {
+                unreadable.push(format!(
+                    "  {job}: `CI_TEST_SHARD_EXTRA` takes a multi-line value, which this \
+                     rule does not read; write it on one line"
+                ));
+                continue;
+            }
             let (names, unread) = shard_extra_exclusions(line);
             excluded.extend(names);
             for form in unread {
@@ -1981,6 +1991,18 @@ fn a_test_binary_filtered_out_of_a_shard_step_runs_in_another_jobs_shard_step() 
     let (gaps, read) = shard_exclusion_gaps(&both, &known);
     assert_eq!(read, 2, "both lanes' exclusions are read");
     assert_eq!(gaps.len(), 2, "each lane's filter is named: {gaps:?}");
+    // A folded value in the other lane is refused: read as no filter, it would
+    // make that lane the unfiltered backup while it filters the binary too.
+    let folded = format!(
+        "{alone}  other:\n    steps:\n      - name: shard\n        env:\n          \
+         CI_TEST_SHARD_EXTRA: >-\n            -E !binary(=a_test)\n        run: \
+         ./tools/scripts/ci_test_shard.sh cerulion_core 0 1\n"
+    );
+    let (gaps, _) = shard_exclusion_gaps(&folded, &known);
+    assert!(
+        gaps.iter().any(|g| g.contains("multi-line value")),
+        "a folded value must be refused: {gaps:?}"
+    );
     // Any other spelling is refused rather than read as no filter.
     for line in [
         "CI_TEST_SHARD_EXTRA: '-E !binary(~a_test)'",
