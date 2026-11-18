@@ -17,11 +17,11 @@ def build_mcp(settings, pool, viewer_url=None):
     """The MCP server. viewer_url: where the viewer pages are served (HTTP), or None (stdio: no pages; the
     instructions name the folder the episode is kept in).
 
-    A client that keeps an MCP session (HTTP) gets one episode per session: a second session that names the
-    same start state and `episode` label while that episode runs joins it, and once it has ended the session's
-    calls are answered "ended". A client with no session (stdio, or the per-request form of HTTP) gets one
-    episode per start state and label; once it has ended, its next connection (initialize, server/discover or
-    tools/list) starts a new one, never the ended one."""
+    A client that keeps an MCP session (HTTP) gets one episode per session, its own: no other session and no
+    client without a session reaches it, whatever start state and `episode` label they name, and once it has
+    ended the session's calls are answered "ended". A client with no session (stdio, or the per-request form of
+    HTTP) gets one episode per start state and `episode` label; once it has ended, its next connection
+    (initialize, server/discover or tools/list) starts a new one, never the ended one."""
     import mcp.types as types
     from mcp.server.lowlevel import Server
     from mcp.shared.exceptions import MCPError
@@ -36,6 +36,12 @@ def build_mcp(settings, pool, viewer_url=None):
         req = getattr(ctx, "request", None)
         return dict(req.query_params) if req is not None else {}
 
+    def opened(state, key):
+        try:
+            return pool.open(state, key)
+        except Refused as exc:
+            raise MCPError(types.INVALID_REQUEST, str(exc)) from None
+
     def open_for(ctx):
         conn = ctx.session._connection
         ep = conn.state.get("episode")
@@ -43,17 +49,16 @@ def build_mcp(settings, pool, viewer_url=None):
             return ep
         q = query(ctx)
         state = q.get("state") or settings.default_state
+        if conn.session_id:
+            # the session's own episode: kept on the session alone, never in by_key, and ended when it closes
+            ep = opened(state, None)
+            conn.state["episode"] = ep
+            conn.exit_stack.push_async_callback(ep.finish, "session_closed")
+            return ep
         key = f"{state}:{q.get('episode', '1')}"
         ep = pool.by_key.get(key)
         if ep is None or (ep.status in ENDED and ctx.method in NEW_CONNECTION):
-            try:
-                ep = pool.open(state, key)
-            except Refused as exc:
-                raise MCPError(types.INVALID_REQUEST, str(exc)) from None
-        if conn.session_id:
-            conn.state["episode"] = ep
-            ep.sessions.add(conn.session_id)
-            conn.exit_stack.push_async_callback(ep.session_closed, conn.session_id)
+            ep = opened(state, key)
         return ep
 
     async def ready(ctx):
@@ -65,8 +70,8 @@ def build_mcp(settings, pool, viewer_url=None):
 
     def instructions(ep):
         if viewer_url:
-            watch = (f" Watch it: {viewer_url}/view/{ep.eid} (anyone you give this link to can watch; it is "
-                     "listed nowhere).")
+            watch = (f" Watch it: {viewer_url}/view/{ep.eid} (not private: anyone who can reach this server can "
+                     f"watch it, and {viewer_url}/episodes lists every episode).")
         else:
             watch = f" Its transcript and pictures are kept in {pool.store.dir(ep.eid)}."
         base = mcp_stdio.instructions_for(ep.bridge.listing if ep.bridge else None, ep.practices)

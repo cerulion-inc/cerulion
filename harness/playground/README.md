@@ -30,15 +30,15 @@ Over stdio the server has one client. Once its episode has ended, listing the to
 The transcript and the pictures of every episode are kept in `~/.cerulion/sim/episodes/ID/` (under
 `CERULION_HOME` when that is set).
 
-Over HTTP each MCP session gets its own episode; `?state=LABEL` on the URL picks the start state, and
-`&episode=N` a second episode for a client that keeps no session. An idle client connection is kept open for the
-idle limit (the episode clock when no limit is set), so a client can keep one connection between turns. The
-pages beside `/mcp`:
+Over HTTP each MCP session gets its own episode, which no other client reaches; `?state=LABEL` on the URL
+picks the start state, and `&episode=N` a second episode for a client that keeps no session. An idle client
+connection is kept open for the idle limit (the episode clock when no limit is set), so a client can keep one
+connection between turns. The pages beside `/mcp`:
 
 | path | what |
 |---|---|
 | `/` | the address to add to a client, and the start states |
-| `/view/ID` | one episode as it runs: pictures, each call and its result, the claim, the benchmark's verdict. Unlisted: anyone with the link can watch |
+| `/view/ID` | one episode as it runs: pictures, each call and its result, the claim, the benchmark's verdict. Not private: anyone who can reach the server can watch it, and `/episodes` lists every episode |
 | `/api/episode/ID`, `/frames/ID/NAME` | what the viewer reads |
 | `/episodes`, `/health` | the live and ended episodes; the server's state and its idle limit |
 | `/source` | the license and where the source is |

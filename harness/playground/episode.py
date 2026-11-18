@@ -2,6 +2,7 @@
 """One episode: one simulator, its watch, its end, and what its viewer page shows."""
 import asyncio
 import contextlib
+import logging
 import os
 import secrets
 import shutil
@@ -10,6 +11,7 @@ import time
 from .common import ENDED, OWNER_FILE, cputime, read_json, utc
 
 END_FILE = "episode_end.json"   # written into the episode folder by the episode server when the episode ends
+log = logging.getLogger("cerulion.sim")
 
 
 class Episode:
@@ -25,7 +27,9 @@ class Episode:
         self.status, self.reason, self.why = "starting", None, None
         self.started_m, self.started_utc, self.ended_utc, self.ended_epoch = time.monotonic(), utc(), None, None
         self.ready_s = self.sim_wall_s = None
-        self.cpu_s, self.peak_rss_mb, self.calls = 0.0, 0.0, 0
+        # The simulator's processor seconds and peak memory as ps last read them; None until ps has read them
+        # (no simulator process yet, or no ps on this machine).
+        self.cpu_s, self.peak_rss_mb, self.calls = None, None, 0
         self.last_m = self.started_m
         # Calls in flight; when the episode last became free of them (None until the simulator is ready); every
         # gap between calls; the idle limit that ended the episode, when one did.
@@ -35,7 +39,7 @@ class Episode:
         self.events, self.ready, self._end_lock = [], asyncio.Event(), asyncio.Lock()
         self.start_done = asyncio.Event()  # set once the simulator's start has returned or failed
         self.ending = None                 # the reason of the first end asked for, while the end waits for the start
-        self._rss, self._cpu, self.sessions = {}, {}, set()
+        self._rss, self._cpu, self._ps_failed = {}, {}, False
         os.makedirs(self.work_dir, exist_ok=True)
         with open(os.path.join(self.work_dir, OWNER_FILE), "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
@@ -127,21 +131,33 @@ class Episode:
     # -- the watch: memory, processor time, the end file, the clock, idle ------------------------------------
 
     async def sample(self):
+        """Read the simulator processes' memory and processor time with ps. A machine where ps does not run
+        leaves both figures as last read (None when never read), with one warning per episode: the watch and the
+        end go on without them."""
         pids = [str(p) for p in self.pids.values() if p]
         if not pids:
             return
-        proc = await asyncio.create_subprocess_exec("ps", "-o", "pid=,rss=,time=", "-p", ",".join(pids),
-                                                    stdout=asyncio.subprocess.PIPE,
-                                                    stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await proc.communicate()
-        for line in out.decode().splitlines():
+        try:
+            proc = await asyncio.create_subprocess_exec("ps", "-o", "pid=,rss=,time=", "-p", ",".join(pids),
+                                                        stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await proc.communicate()
+        except OSError as exc:
+            if not self._ps_failed:
+                self._ps_failed = True
+                log.warning("episode %s: ps did not run, so its memory and processor time are not measured: %s",
+                            self.eid, exc)
+            return
+        for line in out.decode("utf-8", "replace").splitlines():
             f = line.split()
             if len(f) == 3:
                 with contextlib.suppress(ValueError):
                     self._rss[f[0]] = max(self._rss.get(f[0], 0.0), float(f[1]) / 1024.0)
                     self._cpu[f[0]] = cputime(f[2])
-        self.cpu_s = round(sum(self._cpu.values()), 1)
-        self.peak_rss_mb = round(sum(self._rss.values()), 1)
+        if self._cpu:
+            self.cpu_s = round(sum(self._cpu.values()), 1)
+        if self._rss:
+            self.peak_rss_mb = round(sum(self._rss.values()), 1)
 
     def end_reason(self):
         """The reason the episode server wrote at its own end, or None while it runs."""
@@ -165,14 +181,23 @@ class Episode:
         return None
 
     async def watch(self, every_s=2.0):
+        """Every every_s seconds until the episode ends: measure, then end the episode when it is due. A tick that
+        raises is logged (the first one of this episode) and the next tick runs: the watch ends only with the
+        episode."""
+        warned = False
         while self.status not in ENDED:
             await asyncio.sleep(every_s)
             if self.status in ENDED:
                 break
-            await self.sample()
-            reason = self.due(time.monotonic())
-            if reason is not None:
-                await self.finish(reason)
+            try:
+                await self.sample()
+                reason = self.due(time.monotonic())
+                if reason is not None:
+                    await self.finish(reason)
+            except Exception as exc:
+                if not warned:
+                    warned = True
+                    log.warning("episode %s: a check of its watch failed; the watch goes on: %s", self.eid, exc)
 
     # -- end -------------------------------------------------------------------------------------------------
 
@@ -193,10 +218,28 @@ class Episode:
         with contextlib.suppress(OSError):
             self.pool.store.write_meta(self)
 
+    async def _score(self):
+        """Measure once more, then read the benchmark's verdict. A score that fails is logged and leaves the
+        verdict unset; nothing here raises, so the end goes on to stop the simulator."""
+        try:
+            await self.sample()
+            r = await self.pool.sim.score(self.ep_dir)
+            if r:
+                self.verdict = {
+                    "solved": bool(r.get("success")), "claimed_success": r.get("claimed_success"),
+                    "false_claim": bool(r.get("false_claim")), "steps_used": r.get("steps_used"),
+                    "first_success_step": r.get("first_success_step"), "budget_steps": r.get("budget_steps"),
+                    "within_reference_steps": bool(r.get("success_within_ref")),
+                    "reference_steps": r.get("ref_max_steps"), "end_reason": r.get("end_reason"),
+                    "source": "the benchmark's own success check, read from the simulator's truth log"}
+        except Exception as exc:
+            log.warning("episode %s was not scored: %s", self.eid, exc)
+
     async def finish(self, reason):
         """End the episode once: score it, stop the simulator, record it, clear its work folder. An end that
         comes while the simulator is starting waits for the start to return first (a body record being measured
-        stops at once), so the stop finds every process the start made."""
+        stops at once), so the stop finds every process the start made. A score that fails never skips the
+        stop."""
         if self.ending is None:
             self.ending = reason
         if reason != "start_failed":
@@ -207,16 +250,7 @@ class Episode:
             started = self.status != "starting" or os.path.exists(self.ep_dir)
             self.reason = reason
             if reason != "start_failed":
-                await self.sample()
-                r = await self.pool.sim.score(self.ep_dir)
-                if r:
-                    self.verdict = {
-                        "solved": bool(r.get("success")), "claimed_success": r.get("claimed_success"),
-                        "false_claim": bool(r.get("false_claim")), "steps_used": r.get("steps_used"),
-                        "first_success_step": r.get("first_success_step"), "budget_steps": r.get("budget_steps"),
-                        "within_reference_steps": bool(r.get("success_within_ref")),
-                        "reference_steps": r.get("ref_max_steps"), "end_reason": r.get("end_reason"),
-                        "source": "the benchmark's own success check, read from the simulator's truth log"}
+                await self._score()
             if started:
                 with contextlib.suppress(Exception):
                     await self.pool.sim.stop(self.ep_dir)
@@ -225,12 +259,6 @@ class Episode:
                 await asyncio.to_thread(shutil.rmtree, self.work_dir, True)
             self.pool.retire(self)
             self.ready.set()
-
-    async def session_closed(self, session_id):
-        """A client session closed: the simulator stops when no other session is on this episode."""
-        self.sessions.discard(session_id)
-        if not self.sessions:
-            await self.finish("session_closed")
 
     def verdict_note(self):
         """The benchmark's verdict as one sentence, for an episode that was scored; else nothing."""

@@ -268,6 +268,21 @@ class Http:
         got = {k.lower(): v for k, v in got.items()}
         return status, got, answer_of(message, got.get("content-type", ""), body)
 
+    def mcp_without_session(self, message):
+        """POST message to /mcp in the per-request form: the protocol version in the request itself, no session."""
+        version = "2026-07-28"
+        body = dict(message, params={**message.get("params", {}), "_meta": {
+            "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientCapabilities": {}}})
+        headers = {"content-type": "application/json", "accept": "application/json, text/event-stream",
+                   "mcp-protocol-version": version, "mcp-method": message["method"]}
+        if message["method"] == "tools/call":
+            headers["mcp-name"] = message["params"]["name"]
+        req = urllib.request.Request(self.base + "/mcp", data=json.dumps(body).encode(), headers=headers,
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            got = {k.lower(): v for k, v in r.headers.items()}
+            return r.status, got, answer_of(message, got.get("content-type", ""), r.read().decode())
+
     def mcp_on(self, conn, message, session=None):
         """POST message to /mcp over the caller's own connection, which stays open for the next request."""
         headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
@@ -288,6 +303,8 @@ class StreamableHttp(unittest.TestCase):
         session = headers["mcp-session-id"]
         text = init["result"]["instructions"]
         self.assertIn(f"Watch it: {http.base}/view/", text)
+        self.assertIn(f" (not private: anyone who can reach this server can watch it, and {http.base}/episodes "
+                      "lists every episode).", text)
         eid = text.split("/view/", 1)[1].split(" ", 1)[0]
         http.mcp({"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
         self.assertEqual(tool_doc(http.mcp(call(2, "look"), session)[2]["result"])["frames"], ["frames/look001.png"])
@@ -299,6 +316,10 @@ class StreamableHttp(unittest.TestCase):
         status, headers, page = http.get(f"/view/{eid}")
         self.assertEqual((status, headers.get("x-robots-tag")), (200, "noindex, nofollow"))
         self.assertIn(b'<meta name="robots" content="noindex, nofollow">', page)
+        self.assertIn(b"This page is not private: anyone who can reach this server can watch this episode, and "
+                      b"<code>/episodes</code> lists every episode.", page)
+        self.assertNotIn(b"listed nowhere", page)
+        self.assertEqual([e["id"] for e in json.loads(http.get("/episodes")[2])["ended"]], [eid])
         status, _, body = http.get(f"/api/episode/{eid}")
         doc = json.loads(body)
         self.assertEqual((status, doc["status"], doc["reason"], doc["verdict"]["solved"]),
@@ -329,6 +350,46 @@ class StreamableHttp(unittest.TestCase):
         http.run.proc.send_signal(signal.SIGTERM)
         self.assertEqual(http.run.proc.wait(timeout=60), 0)
         self.assertEqual([r[2] for r in http.run.history()], ["claim", "session_closed", "server_stopped"])
+
+
+@unittest.skipUnless(HAS_MCP, "the MCP SDK is not in this interpreter (the harness venv has it)")
+class StreamableHttpSessions(unittest.TestCase):
+    def open_session(self, http, n):
+        status, headers, init = http.mcp(initialize(n))
+        self.assertEqual(status, 200)
+        session = headers["mcp-session-id"]
+        http.mcp({"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
+        return session, init["result"]["instructions"].split("/view/", 1)[1].split(" ", 1)[0]
+
+    def test_two_sessions_on_the_default_url_each_drive_their_own_robot(self):
+        http = Http(self)
+        (a, first), (b, second) = self.open_session(http, 1), self.open_session(http, 2)
+        self.assertNotEqual(first, second)
+        self.assertEqual(json.loads(http.get("/health")[2])["live_simulators"], 2)
+        self.assertEqual(tool_doc(http.mcp(call(3, "look"), a)[2]["result"])["frames"], ["frames/look001.png"])
+        self.assertEqual(tool_doc(http.mcp(call(4, "look"), b)[2]["result"])["frames"], ["frames/look001.png"])
+        claim = http.mcp(call(5, "claim", {"success": True}), a)[2]["result"]
+        self.assertTrue(claim["content"][-1]["text"].startswith("The episode has ended: the claim was recorded."))
+        # the claim ended the first session's episode only: the second session's robot runs on
+        self.assertEqual(tool_doc(http.mcp(call(6, "look"), b)[2]["result"]),
+                         {"ok": True, "frames": ["frames/look002.png"]})
+        self.assertTrue(tool_doc(http.mcp(call(7, "look"), a)[2]["result"])["message"].endswith(AGAIN_HTTP))
+        episodes = json.loads(http.get("/episodes")[2])
+        self.assertEqual([e["id"] for e in episodes["live"]], [second])
+        self.assertEqual([(e["id"], e["reason"]) for e in episodes["ended"]], [(first, "claim")])
+        self.assertEqual([c["verb"] for c in http.run.launcher()], ["start", "start", "score", "stop"])
+
+    def test_a_client_without_a_session_never_reaches_a_sessions_episode(self):
+        http = Http(self)
+        session, eid = self.open_session(http, 1)
+        self.assertEqual(tool_doc(http.mcp(call(2, "look"), session)[2]["result"])["frames"], ["frames/look001.png"])
+        status, _, listed = http.mcp_without_session({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        self.assertEqual((status, [t["name"] for t in listed["result"]["tools"]]), (200, ["look", "claim"]))
+        status, _, look = http.mcp_without_session(call(4, "look"))
+        self.assertEqual((status, tool_doc(look["result"])), (200, {"ok": True, "frames": ["frames/look001.png"]}))
+        live = [e["id"] for e in json.loads(http.get("/episodes")[2])["live"]]
+        self.assertEqual((len(live), live[0]), (2, eid))
+        self.assertEqual([c["verb"] for c in http.run.launcher()], ["start", "start"])
 
 
 @unittest.skipUnless(HAS_MCP, "the MCP SDK is not in this interpreter (the harness venv has it)")

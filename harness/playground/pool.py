@@ -2,6 +2,7 @@
 """The pool: one simulator per episode, started on demand, and what the server holds of them."""
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 
@@ -11,6 +12,7 @@ from .history import History
 from .simulator import Simulator
 from .store import Store
 
+log = logging.getLogger("cerulion.sim")
 AGAIN_HTTP = "Connect again: a new connection starts a new episode."
 AGAIN_STDIO = "To run again, list the tools again or restart the server: either starts a new episode."
 
@@ -73,7 +75,8 @@ class Pool:
         return task
 
     def open(self, state, key):
-        """A new episode of start state state, known by key (what a connection names it by)."""
+        """A new episode of start state state. key: what a connection with no session names it by, in by_key;
+        None for an MCP session's own episode, which only that session reaches."""
         if state not in self.s.states:
             raise Refused(f"no start state {state!r}; the start states offered: {', '.join(self.s.states)}")
         if self.stopping:
@@ -83,7 +86,8 @@ class Pool:
                           "when one has ended.")
         ep = Episode(self, state, key)
         self.episodes[ep.eid] = ep
-        self.by_key[key] = ep
+        if key is not None:
+            self.by_key[key] = ep
         self.spawn(ep.start())
         self.spawn(ep.watch())
         return ep
@@ -94,7 +98,12 @@ class Pool:
         ep.events = ep.events[-2:]
 
     async def end_all(self, reason):
-        await asyncio.gather(*(ep.finish(reason) for ep in self.live()), return_exceptions=True)
+        """End every live episode; an end that raises is logged by episode, and the others still end."""
+        live = self.live()
+        done = await asyncio.gather(*(ep.finish(reason) for ep in live), return_exceptions=True)
+        for ep, result in zip(live, done):
+            if isinstance(result, BaseException):
+                log.warning("episode %s did not end cleanly: %s", ep.eid, result)
 
     def close(self):
         """The server is stopping: end every live episode, once, with the reason the stop carries."""

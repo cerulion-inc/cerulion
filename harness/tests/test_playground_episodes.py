@@ -5,6 +5,8 @@ left. Standard library only."""
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import unittest
 from unittest import mock
 
@@ -108,6 +110,116 @@ class Episodes(unittest.TestCase):
         self.assertEqual((ep.status, ep.reason), ("ended", "server_stopped"))
         self.assertTrue(ep.ready.is_set())
 
+    def without_ps(self):
+        """PATH holds only an empty folder: ps does not run, as on a machine without it."""
+        empty = self.folder.at("empty-path")
+        os.makedirs(empty, exist_ok=True)
+        return mock.patch.dict(os.environ, {"PATH": empty})
+
+    def test_an_end_where_ps_does_not_run_still_scores_and_stops_the_simulator_and_records_no_figures(self):
+        async def go():
+            pool = self.pool()
+            ep = pool.open("bowl-on-plate", "k")
+            await ep.ready.wait()
+            ep.pids = {"episode_server": os.getpid()}
+            with self.without_ps(), self.assertLogs("cerulion.sim", "WARNING") as logs:
+                await ep.finish("claim")
+            return pool, ep, logs
+        pool, ep, logs = self.run_async(go())
+        self.assertEqual((ep.status, ep.reason, ep.verdict["solved"]), ("ended", "claim", True))
+        self.assertEqual([c[0] for c in pool.sim.calls], ["start", "score", "stop"])
+        self.assertFalse(os.path.exists(ep.work_dir))
+        self.assertTrue(ep.ready.is_set())
+        row = pool.history.episodes()[0]
+        self.assertEqual((row["sim_cpu_s"], row["peak_rss_mb"]), (None, None))     # not measured, not 0
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(f"episode {ep.eid}: ps did not run, so its memory and processor time are not measured",
+                      logs.output[0])
+
+    def test_ps_reads_a_live_process_and_a_process_that_is_gone_leaves_the_figures_unset(self):
+        async def go():
+            pool = self.pool()
+            live, gone = pool.open("bowl-on-plate", "a"), pool.open("open-drawer", "b")
+            await live.ready.wait()
+            await gone.ready.wait()
+            ended = subprocess.Popen([sys.executable, "-c", ""])
+            ended.wait()
+            live.pids, gone.pids = {"episode_server": os.getpid()}, {"episode_server": ended.pid}
+            await live.sample()
+            await gone.sample()
+            return live, gone
+        live, gone = self.run_async(go())
+        self.assertGreater(live.peak_rss_mb, 0.0)
+        self.assertGreaterEqual(live.cpu_s, 0.0)
+        self.assertEqual((gone.cpu_s, gone.peak_rss_mb), (None, None))
+
+    def test_the_watch_where_ps_does_not_run_goes_on_and_ends_the_episode_at_its_clock(self):
+        async def go():
+            pool = self.pool(clock_s=0.3)
+            ep = pool.open("bowl-on-plate", "k")
+            await ep.ready.wait()
+            ep.pids = {"episode_server": os.getpid()}
+            with self.without_ps(), self.assertLogs("cerulion.sim", "WARNING") as logs:
+                await asyncio.wait_for(ep.watch(every_s=0.05), 10)
+            return pool, ep, logs
+        pool, ep, logs = self.run_async(go())
+        self.assertEqual((ep.status, ep.reason), ("ended", "clock"))
+        self.assertEqual([c[0] for c in pool.sim.calls], ["start", "score", "stop"])
+        self.assertEqual(len(logs.output), 1)                                     # once, not once per tick
+
+    def test_a_watch_check_that_raises_is_logged_once_and_the_clock_still_ends_the_episode(self):
+        async def go():
+            pool = self.pool(clock_s=0.3)
+            ep = pool.open("bowl-on-plate", "k")
+            await ep.ready.wait()
+            with mock.patch.object(pool, "idle_limit", side_effect=RuntimeError("history unreadable")), \
+                    self.assertLogs("cerulion.sim", "WARNING") as logs:
+                await asyncio.wait_for(ep.watch(every_s=0.05), 10)
+            return pool, ep, logs
+        pool, ep, logs = self.run_async(go())
+        self.assertEqual((ep.status, ep.reason), ("ended", "clock"))
+        self.assertEqual([c[0] for c in pool.sim.calls], ["start", "score", "stop"])
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn(f"episode {ep.eid}: a check of its watch failed; the watch goes on: history unreadable",
+                      logs.output[0])
+
+    def test_a_score_that_fails_leaves_no_verdict_and_still_stops_the_simulator(self):
+        class NoScore(FakeSim):
+            async def score(self, ep_dir):
+                self.calls.append(("score", ep_dir))
+                raise FileNotFoundError("no python at the settings' path")
+
+        async def go():
+            pool = self.pool(NoScore())
+            ep = pool.open("bowl-on-plate", "k")
+            await ep.ready.wait()
+            with self.assertLogs("cerulion.sim", "WARNING") as logs:
+                await ep.finish("claim")
+            return pool, ep, logs
+        pool, ep, logs = self.run_async(go())
+        self.assertEqual((ep.status, ep.reason, ep.verdict), ("ended", "claim", None))
+        self.assertEqual([c[0] for c in pool.sim.calls], ["start", "score", "stop"])
+        self.assertEqual(ep.ended_message(), f"The episode has ended: the claim was recorded. The simulator ran for "
+                                             f"{ep.sim_wall_s:g} s. {AGAIN_HTTP}")
+        self.assertIn(f"episode {ep.eid} was not scored: no python at the settings' path", logs.output[0])
+
+    def test_a_stop_logs_an_end_that_raised_and_still_ends_every_other_episode(self):
+        async def go():
+            pool = self.pool()
+            first, second = pool.open("bowl-on-plate", "a"), pool.open("open-drawer", "b")
+            await first.ready.wait()
+            await second.ready.wait()
+            with mock.patch.object(first, "_close_books", side_effect=RuntimeError("the disk is full")), \
+                    self.assertLogs("cerulion.sim", "WARNING") as logs:
+                await pool.close()
+            return pool, first, second, logs
+        pool, first, second, logs = self.run_async(go())
+        self.assertEqual(logs.output, [f"WARNING:cerulion.sim:episode {first.eid} did not end cleanly: the disk is "
+                                       "full"])
+        self.assertEqual((second.status, second.reason), ("ended", "server_stopped"))
+        self.assertEqual(sorted(c for c in pool.sim.calls if c[0] == "stop"),
+                         sorted([("stop", first.ep_dir), ("stop", second.ep_dir)]))
+
     def test_the_pool_refuses_an_unknown_state_a_full_pool_and_a_stopping_server(self):
         async def go():
             pool = self.pool(pool_size=1)
@@ -125,6 +237,18 @@ class Episodes(unittest.TestCase):
                 pool.open("bowl-on-plate", "c")
             self.assertIn("stopping", str(caught.exception))
         self.run_async(go())
+
+    def test_a_sessions_episode_is_kept_out_of_the_keys_other_connections_look_up(self):
+        async def go():
+            pool = self.pool()
+            own = pool.open("bowl-on-plate", None)
+            keyed = pool.open("bowl-on-plate", "bowl-on-plate:1")
+            await own.ready.wait()
+            await keyed.ready.wait()
+            return pool, own, keyed
+        pool, own, keyed = self.run_async(go())
+        self.assertEqual(pool.by_key, {"bowl-on-plate:1": keyed})
+        self.assertEqual(sorted(pool.episodes), sorted([own.eid, keyed.eid]))
 
     def test_every_end_reason_has_its_own_message(self):
         async def go():

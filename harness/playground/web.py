@@ -88,9 +88,10 @@ async function tick(){
 tick();
 """
 
-# A viewer page is unlisted: anyone holding the link can open it, nothing links to it, and crawlers are told not
-# to index it or to pass the link on.
-UNLISTED = {"x-robots-tag": "noindex, nofollow", "referrer-policy": "no-referrer", "cache-control": "no-store"}
+# The viewer page and its document tell crawlers not to index them, browsers not to pass the link on and caches
+# not to keep them; a picture carries the line for crawlers. None of it is private: /episodes lists every
+# episode's id.
+NOT_INDEXED = {"x-robots-tag": "noindex, nofollow", "referrer-policy": "no-referrer", "cache-control": "no-store"}
 
 
 def build_routes(settings, pool, url):
@@ -147,17 +148,18 @@ def build_routes(settings, pool, url):
         if ep is None and kept is None:
             return HTMLResponse(page("episode", "<p>This episode is not kept here. A viewer link works for "
                                                 f"{keep_viewer} after its episode.</p>"),
-                                status_code=404, headers=UNLISTED)
+                                status_code=404, headers=NOT_INDEXED)
         body = ("<h1>Episode</h1><div class='box' id='head'>loading</div><div id='notes'></div>"
-                f"<p><small>Anyone who has this link can watch this episode, so you can share it. The link is "
-                f"listed nowhere, and it works for {keep_viewer} after the episode ends.</small></p>"
+                f"<p><small>This page is not private: anyone who can reach this server can watch this episode, "
+                f"and <code>/episodes</code> lists every episode. The link works for {keep_viewer} after the "
+                "episode ends.</small></p>"
                 "<div class='row'>"
                 "<div><img id='live' width='512' alt='the latest picture the robot returned'></div></div>"
                 "<h2>Calls and results, newest first</h2><div id='log'></div>"
                 f"<script>{viewer_js}</script>")
         return HTMLResponse(page("episode", body).replace(
             "<meta charset=\"utf-8\">", "<meta charset=\"utf-8\"><meta name=\"robots\" "
-            "content=\"noindex, nofollow\"><meta name=\"referrer\" content=\"no-referrer\">", 1), headers=UNLISTED)
+            "content=\"noindex, nofollow\"><meta name=\"referrer\" content=\"no-referrer\">", 1), headers=NOT_INDEXED)
 
     async def api_episode(request):
         try:
@@ -168,16 +170,16 @@ def build_routes(settings, pool, url):
         ep = pool.episodes.get(eid)
         doc = ep.public(since) if ep else await asyncio.to_thread(pool.store.load, eid, since)
         if doc is None:
-            return JSONResponse({"error": "no such episode"}, status_code=404, headers=UNLISTED)
-        return JSONResponse(doc, headers=UNLISTED)
+            return JSONResponse({"error": "no such episode"}, status_code=404, headers=NOT_INDEXED)
+        return JSONResponse(doc, headers=NOT_INDEXED)
 
     async def frame(request):
         path = await asyncio.to_thread(pool.store.frame_path, request.path_params["eid"],
                                        request.path_params["name"])
         if not path:
             return JSONResponse({"error": f"no such picture (pictures are kept in full for {keep_full})"},
-                                status_code=404, headers=UNLISTED)
-        return FileResponse(path, headers={"x-robots-tag": UNLISTED["x-robots-tag"]})
+                                status_code=404, headers=NOT_INDEXED)
+        return FileResponse(path, headers={"x-robots-tag": NOT_INDEXED["x-robots-tag"]})
 
     async def episodes(request):
         live = [{k: v for k, v in e.meta().items() if k in ("id", "state", "status", "simulator_seconds", "calls")}

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The sim server's settings: the shipped file, every refusal, the paths, the renderer by platform and the
 development start state check. Standard library only; no simulator."""
+import json
 import os
 import unittest
 
@@ -90,6 +91,25 @@ class Refusals(unittest.TestCase):
         self.refused("clock_s must be a number", clock_s="soon")
         self.refused("pool_size must be a number", pool_size=True)
         self.refused("idle_s must be a number more than 0", idle_s=-1)
+
+    def with_null(self, *keys):
+        """A settings file that states keys as JSON null (write_settings drops a key it is given None for)."""
+        path = write_settings(self.folder)
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+        doc.update(dict.fromkeys(keys))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(doc, f)
+        return path
+
+    def test_null_is_refused_for_a_number_setting_and_reads_as_not_set_where_not_set_is_the_default(self):
+        for key in ("budget_requests", "budget_steps", "clock_s", "progress_every_s", "call_timeout_s",
+                    "keep_full_pictures_s", "keep_viewer_s", "keep_last_pictures", "sweep_every_s", "stop_grace_s"):
+            with self.assertRaises(SettingsError, msg=key) as caught:
+                Settings(self.with_null(key), platform="linux")
+            self.assertEqual(str(caught.exception), f"{key} must be a number, not null")
+        s = Settings(self.with_null("idle_s", "pool_size"), platform="linux")
+        self.assertEqual((s.idle_s, s.pool_size), (None, None))
 
     def test_macos_needs_the_host_script(self):
         path = write_settings(self.folder, macos_envhost=None)

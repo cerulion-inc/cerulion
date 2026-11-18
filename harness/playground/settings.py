@@ -32,10 +32,13 @@ class SettingsError(Exception):
 
 
 def _number(doc, key, default, kind=float, low=0.0, allow_low=False):
-    """doc[key] (or default) as kind, finite and above low (at low too when allow_low)."""
+    """doc[key] (or default) as kind, finite and above low (at low too when allow_low). null reads as None only
+    for a setting whose default is None (idle_s, pool_size: not set); any other setting refuses it."""
     value = doc.get(key, default)
     if value is None:
-        return None
+        if default is None:
+            return None
+        raise SettingsError(f"{key} must be a number, not null")
     try:
         number = kind(value)
     except (TypeError, ValueError):
