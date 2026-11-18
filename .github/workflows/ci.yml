@@ -4948,7 +4948,7 @@ jobs:
           export CERULION_PY_PATH
           tests="$PWD/tests"
           cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q
+          "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q --durations=0
       # The SKIP BRANCH of the gate above, under the exact negation of its
       # condition, so the log says what the selection dropped.
       - name: selection marker, cerulion_core
