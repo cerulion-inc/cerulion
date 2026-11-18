@@ -63,6 +63,11 @@ const ORACLE_SCHEMA_HASH: u64 = 0xCE83_7C04_D00D_F00D_u64;
 /// A generous dial bound for the loopback path (never hit; a stall would surface as a
 /// bounded iroh error, not a hang).
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// The dial bound of the stalled-push arm, which runs it out on purpose: its robot
+/// takes the epoch push and never answers. The plane bounds every await of the dial
+/// with this same value, so the loopback endpoint bind, dial, control stream and
+/// catalog round trip must each finish inside it before the stalled read times out.
+const STALLED_PUSH_DIAL_TIMEOUT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // Test-unique identity + SHM roots (parallel-safe).
@@ -733,10 +738,26 @@ fn shared_endpoint_serves_consumes_and_survives_release_and_account_fencing() {
         .ensure_mirror(&served_key, ORACLE_SCHEMA_HASH)
         .unwrap();
     let observed_key = TopicKey::observed("producer", &topic);
-    let (_, path, direct) = plane
-        .query_catalog_with_path("producer", Duration::from_secs(3))
-        .unwrap();
-    assert_eq!(path, cerulion_netd::account_access::RobotPath::Direct);
+    // The path is the connection's selected path when the catalog arrives, and a
+    // path iroh has not selected yet reads Unknown. Every query dials again, so it
+    // is repeated while the path is Unknown; Relayed fails at once, because the
+    // relay is disabled.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let direct = loop {
+        let (_, path, direct) = plane
+            .query_catalog_with_path("producer", Duration::from_secs(3))
+            .unwrap();
+        match path {
+            cerulion_netd::account_access::RobotPath::Direct => break direct,
+            cerulion_netd::account_access::RobotPath::Unknown => {}
+            other => panic!("the producer reported {other:?} with the relay disabled"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the producer never reported a Direct path; last seen {path:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(remote
         .addrs
         .contains(&direct.expect("selected loopback path")));
@@ -1844,17 +1865,20 @@ fn drive_dial_with_epoch_dir(
     epoch_dir: Option<std::path::PathBuf>,
     accept_epoch: EpochReply,
 ) -> DrivenDial {
-    let (driven, result) = try_drive_dial_with_epoch_dir(tag, epoch_dir, accept_epoch);
+    let (driven, result) =
+        try_drive_dial_with_epoch_dir(tag, epoch_dir, accept_epoch, DIAL_TIMEOUT);
     result.expect("demand succeeds — the epoch push must never block the connection");
     driven
 }
 
 /// The same driver WITHOUT the success expectation — for the one fatal class (a peer
 /// that stalls mid-push desyncs the control framing, so the dial itself fails).
+/// `dial_timeout` bounds every await of the dial, the epoch push's included.
 fn try_drive_dial_with_epoch_dir(
     tag: &str,
     epoch_dir: Option<std::path::PathBuf>,
     accept_epoch: EpochReply,
+    dial_timeout: Duration,
 ) -> (DrivenDial, Result<(), MirrorError>) {
     let rt = tokio::runtime::Runtime::new().expect("robot runtime");
     let manager_b = test_manager(tag);
@@ -1886,7 +1910,7 @@ fn try_drive_dial_with_epoch_dir(
     );
     let plane = IrohMirrorPlane::new(manager_b, registry)
         .expect("iroh plane")
-        .with_dial_timeout(DIAL_TIMEOUT);
+        .with_dial_timeout(dial_timeout);
     // The demand forces the dial (and therefore the push).
     let result = plane.ensure_mirror(&TopicKey::new("ubuntu", &topic), ORACLE_SCHEMA_HASH);
     (
@@ -2163,6 +2187,10 @@ fn an_empty_cache_dir_and_no_cache_dir_both_push_nothing_and_are_distinguished()
 /// desk's bounded control read must time out, the dial must FAIL (the cancel-unsafe
 /// framing is desynced — every later demand on that stream would fail anyway), and the
 /// recorded outcome must read `TransportFailed` — never stale-successful (Principle #3).
+///
+/// The dial runs under [`STALLED_PUSH_DIAL_TIMEOUT`], and the failure must name the
+/// push's control read timing out after exactly that bound: a push read with no bound
+/// would wait out the stub's silence and fail on a later stream error instead.
 #[test]
 fn a_stalled_push_fails_the_dial_and_is_recorded_as_transport_failed() {
     let (dir, _) = epoch_dir_with_artifact("ubuntu");
@@ -2170,6 +2198,7 @@ fn a_stalled_push_fails_the_dial_and_is_recorded_as_transport_failed() {
         "push_stall",
         Some(dir.path().to_path_buf()),
         EpochReply::StallForever,
+        STALLED_PUSH_DIAL_TIMEOUT,
     );
 
     let err = result.expect_err("a stalled push desyncs the control stream — the dial must FAIL");
@@ -2177,6 +2206,14 @@ fn a_stalled_push_fails_the_dial_and_is_recorded_as_transport_failed() {
     assert!(
         msg.contains("revocation-epoch push"),
         "the dial failure must name the push as its cause: {msg}"
+    );
+    let bound = format!(
+        "revocation-epoch push to robot 'ubuntu': iroh control read timed out after {}ms",
+        STALLED_PUSH_DIAL_TIMEOUT.as_millis()
+    );
+    assert!(
+        msg.contains(&bound),
+        "the push must fail on its own bounded control read: {msg}"
     );
 
     // The robot really did RECEIVE the artifact (so this is a stalled ANSWER, not a
