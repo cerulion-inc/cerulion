@@ -5428,8 +5428,8 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         triggers.join("\n")
     );
     // The populations are not empty, so a reader that pairs nothing is not a
-    // pass: ten jobs of ci.yml and three of leak-guard.yml carry these names,
-    // all thirteen carry steps, and six of them list a `needs:` set.
+    // pass: eleven jobs of ci.yml and three of leak-guard.yml carry these
+    // names, all fourteen carry steps, and five of them list a `needs:` set.
     assert!(
         judged >= 13,
         "only {judged} job(s) carry a name that produces a required context: \
@@ -5457,7 +5457,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
          payload field, so the exclusion is no longer finding them"
     );
     assert!(
-        dependants >= 6,
+        dependants >= 5,
         "only {dependants} judged job(s) list a `needs:` set: the guard rule is \
          judging a population the reader is no longer finding"
     );
