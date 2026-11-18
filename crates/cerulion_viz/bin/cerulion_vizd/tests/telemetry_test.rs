@@ -14,14 +14,46 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
-use cerulion_telemetry::{consent, guard, rfc3339, Client, Value, DEFAULT_SHUTDOWN_BUDGET};
-/// Slack over the shutdown budget for scheduler jitter on a loaded runner.
-const STOP_BOUND: Duration = Duration::from_millis(DEFAULT_SHUTDOWN_BUDGET.as_millis() as u64 * 3);
-
+use cerulion_telemetry::{consent, guard, rfc3339, Client, Value};
 use cerulion_vizd::telemetry::{
-    common, heartbeat_props, started_props, Heartbeat, Starting, Telemetry, HEARTBEAT_INTERVAL,
-    VIZD_HEARTBEAT, VIZD_STARTED,
+    common, heartbeat_props, started_props, Heartbeat, HeartbeatStop, Recorded, StarterEnd,
+    Starting, StartingShutdown, Telemetry, HEARTBEAT_INTERVAL, VIZD_HEARTBEAT, VIZD_STARTED,
 };
+
+/// The shipped `DEFAULT_SHUTDOWN_BUDGET`, written by hand: the records the
+/// stops and shutdowns keep are checked against this value, not against the
+/// constant they were built from.
+const SHUTDOWN_BUDGET: Duration = Duration::from_millis(300);
+
+/// How long a test waits for an event that must happen (a thread ending, a
+/// starter reaching its abandon check), how long a blocked starter or a stuck
+/// tick waits for the test to release it, and the budget of the explicit
+/// long-interval stop. Never a measure of how long the code took: only a
+/// regression that waits on what the test is holding, or never wakes a
+/// thread, outlasts it, and then the arm fails instead of hanging.
+const HANG_GUARD: Duration = Duration::from_secs(30);
+
+/// The one wall-clock bound in this file, on the two abandon arms' shutdowns:
+/// 20 times the [`SHUTDOWN_BUDGET`] the shutdown waits for the start. A
+/// starter that held the abandon lock across a wait would block the shutdown
+/// with every record still correct, so this bound is the only catch for that
+/// hang; scheduler delay adds a small fraction of it to the 300 ms wait.
+const ABANDON_LOCK_BOUND: Duration = Duration::from_secs(6);
+
+/// The value `record` holds once its thread has set it, waiting up to
+/// [`HANG_GUARD`]; `None` if it is still unset then.
+fn recorded<T: Copy>(record: &Recorded<T>) -> Option<T> {
+    let deadline = Instant::now() + HANG_GUARD;
+    loop {
+        if let Some(value) = record.get() {
+            return Some(*value);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
 
 /// Serializes the tests that set process environment.
 static ENV: Mutex<()> = Mutex::new(());
@@ -108,36 +140,91 @@ fn heartbeat_ticks_in_order_and_stops_promptly_on_drop() {
     );
 }
 
+/// Dropping a heartbeat whose interval is an hour wakes its thread instead of
+/// leaving it to sleep the hour out: the thread ends, which drops the tick
+/// closure and the sender it owns, and the drop waited for it with the one
+/// shutdown budget. The tick itself never runs.
 #[test]
 fn dropping_a_long_interval_heartbeat_does_not_wait_for_the_interval() {
-    let beat = Heartbeat::spawn(Duration::from_secs(3600), |_| {}).expect("spawn");
-    let start = Instant::now();
+    let (alive, ended) = mpsc::channel::<()>();
+    let beat = Heartbeat::spawn(Duration::from_secs(3600), move |_| {
+        let _ = alive.send(());
+    })
+    .expect("spawn");
+    let stop = beat.stop_record_for_test();
     drop(beat);
-    assert!(
-        start.elapsed() < STOP_BOUND,
-        "drop waited {:?}",
-        start.elapsed()
+    assert_eq!(
+        ended.recv_timeout(HANG_GUARD),
+        Err(mpsc::RecvTimeoutError::Disconnected),
+        "the dropped heartbeat's thread must end, not sleep out its hour"
+    );
+    assert_eq!(
+        stop.get().map(|s| s.budget),
+        Some(SHUTDOWN_BUDGET),
+        "the drop waits for the thread with the one shutdown budget"
     );
 }
 
+/// Stopping a heartbeat whose interval is an hour wakes its thread at once:
+/// with a budget of [`HANG_GUARD`], the stop ends by joining a thread that
+/// finished, never by the budget running out. A stop that kept the stop
+/// channel open while it waited would wait out the whole budget and leave the
+/// thread running, and in production every stop would then spend the whole
+/// shutdown budget before the client's flush got any of it.
+#[test]
+fn stopping_a_long_interval_heartbeat_wakes_and_joins_its_thread() {
+    let mut beat = Heartbeat::spawn(Duration::from_secs(3600), |_| {}).expect("spawn");
+    let stop = beat.stop_record_for_test();
+    beat.stop_within(HANG_GUARD);
+    assert_eq!(
+        stop.get().copied(),
+        Some(HeartbeatStop {
+            budget: HANG_GUARD,
+            joined: true,
+        }),
+        "the stop wakes the thread, which finishes inside the budget and is joined"
+    );
+}
+
+/// Dropping a heartbeat whose tick is stuck (a consent read on a hung
+/// filesystem) waits the one shutdown budget and leaves the thread running,
+/// rather than joining it and waiting the tick out.
+///
+/// The tick blocks on a channel this test holds and reports when it returns,
+/// so the drop is checked against the tick itself as well as against the
+/// stop's record: a drop that joined the thread could only return after the
+/// tick had returned.
 #[test]
 fn dropping_a_heartbeat_stuck_in_a_tick_is_bounded() {
     let (entered_tx, entered) = mpsc::channel();
+    let (release, held) = mpsc::channel::<()>();
+    let (tick_done_tx, tick_done) = mpsc::channel();
     let beat = Heartbeat::spawn(Duration::from_millis(10), move |_| {
         let _ = entered_tx.send(());
-        std::thread::sleep(Duration::from_secs(5));
+        let _ = held.recv_timeout(HANG_GUARD);
+        let _ = tick_done_tx.send(());
     })
     .expect("spawn");
-    entered
-        .recv_timeout(Duration::from_secs(5))
-        .expect("tick entered");
-    let start = Instant::now();
+    entered.recv_timeout(HANG_GUARD).expect("tick entered");
+    let stop = beat.stop_record_for_test();
     drop(beat);
-    assert!(
-        start.elapsed() < STOP_BOUND,
-        "drop waited {:?}",
-        start.elapsed()
+    assert_eq!(
+        tick_done.try_recv(),
+        Err(mpsc::TryRecvError::Empty),
+        "the drop returned while the stuck tick was still running"
     );
+    assert_eq!(
+        stop.get().copied(),
+        Some(HeartbeatStop {
+            budget: SHUTDOWN_BUDGET,
+            joined: false,
+        }),
+        "the drop waits one shutdown budget and leaves the stuck tick running"
+    );
+    release.send(()).expect("the stuck tick is still waiting");
+    tick_done
+        .recv_timeout(HANG_GUARD)
+        .expect("the released tick returns");
 }
 
 /// A fresh consent home for one test: `CERULION_HOME` points at an empty
@@ -331,12 +418,27 @@ fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_bud
         "heartbeats stamped after the opt-out: {late:?}"
     );
 
-    let start = Instant::now();
+    // Stopping within budget is a property of what the shutdown hands out: the
+    // heartbeat's stop gets at most the one budget, and the client's flush,
+    // handed what is left once the heartbeat has stopped, gets less than a full
+    // budget, so never a fresh one.
+    let record = telemetry.shutdown_record_for_test();
     telemetry.shutdown();
+    let shut = record
+        .get()
+        .copied()
+        .expect("the shutdown records what it handed out");
+    let heartbeat = shut
+        .heartbeat_budget
+        .expect("the shutdown stops the heartbeat");
+    let client = shut.client_budget.expect("the shutdown flushes the client");
     assert!(
-        start.elapsed() < STOP_BOUND,
-        "shutdown waited {:?}",
-        start.elapsed()
+        heartbeat <= SHUTDOWN_BUDGET,
+        "the heartbeat's stop gets at most the one budget: {shut:?}"
+    );
+    assert!(
+        client < SHUTDOWN_BUDGET,
+        "the client's flush is handed less than a full budget, never a fresh one: {shut:?}"
     );
     drop(collector);
     let _ = std::fs::remove_dir_all(home);
@@ -351,23 +453,38 @@ fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
     let (release, blocked) = mpsc::channel::<()>();
     let starting = Starting::spawn_with(
         move || {
-            blocked.recv().ok()?;
+            blocked.recv_timeout(HANG_GUARD).ok()?;
             Some(loopback_client(&host))
         },
         Duration::from_millis(20),
     );
+    let records = starting.records_for_test();
 
     let start = Instant::now();
     starting.shutdown();
-    assert!(
-        start.elapsed() < STOP_BOUND,
-        "shutdown waited {:?}",
-        start.elapsed()
+    let took = start.elapsed();
+    assert_eq!(
+        records.shutdown.get().copied(),
+        Some(StartingShutdown::Abandoned {
+            waited: SHUTDOWN_BUDGET,
+            late: false,
+        }),
+        "shutdown waits one budget for the blocked start, then abandons it"
     );
+    // A starter that held the abandon lock across a wait would block this
+    // shutdown with the record above still correct, so this bound is the only
+    // catch for that hang. It is 20 times the budget the shutdown waits, far
+    // above what scheduler delay adds to that wait.
+    assert!(took < ABANDON_LOCK_BOUND, "shutdown took {took:?}");
 
     // The start finishes only now, with a client that would send: it finds
     // the abandon flag set and queues nothing.
     release.send(()).expect("starter still waiting");
+    assert_eq!(
+        recorded(&records.starter),
+        Some(StarterEnd::AbandonedBeforeBegin),
+        "the released start returns at its abandon check, before it queues anything"
+    );
     let sent = collector.settled(Duration::from_secs(1), Duration::from_secs(5));
     assert!(sent.is_empty(), "events from an abandoned start: {sent:?}");
     drop(collector);
@@ -400,18 +517,57 @@ fn a_start_blocked_on_the_consent_lock_at_the_deadline_is_abandoned_and_sends_no
         Duration::from_millis(20),
     );
     built.recv().expect("starter built its client");
+    let records = starting.records_for_test();
 
-    let start = Instant::now();
-    starting.shutdown();
-    assert!(
-        start.elapsed() < STOP_BOUND,
-        "shutdown waited {:?} on a start blocked by the consent lock",
-        start.elapsed()
+    // On a helper thread, so a shutdown that blocks on what this test holds
+    // is caught: the starter waits for the consent lock until the test drops
+    // it, so a starter holding the abandon lock across that wait, or a
+    // shutdown that waits for the start, would otherwise deadlock here. Past
+    // ABANDON_LOCK_BOUND the lock is let go, the shutdown is joined if it then
+    // returns within HANG_GUARD, and the arm fails.
+    let (shut_tx, shut) = mpsc::channel::<()>();
+    let shutting = thread::spawn(move || {
+        starting.shutdown();
+        let _ = shut_tx.send(());
+    });
+    match shut.recv_timeout(ABANDON_LOCK_BOUND) {
+        Ok(()) => shutting.join().expect("the shutdown thread"),
+        // The helper ended without reporting, so it panicked: carry that through.
+        Err(mpsc::RecvTimeoutError::Disconnected) => match shutting.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => panic!("the shutdown thread ended without reporting"),
+        },
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Let the lock go; the helper is joined only if it then reports, so
+            // a starter that never lets the abandon lock go cannot hang the arm.
+            drop(held);
+            if shut.recv_timeout(HANG_GUARD).is_ok() {
+                let _ = shutting.join();
+            }
+            panic!(
+                "shutdown did not return within {ABANDON_LOCK_BOUND:?} on a start blocked \
+                 by the consent lock"
+            );
+        }
+    }
+    assert_eq!(
+        records.shutdown.get().copied(),
+        Some(StartingShutdown::Abandoned {
+            waited: SHUTDOWN_BUDGET,
+            late: false,
+        }),
+        "shutdown waits one budget for the start blocked by the consent lock, \
+         then abandons it"
     );
 
     // The lock is released only now, with a client that would send: the
     // start finds itself abandoned and queues nothing.
     drop(held);
+    assert_eq!(
+        recorded(&records.starter),
+        Some(StarterEnd::AbandonedBeforeBegin),
+        "the released start returns at its abandon check, before it queues anything"
+    );
     let sent = collector.settled(Duration::from_secs(1), Duration::from_secs(5));
     assert!(sent.is_empty(), "events from an abandoned start: {sent:?}");
     drop(collector);
@@ -540,7 +696,33 @@ fn no_heartbeat_reaches_the_collector_under_the_network_kill_switch() {
     assert_eq!(started["event"], "vizd_started");
     let beat_event = collector.next(Duration::from_secs(5));
     assert_eq!(beat_event["event"], "vizd_heartbeat");
+    // The heartbeat beats before the starter hands over, so the handover is
+    // waited for on the starter's record, which is set once it is decided.
+    // Then the shutdown takes the handed over branch, and the client's flush
+    // is handed less than a full budget, so never a fresh one.
+    let records = starting.records_for_test();
+    assert_eq!(
+        recorded(&records.starter),
+        Some(StarterEnd::WentOn),
+        "the start went on and handed over"
+    );
     starting.shutdown();
+    assert_eq!(
+        records.shutdown.get().copied(),
+        Some(StartingShutdown::ShutDown),
+        "a start that handed over is shut down, not abandoned"
+    );
+    let handed_over = records
+        .handed_over
+        .get()
+        .copied()
+        .expect("the handed over telemetry is shut down by the deadline");
+    assert!(
+        handed_over
+            .client_budget
+            .is_some_and(|client| client < SHUTDOWN_BUDGET),
+        "the client's flush is handed less than a full budget: {handed_over:?}"
+    );
 
     std::env::remove_var("POSTHOG_API_KEY");
     std::env::remove_var("POSTHOG_HOST");
