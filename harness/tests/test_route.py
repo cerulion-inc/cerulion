@@ -23,7 +23,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from cerulion_harness import cli, route  # noqa: E402
-from run_cell_support import BLOCKS, KEY, MODEL, FakeEndpoint, reply  # noqa: E402
+from run_cell_support import BLOCKS, KEY, MODEL, FakeEndpoint, keep_redirects, reply  # noqa: E402
 
 GOOGLE = "https://aiplatform.googleapis.com/v1/projects/p/locations/global/endpoints/openapi"
 OPENROUTER = "https://openrouter.ai/api/v1"
@@ -379,6 +379,44 @@ class RelayExchange(unittest.TestCase):
                 post(relay.base_url, OPERATOR_TURN_2)
             sent.append([s[2] for s in end.seen])
         self.assertEqual(sent[0], sent[1])
+
+    def test_a_redirect_is_not_followed_and_comes_back_without_its_address(self):
+        # A second server stands for another host. urllib's own redirect step is in place here, as in a process
+        # where run-cell has not replaced it: the relay follows no redirect by itself. The operator's opener in
+        # post() would follow a Location; it gets none.
+        keep_redirects(self)
+        elsewhere = self.endpoint("openrouter")
+        for code in (301, 302, 303, 307, 308):
+            for location in (elsewhere.url + "/v1/chat/completions", "/v2/chat/completions"):
+                with self.subTest(code=code, location=location):
+                    end = self.endpoint("openrouter")
+                    end.answer = (code, {"Location": location, "Content-Type": "application/json"}, b'{"moved": 1}')
+                    with route.Relay(end.url + "/v1") as relay:
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            post(relay.base_url, TURN_1)
+                    self.assertEqual(caught.exception.code, code)
+                    self.assertEqual(caught.exception.read(), b'{"moved": 1}')
+                    self.assertIsNone(caught.exception.headers.get("Location"))
+                    self.assertEqual(caught.exception.headers.get("Content-Type"), "application/json")
+                    self.assertEqual(end.seen, [("/v1/chat/completions", "Bearer " + KEY, TURN_1)])
+                    self.assertEqual(relay.counts, {"requests": 1, "not_reached": 0,
+                                                    "replies_with_reasoning_blocks": 0,
+                                                    "requests_carrying_blocks": 0})
+        self.assertEqual(elsewhere.seen, [])
+
+    def test_a_request_line_that_names_another_host_goes_to_the_given_url_only(self):
+        end, elsewhere = self.endpoint("google"), self.endpoint("google")
+        other = urllib.parse.urlparse(elsewhere.url).netloc
+        with route.Relay(end.url + "/v1") as relay:
+            conn = http.client.HTTPConnection(urllib.parse.urlparse(relay.base_url).netloc, timeout=30)
+            self.addCleanup(conn.close)
+            conn.request("POST", elsewhere.url + "/v1/chat/completions", body=TURN_1,
+                         headers={"Host": other, "Content-Type": "application/json",
+                                  "Authorization": "Bearer " + KEY})
+            status = conn.getresponse().status
+        self.assertEqual(status, 200)
+        self.assertEqual(end.seen, [("/v1/chat/completions", "Bearer " + KEY, TURN_1)])
+        self.assertEqual(elsewhere.seen, [])
 
     def test_a_base_url_that_is_not_http_with_a_host_is_refused(self):
         for url in ("ftp://example.com/v1", "http://", "example.com/v1"):

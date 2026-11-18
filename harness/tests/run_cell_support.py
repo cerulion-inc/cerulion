@@ -13,6 +13,7 @@ import pathlib
 import signal
 import threading
 import time
+import urllib.request
 
 TESTS = pathlib.Path(__file__).resolve().parent
 FIXTURES = TESTS / "fixtures"
@@ -31,6 +32,9 @@ USAGE = [
      "prompt_tokens_details": {"cached_tokens": 1000}},
 ]
 COSTS = [0.0016, 0.0012]
+# urllib's own redirect step, taken when this module is first imported, before any test runs: run-cell replaces it
+# in its process (redirects.refuse_everywhere), and a test that runs run-cell puts it back (keep_redirects).
+FOLLOWS_REDIRECTS = urllib.request.HTTPRedirectHandler.__dict__["redirect_request"]
 
 
 def reply(kind, n):
@@ -47,6 +51,13 @@ def reply(kind, n):
         usage["cost"] = COSTS[n]
     return {"id": f"r{n}", "choices": [{"index": 0, "message": message, "finish_reason": "tool_calls"}],
             "usage": usage}
+
+
+def keep_redirects(test):
+    """For the length of a test: urllib's own redirect step, whatever an earlier test left, and after the test."""
+    handler = urllib.request.HTTPRedirectHandler
+    handler.redirect_request = FOLLOWS_REDIRECTS
+    test.addCleanup(setattr, handler, "redirect_request", FOLLOWS_REDIRECTS)
 
 
 def block_signals():

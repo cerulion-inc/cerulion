@@ -15,7 +15,10 @@ So every request of an episode passes through a relay on the loopback address in
     - a later request whose history holds an assistant message with one of those tool calls gets the blocks back
       on that message, unchanged;
     - every other byte goes on as it came, both ways. An endpoint that returns no reasoning_details (Google's
-      endpoint returns its signature in extra_content) receives the very bytes the operator sent.
+      endpoint returns its signature in extra_content) receives the very bytes the operator sent;
+    - every request goes to the URL given and to no other, with the key the operator sent: the relay follows no
+      redirect (redirects.py), and passes a redirect answer back with its status and body but without its
+      Location header, so the operator has no other address to send the key to.
 
 The blocks are added after the operator has estimated the size of its history, which decides when it shortens old
 turns (above 167,488 estimated tokens with the measured flags). That estimate counts a signature in extra_content
@@ -43,11 +46,14 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from cerulion_harness import redirects
+
 DEFAULT_EXTRA_BODY = {"reasoning_effort": "high"}
 GOOGLE_ON_OPENROUTER = {"only": ["google-vertex"]}
 # The operator's own --http-timeout. The relay waits as long for the endpoint, so the operator's timeout decides.
 HTTP_TIMEOUT_S = 600
-# Headers that go on to the endpoint, and back to the operator; every other one is the relay's own.
+# Headers that go on to the endpoint, and back to the operator; every other one (Location among them) is the
+# relay's own.
 REQUEST_HEADERS = ("content-type", "accept", "authorization")
 ANSWER_HEADERS = ("content-type", "retry-after")
 BLOCKS_NOTE = ("sent back on the assistant message whose tool calls they came with, outside the operator's context "
@@ -169,14 +175,15 @@ class _QuietServer(http.server.ThreadingHTTPServer):
 
 class Relay:
     """The loopback endpoint an episode's operator talks to; see the module text. Use as a context manager: it
-    serves from entering to leaving. on_request() is called as each request arrives, before it goes on."""
+    serves from entering to leaving. on_request() is called as each request arrives, before it goes on. Every
+    request goes to completions_url(base_url), whatever path or host the request line names."""
 
     def __init__(self, base_url, timeout_s=HTTP_TIMEOUT_S, on_request=None):
         self.url = completions_url(base_url)
         parts = urllib.parse.urlparse(self.url)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise ValueError(f"the base URL must be http or https with a host, got {base_url!r}")
-        handlers = [urllib.request.ProxyHandler({})] if loopback(parts.hostname) else []
+        handlers = [redirects.Refuse()] + ([urllib.request.ProxyHandler({})] if loopback(parts.hostname) else [])
         self._opener = urllib.request.build_opener(*handlers)
         self.timeout_s = float(timeout_s)
         self.on_request = on_request

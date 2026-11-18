@@ -23,7 +23,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
 from cerulion_harness import body_record, cli, layout, progress  # noqa: E402
-from run_cell_support import FIXTURES, KEY, MODEL, FakeEndpoint, block_signals, unignore_signals  # noqa: E402
+from run_cell_support import (FIXTURES, KEY, MODEL, FakeEndpoint, block_signals, keep_redirects,  # noqa: E402
+                              unignore_signals)
 
 CELL = "pro_spatial_swap_t00_i00"
 T = "2026-11-18T16:00:00Z"
@@ -103,6 +104,7 @@ class Bench(unittest.TestCase):
 
     def setUp(self):
         unignore_signals(self)
+        keep_redirects(self)   # run-cell makes this process's urllib follow no redirect
         self.base = tempfile.mkdtemp(dir="/tmp")
         self.addCleanup(shutil.rmtree, self.base, True)
         self.end = FakeEndpoint(self.kind)
