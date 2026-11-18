@@ -17583,8 +17583,9 @@ pub fn render_recorder_json(
         // binary writes; v8 marks a stream in which every edge names its frames'
         // writers by run, v9 one in which every multi-frame read whose batch
         // fits its read stage's window names each frame it consumed, and v10
-        // one whose checkpoints state every node the scheduler had stopped,
-        // all three also every bag this binary writes.
+        // one in which every complete checkpoint part of a stopped node
+        // carries the stopped flag, all three also every bag this binary
+        // writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17594,9 +17595,10 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stream_needs_v4(),
             crate::replay_engine::recorder_stamps_read_site_roles(),
             // Whether THIS run folds identical runs, read from the one switch.
-            // `stamp_trace_format` tests the consult term first, so the stamp
-            // is 7 with folding on or off; this term decides the stamp on the
-            // ladder below 7, which is the arm an older recorder's bag took.
+            // `stamp_trace_format` tests the stops, identity and consult terms
+            // first, so the stamp is 10 with folding on or off; this term
+            // decides the stamp on the ladder below 7, which is the arm an
+            // older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
             // Whether THIS binary records every gated consult a replay also
             // makes: it does, at every consult that found its queue empty but
@@ -30622,7 +30624,7 @@ process_groups:
             "every bag this binary writes carries read-site roles, folds runs, \
              records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
-             read stage's window AND states every stopped node in its checkpoints: \
+             read stage's window AND flags every complete checkpoint part of a stopped node: \
              a reader below 10 reads past the stopped flag, so the stamp makes it \
              refuse the bag"
         );
@@ -30654,9 +30656,9 @@ process_groups:
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
         // folding overrides both. 7, not 6: the consult record overrides
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
-        // every consumed frame of a batch is named. 10, not 9: the checkpoints
-        // state every stopped node (`stamp_trace_format`'s hand table pins the
-        // whole matrix).
+        // every consumed frame of a batch is named. 10, not 9: every complete
+        // checkpoint part of a stopped node carries the stopped flag
+        // (`stamp_trace_format`'s hand table pins the whole matrix).
         assert_eq!(v["trace_format"], 10);
     }
 

@@ -23640,11 +23640,12 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 ///
 /// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 10 on every
 /// bag this binary writes (every gated consult, and every frame of each batch
-/// that fits its read stage's window, record), so every "corpus" bag elsewhere in this file is a format-**10** bag, a PRECONDITION that roles are
+/// that fits its read stage's window, record, and every complete checkpoint
+/// part of a stopped node carries the stopped flag), so every "corpus" bag elsewhere in this file is a format-**10** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 10, the identity and
-/// consult terms outrank the fold term). Reading an archived bag is a compatibility claim
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 10, the stops,
+/// identity and consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a
 /// recording stripped of the records those formats never wrote
