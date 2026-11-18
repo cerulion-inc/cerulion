@@ -178,7 +178,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_yaml = "0.9"
 # Dynamic library loading for cdylib nodes
-libloading = "0.8"
+libloading = "0.9"
 
 # Proc macros for node type definition
 cerulion_macros = { workspace = true }
