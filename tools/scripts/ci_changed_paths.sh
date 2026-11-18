@@ -121,6 +121,7 @@ EVERY=all
 PACKAGING_PATHS='
 tools/scripts/build_deb.sh
 tools/scripts/test_build_deb.sh
+tools/scripts/stage_harness.sh
 tools/scripts/build_release_linux_container.sh
 tools/scripts/check_release_glibc.py
 tools/scripts/check_no_dev_issuer.sh
@@ -467,6 +468,7 @@ self_test() {
     # `<input paths>|<expected packaging>`; `;` separates paths.
     local packaging_cases='
 tools/scripts/build_deb.sh|true
+tools/scripts/stage_harness.sh|true
 tools/scripts/build_release_linux_container.sh|true
 tools/scripts/check_no_dev_issuer.sh|true
 docs/packaging/apt.md|true
