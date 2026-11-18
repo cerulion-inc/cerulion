@@ -900,7 +900,7 @@ One dependency, which is what `cargo add cerulion` writes:
 
 ```toml
 [dependencies]
-cerulion = "2.0.0"
+cerulion = "2.1.0"
 ```
 
 `cerulion` is an umbrella crate that re-exports the other three at a single
@@ -915,8 +915,8 @@ with `{ workspace = true }`:
 
 ```toml
 [workspace.dependencies]
-cerulion_core = "=2.0.0"
-native_ros2_messages = "=2.0.0"
+cerulion_core = "=2.1.0"
+native_ros2_messages = "=2.1.0"
 ```
 
 Either works. The macros read the package's own `Cargo.toml` at expansion

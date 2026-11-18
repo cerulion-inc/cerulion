@@ -6,7 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [2.1.0] - 2026-11-18
+
+Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. The lower-level Rust API of `cerulion_core` is not covered by it yet, and neither are the library crates behind the command line and the daemons; this release changes public items in `cerulion_core` and `cerulion_cli_engine` (see Changed), so Rust code that calls them directly may need edits.
+
+### Migration
+
+1. In a workspace made by Cerulion 2.0, change `cerulion_core` and `native_ros2_messages` under `[workspace.dependencies]` in the root `Cargo.toml` from `"=2.0.0"` to `"=2.1.0"` (a workspace made from a source checkout points their `path` at a 2.1.0 checkout instead), and replace its `[patch.crates-io]` block with the one `cerulion workspace create` writes: this release moves the iceoryx2 revision its nodes link. A workspace made by Cerulion 1.0 takes the [2.0.0 migration](#200---2026-11-12) first.
+2. Rebuild every node library once with `cerulion node build <type>`.
+
 ### Added
+<!-- WIP: the agent harness entries of this release (`harness/`, `cerulion rcp --sim`, `cerulion rcp bench`) go here, and this line goes with them. -->
 - `cerulion_ops_proto` provides bounded shell and exec frame codecs, including terminal geometry, direct argv requests, binary chunks, exit reasons and recording commitments. Session frames reject unknown fields and oversized payloads; binary chunks use canonical padded base64.
 - A graph input can set its backpressure in YAML: `backpressure: block` or `drop_oldest`, `depth: N` (1 to 64) and, under `block`, `block_timeout_ms: M`, beside `name` and `source`. A key present wins over the node's `#[input(...)]` attribute. With `block_timeout_ms`, a `block` consumer that stays full and drains nothing for M ms has its slot released: the producer resumes, and the consumer's undrained frames may be evicted from its queue; frames published after the release are not. The key is refused on a topic with more than one in-graph producer or listed in `multi_publisher_topics:`, where a release could leave the slot's count high and release a consumer that keeps up again, and on an edge whose producer runs in another process group or executor unit, where a read and a publish on different threads could leave the count off by a frame after a release; such a consumer's slot is still released when it stops for good. Each release logs a warning naming the producer, the consumer input, the topic and the reason, and counts in `NodeHandle::backpressure_block_slot_releases_count`. A whole-run replay of a lockstep recording judges `block_timeout_ms` again on its own clock, so a release falls at the same step as live; a replay resumed from a mid-run anchor starts from empty slots, and a replay of a free-run recording takes its fires from the recording.
 - A `network.egress` map entry accepts `backpressure: drop_oldest`, beside `topic`, `reliability`, `external` and `send_queue`. It is what network egress always does, so the entry is put the same with or without it; `backpressure: block` there is refused (see Changed). In 2.0.0 any `backpressure:` key on an egress entry was refused as an unknown field.

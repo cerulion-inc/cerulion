@@ -45,7 +45,7 @@ An archive you unpack by hand carries the same helper as `install_rust.sh`:
 sh install_rust.sh
 ```
 
-The 2.0.0 release binaries are built with Rust 1.95.0 and the 1.0.0 binaries were built with Rust 1.93.0, each pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. The workspace's minimum is Rust 1.95, and a node does not need the compiler that built the CLI.
+The 2.1.0 and 2.0.0 release binaries are built with Rust 1.95.0 and the 1.0.0 binaries were built with Rust 1.93.0, each pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. The workspace's minimum is Rust 1.95, and a node does not need the compiler that built the CLI.
 
 ## What the Debian package requires and ships
 
@@ -68,7 +68,7 @@ Building nodes needs a C toolchain, installed before rustup. On Debian and Ubunt
 
 ## Build nodes with a supported Rust compiler
 
-Nodes use stable boundary major 1 and load across Rust compiler versions. Build them with Rust 1.95 or newer and the C toolchain described above. The compiler does not have to match the CLI. To move a workspace made by Cerulion 1.0, follow the migration steps in the [2.0.0 release notes](../CHANGELOG.md#200---2026-11-12), which end with one `cerulion node build <node>` per node. The loader names that rebuild for any library built against an earlier node interface.
+Nodes use stable boundary major 1 and load across Rust compiler versions. Build them with Rust 1.95 or newer and the C toolchain described above. The compiler does not have to match the CLI. To move a workspace made by Cerulion 2.0, follow the migration steps in the [2.1.0 release notes](../CHANGELOG.md#210---2026-11-18); a workspace made by Cerulion 1.0 takes the steps in the [2.0.0 release notes](../CHANGELOG.md#200---2026-11-12) first. Both end with one `cerulion node build <node>` per node. The loader names that rebuild for any library built against an earlier node interface.
 
 A new workspace names no compiler: `cerulion workspace create` and `cerulion workspace init` write no `rust-toolchain.toml`, so Cargo and rustup select one as they do anywhere else. A toolchain file you add, and rustup overrides, keep their usual precedence, and an existing toolchain file is left as it is.
 

@@ -69,8 +69,9 @@ only place wiring lives.
 ## Complete starter source
 
 To read and run complete scanner and controller implementations before writing
-new node types, choose the route for your installed CLI. The 2.0.0 CLI includes
-`--starter`, so it takes the second route; the first is for a 1.0.0 install.
+new node types, choose the route for your installed CLI. Every CLI from 2.0.0 on
+includes `--starter`, so it takes the second route; the first is for a 1.0.0
+install.
 
 ### Released CLI 1.0.0
 

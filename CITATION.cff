@@ -14,8 +14,8 @@ authors:
   - family-names: Kariyawasam
     given-names: Raveen
   - name: "Cerulion Inc. and contributors"
-version: 2.0.0
-date-released: "2026-11-12"
+version: 2.1.0
+date-released: "2026-11-18"
 url: "https://github.com/cerulion-inc/cerulion"
 repository-code: "https://github.com/cerulion-inc/cerulion"
 license: AGPL-3.0-only
