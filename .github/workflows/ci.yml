@@ -13,8 +13,9 @@ on:
   #
   # The rule applied at every event-conditional site below: a `merge_group` run is
   # treated like a `pull_request` run, and push-only jobs stay push-only. The one
-  # exception is macOS: the macOS test jobs run on `merge_group` and not on
-  # `pull_request`, and `macos-contexts` reports their required names.
+  # exception is macOS: `test-macos` and the macOS leg of `crate-tests` run on
+  # `merge_group` and not on `pull_request`, and `macos-contexts` reports their
+  # required names.
   # `main`'s push run is still the control, so a queue run that also did the
   # push-only work would do it twice.
   merge_group:
@@ -3425,9 +3426,9 @@ jobs:
     needs: [changes]
     # `!cancelled()` is load bearing. `needs: [changes]` makes the
     # classifier a prerequisite on every event, and GitHub SKIPS a dependent
-    # when its dependency fails; a skipped required context counts as
-    # SATISFIED, so without this guard a failed classifier would wave the pull
-    # request through with this job's contexts never run. With it the job runs,
+    # when its dependency fails, so without this guard a failed classifier
+    # would skip the shards on a merge-queue batch; `macos-contexts` reds that
+    # batch either way, and with the guard the shards report their own red. With it the job runs,
     # `needs.changes.outputs.pkgs` is the empty string, every gated step's
     # `fromJSON('')` is an expression error, the step fails and the job reds.
     #
@@ -3718,7 +3719,7 @@ jobs:
       # the `shard:` matrix above by
       # the_ci_shard_matrix_agrees_with_the_shard_count_argument in
       # `cerulion_cli_engine/tests/ci_test_coverage_test.rs`, which walks every
-      # job a pull request can fail and this job is one of them.
+      # workflow job whatever its condition.
       # `--check cerulion_core 3` proves the partition
       # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
       # on shard 2, which is why shard 2 gets the lightest package set below).

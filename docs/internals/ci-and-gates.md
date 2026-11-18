@@ -469,8 +469,8 @@ naming gate (pull requests only);
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
 
-EVERY job runs on a GitHub-hosted runner. The macOS test jobs run on `merge_group`, `push`
-and `workflow_dispatch` and not on `pull_request`; `macos-contexts` reports their four
+EVERY job runs on a GitHub-hosted runner. `test-macos` and the macOS leg of `crate-tests` run
+on `merge_group`, `push` and `workflow_dispatch` and not on `pull_request`; `macos-contexts` reports their four
 required contexts on every event (see the macOS paragraph below). There is no other cost gate
 or routing expression.
 
@@ -522,7 +522,8 @@ required macOS contexts (`Test (macOS) shard 0` to `2`, `Crate tests (macos-late
 event instead. It `needs:` both jobs and carries the bare `!cancelled()` guard: on a pull
 request it succeeds with one line that says where the tests run, and on every other event it
 concludes as `test-macos` (the three shard names) or `crate-tests` (the macOS name) did, so a
-red macOS shard reds all three shard names. `macos-clippy` (`Clippy (macOS, pull
+red macOS shard reds all three shard names, and a red Linux `crate-tests` leg reds `Crate tests
+(macos-latest)` too, since the result covers both legs. `macos-clippy` (`Clippy (macOS, pull
 requests)`) runs `cargo clippy --workspace --all-targets -- -D warnings` on macOS on a pull
 request for early compile and lint feedback; it reports no required context. No required
 context name changes.
@@ -608,7 +609,7 @@ main" means a revert rather than a red check. EVERY job that `needs:` the classi
 its job-level `if:` with `!cancelled()`, not `deb-smoke` alone: `needs:` by itself lets a
 failed classifier skip a dependant, and a skipped required context reads as satisfied.
 `test-linux`, `crate-tests` and `viz-tests` carry the bare call; `test-macos` carries it in
-front of its `pull_request` gate, and `macos-contexts` carries it bare; `deb-smoke`
+front of its event gate, and `macos-contexts` carries it bare; `deb-smoke`
 carries it in front of its own event gate, so it keeps its `push` run whatever the
 classifier did. `cerulion_cli_engine::ci_test_coverage_test` holds the rule over every
 dependant, however the job consumes the outputs, rather than over the jobs with a one-line
@@ -891,7 +892,7 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on unless a job that `needs:` it and reads `needs.<job>.result` reports each of its names on that event (an inline-expression matrix `exclude:` drops the legs it names from the names a job reports), the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
 | `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |

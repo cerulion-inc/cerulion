@@ -746,9 +746,11 @@ fn output_producing_steps(job: &str) -> BTreeMap<String, StepOutputs> {
 /// The legs a job's matrix declares, `key -> {leg, ...}`, in both YAML list
 /// forms.
 ///
-/// A matrix carrying `include:` or `exclude:` adds or removes legs this reader
-/// does not model, so it reports NO legs at all and every `matrix.<key>`
-/// condition in that job fails closed.
+/// A matrix carrying `include:`, or an `exclude:` list, adds or removes legs
+/// this reader does not model, so it reports NO legs at all and every
+/// `matrix.<key>` condition in that job fails closed. An `exclude:` spelled as
+/// one inline expression is read: every leg its JSON literals name is dropped,
+/// and one it cannot read, or a leg the matrix does not declare, is refused.
 fn job_matrix_legs(block: &str) -> MatrixLegs {
     let lines: Vec<&str> = block.lines().collect();
     let mut out = MatrixLegs::new();
@@ -779,7 +781,13 @@ fn job_matrix_legs(block: &str) -> MatrixLegs {
         // event, so a name over that leg is credited to no job here and another
         // job has to report it.
         if key == "exclude" && value.starts_with("${{") {
-            dropped.extend(expression_exclude_pairs(value));
+            let pairs = expression_exclude_pairs(value);
+            assert!(
+                !pairs.is_empty(),
+                "an inline `exclude:` names no `\"key\":\"leg\"` pair this reader can \
+                 read: {value}"
+            );
+            dropped.extend(pairs);
             i += 1;
             continue;
         }
@@ -822,9 +830,11 @@ fn job_matrix_legs(block: &str) -> MatrixLegs {
         out.insert(key, legs);
     }
     for (key, leg) in dropped {
-        if let Some(legs) = out.get_mut(&key) {
-            legs.remove(&leg);
-        }
+        let removed = out.get_mut(&key).is_some_and(|legs| legs.remove(&leg));
+        assert!(
+            removed,
+            "an inline `exclude:` names `{key}: {leg}`, which the matrix does not declare"
+        );
     }
     out
 }
@@ -838,7 +848,7 @@ fn expression_exclude_pairs(value: &str) -> Vec<(String, String)> {
     // run, a bare `:`, and the next inside run.
     let mut k = 1;
     while k + 2 < quoted.len() {
-        if quoted[k + 1] == ":" {
+        if quoted[k + 1].trim() == ":" {
             out.push((quoted[k].to_string(), quoted[k + 2].to_string()));
             k += 4;
         } else {
@@ -4827,8 +4837,8 @@ fn names_the_matrix_expands(
 ///
 /// AND AN EXPANSION THIS WALK CANNOT MAKE IS AN `Err`, never a looser match. A
 /// placeholder reading a key the matrix does not declare, a matrix carrying
-/// `include:` or `exclude:`, which [`job_matrix_legs`] does not model and
-/// reports as no legs at all, and a placeholder reading anything but
+/// `include:` or an `exclude:` list, which [`job_matrix_legs`] does not model
+/// and reports as no legs at all, and a placeholder reading anything but
 /// `matrix.<key>` all land here. Matching the literal pieces instead would
 /// credit a context this job may never report: a shard an `exclude:` removed
 /// reads as reported, the export's own floor reads satisfied, and the required
@@ -5270,9 +5280,6 @@ struct RequiredJobWalk {
     produced: BTreeSet<String>,
 }
 
-/// Walk one workflow: pair every job name against the required contexts, then
-/// measure the job's own condition, its steps' conditions and its `needs:` set
-/// against the workflow's triggers.
 /// A readable skip of a job that reports a required context, held until the
 /// whole workflow is read.
 struct HeldSkip {
@@ -5282,32 +5289,38 @@ struct HeldSkip {
     line: String,
 }
 
-/// What one job reporting a required context reports, skips on and needs.
+/// What one job reporting a required context reports, skips on, and needs
+/// and reads the result of.
 struct Reporter {
     job: String,
     contexts: Vec<String>,
     skipped_on: BTreeSet<String>,
-    needs: BTreeSet<String>,
+    reads_result_of: BTreeSet<String>,
 }
 
 /// Does another job report every name of this skip on its event?
 ///
 /// A job that skips on an event leaves its names to whatever else reports them
 /// there. The skip stands unless, for EACH of its names, another job reports
-/// that name, does not skip on that event, and `needs:` the skipping job, so it
-/// is ordered after it and can read its result. `macos-contexts` is that job
-/// for `test-macos` on `pull_request`.
+/// that name, does not skip on that event, `needs:` the skipping job and reads
+/// `needs.<job>.result`, so it runs after it and its step can conclude as the
+/// skipping job did on the events where that job runs. `macos-contexts` is that
+/// job for `test-macos` on `pull_request`. What the step does with the result
+/// is not read here.
 fn skip_is_covered(skip: &HeldSkip, reporters: &[Reporter]) -> bool {
     skip.contexts.iter().all(|context| {
         reporters.iter().any(|r| {
             r.job != skip.job
                 && r.contexts.contains(context)
                 && !r.skipped_on.contains(&skip.event)
-                && r.needs.contains(&skip.job)
+                && r.reads_result_of.contains(&skip.job)
         })
     })
 }
 
+/// Walk one workflow: pair every job name against the required contexts, then
+/// measure the job's own condition, its steps' conditions and its `needs:` set
+/// against the workflow's triggers.
 fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> RequiredJobWalk {
     let triggers = workflow_trigger_events(file, text);
     let mut walk = RequiredJobWalk::default();
@@ -5395,7 +5408,11 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
             job: job.clone(),
             contexts: mine,
             skipped_on,
-            needs: needs.iter().cloned().collect(),
+            reads_result_of: needs
+                .iter()
+                .filter(|need| block.contains(&format!("needs.{need}.result")))
+                .cloned()
+                .collect(),
         });
         if !needs.is_empty() {
             walk.dependants += 1;
@@ -6588,13 +6605,14 @@ fn a_skip_is_covered_only_by_a_dependant_that_reports_every_name() {
                 if: ${{ !cancelled() && (github.event_name == 'merge_group' || github.event_name == 'push') }}\n    \
                 runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        s: [0, 1]\n    \
                 steps:\n      - run: true\n";
-    let reporter = |needs: &str, legs: &str| {
+    let reporter = |needs: &str, legs: &str, run: &str| {
         format!(
             "  ctx:\n    name: ${{{{ matrix.context }}}}\n{needs}    if: ${{{{ !cancelled() }}}}\n    \
              runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        context: [{legs}]\n    \
-             steps:\n      - run: true\n"
+             steps:\n      - run: {run}\n"
         )
     };
+    let mirror = "test \"${{ needs.real.result }}\" = success";
     let walk = |text: String| walk_required_context_jobs("w.yml", &text, &contexts);
 
     let alone = walk(format!("{head}{real}"));
@@ -6607,12 +6625,12 @@ fn a_skip_is_covered_only_by_a_dependant_that_reports_every_name() {
 
     let covered = walk(format!(
         "{head}{real}{}",
-        reporter("    needs: [real]\n", "R 0, R 1")
+        reporter("    needs: [real]\n", "R 0, R 1", mirror)
     ));
     assert!(covered.skips.is_empty(), "-> {:?}", covered.skips);
     assert_eq!(covered.judged, 2, "both jobs report a required name");
 
-    let no_needs = walk(format!("{head}{real}{}", reporter("", "R 0, R 1")));
+    let no_needs = walk(format!("{head}{real}{}", reporter("", "R 0, R 1", mirror)));
     assert_eq!(
         no_needs.skips.len(),
         1,
@@ -6622,13 +6640,24 @@ fn a_skip_is_covered_only_by_a_dependant_that_reports_every_name() {
 
     let one_name = walk(format!(
         "{head}{real}{}",
-        reporter("    needs: [real]\n", "R 0")
+        reporter("    needs: [real]\n", "R 0", mirror)
     ));
     assert_eq!(
         one_name.skips.len(),
         1,
         "a name no other job reports keeps the skip: {:?}",
         one_name.skips
+    );
+
+    let unread = walk(format!(
+        "{head}{real}{}",
+        reporter("    needs: [real]\n", "R 0, R 1", "true")
+    ));
+    assert_eq!(
+        unread.skips.len(),
+        1,
+        "a reporter that never reads the skipping job's result covers nothing: {:?}",
+        unread.skips
     );
 
     let dropped = String::from("  j:\n    name: C (${{ matrix.os }})\n")
@@ -6643,11 +6672,22 @@ fn a_skip_is_covered_only_by_a_dependant_that_reports_every_name() {
         "the leg the expression names is dropped"
     );
     assert_eq!(
-        expression_exclude_pairs(r#"${{ fromJSON('[{"os":"a"},{"os":"b","x":"y"}]') }}"#),
+        expression_exclude_pairs(r#"${{ fromJSON('[{"os": "a"},{"os":"b","x":"y"}]') }}"#),
         vec![
             ("os".to_string(), "a".to_string()),
             ("os".to_string(), "b".to_string()),
             ("x".to_string(), "y".to_string()),
         ]
     );
+}
+
+/// An inline-expression `exclude:` that names a leg the matrix does not declare
+/// is refused rather than read as dropping nothing.
+#[test]
+#[should_panic(expected = "which the matrix does not declare")]
+fn an_inline_exclude_naming_an_undeclared_leg_is_refused() {
+    let block = String::from("  j:\n    name: C (${{ matrix.os }})\n")
+        + "    strategy:\n      matrix:\n        os: [ubuntu-latest]\n"
+        + "        exclude: ${{ fromJSON('[{\"os\":\"macos-latest\"}]') }}\n";
+    let _ = job_matrix_legs(&block);
 }
