@@ -36,9 +36,9 @@ posthog = [
 ]
 
 [dependencies]
-# `url_hash`: the first 12 hex chars of SHA-256. The same 0.10 line the other
+# `url_hash`: the first 12 hex chars of SHA-256. The same sha2 major the other
 # workspace crates pin.
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
