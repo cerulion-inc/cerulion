@@ -51,13 +51,24 @@ opted in.
 
 ## Lint job budget
 
-The `Lint` job has a 45-minute limit covering runner setup, cache restore,
-compilation, the checks themselves, and the cache save (restore-only under the
-default save policy below; the save runs when `CACHE_SAVE_NAMESPACES` names
-`Linux-lint` on a default-branch run). A cold cache restore can take a quarter of an hour on its own, so
-a tighter budget expires inside Clippy and the job dies before it saves a cache,
-which makes the next run pay the same restore again. The limit bounds this job alone; which checks are required is set
-elsewhere in the workflow.
+`Lint`, the required context, is an aggregator. Its three parts run side by side:
+`Lint (gates)` (`lint-gates`: every script gate and self-test, no compile), `Lint (fmt)`
+(`lint-fmt`: rustfmt over the root workspace and every other one) and `Lint (clippy)`
+(`lint-clippy`: the strict clippy run, which carries the `Linux-lint` cache). The `lint` job
+needs all three, carries `always()` so a failed part or a cancelled run still runs it, and fails
+unless every part succeeded: a part that failed, was cancelled, was skipped or went missing
+reds `Lint`, and a cancelled run reds it rather than skipping it.
+`the_lint_aggregator_fails_unless_every_part_succeeded` in `ci_test_coverage_test` runs that
+check over each shape, and the required-context rules judge every job a required job needs,
+so the parts are held to them too. Jobs that `needs: [lint]` wait for all three parts.
+
+`lint-clippy` has a 45-minute limit covering runner setup, cache restore, compilation, clippy,
+and the cache save (restore-only under the default save policy below; the save runs when
+`CACHE_SAVE_NAMESPACES` names `Linux-lint` on a default-branch run). A cold cache restore can
+take a quarter of an hour on its own, so a tighter budget expires inside clippy and the job dies
+before it saves a cache, which makes the next run pay the same restore again. `lint-gates` has
+30 minutes, `lint-fmt` 20 and `lint` 5. The limits bound each job alone; which checks are
+required is set elsewhere.
 
 ## Lint policy: one table, inherited
 
@@ -129,7 +140,7 @@ near-spelling of a standard field name. Contracts worth knowing before editing a
 
 ## The hot-path allocation lint
 
-`./tools/scripts/check_hot_path_allocs.sh` runs in the `lint` job alongside its own `--self-test`
+`./tools/scripts/check_hot_path_allocs.sh` runs in the `lint-gates` job alongside its own `--self-test`
 step. It scans `crates/cerulion_core/src/transport/`, `.../graph/` and `.../scheduler/`, each minus
 a reasoned exclusion list, and all of `crates/cerulion_tf/src/` (the frame math a node tick calls);
 a new file in a scanned directory is linted BY DEFAULT.
@@ -222,7 +233,7 @@ package needs it.
 
 ## The naming gate
 
-`tools/scripts/check_pr_title.sh` runs in the `lint` job on every pull request (locally:
+`tools/scripts/check_pr_title.sh` runs in the `lint-gates` job on every pull request (locally:
 `--title` / `--branch`, or `--self-test` to drive its oracle table). It enforces
 `<type>(<scope>)!: <description>` for the title (comma-separated scopes accepted) and
 `<type>/<kebab-slug>` for the branch: no personal prefix, and no tracker id baked into a
@@ -243,7 +254,7 @@ name is what the exemption covers: the title is still checked.
 
 ## The agent-docs gate
 
-`tools/scripts/check_agents_md.sh` runs in the `lint` job. Context files are loaded by coding
+`tools/scripts/check_agents_md.sh` runs in the `lint-gates` job. Context files are loaded by coding
 agents with SILENT truncation and nearest-file-wins chaining, so the repo must be the alarm.
 It enforces: per-file size budgets (root `AGENTS.md` <= 190 lines and <= 13000 bytes; every
 other <= 60 lines and <= 4096 bytes), a whole-chain byte budget, a `CLAUDE.md` shim beside
@@ -340,7 +351,7 @@ reaches by `path`.
 `tools/scripts/leak_scan.py` keeps machine names, addresses, home paths, logins, people and
 location metadata out of everything the repository publishes: file contents, path and branch
 names, commit messages and identities, pull request text, and media containers. It runs in
-four places. The `lint` job runs its self-test and then a whole-tree scan with the GENERIC
+four places. The `lint-gates` job runs its self-test and then a whole-tree scan with the GENERIC
 classes only (`--no-private`, because that job holds no secret); both steps block CI.
 `.github/workflows/leak-guard.yml` runs with the private tier as a repository secret mapped
 at step level:
@@ -453,10 +464,10 @@ against the type it has to parse as by a unit test in
 
 ## CI job map (`.github/workflows/ci.yml`)
 
-`lint` runs: `cargo fmt --all --check` plus a workspace-root WALK
+`Lint`'s parts run: `cargo fmt --all --check` plus a workspace-root WALK (`lint-fmt`)
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
-`examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`;
-the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
+`examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`
+(`lint-clippy`); and in `lint-gates`, the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
 the agent-docs gate; the leak guard's self-test and generic-class tree scan; the three
 crates.io script self-tests (the index wait, the publish retry, and the post-publish
 archive reader `release.yml` runs after an upload); the nextest, actionlint and cargo-deny
@@ -583,7 +594,7 @@ scratch on every run. It lists no `needs:`, so a pull request starts it beside `
 than after it.
 
 The `changes` job classifies a pull request's changed paths (rules and a
-`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint`) into four
+`--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint-gates`) into four
 outputs. `packaging` only ever makes a job RUN that would otherwise skip: a pull request
 that touches the packaging inputs themselves runs the 22-minute Debian and APT smoke,
 because those are the only pull requests that can break it and "caught on the merge to
@@ -723,7 +734,7 @@ script refuses with exit 2 and writes nothing when `jq` is absent or cannot read
 log, when `gh` is unauthenticated, when the repository carries no `security` label,
 when `gh` refuses a listing, and when two open issues carry the title. Its oracle is
 `tools/scripts/test_advisory_issue.sh`: thirteen cases over JSON log fixtures against
-a `gh` shim that records every call, run as a step of `lint`.
+a `gh` shim that records every call, run as a step of `lint-gates`.
 
 A `schedule` trigger fires only from the default branch, so a pull request branch's
 copy of one of these workflows never runs on the clock. `workflow_dispatch` is not
@@ -816,9 +827,9 @@ when a read leaves an aged access time unchanged, when `target/debug` holds no u
 the run, or (per profile) when no `deps/` entry carries a live unit hash, and it prints the
 target size before and after. It runs on `main` only, under the save's namespace gate. Shard 0's
 archive then holds only the units its own cargo commands read, so a unit that only shards 1 to 3
-or a fall-through job (`lint`, `docs`, `netd-wan`) builds is compiled by that run every time.
+or a fall-through job (`lint-clippy`, `docs`, `netd-wan`) builds is compiled by that run every time.
 
-`lint`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
+`lint-clippy`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
 shards' `cargo-Linux-` key, so whichever finished first saved it: on 2026-09-28 the entry under
 the shards' key was a 0.63 GB archive saved by one of the smaller jobs, not the shards' 3.18 GB
 one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-`,
@@ -873,7 +884,7 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. The required names are read from `tools/ci/required_contexts.txt` | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` (or, as the `Lint` aggregator does, `always()`) whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. Every job a required job needs, transitively, is held to the same rules; the `Lint` aggregator's check is run over every result its parts can carry; and a job-level `always()` sits only on a job that checks out nothing, runs no cargo and carries `timeout-minutes` of at most 5. The required names are read from `tools/ci/required_contexts.txt` | no |
 | `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |

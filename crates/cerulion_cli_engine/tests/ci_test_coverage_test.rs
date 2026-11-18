@@ -117,7 +117,7 @@
 //! block scalar, owe the guard exactly as much as a job with a one-line `if:`.
 //! Whether a guarded job is PR-blocking is a separate question, decided by
 //! `job_is_gated` and pinned by
-//! `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+//! `the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking`.
 //!
 //! THE BASE, PROBED BEFORE THE DIFF READS IT. The classifier's step resolves a
 //! base, then diffs `$BASE...HEAD` for the changed paths. An empty base turns
@@ -295,12 +295,14 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The ONE job-level condition this walk sanctions, spelled whole.
+/// One of the two job-level conditions this walk sanctions, spelled whole;
+/// [`ALWAYS_CALL`] is the other.
 ///
 /// A job-level `if:` normally disqualifies a job outright: it can stop the job
 /// on a pull request, and a package covered only there is covered by nothing.
-/// `!cancelled()` is the exception and it is the exception for the OPPOSITE
-/// reason: it exists so the job runs when a job it `needs:` FAILED. GitHub
+/// `!cancelled()` is the exception, and `always()` beside it (see
+/// [`ALWAYS_CALL`]), and they are the exceptions for the OPPOSITE reason: they
+/// exist so the job runs when a job it `needs:` FAILED. GitHub
 /// skips a dependant of a failed job, a skipped required context counts as
 /// satisfied, and a pull request would then merge with that job's contexts
 /// never run. So a job carrying exactly this condition runs on every pull
@@ -338,7 +340,9 @@ fn job_if_of(block: &str) -> Option<Result<String, String>> {
 fn job_is_gated(block: &str) -> bool {
     match job_if_of(block) {
         None => false,
-        Some(Ok(cond)) => cond.trim() != JOB_IF_NOT_CANCELLED,
+        Some(Ok(cond)) => {
+            cond.trim() != JOB_IF_NOT_CANCELLED && condition_expression(&cond) != ALWAYS_CALL
+        }
         Some(Err(why)) => panic!(
             "{why}\n\nThe walk cannot say whether this JOB runs on a pull \
              request, so it refuses to guess. Spell the job's `if:` as a \
@@ -3948,6 +3952,9 @@ fn a_gated_step_without_its_marker_is_a_red_walker() {
 /// own.
 const GUARD_CALL: &str = "!cancelled()";
 const GUARD_CALL_AND: &str = "!cancelled() && ";
+/// The condition that runs a job on every outcome of its dependencies and on a
+/// cancelled run, so it gates no event either.
+const ALWAYS_CALL: &str = "always()";
 
 /// One condition as a single normalised expression: the `${{ }}` wrapper off,
 /// runs of whitespace down to one space.
@@ -3966,12 +3973,13 @@ fn condition_expression(cond: &str) -> String {
 /// Does this job condition keep the job running when a job it `needs:` FAILED?
 ///
 /// Exactly `!cancelled()`, or `!cancelled()` as the FIRST term of an `&&`
-/// chain, which is `deb-smoke`'s shape. Nothing else: `success() &&
-/// !cancelled()` carries the call and still skips on a failed dependency,
-/// which is the whole fault.
+/// chain, which is `deb-smoke`'s shape, or exactly `always()`, which also runs
+/// the job on a cancelled run and is the aggregator `Lint`'s shape. Nothing
+/// else: `success() && !cancelled()` carries the call and still skips on a
+/// failed dependency, which is the whole fault.
 fn condition_survives_a_failed_dependency(cond: &str) -> bool {
     let expr = condition_expression(cond);
-    expr == GUARD_CALL || expr.starts_with(GUARD_CALL_AND)
+    expr == GUARD_CALL || expr == ALWAYS_CALL || expr.starts_with(GUARD_CALL_AND)
 }
 
 /// Every dependant of the classifier that does NOT guard itself against the
@@ -4041,7 +4049,7 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
         complaints.is_empty(),
         "these jobs depend on the `{SELECTION_JOB}` job, or gate a step on the \
          selection, and their job-level `if:` does not open with \
-         `{GUARD_CALL}`:\n{}\n\nGitHub skips a dependant of a FAILED job and a \
+         `{GUARD_CALL}` (or read exactly `{ALWAYS_CALL}`):\n{}\n\nGitHub skips a dependant of a FAILED job and a \
          skipped required context reads as satisfied, so without the guard a \
          classifier failure is a silent green around every context these jobs \
          report. `{JOB_IF_NOT_CANCELLED}` is the shape a job with no gate of its \
@@ -4051,9 +4059,11 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
     );
     assert!(
         guarded >= 6,
-        "only {guarded} job(s) carry the guard: every job that gates steps on \
-         the selection needs it, and so does every dependant reporting a \
-         required context, so either the reader is broken or a guard is gone"
+        "only {guarded} job(s) carry exactly `{JOB_IF_NOT_CANCELLED}`: every job \
+         that gates steps on the selection opens its condition with the guard, \
+         and so does every dependant reporting a required context other than \
+         the `{ALWAYS_CALL}` aggregator, so either the reader is broken or a \
+         guard is gone"
     );
     // The population is not empty, so an emptied reader is not a pass. Five
     // jobs of `ci.yml` need the classifier today.
@@ -4096,7 +4106,7 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
     // A condition that OPENS with the call keeps the job running when the
     // classifier failed, so it satisfies THIS rule; whether such a job is
     // PR-blocking is the separate question `job_is_gated` decides, pinned by
-    // `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+    // `the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking`.
     assert_eq!(
         jobs_missing_the_not_cancelled_guard(&job(
             "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}\n"
@@ -4185,16 +4195,27 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
     );
 }
 
-/// A job carrying exactly `!cancelled()` still credits its packages, and one
-/// carrying any other job-level condition still does not.
+/// A job carrying exactly `!cancelled()` or `always()` still credits its
+/// packages, and so does a job that needs it; one carrying any other job-level
+/// condition still does not.
 #[test]
-fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking() {
+fn the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking() {
     let body = "    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
     let with = format!("  j:\n    if: {JOB_IF_NOT_CANCELLED}\n{body}");
     let without = format!("  j:\n{body}");
+    let always = format!("  j:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n{body}");
+    let after_always = format!(
+        "  agg:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n    steps:\n      - run: true\n  \
+         j:\n    needs: [agg]\n{body}"
+    );
     let other = format!("  j:\n    if: github.event_name == 'push'\n{body}");
 
-    for (name, text) in [("guarded", &with), ("ungated", &without)] {
+    for (name, text) in [
+        ("guarded", &with),
+        ("ungated", &without),
+        ("always", &always),
+        ("needs-an-always", &after_always),
+    ] {
         assert!(
             pr_blocking_jobs(text).contains("cargo test -p alpha"),
             "the {name} job must stay in the PR-blocking view"
@@ -4225,7 +4246,7 @@ const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
 /// keeps its name and its script and stops running on a pull request, which is
 /// the one property the step exists for.
 const SHARD_CHECK_WORKFLOW: &str = "ci.yml";
-const SHARD_CHECK_JOB: &str = "lint";
+const SHARD_CHECK_JOB: &str = "lint-gates";
 
 /// Is this run script the shipped invocation, WHOLE?
 ///
@@ -4334,8 +4355,9 @@ fn shard_check_complaints_in(texts: &BTreeMap<String, String>) -> Vec<String> {
         .collect()
 }
 
-/// The shard check runs on every pull request, in the `lint` job of `ci.yml`,
-/// under a named step, with the invocation the script documents.
+/// The shard check runs on every pull request, in the `lint-gates` job of
+/// `ci.yml` (a part of the required `Lint`), under a named step, with the
+/// invocation the script documents.
 ///
 /// WHY A TEST HOLDS A WORKFLOW STEP. `ci_test_shard.sh --check` carries the
 /// proof that the partition is total and disjoint AND the hand table its
@@ -4381,7 +4403,7 @@ fn the_shard_check_rule_reads_the_main_workflow_and_no_other() {
     };
 
     // (a) THE STEP IN ANOTHER WORKFLOW COVERS NOTHING. `release.yml` carries
-    //     it in a job named `lint` with the shipped shape, so a rule that
+    //     it in a job named like the shard-check job, with the shipped shape, so a rule that
     //     searched every file would read it and pass; the file this rule reads
     //     carries no such step, and that is what is said.
     let elsewhere = tree(Some(bare), &carrying);
@@ -4505,7 +4527,7 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
          {complaints:?}"
     );
 
-    // The job id alone is not the rule: `lint` behind an event test is still a
+    // The job id alone is not the rule: the shard-check job behind an event test is still a
     // job the check does not run in on a pull request.
     let gated = format!(
         "jobs:\n  {SHARD_CHECK_JOB}:\n    if: github.event_name != 'pull_request'\n    \
@@ -5024,7 +5046,7 @@ fn events_a_job_skips(block: &str, triggers: &BTreeSet<String>) -> Vec<Skip> {
         ),
     };
     let expr = condition_expression(&cond);
-    let tail = if expr == GUARD_CALL {
+    let tail = if expr == GUARD_CALL || expr == ALWAYS_CALL {
         String::new()
     } else if let Some(tail) = expr.strip_prefix(GUARD_CALL_AND) {
         tail.to_string()
@@ -5232,18 +5254,59 @@ struct RequiredJobWalk {
     dependants: usize,
     /// Which required contexts a job of this workflow reports by name.
     produced: BTreeSet<String>,
+    /// How many jobs are judged because a required job needs them.
+    needed: usize,
+}
+
+/// The ids of the jobs a required context depends on: every job that `needs:`
+/// reaches, transitively, from a job in `required`. A required aggregator such
+/// as `Lint` reports its parts' results under its own name, so a part is held
+/// to the same rules as the job that reports it.
+fn jobs_required_jobs_need(
+    jobs: &[(String, String)],
+    required: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: Vec<String> = required.iter().cloned().collect();
+    while let Some(id) = frontier.pop() {
+        let Some((_, block)) = jobs.iter().find(|(name, _)| *name == id) else {
+            continue;
+        };
+        for need in job_needs_of(block) {
+            let exists = jobs.iter().any(|(name, _)| *name == need);
+            if exists && !required.contains(&need) && reached.insert(need.clone()) {
+                frontier.push(need);
+            }
+        }
+    }
+    reached
 }
 
 /// Walk one workflow: pair every job name against the required contexts, then
 /// measure the job's own condition, its steps' conditions and its `needs:` set
-/// against the workflow's triggers.
+/// against the workflow's triggers. A job a required job `needs:` (see
+/// [`jobs_required_jobs_need`]) is measured the same way.
 fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> RequiredJobWalk {
     let triggers = workflow_trigger_events(file, text);
     let mut walk = RequiredJobWalk::default();
-    for (job, block) in jobs_of(text) {
+    let all_jobs = jobs_of(text);
+    let mut required_ids: BTreeSet<String> = BTreeSet::new();
+    for (job, block) in &all_jobs {
+        let name = job_reported_name(job, block);
+        let legs = job_matrix_legs(block);
+        if contexts
+            .iter()
+            .any(|context| name_produces_context(&name, context, &legs).unwrap_or(true))
+        {
+            required_ids.insert(job.clone());
+        }
+    }
+    let needed = jobs_required_jobs_need(&all_jobs, &required_ids);
+    walk.needed = needed.len();
+    for (job, block) in all_jobs {
         let name = job_reported_name(&job, &block);
         let legs = job_matrix_legs(&block);
-        let mut paired = false;
+        let mut paired = needed.contains(&job);
         for context in contexts {
             let produces = name_produces_context(&name, context, &legs).unwrap_or_else(|why| {
                 panic!(
@@ -5316,7 +5379,8 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
             if !guarded {
                 walk.unguarded.push(format!(
                     "  {file} / {job} (\"{name}\") needs {needs:?} and its \
-                     job-level `if:` does not open with `{GUARD_CALL}`"
+                     job-level `if:` does not open with `{GUARD_CALL}` or read \
+                     exactly `{ALWAYS_CALL}`"
                 ));
             }
         }
@@ -5340,6 +5404,234 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
         }
     }
     walk
+}
+
+/// The transitive walk over `needs:`, on a hand-written job list: every job a
+/// required job reaches is returned once, through chains and around a cycle,
+/// a required job is never returned as needed, and a need naming no job adds
+/// nothing.
+#[test]
+fn the_jobs_a_required_job_needs_are_found_through_every_chain() {
+    let text = "jobs:\n  r:\n    needs: [a, r2]\n    steps: []\n  \
+                r2:\n    needs: [b, ghost]\n    steps: []\n  \
+                a:\n    needs: [c]\n    steps: []\n  \
+                b:\n    steps: []\n  \
+                c:\n    needs: [a]\n    steps: []\n  \
+                lone:\n    needs: [r]\n    steps: []\n";
+    let jobs = jobs_of(text);
+    assert_eq!(jobs.len(), 6, "the fixture parses into six jobs: {jobs:?}");
+    let required: BTreeSet<String> = ["r", "r2"].iter().map(|s| s.to_string()).collect();
+    let needed = jobs_required_jobs_need(&jobs, &required);
+    let want: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        needed, want,
+        "`a` and `b` directly, `c` through `a`, the cycle back to `a` once, \
+         `r2` not at all (it is required), `ghost` not at all (no such job), \
+         `lone` not at all (it needs a required job, no required job needs it)"
+    );
+    let none: BTreeSet<String> = BTreeSet::new();
+    assert!(
+        jobs_required_jobs_need(&jobs, &none).is_empty(),
+        "with no required job nothing is needed"
+    );
+}
+
+/// The jobs `Lint` reports: its three parts.
+const LINT_PARTS: &[&str] = &["lint-clippy", "lint-fmt", "lint-gates"];
+
+/// `Lint` is an aggregator: it needs every part, runs when one failed, and its
+/// one step fails unless every part SUCCEEDED. The step's script is run here
+/// over each result a part can carry, so a check that read `skipped` or
+/// `cancelled` as passing, or that a part could leave, is a red.
+#[cfg(unix)]
+#[test]
+fn the_lint_aggregator_fails_unless_every_part_succeeded() {
+    let texts = workflow_texts();
+    let text = texts.get("ci.yml").expect("ci.yml is readable");
+    let jobs = jobs_of(text);
+    let (_, block) = jobs
+        .iter()
+        .find(|(id, _)| id == "lint")
+        .expect("ci.yml has a `lint` job");
+    assert_eq!(
+        job_reported_name("lint", block),
+        "Lint",
+        "the aggregator must report the required context `Lint`"
+    );
+    let mut needs = job_needs_of(block);
+    needs.sort();
+    assert_eq!(needs, LINT_PARTS, "`Lint` must need exactly its parts");
+    assert!(
+        matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL),
+        "`Lint` must carry `${{{{ {ALWAYS_CALL} }}}}` so a failed part and a cancelled run \
+         still run it"
+    );
+    for part in LINT_PARTS {
+        let (_, part_block) = jobs
+            .iter()
+            .find(|(id, _)| id == part)
+            .unwrap_or_else(|| panic!("ci.yml has no `{part}` job"));
+        assert!(
+            job_if_of(part_block).is_none() && job_needs_of(part_block).is_empty(),
+            "`{part}` must carry no job condition and no needs, so it runs on every event"
+        );
+    }
+    let jq = std::process::Command::new("jq").arg("--version").output();
+    assert!(
+        matches!(&jq, Ok(out) if out.status.success()),
+        "the aggregator's check reads `needs` with `jq`, and `jq` is not on PATH \
+         here ({jq:?}): install it to run this test"
+    );
+    let steps = step_blocks(block);
+    assert_eq!(steps.len(), 1, "`Lint` runs one step, the check");
+    let script = run_script_of(&steps[0]).expect("the check has a `run:` script");
+    // `run_script_of` keeps the text after `run:` on its first line, which for a
+    // literal block is the `|` indicator, not a command.
+    let script = match script.split_once('\n') {
+        Some((head, body)) if head.trim() == "|" => body.to_string(),
+        _ => script,
+    };
+
+    let needs_json = |results: &[(&str, &str)]| -> String {
+        let fields: Vec<String> = results
+            .iter()
+            .map(|(id, result)| format!("\"{id}\":{{\"result\":\"{result}\",\"outputs\":{{}}}}"))
+            .collect();
+        format!("{{{}}}", fields.join(","))
+    };
+    let run = |json: &str| -> bool {
+        std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&script)
+            .env("NEEDS", json)
+            .output()
+            .expect("bash runs the aggregator's check")
+            .status
+            .success()
+    };
+    fn all(result: &'static str) -> Vec<(&'static str, &'static str)> {
+        LINT_PARTS.iter().map(|p| (*p, result)).collect()
+    }
+    assert!(run(&needs_json(&all("success"))), "three successes pass");
+    for bad in ["failure", "cancelled", "skipped"] {
+        for part in LINT_PARTS {
+            let mut results = all("success");
+            for entry in results.iter_mut() {
+                if entry.0 == *part {
+                    entry.1 = bad;
+                }
+            }
+            assert!(
+                !run(&needs_json(&results)),
+                "`{part}` ending `{bad}` must red `Lint`"
+            );
+        }
+    }
+    assert!(
+        !run(&needs_json(&[
+            ("lint-gates", "success"),
+            ("lint-fmt", "success")
+        ])),
+        "a part missing from `needs` must red `Lint`"
+    );
+}
+
+/// The longest `timeout-minutes` a job-level `always()` job may carry.
+const ALWAYS_JOB_MAX_MINUTES: u32 = 5;
+
+/// The jobs whose job-level condition is exactly `always()` and that check out
+/// the tree, run cargo, or carry no `timeout-minutes` of at most
+/// [`ALWAYS_JOB_MAX_MINUTES`]. The time limit bounds the runner time however
+/// the work is spelled; the checkout and cargo markers name the usual cause.
+fn always_jobs_that_do_work(text: &str) -> Vec<String> {
+    jobs_of(text)
+        .into_iter()
+        .filter(|(_, block)| {
+            matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL)
+        })
+        .filter(|(_, block)| {
+            let short = block.lines().any(|line| {
+                line.strip_prefix("    timeout-minutes:")
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .is_some_and(|minutes| minutes <= ALWAYS_JOB_MAX_MINUTES)
+            });
+            !short
+                || block.contains("actions/checkout@")
+                || step_blocks(block)
+                    .iter()
+                    .any(|step| run_script_of(step).is_some_and(|run| run.contains("cargo ")))
+        })
+        .map(|(job, _)| job)
+        .collect()
+}
+
+/// A job-level `always()` sits only on a short job that checks out and builds
+/// nothing. The guard rules accept `always()`, and GitHub does not cancel a
+/// running job whose condition is `always()`, so a test shard behind it would
+/// keep its runner through every superseded push and every cancel.
+#[test]
+fn a_job_level_always_sits_only_on_a_short_job_that_builds_nothing() {
+    let mut carriers = 0usize;
+    let mut complaints: Vec<String> = Vec::new();
+    for (file, text) in workflow_texts() {
+        carriers += jobs_of(&text)
+            .iter()
+            .filter(|(_, block)| {
+                matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL)
+            })
+            .count();
+        for job in always_jobs_that_do_work(&text) {
+            complaints.push(format!("  {file} / {job}"));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "these jobs carry `{ALWAYS_CALL}` and check out the tree, run cargo or \
+         carry no `timeout-minutes` of at most {ALWAYS_JOB_MAX_MINUTES}:\n{}\n\nA \
+         running `{ALWAYS_CALL}` job is not cancelled with its run, so it holds its \
+         runner after every superseded push. Use `{JOB_IF_NOT_CANCELLED}`, which \
+         also runs the job when a dependency failed.",
+        complaints.join("\n")
+    );
+    assert!(
+        carriers >= 1,
+        "no job carries `{ALWAYS_CALL}`: the `Lint` aggregator does, so the reader \
+         is no longer finding it"
+    );
+    let job = |steps: &str| {
+        format!(
+            "jobs:\n  j:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n    timeout-minutes: 5\n    \
+             steps:\n{steps}"
+        )
+    };
+    assert_eq!(
+        always_jobs_that_do_work(&job(
+            "      - uses: actions/checkout@v4\n      - run: echo ok\n"
+        )),
+        vec!["j".to_string()],
+        "a checkout is work"
+    );
+    assert_eq!(
+        always_jobs_that_do_work(&job("      - run: cargo test -p alpha\n")),
+        vec!["j".to_string()],
+        "a cargo step is work"
+    );
+    assert!(
+        always_jobs_that_do_work(&job("      - run: echo ok\n")).is_empty(),
+        "a step that reads results is not"
+    );
+    let unbounded = job("      - run: echo ok\n").replace("    timeout-minutes: 5\n", "");
+    assert_eq!(
+        always_jobs_that_do_work(&unbounded),
+        vec!["j".to_string()],
+        "a job with no time limit is held to the default six hours"
+    );
+    let long = job("      - run: echo ok\n").replace("timeout-minutes: 5", "timeout-minutes: 6");
+    assert_eq!(
+        always_jobs_that_do_work(&long),
+        vec!["j".to_string()],
+        "a limit above {ALWAYS_JOB_MAX_MINUTES} minutes is refused"
+    );
 }
 
 /// No job reporting a required context can skip: not on an event its own
@@ -5375,6 +5667,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
     let mut pull_request_only_steps = 0usize;
     let mut all_pull_request_only_jobs = 0usize;
     let mut dependants = 0usize;
+    let mut needed = 0usize;
     let mut produced: BTreeSet<String> = BTreeSet::new();
     for (file, text) in workflow_texts() {
         let walk = walk_required_context_jobs(&file, &text, &contexts);
@@ -5388,6 +5681,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         pull_request_only_steps += walk.pull_request_only_steps;
         all_pull_request_only_jobs += walk.all_pull_request_only_jobs;
         dependants += walk.dependants;
+        needed += walk.needed;
         produced.extend(walk.produced);
     }
     assert!(
@@ -5431,13 +5725,13 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
     // pass: ten jobs of ci.yml and three of leak-guard.yml carry these names,
     // all thirteen carry steps, and six of them list a `needs:` set.
     assert!(
-        judged >= 13,
-        "only {judged} job(s) carry a name that produces a required context: \
-         the rules above are judging a population the reader is no longer \
-         finding"
+        judged >= 18,
+        "only {judged} job(s) carry a name that produces a required context \
+         or are needed by one: the rules above are judging a population the \
+         reader is no longer finding"
     );
     assert!(
-        step_judged >= 13,
+        step_judged >= 18,
         "only {step_judged} judged job(s) carry steps: the step rule is judging \
          a population the reader is no longer finding"
     );
@@ -5460,6 +5754,17 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         dependants >= 6,
         "only {dependants} judged job(s) list a `needs:` set: the guard rule is \
          judging a population the reader is no longer finding"
+    );
+    // `Lint` reports its three parts' results, and `period-park`, both test
+    // shard jobs, `crate-tests` and `viz-tests` need the path classifier
+    // `changes`, so those four jobs are judged too: the `judged` and
+    // `step_judged` floors above count them beside the fourteen jobs that
+    // carry a required name.
+    assert!(
+        needed >= 4,
+        "only {needed} job(s) are judged because a required job needs them: \
+         the three parts of `Lint` and `changes` are, so the transitive walk \
+         is no longer finding them"
     );
     // And the export is not stale in the other direction: a context no job
     // reports by name is a context nothing can ever red.

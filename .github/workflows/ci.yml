@@ -196,8 +196,8 @@ jobs:
   # on a pull request it would otherwise skip. `code`, `docs` and `pkgs` are the
   # test-impact selection and they SKIP test steps, so every rule behind them is
   # fail-closed. The rules, the reason token each one emits and a `--self-test`
-  # table live in `tools/scripts/ci_changed_paths.sh`, and `lint` runs that
-  # table.
+  # table live in `tools/scripts/ci_changed_paths.sh`, and `lint-gates` runs
+  # that table.
   #
   # PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` there
   # is no pull request to diff, and the classifier answers with EVERY package
@@ -677,31 +677,22 @@ jobs:
           KEY_B: ${{ steps['apt-repo'].outputs.key_b }}
           KEY_C: ${{ steps['apt-repo'].outputs.key_c }}
 
-  # Fast lint check — gates all other jobs
-  lint:
-    name: Lint
+  # LINT, IN FOUR JOBS. Three parts run side by side: `lint-gates` (every
+  # script gate and self-test, no compile), `lint-fmt` (rustfmt over the root
+  # workspace and every other one) and `lint-clippy` (the strict clippy run,
+  # which carries this lane's cache). `lint` is the one required context,
+  # `Lint`: it waits for the three and fails unless every one of them
+  # succeeded, so a part that failed, was cancelled or was skipped reds it.
+  # It carries `always()`, so it runs on a cancelled run too and reds there:
+  # the parts report no required context, and a skipped `Lint` would read as
+  # satisfied.
+  # `ci_test_coverage_test` holds the parts to the same rules as a required
+  # job and runs the aggregator's check over every result shape. Jobs that
+  # `needs: [lint]` wait for all three parts.
+  lint-gates:
+    name: Lint (gates)
     runs-on: ubuntu-latest
-    # `actions: write` is for the cache prune step only (it deletes stale
-    # entries of this job's cache namespace). Every other step needs read.
-    permissions:
-      contents: read
-      actions: write
-    # The limit covers runner setup, cache restore, cold compilation of the
-    # iroh tree (netd's `wan` is default-ON, so feature unification pulls it
-    # into `cargo clippy --workspace --all-targets`), the checks, and the cache
-    # save. A cold restore alone can take a quarter of an hour, and a job that
-    # dies before its cache save leaves the next run paying the same cost, so
-    # the budget is wide enough that one slow restore cannot strand it. This is
-    # still a bound, and the required checks and runner routing are unchanged.
-    timeout-minutes: 45
-    env:
-      # Clippy is pure analysis — debuginfo is dead weight, and the workspace's
-      # full-debug target outgrew the hosted runner's disk (after
-      # four large changes merged: every `Lint` run died with the runner's
-      # own "No space left on device" before it could even report). debug=0
-      # shrinks the lint target by tens of GB and composes with the disk-free
-      # step below; test jobs keep their own profiles untouched.
-      CARGO_PROFILE_DEV_DEBUG: "0"
+    timeout-minutes: 30
     steps:
       # `fetch-depth: 0` so the added-line dash gate below can diff against the
       # base it resolves. A shallow checkout does not carry it, and the gate
@@ -909,104 +900,6 @@ jobs:
           python3 tools/scripts/ci_cache_policy_check.py --self-test
           python3 tools/scripts/ci_cache_policy_check.py .github/workflows
 
-
-      # The workspace + restored target cache no longer fit ubuntu-latest's
-      # free disk alongside the preinstalled toolchains the workspace never
-      # uses. `ubuntu-latest` ships tens of GB of them, and reclaiming ~25 GB up
-      # front is what keeps this job off ENOSPC; the `df` lines make a
-      # regression diagnosable from the log.
-      - name: Free runner disk
-        if: runner.environment == 'github-hosted'
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - name: Cache cargo (restore)
-        id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
-            cargo-${{ runner.os }}-lint-main-
-            cargo-${{ runner.os }}-main-
-            cargo-${{ runner.os }}-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      # `cargo fmt --all` above covers ROOT-WORKSPACE members only. Everything
-      # else in the repo is its own workspace: `examples/go2` (21k lines the
-      # users of the demo actually read), each `benches/*`, each `examples/*`,
-      # and `crates/cerulion_core/fuzz`. None of it had ever been fmt-checked
-      # by anything. Four trees were dirty when this step was written.
-      #
-      # A WALK, not a hand list: a new bench or example is covered the day it
-      # lands, which is the same default-cover reasoning the test jobs use and
-      # the same failure mode (`a hand list goes stale`) this workflow keeps
-      # paying for. `cargo fmt` needs no build, so the whole sweep is seconds.
-      #
-      # SCOPE: the walk names the four TREES that exist today (`benches`,
-      # `examples`, `crates/cerulion_core/fuzz`, `crates/cerulion_android/android`). A brand-new
-      # top-level excluded tree would need a line here, visible in review,
-      # unlike a missing file inside a directory already swept.
-      - name: Check formatting (the workspaces the root does not cover)
-        run: |
-          set -uo pipefail
-          fail=0
-          checked=0
-          # WALK for workspace ROOTS, not a shallow glob. A one-level glob such
-          # as `benches/*/Cargo.toml` cannot see a nested root. Keying on
-          # `[workspace]` finds a root wherever it sits, so a bench or example
-          # added at any depth is covered the day it lands.
-          #
-          # `-not -path '*/target/*'`: a build artefact tree can hold vendored
-          # manifests, and fmt-checking one would report a diff nobody owns.
-          #
-          # EVERY tree is checked before the step fails, so one dirty tree does
-          # not hide the others.
-          while IFS= read -r manifest; do
-            grep -q '^\[workspace\]' "$manifest" || continue
-            echo "::group::cargo fmt --check ${manifest}"
-            cargo fmt --manifest-path "$manifest" --all -- --check || fail=1
-            echo "::endgroup::"
-            checked=$((checked + 1))
-          done < <(find benches examples crates/cerulion_core/fuzz crates/cerulion_android/android \
-                        -type f -name Cargo.toml -not -path '*/target/*' | sort)
-          # A walk that matched nothing would be a silent green. The floor is
-          # the exact number of roots in the tree (two under benches/latency,
-          # benches/wire-formats, eight examples, the fuzz crate, the Android
-          # sample's runtime crate), so losing any one of them trips it.
-          # Raise it in the commit that adds a root.
-          if [ "$checked" -lt 13 ]; then
-            echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
-            exit 1
-          fi
-          echo "fmt-checked ${checked} excluded workspace root(s)"
-          exit $fail
-
-      # THE WORKSPACE LINT. `dead_code` / `unused_imports` / `unused_variables`
-      # are DENY across the root workspace, and `--all-targets` puts every test
-      # and bench target under the same bar.
-      #
-      # It lives in `lint` rather than in a test job because it gates every
-      # other job: a clippy break should cost seconds of ubuntu time, not an
-      # hour of macOS. (`examples/go2` is outside the root workspace and gets its
-      # own strict clippy step inside the job that has already built it.)
-      - name: Run clippy (strict)
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
       # Grep-based lint — heap-allocation patterns in hot-path files
       # (transport/, the graph level executor, the scheduler) must carry an
       # explicit `// hot-path-alloc-ok:` / `-ok-fn:` / `-known:` annotation
@@ -1033,9 +926,9 @@ jobs:
       # the target), and a banned-token scan over the public agent docs.
       #
       # It was written, and then ran nowhere — the class this change exists to
-      # close. Pure bash, no cargo, ~0 s, and it belongs in `lint` for the same
-      # reason the hot-path lint above does: ubuntu minutes, fails in seconds,
-      # and gates every other job.
+      # close. Pure bash, no cargo, ~0 s, and it belongs in `lint-gates` for the
+      # same reason the hot-path lint above does: ubuntu minutes, fails in
+      # seconds, and reds `Lint`.
       #
       # It guards a real set now (the tree carries a root `AGENTS.md` plus one
       # per crate), and since the Linux lane landed it also carries a narrower
@@ -1077,9 +970,9 @@ jobs:
       # Which packages a change can reach: the touched packages plus their
       # reverse-dependency closure. The table is hand-built metadata documents
       # with their closures written out beside them, and the live rows run the
-      # walk over this workspace, so the step sits AFTER the toolchain install
-      # above rather than beside the other pure-python gates: those rows shell
-      # out to `cargo metadata`.
+      # walk over this workspace: those rows shell out to `cargo metadata
+      # --no-deps`, which the runner's preinstalled cargo answers, as it does
+      # for the `changes` job.
       - name: Selected-packages closure self-test
         run: python3 -B tools/scripts/ci_selected_packages.py --self-test
 
@@ -1103,7 +996,7 @@ jobs:
       # makes it a red on a pull request that never runs that package, and the
       # walker's `the_shard_check_runs_in_a_named_lint_step` arm fails if this
       # step is renamed, removed, given an argument, moved into another job or
-      # another workflow, or given an `if:` of its own, and if `lint` stops
+      # another workflow, or given an `if:` of its own, and if `lint-gates` stops
       # running on a pull request.
       - name: Shard partition and selection check
         run: ./tools/scripts/ci_test_shard.sh --check
@@ -1118,8 +1011,8 @@ jobs:
       # backed, and a tracker-id scrub that rewrote the inside of a test's
       # string literal. Each of those is a shape a script can see, so this
       # gate reports them as `file:line: class: message` findings with one
-      # remedy line per class, and it belongs in `lint` for the same reason the
-      # gates above do: pure python3 over `git ls-files`, no cargo, seconds.
+      # remedy line per class, and it belongs in `lint-gates` for the same reason
+      # the gates above do: pure python3 over `git ls-files`, no cargo, seconds.
       #
       # The same class also keeps a page in words (no pictograph: the emoji
       # planes, a curated set of sign and emoji-twin characters, and the
@@ -1223,14 +1116,140 @@ jobs:
           ./tools/scripts/check_pr_title.sh --self-test
           ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER" --author "$PR_AUTHOR"
 
-  # Cross-target type-check for aarch64-unknown-linux-gnu (the
-  # Jetson/Orin robotics deployment target). The monitor-wait/doorbell cfg-matrix
-  # code has per-(os,arch) construction sites; a variant constructed on EVERY cell
-  # except aarch64-linux trips `dead_code = deny` ONLY there — invisible to the
-  # x86_64-linux + macOS-aarch64 runners above (and to local x86_64-linux and
-  # aarch64-macOS machines). `cargo check` (no link; the cross C compiler is for
-  # ring's build script) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
-  # cost on the critical path.
+  lint-fmt:
+    name: Lint (fmt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # `cargo fmt --all` above covers ROOT-WORKSPACE members only. Everything
+      # else in the repo is its own workspace: `examples/go2` (21k lines the
+      # users of the demo actually read), each `benches/*`, each `examples/*`,
+      # and `crates/cerulion_core/fuzz`. None of it had ever been fmt-checked
+      # by anything. Four trees were dirty when this step was written.
+      #
+      # A WALK, not a hand list: a new bench or example is covered the day it
+      # lands, which is the same default-cover reasoning the test jobs use and
+      # the same failure mode (`a hand list goes stale`) this workflow keeps
+      # paying for. `cargo fmt` needs no build, so the whole sweep is seconds.
+      #
+      # SCOPE: the walk names the four TREES that exist today (`benches`,
+      # `examples`, `crates/cerulion_core/fuzz`, `crates/cerulion_android/android`). A brand-new
+      # top-level excluded tree would need a line here, visible in review,
+      # unlike a missing file inside a directory already swept.
+      - name: Check formatting (the workspaces the root does not cover)
+        run: |
+          set -uo pipefail
+          fail=0
+          checked=0
+          # WALK for workspace ROOTS, not a shallow glob. A one-level glob such
+          # as `benches/*/Cargo.toml` cannot see a nested root. Keying on
+          # `[workspace]` finds a root wherever it sits, so a bench or example
+          # added at any depth is covered the day it lands.
+          #
+          # `-not -path '*/target/*'`: a build artefact tree can hold vendored
+          # manifests, and fmt-checking one would report a diff nobody owns.
+          #
+          # EVERY tree is checked before the step fails, so one dirty tree does
+          # not hide the others.
+          while IFS= read -r manifest; do
+            grep -q '^\[workspace\]' "$manifest" || continue
+            echo "::group::cargo fmt --check ${manifest}"
+            cargo fmt --manifest-path "$manifest" --all -- --check || fail=1
+            echo "::endgroup::"
+            checked=$((checked + 1))
+          done < <(find benches examples crates/cerulion_core/fuzz crates/cerulion_android/android \
+                        -type f -name Cargo.toml -not -path '*/target/*' | sort)
+          # A walk that matched nothing would be a silent green. The floor is
+          # the exact number of roots in the tree (two under benches/latency,
+          # benches/wire-formats, eight examples, the fuzz crate, the Android
+          # sample's runtime crate), so losing any one of them trips it.
+          # Raise it in the commit that adds a root.
+          if [ "$checked" -lt 13 ]; then
+            echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
+            exit 1
+          fi
+          echo "fmt-checked ${checked} excluded workspace root(s)"
+          exit $fail
+
+  lint-clippy:
+    name: Lint (clippy)
+    runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
+    # The limit covers runner setup, cache restore, cold compilation of the
+    # iroh tree (netd's `wan` is default-ON, so feature unification pulls it
+    # into `cargo clippy --workspace --all-targets`), clippy, and the cache
+    # save. A cold restore alone can take a quarter of an hour, and a job that
+    # dies before its cache save leaves the next run paying the same cost, so
+    # the budget is wide enough that one slow restore cannot strand it.
+    timeout-minutes: 45
+    env:
+      # Clippy is pure analysis: debuginfo is dead weight, and the workspace's
+      # full-debug target outgrew the hosted runner's disk (after
+      # four large changes merged: every `Lint` run died with the runner's
+      # own "No space left on device" before it could even report). debug=0
+      # shrinks the lint target by tens of GB and composes with the disk-free
+      # step below; test jobs keep their own profiles untouched.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The workspace + restored target cache no longer fit ubuntu-latest's
+      # free disk alongside the preinstalled toolchains the workspace never
+      # uses. `ubuntu-latest` ships tens of GB of them, and reclaiming ~25 GB up
+      # front is what keeps this job off ENOSPC; the `df` lines make a
+      # regression diagnosable from the log.
+      - name: Free runner disk
+        if: runner.environment == 'github-hosted'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-lint-main-
+            cargo-${{ runner.os }}-main-
+            cargo-${{ runner.os }}-
+
+      # THE WORKSPACE LINT. `dead_code` / `unused_imports` / `unused_variables`
+      # are DENY across the root workspace, and `--all-targets` puts every test
+      # and bench target under the same bar.
+      #
+      # It lives in `lint-clippy` rather than in a test job: a clippy break
+      # reds `Lint` in minutes of ubuntu time, not an hour of macOS. (`examples/go2` is outside the root workspace and gets its
+      # own strict clippy step inside the job that has already built it.)
+      - name: Run clippy (strict)
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
       - name: Cache cargo (prune the namespace to the current key)
@@ -1260,6 +1279,46 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
+  lint:
+    name: Lint
+    needs: [lint-gates, lint-fmt, lint-clippy]
+    # `always()` so a FAILED part, and a cancelled run, still run this job,
+    # which then fails on it: without it GitHub would skip `Lint`, and a
+    # skipped required context reads as satisfied.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Every part must have SUCCEEDED: `failure`, `cancelled` and `skipped`
+      # all red this job, and so does a part missing from `needs` (the count
+      # below). `ci_test_coverage_test` runs this script over each shape.
+      - name: Every part of Lint passed
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          parts=$(printf '%s' "$NEEDS" | jq 'length')
+          if [ "$parts" -ne 3 ]; then
+            echo "::error::Lint has ${parts} parts; expected 3 (lint-gates, lint-fmt, lint-clippy)"
+            exit 1
+          fi
+          bad=$(printf '%s' "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(" ")')
+          if [ -n "$bad" ]; then
+            echo "::error::Lint parts that did not succeed: ${bad}"
+            exit 1
+          fi
+          echo "every part of Lint succeeded"
+
+  # Cross-target type-check for aarch64-unknown-linux-gnu (the
+  # Jetson/Orin robotics deployment target). The monitor-wait/doorbell cfg-matrix
+  # code has per-(os,arch) construction sites; a variant constructed on EVERY cell
+  # except aarch64-linux trips `dead_code = deny` ONLY there, invisible to the
+  # x86_64-linux + macOS-aarch64 runners above (and to local x86_64-linux and
+  # aarch64-macOS machines). `cargo check` (no link; the cross C compiler is for
+  # ring's build script) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
+  # cost on the critical path.
   cross-aarch64-linux:
     name: Cross-check (aarch64-linux)
     runs-on: ubuntu-latest
@@ -1932,7 +1991,7 @@ jobs:
       actions: write
     timeout-minutes: 30
     env:
-      # Same ENOSPC class as the lint job (see its comment): each example
+      # Same ENOSPC class as the `lint-clippy` job (see its comment): each example
       # workspace compiles the full cerulion_core dep tree into its own
       # target dir, and debuginfo is dead weight for a type-check.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -2109,7 +2168,7 @@ jobs:
       actions: write
     timeout-minutes: 40
     env:
-      # Same ENOSPC class as the lint/examples jobs: this workspace compiles
+      # Same ENOSPC class as the lint-clippy/examples jobs: this workspace compiles
       # its own copy of the cerulion_core + iceoryx2 + rustdds tree into its
       # own target dir, and debuginfo is dead weight for a test run.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -2198,14 +2257,14 @@ jobs:
       - name: cargo build --tests (every target, no GStreamer installed)
         run: cd examples/go2 && cargo build --workspace --tests
 
-      # CLIPPY, in the job that already has the tree compiled. `lint`'s
+      # CLIPPY, in the job that already has the tree compiled. `lint-clippy`'s
       # `cargo clippy --workspace` covers ROOT-workspace members only, so the
       # demo's 21k lines — the code a user of the Go2 demo reads and copies —
       # had no lint gate at all, while the root workspace runs `dead_code`,
       # `unused_imports` and `unused_variables` at DENY.
       #
-      # Here rather than in `lint` because this job has already paid for the
-      # build (`lint` would otherwise pay a second cold compile of
+      # Here rather than in `lint-clippy` because this job has already paid for
+      # the build (`lint-clippy` would otherwise pay a second cold compile of
       # the iceoryx2 + rustdds tree). Measured clean at `-D warnings` on the
       # committed tree, so it ships blocking with no crate-level `allow`s and
       # no exceptions.
@@ -5491,7 +5550,7 @@ jobs:
     # request cannot merge past.
     timeout-minutes: 30
     env:
-      # Same ENOSPC class as the lint job (see its comment): rustdoc's dep
+      # Same ENOSPC class as the `lint-clippy` job (see its comment): rustdoc's dep
       # builds don't need debuginfo either, and this job restores the same
       # ever-growing target cache.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -5530,13 +5589,13 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
-  # `wan` went DEFAULT-ON, so the workspace `lint` clippy + the
+  # `wan` went DEFAULT-ON, so the workspace `lint-clippy` clippy + the
   # `docs` job now ALSO compile netd's iroh tree via feature unification — this
   # dedicated job is now belt-and-suspenders (its explicit `--features wan`
   # invocations are redundant-but-harmless) PLUS the lean-variant rot-guard: it lints
   # the `--no-default-features` (zenoh-only) build so the opt-out path keeps
   # compiling. It still compiles the iroh tree COLD on its own budget, keeping the
-  # explicit-feature + lean-variant analysis OFF the tight `lint`/`docs` gates. Pure
+  # explicit-feature + lean-variant analysis OFF the tight `lint-clippy`/`docs` gates. Pure
   # analysis (clippy + doc), so no debuginfo. It gates NO other job.
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
@@ -5659,7 +5718,7 @@ jobs:
   # test files, so treat them as as-of-this-PR snapshots rather than facts to
   # re-verify.
   #
-  # WHY THIS JOB EXISTS. `cargo clippy --workspace --all-targets` (the `lint`
+  # WHY THIS JOB EXISTS. `cargo clippy --workspace --all-targets` (the `lint-clippy`
   # job) COMPILES every viz test target, so a compile break was always caught —
   # but no job EXECUTED a viz test binary other than the two the predecessor job
   # named, so a FAILING ASSERTION shipped green. A pin that cannot fail a PR is
@@ -5914,7 +5973,7 @@ jobs:
     # That 40 was set for a Linux-only job building TWO test binaries against a
     # WARM cache; this builds 29, and while it still had a macOS leg that leg
     # was the first job in the workflow ever to
-    # cold-compile the rerun tree (`lint`,
+    # cold-compile the rerun tree (`lint-clippy`,
     # which compiles it via `clippy --all-targets`, is ubuntu-only). Both test
     # jobs were raised 45 → 55 for exactly that reason on the iroh tree. A
     # cold-cache timeout is self-sustaining — the job dies before `actions/cache`
@@ -5936,7 +5995,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Linux-only: the rerun SDK tree needs link headroom on the stock runner
-      # (the demos-go2/lint ENOSPC class). macOS runners have ample disk.
+      # (the demos-go2/lint-clippy ENOSPC class). macOS runners have ample disk.
       #
       # This is `test-linux`'s FULLER reclaim, not the predecessor job's shorter
       # one, because the two changes that came with this job both push the other
@@ -5973,7 +6032,7 @@ jobs:
       #
       # The two real reasons:
       #   1. PROFILE. The shared key is a single namespace that five jobs write
-      #      under at different `CARGO_PROFILE_DEV_DEBUG` settings (`lint` and
+      #      under at different `CARGO_PROFILE_DEV_DEBUG` settings (`lint-clippy` and
       #      `docs` at "0", `test-linux` and `test-macos` at
       #      `line-tables-only`). Every mismatch re-fingerprints and rebuilds
       #      what it restored. A private namespace means this job's `line-tables-only`

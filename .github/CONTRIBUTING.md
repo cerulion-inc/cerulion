@@ -182,7 +182,7 @@ CLI subcommand, or fixing a docs gap you hit during setup.
    ```bash
    git checkout -b fix/topic-hz-panic
    ```
-   CI checks this (`tools/scripts/check_pr_title.sh`, in the `lint` job). You can
+   CI checks this (`tools/scripts/check_pr_title.sh`, in the `Lint` check). You can
    run it yourself first:
    ```bash
    ./tools/scripts/check_pr_title.sh --title "fix(cli): stop topic hz panicking" \
@@ -314,7 +314,7 @@ and we'll help.
 - **PR titles must be [Conventional Commits](https://www.conventionalcommits.org/)**
   in the form `<type>(<scope>): <description>`, e.g. `fix(transport): handle empty payload`
   or `docs: clarify setup steps`. This is checked by
-  `tools/scripts/check_pr_title.sh` in CI's `lint` job, not by hand: we squash-merge,
+  `tools/scripts/check_pr_title.sh` in CI's `Lint` check, not by hand: we squash-merge,
   so the PR title becomes the commit message on `main`. The same script checks
   the branch name (step 2 of the flow above), and both are runnable locally.
   Individual commit titles inside the PR are not gated, only the PR title is.
