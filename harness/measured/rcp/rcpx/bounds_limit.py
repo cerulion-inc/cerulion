@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The only things that lower a motion: stated limits (round six, contract C3; the design rulings, b, c).
+"""The only things that lower a motion: stated limits.
 
 First part: pure functions over stated facts (gave, same_kind, stated_limit, solve, arrival); they read no robot,
 no world and no scene. Second part: what gathers the facts for the two methods of rcpx.bounds.Bounds
@@ -65,7 +65,7 @@ def _force(value):
 
 
 def gave(fixed, moved_m, rigid_m):
-    """True when a stop is a give (C3 (4)): a thing the session holds as fixed (the support, a fixture, a part
+    """True when a stop is a give: a thing the session holds as fixed (the support, a fixture, a part
     past its stated travel) moved by more than the rigid travel the body can tell. A free thing that moved under
     a pick, a push, a set down or an expected contact meant to take it is not held as fixed and records no give."""
     return bool(fixed and moved_m is not None and moved_m > rigid_m)
@@ -135,7 +135,7 @@ def stated_limit(intent=None, expected=False, thing=None, sheet=None, gives=(), 
             out.update(malformed=bad[0], malformed_check=bad[1], evidence=f"{bad[0]}; {out['evidence']}")
         return out
     limit, source, evidence, _ = min(terms, key=lambda t: t[0]) if terms else (None, None, None, None)
-    # the least LIMIT among them (the design rulings: never over this, the strike of the way in included): everything stated
+    # the least LIMIT among them (never over this, the strike of the way in included): everything stated
     # but a force_n (each term's last entry says so), which is the force a stroke pushes with or a touch ends at;
     # the least limit is what holds the arm's links
     limits = [t for t in terms if not t[-1]]
@@ -162,7 +162,7 @@ def stated_limit(intent=None, expected=False, thing=None, sheet=None, gives=(), 
 
 
 def carried(held):
-    """The limit somebody stated for the thing held (the hold's record, C8: limit_n and limit_source), as a
+    """The limit somebody stated for the thing held (the hold's record: limit_n and limit_source), as a
     stated limit on every leg that carries it: {"limit_n", "source", "evidence"}, or None when the
     record states none."""
     value = _force(held.get("limit_n")) if isinstance(held, dict) else None
@@ -267,7 +267,7 @@ def arrival(limit_n, source, f_guard, z, v_tell, shown_by=None, v_most=None, flo
 
 # ---------------------------------------------------------------- gathering the facts (the two methods of Bounds)
 def gather_limit(B, thing=None, intent=None, expected=False):
-    """C3: {"limit_n", "source", "evidence"}: the least limit somebody STATED on a contact with the thing
+    """{"limit_n", "source", "evidence"}: the least limit somebody STATED on a contact with the thing
     (expected true) or on a free motion; limit_n None when nothing is stated. Gathers the facts for
     rcpx.bounds_limit.stated_limit: the call's intent, the sheet the session serves for a thing the call
     names, this session's gives, the site, the body's stated rating, people."""
@@ -291,10 +291,10 @@ def gather_limit(B, thing=None, intent=None, expected=False):
 
 
 def gather_arrival(B, limit_n, source, q, u, held=None, f_guard_n=None, floor=None):
-    """C3: {"v_m_s", "kept", "shown_by", "seek", "strike_n", "f_guard_n", "text"}: the speed at which a contact
+    """{"v_m_s", "kept", "shown_by", "seek", "strike_n", "f_guard_n", "text"}: the speed at which a contact
     under limit_n is met at q along u. The guard's level is the contact threshold at the arrival's own speed with
     the arm at rest, under a known hold no less than the hold's level; a hold whose load is not read yet (hold
-    first, C8) has no contact threshold on its one leg. f_guard_n: the threshold the leg's guard runs with, when
+    first) has no contact threshold on its one leg. f_guard_n: the threshold the leg's guard runs with, when
     the caller has derived that guard (a plan does, after it is timed: its fastest stretch and its largest
     acceleration set it). Over the level at rest the arrival is solved again with it, and never comes out
     faster than the arrival at rest. floor: None for a limit; for the force at which a touch ends the
@@ -340,8 +340,8 @@ def moving_point(B, q, point, qd=None):
 
 def link_arrival(B, q, point, u, limit_n, source, held=None, f_guard_n=None, qd=None):
     """The arrival of ONE moving point of the arm that is no tool point (a link) under a stated limit: B.arrival's
-    answer with that point's own Jacobian, so with its own stop slope along its own travel u (the design rulings: a
-    link's strike is held under a stated limit; the design rulings: a limit stated on a call binds every leg of it): the energy
+    answer with that point's own Jacobian, so with its own stop slope along its own travel u (a
+    link's strike is held under a stated limit; a limit stated on a call binds every leg of it): the energy
     bound at the leg's joint step qd (moving_point). The contact level is the arm's own (the guard reads one
     estimate for the whole arm)."""
     with moving_point(B, q, point, qd):
@@ -350,7 +350,7 @@ def link_arrival(B, q, point, u, limit_n, source, held=None, f_guard_n=None, qd=
 
 def hold_of(stated):
     """The LIMIT in what stated_limit (or carried) answers, {limit_n, source, evidence}, or None: the least of
-    max_n, gentle, a sheet, the site, a rating, people, a give, the limit of a thing held (the design rulings: never
+    max_n, gentle, a sheet, the site, a rating, people, a give, the limit of a thing held (never
     over this, the strike of the way in included). A force_n is none: it is the force a stroke pushes with or a
     touch ends at and holds no link."""
     if "hold" in stated:
@@ -393,7 +393,7 @@ def whole(free_limit, shown):
 
 # ---------------------------------------------------------------- what a plan reads (rcpx/bounds_plan.py)
 def expects(B, expect, intent, kinds, targets):
-    """One expected contact (C9) per path segment, or None. expect: a list with one entry per segment, or one
+    """One expected contact per path segment, or None. expect: a list with one entry per segment, or one
     dict for the last stretch; with none given, intent expect "contact" (or a dict there) marks the last stretch
     (the trailing segments of the last kind and target) with the bound B.stated_limit states for its target."""
     n = len(kinds)
@@ -416,7 +416,7 @@ def expects(B, expect, intent, kinds, targets):
 
 def region(B, expect):
     """(the Thing or point an expected contact is with, the region's radius m); (None, 0) for whatever lies ahead.
-    The radius is what the caller states (C9: the spot's own error plus the tool's half width; with none stated,
+    The radius is what the caller states (the spot's own error plus the tool's half width; with none stated,
     the tool's half width) plus BAND times the thing's own measured error: a thing may stand that much nearer
     than its stored place, and the limit's speed must hold where it is met."""
     ref = expect.get("with")
@@ -459,7 +459,7 @@ def assumed(cache):
 
 
 def sought(expect, seeks):
-    """The expect a plan hands to its guard (C9): the caller's own, with seek false when the arrival under its
+    """The expect a plan hands to its guard: the caller's own, with seek false when the arrival under its
     bound says the contact is not sought by force (a sheet's, a rating's, the site's or a give's limit at or under
     the guard's level): the leg then ends at its planned height."""
     if expect is None or seeks.get(id(expect), True) or not expect.get("seek", True):
@@ -468,7 +468,7 @@ def sought(expect, seeks):
 
 
 def gentle_fact(B, q, u, held, path_m, time_s):
-    """What the price is told of the word gentle (C2): the force a stop makes at the speed gentle would run here
+    """What the price is told of the word gentle: the force a stop makes at the speed gentle would run here
     (the hand's own weight where that speed keeps it; more where gentle runs at the tell speed, said as it is),
     and that speed under the key v_tell."""
     hand = B.f_hand()

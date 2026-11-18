@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Side words (SPEC-R3.md 3.4): robot-relative directions from the base axis and gravity, and one device-relative
+"""Side words: robot-relative directions from the base axis and gravity, and one device-relative
 direction (front). Pure: numbers in, words and unit vectors out; nothing here reads a device, a robot name or a scene.
 
-Frame B (SPEC.md section 0): x forward, y left, z up, in mm. A "thing" is a point in B (a located point, a contact).
+Frame B: x forward, y left, z up, in mm. A "thing" is a point in B (a located point, a contact).
 
     radial(p_mm)                 the horizontal unit vector from the base axis to p; +x within RADIAL_NEAR_MM
     side_vector(side, p_mm)      robot_side = -r, far_side = +r, left = z x r, right = -(z x r), above = +z
@@ -80,7 +80,7 @@ def angle_deg(a, b):
 
 
 def words(h, p_mm):
-    """A direction h at the thing p in words, by its angle to r (SPEC-R3 3.4): a mostly vertical h (|h_z| over
+    """A direction h at the thing p in words, by its angle to r: a mostly vertical h (|h_z| over
     VERTICAL_Z of its length) is "up" or "down"; else the horizontal part's angle to r: within AWAY_DEG "away from
     the robot", TOWARD_DEG or more "toward the robot", else "to the robot's left" or "to the robot's right" by the
     sign of z . (r x h)."""

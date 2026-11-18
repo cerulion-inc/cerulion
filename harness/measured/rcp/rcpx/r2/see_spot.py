@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package see_spot (round six, the design notes C11; RULINGS-R6 the design rulings): a pixel becomes a point, a thing, a
+"""Package see_spot: a pixel becomes a point, a thing, a
 part, a wall and an opening, with no motion and no control period. No tools of its own: rcpx/r2/place_point.py
 resolves every spot of the whole-step tools through spot(), and a mark on a scene look reads its point here.
 
@@ -24,7 +24,7 @@ Sources of a pixel's point, the first that exists:
 A depth point that lies inside the robot's own hulls at the look's joint pose is the robot's own (a 3D test) and
 is no surface of the world: the next source is asked and the answer says so.
 A pixel where two surfaces meet within one pixel is read as the surface its COLOUR shows, from the picture around
-it (shows(), the design rulings): the depth under such a pixel is one sample inside it, of either surface; where the colours
+it (shows()): the depth under such a pixel is one sample inside it, of either surface; where the colours
 do not tell the two apart, see_cloud's own reading stands (the nearer surface within one pixel).
 
 spot = {"point_m": [x, y, z] (base frame; always present: where the pointed ray lands),
@@ -41,13 +41,13 @@ spot = {"point_m": [x, y, z] (base frame; always present: where the pointed ray 
                   absent,
         "doubt": [text, ...], "remove_by": {"tool", "args"} or None, "periods": 0, "looks": [ids],
         "names": {"by": "the pixel lies on it" | "within the spot's own error" | (role part) "it closes the
-                 pixel's level in on every side", "distance_m", "error_m", "on_bare_support" (a place, the design rulings)}
-                 when the extent is a thing (rcpx/r2/place_near.py, the design rulings: a pixel on a level names the ONE thing
+                 pixel's level in on every side", "distance_m", "error_m", "on_bare_support" (a place)}
+                 when the extent is a thing (rcpx/r2/place_near.py, a pixel on a level names the ONE thing
                  whose seen pixels lie within sigma_m.across of it, across the view; a place only on the support),
         "answer": roles pick and part, where the look shows the pointed place EMPTY (place_near's five
                   conditions): {"empty": True, "why": "none" | "two", "near": [{"look", "px", "distance_mm",
                   "narrow_mm", "wide_mm", "top_mm"}], "marked", "crop", "crop_box_px", "crop_scale"}: the tool that
-                  gets it moves nothing and says so, with the look's help (the design rulings: the look's own picture with
+                  gets it moves nothing and says so, with the look's help (the look's own picture with
                   the pixel and each near entry marked, a crop around the pixel),
         "near": a place pixel on bare support that names no thing: what the look shows near it, rows as above,
         "not_answered": the conditions that failed, when no thing is named and the tool acts on the point,
@@ -358,7 +358,7 @@ def _typed(ex, value, role="pick"):
         return refusal("spot", "a point is [x, y, z] in base frame mm", "or point in a look: " + HOW)
     out = _no_error({"point_m": [float(x) for x in p], "source": "the point you gave", "doubt": [], "remove_by": None,
                      "periods": 0, "looks": []})
-    try:                        # what the newest look that shows the point shows there (C11); no motion
+    try:                        # what the newest look that shows the point shows there; no motion
         out["shown"], ans = place_near.shown(ex, p, role)
     except Exception as exc:
         out["shown"], ans = {"look": None, "age_s": None, "acts_since": None, "extent": "not in any look",
@@ -510,7 +510,7 @@ def _from_depth(ex, rec, key, fixed, u, v, role, o, d, of_ray=None):
         if role in ("pick", "part") and not low:     # what the level reading found: the condition that failed
             low = (e.get("why", "no level is seen below it") + f" within {SC.REACH * hand['open_m'] * MM:.0f} mm of it "
                    "across the view: the look cannot say the place is bare support")
-        if low:                 # (the design rulings: never answered then; the doubt says which condition failed)
+        if low:                 # (never answered then; the doubt says which condition failed)
             out["not_answered"] = [low]
             out["doubt"].append(low + ". The hand goes to the point with the contact stop armed")
         out["remove_by"] = out["remove_by"] or _other_camera(ex, rec, fixed)

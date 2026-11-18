@@ -16,7 +16,7 @@ pointed in (see_cloud.component: the points extent() took as the thing) and give
 Each way says how far its middle lies from the pixel's own point. Which of them fits the hand, and which this arm
 can take, is place_grasp.choose's to say. No size, name or pose of any thing is typed: the lengths are the hand's
 own (see_spot.hand_of: pad, finger, opening), the look's own (one pixel's footprint, the depth's stated error) and
-the named ratios. Clouds are read only through the frozen functions of see_spot and see_cloud (C11). No motion, no
+the named ratios. Clouds are read only through the frozen functions of see_spot and see_cloud. No motion, no
 control period. Nothing here reads ground truth or names a robot. Lengths m, angles rad, the level axes of
 see_cloud.axes_of(up) (the base x and y where up is the base z).
 """

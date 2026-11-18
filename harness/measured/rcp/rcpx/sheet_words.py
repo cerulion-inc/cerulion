@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Sheet words (SPEC-R3.md 3.6): what the robot://devices document says, read the same way by every package. Pure:
+"""Sheet words: what the robot://devices document says, read the same way by every package. Pure:
 the document as served (rcpx.context_devices.device_knowledge, any level) and text in, dicts out. Nothing here
 names a device or a part: every rule reads a part's OWN entry (text in another part's entry never counts).
 
@@ -190,7 +190,7 @@ def _close_state(plist):
 
 
 def goal_states(sentence, doc):
-    """The goal states of a task sentence, in sentence order (SPEC-R3 3.6 table): open or opened gives open; close,
+    """The goal states of a task sentence, in sentence order: open or opened gives open; close,
     closed or shut gives whichever of closed or shut a part's states list holds; "turn ... on", "switch ... on" or a
     clause's last word "on" gives on (the same for off); onto, into or inside with a mark part on the device gives
     the object's state that starts with in_. Nothing matched: [None]."""
@@ -305,7 +305,7 @@ def _fmt(x):
 
 
 def do_line(part, doc, tools, body=None, f0_n=None):
-    """The do line of one part (rules D1 to D7 of SPEC-R3 3.6, the first that fits); None for no part (D8).
+    """The do line of one part (rules D1 to D7, the first that fits); None for no part.
     part: a parts() entry (or a part name); tools: the names the session loads and lists or reaches through use;
     body: robot://body (the D5 route's surface); f0_n: retained for callers, ignored."""
     plist = parts(doc)

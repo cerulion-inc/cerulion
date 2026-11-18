@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package frames (I29, SPEC-R2.md section 3): frames any model and any camera can act on.
+"""Package frames: frames any model and any camera can act on.
 
-- Post hook on look and standard_look, BRIEF by default (FINDINGS S1: a look must stay small): image_dirs (the
+- Post hook on look and standard_look, BRIEF by default (a look must stay small): image_dirs (the
   nearest base move_tip argument for image right, left, up and down, and mm per 10 px at the tip), world_px (the
   stored points inside the picture: id, label, px, stale), camera_rides_with_tip, detail (what full adds), and the
   arrows drawn on a NEW file beside the round one annotated frame (annotated_axes; the annotated frame is untouched
@@ -22,7 +22,7 @@ without changing them.
 
 Surface note: the extends mechanism adds arguments but cannot drop u and v from mark's required list, so this
 package serves a whole mark entry of the same name (the round one entry plus the new formats, u and v optional);
-SPEC-CHANGES.md carries the request for an extends key that relaxes required.
+An extends key that relaxes required is not supported.
 """
 
 import copy

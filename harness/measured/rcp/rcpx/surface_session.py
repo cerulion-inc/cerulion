@@ -9,7 +9,7 @@ session side is rcpx/server_edge.py).
 - DETAIL_VALUES: every call takes detail ("brief" or "full"), a session argument (rcpx/server_edge.py).
 - dark_rule(tool names, cannot): the hint a dark refusal carries, naming only tools the session has.
 
-Round four (SPEC-R4 A3, A5, A6): numbers a text shows are the session's, never typed.
+Numbers a text shows are the session's, never typed.
 - SLOTS: the words a tool table holds where the runtime knows a number. facts(ex) reads this session's values
   from its bounds (rcpx.bounds.of on the real executor: bounds_of), each with the source word of the getter;
   render(obj, facts) puts "(about VALUE UNIT ..., SOURCE)" behind the first use of each phrase in every text;
@@ -47,7 +47,7 @@ def dark_rule(tool_names, cannot=False):
 
 
 # Ruling 3: calls that only compute on stored looks or the model and move nothing do not spend the call budget.
-# compare (SPEC-R3 C7): it reads two stored looks and moves nothing.
+# compare: it reads two stored looks and moves nothing.
 FREE_TOOLS = ("crop", "mark", "triangulate", "verify", "reach_check", "picture", "device_state", "compare")
 # A tool that reports the seconds it waited on the world under its own key (waiting is world time).
 WORLD_WAIT_KEYS = {"wait_for_light": "waited_s"}
@@ -79,8 +79,8 @@ SOURCE_WORDS = {"rating": "from its ratings", "model": "from its model, not yet 
                 "intent": "as you stated", "stated": "as the owner stated", "prior": "a prior: nothing is known yet",
                 "site": "the site's limit"}
 GUARDED_RETIRED = ("guarded is retired: the contact stop is always armed; look, then say clear: true to state "
-                   "that the way is clear")   # SPEC-R4 A6: said once per session to a call that passes guarded false
-# The refusals round four adds to the list an operator can meet (SPEC-R4 A3, A4.5, A2): check -> what it means and
+                   "that the way is clear")   # said once per session to a call that passes guarded false
+# The refusals round four adds to the list an operator can meet: check -> what it means and
 # what its hint holds. The session makes sure a clear_needs_look hint holds the look call (look_hint).
 REFUSALS = {
     "clear_needs_look": "the word clear (or a speed above RCP's offer) with no look you were shown that is newer "

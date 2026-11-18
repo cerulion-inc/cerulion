@@ -6,7 +6,7 @@ core move runs under is asked here, and nowhere in the core is one typed.
   move it is; the plan that comes back is slowed only where the bounds say why (an expected thing's band, unseen
   space, a stated limit), and its items name each bound's source.
 - The contact stop is armed on every move with the guard spec B.guard derives; there is no switch.
-- A move that starts where the tool last bore on something tells its guard so (the design rulings, _bplan and control_tail
+- A move that starts where the tool last bore on something tells its guard so (_bplan and control_tail
   .start_of): the load it stands with is the baseline, a move away from the thing is not ended by that thing and
   keeps the thing's stated limit until the contact has ended, a move into it is a press and is priced as one.
 - What the operating model states (a lower speed, clear after a look, contact expected at the end) goes to the
@@ -32,7 +32,7 @@ import numpy as np
 from rcpx import control_expect, control_move_pace, control_move_price, control_tail
 from rcpx.context import refusal
 from rcpx.control_base import MM, _mm, _ratio, _val
-from rcpx.control_expect import MEETS, _attr, _hold_module, _unit  # noqa: F401  (MEETS: its home since the design rulings)
+from rcpx.control_expect import MEETS, _attr, _hold_module, _unit  # noqa: F401  (MEETS: its home is control_expect)
 
 FD_EPS = 1e-5        # numeric: rad, the finite-difference step of the point Jacobians
 DOWN = np.array([0.0, 0.0, -1.0])
@@ -138,7 +138,7 @@ class SpeedMixin:
 
     # ------------------------------------------------------------------ what is held
     def _held_for(self, held=None):
-        """The hold in force (C8, C10): the core's one record (control_hold.held). A caller adds only "extent"
+        """The hold in force: the core's one record (control_hold.held). A caller adds only "extent"
         (what the held thing adds below the tip and its half width); it never states a mass."""
         rec = _hold_module().held(self)
         if rec is not None and isinstance(held, dict) and held.get("extent") is not None:
@@ -284,7 +284,7 @@ class SpeedMixin:
     def _quiet(self, s, need_m):
         """True when the force at rest, less what the hand holds, is under the contact level in force (the hold's
         own level while holding) and the motion still left over one detection time is under need_m, what the
-        next step needs of the pose (A4.8, C10)."""
+        next step needs of the pose."""
         hold = _hold_module()
         if hold is not None:
             calm = hold.rest_force(self, s) <= hold.level(self)
@@ -304,7 +304,7 @@ class SpeedMixin:
         return _val(self.bounds.rigid(q, _unit(self.model.fk_tip(q)[1][:, 0])))
 
     def _arrive(self):
-        """Before a call acts where the hand stands (C10): hold the pose the hand was told to reach until the
+        """Before a call acts where the hand stands: hold the pose the hand was told to reach until the
         measured tip speed times the detection time is under the body's still band, under a guard derived for
         the hand's measured speed (the lag tail of a move that did not wait is guarded: control_tail.arrive). It
         ends without that, by motion alone, when the hand gets no stiller. Returns the control periods waited
@@ -319,7 +319,7 @@ class SpeedMixin:
         return None if left is None else int(left)
 
     def _budget(self, periods, hint=None, price=None):
-        """None, or the refusal budget (C12): the plan as it will run at its planned speeds needs more control
+        """None, or the refusal budget: the plan as it will run at its planned speeds needs more control
         periods than are left. No margin and no share of what is left: a motion that cannot finish is not
         started. The hint is a shorter move. price (control_move_price.price_of): when a stated limit is what
         makes the plan long, the refusal names the word, its price, the smallest limit that fits and the ready
@@ -376,7 +376,7 @@ class SpeedMixin:
 
     def _call_extra(self, intent, r):
         """Result keys beside the bounds: the false stops a leg resumed after, and the operator's word when one
-        was given (C4: it is recorded; it changes no speed and no guard)."""
+        was given (it is recorded; it changes no speed and no guard)."""
         extra = {}
         if r.get("false_stops"):
             extra["false_stops"] = r["false_stops"]
@@ -393,7 +393,7 @@ class SpeedMixin:
     def _told_keys(self):
         """told_mm (the end the tool was told to reach: the commanded pose; after a stop it is where the arm was
         eased, the measured pose of the stop), tip_mm (measured now) and behind_mm (their distance). An operator
-        that closes its own loop computes its next line from told_mm (C10)."""
+        that closes its own loop computes its next line from told_mm."""
         s = self._last if self._last is not None else self._sense()
         told = s.tip if self._q_des is None else self.model.fk_tip(self._q_des)[0]
         return {"told_mm": _mm(told), "tip_mm": _mm(s.tip),
@@ -408,7 +408,7 @@ class SpeedMixin:
         extra = dict(extra or {})
         ran, at_s = extra.pop("_ran", None), extra.pop("_at_s", None)
         out.update(extra)
-        strike = _attr(plan, "strike") if plan is not None else None     # the price of this motion (C2)
+        strike = _attr(plan, "strike") if plan is not None else None     # the price of this motion
         if strike is not None or ran is not None:
             out["strike"] = dict(strike or {}, **({"ran": ran} if ran is not None else {}))
             out["predicted_peak_n"] = (strike or {}).get("peak_n")
@@ -426,7 +426,7 @@ class SpeedMixin:
         if slowed:
             out["slowed"] = int(slowed)   # periods the bounds held under the robot's own free speed
         out.update(control_tail.left_keys(self))   # a move that started on a contact: left it, or pressed
-        out.update(control_move_pace.keys(self))   # the command held for the hand, or the move ended short (C10)
+        out.update(control_move_pace.keys(self))   # the command held for the hand, or the move ended short
         if (out.get("pace") or {}).get("why"):
             out["why"] = out["pace"]["why"]
         notes = [n for n in notes if n]

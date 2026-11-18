@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What the env host reads of the body's own sensors beyond one value per control step (round six, the design notes
-C5 and C11): the depth picture of a camera and the wrist force sensor at the physics rate. Runs inside the env host
+"""What the env host reads of the body's own sensors beyond one value per control step: the depth picture of a camera
+and the wrist force sensor at the physics rate. Runs inside the env host
 (bench/ext/libero/envhost.py), on its numpy and its model handles: this file imports nothing.
 
 - depth_facts(m, np, gl): the depth buffer's own facts: the near and far planes (m), the buffer's step turned to
   metres at 1 m (the error a simulator states for its depth: it grows with the square of the distance) and,
   where it was measured for the renderer in use, WHERE INSIDE A PIXEL the depth picture samples its ray
-  ("sample_px": [du, dv], the design rulings): the depth at [v, u] is the depth along the ray through
+  ("sample_px": [du, dv]): the depth at [v, u] is the depth along the ray through
   (u + du, v + dv), u to the right and v down, the pixel being the square [u, u + 1) x [v, v + 1). A renderer
   with no measured entry states none, and a reader then takes the pixel's middle and says so.
 - depth_metres(buf, facts, np): the buffer's values (0 at the near plane, 1 at the far one, row 0 at the bottom as
@@ -18,7 +18,7 @@ C5 and C11): the depth picture of a camera and the wrist force sensor at the phy
 
 DEPTH_BITS = 24   # the renderer's depth buffer: its values step by 2 ** -DEPTH_BITS of the near to far range
 # Where inside a pixel the depth picture samples its ray, per renderer (MUJOCO_GL): (du, dv), u right and v down.
-# MEASURED, not assumed (tests/r6_p2_g1_probe.py sample; checked by tests/test_r6_gate_instruments.py --only masks):
+# MEASURED, not assumed (a probe sample, checked by the gate instrument tests):
 # on the software renderer the host's own ray cast through (u + 0.375, v + 0.875) agrees with the depth picture
 # within 0.01 mm on 90 percent of 600 pixels of each camera, where the ray through the middle is 1.3 mm off in the
 # median: the depth is the first of the renderer's four sub-samples, the colour their mean. No entry: not measured.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What on the tool can touch (the tool part of robot://body, I1), split out of rcpx/model_body.py.
+"""What on the tool can touch (the tool part of robot://body), split out of rcpx/model_body.py.
 
 Everything that moves rigidly with the tip as far as the arm joints go (the last arm joint's body and all bodies
 under it: the last link, a flange, a hand, its jaws, a paddle) is sampled on the model's own collision geometry, as
@@ -403,7 +403,7 @@ def gripper_shapes(model):
     return copy.deepcopy(out)
 
 
-# ---------- hulls, fit errors and the tool's own ratings (SPEC-R4 A8.4, Q2, Q4) ----------
+# ---------- hulls, fit errors and the tool's own ratings ----------
 def _curve_tol(m, g):
     """How far the sampled points of a curved shape can stand inside its true surface (m): the sagitta of two
     samples SAMPLE_M apart on its largest radius. A box and a mesh are their own corners: zero."""

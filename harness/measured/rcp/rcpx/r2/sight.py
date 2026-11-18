@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package sight (I37; SPEC-R3 4.5): point once and the robot measures where it is; look at a thing from a named
+"""Package sight: point once and the robot measures where it is; look at a thing from a named
 side; survey candidates that fit the device.
 
-Tools (the vnext surface; each result leads with said and ends with next, SPEC-R3 3.1):
+Tools (the vnext surface; each result leads with said and ends with next):
 - locate(look, px, part, note="", on="space", detail="brief"): rcpx/r2/sight_locate.py. The operator points at a
   part in a look (or a survey_N or around_N sheet); the robot takes two more views itself (rcpx/r2/sight_plan.py),
-  finds the patch again (rcpx/r2/sight_match.py) and stores a located entry (SPEC-R3 3.2) with its uncertainty, or
+  finds the patch again (rcpx/r2/sight_match.py) and stores a located entry with its uncertainty, or
   the line of sight alone (depth ray_only) when the pictures cannot fix the depth. on "table" or a contact id meets
   that plane instead, with no motion.
 - view(target, side="robot_side", distance_mm=None, elevation_deg=None, detail="brief"): rcpx/r2/sight_view.py.
@@ -20,11 +20,11 @@ the sheet forbids, the operator's label is not evidence: without a colour the sh
 forbidden one) at the spot, next is null, no_act says why, said offers no act, and the located entry carries
 data.identity {verified false, why} for whoever acts on it later. A spot with another part's colour gets no act.
 
-ex.state["sight"] (SPEC-R3 3.3): candidates, plan_camera(target_mm, side, distance_mm=None, elevation_deg=None) ->
+ex.state["sight"]: candidates, plan_camera(target_mm, side, distance_mm=None, elevation_deg=None) ->
 {q or None, got_side, why} (dry: act's witness view), sheets {id: {size, cols, tile_px, tiles, path, known}}.
 
 Safety: every motion is the runtime's own (a nested primitive runs bare), so each one first passes ex.gates (the
-dark gate, the person gates, the path gates: SPEC-R3 3.8), then runs as a guarded, governed joint move whose
+dark gate, the person gates, the path gates), then runs as a guarded, governed joint move whose
 guard is the core's own for a look move; the links and the tool keep the bounds' clearance for a path, at the
 speed the path check solves, from every point robot://world holds and every survey box, and the tool clear of the
 line of sight being
@@ -36,7 +36,7 @@ checked"), act (push: next names push only when loaded), witness (look like: vie
 only when the run's own setting r3_lift_declared is true (ex.cfg, else ex.context); no profile is read. C6 World "box" entries are written when rcpx.context.KINDS has "box"; until then the boxes live in
 ex.state["sight"]["candidates"] and sight's own clearance checks read them there.
 
-Part B (the core lane) calls nothing here; it registers: FREE_TOOLS unchanged (locate and view are charged calls),
+Part B calls nothing here; it registers: FREE_TOOLS unchanged (locate and view are charged calls),
 the brief layer's KEEP_BLOCKS (fits, best_fit, part_check, said, next, no_act).
 Nothing under this package reads simulator ground truth or names a robot or a device.
 """

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""verify gains same_view (the witness package, SPEC-R3.md 4.4).
+"""verify gains same_view (the witness package).
 
 FILTER wraps the merged verify handler (the device package's evidence-checked verify), so it runs first and this
 reads its answer. Without the device package, a post hook on the round one verify primitive does the same.

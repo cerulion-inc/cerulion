@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The self-test (SPEC-R4 A2.1, round six the design rulings, contract C17): the robot measures its own numbers once per
+"""The self-test: the robot measures its own numbers once per
 robot and controller and keeps them (rcpx/bounds_self.py SelfKnow). Never a task's or a scene's numbers; never
 inside a task or a scored cell.
 
@@ -22,10 +22,10 @@ run(ex, intent=None) measures, each step using only what earlier steps gave:
   (the goal snaps to the present reading): its run-on, stop time and settling time are read there; the plateau
   gives the tracked speed, the lag and the cross-track error; ramps and plateaus give the hidden levels by speed and
   acceleration; the rest poses give e_tau. A hidden level is kept only from a pass that ended at its goal.
-- Braking and acceleration (bounds_selftaps.ramps, contract C6), the jaws at their open rest: per joint, rest to
+- Braking and acceleration (bounds_selftaps.ramps), the jaws at their open rest: per joint, rest to
   rest passes that ramp and brake at GIVE times the model's acceleration, then at the model's whole; the largest
   that ended inside the still band is stored as brake_j and accel_j. No single braking number is stored.
-- S3, taps (bounds_selftaps.taps, contract C5): straight descents onto the stated support at speeds that double
+- S3, taps (bounds_selftaps.taps): straight descents onto the stated support at speeds that double
   from the tell speed, each measured by rcpx.bounds_stops.measure. They give the detection time, and, on a body
   with a force signal at the physics rate, the stop slope. The entry "taps" also prices the way down to them.
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The result of one benchmark episode, from its truth log (the design notes S2; standard library only, so
+"""The result of one benchmark episode, from its truth log (standard library only, so
 it runs in either venv).
 
     python -m bench.ext.score_ext --ep EPDIR [--out FILE] [--prices PRICES.json]
@@ -45,7 +45,7 @@ JOURNAL_NAME = "journal.jsonl"
 OPERATOR_NAME = "operator.jsonl"
 RESULT_NAME = "result.json"
 DEFAULT_BUDGET_STEPS = 900
-# Reference max steps per suite (openpi examples/libero/main.py, scout NOTES.md); LIBERO-PRO cells keep their suite's.
+# Reference max steps per suite (openpi examples/libero/main.py); LIBERO-PRO cells keep their suite's.
 REF_MAX_STEPS = {"libero_10": 520, "libero_spatial": 220, "libero_object": 280, "libero_goal": 300,
                  "libero_90": 400}
 ARMS = {"native": "without", "native_sense": "without_sense", "native_calib": "without_calib", "vnext": "with"}

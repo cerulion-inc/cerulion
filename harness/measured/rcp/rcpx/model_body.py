@@ -4,14 +4,14 @@
 Everything here is computed from a RobotModel; nothing is typed per robot. Units in the document: mm, degrees,
 newtons, newton metres.
 
-No kind is hard-coded (SPEC-R2 C7): each joint's kind (revolute or prismatic) and unit come from the loaded model;
+No kind is hard-coded: each joint's kind (revolute or prismatic) and unit come from the loaded model;
 the camera's optical axis and image up in the tool frame come from the spec's camera and tip; a gripper is described
 as a gripper (its joints and the jaw opening in mm, measured on the model at its open and closed commands); the base
 kind is the robot model's own (derived: whether its root body carries a joint) until the installation is given
 (with_installation); and "sources" says for every hand-written spec field whether a person typed it, it was derived from
 the model file, or it is measured at run time.
 
-What can touch (pilot finding T12): the tool block carries the shape of everything that moves with the tip (a box
+What can touch: the tool block carries the shape of everything that moves with the tip (a box
 per body, the outline along the finger, what stands out past each surface and at what tilt it touches first, in
 words too) and the gripper block its closed and open shapes, all from rcpx/model_tool.py; each collision capsule
 gives its two ends at home and the joint that carries it; self_collision says how the arm is kept off itself.
@@ -296,7 +296,7 @@ def _speed_entry(model, i, unit, value=None, source=None):
 
 
 def with_self(doc, know, model=None):
-    """The body document with the robot's own measured numbers (SPEC-R4 A5): a block self holding, each with its
+    """The body document with the robot's own measured numbers: a block self holding, each with its
     source and the stamp of when it was read, the hidden level and noise of the force estimate at rest, the
     detection delay, the lag and stopping tables, the stop slope, the quantum, e_tau, F_tool and F_hand; and
     joints[].speed_limit lowered to what the sweep showed the joint tracks (source self_test). know is a

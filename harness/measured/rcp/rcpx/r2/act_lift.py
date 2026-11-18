@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Lift (SPEC-R3 4.3, SPEC-R4 derived bounds): a lip from under its edge.
+"""Lift: a lip from under its edge.
 
 The declaration gate lists and enables lift only when r3_lift_declared is true;
 its refusal offers the sheet's use route otherwise. P0 checks forbidden places

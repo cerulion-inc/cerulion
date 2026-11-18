@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The receipt of the pick of package place (round six: the design notes C12, C14): what a pick says of its takes,
+"""The receipt of the pick of package place: what a pick says of its takes,
 and what it leaves for the place.
 
-- _pk_extent: the held thing in the tool frame at the grasp (the core's record carries it: C8, C14).
+- _pk_extent: the held thing in the tool frame at the grasp (the core's record carries it: C8).
 - _pk_stands: after the test lift, where it stands in the hand (rcpx/r2/place_hold.py stands), on the record.
 - _pk_result: said first; the take's control periods beside its plan's count and the waits it is owed; doubt
   (every line {what, acted, would_remove}); the largest strike of its motions; on held the state
@@ -98,7 +98,7 @@ class PickOut:
         return report.item(what, value, source, evidence, lift)
 
     def _pk_owed(self, took, planned):
-        """The waits by motion a take ran that its plan does not count (the design rulings: owed by the motion core and
+        """The waits by motion a take ran that its plan does not count (owed by the motion core and
         the hold, listed, never gated): the way down's end, the close's arrive, the rest read past its settle
         window; and the run's periods less the plan's."""
         ph = {p["phase"]: p for p in self.state["place"].get("phases") or []}
@@ -110,7 +110,7 @@ class PickOut:
                 int(took["periods"]) - int(planned["periods"])}
 
     def _pk_result(self, st, seen, took, doubt, strikes):
-        """The pick's result from its ONE take (C12, C14; the design rulings): said first; the take's periods beside
+        """The pick's result from its ONE take: said first; the take's periods beside
         its plan's count, the waits it is owed; doubt, strike; on held the state the place reads and the core's
         record with its extent; with nothing held what a fresh look shows at the spot and the one ready call."""
         B, J = _bounds(self), self._pl_jaws
@@ -153,7 +153,7 @@ class PickOut:
                                 "a second time (a pick takes once): " + shows["said"] + blind + "." + ran,
                                 fingers=took.get("fingers", "not_closed"), stopped=took.get("stopped"),
                                 contact=took.get("contact"), width_mm=took.get("width_mm"), shows=shows,
-                                hint=took.get("hint") or "look", **base)       # ONE ready call (C12)
+                                hint=took.get("hint") or "look", **base)       # ONE ready call
         more = ran
         S, s_low, s1, c = took["S"], took["s_low"], took["s1"], took["close"]
         corners, hang, half = took["extent"]

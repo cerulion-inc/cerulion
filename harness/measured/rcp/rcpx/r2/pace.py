@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Pace: the session's simulated-time budget as the binding limit, for any robot (a round two package; SPEC-R2 1).
+"""Pace: the session's simulated-time budget as the binding limit, for any robot (a round two package).
 
 Load it by name ("all,pace"). It changes no motion. What it adds:
   - every operator call's answer gains sim_s_spent (the world seconds that call took) and sim_s_left (what the

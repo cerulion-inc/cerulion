@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package scene_camera (SPEC-R2 section 1): every look-based tool works from a FIXED scene camera as well as from the
+"""Package scene_camera: every look-based tool works from a FIXED scene camera as well as from the
 wrist camera. Loaded explicitly (it is not in rcpx.r2.core.PACKAGES): pass this module in the mods list.
 
 Where the cameras come from: backend.scene_cameras() -> {name: info} (or ex.context["scene_cameras"], same shape),
@@ -7,7 +7,7 @@ info = {"width", "height", "fx", "fy", "cx", "cy", "fovy_deg", "installation": {
 camera's axes in frame B as columns (image right, image up, toward the viewer: the MuJoCo camera convention). The
 installation pose is a fact of how the camera was mounted, like the robot's own base; nothing here reads the scene.
 
-- look(camera=NAME): a picture from that camera (look_id C1, C2, ...): frame and annotated (the tool tip, the base
+- look(camera=NAME): a picture from that camera (look_id C1, ...): frame and annotated (the tool tip, the base
   axes at the tip labelled with the move_tip argument along them, a 50 mm scale at the tip's depth, the stored
   points), camera_pose, tip_px, mm_per_px_at_tip, image_dirs (the base move_tip argument nearest image right, left,
   up and down at the tip, and how far the tip moves on the floor per 10 px), floor_view_mm (the patch of the surface
@@ -21,7 +21,7 @@ installation pose is a fact of how the camera was mounted, like the robot's own 
   label states it); rays no further apart than the camera resolves fix no depth, and that is said first; when
   the depth it computes is known no better than the way from the hand to the point it says so too.
 - every scene look is noted in the space book and keeps its camera's pose and, where the camera gives one, its
-  depth picture (round six, the design notes C11): a scene look id is a spot for the whole-step tools,
+  depth picture: a scene look id is a spot for the whole-step tools,
   {"look": C1, "px": [u, v]} (rcpx/r2/place_point.py), read with no motion. Nothing is carved.
 - crop(look_id=C..., center_px): an enlarged square of a scene look (resampled).
 - robot://cameras: every camera, its size, lens, pose in frame B and the floor footprint of each fixed view.

@@ -80,7 +80,7 @@ def _attr(obj, name, default=None):
 
 
 def _module(name):
-    """An rcpx module another package of this round brings, or None in a tree that has none yet."""   # r6 shim
+    """An rcpx module another package of this round brings, or None in a tree that has none yet."""   # compat shim
     try:
         return importlib.import_module("rcpx." + name)
     except ImportError:
@@ -100,7 +100,7 @@ def of_intent(ex, intent, u, thing=None):
     B = ex.bounds
     limit = B.stated_limit(thing, intent or None, expected=True)
     # what the call that makes or works this contact stated as a LIMIT, and the thing it resolved: a move that
-    # later leaves the contact keeps that limit until the contact has ended (control_tail.start_of, the design rulings)
+    # later leaves the contact keeps that limit until the contact has ended (control_tail.start_of)
     ex._meant = {"call": getattr(ex, "_calls", None), "thing": thing if isinstance(thing, str) else getattr(thing, "id", None),
                  "words": {k: v for k, v in (intent or {}).items() if k in LIMIT_WORDS and v}}
     bound = limit.get("limit_n")              # with nothing stated the bounds name the source "none": no source here
@@ -281,7 +281,7 @@ def _measure(ex, g, travel):
 
 def _peak_r4(ex, g):
     """(peak N, resolved) as round four read it, where no bounds_stops is there: the wrist's largest reading of
-    the stop's period when the backend hands one, else the estimate's own peak, unresolved."""   # r6 shim
+    the stop's period when the backend hands one, else the estimate's own peak, unresolved."""   # compat shim
     fast = getattr(ex._last, "fast", None) or getattr(g.first, "fast", None)
     wrist = fast.get("wrist_n") if isinstance(fast, dict) else None
     if wrist is None or not len(wrist):
@@ -292,7 +292,7 @@ def _peak_r4(ex, g):
 
 
 def stop_note(ex, g, kind, target, held, at_rest, expect=None, travel=None):
-    """Tell the bounds a guard stop (B.note_stop) and read what it was (C5): {"false": a stop no thing made (the
+    """Tell the bounds a guard stop (B.note_stop) and read what it was: {"false": a stop no thing made (the
     bounds say so: the impulse inside the noise and the force gone at rest; and the hand kept its speed),
     "arrived": the stop is the contact the leg expected (arrived(); never for a false stop or a cap), "speed_m_s":
     the MEASURED tip speed of the reading before the first one over the threshold, "u", "peak_n" (from a force
@@ -333,7 +333,7 @@ def stop_note(ex, g, kind, target, held, at_rest, expect=None, travel=None):
     try:
         if m is not None and "stop" in inspect.signature(B.note_stop).parameters:
             r = B.note_stop(*args, **kw, det_periods=m["det_periods"], expect=expect, stop=m)
-        else:                                        # r6 shim: round four's note_stop takes a number for the peak
+        else:                                        # compat shim: round four's note_stop takes a number for the peak
             r = B.note_stop(*args[:4], peak, *args[5:], **kw)
     except Exception as exc:
         ex._journal("bounds_problem", where="note_stop", error=f"{type(exc).__name__}: {exc}")
@@ -342,7 +342,7 @@ def stop_note(ex, g, kind, target, held, at_rest, expect=None, travel=None):
     if said is None:   # the law itself (A1.1), in its relative form where the noise reads zero
         size = TWO_READ * max(_val(B.sigma_f(v, 0.0)), REL * float(g.force_n or 0.0))
         said = g.impulse <= size * _val(B.t_det()) and at_rest.Fmag <= _val(B.f_thr(0.0, 0.0))
-    # a stop the thing the move was leaving made (over its stated limit, or growing: the design rulings) is never false
+    # a stop the thing the move was leaving made (over its stated limit, or growing) is never false
     over = any((getattr(g, "leave", None) or {}).get(k) is not None for k in ("over_n", "rose_n"))
     out["false"] = bool(said) and g.cap_why == "" and not hand and not over
     out["hand_stopped"] = bool(hand)
@@ -398,7 +398,7 @@ def retreat(ex, steps=None, limit=None, need=None, until=None, intent=None):
     the force of leaving does not stop it). steps: a count the caller states; None: until every link is clear
     of every stored contact (_links_clear). Which paths that is is read off their own poses BEFORE anything
     moves; they run as ONE line with no stop between them, and its control periods are counted against what
-    is left first (a retreat that cannot finish is refused budget, C12). until(s): a caller's own test after
+    is left first (a retreat that cannot finish is refused budget). until(s): a caller's own test after
     each path; such a retreat runs path by path. When the history runs out before the arm is clear, the
     retreat says so (plans_on): the caller plans the rest as a move of its own."""
     s, _ = ex._ease_if_pressing()
@@ -494,7 +494,7 @@ def stream(ex, legs, *, held=None, looks=None, need_m=None, intent=None):
         if bad is None:
             path = [np.asarray(q, dtype=float) for q in (_attr(plan, "path") or [])]
             # the plain budget, counted for every piece; a stated limit that makes it long is named with its price,
-            # the same call without it and the least max_n that fits (C12, the design rulings; final review 2, high 2 (a))
+            # the same call without it and the least max_n that fits
             bad = ex._budget(len(path), ex._shorter(q0, path), _stream_price(ex, plan, word, q0, part, held, moving))
         if bad is not None:
             refused = bad if isinstance(bad, dict) and "refused" in bad else {"refused": bad}
@@ -544,7 +544,7 @@ def stream(ex, legs, *, held=None, looks=None, need_m=None, intent=None):
             if need is None and leg.get("expect"):  # a leg that means a contact ends under its own guard: the
                 need = ex._band_at(seg[-1])         # last target is held until the hand stands still
             stop, s, _, n = ex._run(seg, g, need_m=need, held=ex._held_for(held), hook=hook, leg=False,
-                                    close=final)     # only the stream's last leg ends where it says (C10)
+                                    close=final)     # only the stream's last leg ends where it says
             if _hold_module() is not None:          # every leg's end; leg None where the run ends with it
                 _hold_module().after_move(ex, s, stop, leg=li if stop == "goal" and not final else None)
             per_leg[li] += n

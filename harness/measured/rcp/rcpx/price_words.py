@@ -17,10 +17,10 @@ move's own time constant (control_move_pace.allowance), and lo equals hi.
     line     a straight tip line from where the hand stands, PRICE_MM long (a unit the price is said in, no bound),
              along the first of WAYS the arm can run whole, with nothing stated, under gentle (the hand's own
              weight, B.f_hand) and under max_n at DOUBLE that weight (a named ratio of rcpx/bounds_ratios.py). The
-             limited rows are planned with NOTHING known free (the design rulings: no look, no passage, no site), as the
+             limited rows are planned with NOTHING known free (no look, no passage, no site), as the
              words say; where a look, the arm's own passage or the site shows a stretch free the limit holds only
              the rest (the result's limit.cost says how much).
-    touch    a touch with no number: the force it ends at (B.f_hand, the design rulings) and the speed solved for it (kept for
+    touch    a touch with no number: the force it ends at (B.f_hand) and the speed solved for it (kept for
              the record; its measured way in does not follow one law the opening can state at session start, so
              the opening says the force and what one second is here, and the touch's result says its count).
     jaws     the jaws' whole stroke at their own speed (control_hold_jaws.numbers: speed, spans per second): the
@@ -140,7 +140,7 @@ def _line(ex):
 
 def _touch(ex):
     """A touch with no number over PRICE_MM where a contact can begin: its way in at the speed solved for the hand's
-    own weight (the touch's own default, the design rulings), up or down from where the hand stands, the slower; or None."""
+    own weight (the touch's own default), up or down from where the hand stands, the slower; or None."""
     import numpy as np
     B, q = ex.bounds, np.asarray(ex._sense().q, dtype=float)
     hand = float(B.f_hand())
@@ -301,7 +301,7 @@ def tool_price(name, entry, P):
 
 
 def priced(ex, name):
-    """" (about N to M control periods here)" for a recommended self_check or survey in a hint (the design rulings: no hint
+    """" (about N to M control periods here)" for a recommended self_check or survey in a hint (no hint
     recommends the body check or the survey without its price), or "" when no price is made."""
     try:
         got = (prices(ex) or {}).get(name)

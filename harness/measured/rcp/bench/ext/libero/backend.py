@@ -48,14 +48,14 @@ from rcpx.backend import Backend
 ID = "B3"
 OVERRIDES = ("_predict", "_static_estimate", "_pick_estimate")
 CONTROL_HZ = 20.0   # the env's own control rate (the benchmark's 20 Hz); the backend states its period from it
-# The arm's rated joint speeds, rad/s (SPEC-R4 Q1, maintainer ruling 5: a maker's figure with its sheet cited). The
+# The arm's rated joint speeds, rad/s (a maker's figure with its sheet cited). The
 # benchmark's robot file carries no velocity limit; the maker's own robot description does:
 RATED_QD = [2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100]
 RATED_QD_SHEET = ("the maker's robot description, franka_ros franka_description robots/panda/joint_limits.yaml "
                   "(max_velocity per joint; the same figures as the maker's control parameter table)")
 # Self-knowledge: measured in ONE calibration episode outside every scored cell, kept in
 # this folder, and REQUIRED in every scored cell (an absent file is a refusal there, never a self-test in a cell).
-# Where (the design rulings, C17): env RCPX_SELFKNOW_DIR (the older RCPX_EXT_SELFKNOW_DIR wins), else ~/.rcpx/selfknow.
+# Where: env RCPX_SELFKNOW_DIR (the older RCPX_EXT_SELFKNOW_DIR wins), else ~/.rcpx/selfknow.
 SELFKNOW_DIR = os.environ.get("RCPX_EXT_SELFKNOW_DIR") or os.environ.get("RCPX_SELFKNOW_DIR") or os.path.join(
     os.path.expanduser("~"), ".rcpx", "selfknow")
 # Which mode (cfg selfknow, rcpx/bounds_selfstart.py): build_session's argument when a caller states one, else env
@@ -170,12 +170,12 @@ class LiberoBackend(SenseMixin, Backend):
         self.unjudged_t = None      # end of a period in which the env's controller was handed over (not judged)
 
     def contact_model(self):
-        """{"kind": "damped", "b_per_s", "by_body"} (rcpx/backend.py, SPEC-R4 A8.4): the contact rate of the arm's
+        """{"kind": "damped", "b_per_s", "by_body"} (rcpx/backend.py): the contact rate of the arm's
         own collision geoms, read from the robot file the env host serves (a geom's contact is a damped spring
         given as (time constant, damping ratio): b = 2 / (d timeconst), d the top of its impedance, the time
         constant kept at or over two physics steps as the simulator does; or as (-stiffness, -damping): b =
         damping / d). b_per_s is the stiffest of the tool's geoms (the last arm joint's body and all under it).
-        the design rulings: each body's rate is the stiffer of its own geoms' and the stiffest its geoms can meet the scene
+        Each body's rate is the stiffer of its own geoms' and the stiffest its geoms can meet the scene
         with by the simulator's own mixing rule (the env host's contact_rates: robot body names only), so a scene
         part stiffer than the arm's own geoms (a button of 0.001 s) is read with the rate its contact has."""
         if getattr(self, "_contact", None) is None:
@@ -204,7 +204,7 @@ class LiberoBackend(SenseMixin, Backend):
                 return b == last
 
             src = "the robot file the env host serves (its own geoms alone: the host stated no mixed rate)"
-            try:     # the design rulings: the stiffest contact each body can meet the scene with, mixed by the simulator's rule
+            try:     # the stiffest contact each body can meet the scene with, mixed by the simulator's rule
                 mixed = self.link.call("contact_rates")
             except Exception:
                 mixed = None

@@ -166,7 +166,7 @@ class Mixin:
         if force_n is None:
             force_n, source, evidence = derived.default_force_n(B, thing, entry)
             if force_n is None:
-                # the design rulings: a force nobody stated and nothing has shown is a doubt, never a refusal: the ramp runs to
+                # a force nobody stated and nothing has shown is a doubt, never a refusal: the ramp runs to
                 # what the arm can push here, as the core's press does (r3_limits.force_spec), and the result says so
                 spec0 = B.force("probe", thing, s.q, d, intent=dict(intent or {}))
                 force_n, source = float(spec0.ceiling_n), "model"
@@ -312,7 +312,7 @@ class Mixin:
 
 
 def false_stops_over_drives(ex, result):
-    """p4-read (b), a post hook after the obstacles fit: a contact this call's stop made whose own force on the point
+    """A post hook after the obstacles fit: a contact this call's stop made whose own force on the point
     it was fitted to (data force_n) is over what the drives can push at that point along its push (their torque
     limits over the point's levers, rcpx/bounds_book_read.py) is no thing's push: the entry is marked stale (the
     obstacles, the jaws' room and the clearances leave it out), the stop is counted false, the session's level is
@@ -383,7 +383,7 @@ def setup(ex):
         u = u / size if size else np.array([0, 0, 1])
         words = "contact speed and detection delay"
         if speed is None:
-            # p4-read (a): the speed the arm READ at the stop at the touching point, never the free speed bound
+            # the speed the arm READ at the stop at the touching point, never the free speed bound
             t_s = contact.get("t_s") if isinstance(contact, dict) else result.get("t_s")
             v, said = bounds_book_read.read_speed_m_s(ex, entry.get("point_mm"),
                                                       (entry.get("data") or {}).get("touched_by"), t_s)

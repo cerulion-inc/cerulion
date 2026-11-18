@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package place_point (round six, the design notes C11): the one door from a spot to what the hands take. No tools
+"""Package place_point: the one door from a spot to what the hands take. No tools
 of its own: the whole-step tools (pick, place, put, work_part) call resolve(ex, spot, role) for every spot that is
 not already a Seen.
 
@@ -28,7 +28,7 @@ millimetres apart is known along the view to metres). It is over 0 wherever an e
 for a point that came with none (a typed point, a label stored without one): "doubt" then says that no error is
 stated, and no figure stands in for it. "periods" is 0, "looks_in_motion" false, "coarse" false. "said" says what
 was taken and names the source; "doubt" is the spot's own list. Nothing here reads truth or names an object.
-"answer" (roles pick and part; the design notes C11, the design rulings) is the spot's own: the look shows the pointed place
+"answer" (roles pick and part) is the spot's own: the look shows the pointed place
 empty; a tool that gets it returns stopped "answered" at once, with no motion and no control period.
 """
 

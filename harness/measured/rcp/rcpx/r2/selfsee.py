@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package selfsee (I33, SPEC-R3.md 4.1): the robot's own body and the view, in words, on every look.
+"""Package selfsee: the robot's own body and the view, in words, on every look.
 
 Weak operators took their own mount for the device (r1b ph/02, 23, 29, 33, 35) and read a top view as a front view
 (ph/03, 13, 15). This package adds no tool and moves nothing:
@@ -34,7 +34,7 @@ Weak operators took their own mount for the device (r1b ph/02, 23, 29, 33, 35) a
 - triangulate (post hook): when on_body(point_mm, the q of every look in rays[].look_id) names a group, the located
   entry is marked stale ("own_body") and the result becomes refusal own_body.
 
-For other packages (SPEC-R3 3.3), ex.state["selfsee"]:
+For other packages, ex.state["selfsee"]:
     first_hit(q, u, v)        {what: own_base | own_arm | own_hand | world | floor | none, dist_mm, floor_mm,
                               source: model | region_b | world | floor | none}
     first_hits(q, pixels)     the same for a list of (u, v), one ray cast
@@ -51,7 +51,7 @@ first_hit's "world" is a World entry of kind box (centre_mm, size_mm, top_mm) me
 a package stores boxes. Everything comes from the body model at the look's stored joint pose and robot://body's
 standing surface; nothing reads the picture or ground truth, and no robot or device is named.
 
-What the session around it must do (the core lane, SPEC-R3 2.2, not this package): the brief layer keeps view
+What the session around it must do (not this package): the brief layer keeps view
 (rcpx/surface_brief.py KEEP_BLOCKS gains "view" and FIRST shows "view" after "look_id"; today a brief standard look
 over 1,800 bytes leaves view out first, as the largest block); the image an answer names is the newest annotated
 frame by "supersedes" (rcpx.surface_args.frame_paths already reads it), so the

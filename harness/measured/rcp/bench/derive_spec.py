@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""derive_spec(mjcf_path, name) -> robot_spec (SPEC section 2) from the model file alone (G20, checked by I18).
+"""derive_spec(mjcf_path, name) -> robot_spec from the model file alone.
 
 No robot is named here and no robot number is typed. Every rule below runs the same way on any serial arm:
 

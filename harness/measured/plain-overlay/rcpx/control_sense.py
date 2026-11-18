@@ -305,7 +305,7 @@ class SenseMixin:
         s.tip, s.R = self.model.fk_tip(s.q)
         s.at = s.tip.copy() if at is None else at
         self._last = s
-        control_move_passed.note(self, s)   # where the arm's own bodies have been is free space (the design rulings (2))
+        control_move_passed.note(self, s)   # where the arm's own bodies have been is free space
         return s
 
     def force_now(self):

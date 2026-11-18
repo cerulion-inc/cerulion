@@ -108,7 +108,7 @@ def known(B, name):
 
 def friction(B, n):
     """Dry joint friction the model may lack, per joint, as a share of each torque limit, with its source: the
-    hidden joint torque of the robot's self-knowledge (Q6: tau_hidden holds what dry friction and the model's own
+    hidden joint torque of the robot's self-knowledge (tau_hidden holds what dry friction and the model's own
     error hide; B.tau_thr at rest adds JOINT x its noise)."""
     import numpy as np
     shares = np.asarray(B.tau_thr(0), dtype=float)[:n] / np.asarray(B.tau_max(), dtype=float)[:n]

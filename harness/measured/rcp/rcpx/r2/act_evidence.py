@@ -88,7 +88,7 @@ def at_list(ex, info):
     """
     compare's at: the target, then every fresh located entry that names a cue part or a part of the
     target's own
-    device (SPEC-R3 4.3 P7; a part that springs back shows its change at another part of
+    device (a part that springs back shows its change at another part of
     the device).
     """
     at = [info["id"]]

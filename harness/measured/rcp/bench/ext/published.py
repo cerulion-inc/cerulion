@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Published numbers printed beside the study's own (the design notes section 3, with the corrections of
-the design notes where the two differ), and the list prices the cost column uses. Standard library
-only; nothing here is measured by this lane.
+"""Published numbers printed beside the study's own and the list prices the cost column uses. Standard library
+only; nothing here is measured by this code.
 
 arXiv 2610.30051v1 (the protocol the WITHOUT arm follows), read 2026-11-11 at https://arxiv.org/html/2610.30051v1:
 TABLE_1 holds all 18 rows of its Table 1 (model, effort, solved of 100, failure, limit reached, total cost, calls)
@@ -249,7 +248,7 @@ ROWS = [
 
 # What each arm's operator receives: the report's access table (bench/ext/report_ext.py prints it first in every
 # report). DECLARED facts of the surfaces as built on 2026-11-11 (bench/ext/libero/native.py, native_calib.py,
-# backend.py; the owners' lines in the design notes); the hand speed row is filled at report time from
+# backend.py); the hand speed row is filled at report time from
 # the measured speed files. Change a row when a surface changes.
 ARMS = ("without", "without_sense", "without_calib", "with")
 _PLAIN_PROMPT = ("the paper's system prompt and tool descriptions byte for byte (arXiv 2610.30051v1 Figures 2 and 3, "
@@ -324,7 +323,7 @@ ACCESS = [
 SECTIONS = ("libero_10", "libero_pro")
 KINDS = ("trained_sota", "trained", "zero_shot_plain", "general_harness")
 
-# Our grid's models (RESEARCH.md section 4): canonical key -> the words that identify it in an endpoint name.
+# Our grid's models: canonical key -> the words that identify it in an endpoint name.
 GRID_MODELS = {
     "gpt-6-astra": ("astra",),
     "gpt-6-luna": ("luna",),

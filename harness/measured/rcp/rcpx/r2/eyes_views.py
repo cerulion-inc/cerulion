@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""eyes_views: the depth of a chosen candidate from a second look the robot takes itself (integrator, 2026-11-12).
+"""eyes_views: the depth of a chosen candidate from a second look the robot takes itself.
 
 Why. choose with depth auto measured a candidate's point through the locate tool, and with no locate loaded it
 felt down the candidate's line of sight. The felt point is where the TOOL first met the thing coming along the
 camera's line: on a part that sits on a side face, seen from above, that is the part's upper rim, not the part
-(the design notes, the integrator's lines; measured 16 mm off on a 20 mm part). This file gives choose
+(measured 16 mm off on a 20 mm part). This file gives choose
 a point the way an operator makes one with the tools every surface has: the same thing in two looks from two places,
 two marks, triangulate. The robot takes the second look itself.
 

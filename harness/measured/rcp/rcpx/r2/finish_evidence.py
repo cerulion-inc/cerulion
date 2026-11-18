@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The claim gate's evidence (SPEC-R3 4.2), pure: what the operator did and saw, read from the finish package's
+"""The claim gate's evidence, pure: what the operator did and saw, read from the finish package's
 own call records and the shared ex.state records, into done, contradicted and the gate's checks. No executor, no
 model, no motion: finish.py builds the facts (projections included) and this module only reads them.
 
@@ -20,7 +20,7 @@ Facts (finish.build_facts):
     verifies    [{pos, tested, accepted, state, verdict}]
     budget, light, tools, like, lift_listed, candidates, surveyed, views, now_call, doc
 
-Travel thresholds (SPEC-R4, ledger CK-09): no millimetre is typed here. Each act record carries rigid_mm, the arm's
+Travel thresholds: no millimetre is typed here. Each act record carries rigid_mm, the arm's
 own measurement step at the act's pose and force (finish writes it from the session's bounds). A sliding part's
 last act ended at an end, and a press was still moving, when it went at least QUANT x that act's step along; its
 acts moved it in all when they add to QUANT x the largest step among them. An act with no recorded step counts a

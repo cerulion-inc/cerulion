@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Outside-unit reports of derived SI bounds, A5.
 
-Round six, contract C1: a bound that lowers a speed, a force or an acceleration names one of BINDING as its
+A bound that lowers a speed, a force or an acceleration names one of BINDING as its
 source. The words of RETIRED were the sources of round four's doubt rules; item() still takes them from packages
 that have not been rewritten, and no plan of rcpx/bounds_plan.py makes one.
 """
@@ -52,7 +52,7 @@ def text(item):
 
 
 def first_statement(v_max_m_s, shares, site):
-    """What a session says once about its bounds. shares is taken and not read: no free reach is counted (C4)."""
+    """What a session says once about its bounds. shares is taken and not read: no free reach is counted."""
     stated = "no site limit is stated" if not site else "site limits stated: " + str(site)
     speed = "unresolved" if not math.isfinite(v_max_m_s) else format(_rounded(v_max_m_s * MM), "g")
     return (f"{stated}; the largest tip speed the bounds allow is {speed} mm/s; only a stated limit lowers it "

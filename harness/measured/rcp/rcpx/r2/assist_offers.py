@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The offer engine of the operator gauge (SPEC-R5 sections 5, 4.6 and the untried rule of 4.4). Pure: plain data
+"""The offer engine of the operator gauge, with its untried rule. Pure: plain data
 in, plain data out; no session, no executor, no picture, no clock.
 
     choose_offer(snap, new_events, have, listed, history, prefs, ctx) -> the one offer for this result, or None
@@ -212,7 +212,7 @@ def _routine(have, ctx):
     lists the numbers itself (needs "candidates"). Otherwise the list call, which comes first."""
     have, ctx = _names(have), _dict(ctx)
     if "try_each" not in have or not ("push" in have or "lift" in have):
-        return None        # the routine runs push or lift: without one of them it answers not_built (integrator)
+        return None        # the routine runs push or lift: without one of them it answers not_built
     if ctx.get("has_list") and _placed(ctx):
         if not _budget("try_each", ctx):
             return None
@@ -243,7 +243,7 @@ def _act(have, ctx, touch=False):
         return "act_on", {"on": t["id"], "verb": "touch"}
     if "push" in have:
         return "push", {"target": t["id"]}
-    return None            # act_on runs push: with push not loaded there is no whole step to write (integrator)
+    return None            # act_on runs push: with push not loaded there is no whole step to write
 
 
 def _onto(have, ctx):

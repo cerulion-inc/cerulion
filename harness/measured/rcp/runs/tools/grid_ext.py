@@ -7,7 +7,7 @@ an open model served on that machine directly).
     venv/bin/python runs/tools/grid_ext.py cells [--set libero10|calib|pro_set_a|pro_set_b|day_one]
         [--oracle NAME=FILE ...] > CELLS.txt
     venv/bin/python runs/tools/grid_ext.py run --model NAME --base-url URL [--key-env NAME] --arm ARM
-        --cells CELLS.txt [-j 8] [--label LABEL] [--results the design notes [--work /tmp/rx]
+        --cells CELLS.txt [-j 8] [--label LABEL] [--results DIR] [--work /tmp/rx]
         [--packages all,place] [--op-args FLAGS] [--clock 7200] [--max-attempts 6] [--retry-wait 300] [--only ID,ID]
     venv/bin/python runs/tools/grid_ext.py status --results DIR --label LABEL --arm ARM --bench BENCH
 

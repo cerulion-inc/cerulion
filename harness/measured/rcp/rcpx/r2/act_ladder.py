@@ -13,7 +13,7 @@ MOVING_STOPS = ("travel",)
 
 def rate(f_n, sigma_f_n, e, t_det_s, ceiling_n=None):
     """N/s at the present force: max(TWO_READ sigma, e F) / t_det, e the measured torque error or REL; where the
-    noise is zero the least step is REL x REL x the ceiling per t_det (rcpx.bounds_laws.ramp_rate, SPEC-R4 A4.5)."""
+    noise is zero the least step is REL x REL x the ceiling per t_det (rcpx.bounds_laws.ramp_rate)."""
     from rcpx import bounds_laws
     return bounds_laws.ramp_rate(f_n, sigma_f_n, e, t_det_s, ceiling_n or 0)
 

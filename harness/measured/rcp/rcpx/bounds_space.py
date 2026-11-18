@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The space book of a session (round six, contract C4): the stated support and the things the session has
+"""The space book of a session: the stated support and the things the session has
 MEASURED (touched, located, the extent of a spot, another arm's capsules), and nothing else. Nothing is inferred
 and nothing is kept past the session.
 
 kind() answers "expected" inside the extent of a measured thing (its surface grown by BAND x its own measured
 error) and "free" everywhere else: space nobody measured is free, and what a motion there could strike is priced on
 the plan (rcpx/bounds_strike.py), never slowed for. The book holds no grid, no swept cells, no word cells and no
-ageing: speed never rested on them after round six, so there is nothing for them to prove.
+ageing: speed does not rest on them, so there is nothing for them to prove.
 
 It proves no way either: route() and ceiling() answer None and the caller takes its plain route (up, across,
 down). Looks are recorded for the word (information only) and for the tools that point into them. drop() stamps an
@@ -154,7 +154,7 @@ class SpaceBook:
 
     def drop(self, event, region=None):
         """Something changed the scene (a contact nobody expected, a release, an act, a person, a new epoch): the
-        event is stamped. With a region nothing is stamped: the change is that region's own (C9)."""
+        event is stamped. With a region nothing is stamped: the change is that region's own."""
         if region is None:
             self._order += 1
             self._event = (event, self._order)
@@ -168,28 +168,28 @@ class SpaceBook:
         """None: the book proves no free layer. The caller takes its own height."""
         return None
 
-    # ------------------------------------------------------------------------------------------ r6 shims
-    # Names other packages still call until the an earlier round shims go (contract C13). Each does nothing.
-    def add_swept(self, q0, q1, held=None):   # r6 shim
+    # ------------------------------------------------------------------------------------------ compat shims
+    # Names other packages still call until their callers move. Each does nothing.
+    def add_swept(self, q0, q1, held=None):   # compat shim
         return None
 
-    def covered(self, path, looks=None):      # r6 shim
+    def covered(self, path, looks=None):      # compat shim
         return None, "not computed: the book keeps no cells"
 
-    def word(self, look_id, path=None, held=None):   # r6 shim
+    def word(self, look_id, path=None, held=None):   # compat shim
         return None
 
-    def end_call(self):                       # r6 shim
+    def end_call(self):                       # compat shim
         return None
 
-    def share(self, kind="free"):             # r6 shim
+    def share(self, kind="free"):             # compat shim
         return Share() if kind == "free" else 0.0
 
-    def unseen_hint(self, path):              # r6 shim
+    def unseen_hint(self, path):              # compat shim
         return ""
 
-    def carve(self, *args, **kwargs):         # r6 shim
+    def carve(self, *args, **kwargs):         # compat shim
         return 0
 
-    def resee(self, frames):                  # r6 shim
+    def resee(self, frames):                  # compat shim
         return []

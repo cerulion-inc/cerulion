@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package eyes (SPEC-R5 4.1, 7.1, 7.4, 9.3): the robot does the pointing. It numbers the things in a picture and
+"""Package eyes: the robot does the pointing. It numbers the things in a picture and
 the operator picks a number (candidates, choose), or it looks for a part by words with a small vision model that
 is robot equipment (find). With no vision model declared the same tools answer from colour regions, geometry and
 touch. No tool here runs unless it is called, and nothing here chooses which part is the target.
@@ -36,7 +36,7 @@ for_routine=False, detail="brief"), at(look_id, u, v), find_at(look_id, u, v, pa
 reached the list through a routine sets ex.state["eyes"]["for_routine"] = True (read once) or passes for_routine.
 
 Without the assist package this package keeps its three tools out of the session's listing itself (they still
-run by name); with it loaded, that package's FILTER does (SPEC-R5 6.2). Depends on nothing: selfsee (the own body
+run by name); with it loaded, that package's FILTER does. Depends on nothing: selfsee (the own body
 in a look), sight (survey boxes, locate), assist (ready calls, the guard) are read lazily from ex.state and each
 is worked without, with a note. Nothing here reads simulator ground truth or names a robot, a device or a model.
 """
@@ -208,7 +208,7 @@ def look_outdated(ex, look_id):
 
 
 def stale(ex, look_id=None):
-    """None when the list of the look (default: the newest list) is fresh; else the reason (SPEC-R5 4.7 rule 6)."""
+    """None when the list of the look (default: the newest list) is fresh; else the reason."""
     st = _state(ex)
     key = st["newest"] if look_id is None else _key(ex, look_id)
     lst = st["lists"].get(key)
@@ -299,7 +299,7 @@ def _has(ex, name):
 
 
 def ready(ex, tool, args, needs=None):
-    """A next object: through the assist package's ready_call when it is loaded (SPEC-R5 4.6), else {tool, args}."""
+    """A next object: through the assist package's ready_call when it is loaded, else {tool, args}."""
     a = ex.state.get("assist")
     fn = a.get("ready_call") if isinstance(a, dict) else None
     if callable(fn):
@@ -348,7 +348,7 @@ def can_run_steps(ex):
 
 
 def next_of(ex, lst, for_routine=False):
-    """The next call of a list (SPEC-R5 4.1): never a number filled in for the operator."""
+    """The next call of a list: never a number filled in for the operator."""
     st, parts = _state(ex), _state(ex)["parts"]
     if not lst["items"]:
         return ready(ex, "seek", {}) if _has(ex, "seek") else ready(ex, "look", {})
@@ -361,7 +361,7 @@ def next_of(ex, lst, for_routine=False):
         if parts.get("forbidden"):
             needs.append("candidates: the numbers you choose")
         return ready(ex, "try_each", args, "; ".join(needs) or None)
-    # Integrator, 2026-11-12 (DECISIONS): the pick comes first whenever a row was found by a control part's word.
+    # the pick comes first whenever a row was found by a control part's word.
     # As first written the next was seek unless a control row stood at the equipment's threshold, which a vision
     # model that answers "unsure" on nearly every look never reaches: the chain then ran list, seek, a person.
     # seek stays the next only at level words, once per session, while no row at all was found by a control word.
@@ -385,7 +385,7 @@ def _picture(ex, lst, rec, page, page_rows):
 
 
 def result_of(ex, lst, page=1, detail="brief", for_routine=False, head=None):
-    """The answer of candidates, find and list for one page of a kept list (SPEC-R5 4.1)."""
+    """The answer of candidates, find and list for one page of a kept list."""
     rows = lst["items"]
     pages = max(1, int(math.ceil(len(rows) / float(P.PAGE_ROWS))))
     if page > pages:
@@ -594,7 +594,7 @@ def _attach(ex, session):
 
 
 def FILTER(surface, resources, handlers, ex=None, box=None):
-    """Without the assist package: this package's tools leave the listing (they run by name; SPEC-R5 0.1 G5: an
+    """Without the assist package: this package's tools leave the listing (they run by name: an
     operator that never calls them is sent the same list as without this package). With it loaded, its own FILTER
     takes the help tools out and brings them back when the operator first takes help (6.2, 6.3)."""
     if ex is None:

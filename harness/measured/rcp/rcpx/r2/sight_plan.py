@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Where locate and view put the camera (package sight, I37; SPEC-R3 4.5): camera poses solved on the body model, and
+"""Where locate and view put the camera (package sight): camera poses solved on the body model, and
 the dry checks every pose and joint path passes before anything moves. Nothing here moves the arm.
 
 - The camera rides on the hand, so a wanted camera pose is a tip pose through the fixed camera-to-tip transform read
   off the body model (cam_offset). solve_view solves it on ex.model: an arm of six joints or more tries ROLLS_TRIED
   rolls about the optical axis, the most upright first, and keeps the first that solves; an arm of five joints (or
   one whose roll does not solve) solves the position and the optical axis only, so it keeps the roll its joints give
-  (the lane arm refuses roll and yaw).
+  (the arm refuses roll and yaw).
 - Upright: image up as near world up as the axis allows; for an axis within UPRIGHT_VERTICAL_DEG of vertical (a top
   view) world up has no image direction, and "away from the robot" (side_words.radial) stands in for it.
 - The dry checks (checks): the joint path passes the executor's own path check (path_plane, path_self), every
@@ -399,7 +399,7 @@ def ring(ex, q_look, q_now, centre, cover, grad_dir, px, notes, rigid=False):
 
 
 def locate_views(ex, q_look, q_now, o, d, t_near, t_far, grad_dir, px, patch_px=None):
-    """The two extra views of locate (SPEC-R3 4.5 step 6). o, d: the naming ray (m, unit); [t_near, t_far] its
+    """The two extra views of locate. o, d: the naming ray (m, unit); [t_near, t_far] its
     bracket (m along d). Returns {"pair": [view, view] or None, "why", "notes", "ranked", "ctx"}: the ring about the
     bracket midpoint (ring), and the first pair whose rays span span_min_deg there with every path passing (each
     path at the speed its check solves). patch_px: the side of the patch the operator pointed at. The frame

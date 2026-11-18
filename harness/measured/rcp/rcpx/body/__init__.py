@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The body contract (ARCHITECTURE.md section 2.3, C0) and a shim over today's backend. Nothing else lives here.
+"""The body contract and a shim over today's backend. Nothing else lives here.
 
     from rcpx.body import contract, checks, exits      # the eight calls, the shape checks, the one exit table
     from rcpx.body.shim import BackendBody             # today's five-method backend behind the eight calls

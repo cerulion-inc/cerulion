@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The hold (round six, contract C8): one record, one close, and what a guard does with what the robot does to its
+"""The hold: one record, one close, and what a guard does with what the robot does to its
 own force reading.
 
 The robot knows three things it does to its own reading: it squeezes, it carries, it lets go. Each has a name here
@@ -43,7 +43,7 @@ import math
 import numpy as np
 
 from rcpx import bounds_ratios as R
-from rcpx.control_hold_jaws import facts, measure_jaws, numbers, presses, read  # noqa: F401  (measure_jaws: C7)
+from rcpx.control_hold_jaws import facts, measure_jaws, numbers, presses, read  # noqa: F401  (measure_jaws: the jaws' own numbers)
 
 MM = 1000.0
 
@@ -60,7 +60,7 @@ def _num(x):
 class Hold(dict):
     """The record. A key whose value is not known yet (None) answers get() with the default."""
 
-    def get(self, key, default=None):     # r6 shim: until every reader takes a weight of None as "not read yet"
+    def get(self, key, default=None):     # compat shim: until every reader takes a weight of None as "not read yet"
         value = dict.get(self, key, default)
         return default if value is None else value
 
@@ -126,7 +126,7 @@ def _end(ex, why, **more):
 
 
 def _relevel(ex, rec):
-    """level_n: the largest of the free threshold, the size of the rest reading (p4-read (c): the load read standing
+    """level_n: the largest of the free threshold, the size of the rest reading (the load read standing
     still after the close, control_hold_close.read_still) and the weight as it was last read (it follows the weight
     down as well as up); for a hold on a part of something fixed also DOUBLE what the part showed while it was
     worked (in its first leg, and at each rest it was read at). level_source names the one that set it. A known
@@ -220,7 +220,7 @@ def _lost(ex, rec, s):
         ex._journal("hold_shifted", closed_mm=round(moved * MM, 2), gap_mm=round(rec["gap_m"] * MM, 2))
         return None
     closed = (rec["frac"] - frac) * per * MM
-    # p4-read (e): jaws that came to a command standing open of their closed end, past where they held the thing by
+    # jaws that came to a command standing open of their closed end, past where they held the thing by
     # no more than their reading resolves there (QUANT of the band it is judged in: one step can be rounding, a
     # slip needs distinct samples past it), only reached their command: the thing may still be between them. No
     # "hold lost" is said; the record follows them
@@ -450,7 +450,7 @@ def after_move(ex, s, stop, leg=None, own=True):
     not be free of what it stood on; what the run showed is kept as the load seen so far), every one while the
     hold is on a part of something fixed (what it resists with at that rest is what it has shown), and one
     whose leg began on a standing reading.
-    own False: the call's own end stands in for the core's leg ends (r6 shim, control_base.primitive)."""
+    own False: the call's own end stands in for the core's leg ends (compat shim, control_base.primitive)."""
     st = ex.__dict__.setdefault("_hold_legs", {})
     st["seen_call"] = int(ex._calls)
     if s is None:
@@ -469,7 +469,7 @@ def after_move(ex, s, stop, leg=None, own=True):
     st["path"] = newest                            # the newest path at this leg's end (see _leg_in)
     rec = held(ex)
     lost = rec is not None and _lost(ex, rec, s)
-    _leg_end(ex, s, stop)                          # p4-read (f): what the held leg showed, held or lost
+    _leg_end(ex, s, stop)                          # what the held leg showed, held or lost
     if rec is None or lost:
         return
     # what the guards of this leg said (a stop the core resumed is forgotten by the next guard) beside the
@@ -499,9 +499,9 @@ def after_move(ex, s, stop, leg=None, own=True):
 
 def call_end(ex, name, out, moved):
     """The end of an operator's call (control_base.primitive): stands in for the core's own leg ends where the
-    motion files do not call after_move yet (r6 shim), and puts the hold's own lines into the result."""
+    motion files do not call after_move yet (compat shim), and puts the hold's own lines into the result."""
     st = ex.__dict__.get("_hold_legs") or {}
-    if moved and st.get("seen_call") != ex._calls:        # r6 shim
+    if moved and st.get("seen_call") != ex._calls:        # compat shim
         after_move(ex, ex._last, out.get("stopped") if isinstance(out, dict) else None, own=False)
     if not isinstance(out, dict):
         return out
@@ -548,7 +548,7 @@ def _seen_thing(ex, tip):
 
 
 def _leg_begin(ex, rec, s):
-    """p4-read (f): a held leg begins: where the tip and the jaws stand."""
+    """A held leg begins: where the tip and the jaws stand."""
     if s is None:
         return
     frac, _ = read(ex, s)
@@ -560,7 +560,7 @@ def _leg_begin(ex, rec, s):
 
 
 def _leg_see(ex, rec, s):
-    """p4-read (f): one reading of a held leg: the jaws' reading through it, the tip's height and acceleration."""
+    """One reading of a held leg: the jaws' reading through it, the tip's height and acceleration."""
     leg = ex.__dict__.get("_held_leg")
     if leg is None or s is None:
         return
@@ -576,7 +576,7 @@ def _leg_see(ex, rec, s):
 
 
 def _leg_end(ex, s, stop):
-    """p4-read (f): a held leg ends: the journal line held_leg (rise, jaw reading through it, peak acceleration,
+    """A held leg ends: the journal line held_leg (rise, jaw reading through it, peak acceleration,
     the stop, whether the hold stands, and the tip against the thing's seen top and bottom)."""
     leg = ex.__dict__.pop("_held_leg", None)
     if leg is None or s is None:
@@ -611,7 +611,7 @@ def _leg_end(ex, s, stop):
 def arm_cap(ex, spec):
     """The cap a guard runs with (N): what the arm itself can push along its travel (its joints' torques less
     their measured error) and a tool rating its maker states; a jaw motor's force range is no cap. A spec that
-    names its own source already carries that cap (r6 shim: an older spec's cap held the jaw motor's force)."""
+    names its own source already carries that cap (compat shim: an older spec's cap held the jaw motor's force)."""
     cap = getattr(spec, "cap_n", None)
     if getattr(spec, "source", None) is not None:
         return math.inf if cap is None else float(cap)
@@ -640,7 +640,7 @@ class Watch:
         self.p0 = None if s is None else s.tip.copy()
         self.seen = 0                      # readings judged (a known hold looks at the first: judged)
         self.after_stop = rec.get("leg_stop") is not None      # the leg before this one ended on a stop
-        _leg_begin(ex, rec, s)             # p4-read (f): the held leg's own journal (slip read first)
+        _leg_begin(ex, rec, s)             # the held leg's own journal (slip read first)
         guard.direction = None             # the direction rule is for leaving a touched thing with empty jaws
         rec["leg_stop"] = None             # what this guard's leg ends on (stopped) is kept for the leg's end
         limit = dict.get(rec, "limit_n")
@@ -673,7 +673,7 @@ class Watch:
         and the load seen so far (the hardest reading inside a period for the one reading threshold)."""
         rec = self.rec
         self.mode = "soon"
-        base = self.free + float(np.linalg.norm(rec["rest_n"]))     # p4-read (c): the free level plus the load
+        base = self.free + float(np.linalg.norm(rec["rest_n"]))     # the free level plus the load
         self.g.force_n = base + float(rec.get("load_seen") or 0.0)
         self.g.one_n = base + max(float(rec.get("load_seen") or 0.0), float(rec.get("load_hard") or 0.0)) + self.gap
 

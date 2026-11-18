@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The exit words: one table, and the only one (ARCHITECTURE.md section 3.3).
+"""The exit words: one table, and the only one.
 
 Every stage ends on one physical event, read from measured state. The table maps each event to one exit word and
 says whether that event was the end the caller stated ("as asked"). The turn frame, the conformance vectors of the
@@ -54,7 +54,7 @@ ROWS = (
 
 EVENTS = tuple(r[0] for r in ROWS)
 WORDS = tuple(dict.fromkeys(r[2] for r in ROWS))            # the exit words, in the table's order, each once
-# the until conditions of the stage (ARCHITECTURE.md section 2.5), each with the one event that satisfies it
+# the until conditions of the stage, each with the one event that satisfies it
 UNTIL = {r[4]: r[0] for r in ROWS if r[4] is not None}
 _BY_EVENT = {r[0]: r for r in ROWS}
 

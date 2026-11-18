@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The dry check of a camera path (package sight, I37; SPEC-R4 A3, A4.3): no clearance, speed or pose count is
+"""The dry check of a camera path (package sight): no clearance, speed or pose count is
 typed here.
 
 - The path is the straight joint line the runtime's own camera move takes. It is checked at poses no further apart,
@@ -188,8 +188,8 @@ def _ref(item, pts, boxes, refs):
 def margins(ex, q_from, q_to, pts, boxes, line=None, refs=None):
     """({item: clearance at full speed}, spacing m, {path, still: {item: clearance at standstill}, length_mm}). The
     path is sampled at the bounds' spacing for the smallest standstill clearance; where that is not positive (every
-    error zero on a noise-free robot) at REL x the smallest moving capsule radius (the relative form, SPEC-R4
-    A1.1); with nothing to keep clear of, at that radius itself."""
+    error zero on a noise-free robot) at REL x the smallest moving capsule radius (the relative form); with nothing to
+    keep clear of, at that radius itself."""
     items = each_clearance(ex, q_from, pts, boxes, line)
     still = {item: SB.clearance_m(ex, 0.0, _ref(item, pts, boxes, refs), item[1]) for item in items}
     minimum = min(still.values(), default=0.0)

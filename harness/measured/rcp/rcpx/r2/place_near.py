@@ -73,7 +73,7 @@ def over_support(base_z, support, sigma, foot):
 
 def scene_t(ex):
     """The time (s, the session's clock) of the last control period in which the scene was acted on: a guard read
-    a load, or the jaws were commanded to move (the design notes C10: ex._scene_t, written by the core). Until
+    a load, or the jaws were commanded to move (ex._scene_t, written by the core). Until
     the core writes it: this package's own reading of the same two events (place_motion.period_tick). None:
     nothing has acted on the scene."""
     t = getattr(ex, "_scene_t", None)
@@ -205,7 +205,7 @@ def name(cloud, u, v, up, hand, role, e, sigma, moved, support=None, shown=None)
     taken = dict(on, by=WITHIN, distance_m=snap_px * foot0) if thing else None
     if role in PLACES:
         return _place(cloud, u, v, up, hand, e, sigma, taken, foot0, error, err_px, support, shown)
-    got = beside(P, valid, view, u, v, up, hand, sigma)      # also when e made out nothing (kind None): the design rulings
+    got = beside(P, valid, view, u, v, up, hand, sigma)      # also when e made out nothing (kind None)
     if got is None:              # the pixel's own depth lies on no level: on a thing of its own, or on a surface
         if thing and snap_px > err_px:       # no level is seen under. The thing see_cloud took for it, one pixel
             comp = SC.component(P, valid, view, u + snap[0], v + snap[1], up, hand, sigma)     # off at a corner:
@@ -234,7 +234,7 @@ def name(cloud, u, v, up, hand, role, e, sigma, moved, support=None, shown=None)
 
 
 def _place(cloud, u, v, up, hand, e, sigma, taken, foot0, error, err_px, support, shown=None):
-    """A place pixel (roles place and into; module docstring, the design rulings): (extent, names or None, near or
+    """A place pixel (roles place and into; module docstring): (extent, names or None, near or
     None). near = {"place": True, "why": "none" | "two", "things", "foot_m", "error_m"}: the pixel lies on the
     stated support and names no one thing; it is the point itself and the spot lists what stands near it. An edge
     pixel whose colour is the nearer surface's (shown "near") lies on that nearer thing, as see_cloud took it."""
@@ -322,8 +322,8 @@ def _fails(ex, rec, key, edge, base_z, foot, sigma, hand, things=()):
 def answer(ex, rec, key, fixed, cloud, up, hand, out, empty, sigma, of="pixel", px=None):
     """Close a spot whose pixel names no one thing (roles pick and part): out["answer"] where the look shows
     empty (module docstring), else the doubt that names the condition that failed (the tool then acts on the
-    point with the contact stop armed, the design rulings). px: the pixel (u, v) of look `key` the answer is about; with it the
-    answer carries the look's help (the design rulings, rcpx/control_looks.pointed_pictures): the same picture with that
+    point with the contact stop armed). px: the pixel (u, v) of look `key` the answer is about; with it the
+    answer carries the look's help (rcpx/control_looks.pointed_pictures): the same picture with that
     pixel and each "near" entry marked, and a crop around the pixel that holds them all and the hand's own opening
     on each side."""
     from rcpx.r2 import see_spot
@@ -353,7 +353,7 @@ def answer(ex, rec, key, fixed, cloud, up, hand, out, empty, sigma, of="pixel", 
 
 
 def shown(ex, p_m, role):
-    """What the newest look that shows a typed point shows there (C11): ({"look", "age_s", "acts_since", "extent":
+    """What the newest look that shows a typed point shows there: ({"look", "age_s", "acts_since", "extent":
     "thing" | "bare" | "not in any look"}, answer or None). A look shows the point when the point projects into
     it, the robot's own body does not hide it, and the surface at that pixel is at the point, behind it (the look
     sees through where the point is: nothing stands there), or the top of a thing whose seen height holds the
@@ -416,7 +416,7 @@ def answer_of(seen):
 
 
 def answered(ans, tool, nth=""):
-    """The result of a whole-step tool whose spot was answered (C11): one sentence first, stopped "answered",
+    """The result of a whole-step tool whose spot was answered: one sentence first, stopped "answered",
     nothing held, placed or moved, the "near" list; no motion, no control period, no ready call."""
     near = list(ans.get("near") or [])
     what = f"your {ans.get('of', 'pixel')}"

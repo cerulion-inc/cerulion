@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Planning of the Executor (I2, I6): rotation helpers, the resolved-rate step, Cartesian and joint plans, the
+"""Planning of the Executor: rotation helpers, the resolved-rate step, Cartesian and joint plans, the
 support under the robot and the path check.
 
 A Cartesian move is planned BEFORE motion by resolved-rate steps through model.step_toward (every joint in the solve)
@@ -214,7 +214,7 @@ class PlanMixin:
 
     def _joint_keys(self, q):
         """q_deg (the joints after the move, by name) and limit_margin_deg (the joint nearest a limit, how far, and
-        which way, plus or minus, turns it away from that limit) for motion results (FINDINGS S7: a round one surface
+        which way, plus or minus, turns it away from that limit) for motion results (a round one surface
         has no read_state)."""
         m = self.model
         lo = np.degrees(np.asarray(q) - m.q_lo)
@@ -430,7 +430,7 @@ class PlanMixin:
     def _margins(self, v=0.0, kind=None):
         """(to the support, between the robot's own links, how far below the support a tool that is meant to meet
         it may plan or None for no end): what a plan keeps against a measured thing is the cross track error
-        measured at rest (C12; a link's capsule stands for its body). Nothing here grows
+        measured at rest (a link's capsule stands for its body). Nothing here grows
         with the planned speed or with a thing's position doubt: what speed adds is priced, not refused. v stays
         in the signature for older callers and is not read."""
         B = self.bounds
@@ -526,7 +526,7 @@ class PlanMixin:
     def _contact_clearance(self, path, clear_m=None, exempt=None):
         """None, or a refusal when the path brings the robot newly within its margin of a point robot://world
         holds (a stored contact or a located point: measured things): a part of the arm that starts nearer than
-        that may not come nearer still. clear_m None: the cross track error measured at rest (C12: nothing that
+        that may not come nearer still. clear_m None: the cross track error measured at rest (nothing that
         grows with the planned speed; the capsule itself stands for the body). exempt: the id or label of the
         thing this call takes, works or holds; it is not kept clear of. Sampled by _check_samples."""
         known = self._known_points(exempt)
@@ -549,14 +549,14 @@ class PlanMixin:
     # ------------------------------------------------------------------ path check
     def _path_check(self, path, guarded=True, *, kind=None):
         """None, or a refusal when the path (one pose per control period) brings a LINK newly near the support
-        under it or another link. The margin is the cross track error measured at rest (C12; the link's capsule
+        under it or another link. The margin is the cross track error measured at rest (the link's capsule
         stands for its body): what speed adds across a path is priced by the plan, never refused, and two links
         of one arm lag together. The tool is never refused for the surface, on a move of any kind: the guard
         feels the tool, a tip line planned through the surface is cut there before it is timed and ends under
         its contact stop (control_expect.cut_at_support, called by _drive), and the tool's own bodies stand
         around the tip by their capsules' fit, which is no measured collision (a line that ends just over the
         surface is judged as one that ends in it). On a touch or a press that brings the tip nearer to the
-        surface the link next to the tool is exempt there too (the design rulings: it stands on the tool, its capsule reaches
+        surface the link next to the tool is exempt there too (it stands on the tool, its capsule reaches
         the surface when the tool does, and the contact the stroke means ends the stroke); other links are not,
         but their capsules count as at the surface only past their own fit error."""
         if len(path) < 2:
@@ -568,7 +568,7 @@ class PlanMixin:
             links = [c[0] for c in m.collision_capsules(np.asarray(path[0], dtype=float))[1:] if c[0] not in spared]
             spared |= set(links[-1:])            # the last link of the chain before the tool's own bodies
             fit = dict(m.e_fit())                # a capsule under the surface by less than its own fit error is no
-            # body under it: each link's clearance is read with its own fit error added (the design rulings, the plan refuses
+            # body under it: each link's clearance is read with its own fit error added (the plan refuses
             # only a collision with what is measured)
         plane, own, _ = self._margins(0.0, None)
         least = [x for x in (plane, own) if x > 0.0]

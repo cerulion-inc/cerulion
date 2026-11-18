@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""locate (package sight, I37; SPEC-R3 4.5): point once at a part in a look and the robot measures where it is.
+"""locate (package sight): point once at a part in a look and the robot measures where it is.
 
 Steps (the spec's numbering): 1 refusals (unknown_look, sheet_unknown, outside_frame, can_see); 2 own body
 (ex.state["selfsee"].first_hit at the look's pose; without selfsee a note); 3 on "table" or "contact_N": the ray
@@ -8,7 +8,7 @@ bracket along the ray; 6 two more views (rcpx.r2.sight_plan.locate_views; none: 
 guarded moves (ex.gates first), a look at each, the match along the epipolar band, then where the bands cross; a
 dark view ends it (ray_only, the camera returns by retreat); 8 three-ray least squares within miss_mm; 9 sanity (own
 body, under the table, beyond reach); 10 uncertain_mm; 11 part_check; 12 relations; 13 the survey box holding it; 14
-the located entry (SPEC-R3 3.2), then the camera back where it was; 15 the result.
+the located entry, then the camera back where it was; 15 the result.
 
 uncertain_mm is the step 10 propagation plus the whole stated camera pose uncertainty at the point's depth (pu_mm +
 depth x pu_rad: one fixed camera error moves every ray the same way, which the three-ray miss cannot see) plus the
@@ -207,9 +207,9 @@ def _box_on_line(ex, o, d, t_end, n=64):
 
 
 def move(ex, q, label, intent=None, moves=None):
-    """A joint move the runtime makes by itself (kind look, SPEC-R4 A8.2). The path check solves the share of full
+    """A joint move the runtime makes by itself (kind look). The path check solves the share of full
     speed at which every body keeps its clearance from what the world holds (rcpx/r2/sight_path.py); the gates are
-    asked for the move at that speed (SPEC-R3 3.8; a path gate that judges a speed is asked again at half of it);
+    asked for the move at that speed (a path gate that judges a speed is asked again at half of it);
     then the move runs at the share that passed, with the call's intent (the operator's word). Nothing here passes
     a guard, a reading count or a speed of its own.
     (ok, what, why, ran): what is "goal", "dark", a refusal's check or the stop; ran tells whether the arm moved."""
@@ -347,7 +347,7 @@ def measure(ex, key, rec, img, u, v, o, d, q_now, notes, intent=None, moves=None
             notes.append(f"{lk['look_id']}: {m.get('why', 'no match')}")
         if k == len(pair) - 1 and len(matches) < 2 and len(pair) < most:
             # a view lost the part (it turned away, the hand stood in front, or the patch repeats along that view's
-            # line): one more view in its place (SPEC-R3 4.5 step 7 names two; see the docstring)
+            # line): one more view in its place (the docstring says why)
             alt = _another(ex, plan, pair, matches)
             if alt is not None:
                 pair.append(alt)

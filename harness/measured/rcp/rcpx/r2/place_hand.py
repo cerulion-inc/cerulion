@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The jaws of package place (N4): opening, closing axis, the gap between the jaws and the hand's own shape, from the
+"""The jaws of package place: opening, closing axis, the gap between the jaws and the hand's own shape, from the
 robot's own model.
 
 Everything comes from the robot spec's gripper block (joints, open and closed values, the servo gain and force range

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a robot-run step reads and meters (SPEC-R5 4.2, 4.7): the readers of other tools' results, the meter with
+"""What a robot-run step reads and meters: the readers of other tools' results, the meter with
 the bounds of rule 7, the back-off of rule 8 and the same-view pair. A sibling file of rcpx/r2/assist_step.py, split
 off for length.
 
@@ -121,7 +121,7 @@ def unsafe(args):
 
 
 def ready(ex, tool, args, needs=None):
-    """A next call: written for this client by the assist package when it is loaded (SPEC-R5 4.6), else {tool,
+    """A next call: written for this client by the assist package when it is loaded, else {tool,
     args}. None for a call that would hold firm, a force or max_n: such a call is never written or passed on."""
     g = guard_of(ex)
     if unsafe(args) or (g is not None and callable(g.get("safe_call")) and g["safe_call"](tool, args)):
@@ -142,7 +142,7 @@ def ready(ex, tool, args, needs=None):
 
 
 def read_act(r):
-    """ONE place that reads a push or lift result (SPEC-R3 4.3): its stop, its felt list, its seen sentence."""
+    """ONE place that reads a push or lift result: its stop, its felt list, its seen sentence."""
     r = r if isinstance(r, dict) else {}
     ref = r.get("refused") if isinstance(r.get("refused"), dict) else None
     felt = [f for f in (r.get("felt") or []) if isinstance(f, dict)]
@@ -207,7 +207,7 @@ def spec_of(ex, target, look=None):
 
 
 def read_record(ex, rec, acted, watch, rec2=None, looks=()):
-    """ONE place that reads a witness record (SPEC-R3 4.4) into the plain record assist_until judges: at rows with
+    """ONE place that reads a witness record into the plain record assist_until judges: at rows with
     role acted | watch, changes with where they lie, on_own_body (the robot's own outline in either look) and
     seen_again (a light or colour change at the same place in a second look's record)."""
     if not isinstance(rec, dict):

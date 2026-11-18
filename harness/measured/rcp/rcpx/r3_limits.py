@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Round three limits (SPEC-R3.md 3.7 and the rules of sections 3 and 4, as SPEC-R4 derives them). No number that
-bounds speed, force, travel or time is typed here: each is a function of the bounds object B (rcpx.bounds.of(ex),
-SPEC-R4 A8.1) and of the eight ratios of rcpx/bounds_ratios.py, so it follows the robot's own ratings, what it
+"""Round three limits, as the bounds derive them. No number that
+bounds speed, force, travel or time is typed here: each is a function of the bounds object B (rcpx.bounds.of(ex))
+and of the eight ratios of rcpx/bounds_ratios.py, so it follows the robot's own ratings, what it
 measured on itself, what contact showed and what the operating model stated. Pure: no motion, no scene, no robot
 named. This module is the one place where round three's packages reach the bounds object.
 
@@ -29,7 +29,7 @@ from rcpx.r3_numerics import *  # noqa: F401,F403  the kept word rules, image nu
 
 # ---------------------------------------------------------------- the bounds object and the ratios
 def bounds_of(ex):
-    """The executor's bounds: ex.bounds when it is set, else rcpx.bounds.of(ex) (SPEC-R4 A8.1)."""
+    """The executor's bounds: ex.bounds when it is set, else rcpx.bounds.of(ex)."""
     B = getattr(ex, "bounds", None)
     if B is not None:
         return B
@@ -37,7 +37,7 @@ def bounds_of(ex):
     return bounds.of(ex)
 
 def ratio(name):
-    """One of the eight ratios of SPEC-R4 A7 by name."""
+    """One of the eight ratios by name."""
     from rcpx import bounds_ratios
     return getattr(bounds_ratios, name)
 
@@ -104,7 +104,7 @@ def moved_mm(B, q=None, u=None, v_mm_s=None, force_n=None, thing=None, **kw):
     """The least travel that shows a part moved under a push, never zero: the arm's own resolution and give
     (rigid); on a robot whose readings never change (rigid 0), the error with which the touch that found the part
     knows where it began (v x t_det + quantum, v the touch's own speed, else the arrival speed the bounds give);
-    with no speed either, REL of the tool's half width (the relative form of SPEC-R4 A1.1; closes CK-08)."""
+    with no speed either, REL of the tool's half width (the relative form)."""
     rigid = rigid_mm(B, q, u, force_n)
     if rigid > 0:
         return rigid
@@ -134,10 +134,10 @@ def ladder_round_n(B, q=None, u=None, **kw):
 
 def force_spec(B, kind="press", thing=None, q=None, u=None, intent=None, sheet_forces=None, moved_n=None,
                touched_n=None, local=None):
-    """The ramp and its ceiling (SPEC-R4 A4.5): {first_n, rate_n_s(F), ceiling_n, source, items, refused}. B.force is
+    """The ramp and its ceiling: {first_n, rate_n_s(F), ceiling_n, source, items, refused}. B.force is
     asked first; the facts the caller holds (the sheet's forces, the largest force that moved this part or another
     part of its device, the still hold's noise) complete it. No sheet force, no stated force, nothing that moved
-    and no firm word: NOT refused (the design rulings, C9): the ceiling is what the arm can push and the ramp runs until the
+    and no firm word: NOT refused: the ceiling is what the arm can push and the ramp runs until the
     part moves (round four refused force_unknown here; the core's press says so in its notes and offers max_n)."""
     from rcpx import bounds_report
     intent = dict(intent or {})
@@ -178,7 +178,7 @@ def force_spec(B, kind="press", thing=None, q=None, u=None, intent=None, sheet_f
     if firm and not forces and not stated and moved is None:
         terms[0] = (terms[0][0], "intent", "firm, on your word: the arm's own rating alone", terms[0][3])
     items = [bounds_report.item("force", t[0], t[1], t[2], t[3]) for t in terms]
-    # the design rulings, C9: nothing known of the force this part bears is no reason to refuse (a tool never refuses because
+    # nothing known of the force this part bears is no reason to refuse (a tool never refuses because
     # it is unsure): the ceiling stands with its source, and the ramp runs until the part moves
     refused, ceiling, source = None, terms[0][0], terms[0][1]
     first = max(touched_n or 0, _get(spec, "first_n") or 0, f_touch(B, readings=2, local=local))
@@ -214,7 +214,7 @@ def view_tol(B, q=None, u=None, depth_mm=None, **kw):
     """Same view {mm, deg, roll_deg}: what the robot cannot tell from none (QUANT x the camera's own motion for one
     quantum on every joint) plus what the frame comparison itself lines up (ALIGN_SHIFT_PX pixels at the scene's
     depth, ALIGN_TURN_DEG of roll). It follows the camera and its readings and does not fall to zero on a robot
-    whose readings never change (CK-08)."""
+    whose readings never change."""
     model = _model(B)
     cm, cd = camera_step(model, q, [math.degrees(v) for v in B.joint_quantum()])
     k, f_px = ratio("QUANT"), float(model.f_px)
@@ -239,7 +239,7 @@ def thresholds(B, q=None, u=None, **kw):
     out["source"] = {name: _src(B, name) for name in ("quantum", "sigma_f")}
     return out
 
-# ---------------------------------------------------------------- margins (SPEC-R4 A4.3, A4.8)
+# ---------------------------------------------------------------- margins
 def standoff_mm(B, q=None, u=None, thing=None, v_mm_s=None, **kw):
     """d_stop(v) + QUANT x sigma_p + w_tool before a point; v None = the speed the tool arrives with (v_in)."""
     v = B.v_in(thing, q, u)[0] if v_mm_s is None else float(v_mm_s or 0) / MM
@@ -316,7 +316,7 @@ def settle_max_s(B, q=None, u=None, **kw):
 
 # ---------------------------------------------------------------- 4.3 act: confirm, fit, travel, release, lift
 def confirm_back_mm(B, q=None, u=None, travel_mm=0.0, **kw):
-    """Back off by the travel the part showed and the tool's half width (SPEC-R4 A4.8)."""
+    """Back off by the travel the part showed and the tool's half width."""
     return float(travel_mm or 0) + _w_tool_mm(B)
 
 def confirm_tol_mm(B, q=None, u=None, v_mm_s=0.0, force_n=None, **kw):
@@ -453,7 +453,7 @@ def inputs(ex=None, body=None, B=None):
     """The resolution facts as served: {res_deg (per joint, None where none is stated), pu_mm, pu_deg, source}.
     Read from, in order: body (the robot://body document); ex.context["body"] (the document or a callable);
     ex.model.spec["encoder_counts"] with ex.context["camera_uncertainty"]. With B, quantum_source says whether the
-    quantum is stated or measured by the robot on itself (a robot that states none measures it: CK-08)."""
+    quantum is stated or measured by the robot on itself (a robot that states none measures it)."""
     if isinstance(body, dict):
         facts = _from_body(body)
     else:
@@ -485,16 +485,16 @@ def inputs(ex=None, body=None, B=None):
     return facts
 
 # Still read outside this work package (each goes when its last reader has switched):
-NOISE_DEFAULT_N = 0.1  # rcpx/r2/assist_guard.py, rcpx/r2/assist_step_read.py (round five)
-ACT_MAX_S = 60.0  # rcpx/r2/assist_step.py (round five)
-LADDER_ROUND_N = 0.1  # rcpx/r2/assist_guard.py (round five)
-STANDOFF_MM, STANDOFF_UNC_MULT = 30.0, 2.0  # rcpx/r2/assist_step.py (round five)
-TOUCH_EXTRA_MM, TOUCH_UNC_MULT = 10.0, 3.0  # rcpx/r2/assist_step.py (round five)
-TOUCH_PIECE_S = 40.0  # rcpx/r2/eyes_choose.py (round five)
-VIEW_D_MIN_MM, VIEW_D_MAX_MM, VIEW_D_STEP_MM = 150.0, 400.0, 50.0  # rcpx/r2/assist_seek_move.py (round five)
-VIEW_TOOL_CLEAR_MM = 40.0  # rcpx/r2/assist_seek_move.py (round five)
-DEVICE_BOX_NEAR_MM = 20.0  # rcpx/r2/assist_seek.py (round five)
-BRACKET_NEAR_MM = 60.0  # rcpx/r2/eyes_choose.py (round five), tests/test_r2_sight_path.py
+NOISE_DEFAULT_N = 0.1  # rcpx/r2/assist_guard.py, rcpx/r2/assist_step_read.py
+ACT_MAX_S = 60.0  # rcpx/r2/assist_step.py
+LADDER_ROUND_N = 0.1  # rcpx/r2/assist_guard.py
+STANDOFF_MM, STANDOFF_UNC_MULT = 30.0, 2.0  # rcpx/r2/assist_step.py
+TOUCH_EXTRA_MM, TOUCH_UNC_MULT = 10.0, 3.0  # rcpx/r2/assist_step.py
+TOUCH_PIECE_S = 40.0  # rcpx/r2/eyes_choose.py
+VIEW_D_MIN_MM, VIEW_D_MAX_MM, VIEW_D_STEP_MM = 150.0, 400.0, 50.0  # rcpx/r2/assist_seek_move.py
+VIEW_TOOL_CLEAR_MM = 40.0  # rcpx/r2/assist_seek_move.py
+DEVICE_BOX_NEAR_MM = 20.0  # rcpx/r2/assist_seek.py
+BRACKET_NEAR_MM = 60.0  # rcpx/r2/eyes_choose.py, tests/test_r2_sight_path.py
 MISS_PU_FRAC = 0.5  # rcpx/r2/sight_locate.py
 CAPSULE_GROW_MM, CAPSULE_NEAR_MM, CONTACT_KEEP_MM = 5.0, 15.0, 10.0  # rcpx/r2/selfsee_body.py (its pure callers)
 FRAME_SETTLE_DT_S, FRAME_SETTLE_FRAC = 0.2, 0.02  # rcpx/r2/witness_pose.py

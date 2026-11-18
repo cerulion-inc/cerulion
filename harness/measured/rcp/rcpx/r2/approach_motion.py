@@ -65,7 +65,7 @@ def readable(result, mm=False):
 
 
 def tip_pose(model, q):
-    """Tool-tip transform at a joint pose for the cores stream, SPEC-R4 A8.2."""
+    """Tool-tip transform at a joint pose for the cores stream."""
     p, rot = model.fk_tip(q)
     T = np.eye(4)
     T[:3, :3], T[:3, 3] = rot, p
@@ -74,7 +74,7 @@ def tip_pose(model, q):
 
 class ApproachMotion:
     # ------------------------------------------------------------------ the standoff pose
-    """Dry geometry planning and one-stream execution for approach, SPEC-R4 A8.2."""
+    """Dry geometry planning and one-stream execution for approach."""
     def _appr_stroke_ok(self, q, along, stroke_m, thing=None):
         """Whether the stroke a touch would make from q (a straight guarded line along `along`, orientation held)
         plans and passes the path check: dry, nothing moves."""
@@ -130,7 +130,7 @@ class ApproachMotion:
 
     def _appr_choose(self, kin, q_now, goal, along, p_t, keep_in_view, extra, stroke_m, thing=None):
         """The standoff pose. Of the hand orientations that face the stroke, the one NEAREST THE PRESENT hand is
-        preferred (FINDINGS R5: a roll left free landed the hand upside down): every start is solved with the roll
+        preferred (a roll left free landed the hand upside down): every start is solved with the roll
         held nearest the present one first, and the first fully met pose (square, in view, its stroke plans) is
         taken. Otherwise the roll is freed (the view task may turn it) and those poses join the pool. When no square
         pose passes the plane and self checks, or none has a stroke that plans, facings tilted 10 to 75 deg off
@@ -198,7 +198,7 @@ class ApproachMotion:
         return path if self._path_check([q0] + path, True) is None else None
 
     def _appr_stage_plan(self, kin, s, q_goal, goal, along, thing, intent):
-        """Try a staging point behind the stroke, facing or radial direction, SPEC-R4 A4.2."""
+        """Try a staging point behind the stroke, facing or radial direction."""
         n_face = kin.pose(q_goal)[1]
         backs = [along, n_face]
         flat = np.array([along[0], along[1], 0.0])
@@ -214,7 +214,7 @@ class ApproachMotion:
         return None
 
     def _appr_stage_legs(self, kin, s, q_goal, goal, n_face, back, thing, intent):
-        """Stage from stop distance and tool size, rising only over known space, SPEC-R4 A4.2/Q12."""
+        """Stage from stop distance and tool size, rising only over known space."""
         B = bounds.of(self)
         size = max(kin.size_mm, default=0.0) / 1000.0
         v_travel = B.v_free(q_goal, back)

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The stop conditions of a routine the robot runs itself (SPEC-R5 4.2, 9.4). Pure: standard library only.
+"""The stop conditions of a routine the robot runs itself. Pure: standard library only.
 
 The operating model states a stop condition in two words; this file reads them (parse), says whether a condition may
 be used now (valid), and decides from plain data whether one step met it and with WHICH KIND OF EVIDENCE (met):

@@ -4,10 +4,10 @@
 Space is known free by one of three sources and by nothing else; a word of the caller buys nothing:
 
   1. a look of the scene as it stands shows it free by more than the look's own stated error (rcpx/r2/see_free.py;
-     across calls only a look taken after the arm's last motion, the design rulings);
+     across calls only a look taken after the arm's last motion);
   2. the arm's own bodies or the held thing passed through it IN THIS CALL, with nothing met and no jaw told
      to move since, no look taken since that shows a surface in it, and no part the session set moving able to
-     reach it (rcpx/control_move_passed.py; the design rulings: the passage of an earlier call frees nothing, the
+     reach it (rcpx/control_move_passed.py; the passage of an earlier call frees nothing, the
      world can change between calls);
   3. the owner's site statement calls it free (a zone with "free": true).
 
@@ -58,7 +58,7 @@ def _see(ex):
 
 
 def known_free(ex, points_m, radii_m):
-    """(free, by, why) per ball (centre m, radius m; the design rulings). by: "site", "passed", "look" or None; why: for a
+    """(free, by, why) per ball (centre m, radius m). by: "site", "passed", "look" or None; why: for a
     ball that is not known free, what each source says of it."""
     pts = np.asarray(points_m, dtype=float).reshape(-1, 3)
     radii = np.broadcast_to(np.asarray(radii_m, dtype=float), (len(pts),)).astype(float)
@@ -104,7 +104,7 @@ def known_free(ex, points_m, radii_m):
 def _measured_in(ex, pts, radii):
     """bool per ball: a point of a measured thing of the space book (touched, located, a device's) lies inside the
     ball grown by BAND times that point's own error. The arm's passage frees no ball that holds a surface the
-    session measured: a pose the arm stood at while it touched holds that surface (the design rulings, b (2))."""
+    session measured: a pose the arm stood at while it touched holds that surface."""
     out = np.zeros(len(pts), dtype=bool)
     try:
         things = ex.bounds.space._all()
@@ -179,7 +179,7 @@ def lead(ex, B, q, d, held=None):
 
 def stroke(ex, B, q, p0, d, reach, held=None):
     """How far along a stroke from the pose q (tip p0) along d (unit, base), at most reach (m), ALL that the
-    tool's own bodies and the held thing sweep is known free (the design rulings, c; C15 (1)). The tool keeps its turn on a
+    tool's own bodies and the held thing sweep is known free. The tool keeps its turn on a
     stroke, so its balls move with the tip. A station every half width of the tool (no thing as wide slips
     between). free_to_m: the travel of the last station known free (0: not even the first); by: the sources
     that carried it; why: what the first station that is not known free lacks (None: the whole reach is free)."""
@@ -207,8 +207,8 @@ def stroke(ex, B, q, p0, d, reach, held=None):
 
 def zone(B, free_limit):
     """The record of one plan under a limit stated on free space, or None when none is stated. "limit": what
-    binds the tool there: the least stated limit (a force_n stated on a move counts, C3), but never the force a
-    touch ends at (the design rulings: that record carries "floor"; only the LIMIT stated beside it binds a free stretch)."""
+    binds the tool there: the least stated limit (a force_n stated on a move counts), but never the force a
+    touch ends at (that record carries "floor"; only the LIMIT stated beside it binds a free stretch)."""
     plain = free_limit.get("limit_n") is not None and "floor" not in free_limit
     lim = free_limit if plain else limit.hold_of(free_limit)
     if lim is None:
@@ -284,7 +284,7 @@ def _merge(rows):
 
 
 def cost(zone, periods, without):
-    """The receipt's limit.cost (C12): the control periods the limit added, the same motion's count with no
+    """The receipt's limit.cost: the control periods the limit added, the same motion's count with no
     limit, where the limit held (path coordinate, mm, with what each source says of the stretch) and which
     sources carried the stretches it did not hold. With no look held: what a look that shows the way free would
     have made of it."""

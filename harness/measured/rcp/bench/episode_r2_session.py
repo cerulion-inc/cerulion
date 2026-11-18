@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The round two session (SPEC-R2 C2, C3, C5): rcpx.server.Session with think time, op_id and the claim's cannot.
+"""The round two session: rcpx.server.Session with think time, op_id and the claim's cannot.
 
 SessionR2 wraps Session.dispatch; rcpx/server.py is not edited.
 
-- THINK TIME (C2): before each "call" request (while the episode runs) the world idles think_s simulated seconds
+- THINK TIME: before each "call" request (while the episode runs) the world idles think_s simulated seconds
   through idle(seconds) (the arm holds its present command; devices, light schedules and timed interventions run).
   The session's clock is the ACTIVE clock: world time minus the think time so far, so the simulated-seconds budget
   and every journal t_s count active seconds only. Every response's budget block adds world_seconds (the think time
   so far: the seconds the world ran while the operator thought), world_clock_s (all simulated seconds since the
   session began, active plus think) and think_s_per_call. Each think is journaled as a "think" record (call index,
   seconds, world and active time after it) so a replay with the same think_s reproduces it.
-- OP_ID (C3): a request may carry "op_id". A repeat of the same request with the same op_id returns the stored first
+- OP_ID: a request may carry "op_id". A repeat of the same request with the same op_id returns the stored first
   response unchanged; nothing runs (no think time, no motion, no budget) and an "op_replay" record is journaled. The
   same op_id on a different request is refused with check "op_id" and nothing runs.
-- CLAIM (C5): with claim=CLAIM_R2 (the vnext surface) a claim may carry cannot {reason, evidence}: the operator's
+- CLAIM: with claim=CLAIM_R2 (the vnext surface) a claim may carry cannot {reason, evidence}: the operator's
   statement that the task cannot be done and why. Other surfaces keep the round one claim. claim_check(args) runs on
   a claim that carries cannot (the person package's evidence check when that package is loaded); a refusal it
   returns refuses the claim and the episode goes on.
-- CLAIM GATES (SPEC-R3 C2): claim_gates is [(package, fn(args, session) -> None | answer dict)], in package order.
+- CLAIM GATES: claim_gates is [(package, fn(args, session) -> None | answer dict)], in package order.
   They run on every well-formed claim, with or without cannot, BEFORE the cannot check and before anything is
   recorded. The first answer is returned as {seq, op "claim", episode "continues", result: answer, budget}: the
   claim is NOT recorded, no call is charged and the episode goes on; the journal gets a claim_answer record {req:
@@ -82,7 +82,7 @@ class SessionR2(server.Session):
                  claim_gates=None, claim_fields=None):
         self.world_clock = world_clock if world_clock is not None else server._find_clock(executor)
         self.claim_check = claim_check          # fn(claim args) -> None | refusal, for a claim that carries cannot
-        self.claim_gates = list(claim_gates or [])   # [(package, fn(args, session) -> None | answer)] (SPEC-R3 C2)
+        self.claim_gates = list(claim_gates or [])   # [(package, fn(args, session) -> None | answer)]
         self.claim_fields = claim_fields        # fn() -> dict merged into a recorded claim's result and end record
         self.claim_answers = 0                  # claims a gate answered instead of recording
         self.think_s = max(0.0, float(think_s or 0.0))

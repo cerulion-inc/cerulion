@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package finish (I36, SPEC-R3 4.2): the claim gate. A claim that the evidence does not carry is answered, not
+"""Package finish: the claim gate. A claim that the evidence does not carry is answered, not
 recorded: a success claim with no act, no look after the act, a later step not reached, evidence against it, an
 object never located after its push, or an act that moved nothing, gets a hard answer; a success claim whose
 done test is not met yet, a give-up with most of the budget left and things not tried, and a give-up the evidence
@@ -26,7 +26,7 @@ step, seen_not_claimed once, give_up_early at most once before the first device 
 recorded at once in the dark, with nothing new to try, after a blocking refusal in the last 3 calls, or with a
 third of the budget or less left.
 
-PART B CALLS (core lane C2: the session's claim step, before the cannot check and before any claim is recorded):
+PART B CALLS (the core's claim step, before the cannot check and before any claim is recorded):
     answer = rcpx.r2.finish.CLAIM_GATE(ex, args, session)
         ex       the hooked executor (a forwarding wrapper that holds it as ._ex is unwrapped)
         args     the claim's arguments as sent (a dict with success)
@@ -482,7 +482,7 @@ def _record(ex, facts, seq, success, overridden, would):
 
 
 def claim_fields(ex):
-    """What C2 adds to a recorded claim's record: {"gate_overridden": bool}."""
+    """What the claim gate adds to a recorded claim's record: {"gate_overridden": bool}."""
     rec = state(_real(ex)).get("recorded") or {}
     return {"gate_overridden": bool(rec.get("gate_overridden"))}
 
@@ -535,8 +535,7 @@ def _first_param(fn):
 
 def _limit(ex, name, *args):
     """The round three limit NAME as this session derives it: r3_limits' lower case function of that name called
-    with the session's bounds and args once it exists (device_box_near_mm(B, sigma_mm)); until then the constant
-    (the Review stage removes this branch)."""
+    with the session's bounds and args once it exists (device_box_near_mm(B, sigma_mm)); until then the constant."""
     fn = getattr(L, name.lower(), None)
     if callable(fn) and _first_param(fn) in ("B", "bounds"):
         return float(fn(bounds.of(ex), *args))

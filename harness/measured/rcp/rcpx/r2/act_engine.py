@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The stages of push and lift (SPEC-R3 4.3, SPEC-R4 derived bounds).
+"""The stages of push and lift.
 
 Line selection is pure over stored geometry. Run owns one call's gates, budget,
 local free hold, approach options, confirmed touches, face fit and release.
@@ -63,7 +63,7 @@ def _r(v, nd=4):
 
 def line(way, normal, centre_mm, top_mm, p_mm, ray, B=None, sigma_mm=0):
     """
-    (u, source) by the first rule that applies (SPEC-R3 4.3 P2), or (None, deg up) when u points up more
+    (u, source) by the first rule that applies, or (None, deg up) when u points up more
     than
     WAY_UP_Z: refused way_up. source: way | normal | centre | naming_ray | radial.
     """

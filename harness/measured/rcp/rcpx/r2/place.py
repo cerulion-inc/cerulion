@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package place (N4), round six (the design notes, packages PICK and PLACE; contracts C8, C11, C12, C14): picking
+"""Package place: picking
 up, carrying and setting down FREE things with a gripper, for any arm with a gripper and any thing, with no model
 of the thing given.
 
@@ -21,7 +21,7 @@ Tools (Mixin primitives), each one sentence first (said), then the facts:
 - put(pick, to | on | in, items): the whole step, or several in order inside one budget. The spot of both ends
   is resolved before anything moves (a place that cannot be found costs no pick and no motion; a take whose
   pixel the look shows on an empty place is ANSWERED, stopped "answered", with what the look shows near it:
-  rcpx/r2/place_near.py, the design rulings); before each item
+  rcpx/r2/place_near.py); before each item
   its control periods are counted as the plan will run (rcpx/r2/place_count.py) and compared with those left:
   an item that does not fit is not started.
 
@@ -95,7 +95,7 @@ class Mixin(PickMixin, CarryMixin, SetMixin, SideMixin, CountMixin):
         for key, value in (("gentle", gentle), ("firm", firm), ("touch", touch)):
             if value:
                 intent[key] = True
-        if max_n is not None:      # a limit on the call; a malformed one is refused by the plan (C3)
+        if max_n is not None:      # a limit on the call; a malformed one is refused by the plan
             intent["max_n"] = max_n
         if expect is not None:
             intent["expect"] = expect
@@ -236,7 +236,7 @@ class Mixin(PickMixin, CarryMixin, SetMixin, SideMixin, CountMixin):
         return out
 
     def _pl_pick_run(self, a, intent):
-        """The take (rcpx/r2/place_pick.py, C14: once per item; this file never takes again)."""
+        """The take (rcpx/r2/place_pick.py: once per item; this file never takes again)."""
         st = self.state["place"]
         st["picked_at"] = [float(x) for x in a["point"]]
         st["taken"] = place_spot.taken_of(self, a["seen"])      # the thing as the look showed it before the take
@@ -288,7 +288,7 @@ class Mixin(PickMixin, CarryMixin, SetMixin, SideMixin, CountMixin):
         way = self._pl_way(target, facts, intent, bounds.of(self))
         if "refused" in way:
             return way
-        r = self._pl_carry_impl(target, intent, way)     # (one stream: the core counts it before it starts, C10)
+        r = self._pl_carry_impl(target, intent, way)     # (one stream: the core counts it before it starts)
         if "refused" in r:
             return r
         out = self._pl_carried(r, target, facts) if r["stopped"] == "goal" else self._pl_stopped(r, "carrying it")
@@ -341,8 +341,8 @@ class Mixin(PickMixin, CarryMixin, SetMixin, SideMixin, CountMixin):
     def _pl_place_impl(self, target, intent, release=None, release_m=None, counted=False):
         """The held thing to its place: the carry (ONE stream: up, across, down to the carry height), the way down
         (an expected contact, with its own price), the release, the rise; through the open side when the place
-        stands under a cover the space book holds (place_side). Its control periods are counted before it moves
-        (C12); counted: the caller's budget line held this place already (a put counts the whole item before
+        stands under a cover the space book holds (place_side). Its control periods are counted before it moves;
+        counted: the caller's budget line held this place already (a put counts the whole item before
         its take: the thing is then in the hand, and each stream piece still counts itself). Returns the
         result or a refusal."""
         st = self.state["place"]
@@ -351,7 +351,7 @@ class Mixin(PickMixin, CarryMixin, SetMixin, SideMixin, CountMixin):
         facts = self._pl_hold_facts()
         before = (target.get("seen") or {}).get("looks") or []
         picked = st.get("picked_at")
-        place_spot.settle(self, target, facts)       # the design rulings: where on the pointed thing the held thing stands
+        place_spot.settle(self, target, facts)       # where on the pointed thing the held thing stands
         plan = self._pl_set_plan(target, intent, facts, release, release_m)
         cover = self._pl_cover(target, plan, B)
         if cover is not None:
@@ -451,7 +451,7 @@ class Mixin(PickMixin, CarryMixin, SetMixin, SideMixin, CountMixin):
 
     def _pl_put_impl(self, items, intent):
         """Each item: the spot of both ends with no motion, the budget line (the count of C12), the take (once: the
-        pick's own, C14), the place."""
+        pick's own), the place."""
         done, last = [], None
         for i, item in enumerate(items):
             nth = f"item {i + 1} of {len(items)}: " if len(items) > 1 else ""
@@ -532,7 +532,7 @@ class Mixin(PickMixin, CarryMixin, SetMixin, SideMixin, CountMixin):
         return len(self.state["place"].get("log", {}).get("rows") or [])
 
     def _pl_finish(self, out):
-        """The receipt of a whole-step tool (C12): said first; held and placed; the phases with their control
+        """The receipt of a whole-step tool: said first; held and placed; the phases with their control
         periods, each with its own strike; the periods used and left; the largest strike of its motions and
         predicted_peak_n; the bounds with their sources; the word when one was given; the doubt lines."""
         if not isinstance(out, dict) or "refused" in out:

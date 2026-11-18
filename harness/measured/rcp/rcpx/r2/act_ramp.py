@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Continuous force legs of push and lift (SPEC-R4 A4.5).
+"""Continuous force legs of push and lift.
 
 Each target follows the measured noise, torque error and detection time. A give
 leg stops once it shows resolved travel beyond the earlier legs, even when force
@@ -30,7 +30,7 @@ def drive_period(self, state, u, target, hold):
     k_w = bounds_laws.series(k, k_c) if k_c is not None and k_c > 0 else k
     speed = min(B.v_free(s.q, u), bounds_laws.load_speed(target, state["read_n"], k_w, B.t_det()))
     # toward an end not yet found the tip also goes no faster than the speed whose stop on that end peaks at the
-    # ceiling, (C - F_now) / Z (SPEC-R4 A4.5 follow), wherever the bounds object resolves the stop slope Z
+    # ceiling, (C - F_now) / Z, wherever the bounds object resolves the stop slope Z
     z = B.slope(s.q, u, state.get("thing"))[0] if hasattr(B, "slope") else None
     if z:
         speed = min(speed, max(0.0, state["ceiling_n"] - state["read_n"]) / z)

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What the robot may do on its own (SPEC-R5.md 4.7, interface 9.7): pure rules, plain data in, a verdict out.
+"""What the robot may do on its own: pure rules, plain data in, a verdict out.
 
-Every tool of round five that moves the robot without a call of the model for that very motion, and every call the
+Every tool of this package that moves the robot without a call of the model for that very motion, and every call the
 surface writes for the model, asks this file first. A verdict is None (allowed) or the reason; a refusal is always
 {"check", "why", "hint"}. Data that is missing or cannot be read gets the strict verdict, never the loose one.
 Nothing here names a robot, a device, a part or a task, and no force is typed here (a force comes from

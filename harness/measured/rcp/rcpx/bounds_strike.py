@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The price of a motion: the largest strike it could make on a rigid thing, and what that number rests on
-(round six, the design rulings; contract C2 changed). The strike never lowers a
+"""The price of a motion: the largest strike it could make on a rigid thing, and what that number rests on. The strike
+never lowers a
 free leg; a stated limit does (rcpx/bounds_limit.py).
 
 - price(samples, fit, t_det_s, ...): pure. Per plan sample (a straight stretch at its fastest speed) one figure,
@@ -10,7 +10,7 @@ free leg; a stated limit does (rcpx/bounds_limit.py).
      so that the figure gives back at least every stop's own peak. A sample slower than the slowest such stop
      (V0) is priced no less than that stop's own peak: slower than anything measured, what a stop adds by itself
      is not known to shrink (one arm made 2.04 N at a crawl where the line said 2.0 N).
-  2. above V1, or with no stop yet: THE ENERGY BOUND (the design rulings; z_source starts "bound:"), for a free
+  2. above V1, or with no stop yet: THE ENERGY BOUND (z_source starts "bound:"), for a free
      leg and an arrival stretch alike, at the sample's own speed: the guard's level plus (1 + rel) times the
      body's model at the point held fast along its travel (rcpx/bounds_know_point.py), times max(1, c) where
      this body's stops read over the model, times the speed. Along the point's own travel the mass held fast
@@ -116,7 +116,7 @@ def _level(guard, cap):
 
 
 def price(samples, fit, t_det_s, *, rel=REL, cap=None, link=None, gentle=None, moving=None):
-    """The strike a motion could make (plan.strike, contract C2 changed; the design rulings).
+    """The strike a motion could make (plan.strike).
 
     samples: [{"v": the fastest point of the tool's bodies and of the held thing's extent at that plan sample (m/s),
     "model_z": the body's model of the stop slope there (N per m/s), "f_guard": the threshold the guard will run

@@ -8,7 +8,7 @@ control_sense.py (the external joint torque from two readings and where the forc
 machinery: configuration, the gravity feed-forward command, easing, frames; control_base.py holds the defaults,
 the guard and the primitive wrapper that ticks the World, journals and never raises.
 
-Rules every primitive follows (SPEC section 3 control.py, I6):
+Rules every primitive follows (SPEC section 3 control.py):
 - every bound a move runs under (speed, force, torque, travel, time) is derived by the session's bounds
   (rcpx/bounds.py, ex.bounds) from the robot's own ratings and what it measured; none is typed here;
 - a path check runs before motion; a refusal is a result and changes nothing;
@@ -103,8 +103,8 @@ class Executor(MotionMixin, ContactMixin, LooksMixin, SenseMixin):
         self._q_des = None           # the commanded pose (without the gravity feed-forward)
         self._gripper_cmd = None
         self._pressing = False       # a stop left a joint pressing: ease before a picture
-        self._history = []           # executed joint paths, newest last (I12 retreat)
-        self.base_give = None        # I11: the last measured give, bounds later pushes
+        self._history = []           # executed joint paths, newest last (for a retreat)
+        self.base_give = None        # the last measured give, bounds later pushes
         self._looks = {}
         self._dark_look = None       # (reading id, brightness) of the newest light reading when it is dark, else None
         self._light = None           # the newest light reading (LooksMixin._note_light)
@@ -121,7 +121,7 @@ class Executor(MotionMixin, ContactMixin, LooksMixin, SenseMixin):
         s = self._sense()
         self._q_des = s.q.copy()
 
-    # ---------------------------------------------------------------- the last act that changed the scene (C10)
+    # ---------------------------------------------------------------- the last act that changed the scene
     _scene_t = None   # s: the time of the last control period in which a guard read a load over its threshold or
     _pace = None      # the jaws were told to move; _pace: what the last move's pacing did
 
@@ -135,7 +135,7 @@ class Executor(MotionMixin, ContactMixin, LooksMixin, SenseMixin):
         """The hold record (rcpx/control_hold.py), or None."""
         return control_hold.held(self)
 
-    def _quiet(self, s, need_m):   # r6 shim: until the motion files' own _quiet judges through control_hold
+    def _quiet(self, s, need_m):   # compat shim: until the motion files' own _quiet judges through control_hold
         return control_hold.quiet(self, s, need_m)
 
     # ---------------------------------------------------------------- the jaws in the body model
@@ -200,7 +200,7 @@ class Executor(MotionMixin, ContactMixin, LooksMixin, SenseMixin):
         self._q_cmd, self._frac_cmd = q_cmd, frac
         jaws = self._gripper_cmd
         if hasattr(self, "_jaws_told") and np.any(np.asarray(jaws != self._jaws_told)):
-            self._scene_touch()            # the jaws are told to move: the scene may change from here (C10)
+            self._scene_touch()            # the jaws are told to move: the scene may change from here
         self._jaws_told = jaws
         self.backend.command(q_cmd, torque_frac=frac, gripper=jaws)
 
@@ -287,10 +287,10 @@ class Executor(MotionMixin, ContactMixin, LooksMixin, SenseMixin):
 
     @primitive
     def verify(self, **claim):
-        """I9 through the World: a state is confirmed by a later look or a second sense."""
+        """Through the World: a state is confirmed by a later look or a second sense."""
         return self._verify_impl(claim)
 
-    # ---------------------------------------------------------------- the jaws (FINDINGS R3; A4.7)
+    # ---------------------------------------------------------------- the jaws
     def _jaw_load(self, s):
         """The jaws' squeeze as a share of their servo's force (the largest jaw), from the reading; None without."""
         g, r = self.model.spec.get("gripper"), s.gripper
@@ -368,7 +368,7 @@ class Executor(MotionMixin, ContactMixin, LooksMixin, SenseMixin):
 
     @primitive
     def gripper(self, width_frac, hold=True, force_frac=None, max_n=None):
-        """Open or close the jaws (FINDINGS R3) through the core's one close and one release (rcpx/control_hold.py).
+        """Open or close the jaws through the core's one close and one release (rcpx/control_hold.py).
         A close runs at the jaws' own rate until their own reading tells a thing between them (ended on_thing) or
         they reach the asked opening (closed); then it holds: with force_frac stated, that share of the jaw
         servo's force; with a width stated between open and closed, that width (the caller's squeeze); else the

@@ -17,8 +17,7 @@ whatever directory the client starts it in:
 
 Claude Desktop takes the same command, args and env under `mcpServers` in its config file. A long move can
 outlast a client's tool timeout (Claude Code: `MCP_TOOL_TIMEOUT`, in ms); the bridge itself waits `--timeout`
-seconds (default 900) per request. ROOT/README.md section 2 shows the whole route from a started episode, and
-tests/test_docs_fix2.py runs that launch line against a live episode.
+seconds (default 900) per request.
 
 What a client sees:
 - initialize: instructions. One line names the resources the episode lists, in the order robot://task,
@@ -53,7 +52,7 @@ What a client sees:
   still reads that answer, so a claim or e-stop result is never lost). stdout carries protocol only;
   diagnostics go to stderr.
 
-## What the owner of a deployment may state (SPEC-R4 A6)
+## What the owner of a deployment may state
 
 rcpx types no speed, force, torque, travel or time limit. Every bound is derived for the session from the robot's
 own ratings, what it measured on itself, what contact has shown and what it has reason to expect in the way, and

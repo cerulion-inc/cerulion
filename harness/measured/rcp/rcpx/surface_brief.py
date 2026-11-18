@@ -12,7 +12,7 @@ fits. Scalars (stopped, contact, gave, peak_force_n, can_see ...), refusals, fra
 is answered whole. In-process callers (the oracle, tests, replays) call Session.dispatch and always get whole
 results.
 
-Round four (SPEC-R4 A5). A result that moved or pushed carries bounds: a brief answer holds the one binding bound
+A result that moved or pushed carries bounds: a brief answer holds the one binding bound
 and the count of the others ({"binding": ITEM, "more": N}; the whole list is in robot://result). A whole-step
 tool's result (it has said and phases or periods) is brief in at most STEP_LIMIT bytes: said first, then bounds,
 then periods as one compact list [[phase, periods], ...], periods_used and periods_left; the phase records and
@@ -28,12 +28,12 @@ Pure functions on JSON values: no numpy, no clock, no randomness; deterministic 
 import json
 
 WIDTH = 110            # characters of one printed line before a value is broken into one item per line
-LIMIT_LOOK = 1800      # bytes a brief look result prints in (FINDINGS S1: a default look answer under 2 kB)
+LIMIT_LOOK = 1800      # bytes a brief look result prints in (a default look answer under 2 kB)
 LIMIT = 2400           # bytes any other brief result prints in (any default result under 3 kB; a result with a look
-                       # after it under 2,500, the FINDINGS S1 test)
-STEP_LIMIT = 900       # bytes a whole-step tool's brief result prints in, besides pictures (SPEC-R4 A5)
+                       # after it under 2,500)
+STEP_LIMIT = 900       # bytes a whole-step tool's brief result prints in, besides pictures
 PACK_ITEM = 24         # characters: list items that print this short share a printed line
-# SPEC-R4 A5: what a brief result never loses, in whole or in part: the one binding bound and how many more there
+# what a brief result never loses, in whole or in part: the one binding bound and how many more there
 # are, and a whole-step tool's periods.
 NEVER_CUT = ("bounds", "periods", "periods_used", "periods_left")
 # A whole-step result over its limit gives up its working records first (they are whole at detail full and in
@@ -50,16 +50,16 @@ LEFT_OUT_SHOWN = 10    # names listed under brief.left_out; the rest are counted
 DETAIL_KEYS = ("axes_px", "ticks_px", "image_to_base", "runner_up", "rays", "per_period", "trace", "samples")
 # Blocks whose own keys are cut one by one instead of the block as a whole. next, wait, orientation and tilted
 # carry the next decision (the tool to call next, wait_for_light in the dark, the hand's real pose after an
-# approach): they are never left out whole (FINDINGS S7, R5; the fix round two information check).
+# approach): they are never left out whole.
 KEEP_BLOCKS = ("session", "look", "contact", "refused", "base_moved", "reach", "next", "wait", "orientation", "tilted",
-               # round three (SPEC-R3 C4): what a result says, what was seen and compared, what to try next
+               # round three: what a result says, what was seen and compared, what to try next
                "said", "untried", "stopped", "seen", "part_check", "witness", "felt", "fits", "best_fit",
                "compared_with", "not_recorded")
 # Kept as well at the top of a look result (limit_for: LIMIT_LOOK): the view block, what the picture shows in words.
 # Not elsewhere: an approach result has its own small view key, and a look carried inside another result gives way
 # to that result's limit.
 KEEP_BLOCKS_LOOK = ("view",)
-# Words a result says in plain text: never left out, at any depth, however long (SPEC-R3 C4).
+# Words a result says in plain text: never left out, at any depth, however long.
 KEEP_WORDS = ("said", "says")
 # Of the removable blocks, those under these keys go last (they decide the next call): their own keys first, the
 # whole block only when nothing else is left to cut (marked WHOLE).
@@ -253,8 +253,8 @@ def _shape(result):
 
 
 def brief(result, seq=None, name=None, limit=None):
-    """The brief form of one tool result (module docstring). Bounds and phases are shaped to their brief form
-    (SPEC-R4 A5) also in a result that is under its limit; a result with nothing to shape that prints within its
+    """The brief form of one tool result (module docstring). Bounds and phases are shaped to their brief form also in a
+    result that is under its limit; a result with nothing to shape that prints within its
     limit, a refusal and anything that is not a JSON object come back as they are (the same object)."""
     if not isinstance(result, dict) or "refused" in result:
         return result

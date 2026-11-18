@@ -2,15 +2,15 @@
 """Look primitives of the Executor: look, standard_look and relocalize, mark and triangulate,
 picture, snapshot (the v0 raw frame).
 
-Every look is also noted in the space book (rcpx/bounds.py: SPEC-R4 A3, A8.5): the camera's pose, intrinsics and
-size, the frame and the time, so the operator's word "clear" can name it. Round six (the design notes C11): a look
+Every look is also noted in the space book (rcpx/bounds.py): the camera's pose, intrinsics and
+size, the frame and the time, so the operator's word "clear" can name it. A look
 record keeps the camera's pose of that instant, the joint speeds and the jaws as read, and the depth picture when
 the body's camera gives one (Backend.depth); rcpx/r2/see_spot.py reads a pointed pixel from it. Nothing is carved.
 triangulate gives the point of two marks with its error and never refuses a small baseline; what the point is
 worth along the view and across (see_spot.marks_error) is in the result ("sigma_mm") and is stored with the label.
 
 Every look saves the raw frame and its annotated twin under the episode's frames dir and carries brightness and
-can_see; a look-dependent primitive refuses on a dark look and says so. The look's help (RULINGS-R6 the design rulings):
+can_see; a look-dependent primitive refuses on a dark look and says so. The look's help:
 pointed_pictures() draws a look that a model pointed in with the pixel marked and the things near it numbered,
 and a crop around the pixel, on new files beside its frame, with no motion; a receipt that answers a pixel carries
 them (rcpx/r2/place_near.py). Camera poses come from the body model at
@@ -51,7 +51,7 @@ def _dark_refusal(what, look_id, brightness=None):
     return refusal("can_see", f"look {look_id} is dark{b}: {what}", NO_LIGHT)
 
 
-# ---------------------------------------------------------------------- the look's help (RULINGS-R6 the design rulings)
+# ---------------------------------------------------------------------- the look's help
 POINTED_DRAWN = ("your pixel: an upright cross; each thing listed near it: a tilted cross with its number in the "
                  "list")
 
@@ -131,7 +131,7 @@ class LooksMixin(ViewMixin):
                 "image_right": [round(float(x), 4) for x in Rc[:, 0]],
                 "image_down": [round(float(x), 4) for x in -Rc[:, 1]]}
 
-    # ------------------------------------------------------------------ the space book (SPEC-R4 A3, A8.5)
+    # ------------------------------------------------------------------ the space book
     def _note_seen(self, look_id, q, img, t_s, shown=True):
         """Note a wrist look in the space book (the camera's pose from the body model at the look's joint pose,
         its intrinsics and size, the frame, the time). shown: its picture went to the operator (only such a look
@@ -182,7 +182,7 @@ class LooksMixin(ViewMixin):
     def _no_light_hint(self):
         return MOVE_HINT
 
-    # ------------------------------------------------------------------ look (I7, I17)
+    # ------------------------------------------------------------------ look
     def _look_impl(self, note="", keep_image=False, shown=True):
         s, eased = self._ease_if_pressing()
         img = np.asarray(self.backend.render("wrist"))
@@ -206,14 +206,14 @@ class LooksMixin(ViewMixin):
                "mm_per_px_at_tip": None if mmpp is None else round(mmpp, 4), "note": str(note or ""),
                "floor_view_mm": self.look_footprint(s.q), "hidden_by_hand_px": self.hidden_by_hand(s.q)}
         if light.get("bright_spots"):
-            out["bright_spots"] = light["bright_spots"]   # a lamp that glows in a dark frame (FINDINGS S8)
+            out["bright_spots"] = light["bright_spots"]   # a lamp that glows in a dark frame
         if cs == "dark":
             out["warning"] = ("too dark to see: look-dependent tools refuse on this look, and moves toward the "
                               "world (move_tip, touch, press, orient_tool, move_joints) are refused with check dark "
                               "while the newest light reading is dark (any look reads it again); park, home, retreat "
                               "and ease still run")
         elif cs == "dim":
-            from rcpx.surfaces import DIM_RULE   # the one dim rule (FINDINGS T9); imported here: surfaces reads DEFAULTS
+            from rcpx.surfaces import DIM_RULE   # the one dim rule; imported here: surfaces reads DEFAULTS
             out["warning"] = "dim. " + DIM_RULE
         if eased:
             out["eased"] = "a joint was still pressing; eased before the picture"

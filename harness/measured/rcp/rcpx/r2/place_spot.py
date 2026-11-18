@@ -250,7 +250,7 @@ def _map(ex, target, facts, wide=False):
 
 
 def settle(ex, target, facts):
-    """the design rulings (module docstring). target: a place target of place_target (kind "on" or "into") whose Seen is a
+    """See the module docstring. target: a place target of place_target (kind "on" or "into") whose Seen is a
     thing a look with depth shows. Changes the target in place and returns target["stands"] = {"how", "moved_mm",
     "look", "footprint_mm", "footprint_source", "level_mm", "span_mm"}; None when the place is the point itself."""
     if target.get("kind") not in ("on", "into") or target.get("stands") is not None:
@@ -474,7 +474,7 @@ def settle(ex, target, facts):
 
 
 def _dish(ex, target, facts, H, cell, origin, band, radius, outside, own, pad, tol):
-    """A dish the pointed point lies in (the design rulings; the second fix round's cause C2 (a)): the pointed point lies on a
+    """A dish the pointed point lies in: the pointed point lies on a
     thing whose outline holds an inside the look shows under the pour height of its rim (a pixel on the rim or a
     wall names that inside; the inside nearest the pixel; see_place.dish, within the outline of the
     thing's own cells: what the picture does not hold, and what the look does not show outside that outline, may
@@ -613,7 +613,7 @@ def _sigma_of(sp):
 def _whole_look(ex, target):
     """A thing the pointed look shows cut by the picture's edge (or running on past the hand's window) is read whole
     before its middle is used: the robot looks for itself with its own wrist camera from where the hand stands (a look
-    costs no control period; the design rulings's way), and where that look shows the SAME point (its ray lands within
+    costs no control period), and where that look shows the SAME point (its ray lands within
     BAND of the two spots' stated errors of the pointed point: a point hidden from it is not shown) on a thing it
     does not cut, the place target is made again from that look (place_target.target_from_seen: kind, rim, entry)
     and settle() reads the place from it. Only with something held (the place of this call; a count before the take
@@ -820,7 +820,7 @@ def _px_in(ex, key, p):
 
 
 def _answer(ex, target, rec, key, wide, H, cell, origin, at, radius, level, tol, busy, free=None):
-    """The place ANSWERS (the design rulings's way, for a place the look shows taken): what the look shows standing within the
+    """The place ANSWERS (for a place the look shows taken): what the look shows standing within the
     held thing's footprint where it would go. target["stands"] carries "answer": {"why", "look", "standing":
     [{"z_mm", "over_level_mm", "distance_mm": from the pixel to the nearest of it, "px"}], "footprint_mm",
     "level_mm", "free": the nearest room on that level the look shows free for the footprint ({"distance_mm",
@@ -945,7 +945,7 @@ def rests_over(target, out, facts, floor=None, tall=None):
 
 
 def arrival(ex, target, out, facts, before, picked):
-    """What is known of the arrival (the design rulings: "placed" is true by truth): the set down's own evidence
+    """What is known of the arrival ("placed" is true by truth): the set down's own evidence
     (place_set._pl_arrival: the release, the same view where a witness is loaded); then what the SAME fixed
     camera's depth shows at the place before and after (_depth: a look costs no motion), which decides where it
     can; where it cannot, the landing, for a place onto a level: a contact that ended the way down with the

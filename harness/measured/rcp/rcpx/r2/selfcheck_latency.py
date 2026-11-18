@@ -7,7 +7,7 @@ from rcpx import bounds
 from rcpx import bounds_ratios as R
 from rcpx.r2 import selfcheck_fit as fit
 from rcpx.r2 import selfcheck_image as image
-GN_STEPS = 2  # PB-133: one-dimensional fit iterations
+GN_STEPS = 2  # one-dimensional fit iterations
 
 
 def observer(ex, joints, q, floor_z):

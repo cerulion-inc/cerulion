@@ -22,7 +22,7 @@ From a call's end, space is free only by a look taken after the arm's last motio
 last moving control period before the call began; rcpx/r2/see_free.py reads no look taken before it).
 
 A part the session's own act set moving (a press or a touch that ended in a give or moved the part, a push that
-moved what was there) VOIDS the passage it can reach (the design rulings, the rule the real arm's adapter has as D14 b): the
+moved what was there) VOIDS the passage it can reach (the rule the real arm's adapter has too): the
 side of the contact the part went, ahead of it along the act, as far as the part can have gone (all of that side:
 no extent of the part is known here); the space behind the contact, where the arm's own bodies came from, stands.
 A ball that reaches into a void counts as passed by no pose, kept before or after the act: the part may still be
@@ -137,7 +137,7 @@ def _continuous(ex, seen, q, t):
 
 
 def open_call(ex):
-    """the design rulings: an operator's call begins. Every pose kept in an earlier call is dropped (the arm's own passage
+    """An operator's call begins. Every pose kept in an earlier call is dropped (the arm's own passage
     frees space only inside the call that made it); the pose the arm stands at now is the record's first. The
     looks that free space in this call are those taken after the arm's last motion before it (ex._look_since =
     ex._moved_t, the time of the last moving control period; None: the arm has not moved this session). Moves
@@ -229,7 +229,7 @@ def passed(ex, points_m, radii_m):
 
 
 def void(ex, point_m, along, why, part=None):
-    """the design rulings: the act at point_m (m) along `along` (the act's own travel; None: unknown) set a part moving. Every
+    """The act at point_m (m) along `along` (the act's own travel; None: unknown) set a part moving. Every
     ball on the side ahead of the point along it (every side, with no direction) is voided for the passage from
     now on. Returns the receipt's block {"part", "at_mm", "along", "side", "why", "until"}."""
     rec = _record(ex)

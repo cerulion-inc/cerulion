@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a survey sees (package survey, I32): the floor patch of each view and the raised things in it.
+"""What a survey sees (package survey): the floor patch of each view and the raised things in it.
 
 Inputs are the frames and the body model only (RobotModel.fk, pixel_ray, project, and the robot-only MuJoCo model
 for the robot's own geometry); nothing reads a scene or ground truth, and no robot or device is named.

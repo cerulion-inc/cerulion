@@ -44,7 +44,7 @@ SAME_FRAC = 0.04           # an effect that other parameters reproduce to within
 GRID = (9, 7)              # points per frame for the observability test
 POINTS_PER_LOOK = 90       # edge pixels per look in the geometric fit
 ROBUST_PX = 0.3
-GAIN_SPREADS = 4.0  # PB-133: image gain significance
+GAIN_SPREADS = 4.0  # image gain significance
 
 
 def need_px():

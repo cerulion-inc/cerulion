@@ -23,7 +23,7 @@ it already: nothing to run to).
 Without depth no width is given: the range from the hand's own geometry (the pads' plane) says where a pixel would
 lie IF it lay on the thing, but which pixels are the thing's and which the support's a colour picture does not say
 without a threshold on colour, and none is typed here: the answer is None with that reason, and the close prices the
-arrival rate instead (the design rulings's second branch).
+arrival rate instead.
 
 Clouds are read only through the frozen functions of rcpx/r2/see_spot.py (cloud_of, view_of, hand_of). Nothing here
 reads ground truth or names a robot. Lengths m.

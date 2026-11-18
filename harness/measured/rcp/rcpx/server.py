@@ -40,7 +40,7 @@ BUDGET_KEYS = ("calls", "sim_seconds")
 
 def __getattr__(name):
     """The runtime has no default budget (the harness or the person states one, or there is none). Outside readers
-    that still import the old name get a budget with nothing stated, until the Review stage removes this."""
+    that still import the old name get a budget with nothing stated."""
     if name == "DEFAULT_BUDGET":
         return {"calls": None, "sim_seconds": None}
     raise AttributeError(name)
@@ -317,7 +317,7 @@ class Session(EdgeMixin):
         return response
 
     def _ride_practices(self, op, name, result):
-        """I16: the practices reach the operator once, whatever it asks first. They ride on the first call answer
+        """The practices reach the operator once, whatever it asks first. They ride on the first call answer
         or full list answer (a client that builds its tools from the list); never on a read (the read the operator
         asked for is shown as it is, and a read of robot://practices is that once) and never on a compact or named
         list answer (those are sized to be shown whole, and the compact one says to read robot://practices

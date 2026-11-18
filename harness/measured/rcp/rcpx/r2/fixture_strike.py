@@ -6,9 +6,9 @@ Every phase record of work_part carries "strike": the worst of the motions that 
 true contact to the leg that made it (the phase records partition the call's control periods in order: begin and
 end below read the executor's own counters, and each record says at which period of the call it began).
 
-- a stream (the way in, the way out, the hand going on): the plan's own price as the bounds made it (C2), with
+- a stream (the way in, the way out, the hand going on): the plan's own price as the bounds made it, with
   what its stop showed under "ran" (the core's record). note() keeps it for the phase that ran it.
-- the close of the jaws: what the core's one close states (C8): the peak one pad can make on the part and, where
+- the close of the jaws: what the core's one close states: the peak one pad can make on the part and, where
   the core gives it, on anything else a jaw body meets; the arrival speed; the squeeze. note_close().
 - a stroke along a part's path (the follow) and a turn about the hand's axis are no planned streams: they are force
   led. Their figure is made here from what they ran: the largest force the stroke could hold or read (its ceiling,
@@ -19,15 +19,14 @@ end below read the executor's own counters, and each record says at which period
   pair a pad makes with the part (a squeeze that rises while the stroke pulls is no part of the hand's reading).
   A turn holds the torque ceiling over the jaws' radius on one pad (with the hand's push and one pad's squeeze);
   what a stop of the turning hand adds is the energy bound at the tool's points at the turn's own joint speeds
-  (the design rulings, as bounds_strike states the tool's figure of every leg), not a slope across the axis carried from
+  (as bounds_strike states the tool's figure of every leg), not a slope across the axis carried from
   the taps' pose. stroke() and turn().
 - the jaws' opening (release()): what a jaw body can put on anything it meets while it opens, the way the
-  close states its other_n (C8): the stop of the jaws' own opening rate by their stop slope, or the jaw servo's
+  close states its other_n: the stop of the jaws' own opening rate by their stop slope, or the jaw servo's
   whole push where that is more, plus what the arm read as they began to open.
 - a hand that stands on the part as it begins to leave it (stand()): the push it stands with, by its own reading
   and what the still arm cannot tell; easing and backing off go away from it.
-- every link (the design rulings; final review 2, severe 3 (b): a link met while the result stated a tool figure
-  only): a stroke and a turn also state, under "link", one figure per moving link of the arm at the joint speeds
+- every link: a stroke and a turn also state, under "link", one figure per moving link of the arm at the joint speeds
   they ran (the stroke's: the least squares joint speeds of its fastest tip speed along its path; the turn's: its
   own joint shares), as bounds_strike states the links of every leg (its _links: the energy bound at the link's
   points and what the servo can push there), the worst named and each under "by_body"; the phase keeps for each
@@ -104,7 +103,7 @@ def note(ex, strike):
 
 
 def note_close(ex, c, pads):
-    """Keep what one close of the jaws states (C8) for the phase that ran it. c: the core's result."""
+    """Keep what one close of the jaws states for the phase that ran it. c: the core's result."""
     rec = _rec(ex)
     if rec is None or not isinstance(c, dict) or "refused" in c:
         return None
@@ -177,7 +176,7 @@ def _block(level, level_text, z, z_source, v_fast, v_met, read_n, what, link=Non
 
 
 def stroke(ex, B, q, d, thing, ceiling_n, read_n, side_n, v_fast, v_met, part_kg=None, pad_n=None):
-    """The strike of a follow (C12), kept for the phase: the largest force the stroke could hold along its path
+    """The strike of a follow, kept for the phase: the largest force the stroke could hold along its path
     (its ceiling; the largest reading where one stood over it) with the largest reading across the path, plus
     the stop slope at this pose times the fastest speed it ran. pad_n: where the jaws hold the part, the largest
     squeeze per pad they read over the stroke: one pad can carry the hand's whole force on top of it, so it is
@@ -201,9 +200,9 @@ def stroke(ex, B, q, d, thing, ceiling_n, read_n, side_n, v_fast, v_met, part_kg
 
 
 def release(ex, got, arm_n):
-    """The strike of the jaws' opening, kept for the phase (the design rulings: an opening jaw can meet other bodies beside the
+    """The strike of the jaws' opening, kept for the phase (an opening jaw can meet other bodies beside the
     part; a finger stood on a device's stop button through a let go with no figure): what a jaw body can put on
-    anything it meets while it opens, as the core's close states its other_n (C8): the stop of the jaws' own
+    anything it meets while it opens, as the core's close states its other_n: the stop of the jaws' own
     opening rate by their stop slope, or the jaw servo's whole push (its force range through the pad's shortest
     lever) where that is more; a slope that is the body's model carries the accepted relative error on top; plus
     what the arm read as the jaws began to open (a finger that bears on something carries the arm's push too).
@@ -264,12 +263,12 @@ def _energy(B, q, qd):
 
 
 def turn(ex, B, q, side, thing, ceiling_nm, read_nm, radius_m, force_n, w_fast, w_met, weights=None, pad_n=None):
-    """The strike of a turn about the hand's axis (C12), kept for the phase. What the pads hold: at the jaws'
+    """The strike of a turn about the hand's axis, kept for the phase. What the pads hold: at the jaws'
     radius the torque ceiling (the largest torque read where it stood over it) is a force on one pad, with the
     largest force the hand read while it turned (the push along the axis is no part of the torque) and, on top,
     the largest squeeze one pad read (pad_n). What a stop of the turning hand adds to it: the energy bound at the
     tool's points at the turn's own joint speeds (weights: the joints' share of a turn, rad per rad, times the
-    speed: the design rulings, as bounds_strike states it for the tool of every leg), before the motion at the fastest the
+    speed, as bounds_strike states it for the tool of every leg), before the motion at the fastest the
     hand turned and under "ran" at the speed it turned when its largest torque came. Where the body states no
     contact model, the stop slope across the axis times the speed of the pads stands in, as before."""
     r = max(float(radius_m), np.finfo(float).tiny)
@@ -357,7 +356,7 @@ def of_phase(rec):
 
 
 def of_call(phases):
-    """The call's strike: the worst of its phases' (the receipt carries the largest of its motions, C2), with the
+    """The call's strike: the worst of its phases' (the receipt carries the largest of its motions), with the
     phase that states it."""
     rows = [(p.get("phase"), p["strike"]) for p in phases if isinstance(p.get("strike"), dict)]
     if not rows:

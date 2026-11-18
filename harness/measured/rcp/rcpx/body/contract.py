@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""C0, the body contract: the eight calls between one body's adapter and the kernel (ARCHITECTURE.md section 2.3).
+"""C0, the body contract: the eight calls between one body's adapter and the kernel.
 
 An adapter makes one body (a simulator, an environment host, a real machine's driver) speak these eight calls.
 Every answer is plain data (dicts, lists, numbers, strings), so the same request and answer pairs can be checked
@@ -42,7 +42,7 @@ from abc import ABC, abstractmethod
 
 UNKNOWN = "unknown"
 
-# where a stated or measured value comes from (ARCHITECTURE.md section 2.6): a closed list about knowledge
+# where a stated or measured value comes from: a closed list about knowledge
 SOURCES = ("description", "firmware", "self-measured", "contact", "seen", "swept", "operator", "owner", "protocol",
            "document", "equipment", "prior")
 

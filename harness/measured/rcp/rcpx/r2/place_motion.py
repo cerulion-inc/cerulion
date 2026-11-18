@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Poses and moves of package place (N4), version two (SPEC-R4 B1, B4, C2).
+"""Poses and moves of package place, version two.
 
 Poses: the hand pose that points the tool along an approach with the jaws across a chosen bearing, and its solvers
 (pure kinematics; their tolerances are solver numerics).
@@ -11,11 +11,11 @@ the kind of its legs; the contact stop is armed on every one):
 - _pl_line(dp_m, kind, target, away_from, intent): one straight tool line of the executor's own Cartesian move.
 The operator's word changes no move here: it is passed on as information and nothing is run again for it.
 
-What is carried is the core's one record (rcpx/control_hold.py, contract C8); this package adds nothing to it.
+What is carried is the core's one record (rcpx/control_hold.py); this package adds nothing to it.
 hold_facts reads what a carry and a set down need of it: how far the held thing reaches below the tip and its
 half width, from the extent the take stated on the record, else from where the jaws closed over the support.
 
-Phases: phase(ex, name, did, t0, items) appends the phase record of SPEC-R4 A5 (periods split into moving, waiting
+Phases: phase(ex, name, did, t0, items) appends the phase record (periods split into moving, waiting
 and jaw, seconds, free_share, the binding bound) for what ran since world time t0 and re-sees the space (bounds
 begin). The split comes from a log this package keeps of every control period. No robot is named here.
 """
@@ -71,7 +71,7 @@ def log_of(ex):
 def period_tick(ex):
     """A tick hook: one row per control period the backend ran (time, what the period was for; a backend that counts
     its own control steps, steps_run, and ran none in a period, its budget spent, logs none: the receipt's periods
-    are the step counter's, final review 2, medium 4). The executor's own word for
+    are the step counter's). The executor's own word for
     the period (moving, waiting, jaw) when it keeps one; else this log's reading of it: the arm's commanded pose
     changed (moving), or it stood while the jaws' command changed since the arm last moved (jaw), or neither."""
     def fn(s):
@@ -161,9 +161,9 @@ def binding(items):
 
 
 def phase(ex, name, did, t0, items=None):
-    """Append the phase record of SPEC-R4 A5 for what ran since world time t0 and re-see the space; returns it.
-    The phases PARTITION the call's control periods IN ORDER (contract C12; final review 2, medium 4 and severe 3
-    (c)): a period an earlier phase of this call already counted is never counted again, and a period no phase
+    """Append the phase record for what ran since world time t0 and re-see the space; returns it.
+    The phases PARTITION the call's control periods IN ORDER: a period an earlier phase of this call already counted is
+    never counted again, and a period no phase
     was open for (between the end of the phase recorded before and this one's t0, or before the call's first
     phase) is this phase's, the leg that follows it (work_part's rule, rcpx/r2/fixture_strike.open_phase): so a
     phase counts from the end of the phase recorded before it, or from the call's start, and every period a

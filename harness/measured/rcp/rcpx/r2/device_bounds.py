@@ -155,7 +155,7 @@ def contact_sigma_m(B, entry, result, q, u):
     if speed is not None:
         v = speed / 1000
         return v * B.t_det() + B.quantum(q, u), "contact", "reported contact speed times detection delay plus quantum"
-    # p4-read (a): no speed reported: the speed the arm READ at the stop (the touching point's speed from the joint
+    # no speed reported: the speed the arm READ at the stop (the touching point's speed from the joint
     # speeds of the reading the stop was read at), never the free speed bound
     from rcpx import bounds_book_read
     v, words = bounds_book_read.read_speed_m_s(B.ex, (entry or {}).get("point_mm"), data.get("touched_by"),

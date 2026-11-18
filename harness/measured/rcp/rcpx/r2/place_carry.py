@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""carry of package place (N4), round six (the design notes, package PLACE; contracts C8, C10, C12): the way a
+"""carry of package place: the way a
 held thing goes to its place (the place targets are rcpx/r2/place_target.py).
 
 What is held is the core's one record (rcpx/control_hold.py): it knows the load, its guard is the hold's level, a
@@ -7,7 +7,7 @@ lost hold ends a move with its own words. This file keeps no watch of the jaws a
 core's. It writes no guard, no cap and no speed anywhere.
 
 The way: the carry is ONE stream: up to the layer, across, down to the carry height. The way down of a set down
-is a motion of its own from there, an expected contact (C9) with its own price. No leg is left out unless it is
+is a motion of its own from there, an expected contact with its own price. No leg is left out unless it is
 shorter than the tip's own resolution (place_motion._pl_res: a figure that does not follow the session's contact
 level); the way down is made whenever the plan has an end height under the carry height. The layer clears what
 the looks of the session show near the way, what the world holds there and the place itself, each by what
@@ -96,7 +96,7 @@ def planned_held(r, pads):
     if not isinstance(r, dict) or pads is None or not isinstance(r.get("strike"), dict):
         return
     st = dict(r["strike"])
-    for where in (r, st):           # a band block a stream states (C15 (5)): its two figures by the same law
+    for where in (r, st):           # a band block a stream states: its two figures by the same law
         b = where.get("band")
         if isinstance(b, dict):
             b = dict(b)
@@ -423,7 +423,7 @@ class CarryMixin:
 
     def _pl_way(self, target, facts, intent, B, z_end=None, expect=None, start=None, z_hand=None):
         """The way to a place, planned before anything moves. z_end: the tip height the way down ends at (None:
-        no way down); expect: the expected contact of the way down (C9); start: the pose the way begins at (q,
+        no way down); expect: the expected contact of the way down; start: the pose the way begins at (q,
         tip, R; default: where the hand was told to be).
         Returns {"legs", "names": the carry's one stream (up to the layer, across, down to the carry height),
         "set_leg": the way down from there, a motion of its own with its own price, or None, "q_over": the joints

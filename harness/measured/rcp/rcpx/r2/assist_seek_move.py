@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The camera moves of seek (package assist; SPEC-R5 4.1, 4.7 rules 7 and 9; WP-8) and how they keep clear.
+"""The camera moves of seek (package assist) and how they keep clear.
 
 camera_to(run, target, side) puts the camera on one side of the thing seek looks round and takes a look there, one
 of three ways, each by PUBLIC primitives only, so every gate, cap, journal record and post hook of an operator's

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""A depth picture as points, and what stands at a pixel of it (round six, the design notes C11). Pure geometry on
+"""A depth picture as points, and what stands at a pixel of it. Pure geometry on
 numpy, OpenCV and scipy: no executor, no robot, no truth, no motion. rcpx/r2/see_spot.py is the service over it.
 
 Units: metres, base frame. `up` is the unit vector against gravity (the stated support's normal). Pixel (u, v)
@@ -398,7 +398,7 @@ def _resolve(P, valid, view, u, v, up, hand, sigma_m, snap=True, beside=False):
 
 
 def component(P, valid, view, u, v, up, hand, sigma_m):
-    """The points extent() takes as the thing at pixel (u, v) (the design notes C11), or None when extent() makes
+    """The points extent() takes as the thing at pixel (u, v), or None when extent() makes
     out no thing there (no depth, no level of a pad's size below the pixel, or the pixel lies on that level).
     {"pts": N x 3 (base frame), "xy": N x 2 (the level axes of axes_of(up)), "z": N heights along up, "mask": the
     thing's pixels in the picture given (H x W; every k-th pixel where the picture is finer than the hand can

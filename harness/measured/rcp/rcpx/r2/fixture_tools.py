@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Tool table and practices of package fixture (SPEC-R4 B5). See rcpx/r2/fixture.py.
+"""Tool table and practices of package fixture. See rcpx/r2/fixture.py.
 
 One tool, no typed range: every end (speed, force, torque, travel, time) is derived in the session and named in the
-result with its source; a tool schema carries no derived end (SPEC-R4 A5).
+result with its source; a tool schema carries no derived end.
 """
 
 from rcpx import surfaces as S

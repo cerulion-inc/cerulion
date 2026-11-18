@@ -62,7 +62,7 @@ MM = 1000.0
 MOTION = frozenset(["move_joints", "move_tip", "orient_tool", "touch", "press", "home", "park", "retreat",
                     "standard_look", "measure_base_give", "zero_check",
                     "approach", "grasp", "release", "impulse", "pinch", "probe_motion",
-                    "release_check", "wait_for_light"])   # SPEC-R2 section 3 names; wait_for_light parks first
+                    "release_check", "wait_for_light"])   # the self-check names; wait_for_light parks first
 CAMERA_RESULTS = ("look", "standard_look", "mark", "triangulate")
 
 

@@ -495,7 +495,7 @@ class ChatOperator(StrictEndpointMixin):
         self.counts["claims_sent"] += 1
         self._log("forced_claim", reason=reason, args=args, response=resp, lost=why)
         resends = 0
-        # a claim gate may answer instead of recording (SPEC-R3 C2, "continues"): no turn is left, so send it again
+        # a claim gate may answer instead of recording ("continues"): no turn is left, so send it again
         while resp is not None and resp.get("episode") == "continues" and resends < FORCED_CLAIM_RESENDS:
             resends += 1
             resp, why = self.episode.request({"op": "claim", "args": args})

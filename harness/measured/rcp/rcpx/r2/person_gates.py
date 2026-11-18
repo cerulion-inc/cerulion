@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""I22 person package, part one: the session's journal as evidence, and the gates an ask must pass.
+"""Person package, part one: the session's journal as evidence, and the gates an ask must pass.
 
 Read by rcpx/r2/person.py. Nothing here moves the arm or reads simulator ground truth: every fact comes from the
 journal (the executor's "primitive" records and the session's "call" records, which share one file in an episode),

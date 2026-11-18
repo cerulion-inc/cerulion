@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a stroke of control_contact.py counts, waits for and says (C9, C10, C12): its schedule, its budget count
+"""What a stroke of control_contact.py counts, waits for and says: its schedule, its budget count
 before anything moves, the wait for the hand to stand, a touch the hand already made as it came to rest, whether a
 stated limit is shown kept, and the words of a press result. No speed, force, travel or time here is typed; no
 robot is named."""
@@ -21,10 +21,10 @@ STROKE_UNDER_FORCE_N = True
 class StrokeMixin:
     def _schedule(self, plan, p0, d, speed, edge=0.0):
         """Where the command of a stroke stands at each control period of its free travel (m along d from p0): the
-        line's plan as the bounds time it. From the travel `edge` on (where a contact can begin, C15; 0: the
+        line's plan as the bounds time it. From the travel `edge` on (where a contact can begin; 0: the
         whole stroke) the arrival speed (speed, m/s) lowers the plan's, never raises it: the command follows the
         plan's samples by at most that speed's travel per period, and runs AT it wherever the plan is faster
-        (the design rulings: the speed a stroke states is the speed that ran). Before the edge the plan's own speed stands."""
+        (the speed a stroke states is the speed that ran). Before the edge the plan's own speed stands."""
         step = None if speed is None else float(speed) * self.dt
         xs = [float((self.model.fk_tip(q)[0] - p0) @ d) for q in plan.path]
         sched, at = [0.0], 0.0
@@ -53,8 +53,8 @@ class StrokeMixin:
         return control_move_band.of_stroke(self, B, told.tip, d, reach, thing, told.q, self._held_for(None))
 
     def _band_keys(self, out, B, band, r, v_arr, q, d, detail=False):
-        """The receipt's "band" block of a stroke (C15 (5)): carried when it changed what the stroke did (a fast
-        part ran before the band), when it prices the lack of a source, or in the full result (C12)."""
+        """The receipt's "band" block of a stroke: carried when it changed what the stroke did (a fast
+        part ran before the band), when it prices the lack of a source, or in the full result."""
         z = r.get("z_end")
         arrive_n = None if z is None or v_arr is None else float(B.f_thr(v_arr)) + float(z) * float(v_arr)
         keys = control_move_band.keys(band, r["sched"], self.dt, v_arr, out.get("ends_n"), out.get("ends_source"),
@@ -71,7 +71,7 @@ class StrokeMixin:
     def _stroke_room(self, told, d, travel, lead, stated):
         """(travel, refusal or None, hold, note) of a press's plan (its path check, ReachMixin._stroke_plan). A
         press whose travel nobody stated plans as far as the arm reaches along its line; where that plan would
-        bring a link newly to the surface under the arm, the travel is halved until the plan stands (the design rulings: a
+        bring a link newly to the surface under the arm, the travel is halved until the plan stands (a
         travel nobody asked for refuses nothing) and the note says how far the stroke may go."""
         bad, hold = self._stroke_plan(told, d, travel + lead + lead)
         was, tell = travel, float(self.bounds.rigid(told.q, d))
@@ -85,7 +85,7 @@ class StrokeMixin:
 
     @staticmethod
     def _tell_speed(B, q, d):
-        """The slowest speed at which this arm resolves a stop along d at q (m/s; C3): its still band travelled
+        """The slowest speed at which this arm resolves a stop along d at q (m/s): its still band travelled
         in one detection time under its own braking, by the bounds' own law. No bound of a stroke that the
         operator's own force states runs the part slower than this (the limit is then not shown kept)."""
         law = getattr(laws, "tell_speed", None) or (lambda band, t, a: laws.arrival_speed(band, 0.0, t, a))
@@ -104,7 +104,7 @@ class StrokeMixin:
                 f"the {left} control periods left" + (f" (its end, ramp and hold take {more} more)" if more > 0 else ""))
 
     def _wait_counted(self, told, d, travel, force_n, **kw):
-        """(periods waited, refusal or None). The budget of a stroke, counted before anything runs (C12): the
+        """(periods waited, refusal or None). The budget of a stroke, counted before anything runs: the
         control periods of its plan as it will run from where the hand was told to stand, plus the wait for the
         hand to stand there (by its own lag); more than are left: refused budget, nothing ran. Else the wait
         (ex._arrive: guarded; a stop met in it is left in self._tail)."""
@@ -128,14 +128,14 @@ class StrokeMixin:
 
     @staticmethod
     def _stated(force_n=None, max_n=None, clear=None, hold_s=None, ends_n=None):
-        """The call's intent (Q13) as the bounds read it: only what the operator stated. ends_n: the force_n of a
-        touch, the force at which it ends (the design rulings: no limit on the way in)."""
+        """The call's intent as the bounds read it: only what the operator stated. ends_n: the force_n of a
+        touch, the force at which it ends (no limit on the way in)."""
         out = {"force_n": force_n, "max_n": max_n, "clear": clear, "hold": hold_s, "ends_n": ends_n}
         return {k: (v if k == "clear" else float(v)) for k, v in out.items() if v is not None}
 
     @staticmethod
     def _own_touch(out, arr, force_n):
-        """the design rulings: the hand's own weight, which times the way in of a touch that states no force, is no limit and
+        """The hand's own weight, which times the way in of a touch that states no force, is no limit and
         nobody's word: the receipt's limit keys carry the least limit stated beside it (none: None). That limit
         is said kept only where the slower way in for the hand's weight is itself shown kept and no reading of
         the call passed the limit."""
@@ -220,7 +220,7 @@ class StrokeMixin:
                                       "further from its pivot or a little harder")
         lost = next((lg["lost_m"] for lg in reversed(legs) if lg.get("lost_m") is not None), None)
         if lost is not None and t_res is not None:
-            out["contact_lost_along_mm"] = round(lost * MM, 1)   # the part stopped pushing back here (FINDINGS P5)
+            out["contact_lost_along_mm"] = round(lost * MM, 1)   # the part stopped pushing back here
         if gave or (seen["moved_part"] and not out["sprang_back"]):   # and voids the passage it can reach
             out.update({"void": v} if (v := self._stale_near(seen["first_resist_mm"], "a press moved the part there",
                                                              felt.resisted)) else {})

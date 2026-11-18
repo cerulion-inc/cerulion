@@ -185,7 +185,7 @@ class Hand:
         return float(np.mean(f / self.lever))
 
     def squeeze_at_part_n(self, q, target, part_m):
-        """Squeeze at a stated part depth from its stall opening and hinge lever, SPEC-R4 A4.7, PA-073."""
+        """Squeeze at a stated part depth from its stall opening and hinge lever."""
         tip_m = self.width_m(q)
         if tip_m <= 0 or part_m <= 0:
             return None
@@ -206,7 +206,7 @@ class Hand:
         return lag is not None and bool(np.all(lag >= MIN_LAG_FRAC * np.abs(self.span)))
 
     def note_width(self, width):
-        """Learn the smallest nonzero reading change; zero remains valid, SPEC-R4 A1.1/Q3."""
+        """Learn the smallest nonzero reading change; zero remains valid."""
         if self.last_width_m is not None:
             step = abs(width - self.last_width_m)
             if step > 0:
@@ -217,7 +217,7 @@ class Hand:
         """Per jaw joint, the most the jaw's own weight can load its servo in any arm pose (N on a slide, N m on a
         hinge): the mass the joint carries times gravity, on a hinge times how far that mass sits from the axis.
         From the loaded model; it is what a jaw at rest can lag by with nothing between the jaws, beside its dry
-        friction (SPEC-R4 Q6: a hidden level is what the reading shows when the thing it detects is absent)."""
+        friction (a hidden level is what the reading shows when the thing it detects is absent)."""
         m, d = self.m, self.d
         self._points(self.closed)
         mujoco.mj_comPos(m, d)
@@ -251,7 +251,7 @@ class Hand:
         return float(np.max(np.minimum(self.weight_load(), self.force_range) / self.lever))
 
     def depth_error_m(self, q):
-        """Tip opening minus the hinge-side pad opening at the same angle, SPEC-R4 Q4, PA-055."""
+        """Tip opening minus the hinge-side pad opening at the same angle."""
         if not any(self.hinge):
             return 0.0
         self._points(q)
@@ -261,7 +261,7 @@ class Hand:
         return abs(self.width_m(q) - float(np.mean(gaps)))
 
     def sweep_m(self, part_m):
-        """Chord between each hinged tips open and part-width positions, SPEC-R4 Q4, PA-066."""
+        """Chord between each hinged tips open and part-width positions."""
         if not any(self.hinge):
             return 0.0
         q0, q1 = self.open, self.q_of_frac(self.frac_for_width(part_m))
@@ -300,7 +300,7 @@ class Hand:
 
 @dataclass
 class JawFacts:
-    """Jaw geometry, measured speed and hidden squeeze, with each values source, SPEC-R4 Q3 and Q6."""
+    """Jaw geometry, measured speed and hidden squeeze, with each values source."""
     step_m: float = 0.0
     closed_gap_m: float = 0.0
     rest_band_m: float = 0.0
@@ -333,13 +333,13 @@ def jaw_facts(ex):
 
 
 def width_err_m(hand, facts, stated_err_m=0.0):
-    """Tip width error from jaw quanta, rest band and hinge depth geometry, SPEC-R4 Q3/Q4, PA-055."""
+    """Tip width error from jaw quanta, rest band and hinge depth geometry."""
     q = hand.q_of_frac(hand.frac_for_width(getattr(hand, "seen_width_m", None) or 0.0))
     return R.QUANT * facts.step_m + facts.rest_band_m + stated_err_m + hand.depth_error_m(q)
 
 
 def release_width_m(hand, facts, B, part_m, sigma_p_m=None):
-    """Opening advice from the part error and each jaw's geometric sweep, SPEC-R4 A4.7."""
+    """Opening advice from the part error and each jaw's geometric sweep."""
     error = (width_err_m(hand, facts) + B.lag(facts.speed_m_s or 0.0)
              if sigma_p_m is None else sigma_p_m)
     return min(hand.max_m, part_m + len(hand.sides) * error + hand.sweep_m(part_m))

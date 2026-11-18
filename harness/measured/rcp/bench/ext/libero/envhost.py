@@ -24,7 +24,7 @@ answers object poses, object state, object or region names, contact names or the
 text would name a scene item is withheld (kind "withheld") and the reason goes to SCORING_DIR/host.log. The scoring
 socket (SCORING_DIR/truth.sock) answers status, truth, contacts and audit renders.
 
-Round six (the design notes C5, C11). render takes depth: true: the same render call with its depth flag, turned to
+render takes depth: true: the same render call with its depth flag, turned to
 metres along the optical axis with the model's near and far planes and written beside the picture as a float32
 .npy; a render is no control step, so the step counter does not move. Every state carries "fast": the raw wrist
 force sensor and the arm's joint speeds after every physics step of the last control step (the body's own signals
@@ -499,7 +499,7 @@ class Host(L.ScoringMixin, HT.TruthMixin):
                             init_qpos=r.init_qpos))
 
     def op_contact_rates(self, args):
-        """the design rulings: the stiffest contact rate each of the robot's own bodies can meet the scene with, by the
+        """The stiffest contact rate each of the robot's own bodies can meet the scene with, by the
         simulator's own mixing rule (bench/ext/libero/contact_mix.py), keyed by the robot's own body names only (no
         scene item is named), with its own geoms' rate beside."""
         self._need_env()

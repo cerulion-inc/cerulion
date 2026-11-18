@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What the newest look shows beside a part (package fixture, round six): three readings of a depth picture that
+"""What the newest look shows beside a part (package fixture): three readings of a depth picture that
 order what work_part does. None of them moves the arm, costs a control period or refuses anything: a look is
 MEASURED evidence, it decides which side a hand comes from and which way it takes, never whether the tool acts.
 

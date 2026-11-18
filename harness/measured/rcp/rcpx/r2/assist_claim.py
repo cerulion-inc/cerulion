@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Claim answers of the assist package (SPEC-R5 4.4): the ledger, the one ready call on every claim answer, and
+"""Claim answers of the assist package: the ledger, the one ready call on every claim answer, and
 assist's own gate.
 
 THE LEDGER. The session edge records every claim response of the session in ex.state["assist"]["ledger"]:

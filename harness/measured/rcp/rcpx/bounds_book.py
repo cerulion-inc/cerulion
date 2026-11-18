@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """What the bounds know of a thing (A3, A8.1): its sheet, its error, its clearance, the Thing a reference names
-(thing_of), and what a contact stop writes on it (note_stop, note_give; round six, contracts C3 (4), C5, C9).
+(thing_of), and what a contact stop writes on it (note_stop, note_give).
 
-The space book itself is rcpx/bounds_space.py (contract C4: measured things and the stated support only).
+The space book itself is rcpx/bounds_space.py (measured things and the stated support only).
 """
 
 import math
@@ -16,7 +16,7 @@ from rcpx.bounds_robot import Thing, note_joint_hidden
 
 
 def thing_sheet(world, E, intent):
-    """Read a thing's live device sheet and the call's stated sheet, Q10."""
+    """Read a thing's live device sheet and the call's stated sheet."""
     data = next(((e.get("data") or {}) for e in world.query(include_stale=True)
                  if E is not None and e.get("id") == E.id), {})
     sheet = dict(data.get("sheet") or {})
@@ -168,7 +168,7 @@ def thing_of(B, ref):
 
 
 def note_give(B, thing, force_n, why):
-    """A give of this session (C3 (4)): a thing held as fixed moved, a hold was lost at a known squeeze, or the
+    """A give of this session: a thing held as fixed moved, a hold was lost at a known squeeze, or the
     operator says harm. It bounds later contacts with that thing and with things of the same stated label."""
     entry = B._entry(thing) or {}
     ref = thing if isinstance(thing, str) else entry.get("id", getattr(thing, "id", None))
@@ -178,7 +178,7 @@ def note_give(B, thing, force_n, why):
 
 
 def over_drives(B, q, u, peak_n, rest_n):
-    """p4-read (b): {push_n, read_n, words} when a stop's reading is over what the drives can push at the tip along
+    """{push_n, read_n, words} when a stop's reading is over what the drives can push at the tip along
     u (bounds_book_read.drives_push_n: each joint's torque limit over its lever) by more than the torque model's
     own error (e_tau) and the reading is gone at rest (rest_n at or under the free threshold); else None."""
     if peak_n is None or u is None or not math.isfinite(float(peak_n)):
@@ -202,16 +202,16 @@ def over_drives(B, q, u, peak_n, rest_n):
 
 def note_stop(B, thing, q, u, v, peak_n, impulse_ns, resolved, moved_m, held=False, rest_n=None, k_c=None,
               ext_peak=None, det_periods=None, expect=None, stop=None):
-    """A contact stop (C5, C9). stop: the dict of bounds_stops.measure when the caller has it. A false stop is
+    """A contact stop. stop: the dict of bounds_stops.measure when the caller has it. A false stop is
     counted and never stored. Every other stop goes to the robot's own list of stops (slope, detection time).
     expect (the leg's expected contact): only that region changes, no event is stamped, and the touch goes on
-    the thing's own record. A give is written only for a thing held as fixed (C3 (4))."""
+    the thing's own record. A give is written only for a thing held as fixed."""
     mass = B.m_eff(q, u)
     whole = mass * v if mass > 0 and math.isfinite(mass) and v > 0 else None
     ratio = impulse_ns / whole if whole and impulse_ns is not None else None
     drives = over_drives(B, q, u, peak_n, rest_n)
     if drives is not None:
-        # p4-read (b): a reading over what the drives can push along the travel (their torque limits, less nothing:
+        # a reading over what the drives can push along the travel (their torque limits, less nothing:
         # with the torque model's own error added), gone at rest, is no thing's push: a false stop. It is counted,
         # the session's level is raised to what the drives can push there (no level above that is ever needed:
         # the cap stops there), and nothing is stored
@@ -230,7 +230,7 @@ def note_stop(B, thing, q, u, v, peak_n, impulse_ns, resolved, moved_m, held=Fal
     add = getattr(B.know, "add_stop", None)
     if callable(add):
         add(kept)
-    else:   # r6 shim: until KNOW's add_stop is merged the session keeps the list itself
+    else:   # compat shim: until KNOW's add_stop is merged the session keeps the list itself
         B.stops.append(kept)
     if thing is None and isinstance((expect or {}).get("with"), str):
         thing = expect["with"]

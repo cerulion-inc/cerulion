@@ -191,7 +191,7 @@ def plain_from_env(environ=None):
 
 
 def read_first(listing):
-    """The line naming the resources (the design rulings: no ordered procedure, no step first): those of READ_ORDER
+    """The line naming the resources (no ordered procedure, no step first): those of READ_ORDER
     the list answer shows, in that order. With no list answer yet, a line conditional on the listing; with none of
     them listed, nothing."""
     if listing is None:

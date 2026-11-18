@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The client of the robot's vision service (SPEC-R5 7.2, 7.4): urllib only, never raises.
+"""The client of the robot's vision service: urllib only, never raises.
 
 The service is robot equipment declared in the installation; its address is given by the caller (there is no
 default address here). Every call returns (answer or None, reason or None, seconds): any failure (no address, a
@@ -27,7 +27,7 @@ import time
 import urllib.error
 import urllib.request
 
-TIMEOUT_S = 3.0          # SPEC-R5 7.4: a service that has not answered by then is absent for that call
+TIMEOUT_S = 3.0          # a service that has not answered by then is absent for that call
 MAX_PHRASES = 6          # phrases per request (the service's own limit)
 MAX_CANDIDATES = 16
 

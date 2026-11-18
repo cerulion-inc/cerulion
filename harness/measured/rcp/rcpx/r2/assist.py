@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package assist (SPEC-R5): the robot gauges its operator from the session and offers to take work over.
+"""Package assist: the robot gauges its operator from the session and offers to take work over.
 
 It sits at the session edge (box.on_session, as the lean package does) and joins its sibling files:
 - the dispatch wrap feeds the gauge with every answered request and with what only the robot knows (assist_check),
@@ -11,7 +11,7 @@ It sits at the session edge (box.on_session, as the lean package does) and joins
 - the list hides the help tools and robot://assist (they run and read by name) and grows once, after the operator's
   first take, pick, run or direct call of a help tool; one declared tool, assist, and the resource robot://assist.
 
-SENSING (SPEC-R5 0.1 G5). On the answer path: one ray test and one colour read per pointing act. Off it
+SENSING. On the answer path: one ray test and one colour read per pointing act. Off it
 (assist_sense): one request to the vision equipment per labelled pointing act, queued by the dispatch wrap, STARTED
 at the end of the operator_answer wrap (the last step this package has before the answer leaves; for a caller of
 Session.dispatch, first thing in the next dispatch) and JOINED first thing in the next request, at most 3 s.
@@ -48,7 +48,7 @@ DESCRIPTION = ("Help from the robot, when you want it. {} lists what the robot c
                "Free.")
 ARGS = ("take", "pick", "part", "until", "run", "args", "set")
 # the schema carries no "required" and no "additionalProperties" key: with them the definition a chat loop sends
-# passes the 760 character bound of SPEC-R5 0.1; an argument the tool does not have is refused by the handler
+# passes the 760 character bound; an argument the tool does not have is refused by the handler
 ENTRY = surfaces._tool("assist", DESCRIPTION,
                        {"type": "object",
                         "properties": {"take": {"type": "integer"}, "pick": {"type": "integer"},
@@ -621,7 +621,7 @@ def _assist(ex, session, **kw):
 
 
 def resource(ex, session=None, **_):
-    """robot://assist (SPEC-R5 2.6): what the robot thinks of this session, with the calls that are its evidence."""
+    """robot://assist: what the robot thinks of this session, with the calls that are its evidence."""
     st = _state(ex)
     snap = st["gauge"].snap() if st["gauge"] is not None else {}
     eyes = ex.state.get("eyes") if isinstance(ex.state.get("eyes"), dict) else {}

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The set down of package place (N4), round six (the design notes, package PLACE stage A; RULINGS-R6 the design rulings).
+"""The set down of package place.
 
-A set down is an expected contact (C9): the plan brakes for nothing but a stated limit (C3), the guard ends the way
+A set down is an expected contact: the plan brakes for nothing but a stated limit, the guard ends the way
 down where the held thing lands ("arrived"), and where it meets nothing the way ends at its planned height and the
 thing is let go there, with the drop said. Nothing is searched for and nothing is refused because a height is
 not sure.
@@ -13,7 +13,7 @@ not sure.
   what is near the point plus the hand's tracking error; it is let go there. The receipt says how far its bottom
   stood under the rim, and how far over the floor the pointed ray showed inside. Into an opening whose floor no
   look shows (spots given on its rim) the thing is lowered toward the stated support, to the first contact the arm
-  feels (the design rulings: the whole way under the rim is the arrival stretch), not let go over the rim; with no support
+  feels (the whole way under the rim is the arrival stretch), not let go over the rim; with no support
   stated either, the hand stops over the rim, said. (A shallow dish whose rim the hand clears is a place onto its
   floor: rcpx/r2/place_spot._dish.)
   An opening has a wall beside the thing where the hand stops over the rim before the thing's bottom reaches
@@ -181,7 +181,7 @@ class SetMixin(LandMixin):
     # ---------------------------------------------------------------- what the set down will be
     def _pl_set_plan(self, target, intent, facts, release=None, release_m=None):
         """The plan of a set down, before anything moves: {"mode": onto | into | release_above, "z_end": the tip
-        height the way down ends at (None: it ends at the carry height), "base_z", "expect" (C9), "limit", "why",
+        height the way down ends at (None: it ends at the carry height), "base_z", "expect", "limit", "why",
         "doubt": [...]}. Never a refusal: a place that cannot be reached is refused by the way."""
         B = bounds.of(self)
         told = self._told()
@@ -202,7 +202,7 @@ class SetMixin(LandMixin):
             # INTO an opening the hand's lowest hull point stops at the top of what is near the point plus its
             # tracking error, and the thing's bottom is not planned under the surface the pointed ray lands on
             # inside (what lies under a seen surface is not seen). Where no look shows the floor inside, the thing
-            # is lowered to the first contact the arm feels (the design rulings: the whole way under the rim is the arrival
+            # is lowered to the first contact the arm feels (the whole way under the rim is the arrival
             # stretch), toward the stated support, never let go over the rim for want of a seen floor; the hand's
             # own stop over what the newest look shows under its bodies (_pl_hand_lift below) holds it higher
             # where a body would stand on a wall, and the opening's fit (_pl_fit) reads the hand over the rim as
@@ -245,7 +245,7 @@ class SetMixin(LandMixin):
             plan.update(mode="release_above", why="on your word (release)")
             z_end = None if not finite(release_m) else max(z_end, base + float(release_m) + below)
         plan["z_end"] = z_end
-        # the landing (place_land: the design rulings): the force it may make, the band where a contact can begin, the way
+        # the landing (place_land): the force it may make, the band where a contact can begin, the way
         # down's expected contact and the two figures stated before anything moves
         plan.update(self._pl_land_plan(B, target, intent, facts, z_end, into, above, plan["walled"], plan["z_low"],
                                        plan["hand_stop_z"]))
@@ -350,8 +350,8 @@ class SetMixin(LandMixin):
         above = plan["mode"] == "release_above"
         if not (landed or met or lost or stop in ("goal", "limit")):
             # a way down stopped for another reason (its control periods spent, a tick's stop): its periods are the
-            # set down's own leg, with the landing's own figure over the pairs it loaded (final review 2, severe 3
-            # (c): a period the robot ran is never left to a record of no leg)
+            # set down's own leg, with the landing's own figure over the pairs it loaded: a period
+            # the robot ran is never left to a record of no leg
             rec = phase(self, "set_down", f"lowering it: the way down stopped ({stop})", t0, [r])
             strike, band = self._pl_land_after(plan, r)
             rec["strike"] = strike if strike is not None else r.get("strike")
@@ -526,7 +526,7 @@ class SetMixin(LandMixin):
                "doubt": doubt + list(r.get("doubt") or []) + list(target.get("doubt") or [])}
         if band is not None:
             out["band"] = band
-            if band.get("cost") is not None:      # C12: what the stated limit cost the landing, and where
+            if band.get("cost") is not None:      # what the stated limit cost the landing, and where
                 out["limit"]["cost"] = band["cost"]
         if met:
             out["contact"] = r.get("contact")

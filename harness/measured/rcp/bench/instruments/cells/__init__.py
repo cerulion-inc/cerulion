@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The cell instruments: the frozen lists of outside benchmark cells, the cell log and the walker (ROADMAP A13).
 
-What is here, all standard library only, so the desk, the cloud machine and any benchmark's own Python can run it:
+What is here, all standard library only, so any machine and any benchmark's own Python can run it:
 
     registry.py        the benchmarks file, the arm words, the list files, their hashes and the freeze manifest
     scan.py            reads journals that exist (result files, oracle rows, status files, logs) and lists which

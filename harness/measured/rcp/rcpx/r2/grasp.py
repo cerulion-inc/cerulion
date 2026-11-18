@@ -39,7 +39,7 @@ MM = 1000.0
 
 
 def _grasp_n_text(value):
-    """A reader-facing force, including the unresolved case, SPEC-R4 A5."""
+    """A reader-facing force, including the unresolved case."""
     return "unknown" if value is None else f"{value:.2f}"
 
 
@@ -50,7 +50,7 @@ def _no_gripper():
 
 
 def _frac_arg(value, name, default=None):
-    """Accept any finite stated share above zero and up to the servo range, SPEC-R4 A6."""
+    """Accept any finite stated share above zero and up to the servo range."""
     v = default if value is None else value
     if not _finite(v) or not (0 < float(v) <= 1):
         return None, refusal(name, f"{name} must be a finite share with 0 < share <= 1, got {v!r}",
@@ -59,7 +59,7 @@ def _frac_arg(value, name, default=None):
 
 
 def _said(out):
-    """Lead every result with what happened and the next action, SPEC-R4 A5."""
+    """Lead every result with what happened and the next action."""
     if out.get("refused"):
         r = out["refused"]
         text = r.get("why", "the call was refused") + "; " + r.get("hint", "look before retrying")
@@ -93,7 +93,7 @@ def _readable(out):
 
 
 def _squeeze_items(squeeze, planned_s, limit=None):
-    """The squeeze and the jaw travel time as bounds with their sources (C1): a stated limit binds first."""
+    """The squeeze and the jaw travel time as bounds with their sources: a stated limit binds first."""
     out = []
     if limit is not None and limit.get("max_n") is not None:
         out.append(item("force", limit["max_n"], "intent", "your stated limit on the thing (max_n): "
@@ -140,7 +140,7 @@ class Mixin(ImpulseMixin):
     # ---------------------------------------------------------------- grasp
     @primitive
     def grasp(self, width_mm=None, force_frac=None, max_n=None):
-        """Close on the part through the core's one close and start a watched hold (C8)."""
+        """Close on the part through the core's one close and start a watched hold."""
         return _said(self._grasp_impl(width_mm, force_frac, max_n))
 
     def _grasp_impl(self, width_mm, force_frac, max_n=None):
@@ -248,11 +248,11 @@ class Mixin(ImpulseMixin):
     # ---------------------------------------------------------------- release
     @primitive
     def release(self, width_mm=None):
-        """Open the jaws and end the watched hold, SPEC-R4 A4.7."""
+        """Open the jaws and end the watched hold."""
         return _said(self._grasp_release(width_mm))
 
     def _grasp_release(self, width_mm):
-        """Open to the stated tip width, or fully, and give geometric release advice, SPEC-R4 A4.7."""
+        """Open to the stated tip width, or fully, and give geometric release advice."""
         hand = self._grasp_hand
         if hand is None:
             return _no_gripper()
@@ -293,7 +293,7 @@ class Mixin(ImpulseMixin):
     # ---------------------------------------------------------------- pinch
     @primitive
     def pinch(self, part_point_mm, close_frac=None, force_frac=None, hold_s=None):
-        """Place the moving jaw, close until still for the stated hold, then ease the squeeze, SPEC-R4 A4.7."""
+        """Place the moving jaw, close until still for the stated hold, then ease the squeeze."""
         return _said(self._grasp_pinch(part_point_mm, close_frac, force_frac, hold_s))
 
     def _grasp_pinch(self, part_point_mm, close_frac, force_frac, hold_s):
@@ -362,7 +362,7 @@ class Mixin(ImpulseMixin):
                 self._period(self._q_des)
         q, target, w1 = self._grasp_read()
         peak = hand.squeeze_n(q, target) or 0.0
-        # let the squeeze go: the command a rest band open of the reading (nothing keeps squeezing, I6); this
+        # let the squeeze go: the command a rest band open of the reading (nothing keeps squeezing); this
         # ends the core's record, so a pinch leaves no held state
         eased = control_hold.release(self, min(1.0, hand.frac_of_q(q) + R.QUANT * N["still_band"]
                                                + float(N["lag"][0])))

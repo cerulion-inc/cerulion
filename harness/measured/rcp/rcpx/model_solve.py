@@ -14,7 +14,7 @@ arm points its finger only in its own vertical plane), the nearest direction it 
 the wanted one, the pose, and which tool surface then leads along the wanted direction: so reach_check can answer
 "the tip leads with the finger 40 deg off the approach" instead of a posture whose jaw meets the part first.
 
-No margin here is a typed number (SPEC-R4): motion_of states what the model knows of its own motion until the robot
+No margin here is a typed number: motion_of states what the model knows of its own motion until the robot
 has measured it; limit_stop is how near a limit a joint can no longer be kept off it (the servo's deflection at its
 torque rating, plus the joint's stopping angle at the speed the next move uses); self_margin is the error of the
 distance between two links (zero on the model's own collision geometry, plus what tracking lag moves a link at
@@ -34,7 +34,7 @@ IN_USE = [None]  # the RobotModel that last posed itself: what a number that use
 
 
 class OfModel:
-    """A number that used to be a typed constant and is now the loaded model's own (SPEC-R4: no limit is typed).
+    """A number that used to be a typed constant and is now the loaded model's own (no limit is typed).
     Modules that still import the old name get this: it reads, where it is used in arithmetic or a comparison, as
     the value of the model that last posed itself (the one whose Jacobian the caller has just taken)."""
 

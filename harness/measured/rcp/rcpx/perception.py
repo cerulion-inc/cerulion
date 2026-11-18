@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Perception helpers for the rcpx runtime (I7, I8, I14, I15, I17).
+"""Perception helpers for the rcpx runtime.
 
 Pure functions on images and geometry. Nothing here reads simulator ground truth: every input is a
 rendered frame, a pose from the body model, or a stored world entry.
@@ -16,10 +16,10 @@ import cv2
 import numpy as np
 from PIL import Image
 
-# I7 CAN I SEE
+# CAN I SEE
 #
 # Brightness is the mean Rec.601 luma of the frame on the 0 to 255 scale. No level is typed as a limit: the levels
-# follow the camera's own noise (SPEC-R4 Q6: the hidden level and the noise the robot read on its camera in its
+# follow the camera's own noise (the hidden level and the noise the robot read on its camera in its
 # still hold, handed in as cam = {"hidden", "noise"}; a caller that has none gets the frame's own rounding).
 # dark_level: a frame whose mean is not over the hidden level by more than ONE_READ x the noise (never under one
 #   code step of the 8 bit frame) shows no signal: sensor noise with no usable edges, and no decision may be taken
@@ -31,8 +31,8 @@ from PIL import Image
 #   filling the view, the black space past a table's edge). The light is read from what is lit: when at least
 #   LIT_FRAC of the frame is at LIT_LEVEL or brighter, not counting compact bright blobs (a light source, see
 #   bright_spots), the frame is ok. Under working light the brightest ordinary surfaces in view (a white or light
-#   grey face, a textured table) print at 130 or more; under dim light they stay near 70 (pilot r1a frames,
-#   FINDINGS S8: the lit frames that read dim by their mean had a 98th percentile of 128 to 255, the dim setting's
+#   grey face, a textured table) print at 130 or more; under dim light they stay near 70 (measured frames,
+#   the lit frames that read dim by their mean had a 98th percentile of 128 to 255, the dim setting's
 #   44 to 71).
 # A compact bright blob (bright_spots: at SPOT_LEVEL or brighter, at most SPOT_MAX_FRAC of the frame, filling at
 #   least SPOT_FILL of its bounding box, sides within SPOT_ASPECT of each other) is a light source, not lit surface:
@@ -158,7 +158,7 @@ def light(img: np.ndarray, cam=None) -> dict:
 
 
 # ---------------------------------------------------------------------------------------------
-# I17 ANNOTATED FRAMES
+# ANNOTATED FRAMES
 # ---------------------------------------------------------------------------------------------
 SCALE_BAR_MM = 20.0
 SCALE_BAR_FALLBACK_MM = (10.0, 5.0, 2.0, 1.0)  # used only when a 20 mm bar would not fit
@@ -296,7 +296,7 @@ def annotate_model(img: np.ndarray, model, q, probe_mm: float = 10.0):
 
 
 # ---------------------------------------------------------------------------------------------
-# I8 RELOCALIZE
+# RELOCALIZE
 #
 # Gray, percentile stretch (so a dim frame uses the full code range), CLAHE, ORB features, a
 # brute-force Hamming match with Lowe's ratio test, then a RANSAC partial affine fit (rotation,
@@ -400,7 +400,7 @@ def relocalize(ref_img: np.ndarray, img: np.ndarray, cam=None, scatter=None) -> 
 
 
 # ---------------------------------------------------------------------------------------------
-# I15 TWO-VIEW DEPTH: how far to trust a triangulated point
+# TWO-VIEW DEPTH: how far to trust a triangulated point
 #
 # The distance by which the rays miss each other says the marks are consistent, not that the depth is right: two
 # rays that are nearly parallel meet at a shallow angle, and a mark one pixel off slides the meeting point a long
@@ -445,7 +445,7 @@ def triangulation_quality(rays, point, f_px, px_err=1.0, floor_z_m=None) -> dict
 
 
 # ---------------------------------------------------------------------------------------------
-# I14 THIRD-PERSON PICTURE
+# THIRD-PERSON PICTURE
 # ---------------------------------------------------------------------------------------------
 VIEWS = {"side": (0, 2, "x forward", "z up"), "top": (0, 1, "x forward", "y left")}
 GRID_STEPS_MM = (10, 20, 50, 100, 200, 500)

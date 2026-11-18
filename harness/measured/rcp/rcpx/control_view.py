@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a look covers (FINDINGS P1, the parts in the look itself): the patch of the surface the robot stands on that
+"""What a look covers (the parts in the look itself): the patch of the surface the robot stands on that
 the frame shows (floor_view_mm) and the part of the frame the robot's own hand and tool hide (hidden_by_hand_px).
 Both come from the body model at the look's joint pose and the installation's floor height; nothing reads the
 picture or the simulator. A survey (the packages owner's plug-in) calls look_footprint for each of its poses.

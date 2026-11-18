@@ -12,7 +12,7 @@ Servo law, evaluated every physics step of the scene's own model with the goal h
 A push is only as strong as the goal leads the position, and the cap ends it there. Every device's on_step runs
 after every physics step. read()["fast"] is the joint speeds at every physics step of the last period;
 contact_model() reads the contact rate of the robot's own geoms from the scene's model; servo_law() states the law
-above (SPEC-R4 A8.4). A truth log (every device truth at 10 Hz, base pose, and events: device state changes,
+above. A truth log (every device truth at 10 Hz, base pose, and events: device state changes,
 new violations, interventions) is kept for scoring; truth() and truth_log() are never reachable from a tool.
 
 At construction the scene settles for settle_s of simulated time with the servo holding the start pose (home unless

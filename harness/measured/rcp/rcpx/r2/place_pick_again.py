@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""After a take that did not hold, of the pick of package place (round six: the design rulings): what the look shows.
+"""After a take that did not hold, of the pick of package place: what the look shows.
 
 A pick takes ONCE. A second take by itself, where a fresh look read the spot anew, held once in 25 tries and
 struck in 4, so it is off the default path. What stays is the seeing. A
@@ -105,7 +105,7 @@ def shows(ex, seen, take):
     same = None if first.get("narrow") is None else why is None
     planned = take.get("planned") if isinstance(take.get("planned"), dict) else {}
     ready = {"tool": "pick", "args": {"pick": again["at"]},
-             "periods": planned.get("periods")}   # C12: the first take's own count (the same take, pointed there)
+             "periods": planned.get("periods")}   # the first take's own count (the same take, pointed there)
     return {"look": look, "thing": True, "same": same, "ready": ready,
             "said": (f"look {look} (taken now, 0 control periods) shows a thing at the spot, "
                      f"{S['narrow'] * MM:.0f} by {S['wide'] * MM:.0f} mm across, its top at z {S['top_z'] * MM:.0f} mm"

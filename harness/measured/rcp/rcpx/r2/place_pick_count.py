@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The count of a take of package place (round six: the design notes C12): what a take will cost, made before
+"""The count of a take of package place: what a take will cost, made before
 anything moves.
 
 The count is the control periods of the plan AS IT WILL RUN at its planned speeds, with no margin and no branch
@@ -17,7 +17,7 @@ gate(): what a take earns before the hand or the jaws move: limit_not_keepable w
 what these jaws leave standing once they touch (the close's own refusal, asked first), budget when the count is
 over the control periods left (ex._pl_periods_left; none stated: nothing is refused). count() is also the
 pick's price for the place's budget line (ex._pk_price), and the pick's receipt prints it beside the periods the
-take ran (the design rulings: the waits by motion the plan does not count are listed there as owed, never gated).
+take ran (the waits by motion the plan does not count are listed there as owed, never gated).
 
 The take of a hand with one moving jaw (a fixed jaw that carries the tool tip, a jaw that swings against it) is
 here too. With no width to go by such a hand takes a thing at the point between its PADS, not at the fixed
@@ -80,7 +80,7 @@ def wide_of(plan):
 
 def close_count(ex, plan, ready):
     """(the control periods the close plans, None), or (None, the refusal limit_not_keepable): the core's close
-    as it counts and refuses itself (rcpx/control_hold_close.py rates: the design rulings), asked before the hand
+    as it counts and refuses itself (rcpx/control_hold_close.py rates), asked before the hand
     moves. The floor the jaw joint's own friction leaves and the jaws' stop slope are those of the depth the
     thing is taken at (a hinged jaw presses harder the nearer its hinge the thing stands). The operator's own
     word under that floor is never refused: the close runs at the slowest rate the jaws resolve and
@@ -105,21 +105,21 @@ def close_count(ex, plan, ready):
 
 
 def close_strike(ex, plan, ready, c):
-    """The close's strike as a strike block (C2) for the receipt's largest strike, or None where the jaws' stop
-    slope is not known. the design rulings: the close states its peak: what one pad can make on a rigid thing backed by
+    """The close's strike as a strike block for the receipt's largest strike, or None where the jaws' stop
+    slope is not known. The close states its peak: what one pad can make on a rigid thing backed by
     the other jaw at the rate the jaws ran at when their reading told the thing (the jaws' stop slope at the depth
     the thing is taken at; the slope's source is said: these jaws give no force reading, so it is the body's
     model) with the squeeze they then read standing: the close's own ONE number (control_hold_close.close)."""
     z, v = c.get("z_jaw"), c.get("met_m_s", c.get("arrive_m_s"))
     if not z or v is None or c.get("peak_n") is None:
         return None
-    peak = float(c["peak_n"])       # ONE number: the close's own figure after the jaws stood (C8)
+    peak = float(c["peak_n"])       # ONE number: the close's own figure after the jaws stood
     st = c.get("strike") if isinstance(c.get("strike"), dict) else {}
     return {"peak_n": peak, "at_least_n": None, "model_peak_n": float(z) * float(v), "v_m_s": float(v),
             "f_guard_n": None, "z_n_s_m": float(z),
             "z_source": f"the jaws' own stop slope ({c.get('z_jaw_source') or ready['N']['source']}), per pad",
             "stops": 0, "v_max_m_s": None, "link": None, "gentle": None, "text": c["price"],
-            # C8 changed: per pair: each pad on the thing against pad_n, a jaw body on anything else it
+            # per pair: each pad on the thing against pad_n, a jaw body on anything else it
             # met while closing against other_n
             "pad_n": peak, "other_n": st.get("other_n"), "other_source": st.get("source"), "width": c.get("width")}
 

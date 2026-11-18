@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Three parts of the self-test (rcpx/bounds_selftest.py run), round six: the jaws' own numbers, braking and
-acceleration per joint (contract C6), and the taps (contract C5). Never inside a task or a scored cell.
+"""Three parts of the self-test (rcpx/bounds_selftest.py run): the jaws' own numbers, braking and
+acceleration per joint, and the taps. Never inside a task or a scored cell.
 
-- jaws(ex, know, at): the entry "jaw" from control_hold.measure_jaws (contract C7) where that module is; else one
+- jaws(ex, know, at): the entry "jaw" from control_hold.measure_jaws where that module is; else one
   timed REAL opening and closing (the jaws are closed first, so the opening moves), and the entry says that these
   are end stop numbers. Whatever measuring leaves the jaws at, the self-test sets them itself after it: closed for
   the sweep and for the taps (the hand as the body's hulls hold it), at their open rest for the ramp passes.
@@ -33,7 +33,7 @@ acceleration per joint (contract C6), and the taps (contract C5). Never inside a
   the elastic give of the force the hand rests with); else the entry "taps" says what height was met and no tap
   is used. A body whose servo ripples inside each period (it follows a stepped command closely) is not resolved:
   the stop's own check of the speed of arrival calls its speed changing.
-  Under a stated limit (a tool rating, a site force; the design rulings, b) the body's model may not stand as the bound: it
+  Under a stated limit (a tool rating, a site force) the body's model may not stand as the bound: it
   is no upper bound of a true peak. A body that resolves no peak taps at the tell speed only, and only when the
   model puts that tap under the limit; the entry says the limit is not shown kept. A body that resolves a peak
   climbs only once a tap is resolved and only while the taps it has made put the next one under the limit, and
@@ -70,7 +70,7 @@ def jaws(ex, know, at):
     s = ex._sense()
     if not g or s.gripper is None:
         return None
-    try:   # r6 shim: package HOLD's module; absent until it is merged
+    try:   # compat shim: package HOLD's module; absent until it is merged
         from rcpx import control_hold
         measure = getattr(control_hold, "measure_jaws", None)
     except ImportError:
@@ -122,7 +122,7 @@ def _jaws_to(ex, q_hold, cmd):
             return
 
 
-# ------------------------------------------------------------------ braking and acceleration per joint (C6)
+# ------------------------------------------------------------------ braking and acceleration per joint
 def _ramp_pass(ex, know, q_from, j, goal, w_top, a, facts):
     """One rest to rest pass of joint j from its present command to angle goal: ramp up at a, at most w_top, brake
     at a, then hold the commanded end until still. Returns what the joint's own readings showed."""
@@ -273,7 +273,7 @@ def _levels(know, p, facts, j, at):
     know.add_row("f_hidden", [0.0, radius * p["a"]], float(max(rec.f[k:] or [0.0])), at=at)   # the settling stretch
 
 
-# ------------------------------------------------------------------ the taps (C5)
+# ------------------------------------------------------------------ the taps
 def _low(ex, B, q, normal, offset):
     """How far (m) the lowest point of the tool stands over the stated support plane at pose q: the tool bodies'
     own hull points and the tip."""
@@ -517,7 +517,7 @@ def taps(ex, know, q0, at, log):
                                 "f": float(r.Fmag), "fast": block, "ended": r is ended})
             pose = ended.q
             stop = stops.measure(samples, g.force_n, bounds_strike.normal_z_of(B, pose, u), dt, plan_v=v)
-            stop.update(q=[float(x) for x in pose], u=[float(x) for x in u], body="tool")     # C5: its pose and body
+            stop.update(q=[float(x) for x in pose], u=[float(x) for x in u], body="tool")     # its pose and body
             s, _ = _rest(ex, know, q_cmd, wait)
             stop["height_m"], stop["rest_n"], stop["where"] = _low(ex, B, s.q, normal, offset), float(s.Fmag), "tap"
             give = float(B.rigid(s.q, u, max(float(g.force_n or 0.0), stop["rest_n"])))   # with the force it rests with

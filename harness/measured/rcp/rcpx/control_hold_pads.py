@@ -2,17 +2,17 @@
 """What the pads of a hold bear and what they can make.
 Pure over the jaws' own numbers (control_hold_jaws); nothing here moves anything.
 
-    by_side(F, q, target, d)    the design rulings: what each pad presses the thing with where the jaws stand, by the jaw
+    by_side(F, q, target, d)    what each pad presses the thing with where the jaws stand, by the jaw
                                 servo's own reading through each pad's lever at the opening the jaws read
     stated(F, N, lever, c)      what a close states of its pads, for the hold's record and for the gates:
                                 squeeze_pad_n (the squeeze the hardest pressed pad bears once the close stands, by
                                 the jaw servo's own reading: by_side()), squeeze_by_body (the same per pad), the
                                 goal the close was solved for as its own field (squeeze_goal_n), and the jaws'
                                 numbers at that depth (z_jaw, floor_n, own_m_s) for a later landing
-    strike(F, N, P, c, ...)     C8: {"pad_n", "other_n", "arrive_m_s", "source"}: the peak one pad can make on the
+    strike(F, N, P, c, ...)     {"pad_n", "other_n", "arrive_m_s", "source"}: the peak one pad can make on the
                                 thing between the jaws, and the peak a jaw body can make on anything else it meets
                                 while it closes
-    rise(pads, f_arm_n, v)      the design rulings: the most a landing at the speed v can raise one pad's load on the held thing
+    rise(pads, f_arm_n, v)      the most a landing at the speed v can raise one pad's load on the held thing
                                 over the squeeze that stood, by the arm's own figure along the travel and the jaws'
                                 own stop slope
     planned(ex)                 the squeeze per pad a close of these jaws leaves standing, before any close ran (a
@@ -78,8 +78,7 @@ def stated(F, N, lever, c):
     """The pads' part of a hold's record after a close c (control_hold_close.close's result, before the record is
     made). N, lever: control_hold_close.at_depth (the numbers and the pad's shortest lever at the depth the thing
     is taken at). squeeze_pad_n: what the jaw servo's own reading says the pad that presses hardest bears once the
-    close stands (the design rulings: the squeeze is read where it stands; the force a landing with nothing stated ends at,
-    the design rulings), from c["pads_by_side"] (by_side()) where the close read it, else the servo's lag at the jaw tip
+    close stands (the squeeze is read where it stands; the force a landing with nothing stated ends at), from c["pads_by_side"] (by_side()) where the close read it, else the servo's lag at the jaw tip
     through the shortest lever; None when the jaws give no reading. squeeze_by_body: the same per pad, by the
     side's body name. The squeeze the close was SOLVED for is its own field (squeeze_goal_n): a goal, never the
     statement of what stands. What a pad can make in the close itself, its strike included, is the close's own
@@ -125,7 +124,7 @@ def of_record(rec):
 
 
 def strike(F, N, P, c, frac0, arm_n=0.0):
-    """C8: the close's own strike. pad_n: the peak one pad can make on the thing between the jaws (the close's
+    """The close's own strike. pad_n: the peak one pad can make on the thing between the jaws (the close's
     peak_n, ONE number: the strike of the rate the jaws ran at when their reading told the thing plus the
     squeeze they read standing, with what the arm read on top). other_n: the
     peak a jaw body can make on anything ELSE it meets while it closes: that contact is not backed by the
@@ -160,7 +159,7 @@ def strike(F, N, P, c, frac0, arm_n=0.0):
 
 
 def rise(pads, f_arm_n, v_m_s):
-    """the design rulings: (the most a landing at v_m_s can raise one pad's load on the held thing over the squeeze that stood,
+    """(the most a landing at v_m_s can raise one pad's load on the held thing over the squeeze that stood,
     N; the lever term alone) by the arm's own figure along the travel f_arm_n and the jaws' own stop slope (module
     text): f_arm + sqrt(f_arm x z_jaw x v). (None, None) where the arm states no figure; with no stop slope of the
     jaws the lever term is the arm's figure again (a lever cannot give a pad more than the arm's push where the

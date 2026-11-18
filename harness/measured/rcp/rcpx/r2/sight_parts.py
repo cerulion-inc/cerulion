@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What the sheet and the pictures say about a pointed part (package sight, I37; SPEC-R3 4.5 steps 11 to 13, the survey
+"""What the sheet and the pictures say about a pointed part (package sight, the survey
 fits, the sheet tile maps). Reads robot://devices as served (ex.context["devices"]), the frames and the survey result;
 never a scene. Nothing here moves the arm or names a device: every rule reads the served text.
 
@@ -28,7 +28,7 @@ RELATION_NEAR_MM = 250.0     # another located point this near is on the same de
 RELATIONS_MAX = 2            # relations said (nearest first): the brief result stays under 900 bytes
 RELATION_MIN_MM = 10.0       # a part of a relation this small is not said (the uncertainty of a located point)
 SPOT_KEEP_OUT_PX = 60        # floor gains leave out this square round the pointed spot (it is the part, not floor)
-HARNESS_MAX_SIDE_PX = 640    # the loop's resize rule (SPEC-R3 7): a longer image side is scaled to 640
+HARNESS_MAX_SIDE_PX = 640    # the loop's resize rule: a longer image side is scaled to 640
 
 
 def doc(ex):
@@ -285,7 +285,7 @@ def survey_post(ex, result):
 
 
 def _boxes(ex, kept):
-    """A World box per candidate when the World knows the kind (C6); the boxes stay in ex.state either way."""
+    """A World box per candidate when the World knows the kind; the boxes stay in ex.state either way."""
     try:
         from rcpx.context import KINDS
     except ImportError:

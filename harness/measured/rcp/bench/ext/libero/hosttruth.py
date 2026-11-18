@@ -16,8 +16,8 @@ Scoring ops (methods of TruthMixin, a base of the host):
            group that is switched off) and the segmentation is rendered again until none is left; everything is
            put back. Saved beside: *_all.npy (the simulator's first answer) and *_drawn.npy (every surface the
            picture DRAWS at a pixel, front to back, down to the first that gives more than half of its colour).
-           The same procedure as the pointing calibration's host (the design notes, decisions D20
-           and D27). prove true adds the sha256 of the look's own colour render before, with the invisible
+           The same procedure as the pointing calibration's host. prove true adds the sha256 of the look's own colour
+           render before, with the invisible
            surfaces out, and after. A render is no control step.
   ray      {camera, width, height, pixels: [[u, v], ...]}: for each pixel (column, row; the ray through its
            middle) the first surface the picture draws with more than half of its colour, by a ray cast through
@@ -31,8 +31,8 @@ Scoring ops (methods of TruthMixin, a base of the host):
            whether they collide. For the test's reading of a part's true shape.
   kin      a kinematic copy of the scene with the arm put at given joints (sc_kin): what would be inside what,
            where the pads would stand and what would lie between them; and how near given points are to named
-           bodies. For the census of contract C21. No step runs and the episode's data is not touched.
-  peaks    {from?, reset?}: the raw reading of contract C16, kept by PairWatch below for every control step since
+           bodies. For the census. No step runs and the episode's data is not touched.
+  peaks    {from?, reset?}: the raw reading, kept by PairWatch below for every control step since
            the reset: per pair of bodies the largest NET contact force (the size of the vector sum of the pair's
            contact points) over the step's physics steps and the net at its last physics step; per body the
            largest whole push (the size of the sum over everything it touches); and where every free thing and
@@ -425,7 +425,7 @@ class TruthMixin:
         depth, m); "pads": where the two pads stand; "between": the bodies a straight line from pad to pad
         meets; with close true: "close": at which opening each jaw, closed step by step in the copy, comes to
         bear on the named bodies (null: it never does before the jaws meet); "near": for each point the distance to the nearest surface of the named bodies along 26
-        bearings within reach_m (null: none within reach). For the census (contract C21)."""
+        bearings within reach_m (null: none within reach). For the census."""
         self._need_env()
         np, mj, m, d = self.np, self.mj, self.m, self.d
         r = self.robot

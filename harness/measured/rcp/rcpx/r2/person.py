@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""I22 THE PERSON IS A GATED, COUNTED RESOURCE: constraints in, asks out (SPEC-R2.md section 3, NEXT-IMPROVEMENTS.md).
+"""THE PERSON IS A GATED, COUNTED RESOURCE: constraints in, asks out.
 
 What this package serves:
 - robot://task gains "constraints" (from ex.context["task"]["constraints"]): {kind: no_move, object, tolerance_mm},
@@ -28,7 +28,7 @@ What this package serves:
   far, turned over or hidden). A look where the object's edge cannot be told from its surroundings (dim, or a plain
   run of colour) gives checked false with why, never a number.
 - check_cannot(ex, claim) -> {"ok", "missing"}: a "cannot" claim must give a reason and cite call ids that exist in
-  the journal (the core lane wires it into claim).
+  the journal (the core wires it into claim).
 No robot is named here and nothing reads simulator ground truth.
 """
 

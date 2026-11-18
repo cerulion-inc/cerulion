@@ -3,12 +3,12 @@
 
 When no width is stated or seen for what the jaws close on, the robot looks for itself before the close if a camera
 of its own can see between the jaws: one picture, no motion, no control period, said in the receipt. The width then
-comes from that look with its error and the close runs as the design rulings built it (the jaws' own rate down to where
+comes from that look with its error and the close runs as built (the jaws' own rate down to where
 the pads can first meet the thing, the rate solved for the hold's squeeze from there). Where no camera of this body
 measures between the jaws the close runs at the arrival rate from where the jaws stand and prices that beside what a
 width would have cost (control_hold_close.close).
 
-before(ex, look) is the core's door; the seeing itself is rcpx/r2/see_jaws.py (contract C11), read lazily so that a
+before(ex, look) is the core's door; the seeing itself is rcpx/r2/see_jaws.py, read lazily so that a
 core with no seeing package closes as before. Nothing here names a robot.
 """
 

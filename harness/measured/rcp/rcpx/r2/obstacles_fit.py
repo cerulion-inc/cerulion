@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Which part touched (I20 touched_by): fit the measured external joint torque to J_p(q)^T f for every candidate
+"""Which part touched (touched_by): fit the measured external joint torque to J_p(q)^T f for every candidate
 point on the robot and rank the parts by how well a single point force explains the torque.
 
 The torque is the closed-loop estimate of obstacles_torque.py (sign as Sense.ext: ext = J^T F for a force F the

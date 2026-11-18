@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Side entry of package place (N4), version two (SPEC-R4 B4): setting a held thing down at a place that stands
+"""Side entry of package place, version two: setting a held thing down at a place that stands
 under a cover the space book holds (a roof, a shelf above, the body over an opened drawer), through an open side.
 
 When it applies: the way straight down onto the place, for the held thing and the hand above it, crosses the band
@@ -577,7 +577,7 @@ class SideMixin:
                     "length_m": float(np.linalg.norm(p_in - mouth)), "bearing_deg": round(math.degrees(b), 1),
                     "unseen": unseen, "tried": tried, "from_look": look_e is not None}
         whys.append(f"bearing {math.degrees(fan_b):.0f} deg: {why}")
-        # the reasons by how many bearings each ended, then by their text (the design rulings: never a set's order)
+        # the reasons by how many bearings each ended, then by their text (never a set's order)
         told = reasons_by_count(whys)
         return refusal("no_side_reach", f"the place stands under {cover}, " + (
             "a thing this session measured" if roof is None else "seen, not measured") + ", and no level way in was "

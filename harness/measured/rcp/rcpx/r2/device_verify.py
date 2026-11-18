@@ -9,12 +9,12 @@ act), and the look comes at least the entry's transition time after the last act
 "unobservable", with a view_hint (a move_tip delta from the camera model) when a move would help. Device kinds are
 never named; no simulator ground truth is read here.
 
-What it checked is said, never implied (FINDINGS S3): evidence_checked.tested is "cue_read" when the deciding part
+What it checked is said, never implied: evidence_checked.tested is "cue_read" when the deciding part
 is the device's cue and its state is a lit or dark word (the cue's light is read at the point in the look itself and
 must agree with the state: a lit cue for on or lit, a dark one for off, unlit or dark; a reading that disagrees is
 the verdict "contradicted" and the claim stays unconfirmed), else "in_view_only" (the point projects into the look,
 clear of the robot, the look newer than the last act; the picture is not compared with the state: the state rests
-on the operator's evidence, verdict "not_checked" when the round one rules accept it: the design rulings, no verdict of
+on the operator's evidence, verdict "not_checked" when the round one rules accept it: no verdict of
 acceptance without a reading of the robot's own behind it; the result's said names what the robot read, what it
 could not check and what would check it). A point that
 was located before a motion moved something near it (a result that says moved_part, gave or a probe that moved) is
@@ -218,7 +218,7 @@ class VerifyMixin:
 
     def _dv_was_confirmed(self, claim):
         """True when the claim's record stood confirmed before this call (only a reading of the robot's own confirms
-        one: the design rulings)."""
+        one)."""
         if claim.get("id") is not None:
             e = self.world.entries.get(str(claim["id"]))
             return bool(e and e.get("kind") == "state" and e.get("confirmed"))
@@ -226,7 +226,7 @@ class VerifyMixin:
         return bool(got and got.get("confirmed") and got.get("state") == claim.get("state"))
 
     def _dv_unchecked(self, out, before, said):
-        """the design rulings: a claim the robot did not read itself is recorded and NOT confirmed: accepted false, the record
+        """A claim the robot did not read itself is recorded and NOT confirmed: accepted false, the record
         unconfirmed, the said line names what the robot read, what it could not check and what would check it. A
         record a reading of the robot's own confirmed before stays confirmed by that reading."""
         out["robot_checked"] = bool(before)
@@ -250,7 +250,7 @@ class VerifyMixin:
         return out
 
     def _dv_own_look(self, device, state):
-        """the design rulings: the check that costs no motion. When the state is a lit or dark word of a device with a cue
+        """The check that costs no motion. When the state is a lit or dark word of a device with a cue
         part, the robot takes one look of its own camera as it stands (0 control periods) and reads the cue in it.
         (look_id, the check of _dv_check) or (None, None) when no such look can read a cue (no cue part, no lit or
         dark word, the newest light reading dark)."""

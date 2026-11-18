@@ -97,7 +97,7 @@ def _fits(count, intent, limit_n, left, bare):
 
 
 def refusal_of(ex, periods, left, hint, price):
-    """The budget refusal that names the limit and its price (C12), or None when the limit is not what makes
+    """The budget refusal that names the limit and its price, or None when the limit is not what makes
     the plan long (the same motion with no limit does not plan fewer periods)."""
     limit, intent, count = price["limit"], price["intent"], price["count"]
     try:

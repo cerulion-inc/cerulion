@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Full grid and calibration cells of the LIBERO and LIBERO-PRO study (the design notes section 4). Standard library only.
+"""Full grid and calibration cells of the LIBERO and LIBERO-PRO study. Standard library only.
 
 The grid uses all ten inits per LIBERO-10 task; day_one remains the 75-cell oracle set.
 
@@ -173,7 +173,7 @@ def day_one():
     return libero10() + pro_set_a() + pro_set_b()
 
 
-# The frozen cell lists (bench/cells/outside_v1, the design rulings): every headline and every reserve list of every
+# The frozen cell lists (bench/cells/outside_v1): every headline and every reserve list of every
 # benchmark named in its benchmarks.json is sealed at every scripted door, whatever the benchmark.
 LISTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "cells",
                          "outside_v1")

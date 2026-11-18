@@ -125,7 +125,7 @@ def takes(args_schema, optional_types=True):
 
 def printed_bytes(result):
     """How many bytes a list result takes once rcpx.cli prints its response (the compact layout of
-    rcpx/surface_brief.py dumps, fix round two; it printed with indent 2 before)."""
+    rcpx/surface_brief.py dumps; it printed with indent 2 before)."""
     from rcpx.surface_brief import dumps
     return len(dumps({"seq": 1, "op": "list", "result": result}).encode("utf-8")) + ENVELOPE_BYTES
 

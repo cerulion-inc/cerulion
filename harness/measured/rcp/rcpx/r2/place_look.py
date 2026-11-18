@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The looks of package place (N4): the colour of what is about to be picked, read from the wrist frame at the pick
+"""The looks of package place: the colour of what is about to be picked, read from the wrist frame at the pick
 point, and after a place one look whose sentence says whether that colour shows where the object was set down.
 
 Only the robot's own camera and its body model are read: the point is projected into the frame through the camera

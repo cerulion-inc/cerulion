@@ -3,7 +3,7 @@
 
 A point is SHOWN FREE when a look of the scene AS IT STANDS (taken after the last act that changed the scene,
 ex._scene_t: the last control period in which a guard read a load over its threshold or the jaws were told to
-move; and taken after the arm's last motion before the present call began, ex._look_since: the design rulings) has it in
+move; and taken after the arm's last motion before the present call began, ex._look_since) has it in
 view and sees past it: along the rays through a ball of the stated radius around the point, the
 surface the camera's depth picture shows lies farther than the point by more than that radius and BAND times the
 look's own stated depth error at that range. Everything else is not shown free: space out of every view, space
@@ -44,7 +44,7 @@ def looks_now(ex):
     """The looks with depth of the scene as it stands, newest first: [(id, record, view, depth, own, body)]; own:
     the pixels that show the robot's own body as it stood then; body: its capsules at that pose. A look counts
     when it was taken after the last act that changed the scene (ex._scene_t) and, across calls, after the arm's
-    last motion before this call began (ex._look_since, the design rulings: the frame the call is planned on)."""
+    last motion before this call began (ex._look_since, the frame the call is planned on)."""
     since = [float(t) for t in (getattr(ex, "_scene_t", None), getattr(ex, "_look_since", None)) if t is not None]
     since = max(since) if since else None
     out = []
@@ -143,7 +143,7 @@ def _one(view, rec, z, own, body, p, radius):
 def shows_in(ex, points_m, radii_m, since_t):
     """bool per ball: a look of the scene as it stands, taken after since_t (s, per ball), has the ball in view
     and shows a surface that is not the robot's own INSIDE it (nearer than its far side, farther than its near
-    side). What the arm passed through and such a look shows full is no longer free (the design rulings (2))."""
+    side). What the arm passed through and such a look shows full is no longer free."""
     pts = np.asarray(points_m, dtype=float).reshape(-1, 3)
     r = np.broadcast_to(np.asarray(radii_m, dtype=float), (len(pts),))
     t = np.broadcast_to(np.asarray(since_t, dtype=float), (len(pts),))

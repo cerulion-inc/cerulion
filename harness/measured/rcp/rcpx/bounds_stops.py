@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""A stop: what the robot's own readings say of it, and what the robot learns from it (round six, the design rulings).
+"""A stop: what the robot's own readings say of it, and what the robot learns from it.
 
 Pure: no robot, no backend, no session. The same code serves a task's stop and a self-test tap.
 
@@ -36,7 +36,7 @@ Pure: no robot, no backend, no session. The same code serves a task's stop and a
   move, at least 1) is given either way; a stop with no reading before its contact has det_periods None and no
   speed: nothing reads a detection time off it.
 - fit(stops): over the resolved stops, c = the largest (peak_n - hid_n - f_thr) / (v x model_z of that stop) over
-  EVERY pose and body tapped (contract C5 changed): how the body's own model stood against what a stop showed,
+  EVERY pose and body tapped: how the body's own model stood against what a stop showed,
   each stop at its own pose, over it or under it. hid_n: what the joints' dry friction adds to a stop's peak
   whatever its speed. e0: the most a stop's own peak stood over the line the stated slope draws through the
   guard's level: stated beside the slope, never inside it, so every figure gives back the stops' own peaks.
@@ -56,7 +56,7 @@ Pure: no robot, no backend, no session. The same code serves a task's stop and a
   stated limit be passed by a slope scaled down so). The text starts "fitted:" whenever a stop bears it and
   names the ONE term that set the number.
 - estimate(model_z_here, fit): the stop slope for SOLVING a speed from a force that is no stated limit (the
-  force a touch, a close or a landing ends at: the design rulings; a push law's own ceiling): what this
+  force a touch, a close or a landing ends at; a push law's own ceiling): what this
   body's stops showed, (1 + rel) x c x the body's model here, c also under 1. It promises nothing and states
   no figure: the receipt's strike is slope()'s. Without it every such arrival ran at half its speed or less.
 - said_of(z, text, fit, q, u): what the bounds hand over with a model slope (the range, the travels and the
@@ -260,7 +260,7 @@ def measure(samples, f_thr, model_z, dt, plan_v=None, rel=REL):
             arrive, why_not, early, least = _arrival(speeds, samples, onset, u, dt, rel / QUANT)
             if arrive is None:
                 # no steady, sharply ended or one-way arrival: the speed met is the hand's MEAN speed over the
-                # control period before the first loaded reading (C2), from its fast joint speeds where the body
+                # control period before the first loaded reading, from its fast joint speeds where the body
                 # gives them: a hand that sticks and slips reads anything at one instant
                 mean = _period_speed(samples[onset - 1])
                 arrive = speeds[onset - 1] if mean is None else float(mean @ u)

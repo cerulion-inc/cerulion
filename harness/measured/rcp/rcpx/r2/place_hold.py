@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """The hold of package place: the names the place and fixture files call, over the core's one hold.
 
-Since round six the hold itself is the core's (rcpx/control_hold.py: one record, one close, one release, the load
+The hold itself is the core's (rcpx/control_hold.py: one record, one close, one release, the load
 read at rest, the jaws' own numbers from steady rates in the self-test). This file keeps the names older callers
 use and turns the core's answers into the keys they read; it measures nothing inside a task, searches no squeeze
 and holds no level of its own:

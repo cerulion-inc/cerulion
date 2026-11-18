@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package act (I34, SPEC-R3 4.3 and SPEC-R4 A4.5): push and lift as whole steps.
+"""Package act: push and lift as whole steps.
 
 push chooses its line from the stored point, normal, device geometry or naming
 ray. P0 refuses force_unknown before any look or approach when no sheet force,
@@ -148,7 +148,7 @@ def _push_stages(ex, run, info, u, src, way, until, firm, max_n, hold_s):
                 first = None
         try:
             c, u, fit = _touch_and_fit(ex, run, info, u, max_mm, ft, P, tol, unc, standoff, src, first=first)
-        # Only a sliding part gets the level retry. Review probes on other
+        # Only a sliding part gets the level retry. Probes on other
         # faces pressed beside the part and changed a cue without proving the spot.
         except Stop as stop:
             if stop.stopped != "blocked" or src != "naming_ray" or abs(float(u[2])) <= L.VERTICAL_Z or not sliding:
@@ -455,7 +455,7 @@ def setup(ex):
 
 
 def FILTER(surface, resources, handlers, ex=None):
-    """lift is listed only when r3_lift_declared is true (SPEC-R3 0.1 R10)."""
+    """lift is listed only when r3_lift_declared is true."""
     if ex is not None and not lift_declared(ex):
         surface = dict(surface)
         surface["tools"] = [t for t in surface["tools"] if t.get("name") != "lift"]

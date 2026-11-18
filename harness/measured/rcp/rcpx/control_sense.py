@@ -196,7 +196,7 @@ class SenseMixin:
                     xj[n + j] += probe
                 S[:, j] = (end(xj) - base) / probe
             if not np.all(np.isfinite(S)):
-                # p4-read (d): a sensitivity that is not a number has no singular values: no estimate this period
+                # a sensitivity that is not a number has no singular values: no estimate this period
                 return self._no_estimate("its sensitivity is not a number")
             try:
                 mu = FIT_REG * float(np.linalg.norm(S, 2))
@@ -218,7 +218,7 @@ class SenseMixin:
         return -0.5 * (x[:n] + x[n:]) * lim
 
     def _no_estimate(self, why):
-        """A period whose torque solve cannot answer (p4-read (d)): no external torque is read in it (zero), so the
+        """A period whose torque solve cannot answer: no external torque is read in it (zero), so the
         guard judges that period at its cap alone; never an exception. Counted per call and said once in the call's
         result (bounds_notes) and the journal."""
         self._ext_end = None
@@ -337,8 +337,8 @@ class SenseMixin:
         s.tip, s.R = self.model.fk_tip(s.q)
         s.at = s.tip.copy() if at is None else at
         self._last = s
-        control_move_passed.note(self, s)   # where the arm's own bodies have been is free space (the design rulings (2))
-        bounds_book_read.note_reading(self, s)   # what the arm read: a stop's speed is read from it (p4-read (a))
+        control_move_passed.note(self, s)   # where the arm's own bodies have been is free space
+        bounds_book_read.note_reading(self, s)   # what the arm read: a stop's speed is read from it
         return s
 
     def force_now(self):

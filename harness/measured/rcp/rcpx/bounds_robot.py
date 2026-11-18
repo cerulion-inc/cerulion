@@ -85,7 +85,7 @@ class Plan:
     kinds: list = field(default_factory=list)
     legs: list = field(default_factory=list)
     looks: list = field(default_factory=list)
-    strike: object = None      # the price of the motion (rcpx.bounds_strike.price, contract C2)
+    strike: object = None      # the price of the motion (rcpx.bounds_strike.price)
     limit: object = None       # the limit somebody stated on the motion as a whole: {limit_n, source, shown}
 
 
@@ -99,7 +99,7 @@ class GuardSpec:
     readings: int
     source: str = None         # what the threshold and the cap rest on, in words
     hold: str = None           # None, "first" (a hold whose load is not read yet) or "known"
-    expect: object = None      # the expected contact of the leg (contract C9) or None
+    expect: object = None      # the expected contact of the leg or None
 
 
 @dataclass
@@ -386,7 +386,7 @@ class ModelKnow:
         self._stops = []
 
     def add_stop(self, stop, where="task", at=None, store=None):
-        """Keep a stop measured by rcpx.bounds_stops.measure (contract C5); a false stop is never handed here.
+        """Keep a stop measured by rcpx.bounds_stops.measure; a false stop is never handed here.
         store is SelfKnow's argument: nothing here is ever written to a file."""
         if not isinstance(stop, dict) or "det_periods" not in stop:
             return False
@@ -415,7 +415,7 @@ class ModelKnow:
             value, source = r.speed_limit()
             evidence = "the maker's rated joint speed"
             if value is None or not np.all(np.isfinite(value)):
-                # a joint with no rating: the fastest it can still stop from inside its own range (Q1)
+                # a joint with no rating: the fastest it can still stop from inside its own range
                 sized = laws.qd_until_known(self.get("qdd_max", r.q_home)[0], r.q_hi - r.q_lo)
                 value = sized if value is None else np.where(np.isfinite(value), value, sized)
                 source = "model"
@@ -474,7 +474,7 @@ class ModelKnow:
             self.set("f_hidden", max(old, stop["peak_n"]), "self_test")
 
     def refit(self, stop):
-        """Contract C5: a stop measured by rcpx.bounds_stops.measure is kept, and the slope is read from the kept
+        """A stop measured by rcpx.bounds_stops.measure is kept, and the slope is read from the kept
         stops (bounds_stops.fit). Any other record changes nothing: a peak made of a deceleration and the speed of
         the reading that tripped are no measurement. Returns {"stored", "n": resolved stops kept, "c"}."""
         from rcpx import bounds_stops

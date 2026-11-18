@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Pure image and ray functions of locate (package sight, I37; SPEC-R3 4.5 steps 4, 7, 8 and 10). Frames, pixels and
+"""Pure image and ray functions of locate (package sight). Frames, pixels and
 camera poses in; numbers out. No motion, no executor, no scene; nothing names a robot or a device.
 
     Cam(pc, Rc, f, w, h)                 a pinhole as the body model gives it: project(X), ray(u, v)

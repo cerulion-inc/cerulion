@@ -3,7 +3,7 @@
 
 The force budget comes from Bounds.f_allow by its tiers. The speed offer comes from Bounds.v_in and v_free.
 A lower stated speed leaves more of the budget for steady push; a higher one is cut to the offer. The steady aim
-reserves the strike term and covers servo lead, the force threshold and the relative force step of SPEC-R4 A1.1.
+reserves the strike term and covers servo lead, the force threshold and the relative force step.
 A known stop slope gives an impact estimate. An unresolved slope gives strike energy and claims no impact peak.
 
 Peak_force_n is the estimate held over control readings. An impact shorter than one control period can peak
@@ -27,7 +27,7 @@ MM = 1000.0
 
 
 def _grasp_readable(out):
-    """Round dimensions in direct results and Bounds items for the reader, SPEC-R4 A5."""
+    """Round dimensions in direct results and Bounds items for the reader."""
     if isinstance(out, list):
         return [_grasp_readable(value) for value in out]
     if not isinstance(out, dict):
@@ -47,7 +47,7 @@ def _grasp_readable(out):
 
 
 class ImpulseMixin:
-    """A tip strike bounded by the offered arrival and remaining steady-push budget, SPEC-R4 A4.5."""
+    """A tip strike bounded by the offered arrival and remaining steady-push budget."""
     def _grasp_tip_mass(self, q, d):
         """Effective mass (kg) of the arm at the tip along unit d (frame B) at joint pose q, from the robot's own
         model (links and rotor armature): a tip moving at v along d carries this mass times v into a contact."""
@@ -65,12 +65,12 @@ class ImpulseMixin:
         return 1.0 / max(inv, 1e-9)
 
     def _grasp_stop_coeff(self, q, d, thing=None):
-        """Read the stop slope and its source from Bounds alone, SPEC-R4 Q9."""
+        """Read the stop slope and its source from Bounds alone."""
         return bounds.of(self).slope(q, d, thing)
 
     def _grasp_thing_at(self, B, p):
         """The thing a stroke that ends at p (m, frame B) is meant for: the stored point of robot://world that is
-        the same spot (within its own error plus the tool's half width, SPEC-R4 A4.3 "same spot"; the nearest of
+        the same spot (within its own error plus the tool's half width; the nearest of
         those), so what an earlier touch or press showed of that part bounds the strike; else the bare point, of
         which nothing is known."""
         w_tool = B.standoff(0.0)
@@ -87,13 +87,13 @@ class ImpulseMixin:
         return best[1] if best is not None else B.thing(p)
 
     def _grasp_impulse_ok(self, q, d):
-        """Impulse is possible only with positive capability and arrival offer, SPEC-R4 A4.3."""
+        """Impulse is possible only with positive capability and arrival offer."""
         B = bounds.of(self)
         return B.f_cap(q, d) * (1 - B.e_tau()) > B.f_thr(0.0, 0.0) and B.v_in(None, q, d)[0] > 0
 
     @primitive
     def impulse(self, direction, travel_mm, speed_mm_s=None, frame="base", force_n=None, clear=None):
-        """Strike at the offered or lower stated speed, then ease and report the actual contact, SPEC-R4 A4.5."""
+        """Strike at the offered or lower stated speed, then ease and report the actual contact."""
         out = self._grasp_impulse_impl(direction, travel_mm, speed_mm_s, frame, force_n, clear)
         if out.get("refused"):
             r = out["refused"]
@@ -104,7 +104,7 @@ class ImpulseMixin:
         return _grasp_readable(out)
 
     def _grasp_impulse_impl(self, direction, travel_mm, speed_mm_s, frame, force_n, clear):
-        """Reserve force for arrival, servo lead and a resolvable steady push, SPEC-R4 A4.5/A1.1."""
+        """Reserve force for arrival, servo lead and a resolvable steady push."""
         B = bounds.of(self)
         s = self._sense()
         d, bad = self._unit_in_base(direction, frame, s)

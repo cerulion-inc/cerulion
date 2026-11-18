@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The robot's own body in the picture and in space (SPEC-R3.md 4.1 a, b, e; package selfsee).
+"""The robot's own body in the picture and in space (package selfsee).
 
 Everything here comes from the body model (RobotModel.mj at a joint pose: ray casts against the model's own visible
 geometry, its collision capsules, its kinematic tree) and from robot://body's standing surface (Executor.
@@ -419,8 +419,7 @@ __all__ = ["Body", "CODES", "GROUPS", "NAMES", "OWN", "SOURCES", "mask_from_grid
 def _limit(ex, name, *args):
     """The round three limit NAME (mm) as the session derives it: r3_limits' lower case function of that name with
     the session's bounds and args once it exists (capsule_grow_mm(B, body), capsule_near_mm(B, thing, body),
-    contact_keep_mm(B, sigma_mm)) and an executor is at hand; else the constant (a pure use in a test; the Review
-    stage removes this branch)."""
+    contact_keep_mm(B, sigma_mm)) and an executor is at hand; else the constant (a pure use in a test)."""
     fn = getattr(L, name.lower(), None)
     if ex is not None and callable(fn) and next(iter(inspect.signature(fn).parameters), None) in ("B", "bounds"):
         return float(fn(bounds.of(ex), *args))

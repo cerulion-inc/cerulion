@@ -8,12 +8,12 @@ _S = surfaces
 
 
 def _num(text):
-    """Numeric argument schema with no derived upper end, SPEC-R4 A5."""
+    """Numeric argument schema with no derived upper end."""
     return {"type": "number", "minimum": 0, "description": text}
 
 
 def _vec(text):
-    """Three coordinate numbers with no arbitrary range, SPEC-R4 A5."""
+    """Three coordinate numbers with no arbitrary range."""
     return {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": text}
 
 

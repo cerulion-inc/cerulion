@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""seek (package assist; SPEC-R5 4.1, 4.7 rules 6 to 9; WP-8): the robot looks from the sides a picture cannot show.
+"""seek (package assist): the robot looks from the sides a picture cannot show.
 
 seek(words=None, around=None, max=3, until=None, detail="brief"). A short routine the robot runs itself: it takes up
 to max looks from the unseen sides of one thing (robot side first), asks the eyes package for each look's numbered
@@ -19,7 +19,7 @@ camera moves and how they keep clear of the thing are rcpx/r2/assist_seek_move.p
   bare "found" means found by the words of the call, and by the manual's control part names when the call gives
   none. until_from says where the words came from. With no until the looks run to the bound, stopped "looked".
 - sides: robot side, left, right, far, those the picture cannot show: the list's own unseen record when around is
-  its first row, else the same rule (SPEC-R5 4.1) worked for around; all four when no look is kept.
+  its first row, else the same rule worked for around; all four when no look is kept.
 - Bounds (the guard's Bounds; tested before EVERY nested call): looks at most max (1 to 4); one call charged per
   look taken (the session charges the first, the budget is lowered for each further one); a quarter of the seconds
   the session has left at the start (no time bound without a time budget, and said says so); tip travel at most
@@ -27,7 +27,7 @@ camera moves and how they keep clear of the thing are rcpx/r2/assist_seek_move.p
   (budget_short) or the seconds left under one move's own limit, cfg max_move_s (time_short), nor while the hand
   holds something (holding).
 
-Result (SPEC-R3 3.1): said, stopped (found | no_new | looked | refused | bound | out_of_reach), until_from, look,
+Result: said, stopped (found | no_new | looked | refused | bound | out_of_reach), until_from, look,
 steps [{i, side, look, stopped, new, found_by, seconds, travel_mm, why}], candidates, end {tip_mm}, by "robot",
 pictures, next. Journal: assist_step {by, routine, i, of, side, verdict, seconds, travel_mm} per look. Nothing here
 reads simulator ground truth or names a robot, a device, a task or a model.
@@ -103,7 +103,7 @@ def _has(session, ex, name):
 
 
 def _ready(ex, tool, args, needs=None, why=None):
-    """A next object: through the assist package's ready_call when it is loaded (SPEC-R5 4.6), else {tool, args}."""
+    """A next object: through the assist package's ready_call when it is loaded, else {tool, args}."""
     a = ex.state.get("assist")
     fn = a.get("ready_call") if isinstance(a, dict) else None
     if callable(fn):
@@ -133,7 +133,7 @@ def _area(r):
 
 
 def _unseen(ex, look, point_m):
-    """The sides of an upright box at the point that the look cannot show, by the rule of SPEC-R5 4.1 (the eyes
+    """The sides of an upright box at the point that the look cannot show, by the rule (the eyes
     package's rule, restated here: a package may not import another); None when the look is not kept."""
     rec = (getattr(ex, "_looks", None) or {}).get(look)
     if rec is None:
@@ -520,7 +520,7 @@ def _next(ex, session, eyes, tg, look, found, pick, stopped):
     """(next, why there is none). Never a number filled in for the model, never a claim."""
     a = ex.state.get("assist") if isinstance(ex.state.get("assist"), dict) else {}
     parts = eyes.get("parts") or {}
-    if pick:        # a look listed rows: the pick is the next whether or not a word reached the threshold (integrator)
+    if pick:        # a look listed rows: the pick is the next whether or not a word reached the threshold
         routine = (a.get("prefs") or {}).get("acting") == "routine"
         try:
             routine = routine or int((a["gauge"].standing() or {}).get("acting") or 0) > 0

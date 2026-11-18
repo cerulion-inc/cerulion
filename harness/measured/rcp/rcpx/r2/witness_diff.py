@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Pure image functions of the witness package (SPEC-R3.md 4.4): two frames from the same camera pose in, what
+"""Pure image functions of the witness package: two frames from the same camera pose in, what
 changed out. No model, no scene, no robot: images (H x W x 3 uint8 RGB), masks and numbers.
 
     align(a, b, valid)               ECC (Euclidean) on grey half-size frames, the own body masked out: the warp

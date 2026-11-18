@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The hold of package fixture (SPEC-R4 B5 phase 2): where the hand takes a fixed part, and with which posture.
+"""The hold of package fixture: where the hand takes a fixed part, and with which posture.
 
 A part is worked along a direction d (the way it should move). The hand's candidates:
 - hook:    the closed fingers go in behind the part, thin side first, and draw it; nothing is squeezed (kept only
@@ -167,7 +167,7 @@ def part_of(ex, target, seen=None):
             return None, refusal("unknown_target", f"robot://world holds no located point named {target!r}",
                                  "point at it in a look: work_part(target={'look': 'L1', 'px': [u, v]}, way='pull')")
         entry = (fresh or found)[-1]
-        if not fresh:              # the design rulings: a stale target is acted on where it was last known, and said
+        if not fresh:              # a stale target is acted on where it was last known, and said
             why = (entry.get("data") or {}).get("stale_why")
             stale = {"what": f"{target!r} is only known from before something moved" + (f" ({why})" if why else ""),
                      "acted": "went to where it was last known, the contact stop armed",

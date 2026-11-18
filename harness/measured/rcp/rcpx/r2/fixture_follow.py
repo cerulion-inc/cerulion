@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The follow of package fixture (SPEC-R4 B5 phases 3 to 5, A4.5): one stream along the part's own path.
+"""The follow of package fixture: one stream along the part's own path.
 
 A held or pushed part is first loaded by ONE continuous force ramp along the candidate direction (no steps, no force
 threshold): the command leads the tip by the force asked over the servo's own stiffness, from the first force
@@ -21,7 +21,7 @@ on by more than the tip resolves: the peak a stop makes at the end of a stroke s
 A turn about the tool axis is the same law in N m about that axis; along that axis the hand keeps the height
 its hold was taken at: the drift of a long turn is taken out inside the turn, not pressed into the part, and ends
 the stroke only where the part would leave the pads. Motion between places is one planned stream (B.plan_legs)
-through the core's ex._stream. Periods are the executor's own; strikes: rcpx/r2/fixture_strike.py (C12). SI inside.
+through the core's ex._stream. Periods are the executor's own; strikes: rcpx/r2/fixture_strike.py. SI inside.
 """
 
 import math
@@ -75,7 +75,7 @@ def begin(ex, name):
 
 def end(ex, did, item=None, free_share=None):
     """The phase ends: what it did, its seconds, its control periods by the executor's own counters, its binding
-    bound and the worst strike of the motions it ran (C12)."""
+    bound and the worst strike of the motions it ran."""
     rec = ex._fx["phases"][-1]
     rec["did"] = did
     rec["seconds"] = round(float(ex._sense().t) - rec.pop("_t0"), 3)
@@ -223,7 +223,7 @@ def follow(ex, part, cand, d0, until, intent, fs, known_m=None, hold_r=None, pla
             got = float((pts[-1] - pts[-min(len(pts), int(QUANT) + 1)]) @ d)
             suspect = moving_n >= QUANT and got < REL * sum(expected[-int(QUANT):])
             v_cmd = 0.0 if f_now > C else min(v_goal, v + B.a_brake(s.q, d) * dt)
-            # the servo's own lag is what this follow shows of it (refit upward at once, Q7): the lead the tip
+            # the servo's own lag is what this follow shows of it (refit upward at once): the lead the tip
             # really ran with, less what the force explains, over its measured speed
             if not suspect and v_meas > 0 and moving_n >= QUANT:
                 lag_s = max(lag_s, (max(0.0, ahead) - f_now / k) / v_meas)
@@ -394,7 +394,7 @@ def turn(ex, part, cand, sense_sign, until, intent, clear_rad=None):
     max_n = (intent or {}).get("max_n") or (((ex._fx.get("limit") or {}).get("limit_n")) if (intent or {}).get("gentle") else None)
     if max_n is not None:       # a force stated for the part (max_n, gentle): at the jaws' radius this torque about the axis
         c_nm = min(c_nm, float(max_n) * (H.jaw_read(ex)[0] or ex._fx_jaws.max_m) / laws.TWO)
-    # under a stated force the turn HOLDS what one pad can put on the part to it (the design rulings: kept at the solved speed).
+    # under a stated force the turn HOLDS what one pad can put on the part to it (kept at the solved speed).
     # What a pad bears as the hand reads it is P.pad_load (its squeeze, its share of the couple about the hand's
     # axis, the whole force the hand reads); a stop of the turning pads adds the stop slope across the axis times
     # their speed. So the pads turn no faster than leaves that sum at the stated force (never under the speed
@@ -465,7 +465,7 @@ def turn(ex, part, cand, sense_sign, until, intent, clear_rad=None):
                 v_tell = laws.tell_speed(B.rigid(s.q, side, B.f_thr(0, 0)), B.t_det(), B.a_brake(s.q, side))
                 if v_tell is not None and w_lim * radius < v_tell:
                     # no speed this arm can tell a stop at keeps it: your own word then runs at that slowest
-                    # speed and is said not kept, never refused and never crept under it (the design rulings, C3)
+                    # speed and is said not kept, never refused and never crept under it
                     w_lim, floor_n = v_tell / radius, floor_n + 1
                 if w_lim < w_goal:
                     w_goal, held_share = w_lim, held_share + 1.0 - w_lim / w_goal     # what the word costs (fixture_cost)
@@ -589,7 +589,7 @@ def turn_sense(ex, part, cand, intent, room, retake):
                                             "round it, and the hold was taken again"))
         if not came and not retake():
             # what was measured: the hand turned, part of it under a torque, turned back, and the hold was not
-            # found again. Whether the part turned is not shown by that (the design rulings rule 2: an absence is no
+            # found again. Whether the part turned is not shown by that (an absence is no
             # conclusion; on two development cells the part stood turned by truth where this said it did not turn)
             unsure = (f"clockwise the hand turned {math.degrees(first['angle_rad']):.0f} deg and stood, "
                       f"{math.degrees(first['loaded_rad']):.0f} deg of it under a torque about its axis (the largest "

@@ -2,12 +2,12 @@
 """The approach of a press, its rounds and what it states after its stop.
 
 A press that starts off the part has an arrival like a touch. Its approach ends at the force the press's ramp begins
-with: force_n when the call states one (then it is also the bound of the push, the design rulings), else the ramp's own first
+with: force_n when the call states one (then it is also the bound of the push), else the ramp's own first
 force (the least force this arm tells on two readings). The approach runs at the body's own speed only through space
 known free (rcpx/bounds_free.py: a look, the arm's own passage, the site) and, from the first band where a contact
 can begin (the stated support's band among them), at the speed solved for that force: the ramp's first force as an
-ending force, never under the tell speed (B.arrival, C9); a stated force_n as the bound of the push, kept at its
-solved speed also under the tell speed (the design rulings: an approach met faster strikes the part over force_n, and the stroke
+ending force, never under the tell speed (B.arrival); a stated force_n as the bound of the push, kept at its
+solved speed also under the tell speed (an approach met faster strikes the part over force_n, and the stroke
 then stops on its force before the part has moved). With no way known free the whole travel is the arrival
 stretch, priced in the receipt's band block. max_n, gentle, a sheet, the site and a rating stay limits beside it.
 
@@ -94,7 +94,7 @@ def limit_keys(arr, peak_n, strike_n=None):
 
 
 def ran(B, legs, peak_total_n):
-    """strike.ran of a press (C2, the design rulings ii): {"v_m_s": the measured tip speed along the push where the part was
+    """strike.ran of a press: {"v_m_s": the measured tip speed along the push where the part was
     met, "peak_n": the figure (None when the arrival's share is unresolved), "arrive_n", "read_n", "pushed_n",
     "end_stop_n", "note"}; None when nothing resisted."""
     first = next((lg for lg in legs if lg.get("t_resist") is not None), None)

@@ -5,8 +5,7 @@ Pre hook (touch, press): pops expect_cue and cue_watch_s, attributes the act to 
 refuses a press whose model prediction, scaled by earlier measured contact times, would pass the entry's long_press_s (nothing moves), and reads the
 device's cue before the act (not for a call the executor will refuse on its arguments). Tick hook: records force and
 travel along the push each control period, so contact time and the travel under load are measured, and returns
-"long_press" as the contact nears long_press_s (the motion loops honour it once the core lane's C6 lands; until then
-the press runs on and the result says so). Post hook: outcome_class (ran_free_beyond_tip | touched_no_give | gave |
+"long_press" as the contact nears long_press_s (where the motion loops do not honour it, the press runs on and the result says so). Post hook: outcome_class (ran_free_beyond_tip | touched_no_give | gave |
 moved_under_load | slid_off, defined in OUTCOME_CLASSES), same_as (earlier acts this epoch within the two contacts' combined uncertainty with the same class), and on a device with a located cue: the
 cue after the act and device_outcome (expected | other_transition | no_change | unobservable | unpowered_suspected);
 two no-change acts with contact confirmed while the cue stays dark add the power hint. A cue that goes lit -> dark at
@@ -30,7 +29,7 @@ PKG = "device"
 RAN_FREE_FRAC = 0.25     # a press whose peak stays under this share of force_n met nothing
 LOADED_FRAC = 0.2        # travel under load counts from the first period over this share of force_n
 POWER_HINT = ("the cue the robot watches stayed dark through this act and the one before it, both with contact: "
-              "that is all the robot read")   # the design rulings: a reading, no advice to stop or check
+              "that is all the robot read")   # a reading, no advice to stop or check
 # Loading a face slows under force; a ramp alone is not a measured contact-time bound.
 # The largest measured/predicted ratio of earlier presses scales this session's prediction.
 def new_state():
@@ -211,7 +210,7 @@ def refused_by_arguments(ex, name, kwargs, s, d):
         force = float(kwargs["force_n"])
     except (KeyError, TypeError, ValueError):
         return "force_n is not a number"
-    rated = derived.of(ex).f_tool()      # None: no contact rating is stated for the tool (r6 C1)
+    rated = derived.of(ex).f_tool()      # None: no contact rating is stated for the tool
     if force > min(v for v in (derived.of(ex).f_cap(s.q, d) * (1 - derived.of(ex).e_tau()), rated) if v is not None):
         return "force_n is over what the tip can push here"
     give = getattr(ex, "base_give", None)

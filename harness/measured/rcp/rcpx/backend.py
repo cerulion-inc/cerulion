@@ -6,7 +6,7 @@ SI inside. read() returns numpy arrays; nothing here is ground truth about the w
 what its wrist camera sees. Scoring-only facts live on the simulated backend (MujocoBackend.truth) and never pass
 through this interface.
 
-What a backend states about itself (SPEC-R4 A8.4):
+What a backend states about itself:
 - dt_s: the measured period of its control loop, s. There is no default: a backend that states none raises on the
   read, and a session cannot open on it. dt is the older spelling of the same number (a backend may set either).
 - is_hardware: False on a simulator. On hardware the robot measures itself only when its owner asked for that.

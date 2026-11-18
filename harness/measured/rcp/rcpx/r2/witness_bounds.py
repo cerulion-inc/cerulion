@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What package witness takes from the session's derived bounds (SPEC-R4 A4, A8): the camera's own joint move, how
+"""What package witness takes from the session's derived bounds: the camera's own joint move, how
 long a settle may last, the camera's own noise, the round three limits as the session derives them, and the bounds
 block of a result. No limit is typed here: every value is the session's (rcpx.bounds.of(ex)), a ratio of
 rcpx.bounds_ratios, or a round three limit read through r3_limits' lower case function of the same name (the one
-typed number is OLD_CORE_SHARE, read only on the core before round four). A package never imports another package
-(SPEC-R2 1.2), so the few lines package sight has of the same kind are repeated here.
+typed number is OLD_CORE_SHARE, read only on the core before round four). A package never imports another package, so
+the few lines package sight has of the same kind are repeated here.
 
-TRANSITION (the core and r3_limits are rebuilt beside this package; the Review stage removes these three branches):
-- look_move calls ex._joint_move(q, None, kind="look", intent=...) (SPEC-R4 A8.2: speed None is the derived full
+TRANSITION (the core and r3_limits are rebuilt beside this package):
+- look_move calls ex._joint_move(q, None, kind="look", intent=...) (speed None is the derived full
   speed, the contact stop armed; a share under 1 is the caller's own lower speed). A core that does not take kind
   yet is called exactly the way it was called before round four (the share OLD_CORE_SHARE of its own speed setting,
   guarded), so nothing changes on that core until the core of A8.2 lands.
@@ -81,7 +81,7 @@ def view_tol(ex, q):
 
 
 def clear_word(clear):
-    """(intent, why): the operator's word of a tool call as the intent its moves take (SPEC-R4 A6: clear is true, or
+    """(intent, why): the operator's word of a tool call as the intent its moves take (clear is true, or
     {"look": id}); why is the text of a refusal when clear is anything else."""
     if clear is None or clear is False:
         return None, None
@@ -107,7 +107,7 @@ def look_move(ex, q, intent=None, share=None):
 
 def line_rate(ex, q_from, q_to):
     """The share of the straight joint line from q_from to q_to the core runs per second at full speed (1/s). The
-    core of SPEC-R4 A8.2 runs every joint at most at its own rated or measured speed: the least qd_max[j] /
+    motion core runs every joint at most at its own rated or measured speed: the least qd_max[j] /
     abs(dq[j]) over the joints that move. A core that does not take kind yet runs its own plan: the rate is the
     largest step of that plan (TRANSITION, module text)."""
     q_from, q_to = np.asarray(q_from, dtype=float), np.asarray(q_to, dtype=float)
@@ -135,7 +135,7 @@ def tip_speed(ex, q_from, q_to, share=None):
 
 def gate(ex, q, share=None):
     """(refusal or None, share): the gates of the runtime's own joint move to q, asked the way an operator's
-    move_joints is (SPEC-R3 3.8), with the tip speed the move will run at stated in the call (speed_mm_s), so a path
+    move_joints is, with the tip speed the move will run at stated in the call (speed_mm_s), so a path
     gate that derives its clearance from the speed judges this move's own. A gate whose refusal states the speed it
     judged is asked again at half that speed, down to REL x REL of full speed; the move then runs at the share that
     passed. Any other refusal is returned at once."""
@@ -170,7 +170,7 @@ def binding(move):
 
 
 def report(ex, out, moves, t0, detail="brief"):
-    """out with periods (control periods since t0) and, when a move reported one, bounds (SPEC-R4 A5): the binding
+    """out with periods (control periods since t0) and, when a move reported one, bounds: the binding
     bounds of the tool's own moves through the session's report."""
     out["periods"] = periods(ex, t0)
     items = [i for i in (binding(m) for m in moves) if i is not None]
@@ -218,7 +218,7 @@ def settle_step_s(ex):
 
 
 def settle_bound_s(ex):
-    """The world seconds a settle is planned to take, with the margin every call's time carries (SPEC-R4 A4.8):
+    """The world seconds a settle is planned to take, with the margin every call's time carries:
     r3_limits.settle_max_s(B) when it exists, else the arm's own measured settle time through limit_s; 0 when the
     robot has not measured one."""
     B = bounds.of(ex)

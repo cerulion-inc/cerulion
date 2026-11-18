@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""I20 obstacles: everything known is a volume, and a contact says which part touched.
+"""Obstacles: everything known is a volume, and a contact says which part touched.
 
 robot://world gains "obstacles": every contact point (a ball of the contact error plus the touching surface half size; when the side the touching point came from is
 known, the half of it behind the touched surface, so leaving the way it came is free and going through is not),
@@ -215,7 +215,7 @@ class _State(PathMixin, WorldMixin):
         return {"shape": "sphere", "c": shape["c"], "R": derived.uncertainty_m(B, entry)}
 
     def shown_gone(self, B, pairs):
-        """The touched contacts of the list that are measured no longer (the design rulings: only what is measured refuses): a
+        """The touched contacts of the list that are measured no longer (only what is measured refuses): a
         look of the scene as it stands (taken after the last act that changed the scene, so after the touch)
         shows the touched point, with its own error, free by more than the look's stated error: the thing that
         was touched there has moved. Indices into pairs."""
@@ -425,7 +425,7 @@ class _State(PathMixin, WorldMixin):
         """Write the part and its point into the world contact entry (a cap stop gets one)."""
         world = self.ex.world
         c = result.get("contact") if isinstance(result.get("contact"), dict) else {}
-        if c.get("on"):     # round six (C8): a contact made while holding is kept on the hold, never in the world
+        if c.get("on"):     # a contact made while holding is kept on the hold, never in the world
             return None
         eid = c.get("id") or result.get("id")
         data = {"touched_by": tb["part"], "touched_by_kind": tb["kind"], "touched_by_ambiguous": tb["ambiguous"]}

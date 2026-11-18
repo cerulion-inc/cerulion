@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""choose (package eyes; SPEC-R5 4.1, 4.7): pick a numbered candidate, or the operator's own pixel in a look, and
-the robot finds where it is in space and stores it as a located entry (SPEC-R3 3.2).
+"""choose (package eyes): pick a numbered candidate, or the operator's own pixel in a look, and
+the robot finds where it is in space and stores it as a located entry.
 
 choose(n=None, part=None, look=None, px=None, depth="auto", detail="brief")
 - n: a number of the newest list (or of the list of look). A list that went stale with the scene is refused
@@ -13,7 +13,7 @@ choose(n=None, part=None, look=None, px=None, depth="auto", detail="brief")
   located entry gains data.candidate "eyes:LOOK:N" and data.outline_px (an id a survey gave it moves to
   data.survey_candidate). depth auto goes on to a touch only when locate is absent or answered ray_only AND no
   whole-step tool (push, act_on) is loaded that would feel along the line itself.
-- depth touch is a contact the robot makes on its own and obeys SPEC-R5 4.7:
+- depth touch is a contact the robot makes on its own and obeys the robot's own rules:
   the line of sight from a standoff (the point of the line nearest the camera that reach_check accepts) to where
   it meets the table (or leaves the arm's reach) plus 10 mm is tested BEFORE anything moves by the guard the
   assist package serves (ex.state["assist"]["guard"] keep_off); with no guard and a part the manual forbids:
@@ -30,7 +30,7 @@ choose(n=None, part=None, look=None, px=None, depth="auto", detail="brief")
   seconds and journaled as r3_leg {by: "runtime", tool: "choose"}.
   No force is typed here: the touch uses cfg touch_force_n, as an operator's touch with no force does.
 
-Result (SPEC-R5 4.1): said, stopped (a touch), located, point_mm, uncertain_mm, depth, chosen {n, look},
+Result: said, stopped (a touch), located, point_mm, uncertain_mm, depth, chosen {n, look},
 part_check, identity, legs, end, notes, pictures, next. next is a whole-step call only when the guard's target_ok
 passes for the new entry; with a part_check warning it is a routine over the other candidates (or the list again);
 else a touch. Nothing here reads simulator ground truth or names a robot or a device.
@@ -181,7 +181,7 @@ def _routine_next(ex, st, key):
 
 
 def _next(ex, st, eid, warning, touched, key, n, u, v, part):
-    """SPEC-R5 4.1: a whole step only on an entry the guard's target_ok passes; a routine after a warning; else a
+    """A whole step only on an entry the guard's target_ok passes; a routine after a warning; else a
     touch (after a touch that ran, whatever it met: a look, never the same touch again)."""
     if warning:
         return _routine_next(ex, st, key)
@@ -200,7 +200,7 @@ def _next(ex, st, eid, warning, touched, key, n, u, v, part):
             return E.ready(ex, "push", {"target": eid})
         if E._has(ex, "act_on") and E._has(ex, "lift"):
             return E.ready(ex, "act_on", {"on": eid, "verb": "lift"})
-        # no whole step is loaded here (integrator, 2026-11-12): the next is the operator's own first move onto
+        # no whole step is loaded here: the next is the operator's own first move onto
         # the touched point. A move to a standoff, no contact, no force; the direction is left to the operator.
         if e is not None and e.get("point_mm") is not None and E._has(ex, "approach"):
             return E.ready(ex, "approach", {"target": eid}, E.along_needs(ex, e.get("label")))
@@ -460,7 +460,7 @@ def _touch_said(t, what, eid, label, at_table):
 
 # ---------------------------------------------------------------- the located entry
 def _ray_entry(ex, key, rec, u, v, label):
-    """A located entry with the line of sight alone (SPEC-R3 3.2, depth ray_only), when locate is not loaded."""
+    """A located entry with the line of sight alone (depth ray_only), when locate is not loaded."""
     o, d = ex.model.pixel_ray(np.asarray(rec["q"], dtype=float), u, v)
     data = {"uncertain_mm": None, "depth": "ray_only", "ray": {"origin_mm": _mm(o), "dir": [round(float(x), 4)
                                                                                        for x in d]},

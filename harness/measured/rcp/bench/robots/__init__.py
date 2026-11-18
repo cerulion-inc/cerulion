@@ -33,7 +33,7 @@ from .panda import SPEC as PANDA
 from .so100 import SPEC as SO100
 from .ur5e import SPEC as UR5E
 
-DERIVED_ROBOTS = ("gen3", "koch")  # specs bench.robots_extra derives from the model file (EXTENSIONS.md)
+DERIVED_ROBOTS = ("gen3", "koch")  # specs bench.robots_extra derives from the model file
 
 
 class _Registry(dict):

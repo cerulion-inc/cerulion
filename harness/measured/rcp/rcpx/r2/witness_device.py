@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a same-view reading means (the witness package, SPEC-R3.md 4.4): the device's own move as a first-class
+"""What a same-view reading means (the witness package): the device's own move as a first-class
 answer, one reading every consumer can act on, and the fork a compare offers after a change.
 
 A part of a device reads one of four ways, and no consumer has to guess between them:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What locate decides from its views and from the sheet (package sight, I37; SPEC-R3 4.5 steps 7 and 15), apart from
+"""What locate decides from its views and from the sheet (package sight), apart from
 the moves themselves (rcpx/r2/sight_locate.py):
 
     find(geo, Fk, camk, matches)          one extra view's match: the clear peak, a wider patch, or a weak or
@@ -161,7 +161,7 @@ def identity(part, parts, colour, pc_text):
 
 
 def next_call(ex, part, entry_id, parts, d, ident=None):
-    """(next, why not): next (SPEC-R3 3.1) is push {target} or lift {target} only when the part is a control part,
+    """(next, why not): next is push {target} or lift {target} only when the part is a control part,
     its do line's verbs hold that verb (sheet_words.do_line with the tools listed here), and the spot's identity is
     verified (identity). Otherwise None with the reason: sight never offers an act on a cue, fixed or forbidden
     part, on a part whose do line names no such act, or on a spot it cannot tell from a forbidden part."""

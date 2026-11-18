@@ -1,10 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Taking hold and letting go of package fixture (round six, the design notes package PLACE stage C; contracts
-C3, C8, C9): phases 2 and 5 of work_part (rcpx/r2/fixture.py).
+"""Taking hold and letting go of package fixture: phases 2 and 5 of work_part (rcpx/r2/fixture.py).
 
-- _fx_limit: the limit somebody stated on a contact with the part (C3). A limit stated on the call binds every
+- _fx_limit: the limit somebody stated on a contact with the part. A limit stated on the call binds every
   leg of it, free or expected: every stream of a call carries the call's own intent, the stated
-  force in it (round six first took it out of the legs through free space; a free leg then struck a drawer with
+  force in it (a build that took it out of the legs through free space struck a drawer on a free leg with
   261 N under max_n 20).
 - _fx_close: the core's one close where the hand stands, the hold on a part of something fixed; under a stated
   limit each pad presses its share of it.
@@ -12,11 +11,11 @@ C3, C8, C9): phases 2 and 5 of work_part (rcpx/r2/fixture.py).
   measured band and of what the newest look shows (rcpx/r2/fixture_look.py under), a hand that pushes with a
   straight run in; where none is clear, the straight joint way.
 - _fx_take: ONE stream to the pose before the part and on to the hold pose, its last leg an expected contact
-  with whatever lies ahead (C9: a free line, no ending force); the jaws close where it stopped. Where it stopped
+  with whatever lies ahead (a free line, no ending force); the jaws close where it stopped. Where it stopped
   short of the pose and the jaws tell nothing between them, they open again and the hand goes on to the pose
   under the guard from where it stands, once. What the way in met is named against the part's own region.
 - _fx_let_go: the release and the way back to the pose before the part: a leave of the contact the hand stood in
- where this call's own records show the hand on the part (_fx_stand writes the core's stand record, C10,
+ where this call's own records show the hand on the part (_fx_stand writes the core's stand record,
   only then, with the reading as it is); a sheet, max_n or gentle stated for the part stands over it.
   Where the bounds refuse the way back to that pose, the leave alone runs (the lift along the hand's own axis);
   where they refuse that too, the hand stands where it is. What ran is what the phase and the receipt say ("did",
@@ -133,7 +132,7 @@ def _route_to(ex, choice, q_end, p_end):
 
 class TakeMixin:
     def _fx_limit(self, part, intent):
-        """The limit somebody stated on a contact with this part (C3), or limit_n None."""
+        """The limit somebody stated on a contact with this part, or limit_n None."""
         ref = part["owner"] if part["owner"] is not None else part["ref"]
         return H.bounds_of(self).stated_limit(ref if isinstance(ref, str) else None, intent or None, expected=True)
 
@@ -152,7 +151,7 @@ class TakeMixin:
                                limit_source=limit.get("source") if bound is not None else None, kind="attached")
         if "refused" in c:
             return c, None
-        S.note_close(self, c, pads)                      # what the close states is the phase's own (C8, C12)
+        S.note_close(self, c, pads)                      # what the close states is the phase's own
         if bound is not None:                            # the close's own arrival under the limit is not priced here
             self._fx.setdefault("cost", []).append({"where": "the close of the jaws", "periods": None, "ran": c.get("periods")})
         sq = c.get("squeeze_n")
@@ -167,8 +166,8 @@ class TakeMixin:
 
     def _fx_take(self, part, choice, intent):
         """The take_hold phase for one choice: the jaws go to the way-in opening while the hand moves; ONE stream to the pose
-        before the part and on to the hold pose, its last leg an expected contact with the part (C9) that only a
-        stated limit bounds (C3); the jaws close where it stopped, through the core, the hold on a part of
+        before the part and on to the hold pose, its last leg an expected contact with the part that only a
+        stated limit bounds; the jaws close where it stopped, through the core, the hold on a part of
         something fixed. Where the last leg stopped short of the pose and the jaws tell nothing between them
         there, they open again and the hand goes on to the pose under the guard, once, before the pose is given
         up. The way to the pose before the part is the first of routes_in whose plan the bounds do
@@ -187,15 +186,15 @@ class TakeMixin:
         limit = self._fx_limit(part, intent)
         bound = limit.get("limit_n")
         # what this call states as a limit, with the part it resolved: a move that later leaves the contact this
-        # take makes keeps that limit until the contact has ended (the core reads it: control_tail.stand_limit,
-        # the design rulings). What shows the hand ON the part is noted as the take finds it (_fx["bore"])
+        # take makes keeps that limit until the contact has ended (the core reads it: control_tail.stand_limit).
+        # What shows the hand ON the part is noted as the take finds it (_fx["bore"])
         self._fx["bore"] = None
         self._meant = {"call": getattr(self, "_calls", None), "thing": ref,
                        "words": {k: v for k, v in (intent or {}).items() if k in ("max_n", "gentle") and v}}
         if bound is not None and not self._fx.get("limit"):
             self._fx["limit"] = {"limit_n": float(bound), "source": limit.get("source"), "read": {}, "passed": [],
                                  "not_shown": []}
-        # the last leg in is a free line to its pose (C9, the design rulings: no ending force, no slow arrival; the guard ends
+        # the last leg in is a free line to its pose (no ending force, no slow arrival; the guard ends
         # it and only a stated limit bounds it). Its expected contact is whatever lies ahead on the leg: until a look
         # shows the part's own extent, a contact on the part's own body some way from the pointed point is the
         # part, not a thing in the way (stored as one, it ranked away the pose that takes the part: measured on
@@ -320,7 +319,7 @@ class TakeMixin:
         (_fx_unwind) and, ONLY where this call's own records show the hand on the part (_fx["bore"]: the pads
         press it, the way in ended on it, a stroke read a force over what the still arm tells), write the record
         of the contact the hand stands in: ex._stand = {"tip", "F", "call"}, the same record every guard of the
-        core writes (C10), so that the core's leave runs. F is the hand's reading along `into` (the unit
+        core writes, so that the core's leave runs. F is the hand's reading along `into` (the unit
         direction from the hand to the part: the way it came in, or the stroke) as it is; a reading that does
         not point that way is recorded as no push (the record then names no direction: the core prices the move
         as a leave, never as a press). Where nothing shows the hand on anything, nothing is written: a hand in
@@ -376,7 +375,7 @@ class TakeMixin:
         back = (J.finger_len_m or J.max_m) if J is not None else B.robot.w_tool()
         back += B.standoff(0, part["thing"], s.q, -a)
         # the hand leaves the hold or the part it stood on: the core's guard is told so by the record
-        # every guard writes where the tool last bore on something (ex._stand, C10), written here only where this
+        # every guard writes where the tool last bore on something (ex._stand), written here only where this
         # call's own records show the hand on the part (_fx_stand). What the part puts on the tool as the hand
         # backs off then ends no move (a hand that a long turn left pressed on its part read 58 N in the first
         # period of its way back and stood); a push that keeps growing does, and so does one over a limit
@@ -400,7 +399,7 @@ class TakeMixin:
             if got["stopped"] == "refused":
                 # the way home is refused: the leave alone runs, so that the hand does not stay on the part it
                 # stood on (a [lift, home] refused path_plane left a finger on a device's stop button, 7.5 N
-                # under max_n 5; the design rulings)
+                # under max_n 5)
                 home_refused = _refused_text(got)
                 got = F.stream(self, legs, intent)
         else:

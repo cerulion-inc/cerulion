@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The carry profile (SPEC-R3.md 4.6): what a weak model is served. Opt-in ("all,carry"; naming carry also loads
+"""The carry profile: what a weak model is served. Opt-in ("all,carry"; naming carry also loads
 lean, rcpx/r2/core.py IMPLIES). It adds no tool and moves nothing: it decides what is declared, how each declared
 tool is described, what the practices say and what each part's do line is, all from the tools the session has.
 
@@ -17,9 +17,9 @@ tool is described, what the practices say and what each part's do line is, all f
   line that still asks for a tool the session does not reach (D4 and D6 say "locate" whatever is loaded) is made
   again without push and lift, so it falls to the sheet's own words through use, and says not_reached [names]. The
   document is copied first: the context's own document is never changed.
-- LEAN_PROFILE and lean_profile(ex, surface): the profile lean serves (C1).
+- LEAN_PROFILE and lean_profile(ex, surface): the profile lean serves.
 
-PART B (core lane C1, rcpx/r2/lean.py) must call, for a loaded package that exports LEAN_PROFILE:
+PART B (the core, rcpx/r2/lean.py) must call, for a loaded package that exports LEAN_PROFILE:
 
     prof = mod.LEAN_PROFILE
     if callable(prof.get("resolve")):
@@ -33,7 +33,7 @@ PART B (core lane C1, rcpx/r2/lean.py) must call, for a loaded package that expo
     #   keep, never [keys]: extra lean_cut KEEP and NEVER keys
     #   free      [tool names]: answered without charging a call (calls_left unchanged)
 
-surface is the merged surface lean's FILTER receives (carry's FILTER has run on it). Without C1 nothing of the
+surface is the merged surface lean's FILTER receives (carry's FILTER has run on it). Without that call nothing of the
 profile reaches the session: lean declares by its own FLAGS table, and robot://practices is lean's.
 """
 
@@ -137,7 +137,7 @@ def _noise_n(ex):
 
 
 def do_lines(ex, doc, session=None, tools=None):
-    """A copy of the robot://devices document with each part's do line; the document when it has no parts (D8)."""
+    """A copy of the robot://devices document with each part's do line; the document when it has no parts."""
     if not isinstance(doc, dict) or not isinstance(doc.get("devices"), list):
         return doc
     out = copy.deepcopy(doc)
@@ -214,7 +214,7 @@ def _lift_gate(ex):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# the profile lean serves (C1)
+# the profile lean serves
 
 
 def practices_text(ex=None, session=None, tools=None):
@@ -325,7 +325,7 @@ def _takes_bounds(fn):
 def _f0(ex, part, noise):
     """The first force a do line offers for the part (N). r3_limits.force_spec(B, "press", thing, q, u,
     sheet_forces=...)["first_n"] once it exists (the session's derived first force); until then r3_limits.f0 with
-    the arguments it takes today (the Review stage removes that branch)."""
+    the arguments it takes today."""
     spec = getattr(r3_limits, "force_spec", None)
     if callable(spec) and _takes_bounds(spec):
         return float(spec(bounds.of(ex), "press", part.get("name"), None, None, sheet_forces=part["forces"])["first_n"])

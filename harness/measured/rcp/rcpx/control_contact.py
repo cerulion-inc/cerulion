@@ -4,8 +4,8 @@ measure_base_give and what follows a stroke (ease, back-off, retrace) are in con
 control_basecheck.py. No speed, force, travel or time here is typed: each comes from the bounds (rcpx/bounds.py).
 
 A stroke runs along a line and means its contact (an expected contact, control_expect.py). It runs at the body's
-speed only through space known free and at the speed solved for the force it ends at from its band on (C15 2 a;
-a touch: force_n, else the hand's own weight; the approach of a press: force_n, else the ramp's first force,
+speed only through space known free and at the speed solved for the force it ends at from its band on
+(a touch: force_n, else the hand's own weight; the approach of a press: force_n, else the ramp's first force,
 control_move_press.py); a limit somebody stated (max_n, a sheet, the site, a rating: B.stated_limit) is kept at
 the speed B.arrival gives it. A touch ends on the first reading over the contact threshold of the speed it then
 has. Where the part first resists a press sets its command back onto the measured pose and from there the stroke
@@ -15,12 +15,12 @@ a rigid part is loaded as the ramp says, and a part that slides (its stiffness r
 give does not explain) is followed under the bound of what its end stop could take. A part that slides can run into
 its end stop, and a stop makes the force on the part plus the stop slope times the speed: the command never runs
 faster than keeps that at or under the force asked and what the arm can push (its guard's cap), never
-slower than the slowest speed at which this arm resolves a stop (C3: a limit under what the arm can tell is acted
+slower than the slowest speed at which this arm resolves a stop (a limit under what the arm can tell is acted
 on at that speed and not shown kept); max_n, a sheet or the site bound it further. That pace holds the whole stroke
 once the part moved, and a dip of the readings is no new arrival (control_move_press). The result states the
 fastest speed the part ran and the largest strike an end stop could have taken (limit_kept false when a reading or
-that strike passed the limit). Before it starts a stroke counts its plan's control periods as it will run (C12:
-the schedule at the arrival speed, ramp, hold, settle, ease, the wait for the hand to stand) and is refused budget
+that strike passed the limit). Before it starts a stroke counts its plan's control periods as it will run (the schedule
+at the arrival speed, ramp, hold, settle, ease, the wait for the hand to stand) and is refused budget
 when more are needed than are left. The stops read the tip's own motion: the part MOVED once the tip went on past
 what the arm's own give explains (B.rigid at that force); a GIVE is the force under GIVE of its peak while the tip
 goes on that far; OFF AXIS is the tip leaving its line by the tool's own half width (slipped: the force gone as
@@ -66,7 +66,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
         periods than are left, comes back with stop "refused" and the refusal under "refused". count: nothing
         moves; {"stop": "count", "periods": the plan's control periods, "hint"}. band (control_move_band.of_stroke):
         the stroke runs at the body's own speed up to the travel from which a contact can begin and at `speed`
-        from there on (C15); none: the whole free travel at `speed`."""
+        from there on; none: the whole free travel at `speed`."""
         B = bounds.of(self)
         dt, t_det, t_set = B.dt(), B.t_det(), B.t_settle()
         speed = None if speed is None or not float(speed) > 0.0 else float(speed)
@@ -81,7 +81,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
             whole = verdict == "goal"
         self._travel_direction, self._period_kind = d, "moving"
         kind = "touch" if feel else "press"
-        edge = float((band or {}).get("from_m") or 0.0)   # the travel from which a contact can begin (C15)
+        edge = float((band or {}).get("from_m") or 0.0)   # the travel from which a contact can begin
         line, expect = control_move_band.split(self, B, q_des, line, p_cmd0, d, edge, intent, kind, thing)
         plan = B.plan(q_des, list(line), kind, target=thing, intent={**intent, "expect": "contact"}, expect=expect)
         if plan.refused:
@@ -110,7 +110,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
         planned = len(sched) * dt + t_set
         if not feel:
             planned += ramp_seconds(ramp.rate_n_s, ramp.first_n, top, dt) + travel / v_top + (hold_s or t_set)
-        n_plan = control_tail.stroke_count(planned, dt)   # the budget count: the plan as it will run (C12)
+        n_plan = control_tail.stroke_count(planned, dt)   # the budget count: the plan as it will run
         if count:
             return {"stop": "count", "periods": n_plan, "hint": self._stroke_hint(sched, n_plan), "sched": sched}
         over = self._budget(n_plan, self._stroke_hint(sched, n_plan))
@@ -147,7 +147,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
                 v_cmd = max(0.0, nxt - c) / dt
                 c = min(lead_cap, max(c, nxt))
             elif not (stop_on_force and reached):
-                # the stroke is led by force (C9): the target gains what the ramp gives at its own force per
+                # the stroke is led by force: the target gains what the ramp gives at its own force per
                 # second from the force there (held over two readings), up to the ceiling; the command closes the
                 # gap between that target and the READING in one detection time and never leads the measured tip
                 # by more than the force asked over the servo's own stiffness. A part that slides is followed as
@@ -189,7 +189,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
             resists = s.Fmag > f_res
             v_now = max(0.0, float((self.model.jac(s.q)[:3] @ s.qd) @ d))   # the measured tip speed along d
             if resists:
-                self._scene_touch(s)   # a load over the threshold: the scene may have changed (C10)
+                self._scene_touch(s)   # a load over the threshold: the scene may have changed
                 impulse += s.Fmag * dt
                 if n_free is None:   # the first resisting reading: where, when, how fast the command came in and
                     n_free, t_resist, v_hit, first_resist = len(done) - 1, s.t, v_cmd, tr   # the tip MET it
@@ -312,7 +312,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
     # ------------------------------------------------------------------ touch
     @primitive
     def touch(self, direction, max_mm, frame="base", force_n=None, detail=False, clear=None, max_n=None):
-        """A touch for depth (C9): an expected contact with whatever lies ahead on the line. A limit (max_n on the
+        """A touch for depth: an expected contact with whatever lies ahead on the line. A limit (max_n on the
         call, a sheet of a named thing, a give, the site, a rating) is kept: the stroke arrives at the speed
         solved for it, also under the speed at which this arm can tell a contact. force_n is the force at
         which the touch ends, not a bound on the way in; with none stated it is the hand's own weight
@@ -337,7 +337,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
         if s.Fmag > at_rest:
             return {**refusal("pressing", f"the tip already feels {s.Fmag:.2f} N, over the {at_rest:.2f} N contact "
                               "threshold at rest", "retreat or move away from the surface, then touch"), **no}
-        hand = float(B.f_hand())                     # the design rulings: with no number a touch ends at the hand's own weight
+        hand = float(B.f_hand())                     # with no number a touch ends at the hand's own weight
         own = {**self._stated(ends_n=hand, max_n=max_n, clear=clear), "ends_default": True}
         intent = own if force_n is None else self._stated(ends_n=force_n, max_n=max_n, clear=clear)
         v_own = None if force_n is None else self._arrival(B, s.q, d, own)["v"]   # what the stated number cost
@@ -361,7 +361,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
         if pstop != "goal":   # the line leaves the arm's reach: feel as far as the plan goes
             reach = float((self.model.fk_tip(path[-1])[0] - told.tip) @ d) if path else 0.0
         thing = self._ahead(B, told.tip, d, reach) if reach > 0.0 else None
-        band = self._band_of(B, told, d, reach, thing)   # where a contact can begin (C15, the design rulings)
+        band = self._band_of(B, told, d, reach, thing)   # where a contact can begin
         kw = {"speed": arr["v"], "feel": True, "hold": hold, "thing": thing, "intent": intent, "band": band}
         waited, bad = self._wait_counted(told, d, reach, None, line=path, **kw)   # the budget, then the wait
         if bad is not None:
@@ -401,7 +401,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
         v_ran = float((info or {}).get("speed_m_s") or r["v_hit"] or 0.0)
         keys = self._move_keys(plan, periods, (), {"_ran": info["ran"]} if info else None)
         keys.pop("bounds", None)
-        if "predicted_peak_n" not in keys and r["z_end"] is not None:      # r6 shim: round four's own figure
+        if "predicted_peak_n" not in keys and r["z_end"] is not None:      # compat shim: round four's own figure
             keys["predicted_peak_n"] = round(B.f_thr(v_ran) + r["z_end"] * v_ran, 2)
         out = {"travelled_mm": round(went * MM, 2), "asked_force_n": None if force_n is None else float(force_n),
                "ends_n": round(hand if force_n is None else float(force_n), 2),
@@ -450,7 +450,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
     @primitive
     def press(self, direction, travel_mm=None, force_n=None, mode="nudge", max_rounds=None, frame="base",
               base_check="auto", detail=False, max_n=None, hold_s=None, clear=None):
-        """Push along direction (C9). force_n: the force to reach, as the operator states it. max_n alone: the
+        """Push along direction. force_n: the force to reach, as the operator states it. max_n alone: the
         ramp runs until the part moves, at most to max_n. Neither: the ramp runs until the part moves, at most to
         what the arm can push there, and the result offers max_n. The approach to the part is an expected
         contact bounded by what is stated; the stroke after it is led by force. travel_mm: as stated; none: until
@@ -479,7 +479,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
         thing = self._ahead(B, s.tip, d, room)
         ramp = B.force("press", thing, s.q, d, intent)      # never refused: with no force stated or known
         way_in = control_move_press.approach(intent, force_n, ramp)   # the approach ends at the ramp's first force
-        arr = self._arrival(B, s.q, d, way_in, thing)                  # the approach: an expected contact (C15 2 a)
+        arr = self._arrival(B, s.q, d, way_in, thing)                  # the approach: an expected contact
         if arr["refused"] is not None:
             return {**arr["refused"], **no}
         strk = self._arrival(B, s.q, d, intent, thing, stroke=True)    # the stroke: max_n, a sheet, the site
@@ -495,7 +495,7 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
                                   "runs along a stronger direction (reach_check reports the force at a point)"),
                         **no}
             notes.append(f"held to {ramp.ceiling_n:.1f} N of the {top:g} N asked ({why}): a base that gave bounds "
-                         "the ramp and refuses nothing; measure_base_give lifts it")   # it cannot refuse (C9)
+                         "the ramp and refuses nothing; measure_base_give lifts it")   # it cannot refuse
             top = ramp.ceiling_n
         told = self._told()                            # the stroke starts where the hand was told to stand
         lead = top / B.k_servo(told.q, d)
@@ -587,8 +587,8 @@ class ContactMixin(StrokeMixin, BaseCheckMixin, ReachMixin):
                **self._stroke_keys(B, legs, top, arr, strk, peak_total),
                "ends_n": round(top if force_n is not None else ramp.first_n, 2),
                "ends_source": "your force_n" if force_n is not None else "the ramp's first force (no force_n stated)"}
-        self._band_keys(out, B, kw["band"], legs[0], arr["v"], told.q, d, detail)   # C15 (5)
-        hit = control_move_press.ran(B, legs, peak_total)   # the one figure after the stop (C2, the design rulings ii)
+        self._band_keys(out, B, kw["band"], legs[0], arr["v"], told.q, d, detail)   # the band block
+        hit = control_move_press.ran(B, legs, peak_total)   # the one figure after the stop
         if hit is not None:
             out["strike"] = {**(out.get("strike") or {}), "ran": hit}
         out = self._press_words(out, seen, legs, r, stop, gave, moved_at, t_res, peak, felt)

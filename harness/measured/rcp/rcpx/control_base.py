@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from rcpx.context import jsonable, refusal
-from rcpx.control_felt import BRUSH_BRIEF, HALF_STEP, Felt, _mm, _ratio  # noqa: F401  (their home since round six)
+from rcpx.control_felt import BRUSH_BRIEF, HALF_STEP, Felt, _mm, _ratio  # noqa: F401  (their home is control_felt)
 
 MM = 1000.0   # unit: mm per m
 
@@ -216,7 +216,7 @@ DEFAULTS = _Defaults(FACTS)
 class Cfg(dict):
     """Executor.cfg: stated facts and switches. A key round four removed is not stored: with COMPAT_ON a read of one
     returns what the session's bounds derive for it at the standard pose straight down and journals one note per
-    key; a write of one is ignored with a note. With COMPAT_ON off (after the Review stage) a read raises KeyError
+    key; a write of one is ignored with a note. With COMPAT_ON off a read raises KeyError
     naming the bounds call."""
 
     COMPAT_ON = True
@@ -287,7 +287,7 @@ def primitive(fn):
             opened = getattr(self, "_open_call", None)
             if opened is not None:
                 opened()
-        try:      # the call as it was made: a refusal that offers the same call with another word reads it (C12)
+        try:      # the call as it was made: a refusal that offers the same call with another word reads it
             self._call_now = (name, dict(list(inspect.signature(fn).bind(self, *args, **kwargs).arguments.items())[1:]))
         except TypeError:
             self._call_now = (name, dict(kwargs))
@@ -358,7 +358,7 @@ class Guard:
     is held (hold True and a record stands) self.hold is the hold's Watch: it sets the thresholds, says what is
     judged (Watch.judged) and is told the word a leg ends on. A tick hook's stop request (ex._tick_stop) ends
     the move with stopped equal to its text; so does a lost hold.
-    A move that starts on a contact (the design rulings; rcpx/control_tail.py start_of, leaving): the spec of a move the plan
+    A move that starts on a contact (rcpx/control_tail.py start_of, leaving): the spec of a move the plan
     door timed carries `start`. Its base, the load the still hand read as the move began, is no contact the
     motion made. Until the contact with the thing the move leaves has ended, that thing ends the move only over
     its stated limit or by a push that keeps growing; the cap and a push on a link end it as ever. Every guard
@@ -444,7 +444,7 @@ class Guard:
         tool = (getattr(s, "loc", None) or {}).get("source", "tool") == "tool"
         if tool and f > self.felt.floor > 0.0:
             # where the tool last bore on something, over what an arm at rest can hide: a move that starts
-            # there starts on that contact (control_expect.start_of, the design rulings)
+            # there starts on that contact (control_expect.start_of)
             ex._stand = {"tip": s.tip, "F": s.F, "call": getattr(ex, "_calls", None)}
         ext = getattr(s, "ext", None)
         if ext is not None:
@@ -515,7 +515,7 @@ class Guard:
             off_tool = judged and ext.shape == self.tau.shape and bool(np.any(np.abs(ext) > self.tau))
             over = over or off_tool
         if over:
-            touch = getattr(ex, "_scene_touch", None)   # a load over the threshold: the scene may have changed (C10)
+            touch = getattr(ex, "_scene_touch", None)   # a load over the threshold: the scene may have changed
             if touch is not None:
                 touch(s)
             if self.n_force == 0:
@@ -527,8 +527,8 @@ class Guard:
                 self.contact = _move_guard().met(ex, ex._contact_info(self.first, s), self.before)
                 if hold is not None and not off_tool:
                     # a push located on the tool while holding is on the hold, never a thing in the way; one
-                    # the joints or the reading's own locating put off the tool (a link) stays a contact (C9:
-                    # control_hold.note_contact leaves a contact whose source is not the tool as it is)
+                    # the joints or the reading's own locating put off the tool (a link) stays a contact:
+                    # control_hold.note_contact leaves a contact whose source is not the tool as it is
                     _hold().note_contact(ex, self.contact)
                 return "contact"
         else:
@@ -590,7 +590,7 @@ def _hold_lines(ex, name, out, moved0):
 
 def budget_refusal(ex, plan, periods, intent=None):
     """None, or the refusal budget: a move is not started when the backend states how many control periods are
-    left (a harness budget, Q14) and the plan needs more than are left. The hint is a shorter move."""
+    left (a harness budget) and the plan needs more than are left. The hint is a shorter move."""
     left = getattr(ex.backend, "steps_left", None)
     left = left() if callable(left) else None
     if left is None or periods <= left:

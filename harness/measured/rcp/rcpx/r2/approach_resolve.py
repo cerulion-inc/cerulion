@@ -212,7 +212,7 @@ def surface_kin(ex, name):
 # ---------------------------------------------------------------------------------------------- pose checks
 def _body_fit(ex, B, name):
     """The margin a body's capsule owes its own shape (m): Bounds.clearance at rest with no thing, which is the
-    farthest the body's hull stands out of its capsule (SPEC-R4 Q4). A fact of the model: kept per executor."""
+    farthest the body's hull stands out of its capsule. A fact of the model: kept per executor."""
     cache = ex.state.setdefault("approach", {}).setdefault("fit", {})
     if name not in cache:
         cache[name] = float(B.clearance(0.0, None, name))
@@ -220,10 +220,10 @@ def _body_fit(ex, B, name):
 
 
 def _body_low(ex, B, name, q, low, fit, band, plain):
-    """How far a body stands above the surface under it (m), by SPEC-R4 Q4: on its capsule (low, from the
+    """How far a body stands above the surface under it (m): on its capsule (low, from the
     executor's own geometry) while the capsule is farther than its fit error plus the band in force; nearer than
     that on the body's own hull against the support plane (Bounds.distance), so a link is measured as the link it
-    is. The hull is used only where the model states one (Model.hulls, SPEC-R4 A8.4) and the surface under the
+    is. The hull is used only where the model states one (Model.hulls) and the surface under the
     body is the plain support (plain: not over a mount, and a support is stated); elsewhere the capsule is all the
     model states of the body and stands as measured."""
     if low >= fit + band or not plain or not callable(getattr(ex.model, "hulls", None)):
@@ -284,7 +284,7 @@ def pose_ok(ex, q, q_ref, stroke):
 
 
 def starts(ex, q_now, extra=()):
-    """Current, extra, home and deterministically seeded starts for the geometry solver, PA-026."""
+    """Current, extra, home and deterministically seeded starts for the geometry solver."""
     rng = np.random.default_rng(START_SEED)
     out = [np.asarray(q_now, dtype=float)] + [np.asarray(x, dtype=float) for x in extra]
     out.append(ex.model.q_home.copy())
@@ -294,12 +294,12 @@ def starts(ex, q_now, extra=()):
 
 
 def reach_past_m(B, thing, q, a):
-    """One Bounds travel law for both the checked stroke and suggested touch, SPEC-R4 A4.3."""
+    """One Bounds travel law for both the checked stroke and suggested touch."""
     return B.travel("touch", thing, q, a).past_m
 
 
 def reach_tol_m(ex, q, along=None, tol_m=None):
-    """A solve cannot state error below its convergence tolerance, PA-015/PA-027, SPEC-R4 Q3."""
+    """A solve cannot state error below its convergence tolerance."""
     return max(bounds.of(ex).rigid(q, [0, 0, -1] if along is None else along), tol_m or 0.0, POS_TOL_M)
 
 
@@ -358,7 +358,7 @@ def surface_reach(ex, kin, p, q_now, along=None, margin=True, tol_m=None):
     out.update({"reachable": True, "margin_mm": round(lo * MM, 2), "margin_along": _r(out_dir, 3),
                 "short_by_mm": 0.0, "direction": None,
                 "force_n": round(kin.force_capability(q, force_dir) * (1 - B.e_tau()), 2),
-                "force_tool_n": None if B.f_tool() is None else round(B.f_tool(), 2),   # None: no rating is stated (r6 C1)
+                "force_tool_n": None if B.f_tool() is None else round(B.f_tool(), 2),   # None: no rating is stated
                 "force_along": _r(force_dir, 3),
                 "q_deg": {n: round(math.degrees(float(v)), 3) for n, v in zip(m.joint_names, q)}})
     return out, q

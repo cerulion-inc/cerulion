@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The routine the robot runs itself and its exports (SPEC-R5 4.2, 4.7, 9.4): try_each, act_on by a candidate
+"""The routine the robot runs itself and its exports: try_each, act_on by a candidate
 number, and the tool entries of act_on, try_each and changed. A sibling file of the assist package: it exports
 TOOLS, HANDLERS and setup(ex), which rcpx/r2/assist.py merges.
 
@@ -174,7 +174,7 @@ def _number(v):
 
 
 def _until_call(parts):
-    """(until for a call this file writes, needs): the manual's cue or nothing (SPEC-R5 4.2)."""
+    """(until for a call this file writes, needs): the manual's cue or nothing."""
     return ("cue changes", None) if U.from_manual(parts) else (None, "until: your stop condition, two words")
 
 
@@ -215,7 +215,7 @@ def _full(out, steps, detail):
 
 # ---------------------------------------------------------------- act_on
 def act_on(ex, session, on=None, verb="push", part=None, until=None, detail="brief", **extra):
-    """SPEC-R5 4.2: from a candidate number, a located or contact id or a part label to a checked result."""
+    """From a candidate number, a located or contact id or a part label to a checked result."""
     if extra:
         return A.bad_args("act_on", extra, 'act_on {"on": 3}')
     if verb not in A.VERBS or on is None or isinstance(on, bool) or detail not in ("brief", "full"):
@@ -336,7 +336,7 @@ def _act_result(ex, session, run, step, verb, cond, watch, rows, parts, detail):
 # ---------------------------------------------------------------- try_each
 def try_each(ex, session, candidates=None, verb="push", until=None, watch=None, part=None, max=3, detail="brief",
              **extra):
-    """SPEC-R5 4.2: the robot tries each numbered candidate itself until the model's stop condition is met."""
+    """The robot tries each numbered candidate itself until the model's stop condition is met."""
     if extra:
         return A.bad_args("try_each", extra, 'try_each {"until": "cue changes"}')
     ok_list = candidates is None or (isinstance(candidates, (list, tuple)) and candidates

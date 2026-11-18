@@ -505,7 +505,7 @@ class RobotModel:
 
         return describe(self)
 
-    # ---------- the robot's own shape, ratings and stopping (SPEC-R4 A8.4, Q1, Q2, Q4) ----------
+    # ---------- the robot's own shape, ratings and stopping ----------
     def hulls(self):
         """{body: {"points_m": N x 3 in the body frame, "tol_m"}}: the convex shape each body collides with."""
         return model_tool.body_hulls(self)

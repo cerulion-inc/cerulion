@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What is left to try, ranked (SPEC-R3 4.2 "untried"), pure: finish_evidence's facts in, at most UNTRIED_MAX calls
+"""What is left to try, ranked, pure: finish_evidence's facts in, at most UNTRIED_MAX calls
 out. Only tools the session lists or reaches through use (facts["tools"]); never a stale target; an item whose
 tool is not loaded is dropped. Each item is a ready call {tool, args, why} or a point call {tool: "locate",
 args: {look, part}, needs: "px", why} (the operator supplies the pixel); "rule" is its rank (1 to 8), kept for the

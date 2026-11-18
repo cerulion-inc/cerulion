@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package fixture (SPEC-R4 B5; round six, the design notes package PLACE stage C): working a fixed part in one
+"""Package fixture: working a fixed part in one
 step, with no model of any device.
 
 One tool (Mixin primitive): work_part(target, way: pull | push | turn, until: "end" | {"mm": n} | {"deg": n},
@@ -18,8 +18,8 @@ Phases, each reported with its control periods and its binding bound:
               along the stroke, clears what the newest look shows over the part until the part comes to the face
               it goes into, the nearest the pointed point; where none does, the hold as solved and the receipt
               says what the hand would meet and after how far). ONE stream to the pose before the part
-              and on to the hold: its last leg is an expected contact with the part (C9), bounded only by a limit
-              somebody stated (C3). The jaws close where it stops through the core's one close
+              and on to the hold: its last leg is an expected contact with the part, bounded only by a limit
+              somebody stated. The jaws close where it stops through the core's one close
               (rcpx/control_hold.py), the hold on a part of something fixed. A pose that meets something on the
               way in gives way to the next one, ranked again from where the arm then stands, once;
 3. probe      one continuous force ramp along the direction until the tip's path passes rigid (no threshold);
@@ -115,7 +115,7 @@ class Mixin(SayMixin, TakeMixin):
                 return None, seen
         answer = (seen.get("answer") or (seen.get("spot") or {}).get("answer")) if isinstance(seen, dict) else None
         if isinstance(answer, dict):
-            # the look shows nothing at that pixel (contract C11, the design rulings): the tool answers at once what
+            # the look shows nothing at that pixel: the tool answers at once what
             # the look shows near it, with no motion and no control period; it is no refusal. The same for a
             # resolved spot handed in as the target that carries the answer
             near = list(answer.get("near") or [])
@@ -134,8 +134,8 @@ class Mixin(SayMixin, TakeMixin):
         part, bad = H.part_of(self, target, seen)
         if bad:
             return None, bad
-        # The target is a spot (C11, role part): a point with what is known of its error. Nothing more is asked of
-        # it: the way in's last leg is an expected contact with it (C9), and what is not known of it is a
+        # The target is a spot (role part): a point with what is known of its error. Nothing more is asked of
+        # it: the way in's last leg is an expected contact with it, and what is not known of it is a
         # line of the receipt's doubt.
         part["spot"] = seen.get("spot") if isinstance(seen, dict) else None
         part["doubt"] = list(seen.get("doubt") or []) if isinstance(seen, dict) else []
@@ -151,7 +151,7 @@ class Mixin(SayMixin, TakeMixin):
             # the look shows standing highest about the pointed point, at the height of its top, not to the
             # pointed point (a hold off the part's axis is pushed aside as it turns; a hold at the height of a
             # pixel on the part's side or foot puts the fingers into what the part stands on). A pixel anywhere
-            # on the part works it (the design rulings, f): the hold is taken where this hand fits the part nearest the
+            # on the part works it (f): the hold is taken where this hand fits the part nearest the
             # pixel: on what stands highest within half the jaws' opening of the point, where the fingers reach
             # from that top down to the point (their own length); said with the distance. Where the point does
             # not lie under that top the look's outline at the point is of another piece of the part: the jaws
@@ -333,7 +333,7 @@ class Mixin(SayMixin, TakeMixin):
         if bad:
             return bad
         if from_top and part.get("top_alt") is not None:
-            # no hand pose from the side has a plan (the design rulings: a plan that exists is taken, the tool does not refuse):
+            # no hand pose from the side has a plan (a plan that exists is taken, the tool does not refuse):
             # the look shows a part's top within half the jaws' opening of the point, and it is worked from above
             self._fx_onto_top(part, part.pop("top_alt"))
             part["doubt"].append("no hand pose that comes at the point from the side has a plan: the part is "

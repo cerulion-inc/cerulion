@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""SelfKnow: what a robot keeps about itself between sessions (SPEC-R4 A2.1; round six contract C17), and nothing
+"""SelfKnow: what a robot keeps about itself between sessions, and nothing
 about a task or a place.
 
 Where (default_dir): the folder a session states (cfg selfknow_dir), else env RCPX_SELFKNOW_DIR, else
@@ -19,7 +19,7 @@ readings where no contact is proven (note_free_leg, note_held_leg: a leg through
 what a false stop showed stands for the session alone and is never written to the file (note_false_stop,
 note_session). A value can be exactly zero (a simulator adds no noise): zero is a value, None is "not known".
 
-Stops (contract C5): add_stop keeps every stop measured by rcpx.bounds_stops.measure, a self-test tap ("where":
+Stops: add_stop keeps every stop measured by rcpx.bounds_stops.measure, a self-test tap ("where":
 "tap", written to the file) or a task's contact ("task": this session alone). The detection time and the stop
 slope are read from them. Braking and acceleration are stored per joint (brake_j, accel_j); no rise term.
 
@@ -321,7 +321,7 @@ class SelfKnow:
             self.tables = kept
 
     def add_stop(self, stop, where="task", at=None, store=None):
-        """Keep a stop measured by rcpx.bounds_stops.measure (contract C5): where is "tap" (the self-test) or
+        """Keep a stop measured by rcpx.bounds_stops.measure: where is "tap" (the self-test) or
         "task". A record that is not one (no det_periods) is not kept. A false stop is never handed here. store:
         whether the file keeps it (none given: a tap yes, a task's stop no: it stands for this session)."""
         if not isinstance(stop, dict) or "det_periods" not in stop:
@@ -426,13 +426,13 @@ class SelfKnow:
         return self._entry("n_det")
 
     def rise(self):
-        return _ABSENT   # no rise term is stored or read (round six): t_det() is what the stops showed
+        return _ABSENT   # no rise term is stored or read: t_det() is what the stops showed
 
     def t_settle(self):
         return self._entry("t_settle")
 
     def a_brake(self):
-        return _ABSENT   # no single braking number is stored or read (round six): brake_j is per joint
+        return _ABSENT   # no single braking number is stored or read: brake_j is per joint
 
     def t_sample(self):
         return self._entry("t_sample")
@@ -565,7 +565,7 @@ class SelfKnow:
         return changed
 
     def refit(self, stop):
-        """Contract C5: a stop measured by rcpx.bounds_stops.measure is kept and the slope and the detection time
+        """A stop measured by rcpx.bounds_stops.measure is kept and the slope and the detection time
         are read from the kept stops, up and down (a task's stop is kept for this session, not in the file). Any
         other record changes no slope: a peak made of a deceleration and the speed of the reading that tripped are
         no measurement. Returns {"stored", "n": the resolved stops kept, "c": their largest ratio to the body's

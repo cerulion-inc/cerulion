@@ -17,7 +17,7 @@ DOWN = np.array([0.0, 0.0, -1.0])
 
 
 def cost(ex, B, q, land, bnd, z_end, pads, depth=None):
-    """C12: what a stated limit costs the landing, {"periods": with less without, "without_periods", "where"}, or
+    """What a stated limit costs the landing, {"periods": with less without, "without_periods", "where"}, or
     None when the landing runs under no limit or has no band: the band's depth at the limit's arrival speed
     against the same depth at the speed the ending force would have run (the hold's squeeze per pad; the body's
     own speed where no squeeze stands)."""
@@ -75,7 +75,7 @@ def let_go(ex, pads, facts, drop_m, after_n=None):
 
 
 def read_moved(rel):
-    """What the way down's own readings showed of a landing that no guard told (the design rulings: a reading that moved is
+    """What the way down's own readings showed of a landing that no guard told (a reading that moved is
     said beside what the arm read), as words, or "" when none moved. rel["landing_read"]: the set down's own figure
     after the stop (strike["ran"]): a load that rose on the arm's own reading at a height with no guard telling
     it, and the jaws' gap that closed while it went down (the thing moved between the pads)."""

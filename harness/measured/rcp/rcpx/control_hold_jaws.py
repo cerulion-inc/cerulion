@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The jaws' own numbers (round six, contract C7): what the free jaws do, measured at STEADY closing rates.
+"""The jaws' own numbers: what the free jaws do, measured at STEADY closing rates.
 
     numbers(ex)       the numbers a close and a release run on: the robot's stored self-knowledge (entry jaw) when it
                       holds them, else the body's own description (source model, said in every receipt)
@@ -185,8 +185,8 @@ def presses(ex, s=None):
 
 
 def scene_touch(ex):
-    """Contract C10: tell the motion core that the jaws are commanded to move in this control period (the last act
-    that changed the scene, the design rulings: a look taken before it no longer shows the scene as it stands). The core keeps
+    """Tell the motion core that the jaws are commanded to move in this control period (the last act
+    that changed the scene, a look taken before it no longer shows the scene as it stands). The core keeps
     the time (ex._scene_t); a core that has no such hook is told nothing."""
     touch = getattr(ex, "_scene_touch", None)
     if callable(touch):
@@ -242,7 +242,7 @@ def _steady(ex, q_hold, f0, f1, rate, n=None):
 
 
 def measure_jaws(ex):
-    """C7: the jaws' own numbers from steady rates in free air (the hand stands where it is; nothing between the
+    """The jaws' own numbers from steady rates in free air (the hand stands where it is; nothing between the
     jaws). The jaws' own rate is the fastest the reading follows a command (the command's rate doubled from a slow
     stroke until the reading falls behind it, or a stroke gets too short to tell); the lag line a + b x rate is
     fitted over that rate and its halves; rate_tell is the slowest of those rates at which the moving jaw's lag

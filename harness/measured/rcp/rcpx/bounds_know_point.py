@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a rigid thing can push back with, per unit of speed, at ONE moving point of the body (round six, second
-pass; the design rulings; contract C5 changed). Pure but for the body's own description.
+"""What a rigid thing can push back with, per unit of speed, at ONE moving point of the body. Pure but for the body's
+own description.
 
 A strike has two parts, and each is taken here from the body's own description alone:
 - the impact: the contact model's rate the backend states (b, 1/s: force per unit of moving mass and arrival

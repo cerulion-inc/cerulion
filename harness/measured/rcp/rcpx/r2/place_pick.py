@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""pick of package place (round six: the design notes C8, C9, C11, C12, C14; the design rulings): take a thing, a
+"""pick of package place: take a thing, a
 rim or a part at a spot, for any gripper arm, acting on what there is with the contact stop armed.
 
 Before anything moves the take is counted (place_pick_count: the way as the bounds plan it, the close, the test
@@ -11,7 +11,7 @@ One take runs three phases, each a motion of the bounds (rcpx/bounds.py); the to
 - over and down: ONE stream (ex._stream): up to a height the hand stood free at (when it stands lower), across,
   down around the spot. The jaws open on the way (to the chosen width plus twice its error plus twice what the
   hand can be off its path, else as far as they go; never onto their own open end). The way down is an EXPECTED
-  contact (C9): it brakes for nothing but a limit somebody stated (B.stated_limit), and a contact on it is no
+  contact: it brakes for nothing but a limit somebody stated (B.stated_limit), and a contact on it is no
   ending: the hand backs off by what its own give explains under the force it reads there while the jaws close
   where they stand, and that contact is the measured top. Reach is refused only after every route was tried: that one, one line to over
   the spot and down, and across at the hand's own height. The way down is measured as the hand ran it (how far
@@ -19,10 +19,10 @@ One take runs three phases, each a motion of the bounds (rcpx/bounds.py); the to
 - close: the core's one close (control_hold.close), at the jaws' own rate unless a limit is stated. A hand with
   one moving jaw and no width seen moves with its jaw along its closing axis, the point between its pads where
   the thing's middle is (place_pick_count.follow). A stall wider than the thing was seen is said, not an ending.
-  Under a stated limit the squeeze is eased by REL before the lift (the design rulings: kept by truth, the lift
+  Under a stated limit the squeeze is eased by REL before the lift (kept by truth, the lift
   included; the close's squeeze is a figure of the jaws' own fitted numbers and the thing settles as it rises).
 - test lift: ONE move straight up by twice the fingers' own reach, no longer than the way down (the hold's first
-  leg, C8) unless that would not free the thing from where it stood (how deep the fingers took it, plus the
+  leg) unless that would not free the thing from where it stood (how deep the fingers took it, plus the
   hand's band): then it rises by what frees it, the hold kept, and the receipt says how much of the lift ran
   past the way down (the hold's own level judges that stretch). It ends with the load read at rest
   (control_hold.read_load). Held = the core's record stands after it AND the hand rose by the lift planned.
@@ -118,7 +118,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
         return r if isinstance(r, dict) else {"stopped": "refused", "refused": {"check": "motion", "why": str(r)}}
 
     def _pk_expect(self, plan, intent, st):
-        """(the expected contact of the way down (C9), the stated limit it rests on (C3)). The region is the
+        """(the expected contact of the way down, the stated limit it rests on). The region is the
         stretch the fingers go down around the spot: its middle, and for its radius the spot's own error, the
         open hand's half width and half that stretch. With nothing stated bound_n is None: nothing lowers it."""
         B, J = _bounds(self), self._pl_jaws
@@ -242,7 +242,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
                 ticks.remove(count)
 
     def _pk_run(self, st, seen, hints, intent):
-        """ONE take (the design rulings: a pick never takes a second time by itself; a take that did not hold comes
+        """ONE take (a pick never takes a second time by itself; a take that did not hold comes
         back with what the look shows, place_pick_out._pk_result)."""
         z0 = float(self._sense().tip[-1])
         st["free_z"] = max(float(st.get("free_z", z0)), z0)       # the hand stood free here when a pick began
@@ -272,7 +272,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
                          "ways": self._pk_ways(plan, s, expect, st)}
 
     def _pk_price(self, a, intent=None):
-        """The control periods one take plans from where the hand stands (C12; the place's budget line asks it
+        """The control periods one take plans from where the hand stands (the place's budget line asks it
         before a put starts): {"periods", "way", "close", "lift", "rest", "route"}, no second take. a: the
         pick's arguments (seen, spot, point, t, width_hint_m, yaw_rad, grasp). None when no take is planned (a
         spot that resolves to nothing, a plan that is a refusal): the pick itself then says why. Moves nothing."""
@@ -307,7 +307,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
             return plan
         doubt += [d for d in plan["doubt"] if d not in doubt]
         word = {k: intent[k] for k in ("clear", "look", "speed", "accel") if k in intent}
-        planned = place_pick_count.count(self, plan, ready, word)       # counted before anything moves (C12)
+        planned = place_pick_count.count(self, plan, ready, word)       # counted before anything moves
         bad = place_pick_count.gate(self, plan, ready, word, planned)
         if bad is not None:
             return bad
@@ -414,7 +414,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
             "strike": place_pick_count.close_strike(self, plan, ready, c)}, strikes)
         if c.get("held"):
             # where the pads stand on it, read before the lift: jaws that stalled wider than the thing stand on a
-            # corner of it and are re-seated once inside this take (place_grasp_seat; the design rulings stands)
+            # corner of it and are re-seated once inside this take (place_grasp_seat)
             c, s_now = self._pk_reseat(plan, ready, S, c, how, word, ev, doubt, strikes, ran)
             if ev.get("reseat"):
                 gap, s_low = c.get("gap_m"), s_now
@@ -448,7 +448,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
                               "something wider, or on a corner of it", "kept the hold and ran the test lift",
                               {"tool": "look", "args": {"camera": "wrist"}, "periods": 0}))
         if limited and c.get("frac") is not None and not isinstance(self._gripper_cmd, str):
-            # the design rulings (a limit served to the close is kept by truth, the lift included): the close leaves the
+            # (a limit served to the close is kept by truth, the lift included): the close leaves the
             # squeeze AT the limit by the jaws' own fitted numbers, and a held thing settles between the pads as
             # it comes up (20.7 N read in the lift on a 20 N thing): the command leads the reading REL less
             lead = max(0.0, float(c["frac"]) - float(self._gripper_cmd))
@@ -460,7 +460,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
 
     def _pk_lift(self, plan, S, s_low, c, ran, short, q_from, word, out, strikes, doubt):
         """The test lift: ONE move straight up, no longer than the way down (which is the leg in the hold's record
-        was told, C8) unless that would not free the thing from where it stood (how deep it stands between the
+        was told) unless that would not free the thing from where it stood (how deep it stands between the
         fingers: the depth planned less what an early contact stopped short of it, plus the hand's band): then
         the hold is kept and the hand rises by what frees it, on past where its last leg began, and the doubt
         says how far (the hold's record keeps the way down as run: the core judges the rest by the hold's own
@@ -501,7 +501,7 @@ class PickMixin(SeatMixin, PickOut, PlaceMotion):
         rec = control_hold.check(self)
         went = rl.get("stopped") == "goal"
         if rec is not None and went and dict.get(rec, "weight_n") is None and rec.get("read_call") != self._calls:
-            control_hold.read_load(self)                # the lift ends with the load read at rest (C8)
+            control_hold.read_load(self)                # the lift ends with the load read at rest
             rec = control_hold.held(self)
         s1 = self._sense()
         rise = float(s1.tip[-1] - s_low.tip[-1])

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Start, serve, score and stop one LIBERO or LIBERO-PRO episode of the with and without rcpx study
-(the design notes S3). The env host (bench/ext/libero/envhost.py, the benchmark's own venv, started by
+"""Start, serve, score and stop one LIBERO or LIBERO-PRO episode of the with and without rcpx study. The env host (bench/ext/libero/envhost.py, the benchmark's own venv, started by
 bench.ext.libero.launch) holds the physics, the success check and the truth; the serve process (this file, rcpx
 venv) serves EPDIR/rcp.sock with the rcpx socket protocol, so rcpx.cli and bench/operators/chat_operator.py work
 unchanged.
@@ -51,7 +50,7 @@ MAX_SOCK = server.MAX_SOCK_PATH
 
 
 def scoring_dir(ep_dir):
-    """bench.run_episode.scoring_dir, restated (that module loads the whole lane bench)."""
+    """bench.run_episode.scoring_dir, restated (that module loads the whole bench)."""
     ep = os.path.abspath(ep_dir)
     return os.path.join(os.path.dirname(ep), "_scoring", os.path.basename(ep))
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The texts and limits of the offer engine (SPEC-R5 5.1 and 5.2), and the one rule for cutting an evidence phrase.
+"""The texts and limits of the offer engine, and the one rule for cutting an evidence phrase.
 
 An offer is {n, noticed, can, next}: noticed is the gauge's own evidence phrase for the event (never rewritten
 here, only cut), can is one of the texts below (what the robot can take over), next is a call. No text here grades

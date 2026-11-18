@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The close and the release of the hold (round six, contract C8; the record and the guard are in control_hold.py).
+"""The close and the release of the hold (the record and the guard are in control_hold.py).
 
 close(): no arm guard at the contact threshold judges it, only the cap. A close that makes a hold is an expected
 contact whose purpose is a force that stays, the hold's squeeze: the free travel down to where the
@@ -10,7 +10,7 @@ That is no limit: the receipt states the squeeze, the speed of the arrival and t
 rate further, to at most (L - floor_n) / z_jaw and never under rate_tell (z_jaw carries what the jaw servo winds up
 before a touch is told), and in the hold squeeze the command never leads the reading by more than L allows through
 the pad's shortest lever. A limit the operator's own word states under what these jaws leave standing once they
-touch runs at rate_tell and is said not kept (the design rulings: never a refusal); a sheet, a rating, the site or a give
+touch runs at rate_tell and is said not kept (never a refusal); a sheet, a rating, the site or a give
 under it is refused limit_not_keepable. "Told" is the jaws' own
 reading: the lag over the free lag of the running rate by REL of it plus TWO_READ spreads, on QUANT readings in a
 row; or, once the command has stood at its end for the jaws' own lag, jaws that stand (no longer running) open of
@@ -42,10 +42,10 @@ MM = 1000.0
 
 
 def _arrive(ex):
-    """C10: before acting where the hand stands, wait by motion alone (ex._arrive, the motion core's). Returns
+    """Before acting where the hand stands, wait by motion alone (ex._arrive, the motion core's). Returns
     (the periods it waited, how far the hand then stands from where it was last sent, m): the jaws act where the
     hand IS, and a caller sees how far that is from the end it commanded."""
-    arrive = getattr(ex, "_arrive", None)      # r6 shim: a core without it does not wait
+    arrive = getattr(ex, "_arrive", None)      # compat shim: a core without it does not wait
     n = 0
     try:
         n = int(arrive()) if callable(arrive) else 0
@@ -62,7 +62,7 @@ def _limit(ex, limit_n, limit_source):
     bounds hold as stated for an expected contact (the site, a rating, a give of this session)."""
     if limit_n is not None:
         return {"limit_n": float(limit_n), "source": limit_source or "intent", "evidence": "stated on the call"}
-    ask = getattr(ex.bounds, "stated_limit", None)     # r6 shim: bounds without it state none
+    ask = getattr(ex.bounds, "stated_limit", None)     # compat shim: bounds without it state none
     if ask is None:
         return None
     try:
@@ -119,7 +119,7 @@ def squeeze_goal(F, lever_min, at_frac, to_frac, squeeze_n=None):
 
 def rates(F, N, lever_min, frac, *, expect_m=None, band_m=None, depth_m=None, lim=None, squeeze_n=None,
           to_frac=0.0, hold=True, wide_m=None):
-    """The rates of one close before the jaws move (pure; the design rulings). N, lever_min: at_depth(). Returns
+    """The rates of one close before the jaws move (pure). N, lever_min: at_depth(). Returns
     {own, tell, begin (the opening at which the pads can first meet a thing expect_m wide, None: not known),
      slow_from (the opening down to which the jaws run at their own rate), rate (the rate from there, spans per s),
      squeeze_goal_n, squeeze_rate (the rate solved for the hold's squeeze, None: no stop slope or no servo gain),
@@ -272,7 +272,7 @@ def _price(N, P, lim):
 
 def close(ex, *, expect_m=None, band_m=None, limit_n=None, limit_source=None, squeeze_n=None, hold=True,
           to_frac=0.0, arm=None, depth_m=None, kind=None, pads=1, width_source=None, look=True, wide_m=None):
-    """The one close (C8). expect_m, band_m: the gap between the jaws at which the thing is seen to begin, and its
+    """The one close. expect_m, band_m: the gap between the jaws at which the thing is seen to begin, and its
     error (the jaws run at their own rate down to there even under a limit; a caller that knows the thing's width
     but not where it stands between the jaws states none, and a close under a limit is then slow from where the
     jaws stand). limit_n, limit_source: a stated limit on the thing; pads: how many pads press the thing at once
@@ -291,10 +291,10 @@ def close(ex, *, expect_m=None, band_m=None, limit_n=None, limit_source=None, sq
     told a thing between them. held: it did, the jaws stand on it (the stated limit or the arm's own cap may have
     ended the squeeze) and hold was asked: the record stands. A close that ended on the limit or the cap before
     any touch was told holds nothing.
-    Second pass (C8 changed; the design rulings): width_source says where expect_m came from ("stated", "seen:
+    Width_source says where expect_m came from ("stated", "seen:
     ..."); with no width given and hold asked the robot looks for itself first (control_hold_look.before: a
     picture of its own camera that sees between the jaws, no control period; look False: the caller looked
-    already, or wants none) and the design rulings runs on that width with its error. The result gains "strike": {pad_n,
+    already, or wants none) and the close runs on that width with its error. The result gains "strike": {pad_n,
     other_n, arrive_m_s, source} (control_hold_pads.strike), "width": {m, sigma_m, source, and where no width was
     known "price": {periods, with_width_periods}}; the hold's record gains "squeeze_pad_n" and "pads".
     wide_m: the widest the thing can stand between the jaws (rates()).
@@ -321,7 +321,7 @@ def close(ex, *, expect_m=None, band_m=None, limit_n=None, limit_source=None, sq
              float(band_m or 0.0), "source": width_source or ("stated" if expect_m is not None else None)}
     if expect_m is None and hold:
         from rcpx import control_hold_look
-        width = control_hold_look.before(ex, look)        # the design rulings: the robot's own look before the close
+        width = control_hold_look.before(ex, look)        # the robot's own look before the close
         if width.get("m") is not None:
             expect_m, band_m = float(width["m"]), R.BAND * float(width["sigma_m"] or 0.0)
     frac0 = frac
@@ -382,7 +382,7 @@ def close(ex, *, expect_m=None, band_m=None, limit_n=None, limit_source=None, sq
         nonlocal cmd, s, frac, arm_n, arm_now, k
         recent.append((cmd - new_cmd) / dt)
         if new_cmd != cmd:
-            scene_touch(ex)             # C10: the jaws are commanded to move: the scene may change
+            scene_touch(ex)             # the jaws are commanded to move: the scene may change
         cmd = ex._gripper_cmd = new_cmd
         was_at = frac
         s = ex._period(ex._q_des if arm is None else arm(cmd))
@@ -471,7 +471,7 @@ def close(ex, *, expect_m=None, band_m=None, limit_n=None, limit_source=None, sq
         ex._period_kind = was
     q, target = J.reading(s.gripper, ex._gripper_cmd)
     sq = None if q is None else J.squeeze_n(q, target)
-    sides = None if q is None else pads_of.by_side(F, q, target, depth_m)     # the design rulings: per pad where it stands
+    sides = None if q is None else pads_of.by_side(F, q, target, depth_m)     # per pad where it stands
     gap = None if q is None else float(J.width_m(q))
     # ONE figure after the jaws stood: the strike of the rate they met the thing at (met_of; the planned arrival
     # rate where nothing was told) plus the squeeze, per pad through the lever at the depth the thing stands at:
@@ -526,7 +526,7 @@ def close(ex, *, expect_m=None, band_m=None, limit_n=None, limit_source=None, sq
         # was stated, seen or looked): said, never an ending here; the caller judges what it took
         out["wider_m"] = max(0.0, float(gap) - float(width["m"]) - float(band_m or 0.0))
     if width.get("m") is None and hold and rate < own:
-        # the design rulings: no width was stated, seen or looked: the arrival rate ran from where the jaws stood. Its price
+        # no width was stated, seen or looked: the arrival rate ran from where the jaws stood. Its price
         # beside what a width would have cost: the same close with the jaws' own rate down to where they stood on
         # the thing (its band as wide as the jaws' own still band says)
         # beside what the same close would plan with the width the jaws now stand at stated (its band the jaws'
@@ -565,7 +565,7 @@ def close(ex, *, expect_m=None, band_m=None, limit_n=None, limit_source=None, sq
                    limit_source=None if whole is None else whole["source"], extent=None,
                    frac=float(frac), cmd_frac=float(ex._gripper_cmd), still_frac=still,
                    judged_at=np.asarray(s.tip, dtype=float).copy())
-        rec["pads"] = pads_of.stated(F, N, lever_min, out)       # C8 changed: what the pads bear and can make
+        rec["pads"] = pads_of.stated(F, N, lever_min, out)       # what the pads bear and can make
         rec["squeeze_pad_n"] = rec["pads"]["squeeze_pad_n"]
         rec["squeeze_by_body"] = rec["pads"]["squeeze_by_body"]
         rec["depth_m"] = None if depth_m is None else float(depth_m)
@@ -620,7 +620,7 @@ def release(ex, to_frac=None):
             new = min(goal, cmd + rate * dt)
             recent.append((new - cmd) / dt)
             if new != cmd:
-                scene_touch(ex)         # C10: the jaws are commanded to move: the scene may change
+                scene_touch(ex)         # the jaws are commanded to move: the scene may change
             cmd = ex._gripper_cmd = new
             was_at = frac
             s = ex._period(ex._q_des)

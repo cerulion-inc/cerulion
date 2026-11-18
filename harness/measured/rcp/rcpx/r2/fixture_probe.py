@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The probe of package fixture (SPEC-R4 B5 phase 3) and the jaws' own readings: fits, ramp laws, the jaw strokes.
+"""The probe of package fixture and the jaws' own readings: fits, ramp laws, the jaw strokes.
 
 A part that is held or pushed shows its own path from the first travel the robot can tell from none (rigid). The
 points past that travel fit a LINE (one direction) or an ARC (a centre, a radius and the normal of its plane); the

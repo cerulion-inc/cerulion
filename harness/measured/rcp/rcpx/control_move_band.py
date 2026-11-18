@@ -6,7 +6,7 @@ that is KNOWN free, and from the first place where a contact can begin at the sp
 (what lies past the first surface is hidden). Two things place that edge, and the nearer one decides:
 
   the WAY: how far ALL that the tool's own bodies (the hand, each jaw where it stands) and the held thing sweep
-  is known free (rcpx/bounds_free.py stroke, the design rulings): by a look of the scene as it stands, by the arm's own
+  is known free (rcpx/bounds_free.py stroke): by a look of the scene as it stands, by the arm's own
   passage this session with nothing met since, by the site's word. A word of the caller buys nothing.
 
   the END: the first surface the session knows of along the stroke, each less BAND times its own stated or
@@ -17,8 +17,8 @@ that is KNOWN free, and from the first place where a contact can begin at the sp
 With no way known free the whole travel is the arrival stretch and the receipt prices it. Nothing here is typed
 and nothing reads the scene's truth.
 
-The bet is priced, not hidden (C15 (4)): before the motion the receipt carries fast_n, the strike a contact
-outside the band would make at the stroke's fastest sample (the plan's own figure, C2), and arrive_n, the band's
+The bet is priced, not hidden: before the motion the receipt carries fast_n, the strike a contact
+outside the band would make at the stroke's fastest sample (the plan's own figure), and arrive_n, the band's
 figure at the arrival speed; after a stop the one figure for the speed the contact was met at (strike.ran).
 
     of_stroke(ex, B, p0, d, reach, thing, q0, held)  -> the band {"from_m", "at_m", "sigma_m", "half_m", "source", "by"}
@@ -79,7 +79,7 @@ def _end(ex, B, p0, d, reach, thing, lead):
 
 
 def of_stroke(ex, B, p0, d, reach, thing=None, q0=None, held=None):
-    """C15 (1) for a stroke from p0 along d (unit, base) of at most reach (m), the arm at q0 (None: where it was
+    """C15 for a stroke from p0 along d (unit, base) of at most reach (m), the arm at q0 (None: where it was
     last read), holding `held`. from_m: the tip travel from which a contact can begin (0: the whole stroke);
     at_m: where the surface that ends the fast part is expected (None: the edge of what is known free);
     sigma_m: its stated or measured error; half_m: the band's half depth; source: the words, naming what carried
@@ -140,7 +140,7 @@ def split(ex, B, q0, line, p0, d, from_m, intent, kind, thing):
 
 
 def keys(band, sched, dt, v_arr, ends_n, ends_source, plan, arrive_n, n_plan=None, v_free=None):
-    """The receipt's "band" block (C15 (5)): where the arrival stretch began and by what source, the speed of the
+    """The receipt's "band" block: where the arrival stretch began and by what source, the speed of the
     fast part, the ONE speed the arrival ran at (arrive_mm_s) beside the speed solved for it (solved_mm_s), the
     ending force and the two figures stated before the motion. With no source: the price of that, the
     control periods the stroke plans beside what a look or a stated distance would make of it."""

@@ -3,8 +3,7 @@
 Espinola, Qifan Zhang and Yu Xiang, "From Reasoning to Action: Benchmarking Frontier AI Models on LIBERO-10 Robot
 Manipulation Tasks", licence CC BY 4.0), served over the rcpx socket protocol by bench/ext/episode_ext.py. The system
 prompt (the paper's Figure 2) and the tool descriptions (its Figure 3) are the paper's text BYTE FOR BYTE, copied
-from the listing sources embedded in https://arxiv.org/html/2610.30051v1 (the design notes holds
-them, every sentence that fixes semantics and the list of declared differences). The authors' code repository has
+from the listing sources embedded in https://arxiv.org/html/2610.30051v1. The authors' code repository has
 no licence and was never opened: the code here is a clean build from the paper's text. Three numbers are not in
 the paper and are set here: the per-step caps STEP_CAP.
 
@@ -23,7 +22,7 @@ pose") and the current gripper command to the clamped target, cut into n = max o
 20 Hz steps; a value left out keeps its present value; equal targets run 0 steps. Each step's six rotation values
 are made a rotation by Gram-Schmidt (a step whose values make none keeps the previous rotation; a TARGET that makes
 none is refused) and sent as one absolute OSC_POSE step. The rotation values are the absolute first two columns of
-the grip site's world rotation (the paper's printed call fixes this reading; PAPER-PROTOCOL.md 4.6). Not
+the grip site's world rotation (the paper's printed call fixes this reading). Not
 convergence checked. Gripper rule (the paper leaves it open): default "command", every step of a call carries the
 call's gripper command; declared variant "ramp" (RCPX_NATIVE_VARIANT=gripper=ramp), the command is interpolated
 like the pose, so only the steps past 0.5 close. The step count is the same under both.
@@ -39,7 +38,7 @@ after that turn, 17 to 106 without it). So the surface native serves the picture
 agentview mirrored left to right, each wrist picture flipped top to bottom, same file names); the declared variant
 "images=true" (RCPX_NATIVE_VARIANT, beside gripper=..., comma separated) serves the env host's own pictures, and
 native_sense (and native_calib over it), whose pictures are the rcpx arm's, always does. Not reproduced: the paper's
-living room scenes show no ketchup, milk or orange juice; this lane's LIBERO has them (PAPER-PROTOCOL.md section 6).
+living room scenes show no ketchup, milk or orange juice; the LIBERO run here has them.
 
 Endings: the env host halts the episode at the first success and at the step budget ("over" for both; step budget
 + 1 never runs); done and give_up end it as a claim; a lost env host as "env_lost"; and the answer of the last

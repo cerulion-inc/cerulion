@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The numbered picture of the eyes package (SPEC-R5 4.1): the look's own picture with each candidate's outline and
+"""The numbered picture of the eyes package: the look's own picture with each candidate's outline and
 its number beside the outline, outside it.
 
 The picture is NEVER turned, scaled or cut: it has the look's size and, outside the drawn outlines and number

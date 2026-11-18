@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Generic N-arm MuJoCo world with free boxes and fixed or arm-mounted cameras, for desk tests of the bimanual
+"""Generic N-arm MuJoCo world with free boxes and fixed or arm-mounted cameras, for tests of the bimanual
 package (rcpx/r2/bimanual.py).
 
 TwinSim(spec, bases, boxes=..., cameras=...) implements rcpx.r2.bimanual_arms.MultiArmBackend: N copies of one bench

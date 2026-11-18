@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Pure helpers of the eyes package (SPEC-R5 4.1): the one merged, numbered list, what the manual says about a
+"""Pure helpers of the eyes package: the one merged, numbered list, what the manual says about a
 colour, which sides of a thing a picture cannot show, and the part a pick may take from a row.
 
 Nothing here reads a picture, a file, a clock or the executor, and nothing names a robot, a device or a part: part
@@ -145,7 +145,7 @@ def _combine_words(kept, dropped):
 
 
 def merge(per_part, proposed, parts, first=()) -> list:
-    """The numbered list (SPEC-R5 4.1). per_part: {word: [rows the vision model returned for it]}; proposed: the
+    """The numbered list. per_part: {word: [rows the vision model returned for it]}; proposed: the
     proposer's rows, best first. Word order: the words in `first` (the model's own words), then the manual's
     control parts, cue parts, forbidden parts, fixed parts, then any other key. Each word's rows by confidence, the
     best BEST_PER_PART kept, interleaved by rank (the first of every word, then the second of every word, ...);

@@ -37,7 +37,7 @@ MANUAL_KEYS = ("part", "name", "label", "kind", "where", "moves", "direction", "
 WORDS_ONLY = ("where",)   # kept at manual level only as words (a text or a list of texts), never numbers
 # A size key that names where something is rather than how big it is: never served as a rough size.
 POSITION_WORDS = ("above", "pivot", "distance", "axis_height", "centre_height", "center_height",
-                  "behind", "gap")   # where a part sits behind a face or a bar (maintainer flag, 2026-11-11)
+                  "behind", "gap")   # where a part sits behind a face or a bar
 ROUGH_NOTE = ("size_mm at manual level is rough, as a manual's drawing gives it (rounded, within about 20 percent); "
               "it gives no position, travel or force")
 NEVER_KEYS = ("state", "current_state", "qpos", "value")  # the present state is never knowledge
@@ -178,7 +178,7 @@ def _names(entry, keys):
 
 
 def sheet_of(doc, names):
-    """The force the SERVED robot://devices document states for a named thing (round six, contract C3 (2)):
+    """The force the SERVED robot://devices document states for a named thing:
     {"max_n", "what"} or None. doc is the document as the session serves it (device_knowledge at the session's
     level), never a scene; names are what the call and the session call the thing (an id, a label, a part's
     name). A device is matched by its id, name or label and gives its max_force_n; a part by its part, name or

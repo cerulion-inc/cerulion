@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The tail of a move that did not wait at its end (C10), and what a stroke counts before it starts (C12).
+"""The tail of a move that did not wait at its end, and what a stroke counts before it starts.
 
 A move with no tolerance stated returns while the hand is still travelling onto the end it was told to reach: its
 lag tail. Nothing else runs in that tail but the next call, so the next call owns it:
@@ -13,7 +13,7 @@ While a hand brakes onto a command that stands still, its force estimate reads t
 bench: 20.3 N along the travel, located inside the table, 20 mm before the thing the next touch found at 1 N), and
 no self-test measures that level. So in such a wait (arrive, and the settle of a move that waits at its end) only
 the guard's CAP ends the wait at once; the contact threshold judges when the hand STANDS, at the level of an arm at
-rest (C10: a wait judges the force at rest against the level): a hand that stands on something has met it
+rest (a wait judges the force at rest against the level): a hand that stands on something has met it
 (standing()). Such a stop is eased, told to the bounds as found standing (its arrival speed was not measured, so
 it never enters a slope fit), stored as a move's contact is, and, in arrive, handed on as ex._tail = {"call",
 "stopped", "contact", "periods", "said", "ran"}; the receipts of the motion core carry it as tail_contact, every
@@ -188,7 +188,7 @@ def finish_count(ex, path, g, recent):
 
 
 def stroke_count(planned_s, dt):
-    """The budget count of a stroke (C12): the control periods of its plan as it will run, and the one period
+    """The budget count of a stroke: the control periods of its plan as it will run, and the one period
     the ease that ends every stroke runs at the least (Executor._ease_impl)."""
     return int(math.ceil(float(planned_s) / float(dt))) + 1
 
@@ -218,7 +218,7 @@ def _stand_thing(ex, rec, zone):
 
 
 def stand_limit(ex, rec, intent, zone):
-    """The limit somebody stated for the thing the hand stands on (the design rulings's limits, never a force_n): max_n or
+    """The limit somebody stated for the thing the hand stands on (stated limits, never a force_n): max_n or
     gentle on this call or on the call that made or worked the contact, the sheet of that thing where the session
     serves one, a give, the site, a rating, people (B.stated_limit). {"limit_n": None, ...} with none."""
     words = {k: v for k, v in (intent or {}).items() if k in control_expect.LIMIT_WORDS and v}
@@ -449,14 +449,14 @@ def speed_said(ran_m_s, solved_m_s):
 
 
 def limit_block(lim, ran, link=None, at_s=None):
-    """What a move says of the limit somebody stated on it (the design rulings: kept or passed is said,
+    """What a move says of the limit somebody stated on it (kept or passed is said,
     for the tool and for a link alike). lim: the plan's limit {limit_n, source, shown: every arrival of the plan
     under it is shown kept by this arm's own resolved stops, cost: what the limit added and where it held, zone:
     the plan's stretches (rcpx/bounds_free.py)}; ran: the stop's own record (strike.ran) or None when the move
     met nothing; link: the body the push was located on when it is no tool body; at_s: the path coordinate of
     the stop (m). kept is True only where the stop's own figure stands at or under the limit and the plan's
     speed is shown to keep it; False where a reading passed it; None where nothing was met or it is not shown.
-    A contact on a stretch that was known free (the limit did not hold it, the design rulings) is said PASSED with its
+    A contact on a stretch that was known free (the limit did not hold it) is said PASSED with its
     figure when that figure is over the limit or was not read; kept only when its figure stands at or under it."""
     limit_n, source = float(lim["limit_n"]), lim.get("source")
     head = f"the limit of {limit_n:g} N ({source})"

@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Pure SI laws for derived motion bounds, A1 and A4.
 
-Round six: no law here lowers a speed or a force for doubt. What a contact may see is a stated limit
+No law here lowers a speed or a force for doubt. What a contact may see is a stated limit
 (rcpx/bounds_limit.py); what a motion could strike is priced (rcpx/bounds_strike.py).
 """
 
@@ -102,7 +102,7 @@ def a_dec(f_thr_of_a, f_allow, a_brake):
 
 
 def series(k1, k2):
-    """Series stiffness with an unknown stiffness treated as rigid, Q9."""
+    """Series stiffness with an unknown stiffness treated as rigid."""
     if k1 is None or math.isinf(k1):
         return math.inf if k2 is None else k2
     if k2 is None or math.isinf(k2):
@@ -111,14 +111,14 @@ def series(k1, k2):
 
 
 def z_impact(m_eff, b_per_s=None, c=1.0, c2=None):
-    """Contact-model or fitted impact slope times effective mass, Q9."""
+    """Contact-model or fitted impact slope times effective mass."""
     if b_per_s is not None:
         return c * b_per_s * m_eff
     return c2 * m_eff if c2 is not None else None
 
 
 def stop_slope(z_i, k_w, t_det, lag_s):
-    """Impact plus servo run-on slope with its relative margin, Q9."""
+    """Impact plus servo run-on slope with its relative margin."""
     if z_i is None:
         return None
     if not math.isfinite(k_w):
@@ -127,7 +127,7 @@ def stop_slope(z_i, k_w, t_det, lag_s):
 
 
 def with_margin(z):
-    """Apply the relative margin to a fitted stop slope, Q9."""
+    """Apply the relative margin to a fitted stop slope."""
     return None if z is None else z * (1 + REL)
 
 
@@ -151,7 +151,7 @@ def tell_speed(rigid_m, t_det, a_brake):
     return speed_for_stop(rigid_m, t_det, a_brake) if rigid_m > 0 and math.isfinite(rigid_m) else None
 
 
-def arrival_speed(rigid_m, band_m, t_det, a_brake):   # r6 shim: the older name and signature of tell_speed
+def arrival_speed(rigid_m, band_m, t_det, a_brake):   # compat shim: the older name and signature of tell_speed
     return tell_speed(rigid_m, t_det, a_brake)
 
 
@@ -166,7 +166,7 @@ def peak_floor(m_eff, v, t_sample):
 
 
 def f_hand(hand_kg, g, held_n=0.0):
-    """Weight of the hand and any carried load, Q2 (a load not read yet counts as none)."""
+    """Weight of the hand and any carried load (a load not read yet counts as none)."""
     return g * hand_kg + (held_n or 0.0)
 
 
@@ -227,7 +227,7 @@ def same_spot(sigma_a, sigma_b, w_tool):
 
 
 def rigid(quantum, jitter, force_n, k_servo):
-    """Resolvable travel plus elastic servo give, Q3."""
+    """Resolvable travel plus elastic servo give."""
     give = force_n / k_servo if force_n and k_servo is not None and math.isfinite(k_servo) and k_servo > 0 else 0.0
     return QUANT * quantum + jitter + give
 
@@ -313,7 +313,7 @@ def strike_speed(f_allow, aim_n, z):
 
 def false_stop(impulse_ns, sigma_f, t_det, rest_n, f_thr0, stop_impulse_ns=None):
     """Small impulse gone at rest is false, A1.1. Small is inside the noise or, in the relative form a noise-free
-    reading needs, under REL of the impulse that stopping the moving mass would give (m_eff x v, Q8)."""
+    reading needs, under REL of the impulse that stopping the moving mass would give (m_eff x v)."""
     small = impulse_ns < TWO_READ * sigma_f * t_det
     if stop_impulse_ns is not None and math.isfinite(stop_impulse_ns):
         small = small or impulse_ns < REL * stop_impulse_ns
@@ -321,30 +321,30 @@ def false_stop(impulse_ns, sigma_f, t_det, rest_n, f_thr0, stop_impulse_ns=None)
 
 
 def m_eff(a, m_inv):
-    """Reciprocal directional joint mobility is effective mass, Q8."""
+    """Reciprocal directional joint mobility is effective mass."""
     den = float(np.asarray(a) @ m_inv @ np.asarray(a))
     return 1 / den if den > 0 else math.inf
 
 
 def k_servo(a, kp):
-    """Reciprocal directional joint compliance is servo stiffness, Q8."""
+    """Reciprocal directional joint compliance is servo stiffness."""
     den = sum(aj ** 2 / kj for aj, kj in zip(a, kp) if kj > 0)
     return 1 / den if den > 0 else math.inf
 
 
 def a_brake_model(tau_max, g_tau, m_jpinv_u):
-    """Torque left after gravity over directional joint inertia, Q7."""
+    """Torque left after gravity over directional joint inertia."""
     return min((max(0, t - abs(g)) / abs(a) for t, g, a in zip(tau_max, g_tau, m_jpinv_u) if a != 0), default=math.inf)
 
 
 def qdd_model(tau_max, g_tau, m_diag):
-    """Per-joint gravity-reserved torque over diagonal inertia, Q1."""
+    """Per-joint gravity-reserved torque over diagonal inertia."""
     margin = np.maximum(0, np.asarray(tau_max) - np.abs(g_tau))
     return np.divide(margin, m_diag, out=np.zeros_like(margin, dtype=float), where=np.asarray(m_diag) > 0)
 
 
 def qd_until_known(qdd, joint_range):
-    """Speed reached over the joint range at model acceleration, Q1."""
+    """Speed reached over the joint range at model acceleration."""
     return np.sqrt(TWO * np.asarray(qdd) * np.asarray(joint_range))
 
 

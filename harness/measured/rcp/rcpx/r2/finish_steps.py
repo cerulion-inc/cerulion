@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The measurement step of the claim gate's travel rules (package finish; SPEC-R4, ledger CK-09), pure.
+"""The measurement step of the claim gate's travel rules (package finish), pure.
 
 No millimetre is typed: each act record carries rigid_mm, the arm's own measurement step at the act's pose (finish
 writes it), and every travel rule is a multiple (a ratio of rcpx.bounds_ratios) of the step of the acts that made
 the travel. An act with no recorded step counts a step of 0: then any travel over 0 reads as travel, and no travel
-never does (SPEC-R4 A1.1: a threshold that can be zero is never crossed by zero).
+never does (a threshold that can be zero is never crossed by zero).
 """
 
 from rcpx import bounds_ratios as R

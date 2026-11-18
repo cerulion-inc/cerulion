@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The SI bounds interface, A8.1, with session-only thing evidence. Round six: speed is the
+"""The SI bounds interface, with session-only thing evidence. Speed is the
 body's. Nothing here lowers a motion but a stated limit (stated_limit and arrival, rcpx/bounds_limit.py); doubt
 is priced on the plan, never slowed or refused for."""
 
@@ -42,7 +42,7 @@ class Bounds:
         self.space._bounds = self
 
     def _load_know(self):
-        """The stored self-knowledge of this robot (A2.1, C17), read at session open with no motion; else an empty one."""
+        """The stored self-knowledge of this robot, read at session open with no motion; else an empty one."""
         try:
             know = importlib.import_module("rcpx.bounds_self").of(self.ex)
             if know is not None:
@@ -132,7 +132,7 @@ class Bounds:
 
     def qdd_max(self, q):
         """Per joint the lesser of the model's acceleration (the torque limit over the inertia) and what a
-        self-test pass showed (accel_j); where no pass ran, the model's (C6). Never a stored share of it."""
+        self-test pass showed (accel_j); where no pass ran, the model's. Never a stored share of it."""
         value, source, evidence = self.model_know.get("qdd_max", self._pose(q)[0])
         value = np.asarray(value, dtype=float)
         shown = self._shown("accel_j", value.shape)
@@ -193,12 +193,12 @@ class Bounds:
         hidden, source = model_hidden(self, self._value("tau_hidden", v)), self.src("tau_hidden")
         return self._derived("tau_thr", laws.tau_thr(hidden, self._value("sigma_tau", v)), *source)
 
-    def _stops(self):    # the stops this robot keeps (C5): the self-knowledge's own list, else the session's
+    def _stops(self):    # the stops this robot keeps: the self-knowledge's own list, else the session's
         kept = getattr(self.know, "stops", None)
         return list(kept() if callable(kept) else self.stops)
 
     def t_det(self, readings=2):
-        """The detection time (C5): the largest over this robot's stops; with none, the guard's own readings."""
+        """The detection time: the largest over this robot's stops; with none, the guard's own readings."""
         seconds, text, n = bounds_stops.t_det(self._stops(), self.dt(), readings)
         return self._derived("t_det", seconds, "contact" if n else "model", text)
 
@@ -212,7 +212,7 @@ class Bounds:
         return self._value("t_settle")
 
     def a_brake(self, q, u):
-        """Braking along u from the joints that carry the motion (C6): the model's (the torque left after gravity
+        """Braking along u from the joints that carry the motion: the model's (the torque left after gravity
         over the directional inertia), and per joint no more than a self-test pass showed (brake_j). The stored
         scalar of round four (the least lever times braking over all joints) is never read."""
         q, u = self._pose(q, u)
@@ -248,7 +248,7 @@ class Bounds:
         return self._value("f_cap", q, u) if "f_cap" in self._override else self._derived("f_cap", self.robot.f_cap(q, u))
 
     def f_tool(self):
-        """The tool's stated contact rating (spec tool_rating_n), else None (C1): a grip force is no rating."""
+        """The tool's stated contact rating (spec tool_rating_n), else None: a grip force is no rating."""
         rated = self.robot.model.spec.get("tool_rating_n")
         if rated is None:
             return self._derived("f_tool", None, "model", "no contact rating is stated for the tool")
@@ -284,7 +284,7 @@ class Bounds:
         return max(b.values(), default=None) if isinstance(b, dict) else b
 
     def model_z(self, q, u, thing=None, part_kg=0.0):
-        """The body's model of the stop slope, N per (m/s) (C5 changed; rcpx/bounds_know_point.py): the contact
+        """The body's model of the stop slope, N per (m/s) (rcpx/bounds_know_point.py): the contact
         rate times the mass that moves along the travel at the point (held fast), plus the servo's stiffness there
         times (the detection time plus the lag); a link's point (bounds_robot.point_model) gives its own, by the
         energy bound at the leg's joint step where one is handed (bounds_limit.moving_point). None with no contact
@@ -312,7 +312,7 @@ class Bounds:
         return bounds_stops.Slope(z, said=said, **({} if body is not None else {"moving": bounds_strike.moving_at(self, q)}))
 
     def slope(self, q, u, thing=None, part_kg=0.0):
-        """(the stop slope N per (m/s) for SOLVING a speed from a force, what it rests on) (C5 changed); (None,
+        """(the stop slope N per (m/s) for SOLVING a speed from a force, what it rests on); (None,
         why) with no contact model. Under a stated limit, and for a link's point: bounds_stops.slope, the slope
         the motion's figure is stated with (never under the body's model). Else (the force a touch, a close, a
         landing or a press ends at; a caller outside a plan): bounds_stops.estimate, what this body's stops
@@ -362,12 +362,12 @@ class Bounds:
         return next((v for v in self.ex.world.query(include_stale=True) if ref in (v.get("id"), v.get("label"))), None)
 
     def stated_limit(self, thing=None, intent=None, expected=False):
-        """C3: the least limit somebody STATED (rcpx/bounds_limit.py gather_limit); limit_n None when none is."""
+        """The least limit somebody STATED (rcpx/bounds_limit.py gather_limit); limit_n None when none is."""
         got = solve.noted(self, limit.gather_limit(self, thing, intent, expected))   # a limit, or a force to end at
         return self._derived("stated_limit", got, got["source"] if got["limit_n"] is not None else "model", got["evidence"])
 
     def arrival(self, limit_n, source, q, u, held=None, floor=None):
-        """C3: {"v_m_s", "kept", "shown_by", "seek", "strike_n", "f_guard_n", "text"}: the speed at which a contact
+        """{"v_m_s", "kept", "shown_by", "seek", "strike_n", "f_guard_n", "text"}: the speed at which a contact
         under limit_n is met at q along u, solved from the contact threshold of the arm at rest at that speed
         (under a known hold no less than the hold's level) and the stop slope here (rcpx/bounds_limit.py arrival
         and gather_arrival, which a caller that has derived its leg's guard asks itself). floor: stated_limit's
@@ -379,7 +379,7 @@ class Bounds:
         return self._derived("arrival", got, source, got["text"])
 
     def f_allow(self, thing, q, u, intent=None, meant=False):
-        """The force a contact with the thing may see, as a bound item: the stated limit (C3) when under what the
+        """The force a contact with the thing may see, as a bound item: the stated limit when under what the
         robot itself can push there, else the robot's own side. meant (the move is to move the thing): only the operator's."""
         got = self.stated_limit(thing, intent, expected=True)
         own, term = laws.f_allow(None, self.f_cap(q, u), self.e_tau(), self.f_tool())
@@ -407,12 +407,12 @@ class Bounds:
                              got["source"], evidence)
 
     def note_give(self, thing, force_n, why):
-        """A give of this session (C3 (4)): it bounds later contacts with that thing and things of its stated label."""
+        """A give of this session: it bounds later contacts with that thing and things of its stated label."""
         return note_give(self, thing, force_n, why)
 
     def note_stop(self, thing, q, u, v, peak_n, impulse_ns, resolved, moved_m, held=False, rest_n=None, k_c=None,
                   ext_peak=None, *, det_periods=None, expect=None, stop=None):
-        """A contact stop (C5, C9; bounds_book.note_stop). It keeps its pose; an arrival's figures are remembered."""
+        """A contact stop (bounds_book.note_stop). It keeps its pose; an arrival's figures are remembered."""
         if isinstance(stop, dict):
             stop.setdefault("q", [float(x) for x in np.asarray(q, dtype=float)])
             before = (stop.get("said") or {}).get("before")
@@ -441,7 +441,7 @@ class Bounds:
         cap_source = "the tool's stated contact rating" if term == "tool" else "what the arm can push along this travel"
         hold = None if not (isinstance(held, dict) and "weight_n" in held) else ("first" if held["weight_n"] is None else "known")
         if hold == "first":
-            # C8: the load is not read yet, so no contact threshold can tell it from a contact: for this ONE leg
+            # the load is not read yet, so no contact threshold can tell it from a contact: for this ONE leg
             # only the cap judges (the least of the arm's own push and the hold's stated limit)
             if held.get("limit_n") is not None and held["limit_n"] < cap:
                 cap, cap_source = held["limit_n"], f"the hold's stated limit ({held.get('limit_source')})"
@@ -455,7 +455,7 @@ class Bounds:
                 force, one = level, max(one, level)
                 source = f"the hold's own level ({held.get('level_source')}); cap {cap:.3g} N: {cap_source}"
             spec = GuardSpec(force, one, self.tau_thr(v), direction, cap, readings)
-        spec.source, spec.hold, spec.expect = source, hold, None     # plain attributes: KNOW adds the fields (C13)
+        spec.source, spec.hold, spec.expect = source, hold, None     # plain attributes: KNOW adds the fields
         return self._derived("guard", spec)
 
     def force(self, kind, thing, q, u, intent=None):
@@ -540,21 +540,21 @@ class Bounds:
         return self._derived("spacing", laws.spacing(margin_m))
 
     def report(self, result, items, detail="brief"):
-        """Attach the bounds; a cold session's first result also carries "selfknow" (contract C17)."""
+        """Attach the bounds; a cold session's first result also carries "selfknow"."""
         cold = getattr(self.ex, "_selfknow_cold", None)
         if cold is not None and not getattr(self, "_cold_said", False) and isinstance(result, dict):
             result["selfknow"], self._cold_said = cold, True
         return report.attach(result, items, detail)
 
     def begin(self, what="call"):
-        """A call, or a phase of one, begins. Nothing is re-seen and nothing ages (C4): no changes; the word goes."""
+        """A call, or a phase of one, begins. Nothing is re-seen and nothing ages: no changes; the word goes."""
         if what == "call":
             self._word_info = None
-            solve.new_call(self)          # the numbers of the call before; a cold session's first line (C17)
+            solve.new_call(self)          # the numbers of the call before; a cold session's first line
         return []
 
     def word(self, intent, path=None):
-        """The operator's word (C4): {"look", "given", "text", "refused"}: recorded; refused only for an unknown look."""
+        """The operator's word: {"look", "given", "text", "refused"}: recorded; refused only for an unknown look."""
         intent = intent or {}
         clear = intent.get("clear")
         named = clear.get("look") if isinstance(clear, dict) else (clear if isinstance(clear, str) else intent.get("look"))
@@ -576,7 +576,7 @@ class Bounds:
         return self._word_info
 
     def plan(self, q0, path, kind, target=None, intent=None, held=None, away_from=None, expect=None):
-        """expect (C9): the expected contact of the path's last stretch, or one per path segment (None where a
+        """expect: the expected contact of the path's last stretch, or one per path segment (None where a
         segment expects none); intent expect "contact" marks the last stretch when no expect is given."""
         from rcpx.bounds_plan import plan
         return solve.planned(self, [intent], held, expect, lambda: plan(

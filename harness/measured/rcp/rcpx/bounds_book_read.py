@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What the arm READ at a stop (an earlier round, p4-read): the touching point's speed from the joint speeds the backend
+"""What the arm READ at a stop: the touching point's speed from the joint speeds the backend
 reported, and what the drives can push at that point. No robot is named; nothing is typed.
 
     note_reading(ex, s)                  -> keeps (t, q, qd) of each reading of the present call

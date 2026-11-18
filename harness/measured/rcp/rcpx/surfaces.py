@@ -9,7 +9,7 @@ Two surfaces:
   an argument schema and one worked example.
 - V0: the plain-manifest baseline: read_state, move_joints (degrees by joint name), gripper, snapshot.
 
-NO NUMBER OF THE ROBOT LIVES HERE (SPEC-R4 A5, A6). The tables are written in WORDS: where the runtime knows a
+NO NUMBER OF THE ROBOT LIVES HERE. The tables are written in WORDS: where the runtime knows a
 number (the contact threshold, the gentle first-touch bound, the robot's full speed ...) the text holds one of the
 slot phrases of rcpx/surface_session.py SLOTS, and a session puts its own derived value and where it came from
 behind the phrase when it serves a list (for_session; rcpx/server.py Session._list). A listing built with no
@@ -19,7 +19,7 @@ Schema language and the constructors of a schema (_num, _pos, _obj, _tool ...): 
 carries no derived end: a speed, force, travel, time or count argument has its type and its sign ("x-positive")
 and no range; a value the robot cannot do is refused by the primitive, with the derived end in the refusal.
 Ranges that remain are geometry or shares (an angle to turn, the gripper's opening as a share, a pixel index).
-guarded is retired (SPEC-R4 A6): the move tools still accept it ("x-retired": no listing shows it) and it changes
+guarded is retired: the move tools still accept it ("x-retired": no listing shows it) and it changes
 no bound. clear, expect and max_n are the operating model's words ("x-intent"). JOINT stands for a joint name in
 an example; for_robot() puts the robot's first joint name there once a session knows it.
 
@@ -48,7 +48,7 @@ from rcpx.surface_session import (DETAIL_VALUES, FREE_TOOLS, SLOTS, WAIT_TOOL, W
 THRESHOLD, ONE_READING, HAND = SLOTS["f_thr"], SLOTS["f_one"], SLOTS["f_hand"]
 TOOL_RATING, RIGID, FULL_SPEED = SLOTS["f_tool"], SLOTS["rigid"], SLOTS["v_full"]
 LIMIT_COST = SLOTS["limit_cost"]
-# the design rulings as amended (the maintainer's answer to question 29): a limit only a model typed is a request until its record
+# a limit only a model typed is a request until its record
 # earns it more; the words say so where max_n and gentle are offered
 TYPED_LIMIT = "A limit you type is a request, not a guarantee: the result says kept or PASSED with its figure."
 
@@ -120,7 +120,7 @@ _SPEED = _pos("a share of the robot's full joint speed, more than 0 and at most 
 _GRIP = {"anyOf": [{"type": "number", "minimum": 0.0, "maximum": 1.0},
                    {"type": "string", "enum": ["open", "close"]}],
          "description": "opening as a fraction (0 closed, 1 fully open) or \"open\" or \"close\""}
-# The operating model's words (SPEC-R4 A6) and the retired argument. One line of text each.
+# The operating model's words and the retired argument. One line of text each.
 _CLEAR = {"anyOf": [{"type": "boolean"},
                     {"type": "object", "properties": {"look": {"anyOf": [{"type": "string"}, {"type": "integer"}]}},
                      "required": ["look"], "additionalProperties": False}],

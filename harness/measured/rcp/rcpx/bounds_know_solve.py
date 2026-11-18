@@ -7,7 +7,7 @@ A speed is solved from a force in two cases that are not the same promise:
   (rcpx.bounds_stops.slope: the body's model with its margin, raised where stops read over it), so that what
   the motion says it can strike and what it says it keeps are one number. That is the price of a limit.
 - a force a motion ENDS at (a touch's force_n or the hand's own weight, a close's squeeze, a landing's force, a
-  press's force_n, a push law's ceiling): no limit and no promise (the design rulings: "the way in runs at the speed solved
+  press's force_n, a push law's ceiling): no limit and no promise ("the way in runs at the speed solved
   for T"). It is solved with what this body's stops showed (rcpx.bounds_stops.estimate, also under the model),
   as the first pass did; the result states the strike the arrival could make by the first slope.
 The hand-overs of rcpx/bounds.py see every stated number of a call (stated_limit answers it, plan, plan_time,
@@ -20,11 +20,11 @@ measured slope answers. A link's point is always solved with the first slope (no
   contacts.
 - planned(B, intents, held, expect, call): a plan run under keeps().
 - run(B, mode, call): call() with B._solving = mode; what stood is put back (plans nest).
-- new_call(B): a call begins; the cold session's line for the first result of any tool (contract C17).
+- new_call(B): a call begins; the cold session's line for the first result of any tool.
 - above(B, got): an arrival solved faster than the fastest stop that bears the fit (V1) runs at the speed solved
 : nothing holds it to V1. Its strike there is stated by the energy bound, an upper bound by
   physics (rcpx/bounds_strike.py rule 2), and the answer says so: it is not shown kept by a stop. The one case
-  the design rulings keeps for a hold (no bound by physics can be stated) does not arise: a body whose description states
+  kept for a hold (no bound by physics can be stated) does not arise: a body whose description states
   no contact model has no stop that bears a fit, so no V1, and its arrival solves no speed from a slope.
 - rest(B): the contact level of the still arm by this robot's own self-knowledge, never raised by this session's
   own false stops: the force rigid() reads the servo's give at when no force is named (bounds.Bounds.rigid).
@@ -90,7 +90,7 @@ def run(B, mode, call):
 def new_call(B):
     """A call begins: the numbers of the call before are forgotten. At the first call of a session (no motion) a
     cold session's line goes to the sentences the call's result takes (bounds_notes), whatever tool makes it
-    (contract C17, rcpx.bounds_selfstart.notice)."""
+    (rcpx.bounds_selfstart.notice)."""
     B.__dict__.pop("_stated_numbers", None)
     if getattr(B, "_cold_asked", False):
         return

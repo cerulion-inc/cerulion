@@ -182,7 +182,7 @@ def raise_epoch(ex, st, why, pose=None, err=None, source=None):
 
 
 def give_stale(ex, st, why):
-    """A base move: the measured give no longer describes the base under the arm (I11 measures again)."""
+    """A base move: the measured give no longer describes the base under the arm (the next push measures again)."""
     g = getattr(ex, "base_give", None)
     if g:
         st["give"] = {"stale": True, "was": dict(g), "since_epoch": ex.epoch, "why": why}

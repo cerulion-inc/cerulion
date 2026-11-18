@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The ladder registry and the table of ready calls (SPEC-R5 4.5, 4.6; package assist).
+"""The ladder registry and the table of ready calls (package assist).
 
 THE LADDER. Help comes in rungs per skill (seeing, acting, checking); every rung is a real tool. A row is
 {skill, rung, tool, line (at most 100 characters), needs [tool or state names]}. build(ex, session) reads each
@@ -510,7 +510,7 @@ def _watch(ex, kinds):
 
 
 def context(ex, session):
-    """The ctx dict of the offer engine and of its untried rule (SPEC-R5 9.2), from what the session holds now."""
+    """The ctx dict of the offer engine and of its untried rule, from what the session holds now."""
     from rcpx.r2 import assist_check
     st = _state(ex) or {}
     gauge = st.get("gauge")

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Pointing tests with a known answer, and what the robot's own checks said (SPEC-R5 section 3; package assist).
+"""Pointing tests with a known answer, and what the robot's own checks said (package assist).
 
 Every pointing act is a test the robot can mark without ground truth: it knows where its own body is in that look
 (the body model at the look's joint pose) and what the manual says the parts look like. All of it is sensing: it
@@ -299,7 +299,7 @@ def colour_mislabel(image, px, label, doc, can_see=None):
             continue
         for state, c in other.get("colours", {}).items():
             if colour_words.near(c, colour):
-                # the colour of the ground the thing stands on is no sign of another part (integrator, 2026-11-12:
+                # the colour of the ground the thing stands on is no sign of another part (seen:
                 # a mark a few pixels off a small part, on a table of the colour the manual gives a lit lamp,
                 # read as that lamp on a correct operator)
                 ground = ground_colour(image)
@@ -486,7 +486,7 @@ def located_rows(ex, guard=None, flags=None, limit=6):
     return rows
 
 
-# ---------------------------------------------------------------- the standing preferences (SPEC-R5 6.5)
+# ---------------------------------------------------------------- the standing preferences
 # One word each through assist {"set": WORD}; only the operator sets one. Each answer says what will be different,
 # what the robot will do on its own under it, and what it costs. The tables stand in this file (not in assist.py)
 # only for that file's length; assist.py applies them.

@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What the robot itself reads while a held thing is lowered, and how far its own stops run on (round six, second
-pass, package p2_land's fix round: the design rulings; contract C15 (4)).
+"""What the robot itself reads while a held thing is lowered, and how far its own stops run on.
 
 Two readers of the control periods (tick hooks of the session: they move nothing and read no truth):
 
@@ -108,7 +107,7 @@ class RunOn:
            speed: a hand that stood still after a level or a slower stop can run on after a faster one along
            gravity (and then reaches the band faster than the arrival); read only on stops along the way down at
            the stretch's speed or faster, a thing held on its corner lands that much higher and the jaws of a hand
-           with one hinged jaw may then not open on it (tests/r6_p2_land_ab.py);
+           with one hinged jaw may then not open on it (seen in a test);
         3. lag_m, the body's own lag at that speed (the stored record: how far the hand trails its command
            there): a hand that runs on past a command that comes to stand has that much to make up and can
            carry it past the end; never under what a way down of this session showed before a load cut it. (Not

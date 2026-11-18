@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Colour words (SPEC-R3.md 3.5): one table that names a patch's colour the same way in every package, and reads
+"""Colour words: one table that names a patch's colour the same way in every package, and reads
 the colour words of a device sheet. Pure: images (H x W x 3 uint8 RGB) and text in, names and booleans out.
 
     balance(frame, mask)                        grey-world gains (r, g, b) from the masked pixels (the floor)

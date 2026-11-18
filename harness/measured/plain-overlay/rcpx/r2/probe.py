@@ -166,7 +166,7 @@ class Mixin:
         if force_n is None:
             force_n, source, evidence = derived.default_force_n(B, thing, entry)
             if force_n is None:
-                # the design rulings: a force nobody stated and nothing has shown is a doubt, never a refusal: the ramp runs to
+                # a force nobody stated and nothing has shown is a doubt, never a refusal: the ramp runs to
                 # what the arm can push here, as the core's press does (r3_limits.force_spec), and the result says so
                 spec0 = B.force("probe", thing, s.q, d, intent=dict(intent or {}))
                 force_n, source = float(spec0.ceiling_n), "model"

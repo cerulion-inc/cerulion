@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""view (package sight, I37; SPEC-R3 4.5): put the camera on a named side of a thing, or around it.
+"""view (package sight): put the camera on a named side of a thing, or around it.
 
 target: a located or contact id, a part label (the newest fresh located entry whose label names that part) or a
 survey candidate id (c1, c2, ...). side: robot_side, left, right, far_side (robot-relative, rcpx.side_words), above,
@@ -50,7 +50,7 @@ def side_dir(side, target_m, front=None):
 
 def side_pose(ex, q_now, target_m, side, size_mm=None, distance_mm=None, elevation_deg=None, front=None,
               path=True, sigma_mm=None, extent_mm=None):
-    """view's pose search for one side (SPEC-R3 4.5 view): {q, cam_m, d_mm, el_deg, az_deg, roll_deg, how} or
+    """view's pose search for one side: {q, cam_m, d_mm, el_deg, az_deg, roll_deg, how} or
     {"why"}. The camera stands on the side at the distances of view_distances (from the nearest at which the whole
     thing is in the picture, out to the arm's reach); the elevation the given one (VIEW_EL_DEG, or
     VIEW_EL_ABOVE_DEG above), then +/-10 and 20; the azimuth the side's, then +/-VIEW_AZ_STEP_DEG; the axis through
@@ -452,7 +452,7 @@ def _around(ex, tg, q_now, distance_mm, elevation_deg, detail, intent=None, move
 
 
 def plan_camera(ex, target_mm, side, distance_mm=None, elevation_deg=None):
-    """ex.state["sight"]["plan_camera"] (SPEC-R3 3.3): {q or None, got_side, why}, dry (nothing moves)."""
+    """ex.state["sight"]["plan_camera"]: {q or None, got_side, why}, dry (nothing moves)."""
     if side not in SIDES or side in ("around", "front"):
         return {"q": None, "got_side": None, "why": f"side {side!r} has no single pose"}
     T = np.asarray(target_mm, dtype=float) / MM

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The rows of the eyes package (SPEC-R5 4.1, 7.4): make_rows asks the vision service when one is declared and
+"""The rows of the eyes package: make_rows asks the vision service when one is declared and
 answers from geometry and colour when none is or it does not answer; the robot's own body in a look as polygons;
 and the words of a row that come from the picture and the body model.
 
@@ -260,7 +260,7 @@ def table_hit_mm(ex, q, u, v):
 
 # ---------------------------------------------------------------- the rows of a list
 def make_rows(ex, st, rec, img, exclude, words=None, only_words=False, n_max=None):
-    """The rows of a look's list (SPEC-R5 4.1) as a record {source, words, items, unseen, notes, threshold, floor,
+    """The rows of a look's list as a record {source, words, items, unseen, notes, threshold, floor,
     per_phrase}, or None for a find (only_words) that the vision model did not answer.
     Level words: one find for EVERY part name of the manual (and the operator's own words of this call, first),
     then the model's regions; level segments: the regions; level absent, or a service that did not answer: colour
@@ -340,7 +340,7 @@ def at(st, key, u, v):
 
 
 def find_at(ex, st, look_id, u, v, part):
-    """The sensing job of SPEC-R5 section 3: "in" when the pixel lies in one of the first 8 candidates the vision
+    """The sensing job: "in" when the pixel lies in one of the first 8 candidates the vision
     model gives for the part's name on that look's frame file, "out" when it gives candidates and the pixel lies
     in none, "not known" otherwise (no service, a timeout, no candidate, a level that is not words). Safe off the
     session thread: it reads the frame's path, the kept body polygons and the service's address, makes one

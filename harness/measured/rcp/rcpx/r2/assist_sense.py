@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Sensing off the answer path (SPEC-R5 0.1 G5, section 3): a robot-side check that only gathers evidence runs on
+"""Sensing off the answer path: a robot-side check that only gathers evidence runs on
 a worker thread while the operator thinks, and its finding is read when the next request arrives.
 
     start(job, fn)      returns at once. job is a plain dict {call, what, ...}; fn(job) -> a verdict word. One worker

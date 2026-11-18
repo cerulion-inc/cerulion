@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Tool table and practices of package place (N4), version two (SPEC-R4 B4, B6). See rcpx/r2/place.py.
+"""Tool table and practices of package place, version two. See rcpx/r2/place.py.
 
 A spot is {"look": id, "px": [u, v]} (a pixel on the thing or the place, in a look the operator was shown),
 a located label, or [x, y, z] in base frame mm. No schema carries a range: what the arm cannot do is refused by the
@@ -71,7 +71,7 @@ _RELEASE = _text("drop: let go above the spot instead of lowering until it touch
                  "drop height and energy (optional)", enum=("drop",))
 _RELEASE_MM = dict(_NUMBER, description="the older way to ask for a drop: let go with the thing's bottom this high "
                                         "above the surface, mm", **{"x-retired": True})
-# the design rulings as amended (the maintainer's answer to question 29): a limit only a model typed is a request
+# a limit only a model typed is a request
 _TYPED = "A limit you type is a request, not a guarantee: the result says kept or PASSED with its figure."
 _GENTLE = _flag("a stated limit of the hand's weight on what the call touches; it slows only where a contact "
                 "can begin, and the result says kept or PASSED and limit.cost. " + _TYPED)

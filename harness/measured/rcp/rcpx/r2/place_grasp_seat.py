@@ -5,7 +5,7 @@ A hand with ONE moving jaw pushes the thing against its fixed jaw. Where such a 
 is across the bearing the jaws were planned on (its width as seen or stated, its error and the jaws' own band), the
 thing stands turned against the fixed jaw: two edges hold it, not two faces. It turns between the pads when the hand
 moves, comes loose and is caught again by the closing jaw, or leaves the pads in the lift. The take reads it from the
-jaws' own gap before the lift and re-seats ONCE inside the same take (it is no second take: the design rulings stands). A hand
+jaws' own gap before the lift and re-seats ONCE inside the same take (it is no second take). A hand
 with two moving jaws centres the thing between them and holds it on its corners; the gap alone shows no weak hold
 there and nothing is re-seated (measured: such a hand held and lifted the thing as it stood, and a re-seat cost it
 half again the take's control periods for nothing).
@@ -82,7 +82,7 @@ class SeatMixin:
     def _pk_reseat(self, plan, ready, S, c, how, word, ev, doubt, strikes, ran=None):
         """The re-seat of a hold that stands on a corner (module text). c: the close that stands; how: the
         arguments the take closed with; ran: the way down as the hand ran it (m), which every close of this take
-        tells the hold as its leg in (C8: the turn of the open jaws is no way in). Returns (the close that stands
+        tells the hold as its leg in (the turn of the open jaws is no way in). Returns (the close that stands
         at the end, the hand as it stands)."""
         J = self._pl_jaws
         band = ready["band"]

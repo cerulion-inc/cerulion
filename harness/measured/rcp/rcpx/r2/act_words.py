@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The words of push and lift (SPEC-R3.md 3.1 and 4.3): the said sentence of each stop, the next call, and the
+"""The words of push and lift: the said sentence of each stop, the next call, and the
 brief result. Pure: dicts in, dicts and text out.
 
     said(stopped, **f)             the one sentence that leads the result (at most SAID_MAX_WORDS words)
@@ -131,7 +131,7 @@ def _call(tool, args, why):
 
 def next_for(stopped, ctx):
     """
-    The next of a push (SPEC-R3 4.3). ctx: tools (loaded names), target (id), label, part (name or
+    The next of a push. ctx: tools (loaded names), target (id), label, part (name or
     None),
     others (fresh located ids of other control parts), up (the felt face points up), how (the
     goal's how_to_tell

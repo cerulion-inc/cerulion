@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Round three numerics (SPEC-R3.md sections 3 and 4): the word rules, image numerics and counts that are NOT limits
+"""Round three numerics: the word rules, image numerics and counts that are NOT limits
 on speed, force, travel or time. They are the same on every robot because they describe words, pixels and answer
 sizes, not motion. rcpx/r3_limits.py serves every name here as its own (from rcpx.r3_numerics import *), so readers
 keep writing r3_limits.NAME; the limits themselves are functions of the bounds object there."""

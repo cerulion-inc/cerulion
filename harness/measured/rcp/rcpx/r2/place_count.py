@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The count of package place (N4), round six (the design notes, contract C12): what a whole-step tool will take,
+"""The count of package place: what a whole-step tool will take,
 before it moves, and the small parts of its receipt.
 
 The budget line of a put and of a place is the control periods of the plan AS IT WILL RUN at its planned speeds:
@@ -20,7 +20,7 @@ inside each stream piece.
 - budget(tool, need, left, price, word, call): the refusal; with a stated limit it names the word, its price in
   control periods, the least limit that fits and the ready calls. _pl_word, _pl_word_price and
   _pl_limit_cost make the blocks; result["limit"]["cost"] is what the word added, and where.
-- worst(strikes): the largest strike of several motions (C2), with the largest model and link figure any of them
+- worst(strikes): the largest strike of several motions, with the largest model and link figure any of them
   states. doubts(lines): the doubt lines of a receipt.
 Nothing here reads ground truth or names a robot.
 """
@@ -62,7 +62,7 @@ class CountMixin:
         return max(int(ratios.QUANT), int(math.ceil(float(bounds.of(self).t_settle()) / float(self.dt)))) + int(stop)
 
     def _pl_place_count(self, way, facts, start=None, intent=None):
-        """The control periods a place plans (C12): the carry's one stream; the way down as the bounds time it
+        """The control periods a place plans: the carry's one stream; the way down as the bounds time it
         and the wait that ends a leg that means a contact; the release at the jaws' own rate; the rise from
         where the way down ends. No margin, and no branch that is not planned. start: the pose the way was
         planned from (default: where the hand was told to be). Counted before the take (nothing held yet), the
@@ -125,7 +125,7 @@ class CountMixin:
                 "lift": lift, "rest": wait + wait}
 
     def _pl_price(self, a, target, intent):
-        """The control periods one item of a put plans before it starts (C12): the take (the pick's own count when
+        """The control periods one item of a put plans before it starts: the take (the pick's own count when
         the pick gives one, else _pl_take_count), then the place from where the take leaves the hand (its
         stream, the way down, the release, the rise), with the held thing taken as deep as the thing was seen
         tall. Returns {"periods", "take", "place", "take_parts", "place_parts", "take_by"}."""
@@ -187,7 +187,7 @@ class CountMixin:
             st.update(keep)
         return out
 
-    # ---------------------------------------------------------------- the price of a stated limit (the design rulings, C12)
+    # ---------------------------------------------------------------- the price of a stated limit
     def _pl_word(self, target, intent):
         """The limit this call states for its contacts, as a budget line names it: {"word": "gentle" | "max_n" |
         "the sheet of X" | "the site" | the source, "limit_n", "own": the operator's own word on the call,
@@ -203,7 +203,7 @@ class CountMixin:
                 "text": (f"Your word {word}" if own else word[:1].upper() + word[1:]) + f" ({float(lim['limit_n']):.3g} N)"}
 
     def _pl_word_price(self, word, intent, count, left=None):
-        """What a stated limit costs this plan (C12): {"word", "limit_n", "without_periods": the same plan with the
+        """What a stated limit costs this plan: {"word", "limit_n", "without_periods": the same plan with the
         word left out, "fits_n": the least limit of a doubling ladder from the stated one whose plan fits the
         periods left (None: none fits, the word is not the operator's own, or nothing is left to ask for),
         "fits_periods"}. count(intent) -> control periods or None: the caller's own count of the same plan."""
@@ -216,8 +216,8 @@ class CountMixin:
         n = float(word["limit_n"])
         # each step doubles the limit; it ends when the plan fits (the plan without the word fits, so a large
         # enough limit does), or after as many doublings as a float's mantissa tells apart. A doubling that gains
-        # nothing does not end it (a plateau: another leg binds until the limit passes its figure; final review 2,
-        # medium 3: 10 of 10 refusals under max_n 20 named no least max_n)
+        # nothing does not end it (a plateau: another leg binds until the limit passes its figure;
+        # without it 10 of 10 refusals under max_n 20 named no least max_n)
         for _ in range(sys.float_info.mant_dig):
             n *= ratios.DOUBLE
             got = count(dict(bare, max_n=n))
@@ -230,7 +230,7 @@ class CountMixin:
 
     @staticmethod
     def _pl_limit_cost(word, without, used, phases):
-        """result["limit"]["cost"] (C12): the control periods the stated limit added, and in which phases a bound
+        """result["limit"]["cost"]: the control periods the stated limit added, and in which phases a bound
         of that source was the binding one."""
         where = [p["phase"] for p in phases or [] if isinstance(p.get("bounds"), dict)
                  and str(p["bounds"].get("source")) == word["source"]]
@@ -246,7 +246,7 @@ def call_of(tool, item, intent):
 
 
 def budget(tool, need, left, price=None, word=None, call=None):
-    """The budget refusal (C12): the plan as it will run needs more control periods than are left; nothing moved.
+    """The budget refusal: the plan as it will run needs more control periods than are left; nothing moved.
     word: _pl_word_price's block when the call states a limit: the refusal then NAMES the word, says how many of
     the plan's periods are its price, and offers the same call with the least limit that fits (first: it keeps a
     limit) and the same call without the word (only the operator's own word can be left out), each with its
@@ -294,7 +294,7 @@ def _size(strike):
 
 
 def worst(strikes):
-    """The largest strike of several motions (a whole-step tool carries the largest of its motions, C2), ranked by
+    """The largest strike of several motions (a whole-step tool carries the largest of its motions), ranked by
     its own stated figure. Its model figure and its link figure are the largest ANY of the motions states (a
     motion with a small floor can hold the largest model figure, and a reader takes the receipt's strike for
     the whole tool); "of_all" says so."""

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Where a survey looks from (package survey, I32): a ring of views around the robot, from the body model.
+"""Where a survey looks from (package survey): a ring of views around the robot, from the body model.
 
 The views are the standard look turned about the base's vertical axis. When the first joint of the chain turns
 about a vertical axis through the base origin (read off RobotModel.joint_frames at the standard pose), a view is
@@ -213,7 +213,7 @@ CLEAR_ARG = {"anyOf": [{"type": "boolean"}, {"type": "object", "properties": {"l
 
 
 def clear_word(clear):
-    """(intent, why): the operator's word of a tool call as the intent its moves take (SPEC-R4 A6: clear is true, or
+    """(intent, why): the operator's word of a tool call as the intent its moves take (clear is true, or
     {"look": id}); why is the text of a refusal when clear is anything else."""
     if clear is None or clear is False:
         return None, None
@@ -230,11 +230,11 @@ OLD_CORE_SHARE = 0.5     # TRANSITION only (see look_move): never read on a core
 
 
 def look_move(ex, q, intent=None, share=None):
-    """The camera's own joint move to q: ex._joint_move(q, None, kind="look", intent=...) (SPEC-R4 A8.2: speed
+    """The camera's own joint move to q: ex._joint_move(q, None, kind="look", intent=...) (speed
     None is the derived full speed, the contact stop armed; a share under 1 is the caller's own lower speed).
     TRANSITION: a core that does not take kind yet is called the way it was called before round four (the share
-    OLD_CORE_SHARE of its own speed setting, guarded), so nothing changes on that core; the Review stage removes
-    that branch and the constant. Returns the core's stop dict or a refusal."""
+    OLD_CORE_SHARE of its own speed setting, guarded), so nothing changes on that core.
+    Returns the core's stop dict or a refusal."""
     move = ex._joint_move
     q = np.asarray(q, dtype=float)
     slower = share is not None and share < 1
@@ -259,7 +259,7 @@ def binding(move):
 
 
 def report(ex, out, moves, t0, detail="brief"):
-    """out with periods (control periods since t0) and, when a move reported one, bounds (SPEC-R4 A5): the binding
+    """out with periods (control periods since t0) and, when a move reported one, bounds: the binding
     bounds of the tool's own moves through the session's report."""
     out["periods"] = periods(ex, t0)
     items = [i for i in (binding(m) for m in moves) if i is not None]

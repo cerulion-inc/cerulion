@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The contact rate the robot's own bodies can meet the scene with, by the simulator's own mixing rule (the design rulings,
-the design rulings): pure over a compiled MjModel, no stepping. The env host calls rates() on the whole scene and answers by the
+"""The contact rate the robot's own bodies can meet the scene with, by the simulator's own mixing rule: pure over a compiled MjModel, no stepping. The env host calls rates() on the whole scene and answers by the
 robot's own body names only (bench/ext/libero/envhost.py op contact_rates); the backend folds the answer into its
 contact_model (bench/ext/libero/backend.py). Nothing here names a scene item in what it returns.
 

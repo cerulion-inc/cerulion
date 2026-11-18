@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""I22 person package, part two: geometry and looks for the two constraint behaviours.
+"""Person package, part two: geometry and looks for the two constraint behaviours.
 
 Jaws. The region "between the jaws" is the convex hull of every jaw body's geometry (the bodies the spec's gripper
 joints move, with their children) sampled at openings from the present one to the commanded one, at the present arm

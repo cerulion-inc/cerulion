@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The texts of the carry profile (SPEC-R3.md section 6), rendered from what a session loads and lists. Pure: names
+"""The texts of the carry profile, rendered from what a session loads and lists. Pure: names
 in, text out. Nothing here names a robot, a device or a part.
 
     practices(tools, packages, calls, lift_listed=False) -> str     6.1, one numbered line each
@@ -12,7 +12,7 @@ declared (cfg r3_lift_declared): only then does a text name lift.
 
 Rendering rule (6.4): a line whose tools are not loaded is replaced by its fallback; every alternative below keeps
 the line's intent with the tools that are there. Where the spec's fallback names a field the arm does not have,
-the nearest wording that names only what is there is used (SPEC-CHANGES.md, carry lines):
+the nearest wording that names only what is there is used (carry lines):
 - line 2 without view: the spec's "the candidate whose fits says it matches" needs sight's fits, and sight is the
   package that brings view; without sight the line names the candidate's size against the device's size_mm;
 - line 3 and line 5 name press (through use) instead of push when act is not loaded;

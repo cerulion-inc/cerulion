@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The base check after a push (I8, I11; FINDINGS R1): did the push move the robot's base?
+"""The base check after a push: did the push move the robot's base?
 
 It compares the standard look with its reference. It is DUE only when the push could have shifted the base by
 more than the stored points are good to: peak force x the base's give (mm per N: measured by measure_base_give;
@@ -7,8 +7,8 @@ until then no more than this push's own travel under load per newton, since a ba
 passes the smallest error of the points robot://world holds. It never runs on a base stated fixed or read rigid,
 without a reference, or when the caller asked base_check "defer" or "skip".
 
-Every move it makes is one the operator did not command. Each is planned by its direction against the part
-(SPEC-R4 A4.2), with the contact stop armed:
+Every move it makes is one the operator did not command. Each is planned by its direction against the part, with the
+contact stop armed:
 
 1. leave (kind retreat, away from the part): the arm retraces the way it came (its history, newest first) until
    every part of it stands off every stored contact and located point and the point just pushed by the bounds'

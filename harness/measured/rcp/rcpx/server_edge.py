@@ -60,7 +60,7 @@ class EdgeMixin:
             world.spot_rule = spot_rule(executor)
         clock = getattr(executor, "sim_time", None)
         if world is not None and hasattr(world, "clock") and world.clock is None and callable(clock):
-            world.clock = clock   # observations are stamped when they are taken (FINDINGS S9)
+            world.clock = clock   # observations are stamped when they are taken
         claim = getattr(self, "claim_spec", None) or surfaces.CLAIM
         self.dark_hint = surfaces.dark_rule([t["name"] for t in self.surface["tools"]],
                                             cannot="cannot" in (claim.get("args") or {}).get("properties", {}))
@@ -255,7 +255,7 @@ class EdgeMixin:
         return out
 
     def park_arm(self, why):
-        """Park the arm for a session that is about to close without its operator (SPEC-R4 A4.1: an abandoned
+        """Park the arm for a session that is about to close without its operator (an abandoned
         session parks): through the gates an operator's park would meet (rcpx/r2/core.py gates, asked on the
         real executor) and then the executor's own park, which runs through the harness's wrapper like any call.
         It charges no call, is journaled as a session record with event park, and never raises."""
@@ -323,8 +323,8 @@ def _takes(fn, name):
 
 
 def _without_absent_gripper(surface, executor):
-    """The surface as listed, without its gripper tool on a robot whose model says it has none (a fixed finger;
-    FINDINGS T6). A call of it still runs and gets the primitive's own refusal."""
+    """The surface as listed, without its gripper tool on a robot whose model says it has none (a fixed finger). A call
+    of it still runs and gets the primitive's own refusal."""
     spec = getattr(getattr(executor, "model", None), "spec", None)
     if not (isinstance(spec, dict) and "gripper" in spec and not spec["gripper"]):
         return surface
@@ -360,7 +360,7 @@ def _tip_half_width(ex):
 
 
 def spot_rule(ex):
-    """The session's "same spot" for two stored contacts (SPEC-R4 A4.3): their combined position error plus the
+    """The session's "same spot" for two stored contacts: their combined position error plus the
     tool tip's own half width, in mm; None when the session has no bounds. An entry's error is what it states
     (data.error_mm: what its speed and the reading's step left open), else what the bounds hold for that thing,
     else the travel the robot can tell from none at that contact's force (rigid): never a typed length."""

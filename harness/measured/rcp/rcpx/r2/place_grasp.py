@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Where the jaws go, of package place (round six: the design notes C11 and C12, the design rulings): from the spot a
+"""Where the jaws go, of package place: from the spot a
 pick was pointed at and the hand's own shape, never from a list of things, and never a refusal because something is
 unsure. A measured thing makes the plan better; it is not the gate: every plan that a better look gives and this
 arm cannot take falls back to the plan of the point itself.
@@ -78,7 +78,7 @@ def num(x, default=None):
 
 
 def line(what, acted, would_remove=None):
-    """One doubt line of a receipt (C12): what was unsure with its number and source, what the tool did about it,
+    """One doubt line of a receipt: what was unsure with its number and source, what the tool did about it,
     and the ONE ready call that would remove it (or None)."""
     return {"what": str(what), "acted": str(acted), "would_remove": would_remove}
 
@@ -487,7 +487,7 @@ def choose(ex, seen, hints=None):
         return d, ("nothing is seen of what stands under the point: half the fingers' depth under it, no deeper "
                    "than half its height over the support")
     blind = unseen if S["narrow"] is None else None
-    # the design rulings: a thing that fits the hand whole is taken at its seen middle wherever on it the pixel lies
+    # a thing that fits the hand whole is taken at its seen middle wherever on it the pixel lies
     if place_grasp_ways.whole(narrow, both, J.max_m, want):
         if fixed is not None:
             opts = [(float(fixed), extent_along(narrow, wide, bearing, float(fixed)))]
@@ -529,7 +529,7 @@ def choose(ex, seen, hints=None):
 
     def every():
         """The candidates in order: the whole thing; then, read once from the thing's own points when the whole
-        thing gave no plan (the design rulings: place_grasp_ways), its rim nearest the pixel wherever on it the pixel lies
+        thing gave no plan (place_grasp_ways), its rim nearest the pixel wherever on it the pixel lies
         (a hollow thing's wall, read from its top and centred where the pads meet it: ahead of the wall and the
         part read at the pixel itself); its wall at the pixel, its part through the pixel; every other part of
         it that fits the jaws, nearest the pixel first; the point itself last."""
@@ -578,7 +578,7 @@ def choose(ex, seen, hints=None):
                               f"took {cand[1]}", None))
         plan["doubt"] = lines + plan["doubt"]
         plan["sigma_z"] = S["sigma_z"]
-        if plan.get("width_m") is not None:       # where the width the close runs to came from (C8: width.source)
+        if plan.get("width_m") is not None:       # where the width the close runs to came from (width.source)
             plan["width_source"] = "stated" if stated else "seen: the spot"
         return plan
     if abs(float(t[-1])) > HALF and want == "auto":

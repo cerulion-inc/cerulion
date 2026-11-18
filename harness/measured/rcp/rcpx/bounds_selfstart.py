@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""How a session starts on what the robot knows of itself (SPEC-R4 A2.1; round six the design rulings, contract C17).
+"""How a session starts on what the robot knows of itself.
 The measuring itself is rcpx/bounds_selftest.py (run); the record is rcpx/bounds_self.py (SelfKnow).
 
 before_move(ex) is the gate a session calls before its first operator move. The stored record of this body is the
@@ -123,7 +123,7 @@ LACKS = (
 
 
 def cold(ex, know=None, still=None):
-    """What a session with no stored record says of it (contract C17): {"stored": False, "key", "path": where the
+    """What a session with no stored record says of it: {"stored": False, "key", "path": where the
     record would be read from, "lacks": what stands on the body's description instead of a measurement, "cost":
     words, "calibration": {"periods": about how many control periods one calibration takes, from the body's own
     model}, "still_hold": {"periods": what the one still hold of this session's first move costs (None before
@@ -161,7 +161,7 @@ def notice(ex, B):
 
 def first_result(ex, result):
     """A post hook on the operator's own calls: the first result of a cold session, whatever tool made it, carries
-    "selfknow" (contract C17); later results are left as they are."""
+    "selfknow"; later results are left as they are."""
     said = getattr(ex, "_selfknow_cold", None)
     if said is None or getattr(ex, "_selfknow_first_said", False) or not isinstance(result, dict):
         return None

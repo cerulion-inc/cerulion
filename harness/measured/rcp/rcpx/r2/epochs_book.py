@@ -119,7 +119,7 @@ def _initial_error(ex, e, result=None):
     u = [float(x) / norm for x in u] if norm > 0 else [0, 0, 1]
     source = f"contact: {said} x detection delay + quantum"
     if speed is None:
-        # an earlier round p4-read (a): a stop whose speed no record carries takes the speed the arm READ at the stop
+        # a stop whose speed no record carries takes the speed the arm READ at the stop
         # (the touching point's speed from the joint speeds of the reading the stop was read at, and the one
         # before it), never the free speed bound; a stop made in this call is read at its own reading
         made_now = (e.get("observed_at") or {}).get("call") == ex.world.now.get("call")
@@ -189,7 +189,7 @@ def raise_epoch(ex, st, why, pose=None, err=None, source=None):
 
 
 def give_stale(ex, st, why):
-    """A base move: the measured give no longer describes the base under the arm (I11 measures again)."""
+    """A base move: the measured give no longer describes the base under the arm (the next push measures again)."""
     g = getattr(ex, "base_give", None)
     if g:
         st["give"] = {"stale": True, "was": dict(g), "since_epoch": ex.epoch, "why": why}

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Camera poses of the witness package (SPEC-R3.md 4.4): the same view, the robot's own body in a frame, where a
+"""Camera poses of the witness package: the same view, the robot's own body in a frame, where a
 point or a survey candidate falls in a look, and the move that puts the camera back at a look's pose.
 
     cam_pose(model, q)                       (position m, rotation): the wrist camera at joint pose q (frame B)
@@ -499,7 +499,7 @@ def settle(ex, tool="look"):
     exposure. At least one pair is compared. The wait goes on while the time waited is under the arm's own settle
     time with its margin (witness_bounds.settle_bound_s) or the picture is still calming (the difference fell by REL
     of the last one; the first pair that differs has no last one and is given a second); it ends at the first pair
-    that did not get calmer after that time (no progress, SPEC-R4 A4.8). No number of seconds is typed.
+    that did not get calmer after that time (no progress). No number of seconds is typed.
     {settled, waited_s, ended: agree | no_progress}."""
     from rcpx import perception
     t0, waited, previous = ex.sim_time(), 0.0, None

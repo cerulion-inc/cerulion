@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The plug-in core of round two (SPEC-R2.md sections 1.1 and 1.2).
+"""The plug-in core of round two.
 
 A package is a module rcpx/r2/<name>.py that may export ID, Mixin, setup(ex), TOOLS, RESOURCES, RESOURCE_PATCH,
 HANDLERS and PRACTICES. This file loads the packages, builds one Executor class from the round one Executor plus
@@ -28,7 +28,7 @@ judges its evidence against the last call that moved the arm.
 
 OPT-IN packages (OPT_IN) are in PACKAGES for their place in the order, but "all" leaves them out: one loads only
 when it is named ("all,lean", "lean", or a list that names it). IMPLIES names what a package needs loaded with it:
-naming carry also loads lean (SPEC-R3 2.2 C0; carry's profile is served through lean's LEAN_PROFILE).
+naming carry also loads lean (carry's profile is served through lean's LEAN_PROFILE).
 
 HELD packages (HELD, a part of OPT_IN) are built and tested but stay out of "all" while a known fault of the
 highest class is open against them (a tool that can act on a part the device sheet forbids, a result that can say
@@ -37,7 +37,7 @@ gets such a tool unless it asks for it by name ("all,act"). The setting RCPX_R2_
 puts those names back into "all" for one process and its children: a held package's own tests set it, so that
 they exercise the package the way an episode that names it would. A name that is not in HELD is ignored there.
 
-GATES (SPEC-R3 3.8): a primitive called from inside another runs bare, so a move the runtime makes by itself would
+GATES: a primitive called from inside another runs bare, so a move the runtime makes by itself would
 skip the dark gate, the person gates and the path gates. ex.gates(name, kwargs) runs every pre hook an operator's
 call of name would meet (a hook registered without names covers every primitive), in registration order, on one
 copy of kwargs, and returns the first refusal (a ("skip", result) answer counts as none); None when every gate
@@ -102,7 +102,7 @@ class PackageImportError(ImportError):
 
 
 def load(enabled=None):
-    """Import every enabled package. the design rulings: a listed package that does not import (it fails to import,
+    """Import every enabled package. A listed package that does not import (it fails to import,
     or it is not there) is an error that stops the session start, never a dropped line: PackageImportError names
     each with the last line of its trace (load.problems and load.absent keep the whole record)."""
     mods, load.problems, load.absent = [], {}, []
@@ -228,7 +228,7 @@ class HookMixin:
 
     # ---------------------------------------------------------------- plumbing
     def _guarded(self, fn, where, *args, **kwargs):
-        """A hook's answer. the design rulings: a PRE hook or a gate that raises REFUSES the call (fails closed:
+        """A hook's answer. A PRE hook or a gate that raises REFUSES the call (fails closed:
         check hook_failed, the hook's error in the answer); a post hook, a tick, an idle hook or an event listener
         that raises is journaled and leaves the result as it was."""
         try:
@@ -257,7 +257,7 @@ class HookMixin:
             if self._depth > 0 or self._hook_depth > 0:
                 return bound(*args, **kwargs)        # nested: hooks run on the operator's own call only
             opened = getattr(self, "_open_call", None)
-            if opened is not None:                   # the design rulings: an earlier call's passage frees nothing here
+            if opened is not None:                   # an earlier call's passage frees nothing here
                 opened()                             # (the hooks' checks read the same opening as the call)
             self._call_opened = True
             self._jaws_enter()                       # the hooks' path checks see the jaws where they are too
@@ -562,7 +562,7 @@ def assemble(ex, mods, base_surface, base_resources=None, base_handlers=None):
 
         def practices(**kw):
             content = inner(**kw)
-            extra = PRACTICES_HEADING + "\n" + "\n".join(lines)     # FINDINGS T10: under a heading, not a run
+            extra = PRACTICES_HEADING + "\n" + "\n".join(lines)     # under a heading, not a run
             if isinstance(content, str):
                 return content.rstrip() + "\n" + extra + "\n"
             if isinstance(content, dict) and isinstance(content.get("text"), str):

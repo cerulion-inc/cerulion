@@ -2,12 +2,12 @@
 """The landing of a held thing.
 
 A set down is fast to the band where a contact can begin and arrives inside it at the speed SOLVED for the force the
-landing may make, never under the tell speed (the same law as a touch, the design rulings):
+landing may make, never under the tell speed (the same law as a touch):
 
 - ends(): the force the landing may make. A limit somebody stated for the thing (the call's word, a served sheet,
-  the site, a rating, a give, the limit the hold's record carries) replaces everything else and is kept (C3). With
-  nothing stated it is what the thing already bears: the hold's own stated squeeze per pad (C8), an ENDING force
-  (C9: expect["floor"] present; the receipt never calls it a limit). Where no squeeze stands (nothing is held by
+  the site, a rating, a give, the limit the hold's record carries) replaces everything else and is kept. With
+  nothing stated it is what the thing already bears: the hold's own stated squeeze per pad, an ENDING force
+  (expect["floor"] present; the receipt never calls it a limit). Where no squeeze stands (nothing is held by
   jaws that state one) nothing slows the landing.
 - band(): where a contact can begin: about the tip height at which the thing's bottom reaches what the place's look
   shows, by BAND (laws.band) of the two stated errors together: the place's own height error (its Seen sigma_z; for
@@ -15,7 +15,7 @@ landing may make, never under the tell speed (the same law as a touch, the desig
   (the take's own figure). Into an opening whose floor no look shows, a contact can begin anywhere under the rim.
   No stated error for the place: no band; the whole way down is the arrival stretch and the receipt prices it.
   Never a typed length.
-- the hand-over (fix round; C10, C15 (2)): the fast stretch ends its COMMAND above the band's upper edge by how
+- the hand-over: the fast stretch ends its COMMAND above the band's upper edge by how
   far this body's hand runs on past a command that comes to stand (place_land_watch.RunOn: measured on this
   session's own free stops, as a time, times the stretch's fastest speed), and where the hand is still faster
   than the arrival speed when that command stands it waits by motion alone (C10's wait, guarded). So the HAND,
@@ -137,9 +137,9 @@ def band(target, facts, z_end, into, support=None, sig_b=None, res=0.0, z_low=No
 
 def expects(sigma_xy, half_width, land):
     """(the C9 record of the fast stretch, the C9 record of the arrival stretch or None). The fast stretch is an
-    expected contact with nothing that lowers it (a thing met there is met at the speed that runs: the design rulings); the
+    expected contact with nothing that lowers it (a thing met there is met at the speed that runs); the
     arrival stretch carries the landing's force as its bound (land: ends()'s force; None: nothing slows the
-    landing and there is no arrival stretch), an ENDING force with its floor when nothing is stated (C9)."""
+    landing and there is no arrival stretch), an ENDING force with its floor when nothing is stated."""
     fast = {"with": None, "radius_m": (float(sigma_xy) if finite(sigma_xy) else 0.0) + float(half_width),
             "along": DOWN.copy(), "bound_n": None, "bound_source": None, "seek": True}
     if land is None:
@@ -173,7 +173,7 @@ def _priced(B, q, v, f_guard):
 def _arm(B, q, v, held):
     """The arm's own figure along the travel for a contact met at v (N): the threshold its guard runs with there
     (under a known hold no less than the hold's level) plus the stop slope at that pose times v, and never under
-    what the plan's own price states for that sample (C2); None with no slope."""
+    what the plan's own price states for that sample; None with no slope."""
     z, text = B.slope(q, DOWN)
     if z is None or not finite(z):
         return None, None
@@ -185,7 +185,7 @@ def _arm(B, q, v, held):
 
 
 def block(ex, B, q, land, bnd, pads, z_from=None, z_end=None):
-    """The receipt's band block (C15 (5)) as the plan knows it before anything moves: {"from_mm", "source",
+    """The receipt's band block as the plan knows it before anything moves: {"from_mm", "source",
     "sigma_mm", "half_mm", "fast_mm_s", "arrive_mm_s", "ends_n", "ends_source", "fast_n", "arrive_n", ...}, or None
     when nothing slows the landing, and beside it the unrounded figures {"v_arr", "arm_arr", "v_fast"}. q: the
     joints over the place; z_from: the tip height the way down starts at; z_end: where its fast stretch ends."""
@@ -225,13 +225,13 @@ def block(ex, B, q, land, bnd, pads, z_from=None, z_end=None):
     if land["is"] == "ends":
         out["kept"] = None          # an ending force is no limit: nothing is kept or passed
     else:
-        out["shown_kept"] = bool(arr.get("kept"))      # the arrival's own answer (C3): shown by resolved stops
+        out["shown_kept"] = bool(arr.get("kept"))      # the arrival's own answer: shown by resolved stops
     return out, {"v_arr": v_arr, "arm_arr": float(arm_arr) if finite(arm_arr) else None, "v_fast": v_fast}
 
 
 def after(band_block, r, pads, watch=None, arm_fn=None, exact=None):
     """The set down's strike block after the way down ran (r: the result of the stretch that ended it, with
-    "fast": the fast stretch's own result when the arrival stretch ran after it): the plan's strike (C2) with the
+    "fast": the fast stretch's own result when the arrival stretch ran after it): the plan's strike with the
     band, the two figures before the motion and ONE figure after the stop under "ran", which covers the whole
     way down. watch: what place_land_watch.LandWatch read over both stretches; arm_fn(v): the arm's own figure
     along the travel for a contact met at v (N). The speed the figure is for, the largest of:
@@ -243,7 +243,7 @@ def after(band_block, r, pads, watch=None, arm_fn=None, exact=None):
     the pads' rise; never under the strike of a thing caught again between the pads."""
     end = dict(r.get("strike") or {}) if isinstance(r, dict) else {}
     first = r.get("fast") if isinstance(r, dict) and isinstance(r.get("fast"), dict) else None
-    st = dict(first.get("strike") or {}) if first is not None else dict(end)   # the plan's fastest sample (C2)
+    st = dict(first.get("strike") or {}) if first is not None else dict(end)   # the plan's fastest sample
     ran = dict(end.get("ran") or {})
     z, thr = end.get("z_n_s_m"), end.get("f_guard_n")
     plan_v, plan_peak = st.get("v_m_s"), st.get("peak_n")
@@ -321,7 +321,7 @@ def after(band_block, r, pads, watch=None, arm_fn=None, exact=None):
         early = float(met["z"]) - float(b["from_mm"]) / MM          # met before the band: session evidence
         b["met_before_band_mm"] = round(early * MM, 1)
     if b is not None and b.get("ends_is") == "limit":
-        # the design rulings: kept is said only when every contact this landing made was under the limit. The limit is on
+        # kept is said only when every contact this landing made was under the limit. The limit is on
         # what the landing makes of the thing on what it lands on: the arm's figure along the travel at the
         # speed the figure is for; whenever that is over the limit the receipt says PASSED with it
         lim = float(b["ends_n"])
@@ -345,7 +345,7 @@ class LandMixin(SaidMixin):
 
     def _pl_land_plan(self, B, target, intent, facts, z_end, into, above, walled=False, z_low=None, hand_z=None):
         """The landing's part of a set down's plan, made when its end height is known: {"limit": the stated limit
-        of the place (C3), "expect": the C9 record of the way down's FAST stretch, "z_end": where that stretch
+        of the place, "expect": the C9 record of the way down's FAST stretch, "z_end": where that stretch
         ends (above the band's upper edge by how far this body's hand runs on past its command: RunOn; the true
         end where nothing slows the landing), "z_true": the true end (the band's lower edge for a thing set onto
         a place; never under hand_z, the hand's own stop over what a look shows beside the place),

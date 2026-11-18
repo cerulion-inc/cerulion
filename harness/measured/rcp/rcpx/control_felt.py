@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """What a move met, below any stop threshold too (Felt), with the two small helpers the core's results share. Split
-from rcpx/control_base.py in round six (that file's size); control_base re-exports every name. No robot is named
+from rcpx/control_base.py for that file's size; control_base re-exports every name. No robot is named
 here and no limit is stated here: Felt's levels are asked of the session's bounds (ex._felt_levels).
 """
 

@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Motion primitives of the Executor (I2, I6, I12): streaming and the moves (planning and the path check are in
+"""Motion primitives of the Executor: streaming and the moves (planning and the path check are in
 control_plan.py, the bounds every move runs under in control_speed.py, the jaws in control.py).
 
 A plan is the robot's own fastest along its path, slowed by the session's bounds only where they have reason to; it
-is streamed one joint target per control period with the contact stop armed. A move ends where it says (C10,
-control_move_pace.py): its command never leads the measured hand by more than the body's own lag, and it ends
+is streamed one joint target per control period with the contact stop armed. A move ends where it says
+(control_move_pace.py): its command never leads the measured hand by more than the body's own lag, and it ends
 "goal" only when the command stands at its end and the hand inside its still band of it; a hand that stays
 further behind and does not close ends the move "short", with told_mm at the measured pose. A stated tolerance
 (tolerance_mm) has the end waited for and corrected to it; a move that means a contact holds its last target
@@ -333,7 +333,7 @@ class MotionMixin(PlanMixin, SpeedMixin):
     # ------------------------------------------------------------------ move_tip
     def _move_intent(self, clear=None, expect=None, tolerance_mm=None, max_n=None):
         """The intent of an operator's move: only what the call states. tolerance_mm: what the caller needs of
-        the end pose (the end is then waited for and corrected, C10). max_n: a stated limit (C3)."""
+        the end pose (the end is then waited for and corrected). max_n: a stated limit."""
         intent = {k: v for k, v in (("clear", clear), ("expect", expect)) if v}
         if max_n is not None:
             intent["max_n"] = float(max_n)
@@ -528,7 +528,7 @@ class MotionMixin(PlanMixin, SpeedMixin):
             out["why"] = r["why"]
         return out
 
-    # ------------------------------------------------------------------ ease, retreat, park, home (I6, I12)
+    # ------------------------------------------------------------------ ease, retreat, park, home
     @primitive
     def ease(self):
         s = self._ease_impl()

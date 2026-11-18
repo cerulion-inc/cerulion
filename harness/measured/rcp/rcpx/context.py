@@ -28,7 +28,7 @@ from rcpx.context_devices import (LEVEL_SOURCE, LEVELS, MANUAL_DEVICE_KEYS, MANU
 KINDS = ("contact", "located", "device", "state", "event", "box")
 # A touch is a measurement; a located point is an image estimate; a device entry is a hypothesis;
 # a state claim is unconfirmed until verify; an event is a record of something that happened.
-# A box (SPEC-R3 C6) is the rough extent of a thing a survey saw: data {centre_mm [x, y], size_mm [sx, sy], top_mm,
+# A box is the rough extent of a thing a survey saw: data {centre_mm [x, y], size_mm [sx, sy], top_mm,
 # source, candidate}; an image estimate, so unconfirmed.
 DEFAULT_CONFIRMED = {"contact": True, "located": False, "device": False, "state": False, "event": True,
                      "box": False}
@@ -327,7 +327,7 @@ class World:
         return self.add("event", name, source=source, data=data)
 
     def world_moved(self, info=None, source="relocalize") -> dict:
-        """Record that the robot's base or the scene moved (I8, I11). Every positional entry taken
+        """Record that the robot's base or the scene moved. Every positional entry taken
         before it is marked stale: its base-frame point may no longer be where the thing is."""
         ev = self.event("world_moved", data=info or {}, source=source)
         staled = []
@@ -439,7 +439,7 @@ class World:
         return copy.deepcopy(e)
 
     def verify(self, claim) -> dict:
-        """I9: confirm a state claim by a look, or by a second sense that agrees, taken after the arm last moved.
+        """Confirm a state claim by a look, or by a second sense that agrees, taken after the arm last moved.
 
         claim: {"id": state entry id} or {"device", "state"[, "from_sense"]} (the open claim with that
         state is reused, else a new one is made), plus the evidence route {"look_id": ...} or

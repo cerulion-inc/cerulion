@@ -11,10 +11,10 @@ travel its own give explains under a force it cannot tell from none, B.rigid, at
 holds something), the lag is measured, the window is the detection time.
 
 So a plan that brakes its command to a stand has its last samples wait for the arm, and no wait is added after
-them (the design rulings's owed waits stay owed to nobody). When the command stands at its end the move ends
+them (owed waits stay owed to nobody). When the command stands at its end the move ends
 
 - "goal" as soon as the arm will be inside its still band of that end one detection time on (the test a wait
-  uses, C10); or once its farthest point has PASSED its end with no reading over the contact threshold of its
+  uses); or once its farthest point has PASSED its end with no reading over the contact threshold of its
   speed (a push met while it closes is judged when it stands) and stands no further from it than its rest band
   (the same give along its softest direction, with what its joints' dry friction can hide: the body's own rest
   error) plus its own lag at the speed it still has (the lag this move's own first periods showed; a move that
@@ -29,7 +29,7 @@ them (the design rulings's owed waits stay owed to nobody). When the command sta
 While the arm brakes onto the standing command only the guard's cap judges (the force estimate reads the braking
 itself: tests/test_r6_move_fix.py test_braking_is_no_contact), and once it stands the contact threshold of an arm
 at rest (control_tail.standing, as every wait of C10): a contact that still stands then ends the move as any
-other. After the first loaded reading the command is never held here: the lead is then the force law's (C9).
+other. After the first loaded reading the command is never held here: the lead is then the force law's.
 The record of the move (ex._pace) says how many control periods the command held and where the arm stood; the
 receipt carries it only when it changed what the move did. No robot is named here.
 """
@@ -252,7 +252,7 @@ class Pace:
 
 
 def allowance(ex, q0, path):
-    """The control periods pacing may add to a path's own count (C12: the budget counts them): the arm closes on
+    """The control periods pacing may add to a path's own count (the budget counts them): the arm closes on
     its standing command by e in its own time constant, and the move ends once what is left is inside its still
     band. The time constant is the one this session's own last paced move showed (tau_s: its lag over its
     speed); a session that has shown none yet counts none. 0 for an empty path."""
@@ -269,7 +269,7 @@ def allowance(ex, q0, path):
 
 
 def keys(ex):
-    """{"pace": ...} for the receipt of a move whose command held (C12: a block enters a result only when it
+    """{"pace": ...} for the receipt of a move whose command held (a block enters a result only when it
     changed what the tool did), else {}. Read once: the next move writes its own."""
     pace = getattr(ex, "_pace", None)
     ex._pace = None

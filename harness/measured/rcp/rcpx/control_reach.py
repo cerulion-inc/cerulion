@@ -3,8 +3,8 @@
 stroke of control_contact.py: the back-off that follows the part, the path a retreat may retrace, and the stored
 points a moved part made stale.
 
-No length, force, speed or time here is typed: each comes from the bounds module (rcpx/bounds.py, SPEC-R4 A4.5,
-A4.8). No robot is named here."""
+No length, force, speed or time here is typed: each comes from the bounds module (rcpx/bounds.py). No robot is named
+here."""
 
 import math
 
@@ -143,7 +143,7 @@ class ReachMixin:
 
     @staticmethod
     def _rating_words(out):
-        """A reach result whose tool has no stated contact rating says so (the design rulings: the jaw motor's force is none)."""
+        """A reach result whose tool has no stated contact rating says so (the jaw motor's force is none)."""
         if out.get("tool_force_n") is None:
             out["tool_force_note"] = "no contact rating is stated for the tool: what the arm can push stands alone"
         return out
@@ -336,7 +336,7 @@ class ReachMixin:
         return self.model.clip(q2)
 
     def _arrival(self, B, q, d, intent, thing=None, stroke=False):
-        """What a stated limit makes of a stroke's speed (C3, C9): {"expect": the expected contact record,
+        """What a stated limit makes of a stroke's speed: {"expect": the expected contact record,
         "v": the arrival speed in m/s or None (nothing stated: the body's own speed), "kept", "note", "refused"}.
         stroke: the bound of a press's stroke once the part yields (max_n, a sheet, the site; never the force the
         press is asked to reach). A limit under what this arm can tell is acted on at the tell speed when it is
@@ -375,7 +375,7 @@ class ReachMixin:
         return list(range(k)), list(range(k, self.model.n))
 
     def _stroke_keys(self, B, legs, top, arr, strk, peak_n=0.0):
-        """What a press says of its own speed and strike (C2, C9): the limit its approach ran under and whether
+        """What a press says of its own speed and strike: the limit its approach ran under and whether
         it is shown kept (never when a reading of the call passed it), the fastest the part ran once it yielded,
         and the largest strike an end stop could have taken (over the stroke: the force on the part plus the
         stop slope there times the tip's speed; unresolved where the body has no slope)."""
@@ -525,8 +525,8 @@ class ReachMixin:
 
     def _stale_near(self, point_mm, why, travel_m=0.0, along=None):
         """A part moved at point_mm by travel_m: the located and contact points within that travel and their own
-        "same spot" distance of it may no longer be where the part is (FINDINGS S6): robot://world marks them
-        stale. The part the act set moving voids the arm's passage on the side it went (the design rulings; along: the act's
+        "same spot" distance of it may no longer be where the part is: robot://world marks them
+        stale. The part the act set moving voids the arm's passage on the side it went (along: the act's
         travel, else the last stroke's). Returns the receipt's "void" block, or None."""
         if point_mm is None or not hasattr(self.world, "mark_stale"):
             return None

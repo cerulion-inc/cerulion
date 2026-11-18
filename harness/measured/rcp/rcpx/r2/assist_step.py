@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""One whole step the robot runs itself, with the check inside (SPEC-R5 4.2, 4.3, 4.7): do_step, and the two tools
+"""One whole step the robot runs itself, with the check inside: do_step, and the two tools
 that are one step each: act_on (from a number, an id or a part label to a checked result) and changed (the robot
 goes back to the view before the last act and says what changed).
 
@@ -283,7 +283,7 @@ class Run:
         self.meter = Meter(ex, session, self.bounds, one_step)
         self.ref = self.look = None
         table = dict(U.UNTIL)
-        for mod in getattr(ex, "mods", None) or ():       # a package's own stop conditions (SPEC-R5 4.5)
+        for mod in getattr(ex, "mods", None) or ():       # a package's own stop conditions
             if isinstance(getattr(mod, "UNTIL", None), dict):
                 table.update(mod.UNTIL)
         self.table = table
@@ -410,7 +410,7 @@ def fallback_next(ex, session):
 
 # ---------------------------------------------------------------- changed
 def changed(ex, session, at=None, since=None, detail="brief", **extra):
-    """SPEC-R5 4.3: the robot goes back to the view it had before the last act and says what changed there."""
+    """The robot goes back to the view it had before the last act and says what changed there."""
     if extra:
         return bad_args("changed", extra, "changed {}")
     h = holding(ex)

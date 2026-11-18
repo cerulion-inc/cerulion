@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""External joint torque over one control period, closed loop (for touched_by, I20).
+"""External joint torque over one control period, closed loop (for touched_by).
 
 The executor's own estimate (Sense.ext) predicts the arm alone from the previous reading with the servo law and the
 commanded target held, and reads the external torque as M (qd_measured - qd_predicted) / elapsed. That prediction

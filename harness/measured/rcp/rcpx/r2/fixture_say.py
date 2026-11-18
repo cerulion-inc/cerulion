@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The receipt of package fixture (round six, the design notes package PLACE stage C; contracts C2, C12): what
+"""The receipt of package fixture: what
 work_part says of what it did.
 
 - _fx_words: a direction in the operator's words.
-- _fx_seen: what one part of the call put on the part, held against the limit somebody stated on it (C3): the way
+- _fx_seen: what one part of the call put on the part, held against the limit somebody stated on it: the way
   in's stop, the pads' squeeze (both pads press it: the part sees their sum), the stroke's largest force.
 - _fx_result: the frame of every receipt: phases, each with its control periods (they partition periods_used in
-  order) and the worst strike of the motions it ran (rcpx/r2/fixture_strike.py; C12), the bounds, the call's
+  order) and the worst strike of the motions it ran (rcpx/r2/fixture_strike.py), the bounds, the call's
   strike (the worst of its phases'), the doubt lines, and, when a limit was stated, the block "limit": {limit_n,
   source, kept, read, passed, not_shown, cost} (cost: the control periods the operator's own word cost,
   rcpx/r2/fixture_cost.py, said in one sentence). A limit that was passed, or that the arm or the jaws cannot
@@ -17,7 +17,7 @@ work_part says of what it did.
   is the part's own end.
 - _fx_met: what one motion of the call met, from that motion's own stop record (its strike block's "ran", else
   the contact's reading): where, the force, the speed it was met at. Every sentence of the receipt is built from
-  these records (the design rulings rule 2): the largest force of the call is the largest over EVERY motion,
+  these records: the largest force of the call is the largest over EVERY motion,
   the way in and the way out included ("largest_force_n", "largest_force_where"); a way in that ended on a
   contact is said as met; a stroke that met no stop says what it read along the way and across it against what
   this arm tells (never "did not move" or "did not come along" from a silence), and, where the hand stood on
@@ -135,12 +135,12 @@ class SayMixin:
     def _fx_out_item(self, back):
         """The binding bound of the way out for its phase record: the stream's own; where its plan names none
         (a short leave with nothing stated), the body's own speed, which is what ran. What the core says
-        of the contact the hand left (the design rulings: left it, the limit that stood over the leave) goes on the record."""
+        of the contact the hand left (left it, the limit that stood over the leave) goes on the record."""
         if self._fx["phases"]:               # how the way out itself ended (goal, or what stopped it)
             self._fx["phases"][-1]["way_out"] = back.get("stopped")
         if back.get("left") and self._fx["phases"] and (self._fx.get("stood") or self._fx.get("met")):
             # only where this call's own records show the hand ON something (a stop of one of its motions, pads
-            # that pressed, a stroke that read the part): a hand in free air left nothing (the design rulings rule 2)
+            # that pressed, a stroke that read the part): a hand in free air left nothing
             self._fx["phases"][-1]["left"] = back["left"]
         if back.get("bounds") is not None:
             return back["bounds"]
@@ -168,7 +168,7 @@ class SayMixin:
         if left is not None:
             out["periods_left"] = int(left)
         out["bounds"] = [it for it in items if it is not None]
-        worst = S.of_call(phases)           # every phase states its own (C12); the call's is the worst of them
+        worst = S.of_call(phases)           # every phase states its own; the call's is the worst of them
         out["strike"] = worst
         top, where = self._fx_largest(out.get("peak_force_n"))
         out["largest_force_n"] = None if top is None else round(top, 2)
@@ -232,7 +232,7 @@ class SayMixin:
         if moved and fit["shape"] == "none" and rec["stopped"] != "amount" and (
                 rec["stopped"] == "slipped" or rec["travel_m"] <= play):
             # no path was fitted, and the hand lost what it held, or went no further than the free play its hold
-            # leaves: whether the part came along is not shown (the design rulings rule 2; on the own bench a hand's jaws stalled
+            # leaves: whether the part came along is not shown (an absence is no conclusion; on the own bench a hand's jaws stalled
             # on the face beside a handle, the hand went 10 mm, the drawer stood shut by truth, and the receipt said
             # it had pulled the part 10 mm; a shut drawer pushed the wrong way was said pushed 1 mm). A long stroke
             # with no fitted shape (a drawer pushed 134 mm shut on a development cell) stays a motion
@@ -248,7 +248,7 @@ class SayMixin:
             if rec["stopped"] == "end" and rec["why"]:
                 said = said[:-1] + f" ({rec['why']})."
         elif ended == "nothing_felt":
-            # an absence of a contact stop is no proof that nothing moved (the design rulings rule 2: an absence is reported
+            # an absence of a contact stop is no proof that nothing moved (an absence is reported
             # as an absence, never as a conclusion): the stroke says what it read along the way and across it,
             # against what this arm tells, and nothing more (a contact under what the arm tells can load the part
             # while the stroke reads nothing). Where the hand stood on something as the stroke began and went on

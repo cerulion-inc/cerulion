@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Package survey: search for something that is outside the standard look, in one call.
 
-FINDINGS P1 and T4 (pilot r1a): the standard look sees only the floor patch under the hand, and operators spent 8 to
+The standard look sees only the floor patch under the hand, and operators spent 8 to
 19 calls per episode turning the arm by hand to find a device placed elsewhere. survey() does that search:
 
 - the views: the standard look turned about the base's vertical axis, a ring around the robot from the body model
@@ -314,9 +314,9 @@ def _budget_left_s(ex):
 
 
 def _to_book(ex, listed, taken, z):
-    """The survey's boxes into the session's space book (SPEC-R4 A3): each listed candidate as a box with sigma =
+    """The survey's boxes into the session's space book: each listed candidate as a box with sigma =
     its own two-view error (err_m; nothing is grown by a typed margin). The looks themselves are the core's looks
-    (ex._look_impl): the core hands each one to the session's seeing (SPEC-R4 A8.5), so the survey does not feed
+    (ex._look_impl): the core hands each one to the session's seeing, so the survey does not feed
     them a second time."""
     space = bounds.of(ex).space
     if hasattr(space, "add_thing"):

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""robot://world obstacles and robot://body mounted_parts for the obstacles package (I20; see obstacles.py): the
+"""robot://world obstacles and robot://body mounted_parts for the obstacles package (see obstacles.py): the
 obstacle list built from world entries (contacts, triangulated and located points, located boxes) and swept
 keep-outs, the moving part entries a device act triggers, and the two resource documents. A mixin of the package's
 state (obstacles._State): it reads self.ex, self.cfg, self.body, self.mounted, self.keepouts, self.new_keepouts,

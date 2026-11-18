@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The hold (round six, contract C8): one record, one close, and what a guard does with what the robot does to its
+"""The hold: one record, one close, and what a guard does with what the robot does to its
 own force reading.
 
 The robot knows three things it does to its own reading: it squeezes, it carries, it lets go. Each has a name here
@@ -43,7 +43,7 @@ import math
 import numpy as np
 
 from rcpx import bounds_ratios as R
-from rcpx.control_hold_jaws import facts, measure_jaws, numbers, presses, read  # noqa: F401  (measure_jaws: C7)
+from rcpx.control_hold_jaws import facts, measure_jaws, numbers, presses, read  # noqa: F401  (measure_jaws: the jaws' own numbers)
 
 MM = 1000.0
 
@@ -60,7 +60,7 @@ def _num(x):
 class Hold(dict):
     """The record. A key whose value is not known yet (None) answers get() with the default."""
 
-    def get(self, key, default=None):     # r6 shim: until every reader takes a weight of None as "not read yet"
+    def get(self, key, default=None):     # compat shim: until every reader takes a weight of None as "not read yet"
         value = dict.get(self, key, default)
         return default if value is None else value
 
@@ -432,7 +432,7 @@ def after_move(ex, s, stop, leg=None, own=True):
     not be free of what it stood on; what the run showed is kept as the load seen so far), every one while the
     hold is on a part of something fixed (what it resists with at that rest is what it has shown), and one
     whose leg began on a standing reading.
-    own False: the call's own end stands in for the core's leg ends (r6 shim, control_base.primitive)."""
+    own False: the call's own end stands in for the core's leg ends (compat shim, control_base.primitive)."""
     st = ex.__dict__.setdefault("_hold_legs", {})
     st["seen_call"] = int(ex._calls)
     if s is None:
@@ -479,9 +479,9 @@ def after_move(ex, s, stop, leg=None, own=True):
 
 def call_end(ex, name, out, moved):
     """The end of an operator's call (control_base.primitive): stands in for the core's own leg ends where the
-    motion files do not call after_move yet (r6 shim), and puts the hold's own lines into the result."""
+    motion files do not call after_move yet (compat shim), and puts the hold's own lines into the result."""
     st = ex.__dict__.get("_hold_legs") or {}
-    if moved and st.get("seen_call") != ex._calls:        # r6 shim
+    if moved and st.get("seen_call") != ex._calls:        # compat shim
         after_move(ex, ex._last, out.get("stopped") if isinstance(out, dict) else None, own=False)
     if not isinstance(out, dict):
         return out
@@ -499,7 +499,7 @@ def call_end(ex, name, out, moved):
 def arm_cap(ex, spec):
     """The cap a guard runs with (N): what the arm itself can push along its travel (its joints' torques less
     their measured error) and a tool rating its maker states; a jaw motor's force range is no cap. A spec that
-    names its own source already carries that cap (r6 shim: an older spec's cap held the jaw motor's force)."""
+    names its own source already carries that cap (compat shim: an older spec's cap held the jaw motor's force)."""
     cap = getattr(spec, "cap_n", None)
     if getattr(spec, "source", None) is not None:
         return math.inf if cap is None else float(cap)

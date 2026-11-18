@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The place targets of package place (N4), round six (the design notes, package PLACE; contracts C11, C12): where a
+"""The place targets of package place: where a
 held thing goes, from a spot.
 
 A place target comes from a spot (rcpx/r2/place_point.py: a pixel of a look, a located label, a point):

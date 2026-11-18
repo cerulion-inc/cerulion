@@ -18,12 +18,12 @@ one bench arm: 664 mm/s for a free speed of 2162 mm/s), and every faster leg say
   A raised ladder that stores no tap (its way down met something over the support: the raise can drift the column
   by up to REL of its length) is run again from where the hand stood, as the straight taps always were.
   The entry "taps" holds every ladder ("ladders") and their rows together; "used" counts every tap stored. Each
-  tap is measured and stored as the straight taps are (a tap's pose, travel and body; contract C5).
+  tap is measured and stored as the straight taps are (a tap's pose, travel and body).
 How long it takes is said in the entry ("took_s") and in the self-test's own time.
 
 No tap is made with a LINK. A build that brought a link onto the support and read its push from the joint
 torques (the force along the normal at the link's lowest point, or at its shortest lever there) read every one
-of its taps UNDER the true peak, 0.36 to 0.83 of it on four arms (the design notes): a link's
+of its taps UNDER the true peak, 0.36 to 0.83 of it on four arms: a link's
 push cannot be read from the joints well enough to bear a figure, so no stop is made with one and a link's
 strike is said "not measured" with the body's model beside (rcpx/bounds_strike.py).
 """

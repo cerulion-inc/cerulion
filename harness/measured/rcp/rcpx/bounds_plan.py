@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Polyline timing with exact constant-acceleration phases, A4.2 and A8.1.
 
-Round six (the design rulings, contracts C3, C9): a stretch runs at the body's own speed. It is slowed only by a site speed or
+A stretch runs at the body's own speed. It is slowed only by a site speed or
 zone, the operator's speed or accel, a proven grip's acceleration, and B.arrival for a stated limit: the bound_n of
-an expected contact, or a limit stated on free space where a contact can begin (the design rulings, rcpx/bounds_free.py).
+an expected contact, or a limit stated on free space where a contact can begin (rcpx/bounds_free.py).
 Unproven space, a thing seen and never touched, a band of position doubt and an unresolved stop slope slow
 nothing; what the motion could strike is priced on the plan (plan.strike) and never lowers a speed.
 """
@@ -39,7 +39,7 @@ def _accel(dq, L, qdd):
 
 
 def _moving_points(B, q0, q1, held):
-    """The moving points at both ends of a step (Q4): a body's capsule ends while the capsule is farther from every
+    """The moving points at both ends of a step: a body's capsule ends while the capsule is farther from every
     thing than its own fit error plus the band in force; nearer than that, the body's own hull, as the hull point
     nearest the thing at each end (a thing of unknown sigma: when the book says the capsule is inside its band)."""
     starts, ends = B.robot.points(q0), B.robot.points(q1)
@@ -181,7 +181,7 @@ def _shares(segments, phases, labels, keys, dt):
 
 
 def _strike(B, nodes, segments, phases, guard, held, total):
-    """plan.strike (C2) by rcpx.bounds_strike.price (None in a build with none): one sample a straight stretch (its
+    """plan.strike by rcpx.bounds_strike.price (None in a build with none): one sample a straight stretch (its
     fastest speed, the largest model slope of its nodes), every moving body at the plan's joint speeds beside it."""
     from rcpx import bounds_strike
     price = getattr(bounds_strike, "price", None)
@@ -241,12 +241,12 @@ def plan(B, q0, path, kind, target=None, intent=None, held=None, away_from=None,
     qd = B.qd_max()
     qd_source, qd_evidence = B.src("qd_max")
     if intent.get("clear") or intent.get("look") is not None:
-        word = B.word(intent, path)       # recorded; it changes no speed and no guard (C4)
+        word = B.word(intent, path)       # recorded; it changes no speed and no guard
         if word.get("refused"):
             return Plan(refused=word["refused"])
     expects = limit.expects(B, expect, intent, kinds, targets)
     free_limit = B.stated_limit(None, intent, expected=False)     # a stated limit on free space, or limit_n None
-    if free_limit.get("malformed"):       # a stated force that is no number over 0 N (the design rulings: a malformed argument)
+    if free_limit.get("malformed"):       # a stated force that is no number over 0 N (a malformed argument)
         return _refused(free_limit["malformed"], "state a force over 0 N, or none", free_limit["malformed_check"])
     carried = limit.carried(held)             # the limit stated for the thing held bounds every leg that carries it
     if carried is not None and (free_limit["limit_n"] is None or carried["limit_n"] < free_limit["limit_n"]):
@@ -298,8 +298,8 @@ def plan(B, q0, path, kind, target=None, intent=None, held=None, away_from=None,
             if item["value"] is not None:
                 spans.setdefault(key, []).append(item["value"])
 
-        # (1) a LIMIT stated on free space (C3) holds the tool, what it holds and (1b) the arm's links, where a
-        # contact can begin (the design rulings: bounds_free). The force a touch ends at is no limit on a free stretch
+        # (1) a LIMIT stated on free space holds the tool, what it holds and (1b) the arm's links, where a
+        # contact can begin (bounds_free). The force a touch ends at is no limit on a free stretch
         inside = free.holds(B, zone, ps, pe, coordinate, L)
         lim = zone["limit"] if inside else None
         if lim is not None and leads:
@@ -312,7 +312,7 @@ def plan(B, q0, path, kind, target=None, intent=None, held=None, away_from=None,
         for cap, kept, item in limit.links_under(B, links, q0s, L, free_limit if inside else {}, held, _f_guard, dq):
             shown.append(kept)
             bind("limit:link", cap, cap, cap, item)
-        # (2) an expected contact (C9): brakes only for its bound_n, to B.arrival's speed at the region's edge
+        # (2) an expected contact: brakes only for its bound_n, to B.arrival's speed at the region's edge
         want = expects[k]
         if want is not None and want.get("bound_n") is not None and leads:
             got = limit.over(B, arrivals, q0s, q1s, direction, want["bound_n"], want.get("bound_source") or "intent",
@@ -397,7 +397,7 @@ def plan(B, q0, path, kind, target=None, intent=None, held=None, away_from=None,
     level = limit.assumed(arrivals)
     if _f_guard is None and level is not None and guard.force_n is not None and guard.force_n > level * (1 + laws.ROUND):
         # the guard of this plan runs over the level its arrivals were solved with (its fastest stretch and its
-        # largest acceleration set it): solve them again with the threshold the guard really runs with (C3)
+        # largest acceleration set it): solve them again with the threshold the guard really runs with
         return plan(B, q0, path, kind, target, intent, held, away_from, materialize, expect, guard.force_n)
     periods = max(0, int(math.ceil(total / B.dt() - laws.ROUND)))
     if materialize:
@@ -419,7 +419,7 @@ def plan(B, q0, path, kind, target=None, intent=None, held=None, away_from=None,
     free_count = counts.get("free", 0) + counts.get("corner", 0)
     profile = [{"s_m": (segments[k]["s"] if k < len(segments) else coordinate), "v": v, "limit": label,
                 "tip_m": B.robot.tip(q)[0].tolist()} for k, (q, v, label) in enumerate(zip(nodes, caps, labels))]
-    guard.expect = limit.sought(expects[-1], seeks)  # MOVE's control_expect reads it (C9)
+    guard.expect = limit.sought(expects[-1], seeks)  # MOVE's control_expect reads it
     ruled = sum(counts.values())
     free_share = free_count / ruled if ruled > 0 else 1.0
     result = Plan(output, guard, items, total, periods - int(round(free_share * periods)), free_share,
@@ -428,7 +428,7 @@ def plan(B, q0, path, kind, target=None, intent=None, held=None, away_from=None,
     result._segments = segments
     result.strike = _strike(B, nodes, segments, phases, guard, held, total) if materialize else None
     result.limit = limit.whole(free_limit, shown)     # for the receipt's limit block (kept or passed is said)
-    if result.limit is not None and materialize:      # what the limit cost and where it held (C12, the design rulings)
+    if result.limit is not None and materialize:      # what the limit cost and where it held
         bare = plan(B, q0, path, kind, target, {**intent, "_no_limit": True}, held, away_from, False, expect)
         result.limit.update(cost=free.cost(zone, periods, getattr(bare, "periods", periods)), zone=zone)
     return result
@@ -485,7 +485,7 @@ def _reach(why, hint, leg):
 
 
 def plan_legs(B, q0, legs, held=None, looks=None, intent=None):
-    """A stream of legs with rounded corners. A leg may carry expect (C9): its expected contact."""
+    """A stream of legs with rounded corners. A leg may carry expect: its expected contact."""
     q0 = np.asarray(q0, dtype=float)
     stream_intent = intent or next((leg["intent"] for leg in legs if leg.get("intent")), {})
     end_nodes, line_paths = [q0], []

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The view in words, and the own-body outlines drawn on a look (SPEC-R3.md 4.1 c; package selfsee).
+"""The view in words, and the own-body outlines drawn on a look (package selfsee).
 
 Pure geometry and drawing: a camera pose (from the body model at a look's joint pose), the own-body grid of
 selfsee_body and the side words of rcpx/side_words.py in, words and an image out. No robot or device is named.

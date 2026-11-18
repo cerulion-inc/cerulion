@@ -7,7 +7,7 @@ joint name and either-or arguments). "description" and "default" are annotations
 internal and never shown to the operator; "x-kind": "direction" turns a direction name into a unit vector before the
 executor is called and refuses a zero vector.
 
-Round four (SPEC-R4 A5, A6): a schema carries no derived end. A speed, force, travel, time or count argument has its
+A schema carries no derived end. A speed, force, travel, time or count argument has its
 type and its sign and no range: "x-positive": true refuses a value that is not more than 0. "x-retired": true marks
 an argument that is still accepted and no longer listed (guarded): public_schema, the takes line and every hint
 leave it out. "x-intent": true marks one of the operating model's words (clear, expect, max_n): the session passes
@@ -108,7 +108,7 @@ def _tool(name, description, args, example_args, means, **extra):
 
 
 # ---------------------------------------------------------------------------------------------------------------
-# Argument checking (I6: a bad argument is a refused result whose hint names the field)
+# Argument checking (a bad argument is a refused result whose hint names the field)
 
 
 def _fmt(x):
@@ -386,7 +386,7 @@ def normalize_args(tool, args):
             continue
         if isinstance(parsed, str) and fits and not (len(text) >= 2 and text[0] == text[-1] == '"'):
             continue
-        # the design rulings: a text that holds an object or a list the argument takes is read as that object, also where a
+        # a text that holds an object or a list the argument takes is read as that object, also where a
         # text is legal too (a label), and the result says so in one line
         whole = isinstance(parsed, (dict, list))
         if (not fits or whole or isinstance(parsed, str)) and parsed != value and check(props[key], parsed, key) is None:
@@ -471,7 +471,7 @@ def frame_paths(obj, base_dir=None):
     """Every image path in obj, in order, without repeats; relative paths are resolved against base_dir. A result
     (at any depth) may say "supersedes": {newer key: older key}: when it holds an image under the newer key, the
     image under the older key is left out, so a frame that is another frame with more drawn on it is sent once.
-    A result with a top-level "pictures" list says itself which picture shows it (SPEC-R3 C4): its frames are that
+    A result with a top-level "pictures" list says itself which picture shows it: its frames are that
     list only, at most PICTURES_SENT of them (an empty list: no frame), whatever other paths the result holds."""
     found = []
     pictures = obj.get("pictures") if isinstance(obj, dict) else None

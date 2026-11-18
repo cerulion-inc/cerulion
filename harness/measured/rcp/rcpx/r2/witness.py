@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Package witness (I35, SPEC-R3.md 4.4): the same view before and after.
+"""Package witness: the same view before and after.
 
 A change of viewpoint is not a change of state. Weak operators took a top view for a front view and a new camera
 pose for a moved part; this package compares two looks only when the camera stood in the same place.
@@ -19,7 +19,7 @@ pose for a moved part; this package compares two looks only when the camera stoo
   device_moved {answer: yes | possible, ...} when the device itself moved between the looks: every target on it
   then reads unclear and no claim is offered. elsewhere counts the changes on the device at no judged point.
 - look gains like (a look id) and, with it, clear (the operator's word that the camera's way is clear: true or
-  {"look": id}, SPEC-R4 A6): the pre hook pops them, gates the move, puts the camera back at that look's pose by
+  {"look": id}): the pre hook pops them, gates the move, puts the camera back at that look's pose by
   the runtime's own look move at the session's derived speed, with correctives (witness_pose.go_to), settles, and
   the look runs; its post hook adds compared_with (the compare with that look, at the device points acted on
   since it and the located points in view) and the move's control periods and binding bound, at no extra call.

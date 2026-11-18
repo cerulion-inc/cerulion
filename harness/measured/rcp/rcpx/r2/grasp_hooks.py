@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Hooks of package grasp (I26; see rcpx/r2/grasp.py): the held-state watch on every result, the gripper result
+"""Hooks of package grasp (see rcpx/r2/grasp.py): the held-state watch on every result, the gripper result
 keys, reach_check's force_n and base_limited, and the robot://body patch. They read the gripper only through
 Backend.read()["gripper"] (via the Mixin's _grasp_read) and the executor's own base_give; no ground truth.
 """
@@ -146,7 +146,7 @@ def reach_post(ex):
 
 
 def body_patch(ex, session, content):
-    """Expose the hands model geometry and force range in the body document, SPEC-R4 Q4."""
+    """Expose the hands model geometry and force range in the body document."""
     if not isinstance(content, dict):
         return content
     hand = ex._grasp_hand

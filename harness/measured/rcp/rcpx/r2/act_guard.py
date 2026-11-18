@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""What a push or lift may act on (SPEC-R3.md 4.3): the target and what is known of it, the P0 preflight refusals
+"""What a push or lift may act on: the target and what is known of it, the P0 preflight refusals
 (nothing moves), and the carry press guard. Nothing here names a robot or a device; nothing reads truth.
 
     resolve(ex, target)          (entry, None) or (None, refusal unknown_target): an id, else the newest located
@@ -148,7 +148,7 @@ def _tri_uncertainty(ex, e):
 
 
 def target_info(ex, e, B=None):
-    """What the stages need of a target entry (SPEC-R3 3.2): P (mm or None), uncertain_mm, depth, normal (unit, the face's outward normal, or None), device centre (x, y) and top (mm or None), the naming look and its q, the naming ray (unit, camera to P), the part (sheet_words parts entry or None) and the label said."""
+    """What the stages need of a target entry: P (mm or None), uncertain_mm, depth, normal (unit, the face's outward normal, or None), device centre (x, y) and top (mm or None), the naming look and its q, the naming ray (unit, camera to P), the part (sheet_words parts entry or None) and the label said."""
     d = e.get("data") or {}
     parts = plist(ex)
     part = sheet_words.label_part(e["label"], parts)
@@ -481,7 +481,7 @@ def _args(target, way, until, firm, max_n, hold_s, detail):
         return no("detail", "brief or full", 'push {"target": "located_3", "detail": "full"}')
     return None
 
-     # the press line checked runs this far ahead of the tip (SPEC-R3 4.3)
+     # the press line checked runs this far ahead of the tip
 
 
 def _state(ex):

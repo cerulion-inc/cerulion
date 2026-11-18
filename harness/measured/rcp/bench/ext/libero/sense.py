@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The bridge's cameras, and what its arm senses beyond one reading per control period (round six, the design notes
-C5 and C11): depth pictures of its two cameras and the wrist force sensor at the physics rate. A mixin of
+"""The bridge's cameras, and what its arm senses beyond one reading per control period: depth pictures of its two
+cameras and the wrist force sensor at the physics rate. A mixin of
 LiberoBackend (bench/ext/libero/backend.py); the env host's side is bench/ext/libero/hostsense.py.
 
 - render(camera) and camera_info(camera): the wrist camera at the spec's size, and the fixed scene camera(s) with
@@ -32,7 +32,7 @@ import numpy as np
 
 
 def stated_sigma():
-    """A depth noise stated for this run (the design notes C18, the design rulings): env R6_DEPTH_SIGMA_M, metres
+    """A depth noise stated for this run: env R6_DEPTH_SIGMA_M, metres
     at 1 m; 0 when none is stated. Gate G1's rows noise1 and noise3 set it; nothing else does."""
     return float(os.environ.get("R6_DEPTH_SIGMA_M", 0.0) or 0.0)
 

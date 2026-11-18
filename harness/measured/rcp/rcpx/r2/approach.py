@@ -11,7 +11,7 @@ Tools:
   the stroke square) and, as a lower task, keeps the target in the wrist view (RobotModel.project); when no square
   pose passes the plane and self checks, facings tilted off along are tried and the tilt is reported. Then it moves
   there through one guarded stream (a straight tool line when it plans, else staged or joint legs), path
-  checked under SPEC-R4 A8.2. A stopped stream has no fallback. The result states what was reached: the surface
+  checked by the motion core. A stopped stream has no fallback. The result states what was reached: the surface
   point, the standoff left, the facing error, what the
   wrist camera sees of the target, and the next stroke.
 - look_after on move_tip, touch, press, orient_tool and approach: the step and its look in one call. The pre hook
@@ -120,7 +120,7 @@ class Mixin(ApproachMotion):
     @primitive
     def approach(self, target, along=None, surface="tip", standoff_mm=None, keep_in_view=True, guarded=True,
                  point_source=None, speed_mm_s=None, look_after=False, clear=None):
-        """Reach the stated or derived standoff using one intent and one stream, SPEC-R4 A4.3/A8.2."""
+        """Reach the stated or derived standoff using one intent and one stream."""
         out = self._appr_impl(target, along, surface, standoff_mm, keep_in_view, point_source,
                              speed_mm_s, look_after, clear)
         if out.get("refused"):
@@ -185,7 +185,7 @@ class Mixin(ApproachMotion):
             return {**refusal("reach_unknown" if unknown else "reach", f"the {kin.name} cannot get to the target: "
                               f"{why}", hint), "reached": False, "stopped": "refused", "reach": reach,
                     "target": target_out, "tip_mm": _mm(s.tip)}
-        # the room left before the target is the stop from the speed the surface may arrive with (SPEC-R4 A4.3):
+        # the room left before the target is the stop from the speed the surface may arrive with:
         # the band speed v_in where the target's own error is known (the core slows inside that band); where it
         # is not known there is no band to slow in, so the room is the stop from full speed
         v_in, _speed_item = B.v_in(thing, q_reach, a, intent)
@@ -286,7 +286,7 @@ class Mixin(ApproachMotion):
         return out
 
     def _appr_orientation(self, kin, q, R_before):
-        """How the hand arrived (FINDINGS R5, S7): which orientation rule chose it, the turn from the hand before
+        """How the hand arrived: which orientation rule chose it, the turn from the hand before
         the call, the hand's up and the image's up against base up, whether the camera rides above the finger, and
         the joint pose used."""
         choice = dict((self.state.get("approach") or {}).get("choice") or {})
