@@ -620,6 +620,9 @@ def build_classes(neuter=None):
     # explaining the format mid-sentence is not one, and an authorless template
     # is not one either, so the match is anchored and needs a name after the
     # colon. Both shapes appear in documentation and neither is an attribution.
+    # One trailer passes, on a commit message of a scanned range and nowhere else:
+    # the exact shape the forge writes, in the trailer block, naming a noreply
+    # identity already on record as an author (COAUTHOR_RX, coauthors_on_record).
     add('attribution-trailer', '^[ \t]*co-?' + 'authored-by' + r'[ \t]*:[ \t]*\S',
         ['authored-by'], None, CONTENT_HARD,
         'Co-' + 'authored-by' + ': A Contributor', what='a co-author trailer')
@@ -1711,6 +1714,8 @@ class Stats(object):
         self.units = self.json_leaves = self.json_unparsed = 0
         self.oversize = self.skipped = self.pragmas = self.pragmas_refused = 0
         self.commits = self.media = 0
+        # Co-author trailer lines let through as naming an identity on record.
+        self.coauthors = 0
 
 
 def gh_escape(s, prop=False):
@@ -1798,13 +1803,22 @@ class Scanner(object):
 
     # -- the one line scanner -------------------------------------------------
     def scan_unit(self, path, text, line_base=1, where='', sevpath=None, deep=True,
-                  skip_private_tags=()):
-        """Scan one multi-line unit. Line numbers are line_base + index."""
+                  skip_private_tags=(), coauthors=None):
+        """Scan one multi-line unit. Line numbers are line_base + index.
+
+        `coauthors` maps a 0-based line index to the span of the name in a
+        co-author trailer that names an identity on record (see
+        coauthors_on_record). On that line, in the RAW view only, the trailer
+        class does not fire and a private pattern tagged @person judges the line
+        with the name blanked, the rule an author name already gets; every other
+        class and pattern reads the whole line. A derived view of the line that
+        differs from the raw one gets no exemption at all."""
         sevpath = sevpath if sevpath is not None else path
         raw_lines = None
         self.stats.units += text.count('\n') + 1
         views = text_views(text) if deep else [text]
-        for v in views:
+        for vi, v in enumerate(views):
+            ex = coauthors if (coauthors and vi == 0) else None
             low = v.lower()
             starts = None
             lines = None
@@ -1830,6 +1844,8 @@ class Scanner(object):
                 if lines is None:
                     lines = v.split('\n')
                 for li in sorted(cand):
+                    if ex and li in ex and c.id == 'attribution-trailer':
+                        continue
                     line = lines[li]
                     for m in c.rx.finditer(line):
                         if c.flt is not None and not c.flt(m, line):
@@ -1889,7 +1905,7 @@ class Scanner(object):
                     if lines is None:
                         lines = v.split('\n')
                     li = bisect.bisect_right(starts, i) - 1
-                    if p.rx.search(lines[li]):
+                    if p.rx.search(_judged(lines[li], li, p, ex)):
                         if raw_lines is None:
                             raw_lines = text.split('\n')
                         self.add(p.label(), 'HARD', path, line_base + li, '', where, private=p,
@@ -1898,9 +1914,9 @@ class Scanner(object):
                         break
                     i = low.find(p.anchor, starts[li + 1])
             if self.private.slow:
-                self._scan_slow(path, v, text, line_base, where, skip_private_tags)
+                self._scan_slow(path, v, text, line_base, where, skip_private_tags, ex)
 
-    def _scan_slow(self, path, v, text, line_base, where, skip_private_tags=()):
+    def _scan_slow(self, path, v, text, line_base, where, skip_private_tags=(), ex=None):
         ps = self.private
         starts = None
         lines = None
@@ -1924,7 +1940,7 @@ class Scanner(object):
                     continue
                 done.add(li)
                 for p in ps.slow:
-                    if p.rx.search(lines[li]):
+                    if p.rx.search(_judged(lines[li], li, p, ex)):
                         record(p, li)
             return
         for p in ps.slow:
@@ -1934,6 +1950,11 @@ class Scanner(object):
                 if starts is None:
                     starts = _line_starts(v)
                 li = bisect.bisect_right(starts, m.start()) - 1
+                if ex and li in ex:
+                    if lines is None:
+                        lines = v.split('\n')
+                    if not p.rx.search(_judged(lines[li], li, p, ex)):
+                        continue
                 record(p, li)
 
     # -- output ----------------------------------------------------------------
@@ -2042,6 +2063,17 @@ class Scanner(object):
 
 def _safe_chr(code):
     return ' ' if code < 0x20 or 0xD800 <= code <= 0xDFFF else chr(code)
+
+
+def _judged(line, li, p, ex):
+    """The text private pattern `p` judges on line `li`: the line itself, except
+    that a pattern tagged @person reads a co-author trailer on record with the
+    name blanked (the span `ex` holds for that line), so the name is exempt from
+    exactly the patterns an author name is exempt from and nothing else is."""
+    if not ex or li not in ex or p.tag != 'person':
+        return line
+    start, end = ex[li]
+    return line[:start] + ' ' * (end - start) + line[end:]
 
 
 def _line_starts(text):
@@ -2565,6 +2597,77 @@ def identity_ok(email, allow_emails):
     return False
 
 
+# The one co-author trailer the guard lets through, spelled exactly the way the
+# forge writes one on a squash: the token in that case, one space, a name with no
+# control character and no angle bracket, one space, and a forge noreply address
+# in its numbered form, `<id>+<login>` for a person or `<id>+<slug>[bot]` for an
+# app. Matched in full against one line, so indentation, a second space, a
+# trailing character or a longer domain is not this shape.
+COAUTHOR_RX = re.compile(
+    'Co-' + 'authored-by'
+    + r': (?P<name>[^\x00-\x20\x7f-\x9f<>](?:[^\x00-\x1f\x7f-\x9f<>]*[^\x00-\x20\x7f-\x9f<>])?)'
+    r' <(?P<addr>[0-9]+\+(?P<login>[A-Za-z0-9][A-Za-z0-9-]{0,38})(?P<bot>\[bot\])?@'
+    + re.escape(FORGE_NOREPLY) + r')>')
+# A git trailer line as the block test reads it: a token, a colon, one space, a
+# value. Strict on purpose: a line git would still parse (a continuation line, a
+# missing space) ends the block here, and the trailer in it stays a finding.
+TRAILER_LINE_RX = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*: \S')
+GIT_BLANK = ' \t\n\v\f\r'
+
+
+def trailer_block(lines):
+    """The line indices of a message's trailer block: its LAST paragraph, when that
+    is not also its first (the subject) and every line in it is a trailer line.
+    Anything else is an empty range, so a trailer above a later paragraph, in the
+    subject, or beside a line of prose is outside it. Blank means git's blank,
+    ASCII whitespace only."""
+    end = len(lines)
+    while end and not lines[end - 1].strip(GIT_BLANK):
+        end -= 1
+    start = end
+    while start and lines[start - 1].strip(GIT_BLANK):
+        start -= 1
+    if start == 0 or not all(TRAILER_LINE_RX.match(lines[i]) for i in range(start, end)):
+        return range(0)
+    return range(start, end)
+
+
+def coauthors_on_record(lines, on_record, author):
+    """{line index: (name start, name end)} for each co-author trailer the guard
+    lets through: inside the trailer block, the exact COAUTHOR_RX shape, and an
+    identity on record. A person is on record when the exact name and address
+    pair authors a commit in the history the scanned range builds on
+    (`on_record`, called only when a line has the shape). An app bot is named by
+    its own login and is on record the same way, or when it is the `author`, as
+    a (name, address) pair, of the very commit that carries the trailer: the
+    forge squashes a bot's pull request under the bot's identity, so its first
+    landing has no earlier commit to point at, and the trailer repeats an
+    identity the author field already publishes."""
+    out = {}
+    for i in trailer_block(lines):
+        m = COAUTHOR_RX.fullmatch(lines[i])
+        if not m:
+            continue
+        ident = (m.group('name'), m.group('addr'))
+        if m.group('bot'):
+            if m.group('name') != m.group('login') + '[bot]':
+                continue
+            if ident == author or on_record(ident):
+                out[i] = m.span('name')
+        elif on_record(ident):
+            out[i] = m.span('name')
+    return out
+
+
+def base_authors(git, base):
+    """Every (author name, author address) pair of a commit reachable from `base`,
+    raw: no mailmap, which a change could edit. A shallow history yields fewer
+    pairs, so a trailer it cannot place stays a finding."""
+    data = git.text(['log', '--no-show-signature', '--format=%an%x00%ae', base])
+    return frozenset(tuple(ln.split('\x00')) for ln in data.split('\n')
+                     if ln.count('\x00') == 1)
+
+
 SCISSORS_RX = re.compile(r'^\S{1,8} -{24} >8 -{24}$')
 
 
@@ -2633,12 +2736,28 @@ def run_messages(sc, git, args, env):
         recs = [r for r in data.split('\x01') if r.strip()]
         if not recs and args.require_commits:
             raise NoRun('zero commits in the range on a pull request event')
+        # The authors of the history the range builds on, read once and only when
+        # a message carries a trailer of the one shape that can be let through.
+        record = []
+
+        def on_record(ident):
+            if not record:
+                record.append(base_authors(git, a))
+            return ident in record[0]
+
         for r in recs:
             sha, an, ae, cn, ce, body = r.lstrip('\n').split('\x00', 5)
             sc.stats.commits += 1
             sources += 1
             label = 'commit:' + sha[:12]
-            sc.scan_unit(label, body.rstrip('\n'), 1, '')
+            body = body.rstrip('\n')
+            # Commit messages of the range are the one surface a trailer can be
+            # let through on: never a title, a body or a message file.
+            exempt = None
+            if ('Co-' + 'authored-by: ') in body:
+                exempt = coauthors_on_record(body.split('\n'), on_record, (an, ae))
+                sc.stats.coauthors += len(exempt)
+            sc.scan_unit(label, body, 1, '', coauthors=exempt)
             ident(label + ' author', an, ae)
             ident(label + ' committer', cn, ce)
     if args.message_file:
@@ -3381,6 +3500,8 @@ def _extras(sc):
         bits.append('skipped=%d' % st.skipped)
     if st.commits:
         bits.append('commits=%d' % st.commits)
+    if st.coauthors:
+        bits.append('coauthors_on_record=%d' % st.coauthors)
     if sc.suppressed:
         bits.append('suppressed=%d' % sc.suppressed)
     if sc.refs is not None and sc.refs.res.asked:
@@ -3510,7 +3631,7 @@ R_WITHDRAWN = 'qz' + 'rkv-withdrawn'     # 410: taken down, and still a not-foun
 R_ONEWORD = 'qz' + 'rkvsolo'             # no separator: the shape cannot see it
 CANNED_FORGE = {(RO, R_SELF): 200, (RO, R_PUB): 200, (RO, R_PRIV): 404, (RO, R_GONE): 404,
                 (RO, R_SLOW): 429, (RO, R_WITHDRAWN): 410, (RO, R_ONEWORD): 404}
-EXPECTED_ARMS = 263
+EXPECTED_ARMS = 284
 
 
 COND_RX = re.compile(r'^  conversation:$.*?^    if: >-\n(.*?)^    runs-on:', re.S | re.M)
@@ -4325,6 +4446,205 @@ def self_test(out, base_env, argv0):
         rc, lines = run(['messages', '--range', 'main..feature', '--no-allow'],
                         dict(penv, LEAK_PATTERNS=private_env))
         arm('messages-private-redacted', not any(PW.lower() in ln.lower() for ln in lines))
+        # --- messages: the one co-author trailer that passes ----------------------------
+        # A scratch repository whose base history puts six identities on record. Each
+        # case is one commit on top of `base`, scanned as `base..<commit>` with the
+        # tier loaded, so PERSON is a @person name and SU a @login the tier knows.
+        tr = 'Co-' + 'authored-by: '
+        co_a = '4242+' + PLAIN_USER + '@' + FORGE_NOREPLY       # PERSON, on record
+        second = 'Ysolde' + ' ' + 'Brackwater'
+        co_b = '5150+' + 'ybrack' + '@' + FORGE_NOREPLY          # second, on record
+        co_login = '4243+' + SU + '@' + FORGE_NOREPLY            # PERSON again, a tier login
+        co_named = '4245+' + PERSON.lower().replace(' ', '-') + '@' + FORGE_NOREPLY  # second
+        pct_name = PERSON.replace(' ', '%20')
+        co_pct = '4244+' + 'pctname' + '@' + FORGE_NOREPLY      # pct_name, on record
+        keeper = 'keeper' + '[bot]'
+        keeper_addr = '99+' + keeper + '@' + FORGE_NOREPLY       # a bot on record
+        fixer = 'fixer' + '[bot]'
+        fixer_addr = '88+' + fixer + '@' + FORGE_NOREPLY         # a bot NOT on record
+        newcomer = 'Tamsin' + ' ' + 'Oakhurst'
+        new_addr = '6060+' + 'tamoak' + '@' + FORGE_NOREPLY      # a person NOT on record
+        repo_co = os.path.join(tmp, 'repo-co')
+        os.makedirs(repo_co)
+        gco = Git(repo_co, env)
+        gco.run(['init', '-q'])
+        gco.run(['symbolic-ref', 'HEAD', 'refs/heads/main'])
+        for who, addr in ((PERSON, co_a), (second, co_b), (PERSON, co_login),
+                          (second, co_named), (pct_name, co_pct), (keeper, keeper_addr)):
+            Git(repo_co, dict(env, GIT_AUTHOR_NAME=who, GIT_AUTHOR_EMAIL=addr)).run(
+                ['commit', '-q', '--allow-empty', '-m', 'feat: from ' + addr.split('+')[0]])
+        gco.run(['tag', 'base'])
+
+        def co_scan(msg, who='Self Test', addr='self-test@' + FORGE_NOREPLY):
+            sha = Git(repo_co, dict(env, GIT_AUTHOR_NAME=who, GIT_AUTHOR_EMAIL=addr)).text(
+                ['commit-tree', 'base^{tree}', '-p', 'base', '-m', msg]).strip()
+            return run(['messages', '--range', 'base..' + sha, '--no-allow'], penv, repo_co)
+
+        def body_hits(lines):
+            return set((c, n) for c, p, n in hits(lines)
+                       if p.startswith('commit:') and ' ' not in p)
+
+        def summary(lines):
+            return [ln for ln in lines if ln.startswith('leak_scan messages:')]
+
+        line_a = tr + PERSON + ' <' + co_a + '>'
+        line_b = tr + second + ' <' + co_b + '>'
+        line_keeper = tr + keeper + ' <' + keeper_addr + '>'
+        squash = 'fix: a change worth making (#12)\n\n' + line_a + '\n' + line_b + '\n'
+        rc, lines = co_scan(squash)
+        arm('coauthor-collaborator-noreply-trailers-in-a-squash-pass',
+            rc == EXIT_OK and not hits(lines)
+            and any('coauthors_on_record=2' in ln for ln in summary(lines)),
+            'rc=%d %s %s' % (rc, sorted(body_hits(lines)), summary(lines)))
+        rc, lines = co_scan('fix: x (#3)\n\nSigned-off-by: ' + second + ' <' + co_b + '>\n'
+                            + line_keeper + '\n')
+        arm('coauthor-a-bot-on-record-beside-another-trailer-passes',
+            rc == EXIT_OK and not hits(lines)
+            and any('coauthors_on_record=1' in ln for ln in summary(lines)),
+            'rc=%d %s' % (rc, sorted(body_hits(lines))))
+        rc, lines = co_scan('build(deps): bump (#7)\n\nSigned-off-by: ' + fixer + ' <support@'
+                            + FORGE_HOST + '>\n' + tr + fixer + ' <' + fixer_addr + '>\n',
+                            fixer, fixer_addr)
+        arm('coauthor-a-bot-naming-itself-on-its-own-commit-passes',
+            rc == EXIT_OK and not hits(lines), 'rc=%d %s' % (rc, sorted(body_hits(lines))))
+        # still HARD, each with the findings it carried before this rule existed
+        personal = PLAIN_USER + '@gmail' + '.com'
+        hard_cases = (
+            ('a-personal-address', tr + PERSON + ' <' + personal + '>',
+             {'attribution-trailer', 'private#3@person', 'email-personal'}, None),
+            ('an-unknown-login', tr + PERSON + ' <7777+stranger@' + FORGE_NOREPLY + '>',
+             {'attribution-trailer', 'private#3@person'}, None),
+            ('an-on-record-address-under-another-name', tr + second + ' <' + co_a + '>',
+             {'attribution-trailer'}, None),
+            ('a-lookalike-domain', tr + PERSON + ' <' + co_a + '.evil>',
+             {'attribution-trailer', 'private#3@person'}, None),
+            ('an-unknown-bot', tr + fixer + ' <' + fixer_addr + '>',
+             {'attribution-trailer'}, None),
+            ('a-bot-address-under-a-person-name-on-its-own-commit',
+             tr + PERSON + ' <' + fixer_addr + '>',
+             {'attribution-trailer', 'private#3@person'}, (PERSON, fixer_addr)),
+            ('a-person-naming-themself-off-record', tr + newcomer + ' <' + new_addr + '>',
+             {'attribution-trailer'}, (newcomer, new_addr)),
+        )
+        for tag, line, want, author in hard_cases:
+            rc, lines = co_scan('fix: x\n\n' + line + '\n', *(author or ()))
+            got = set(c for c, n in body_hits(lines) if n == 3)
+            arm('coauthor-still-hard-' + tag, rc == EXIT_HIT and got == want,
+                'rc=%d got=%s' % (rc, sorted(got)))
+        # a near miss of the one shape is the trailer class on that line, every time
+        near = [ln.replace(tr, 'co-authored-by: ') for ln in (line_a,)] + [
+            line_a.replace('Co-', 'Co'), line_a.replace('-by', '-By'), '  ' + line_a,
+            line_a.replace(': ', ':  '), line_a + ' ', line_a.replace(' <', '  <'),
+            tr + PERSON + ' <' + PLAIN_USER + '@' + FORGE_NOREPLY + '>',
+            tr + PERSON + ' <' + co_a.replace('users.', 'xusers.') + '>',
+            tr + PERSON + ' <' + co_a.upper() + '>']
+        missed = []
+        for line in near:
+            rc, lines = co_scan('fix: x\n\n' + line + '\n')
+            if rc != EXIT_HIT or ('attribution-trailer', 3) not in body_hits(lines):
+                missed.append(near.index(line))
+        arm('coauthor-every-near-miss-of-the-shape-is-hard', not missed, str(missed))
+        # outside the trailer block: above a later paragraph, beside a prose line in
+        # the last paragraph, or as the subject itself
+        rc1, l1 = co_scan('fix: x\n\n' + line_a + '\n\nmore words after it\n')
+        rc2, l2 = co_scan('fix: x\n\n' + line_a + '\nplain words beside it\n')
+        rc3, l3 = co_scan(line_a + '\n')
+        arm('coauthor-a-trailer-outside-the-trailer-block-is-hard',
+            rc1 == rc2 == rc3 == EXIT_HIT
+            and ('attribution-trailer', 3) in body_hits(l1)
+            and ('attribution-trailer', 3) in body_hits(l2)
+            and ('attribution-trailer', 1) in body_hits(l3),
+            '%d %d %d' % (rc1, rc2, rc3))
+        # the collaborator's name on an ordinary line of the same message stays hard
+        rc, lines = co_scan('fix: x\n\nreviewed with ' + PERSON + '\n\n' + line_a + '\n')
+        arm('coauthor-the-name-on-a-prose-line-is-still-hard',
+            rc == EXIT_HIT and body_hits(lines) == {('private#3@person', 3)},
+            'rc=%d %s' % (rc, sorted(body_hits(lines))))
+        # the exemption covers the NAME: a login the tier knows in the address fires,
+        # and so does a person entry the address spells, as both do on an author email
+        rc, lines = co_scan('fix: x\n\n' + tr + PERSON + ' <' + co_login + '>\n')
+        rc2, l2 = co_scan('fix: x\n\n' + tr + second + ' <' + co_named + '>\n')
+        arm('coauthor-the-exemption-covers-the-name-and-not-the-address',
+            rc == rc2 == EXIT_HIT and body_hits(lines) == {('private#2@login', 3)}
+            and body_hits(l2) == {('private#3@person', 3)},
+            'rc=%d %s %s' % (rc, sorted(body_hits(lines)), sorted(body_hits(l2))))
+        # on record in the raw text, and a person in the decoded view: judged in full
+        rc, lines = co_scan('fix: x\n\n' + tr + pct_name + ' <' + co_pct + '>\n')
+        arm('coauthor-a-line-another-view-reads-differently-is-judged-in-full',
+            rc == EXIT_HIT and {('attribution-trailer', 3), ('private#3@person', 3)}
+            <= body_hits(lines), 'rc=%d %s' % (rc, sorted(body_hits(lines))))
+        # never on a surface other than a commit message of the range
+        rc, lines = run(['messages', '--conversation', '--skip-code', '--pr-body-env', 'B',
+                         '--no-allow'], dict(penv, B=squash), repo_co)
+        arm('coauthor-a-pull-request-body-is-never-let-through',
+            rc == EXIT_HIT and {('attribution-trailer', 'pr-body', 3),
+                                ('attribution-trailer', 'pr-body', 4),
+                                ('private#3@person', 'pr-body', 3)} <= hits(lines),
+            'rc=%d %s' % (rc, sorted(hits(lines))))
+        with open(os.path.join(tmp, 'co-msg'), 'w') as fh:
+            fh.write(squash)
+        rc_f, lf = run(['messages', '--message-file', os.path.join(tmp, 'co-msg'), '--no-allow'],
+                       penv, repo_co)
+        rc_t, lt = run(['messages', '--pr-title-env', 'T', '--no-allow'],
+                       dict(penv, T=line_a), repo_co)
+        arm('coauthor-a-message-file-or-a-title-is-never-let-through',
+            rc_f == rc_t == EXIT_HIT and ('attribution-trailer', 'message', 3) in hits(lf)
+            and ('attribution-trailer', 'pr-title', 1) in hits(lt), '%d %d' % (rc_f, rc_t))
+        # determinism: the same range twice reads the same, wall clock aside
+        mixed = 'fix: x\n\nreviewed with ' + PERSON + '\n\n' + line_a + '\n' + line_b + '\n'
+        sha_m = Git(repo_co, env).text(['commit-tree', 'base^{tree}', '-p', 'base', '-m',
+                                        mixed]).strip()
+        twice = [[re.sub(r' wall=\S+', '', ln) for ln in run(
+            ['messages', '--range', 'base..' + sha_m, '--no-allow'], penv, repo_co)[1]]
+            for _ in range(2)]
+        arm('coauthor-two-runs-read-identically', twice[0] == twice[1] and any(
+            'coauthors_on_record=2' in ln for ln in twice[0]), str(twice[0][-2:]))
+        # the two pure decisions, on hand-written vectors
+        tl = 'Signed-off-by: x'
+        arm('coauthor-trailer-block-oracle',
+            trailer_block(['s', '', tl, line_a]) == range(2, 4)
+            and trailer_block(['s', '', tl, '', '']) == range(2, 3)
+            and trailer_block(['s', 'body', '', tl, line_a]) == range(3, 5)
+            and trailer_block([tl]) == range(0)
+            and trailer_block(['s', '', tl, 'prose']) == range(0)
+            and trailer_block(['s', '', tl, ' continued']) == range(0)
+            and trailer_block(['s', chr(0xA0), tl]) == range(0)
+            and trailer_block([]) == range(0) and trailer_block(['', '']) == range(0))
+        rec = {(PERSON, co_a), (keeper, keeper_addr)}.__contains__
+        name_at = (len(tr), len(tr) + len(PERSON))
+        arm('coauthor-on-record-oracle',
+            coauthors_on_record(['s', '', line_a], rec, None) == {2: name_at}
+            and coauthors_on_record(['s', '', line_a, line_keeper], rec, None)
+            == {2: name_at, 3: (len(tr), len(tr) + len(keeper))}
+            and coauthors_on_record(['s', '', line_b], rec, None) == {}
+            and coauthors_on_record(['s', '', line_b], rec, (second, co_b)) == {}
+            and coauthors_on_record(['s', '', tr + fixer + ' <' + fixer_addr + '>'], rec,
+                                    (fixer, fixer_addr)) == {2: (len(tr), len(tr) + len(fixer))}
+            and coauthors_on_record(['s', '', tr + 'fixer <' + fixer_addr + '>'], rec,
+                                    ('fixer', fixer_addr)) == {}
+            and coauthors_on_record([line_a], rec, None) == {})
+        # a REGEX entry reads through the slow path, in both of its branches (the
+        # combined candidate finder, and the per-pattern walk it falls back to), and
+        # follows the same rule there: the name is exempt, the address and every
+        # other line are not
+        rx_person = parse_private('(?<![a-z])' + PERSON.split()[0] + '[ -]'
+                                  + PERSON.split()[1] + '(?![a-z]) @person\n')
+        slow_seen = []
+        for drop_combined in (False, True):
+            ps_slow = PrivateSet(rx_person)
+            if drop_combined:
+                ps_slow.combined = None
+            sc_slow = Scanner('messages', build_classes(), ps_slow, [], lambda s: None)
+            sc_slow.scan_unit('c', 's\n\n' + line_a, 1, '', coauthors={2: name_at})
+            sc_slow.scan_unit('d', 's\n\n' + tr + second + ' <' + co_named + '>', 1, '',
+                              coauthors={2: (len(tr), len(tr) + len(second))})
+            sc_slow.scan_unit('e', 's\n\nwith ' + PERSON + '\n\n' + line_a, 1, '',
+                              coauthors={4: name_at})
+            slow_seen.append(sorted((h.cls, h.path, h.line) for h in sc_slow.hits))
+        slow_want = [('private#1@person', 'd', 3), ('private#1@person', 'e', 3)]
+        arm('coauthor-a-regex-person-entry-follows-the-rule-on-both-slow-paths',
+            slow_seen == [slow_want, slow_want], str(slow_seen))
+        surfaces.add('coauthor-trailer')
         # --- media -----------------------------------------------------------------------
         git.run(['checkout', '-q', 'main'])
         rc, lines = run(['media', '--no-allow'], penv)
