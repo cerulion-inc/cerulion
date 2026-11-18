@@ -1693,6 +1693,155 @@ fn every_package_with_tests_is_named_in_a_ci_test_step() {
     }
 }
 
+/// The packages each sharded lane runs on every pull request, by job.
+///
+/// The package map of `test-linux` and `test-macos` is balanced by hand across
+/// their shards, and a rebalance moves steps between shards. A step moved to
+/// another shard its job's matrix declares keeps its package here. A step
+/// deleted, moved onto a shard the matrix does not declare, or put behind a
+/// condition a pull request can fail takes its package out of that lane, and
+/// `every_package_with_tests_is_named_in_a_ci_test_step` stays green as long
+/// as the other operating system still runs it. So each lane is held to its own
+/// list, in both directions.
+const SHARD_LANE_PACKAGES: &[(&str, &[&str])] = &[
+    (
+        "test-linux",
+        &[
+            "cerulion_android",
+            "cerulion_bag",
+            "cerulion_bagd",
+            "cerulion_cli",
+            "cerulion_cli_engine",
+            "cerulion_cli_tui",
+            "cerulion_connectd",
+            "cerulion_core",
+            "cerulion_discovery",
+            "cerulion_heaphook",
+            "cerulion_macros",
+            "cerulion_msgio",
+            "cerulion_netd",
+            "cerulion_wireclient",
+            "native_ros2_messages",
+            "rmw_cerulion",
+            "test_node_macro_cdylib",
+        ],
+    ),
+    (
+        "test-macos",
+        &[
+            "cerulion_bag",
+            "cerulion_bagd",
+            "cerulion_cli",
+            "cerulion_cli_engine",
+            "cerulion_cli_tui",
+            "cerulion_connectd",
+            "cerulion_core",
+            "cerulion_discovery",
+            "cerulion_macros",
+            "cerulion_msgio",
+            "cerulion_netd",
+            "cerulion_viz",
+            "cerulion_vizd",
+            "cerulion_wireclient",
+            "go2_tf",
+            "native_ros2_messages",
+            "rmw_cerulion",
+        ],
+    ),
+];
+
+/// The packages with tests that a PR-blocking step of `job` in `ci.yml` names.
+fn packages_a_shard_lane_runs(job: &str) -> BTreeSet<String> {
+    let texts = pr_blocking_workflow_texts();
+    let text = texts
+        .get("ci.yml")
+        .expect("ci.yml is classified as PR-blocking");
+    let block = jobs_of(text)
+        .into_iter()
+        .find(|(name, _)| name == job)
+        .map(|(_, block)| block)
+        .unwrap_or_else(|| panic!("ci.yml has no PR-blocking job `{job}`"));
+    packages_with_tests()
+        .keys()
+        .filter(|pkg| block.lines().any(|line| line_names_package(line, pkg)))
+        .cloned()
+        .collect()
+}
+
+/// The complaints about one lane: a declared package no step runs, a run
+/// package nothing declares.
+fn lane_complaints(job: &str, declared: &BTreeSet<String>, runs: &BTreeSet<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for pkg in declared.difference(runs) {
+        out.push(format!(
+            "  {job}: declares `{pkg}`, but no step that runs on every pull request names it"
+        ));
+    }
+    for pkg in runs.difference(declared) {
+        out.push(format!(
+            "  {job}: runs `{pkg}`, which SHARD_LANE_PACKAGES does not declare"
+        ));
+    }
+    out
+}
+
+#[test]
+fn each_shard_lane_runs_exactly_its_declared_packages() {
+    let mut complaints: Vec<String> = Vec::new();
+    for (job, declared) in SHARD_LANE_PACKAGES {
+        let declared: BTreeSet<String> = declared.iter().map(|p| (*p).to_string()).collect();
+        let runs = packages_a_shard_lane_runs(job);
+        complaints.extend(lane_complaints(job, &declared, &runs));
+        // The lanes are large; a reader that found almost nothing is broken.
+        assert!(
+            runs.len() >= 10,
+            "only {} package(s) found in `{job}`: the job reader is not reaching the lane",
+            runs.len()
+        );
+    }
+    assert!(
+        complaints.is_empty(),
+        "a shard lane's packages changed:\n{}\n\nA package step that moves between \
+         shards keeps its package; one that was deleted, moved onto a shard the job's \
+         matrix does not declare, or put behind a condition a pull request can fail \
+         takes it out of that operating system before merge. Put the step back on a \
+         declared shard, or, when the change is meant, edit SHARD_LANE_PACKAGES in this \
+         file to match.",
+        complaints.join("\n")
+    );
+
+    // The control: one declared package missing and one undeclared run, both named.
+    let set =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| (*n).to_string()).collect() };
+    let got = lane_complaints("lane", &set(&["a", "b"]), &set(&["b", "c"]));
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(
+        got[0].contains("declares `a`") && got[1].contains("runs `c`"),
+        "{got:?}"
+    );
+    assert!(lane_complaints("lane", &set(&["a"]), &set(&["a"])).is_empty());
+}
+
+#[test]
+fn a_shard_lane_loses_a_package_whose_step_moves_onto_an_undeclared_shard() {
+    // The same reading `packages_a_shard_lane_runs` applies, over a hand-written
+    // job: shard 1 exists, shard 7 does not, so only `pkg_a` is credited.
+    let job = "  lane:\n    runs-on: macos-latest\n    strategy:\n      matrix:\n        \
+               shard: [0, 1]\n    steps:\n      - name: a\n        if: matrix.shard == 1\n        \
+               run: cargo test -p pkg_a\n      - name: b\n        if: matrix.shard == 7\n        \
+               run: cargo test -p pkg_b\n";
+    let text = format!("on:\n  pull_request:\njobs:\n{job}");
+    let kept = pr_blocking_jobs(&text);
+    assert!(
+        kept.lines().any(|l| line_names_package(l, "pkg_a")),
+        "a step on a declared shard must stay:\n{kept}"
+    );
+    assert!(
+        !kept.lines().any(|l| line_names_package(l, "pkg_b")),
+        "a step on an undeclared shard must be dropped:\n{kept}"
+    );
+}
+
 /// The name-boundary rule is what keeps `cerulion_viz` and `cerulion_vizd`
 /// apart, and it is asserted directly rather than trusted: with a plain
 /// `contains`, deleting the `cerulion_viz` step would leave the gate green
@@ -1794,7 +1943,7 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
         "the --check verdict line is missing; got:\n{stdout}"
     );
 
-    // The ONE routing exception must be reported, by name and by shard.
+    // Each routing exception must be reported, by name and by shard.
     //
     // `--check` pins `macro_compile_fail_test` to a fixed shard because it is the
     // serial trybuild tail: one test that is essentially the whole of whichever
@@ -1810,16 +1959,23 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
     // So this asserts the LINE, which is what makes the pin observable. Without
     // it the pin's own guard can go inert — silently, and in exactly the
     // direction that puts the tail back on a runner chosen by an unrelated PR.
-    let expected_pin = "pinned: macro_compile_fail_test -> shard 2";
-    assert!(
-        stdout.contains(expected_pin),
-        "the --check pin line is missing.\n\
-         Expected a line containing: {expected_pin}\n\
-         Either the pin moved (re-balance the package map in \
-         .github/workflows/ci.yml to match), or its target file was renamed \
-         or deleted (see PINNED_TEST in tools/scripts/ci_test_shard.sh).\n\
-         got:\n{stdout}"
-    );
+    // The second pin, the waiver gate whose shard also builds the binaries it
+    // asks about, is held to the same line for the same reason.
+    for expected_pin in [
+        "pinned: macro_compile_fail_test -> shard 2",
+        "pinned: upstream_waivers_test -> shard 1",
+    ] {
+        assert!(
+            stdout.contains(expected_pin),
+            "the --check pin line is missing.\n\
+             Expected a line containing: {expected_pin}\n\
+             Either the pin moved (re-balance the package map in \
+             .github/workflows/ci.yml to match), or its target file was renamed \
+             or deleted (see PINNED_TEST and WAIVER_PINNED_TEST in \
+             tools/scripts/ci_test_shard.sh).\n\
+             got:\n{stdout}"
+        );
+    }
 }
 
 /// The test binaries one `CI_TEST_SHARD_EXTRA` line filters out, read in the
@@ -2005,7 +2161,7 @@ fn a_test_binary_filtered_out_of_a_shard_step_runs_in_another_jobs_shard_step() 
 
 /// `--check` finds the pinned file in a listing far longer than a pipe holds.
 ///
-/// The pinned name is the listing's FIRST line and the listing runs to several
+/// The pinned names sort FIRST in the listing and the listing runs to several
 /// hundred kilobytes, so a membership test that pipes the listing into `grep -q`
 /// has grep exit on line one while the writer still holds most of the listing:
 /// the writer takes SIGPIPE, and under `pipefail` the file reads as absent. A
@@ -2019,7 +2175,8 @@ fn the_shard_check_finds_the_pinned_file_in_a_listing_longer_than_a_pipe_holds()
     let tests = package.path().join("tests");
     std::fs::create_dir(&tests).expect("the package's tests directory");
     std::fs::write(tests.join("macro_compile_fail_test.rs"), "").expect("the pinned file");
-    // 4000 names of 207 bytes that all sort after the pinned one: about 830 KB.
+    std::fs::write(tests.join("upstream_waivers_test.rs"), "").expect("the second pinned file");
+    // 4000 names of 207 bytes that all sort after the pinned ones: about 830 KB.
     let pad = "x".repeat(200);
     for i in 0..4000 {
         std::fs::write(tests.join(format!("z_{pad}_{i:04}.rs")), "").expect("a test file");
@@ -2040,13 +2197,15 @@ fn the_shard_check_finds_the_pinned_file_in_a_listing_longer_than_a_pipe_holds()
         "--check refused a package whose pinned file is on disk.\n\
          stdout:\n{stdout}\nstderr:\n{stderr}"
     );
-    // The 4000 others round robin to 1000 a shard, and the pinned file joins shard 2.
+    // The 4000 others round robin to 1000 a shard, the trybuild tail joins shard
+    // 2 and the waiver gate shard 1.
     for line in [
         "shard 0/4: 1000 test file(s)",
-        "shard 1/4: 1000 test file(s)",
+        "shard 1/4: 1001 test file(s)",
         "shard 2/4: 1001 test file(s)",
         "shard 3/4: 1000 test file(s)",
         "pinned: macro_compile_fail_test -> shard 2/4",
+        "pinned: upstream_waivers_test -> shard 1/4",
     ] {
         assert!(
             stdout.lines().any(|l| l.starts_with(line)),

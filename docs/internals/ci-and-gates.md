@@ -502,11 +502,13 @@ PROJECTED from those per-step costs at 26.6 min warm; the eight default-branch r
 2026-09-27 put the observed macOS shard walls at 29 to 44 min, cache state not recorded. Each leg
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
-`index mod count`, GENERATED, never hand-listed, save for ONE pinned name
-(`macro_compile_fail_test`, the serial trybuild tail (see `PINNED_TEST` in that script for the
-per-run measurement), which must not relocate every time a test
-file is added; it lands on `PINNED_SHARD % count`, shard 2 of 4 on Linux, shard 2 of 3 on
-macOS, and `--check` proves the pin), and execs `cargo nextest run --profile ci`
+`index mod count`, GENERATED, never hand-listed, save for TWO pinned names, which must not
+relocate every time a test file is added: `macro_compile_fail_test`, the serial trybuild tail
+(see `PINNED_TEST` in that script for the per-run measurement), on `PINNED_SHARD % count`,
+shard 2 of 4 on Linux and 2 of 3 on macOS; and `upstream_waivers_test`, the waiver gate whose
+shard first builds the binaries it asks about (see `WAIVER_PINNED_TEST`), on shard 1 of 4 and
+0 of 3, beside the `cerulion_cli` suite that builds most of the same binaries.
+`--check` proves each pin. The script execs `cargo nextest run --profile ci`
 (install via `tools/scripts/install_nextest.sh`). It does NOT pass `--test-threads=1`; see the
 serialisation fence below. The split across runners is legal because each VM has its own
 `/dev/shm`.

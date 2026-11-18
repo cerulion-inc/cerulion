@@ -31,13 +31,15 @@
 # sorted, assigned round-robin by `index mod count`. Add a test file and it
 # lands in a shard automatically; nothing needs editing.
 #
-# WITH EXACTLY ONE NAMED EXCEPTION, and the rule above is why it is one name
-# and not a list: `macro_compile_fail_test` is PINNED to a fixed shard, because
-# it is a multi-minute serial trybuild tail whose round-robin position — and
-# therefore which runner pays it — changes every time an unrelated test file is
-# added. Everything else still round-robins with no edit here. The evidence,
-# the arithmetic and the bar for adding a second name are at `PINNED_TEST`
-# below; `--check` proves the pin landed where it says it did.
+# WITH TWO NAMED EXCEPTIONS, and the rule above is why each name needs its
+# own evidence: `macro_compile_fail_test` and `upstream_waivers_test` are
+# PINNED to fixed shards, because each carries a multi-minute fixed cost (a
+# serial trybuild tail; a build of the test binaries the waiver gate asks
+# about) whose round-robin position, and therefore which runner pays it,
+# changes every time an unrelated test file is added. Everything else
+# still round-robins with no edit here. The evidence, the arithmetic and the
+# bar for adding a name are at `PINNED_TEST` and `WAIVER_PINNED_TEST` below;
+# `--check` proves each pin landed where it says it did.
 #
 # `--lib` (the package's own unit tests) rides shard 0. It is a single target,
 # it is cheap, and it has to go somewhere exactly once.
@@ -95,11 +97,11 @@ DEFAULT_PACKAGE=cerulion_core
 DEFAULT_SHARD_COUNT=4
 
 # --------------------------------------------------------------------------
-# The one routing exception (a deliberate decision).
+# The first routing exception (a deliberate decision).
 #
 # Read the header rule first — "THE LIST IS GENERATED, NEVER HAND-WRITTEN" —
-# because this is a deliberate, single-name carve-out of it and nothing else
-# may follow it in without the same evidence.
+# because this is a deliberate carve-out of it, and nothing may follow it in
+# without the same evidence (the second, `WAIVER_PINNED_TEST`, carries its own).
 #
 # WHY. `macro_compile_fail_test::compile_fail_tests` is a trybuild harness: it
 # invokes rustc once per `tests/ui/*.rs` case, inside ONE test, serially.
@@ -140,13 +142,14 @@ DEFAULT_SHARD_COUNT=4
 #
 # WHAT IS NOT CHANGED. New test files still round-robin, automatically, with no
 # edit here — the generated-list property the header defends is intact for
-# every other binary. This is one name, not a list, and `--check` PROVES the
-# partition is still total and disjoint AND that the pin landed where declared
-# (`do_check` below), so a future arithmetic slip is a red, not a silent drop.
+# every other binary. Each pinned name carries its own evidence, and `--check`
+# PROVES the partition is still total and disjoint AND that each pin landed
+# where declared (`do_check` below), so a future arithmetic slip is a red, not
+# a silent drop.
 #
-# ADDING A SECOND NAME HERE NEEDS THE SAME EVIDENCE: a measured wall showing
-# one binary dominates a shard, and a map that is balanced around it. Absent
-# that, the answer is the round-robin.
+# ADDING A NAME HERE NEEDS THE SAME EVIDENCE: a measured fixed cost that one
+# binary puts on whichever shard holds it, and a map that is balanced around
+# it. Absent that, the answer is the round-robin.
 #
 # PINNED_SHARD is taken `% count`, so the pin is always a valid index for any
 # shard count: `--check cerulion_core 2` still partitions. TWO counts ship, 4 on
@@ -156,10 +159,35 @@ DEFAULT_SHARD_COUNT=4
 # `ci_test_shard.sh cerulion_bag …` is unaffected.
 PINNED_TEST=macro_compile_fail_test
 PINNED_SHARD=2
-# The package that OWNS the pin. `--check` on this package REQUIRES the pinned
-# file to exist (see the fail-closed arm in `do_check`); on any other package
-# the pin is inert. Separate from DEFAULT_PACKAGE, which happens to hold the
-# same value but answers a different question ("what does CI shard?").
+
+# The second routing exception, held to the bar above.
+#
+# WHY. `upstream_waivers_test` asks OTHER test binaries what libtest will do
+# with the arms it declares waived, so the shard that runs it first builds
+# those binaries in a step of its own (`Build the binaries the waiver gate asks`
+# in `.github/workflows/ci.yml`): test binaries of `cerulion_core`,
+# `cerulion_cli_engine` and `cerulion_cli`, most of them `cerulion_cli`'s.
+# Measured on the 30 green pull request runs of ci.yml created 2026-11-17
+# 19:33 to 2026-11-18 01:34 UTC (runs 44159878309 to 44216837072), that step
+# took 2.2 to 11.6 min on the shard that ran the gate, and the round-robin
+# moved the gate between macOS shards 1, 0 and 2 and between Linux shards 1
+# and 3 inside those six hours, as test files were added. No package map can
+# be balanced against a term that moves.
+#
+# WHERE. `9`, taken `% count` like every pin: shard 1 of 4 on Linux and shard
+# 0 of 3 on macOS, the shards whose `CLI binary tests` step builds the same
+# `cerulion_cli` test binaries, so the two share that build.
+WAIVER_PINNED_TEST=upstream_waivers_test
+WAIVER_PINNED_SHARD=9
+
+# Every pin as `<test>:<shard>`, in the order `--check` reports them.
+PINS="${PINNED_TEST}:${PINNED_SHARD} ${WAIVER_PINNED_TEST}:${WAIVER_PINNED_SHARD}"
+
+# The package that OWNS the pins. `--check` on this package REQUIRES every
+# pinned file to exist (see the fail-closed arm in `do_check`); on any other
+# package the pins are inert. Separate from DEFAULT_PACKAGE, which happens to
+# hold the same value but answers a different question ("what does CI
+# shard?").
 PINNED_PACKAGE=cerulion_core
 
 die() {
@@ -230,24 +258,36 @@ enumerate() {
         | LC_ALL=C sort
 }
 
-# Print the members of one shard: round-robin by position, EXCEPT `$PINNED_TEST`,
-# which is held out of the rotation and appended to shard `$PINNED_SHARD % count`
-# (see the block above the constants for why that one name is pinned).
+# Print the members of one shard: round-robin by position, EXCEPT each name in
+# `$PINS`, which is held out of the rotation and appended to its shard taken
+# `% count`, in `$PINS` order (see the blocks above the constants for why
+# those names are pinned).
 #
 # ONE awk pass, not a `grep -v` pipeline, on purpose: under `set -o pipefail` a
 # `grep` that matches nothing exits 1 and would take the whole command
 # substitution down with it — for a package whose only test file happened to be
-# the pinned one, and for every package that does not contain it.
+# a pinned one, and for every package that does not contain them.
 shard_members() {
     _dir=$1; _index=$2; _count=$3
     enumerate "$_dir" | awk \
-        -v idx="$_index" -v cnt="$_count" \
-        -v pin="$PINNED_TEST" -v pinshard="$((PINNED_SHARD % _count))" '
-        # Hold the pinned binary out of the rotation entirely, so the other
+        -v idx="$_index" -v cnt="$_count" -v pins="$PINS" '
+        BEGIN {
+            n = split(pins, entry, " ")
+            for (i = 1; i <= n; i++) {
+                split(entry[i], part, ":")
+                name[i] = part[1]
+                home[part[1]] = part[2] % cnt
+            }
+        }
+        # Hold every pinned binary out of the rotation entirely, so the other
         # files close ranks and their positions stay contiguous.
-        $0 == pin { pinned = $0; next }
+        $0 in home { present[$0] = 1; next }
         (pos++ % cnt) == idx { print }
-        END { if (pinned != "" && idx == pinshard) print pinned }
+        END {
+            for (i = 1; i <= n; i++) {
+                if ((name[i] in present) && home[name[i]] == idx) print name[i]
+            }
+        }
     '
 }
 
@@ -460,51 +500,52 @@ $_members"
         exit 1
     fi
 
-    # PINNED: the one routing exception must land on the shard it DECLARES —
-    # and, on the package that owns the pin, must still EXIST.
+    # PINNED: each routing exception must land on the shard it DECLARES, and,
+    # on the package that owns the pins, must still EXIST.
     #
-    # Totality and disjointness above already prove the pinned binary runs
-    # exactly once — they do NOT prove it runs where the workflow's package map
-    # was balanced to expect. That map counts the serial tail as a FIXED term
-    # of the pinned shard's wall and packs the package steps around it; a pin
-    # that silently drifted would leave two shards mis-sized with every gate
-    # green.
+    # Totality and disjointness above already prove each pinned binary runs
+    # exactly once; they do NOT prove it runs where the workflow's package map
+    # was balanced to expect. That map counts each pin's cost as a FIXED term
+    # of its shard's wall and packs the package steps around it; a pin that
+    # silently drifted would leave two shards mis-sized with every gate green.
     #
-    # FAIL CLOSED on absence. Guarding this whole block on
-    # "the pinned file is present" would make a rename or a delete report
-    # SUCCESS with no `pinned:` line at all: the tail would rejoin the
-    # round-robin (landing on shard 0, the heaviest) and the only signal was a
-    # line of output nobody was asserting on. An exemption that stops
-    # describing anything must fail rather than evaporate, so on
-    # $PINNED_PACKAGE an absent pin target is a VIOLATION naming both real
-    # remedies. Other packages stay inert — they never had the file.
+    # FAIL CLOSED on absence. Guarding a pin on "its file is present" would
+    # make a rename or a delete report SUCCESS with no `pinned:` line at all:
+    # the binary would rejoin the round-robin and the only signal was a line
+    # of output nobody was asserting on. An exemption that stops describing
+    # anything must fail rather than evaporate, so on $PINNED_PACKAGE an
+    # absent pin target is a VIOLATION naming both real remedies. Other
+    # packages stay inert: they never had the files.
     # A here-string, not a pipe: `grep -q` exits on the match, and a `printf`
     # still writing the rest of the list would take SIGPIPE, which `pipefail`
     # reads as "no such file".
-    if grep -qx -- "$PINNED_TEST" <<<"$_all"; then
-        _pin_shard=$((PINNED_SHARD % _count))
-        _pin_found=$(shard_members "$_dir" "$_pin_shard" "$_count" | grep -cx "$PINNED_TEST" || true)
-        if [ "$_pin_found" -ne 1 ]; then
-            printf 'VIOLATION: %s is pinned to shard %d/%d but is not in it.\n' \
-                "$PINNED_TEST" "$_pin_shard" "$_count" >&2
-            printf 'The workflow package map in .github/workflows/ci.yml is balanced around\n' >&2
-            printf 'that shard carrying this serial tail. Fix shard_members() in %s.\n' "$0" >&2
+    for _pin in $PINS; do
+        _pin_test=${_pin%%:*}
+        _pin_shard=$((${_pin#*:} % _count))
+        if grep -qx -- "$_pin_test" <<<"$_all"; then
+            _pin_found=$(shard_members "$_dir" "$_pin_shard" "$_count" | grep -cx "$_pin_test" || true)
+            if [ "$_pin_found" -ne 1 ]; then
+                printf 'VIOLATION: %s is pinned to shard %d/%d but is not in it.\n' \
+                    "$_pin_test" "$_pin_shard" "$_count" >&2
+                printf 'The workflow package map in .github/workflows/ci.yml is balanced around\n' >&2
+                printf 'that shard carrying this binary. Fix shard_members() in %s.\n' "$0" >&2
+                exit 1
+            fi
+            printf 'pinned: %s -> shard %d/%d (a routing exception)\n' \
+                "$_pin_test" "$_pin_shard" "$_count"
+        elif [ "$_pkg" = "$PINNED_PACKAGE" ]; then
+            printf 'VIOLATION: %s pins %s, but %s/tests holds no such file.\n' \
+                "$PINNED_PACKAGE" "$_pin_test" "$_dir" >&2
+            printf 'The pin is now describing nothing, and the binary it names has silently\n' >&2
+            printf 'rejoined the round-robin, which is what the pin exists to prevent and\n' >&2
+            printf 'what the workflow package map is balanced against.\n' >&2
+            printf 'Fix ONE of:\n' >&2
+            printf '  * restore %s/tests/%s.rs (it was renamed or deleted), or\n' "$_dir" "$_pin_test" >&2
+            printf '  * update the pin in %s to the new name AND re-check the package\n' "$0" >&2
+            printf '    map in .github/workflows/ci.yml still counts shard %d as carrying it.\n' "$_pin_shard" >&2
             exit 1
         fi
-        printf 'pinned: %s -> shard %d/%d (the one routing exception)\n' \
-            "$PINNED_TEST" "$_pin_shard" "$_count"
-    elif [ "$_pkg" = "$PINNED_PACKAGE" ]; then
-        printf 'VIOLATION: %s pins %s, but %s/tests holds no such file.\n' \
-            "$PINNED_PACKAGE" "$PINNED_TEST" "$_dir" >&2
-        printf 'The pin is now describing nothing, and the serial trybuild tail it\n' >&2
-        printf 'names has silently rejoined the round-robin — which is what the pin\n' >&2
-        printf 'exists to prevent, and what the workflow package map is balanced against.\n' >&2
-        printf 'Fix ONE of:\n' >&2
-        printf '  * restore %s/tests/%s.rs (it was renamed or deleted), or\n' "$_dir" "$PINNED_TEST" >&2
-        printf '  * update PINNED_TEST in %s to the new name AND re-check the package\n' "$0" >&2
-        printf '    map in .github/workflows/ci.yml still counts shard %d as carrying the tail.\n' "$PINNED_SHARD" >&2
-        exit 1
-    fi
+    done
 
     printf 'ci_test_shard --check: OK — %d test file(s) partitioned across %d shard(s) of %s, total and disjoint.\n' \
         "$_total" "$_count" "$_pkg"

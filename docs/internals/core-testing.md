@@ -14,15 +14,17 @@ document; when a row and the file's own header disagree, the header wins; fix th
 - CI SHARDS this crate 4 ways on Linux and 3 ways on macOS.
   `./tools/scripts/ci_test_shard.sh cerulion_core <n> <count>` enumerates `tests/*.rs` at
   depth 1 and takes every file whose position is `index mod count`, so a new test file
-  joins a shard with nothing to edit, with ONE named exception: the script PINS
+  joins a shard with nothing to edit, with TWO named exceptions. The script PINS
+  `upstream_waivers_test` beside the `cerulion_cli` suite (shard 1 of 4, 0 of 3), because the
+  shard that runs it first builds the test binaries it asks about, and
   `macro_compile_fail_test` to shard `PINNED_SHARD % count` (2 of 4 on Linux, 2 of 3 on
-  macOS), because that trybuild harness is the serial tail: one test that is essentially the
-  whole of whichever shard holds it. On macOS it runs on a push to `main` and on a dispatch
-  only; pull requests and the merge queue run it on Linux (`docs/internals/ci-and-gates.md`).
-  Unpinned, its position shifts whenever any unrelated test file is added, moving which runner
-  is the critical path. Its SIZE is a per-run
-  measurement this doc does not restate: the reading lives in `PINNED_TEST` in that script,
-  which is also where the bar for adding a second pinned name lives. `--check` proves the
+  macOS), because that trybuild harness is
+  the serial tail: one test that is essentially the whole of whichever shard holds it. On
+  macOS it runs on a push to `main` and on a dispatch only; pull requests and the merge queue
+  run it on Linux (`docs/internals/ci-and-gates.md`). Unpinned, its position shifts whenever
+  any unrelated test file is added, moving which runner is the critical path. Its SIZE is a
+  per-run measurement this doc does not restate: the reading lives in `PINNED_TEST` in that
+  script, which is also where the bar for adding a pinned name lives. `--check` proves each
   pin landed where declared, and that the partition is total and disjoint. The script execs
   `cargo nextest run --profile ci` (install: `tools/scripts/install_nextest.sh`). It does
   NOT pass `--test-threads=1`, and the absence is deliberate: nextest gives each test its

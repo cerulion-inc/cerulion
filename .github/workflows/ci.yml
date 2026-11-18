@@ -1094,7 +1094,7 @@ jobs:
 
       # THE SHARD PARTITION AND ITS SELECTION READER. `--check` proves the
       # partition of `cerulion_core`'s test files is total and disjoint, that
-      # the one routing exception landed where it declares, and that the
+      # each of the two routing exceptions landed where it declares, and that the
       # selection reader agrees with its hand table. A bare `--check` is the
       # SHIPPED configuration, which is why no argument follows it.
       #
@@ -2692,12 +2692,9 @@ jobs:
       # reads, so the two cannot drift, and each crate's count is floored so a
       # parse that matched nothing fails here instead of building nothing.
       #
-      # COST, stated because it is not measured: this puts a
-      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
-      # which otherwise builds that crate on shard 2 alone, on a different runner
-      # with its own target directory. The added wall on a runner is NOT measured
-      # here and is owed; the shard map above is packed against measured walls, so
-      # the figure belongs beside its other terms once one run has it.
+      # The gate is pinned to shard 1 here (`WAIVER_PINNED_TEST` in
+      # `tools/scripts/ci_test_shard.sh`), the shard whose `CLI binary tests`
+      # step builds most of the same `cerulion_cli` test binaries.
       - name: Build the binaries the waiver gate asks (its shard only)
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
@@ -2889,8 +2886,8 @@ jobs:
       # steps). The core quarter is therefore NOT where the imbalance lives:
       # the per-binary walls in the nextest final block of one of those runs sum
       # to 51-63 s per shard outside the tail and no other binary exceeds
-      # 18 s, so the file map in `ci_test_shard.sh` stays round-robin and no
-      # second pin is warranted. The package steps are the whole imbalance.
+      # 18 s, so the file map in `ci_test_shard.sh` stays round-robin apart
+      # from its pins. The package steps are the rest of the imbalance.
       # (The tail itself is not addressable: splitting it by expectation
       # WITHIN the job measured +158 s of trybuild work, +2.4 min of
       # shard-step wall. It is PINNED so it cannot relocate
@@ -3367,8 +3364,10 @@ jobs:
   # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
   # stay together so that ~390-crate tree compiles once; `--lib` and the
   # doctests ride shard 0 because the shard script puts the lib unit tests
-  # there; and the trybuild tail lands on `PINNED_SHARD % 3` = shard 2, so
-  # shard 2 gets the lightest package set. Re-tilt if a run shows the legs
+  # there; and the trybuild tail lands on `PINNED_SHARD % 3` = shard 2, which
+  # runs it only on a push and a dispatch (pull requests and the queue run it
+  # on Linux), so shard 2 takes the serial `bagd` suite beside the viz suites.
+  # Re-tilt if a run shows the legs
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
 
@@ -3616,7 +3615,8 @@ jobs:
       # shard 1, the rerun tree on shard 2, both of which `cargo build
       # --workspace` builds on every leg anyway). That makes shard 0 a better
       # saver under this map than under the 2-way one, not merely a defensible
-      # one. If the package map moves again, re-derive this rather than
+      # one, and since the rebalance it also runs the engine's own suite and the
+      # waiver gate. If the package map moves again, re-derive this rather than
       # trusting it.
       # (Shard 0 is the SOLE saver of `cargo-macOS-`: no other job on this
       # runner writes that key.)
@@ -3714,8 +3714,8 @@ jobs:
       # `cerulion_cli_engine/tests/ci_test_coverage_test.rs`, which walks every
       # job a pull request can fail and this job is one of them.
       # `--check cerulion_core 3` proves the partition
-      # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
-      # on shard 2, which is why shard 2 gets the lightest package set below).
+      # (109 + 108 + 108 files today, `PINNED_SHARD % 3 == 2` so the trybuild
+      # tail lands on shard 2, and the waiver gate on shard 0).
       # ---------------------------------------------------------------
       # Descriptor sampler, recording only what it can read. The kernel's
       # open-file counters at 10 Hz on one line per tick, and once a second a
@@ -3906,12 +3906,9 @@ jobs:
       # reads, so the two cannot drift, and each crate's count is floored so a
       # parse that matched nothing fails here instead of building nothing.
       #
-      # COST, stated because it is not measured: this puts a
-      # `cerulion_cli_engine` lib build plus two of its test binaries on shard 0,
-      # which otherwise builds that crate on shard 2 alone, on a different runner
-      # with its own target directory. The added wall on a runner is NOT measured
-      # here and is owed; the shard map above is packed against measured walls, so
-      # the figure belongs beside its other terms once one run has it.
+      # The gate is pinned to shard 0 here (`WAIVER_PINNED_TEST` in
+      # `tools/scripts/ci_test_shard.sh`), the shard whose `CLI binary tests`
+      # step builds most of the same `cerulion_cli` test binaries.
       - name: Build the binaries the waiver gate asks (its shard only)
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
@@ -3999,12 +3996,12 @@ jobs:
       # `test-linux`'s 4-way table), balanced against the per-step numbers in
       # the note above the job:
       #
-      #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
-      #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
-      #            tree kept together (wireclient, connectd, netd-wan)
+      #   shard 0  `--lib` + doctests, rmw, CLI binary, CLI engine
+      #   shard 1  installer self-test, bag, CLI TUI, and the iroh tree kept
+      #            together (wireclient, connectd, netd-wan)
       #   shard 2  the pinned trybuild tail and the context helper's trybuild
       #            suite (push and dispatch only), native_ros2_messages,
-      #            macros, discovery, and the folded viz suites
+      #            macros, discovery, bagd (serial), and the folded viz suites
       #
       # Every `run:` line is byte-identical to the 2-way map, so nothing about
       # WHAT runs changed and both nightly mirrors still cover the job; only
@@ -4047,7 +4044,7 @@ jobs:
         run: |
           echo "selection: skipped cerulion_bag (selected: $SELECTED)"
       - name: cerulion_bagd tests (serial, process-global panic hook)
-        if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
         run: cargo test -p cerulion_bagd -- --test-threads=1
       - name: selection marker, cerulion_bagd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd') }}
@@ -4087,12 +4084,13 @@ jobs:
         run: |
           echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
 
-      # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
-      # rides shard 1 and the binary rides shard 0, because the binary's suite
-      # is the single most expensive package step on this job (10.4 min warm)
-      # and the engine's is the third (6.2 min).
+      # `cli_engine` and `cli` both ride shard 0. The engine's suite is the
+      # largest package step on this job (17.0 min at the median of 30 pull
+      # request runs, the binary's 5.6) and left shard 1 the heaviest once the
+      # trybuild suites ran on shard 2 only on a push and a dispatch; shard 2
+      # takes the serial `cerulion_bagd` suite from shard 0 in exchange.
       - name: CLI engine tests
-        if: matrix.shard == 1
+        if: matrix.shard == 0
         # --no-fail-fast so ONE run reports every failing binary: cargo stops at
         # the first by default, which is why a per-binary waiver took three heads.
         run: cargo test -p cerulion_cli_engine --no-fail-fast
