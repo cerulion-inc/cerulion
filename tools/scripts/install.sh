@@ -1166,7 +1166,9 @@ $(system_bin_dir)"
 # a regular file and not a link, names install.sh and records that the install
 # placed the tree ("harness":true). A tree without that record is the user's:
 # the installer neither replaces nor removes it. A marker that could not be
-# written leaves a placed tree unrecorded, so the next install refuses it.
+# written leaves the previous one in place: a tree this install placed goes
+# unrecorded, so the next install refuses it, and a record an earlier install
+# wrote can outlive the tree it names.
 harness_is_ours() {
     harness_marker="$1/.cerulion-provenance.json"
     [ -f "$harness_marker" ] && [ ! -L "$harness_marker" ] &&
@@ -2669,7 +2671,13 @@ MV_EOF
         if [ "$harness_status" -eq 0 ]; then
             die "self-test: a harness/ that appeared during the install ($harness_fault) did not fail it"
         fi
-        grep -Fq 'could not activate harness' "$harness_root/race-$harness_fault-error" ||
+        # A directory there before the move meets the check made just before
+        # it; one the move itself meets fails it (GNU mv -T) or is found by
+        # the tree's identity (a plain mv).
+        harness_race_message='could not activate harness'
+        [ "$harness_fault" = appear ] ||
+            harness_race_message="could not activate harness: $harness_race_dir/harness appeared during the install"
+        grep -Fq "$harness_race_message" "$harness_root/race-$harness_fault-error" ||
             die "self-test: the harness/ that appeared ($harness_fault) was not reported: $(cat "$harness_root/race-$harness_fault-error")"
         [ "$(cat "$harness_race_dir/harness/notes.txt")" = mine ] ||
             die "self-test: the install removed or changed a harness/ that appeared ($harness_fault)"
