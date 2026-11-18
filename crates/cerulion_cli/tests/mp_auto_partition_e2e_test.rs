@@ -41,6 +41,10 @@
 //!    hosts every unit across the window, nothing is derived, the skip notice
 //!    is present, and the bag embeds one process group holding every node,
 //!    with one rank per unit.
+//! 4. **One warning per run**: the default 3-worker run beside a name and a
+//!    value that are not valid UTF-8 prints the node-environment line once,
+//!    from the supervisor, and each `env.json` line once, from the run
+//!    directory's render, and no line carries a value.
 //!
 //! Harness cribs `mp_record_e2e_test.rs` (tempdir workspace, PREBUILT fixture
 //! cdylibs — no in-test cargo build, redirected child logs, bounded waits,
@@ -62,7 +66,9 @@
 // `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
+use std::ffi::OsStr;
 use std::io::Read as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -470,15 +476,22 @@ fn spawn_graph_run(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf, PathBuf
 
 /// [`spawn_graph_run`] plus extra process env — the run-directory writer needs `CERULION_HOME`
 /// redirected so the run directory the REAL binary writes lands under the
-/// test's tempdir rather than the developer's home.
+/// test's tempdir rather than the developer's home. A name or value in `env`
+/// may be bytes that are not valid UTF-8; any such variable this process
+/// inherited is removed, so the ones in `env` are the only such variables.
 fn spawn_graph_run_with_env(
     root: &Path,
     extra: &[&str],
-    env: &[(&str, &Path)],
+    env: &[(&OsStr, &OsStr)],
 ) -> (ChildGuard, PathBuf, PathBuf) {
     let stdout_path = root.join("run.stdout");
     let stderr_path = root.join("run.stderr");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    for (name, value) in std::env::vars_os() {
+        if name.to_str().is_none() || value.to_str().is_none() {
+            cmd.env_remove(name);
+        }
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -1441,8 +1454,11 @@ fn no_tty_default_mp_run_writes_and_announces_its_run_directory() {
     let home = tmp.path().join("cerhome");
     std::fs::create_dir_all(&home).unwrap();
 
-    let (mut guard, stdout_path, stderr_path) =
-        spawn_graph_run_with_env(tmp.path(), &[], &[("CERULION_HOME", home.as_path())]);
+    let (mut guard, stdout_path, stderr_path) = spawn_graph_run_with_env(
+        tmp.path(),
+        &[],
+        &[(OsStr::new("CERULION_HOME"), home.as_os_str())],
+    );
     let sup_pid = guard.0.id();
 
     // REALLY multi-process (the supervisor arm, which returns from inside the
@@ -1565,6 +1581,96 @@ fn no_tty_default_mp_run_writes_and_announces_its_run_directory() {
         "a clean exit must remove the run directory — leftovers are indistinguishable \
          from a SIGKILLed run's while being neither"
     );
+}
+
+/// (4) A 3-worker run beside a name and a value that are not valid UTF-8
+/// prints each environment warning once. The supervisor reports what its
+/// planning build left out of the nodes' environment and no worker does, so
+/// the node-environment line prints once, not four times; the run directory's
+/// `env.json` render prints each `env.json` line once. Every worker inherits
+/// the variables and writes to the same stderr, so a worker's line would be
+/// counted here. No line carries a value.
+#[test]
+#[serial_test::serial]
+fn a_three_worker_run_beside_non_utf8_variables_prints_each_environment_warning_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    build_unpartitioned_workspace(tmp.path(), "apdnu");
+    let home = tmp.path().join("cerhome");
+    std::fs::create_dir_all(&home).unwrap();
+    let (mut guard, stdout_path, stderr_path) = spawn_graph_run_with_env(
+        tmp.path(),
+        &[],
+        &[
+            (OsStr::new("CERULION_HOME"), home.as_os_str()),
+            (
+                OsStr::from_bytes(b"CER_E2E_PROBE_NAME_\xff"),
+                OsStr::new("cer-e2e-probe-name-value"),
+            ),
+            // "café" in Latin-1 under an allowlisted name: the default mode
+            // would have kept it as text.
+            (
+                OsStr::new("CERULION_E2E_PROBE_LATIN1"),
+                OsStr::from_bytes(b"caf\xe9"),
+            ),
+        ],
+    );
+    let sup_pid = guard.0.id();
+    let workers = wait_for_workers(sup_pid, 3, Duration::from_secs(60));
+    assert!(
+        workers.len() >= 3,
+        "expected the derived process-per-node partition to spawn 3 workers, observed \
+         {workers:?}\nstdout:\n{}\nstderr:\n{}",
+        read_file(&stdout_path),
+        read_file(&stderr_path)
+    );
+    // Every worker has built its graph by GO.
+    assert!(
+        wait_for_log(&stderr_path, GO_MARKER, Duration::from_secs(90))
+            || wait_for_log(&stdout_path, GO_MARKER, Duration::from_secs(1)),
+        "the run must reach the supervisor GO;\nstdout:\n{}\nstderr:\n{}",
+        read_file(&stdout_path),
+        read_file(&stderr_path)
+    );
+    send_sigint(sup_pid);
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(90))
+        .expect("supervisor did not exit after SIGINT");
+    assert!(
+        status.success(),
+        "the run must exit 0 on Ctrl-C, got {status:?}"
+    );
+
+    let log = strip_ansi(&merged_log(&stdout_path, &stderr_path));
+    for (message, fields) in [
+        (
+            "node environment: variables whose name or value is not valid UTF-8 are left out, so \
+             ctx.env and ctx.env_str return the default for them",
+            r#"names=["CERULION_E2E_PROBE_LATIN1", "CER_E2E_PROBE_NAME_\xFF"]"#,
+        ),
+        (
+            "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
+             compare them",
+            r#"artifact=run_directory names=["CER_E2E_PROBE_NAME_\xFF"]"#,
+        ),
+        (
+            "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
+             utf8 false; a replay still detects a change",
+            r#"artifact=run_directory names=["CERULION_E2E_PROBE_LATIN1"]"#,
+        ),
+    ] {
+        let lines: Vec<&str> = log.lines().filter(|l| l.contains(message)).collect();
+        match lines.as_slice() {
+            [line] if line.contains(" WARN ") && line.contains(fields) => {}
+            other => panic!("one WARN line for {message:?} with {fields}: {other:#?}\nlog:\n{log}"),
+        }
+    }
+    for absent in [
+        "panicked",
+        "cer-e2e-probe-name-value",
+        r"caf\xE9",
+        "\u{fffd}",
+    ] {
+        assert!(!log.contains(absent), "the log must not carry {absent:?}");
+    }
 }
 
 // ==========================================================================
