@@ -668,6 +668,11 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
          loaded runner inflates the per-size floors it compares",
     ),
     (
+        "exact_deadline_grid_latency_test",
+        "release-only: a 1 kHz node's fire gaps and the wait after a slow step against \
+         wall time",
+    ),
+    (
         "flat_latency_test",
         "the primary one-way flatness gate — DEBUG-OK, so it gates every PR; \
          its own header records macOS VM stalls inflating a size's floor",
@@ -690,6 +695,12 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
     (
         "latency_threshold_test",
         "release-only latency regression gate — the ci.yml test-latency headline",
+    ),
+    (
+        "live_exact_deadline_iox2_test",
+        "runs a 1 kHz node live for a second; DEBUG-OK, so it gates every PR, and \
+         on Linux it requires every frame delivered, which a runner that stalls \
+         the ticker past its consumer's queue depth would break",
     ),
     (
         "period_decompose_bench_test",

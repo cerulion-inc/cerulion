@@ -40,7 +40,7 @@ case "$base_key" in
     "key=tool-tarballs-nextest-$nextest_version-cargo-deny-$deny_version-"????????????????) ;;
     *) fail "the key line is '$base_key'" ;;
 esac
-printf '%s' "${base_key##*-}" | grep -qE '^[0-9a-f]{16}$' || fail "the digest of '$base_key' is not 16 hex digits"
+grep -qE '^[0-9a-f]{16}$' <<<"${base_key##*-}" || fail "the digest of '$base_key' is not 16 hex digits"
 [ "$(key_of "$base")" = "$base_key" ] || fail "two runs over the same pins gave different keys"
 [ "$(key_of "$script_dir")" = "$base_key" ] || fail "the copy and the tree give different keys"
 printf 'the key names both versions and a digest, and is stable: passed\n'

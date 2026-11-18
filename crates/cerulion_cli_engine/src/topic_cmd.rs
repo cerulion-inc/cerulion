@@ -105,7 +105,7 @@ pub fn gather_mirror_provenance() -> BTreeMap<String, String> {
 pub fn gather_mirror_identities() -> CliResult<BTreeMap<String, String>> {
     let mut mirrors = gather_mirror_provenance();
     let transport = cerulion_core::TransportManager::get_or_init()?;
-    for topic in transport.network_mirror_topics()? {
+    for topic in transport.network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)? {
         mirrors
             .entry(topic)
             .or_insert_with(|| "origin unavailable".to_string());
@@ -464,7 +464,8 @@ fn ensure_topic_available_with_selection(
     // provenance registry) — `Some` drives both the demand routing AND the accurate
     // kill-switch message below.
     let mirror_robot = gather_mirror_provenance().get(topic).cloned();
-    let mut marked_mirror = transport.is_network_mirror(topic)?;
+    let mut marked_mirror =
+        transport.is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)?;
     #[cfg(unix)]
     let remote_directory = if !killed {
         Some(crate::account_robot_access::automatic::discover()?)
@@ -576,7 +577,8 @@ fn ensure_topic_available_with_selection(
                     subscriber,
                     _guard: guard,
                 };
-                marked_mirror = transport.is_network_mirror(topic)?;
+                marked_mirror = transport
+                    .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)?;
                 if !marked_mirror {
                     return Ok((transport, subscriber, TopicSource::Local));
                 }
