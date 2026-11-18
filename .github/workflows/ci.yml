@@ -4787,15 +4787,15 @@ jobs:
   # THIS JOB IS THE LATENCY REGRESSION GATE, and the only one. There is no
   # separate benchmark workflow running the same two tests, because this job
   # would be a strict superset of it on both axes —
-  #   - TESTS: it runs `latency_threshold_test` and
-  #     `graph_latency_test`, and additionally the release-mode `--lib` tests
+  #   - TESTS: it runs `latency_threshold_test`, `graph_latency_test` and
+  #     `exact_deadline_grid_latency_test`, and additionally the release-mode `--lib` tests
   #     (cfg(not(debug_assertions))-gated) and a
   #     `cargo check --tests --release`;
   #   - TRIGGERS: this workflow is push-to-main with NO path filter, so a
   #     push outside `cerulion_core/**` that can still move latency is
   #     not skipped.
-  # `--nocapture` on the two latency steps means a green run prints the
-  # measured numbers — see the steps below.
+  # `--nocapture` on the latency steps means a green run prints the
+  # measured numbers; see the steps below.
   #
   # Accepted tradeoff: a PR that breaks release-only-compiled code
   # surfaces on main rather than on the PR. Use workflow_dispatch to run
@@ -5044,6 +5044,14 @@ jobs:
 
       - name: Graph latency test (user-POV, release mode)
         run: cargo test -p cerulion_core --test graph_latency_test --release -- --nocapture --test-threads=1
+
+      # The exact-deadline grid: a 1 kHz node with a 300 us tick keeps its 1 ms
+      # grid, and the wait after a slow step is the time left, both against the
+      # wall clock. A loaded PR runner delays the park's wake, so these claims
+      # run here and not in the PR shards; the shards pin the wait sizing on a
+      # controlled clock. A green run prints the double-fire share and median gap.
+      - name: Exact-deadline grid test (release mode)
+        run: cargo test -p cerulion_core --test exact_deadline_grid_latency_test --release -- --nocapture --test-threads=1
 
       # Release-mode counterpart: `record_below_wire_header_size_silent_fallback_in_release`
       # in `cerulion_core::transport::adaptive_sizer::tests` is `cfg(not(debug_assertions))`-gated
