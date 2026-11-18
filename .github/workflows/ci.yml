@@ -2882,10 +2882,11 @@ jobs:
       # directory, order and fail-fast rule `cargo test` gives them. A package
       # builds when the selection names it, as its step's own condition reads;
       # a `+` package builds on every change because its step carries no
-      # selection condition. The audit at the end of the job fails when a built
-      # binary never ran or when anything compiles outside the declared build
-      # steps. See `docs/internals/ci-and-gates.md`.
-      - name: Build this shard's package tests once
+      # selection condition. Cargo runs the packages' doctests at the end of
+      # this step, against the libraries it compiled. The audit at the end of
+      # the job fails when a built binary never ran or when anything compiles
+      # outside the declared build steps. See `docs/internals/ci-and-gates.md`.
+      - name: Build this shard's package tests once and run their doctests
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: |
@@ -3325,17 +3326,13 @@ jobs:
         if: matrix.shard == 3
         run: df -h / || true
 
-      # The twin of the reclaim after the `cerulion_core` step —
-      # identical script, canonical explanation there. This is the placement
-      # aimed straight at the five measured firings: every one of them died
-      # linking a netd test binary in the step below, entering it with 824 MB
-      # to 2.3 GB free. The test executables the steps between the two prunes
-      # linked — on THIS shard: ros msgs, bag, wireclient, connectd — have all
-      # RUN, and the step below is the last one in the job, so nothing reads any
-      # of them again. (The list is per-shard because the package steps are
-      # `if:`-gated; pre-split it was every package in the job.)
-      # The same deletion, keeping the prebuilt test binaries a later step
-      # still runs (netd's, which the build step compiled with the others).
+      # The twin of the reclaim after the `cerulion_core` step, canonical
+      # explanation there. The five measured firings all died linking a netd
+      # test binary; those binaries now link in the build step with the rest
+      # of the shard's, and that step prints free disk right after the link.
+      # This reclaim frees what the steps above have run (rmw, ros msgs, bag,
+      # wireclient, connectd) before the step below links the binaries netd's
+      # tests spawn, and keeps every prebuilt binary a later step still runs.
       - name: Reclaim disk from already-run test binaries (before the wan step)
         if: matrix.shard == 3
         run: |
@@ -3368,14 +3365,10 @@ jobs:
         run: |
           echo "selection: skipped cerulion_netd (selected: $SELECTED)"
 
-      # The packages' doctests, over the same package set as the build, so they
-      # link the libraries it compiled. Then the audit: every built binary ran,
-      # the shard built at least its floor of test binaries when the selection
-      # kept every package (the count a full run builds), and nothing
-      # compiled outside a declared build step.
-      - name: Doctests of this shard's packages
-        run: python3 -B tools/scripts/ci_built_tests.py doctests
-      # Three `cerulion_android` binaries build with their package and no step
+      # The audit: every built binary had a whole run, the shard built at least
+      # its floor of test binaries when the selection kept every package (the
+      # count a full run builds), and nothing compiled outside a declared build
+      # step. Three `cerulion_android` binaries build with their package and no step
       # here runs them: `mdns_beacon_test`'s one arm is `#[ignore]`d (it needs
       # real multicast), `embedded_remote_plane_test` runs in `local-transport`
       # and `jni_java_test` in `android-check`.
@@ -3787,14 +3780,15 @@ jobs:
       # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
       # on shard 2, which is why shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
-      # BUILD ONCE, as in `test-linux` (see that job's step of this name). It
-      # runs before the first package step, the credit death arms on shard 0.
+      # BUILD ONCE and the doctests, as in `test-linux` (see that job's step of
+      # this name). It runs before the first package step, the credit death
+      # arms on shard 0.
       # `cerulion_vizd` builds in a group of its own: built beside
       # `cerulion_viz`, it would link the viz library with the
       # `decoder-from-source` feature that crate's own tests enable, which
       # switches vizd's decoder from the dlopen path to the compiled one, so
       # its tests keep the features they build with alone.
-      - name: Build this shard's package tests once
+      - name: Build this shard's package tests once and run their doctests
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: |
@@ -4327,9 +4321,7 @@ jobs:
         run: |
           echo "selection: skipped cerulion_viz (selected: $SELECTED)"
 
-      # The doctests and the audit, as in `test-linux`.
-      - name: Doctests of this shard's packages
-        run: python3 -B tools/scripts/ci_built_tests.py doctests
+      # The audit, as in `test-linux`.
       - name: Every built test binary ran and nothing rebuilt
         run: |
           case "${{ matrix.shard }}" in

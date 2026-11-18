@@ -569,8 +569,8 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
   binaries a later step still runs.
 
 Every `test-linux` and `test-macos` leg uses it: the step `Build this shard's package tests
-once` builds the leg's packages, every package step runs through `run`, and the leg ends
-with the doctests and the audit. `cerulion_core` keeps its own build in its shard step,
+once and run their doctests` builds the leg's packages, every package step runs through
+`run`, and the leg ends with the audit. `cerulion_core` keeps its own build in its shard step,
 unchanged. A Lint step runs `check-workflow .github/workflows/ci.yml`.
 
 * **Groups.** One unified build changes some packages' features: a package's tests link a
@@ -582,9 +582,9 @@ unchanged. A Lint step runs `check-workflow .github/workflows/ci.yml`.
   rustls provider beside the ring one every client installs. The one that switches
   behavior is `cerulion_viz`'s `decoder-from-source`, so `cerulion_vizd` builds in a group
   of its own on macOS shard 2.
-* **Doctests here.** No package of these legs carries an executing doctest that a missing
-  `--test-threads=1` would change: their examples are `text` or `ignore` blocks, or the
-  `rust` blocks of `native_ros2_messages`, which ran unflagged before.
+* **Doctests here.** The executing doctests of these legs (`native_ros2_messages`,
+  `cerulion_bag`, `cerulion_cli_engine`) belong to packages whose steps pass no
+  `--test-threads=1`, so they run as they did.
 * **Disk.** The pre-wan reclaim on Linux shard 3 runs `reclaim`.
 
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
