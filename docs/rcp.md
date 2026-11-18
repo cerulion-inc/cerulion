@@ -1,7 +1,8 @@
 # Robot Context Protocol (`cerulion-rcpd`)
 
 Experimental: `cerulion-rcpd` is not in any release; build it from source. The simulated robot of
-[Try it in simulation](#try-it-in-simulation) is in the release.
+[Try it in simulation](#try-it-in-simulation) needs no source build: the release's `cerulion` runs it from the
+`harness/` folder of a checkout of this repository.
 
 `cerulion-rcpd` is an MCP server that lets an agent read the live state of a
 robot running Cerulion and call the tools its manifest declares. It identifies
@@ -20,10 +21,13 @@ Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep thei
 ## Try it in simulation
 
 `cerulion rcp --sim` serves the tools of the [Cerulion harness](harness.md) with a simulated robot on your
-machine, to any MCP client. It is in the release: no robot and no source build. Sign in once, start it, and add
-it to your client:
+machine, to any MCP client. It needs no robot and no source build. The release packages install `cerulion`
+without the harness folder, so clone this repository once and name its `harness/` folder in
+`CERULION_HARNESS_DIR`. Then sign in once, start it, and add it to your client:
 
 ```bash
+git clone --depth 1 https://github.com/cerulion-inc/cerulion   # the harness folder, once
+export CERULION_HARNESS_DIR="$PWD/cerulion/harness"
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
 claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp

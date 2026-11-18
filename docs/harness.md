@@ -20,7 +20,14 @@ Both run under the free Cerulion account, as the other `cerulion` commands do: r
 
 ## Try it
 
+The release packages install `cerulion` without the harness folder. Clone this repository once and name its
+`harness/` folder in `CERULION_HARNESS_DIR`, or run a `cerulion` built in the checkout, which finds it on its own
+([Where the harness lives](#where-the-harness-lives)). To run the harness your `cerulion` was released with, add
+`--branch` and the release's tag to the clone: `v` and the version `cerulion --version` prints.
+
 ```bash
+git clone --depth 1 https://github.com/cerulion-inc/cerulion   # the harness folder, once
+export CERULION_HARNESS_DIR="$PWD/cerulion/harness"
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
 ```
@@ -42,7 +49,7 @@ when no call arrives for a while; connect again for a new one.
 Without `--http`, `cerulion rcp --sim` serves MCP over stdio, so a client can start it itself:
 
 ```bash
-claude mcp add cerulion-sim -- cerulion rcp --sim
+claude mcp add cerulion-sim -e CERULION_HARNESS_DIR="$CERULION_HARNESS_DIR" -- cerulion rcp --sim
 ```
 
 Run `cerulion rcp --sim` once in a terminal before you add it this way: the first run installs the simulator
@@ -114,7 +121,10 @@ each. The code that runs is the code the benchmark measured: the harness folder 
 
 Before the simulator starts it sends one small request to your endpoint, so a wrong address, key or model name
 is reported at once. It exits 0 when both episodes ran and were scored, 1 when one was not scored, and 2 when it
-refused to start (no endpoint, no key, an endpoint that refuses the key or the model).
+refused to start (no endpoint, no key, an endpoint that refuses the key or the model). Ctrl+C, or a SIGTERM or
+SIGHUP sent to `cerulion`, passes the stop to the run, its episode driver and the model client, so no further
+request reaches your endpoint, and `cerulion` exits 130. The episode's simulator and episode server run in
+sessions of their own, and the stop does not reach them.
 
 One episode is one draw at temperature 1.0, so a single pair can go either way. The published rates come from
 100 start states a model.
@@ -129,24 +139,28 @@ installs nothing and needs only `python3`.
 ## Where the harness lives
 
 The harness is the `harness/` folder of the Cerulion repository (see [harness/README.md](../harness/README.md)).
-`cerulion rcp --sim` and `cerulion rcp bench` find it in this order:
+The release packages do not install it: a `cerulion` of a release runs it through `CERULION_HARNESS_DIR`, and a
+`cerulion` built in a checkout finds that checkout's own. `cerulion rcp --sim` and `cerulion rcp bench` find it
+in this order:
 
 1. `CERULION_HARNESS_DIR`, when set and not empty. A value that names a missing folder, or a folder that holds no
    harness, is an error; the search never falls through to the places below.
-2. `harness/` beside the `cerulion` binary, where the release packages install it. A link to `cerulion` in a
-   `bin` directory still reaches the folder beside the real binary.
+2. `harness/` beside the `cerulion` binary. A link to `cerulion` in a `bin` directory still reaches the folder
+   beside the real binary.
 3. `harness/` at the root of the Cerulion source checkout the `cerulion` binary sits in: the nearest folder above
    the binary that holds `crates/cerulion_cli/Cargo.toml`. So a `cerulion` that `cargo run` or `cargo build` made
    in a checkout finds that checkout's harness; one built into a target folder outside the checkout
    (`CARGO_TARGET_DIR`) does not, and needs `CERULION_HARNESS_DIR`.
 
 The current directory is never searched, so a folder you run `cerulion` in, such as a repository you downloaded,
-cannot supply a harness. When none of the three holds a harness, the error names where it looked.
+cannot supply a harness. Places 2 and 3 never take a folder that other users of the machine can write to, such
+as `/tmp`: the search for a checkout stops at the first one, so a `harness/` someone else put there never runs.
+When none of the three holds a harness, the error names where it looked.
 
-The install writes inside the folder the harness runs from. Nothing writes into the folder the release packages
-install, even when your user can write there: the first run copies it once, byte for byte, to `harness/<version>`
+The install writes inside the folder the harness runs from. Nothing writes into the folder beside the `cerulion`
+binary, even when your user can write there: the first run copies it once, byte for byte, to `harness/<version>`
 under the Cerulion config directory (`~/.cerulion`, or `CERULION_HOME`), and the install and every later run of
-that version use the copy, also when `CERULION_HARNESS_DIR` names the installed folder. A new version makes its
+that version use the copy, also when `CERULION_HARNESS_DIR` names that folder. A new version makes its
 own copy and leaves the old one in place; delete an old version's folder to free its space. Any other folder, one
 that `CERULION_HARNESS_DIR` names or a source checkout's, runs in place and the install writes inside it; when your
 user cannot write there, the first run copies it the same way.

@@ -542,12 +542,14 @@ macOS on Apple silicon, Linux on x86-64 or arm64; Linux also needs the CPU rende
 
 The harness folder is found in this order: `CERULION_HARNESS_DIR` when it is set and not empty (a value that
 names a missing folder, or a folder without the harness's `rcp.sh` and `install.sh`, is an error and the search
-stops there); `harness/` beside the canonicalized `cerulion` binary, where the release packages install it; then
-`harness/` at the root of the Cerulion source checkout the binary sits in, the nearest folder above it that holds
-`crates/cerulion_cli/Cargo.toml`, so a `cerulion` built in a checkout (`cargo run`, `target/debug/cerulion`) finds
-that checkout's harness. The current directory is never searched. With none found it exits 1 and the error names
-where it looked. Both forms run the folder's `rcp.sh` under `bash` with the terminal attached and exit with its
-code. The folder beside the binary is never written, however it is found:
+stops there); `harness/` beside the canonicalized `cerulion` binary; then `harness/` at the root of the Cerulion
+source checkout the binary sits in, the nearest folder above it that holds `crates/cerulion_cli/Cargo.toml`, so a
+`cerulion` built in a checkout (`cargo run`, `target/debug/cerulion`) finds that checkout's harness. The current
+directory is never searched, and the last two places take nothing from a folder other users can write to, such
+as `/tmp`: the search for a checkout stops at the first one. The release packages do not install the harness, so
+a `cerulion` of a release needs `CERULION_HARNESS_DIR` set to the `harness/` folder of a checkout. With none found
+it exits 1 and the error names where it looked. Both forms run the folder's `rcp.sh` under `bash` with the
+terminal attached and exit with its code. The folder beside the binary is never written, however it is found:
 the first run copies it once to `harness/<version>` under the Cerulion config directory and installs and runs
 there, one copy per version. Any other folder runs in place, and is copied the same way only when the user cannot
 write to it.
@@ -4125,7 +4127,7 @@ For `cerulion connect` / `login` and the WAN plane. See
 | `CERULION_RELAY_URL` | A self-hosted iroh relay URL, instead of the public n0 relays. Also the `--relay-url` flag on `connect` and `rcp`. |
 | `CERULION_EPOCH_DIR` | Where the desk's revocation-epoch cache lives. Deliberately not `CERULION_NETD_*`-prefixed: it is a desk-wide artifact location honored by `cerulion connect`, `cerulion-netd` and the account-page cache writer alike. Default: an `epochs/` directory next to the desk key file. |
 | `CERULION_CONNECTD_BIN` | Path to the `cerulion-connectd` sibling binary that `cerulion connect` spawns, for when it does not sit beside `cerulion`. The release archive, which the installer and the apt package unpack, puts it there; it is not published to crates.io, so a CLI installed with `cargo install` has none. In a source checkout `cargo build -p cerulion_connectd` builds it. |
-| `CERULION_HARNESS_DIR` | The harness folder `cerulion rcp --sim` and `cerulion rcp bench` run, in place of the one beside `cerulion` or in a source checkout. Set and not empty, it is final: a value that names a missing folder, or a folder without the harness's `rcp.sh` and `install.sh`, is an error. Unset or empty, the folder beside the canonicalized `cerulion` binary is used, then `harness/` at the root of the Cerulion source checkout the binary sits in; the current directory is never searched. |
+| `CERULION_HARNESS_DIR` | The harness folder `cerulion rcp --sim` and `cerulion rcp bench` run, in place of the one beside `cerulion` or in a source checkout. Set and not empty, it is final: a value that names a missing folder, or a folder without the harness's `rcp.sh` and `install.sh`, is an error. Unset or empty, the folder beside the canonicalized `cerulion` binary is used, then `harness/` at the root of the Cerulion source checkout the binary sits in; the current directory is never searched. The release packages do not install the harness, so a release's `cerulion` needs this set to the `harness/` folder of a checkout. |
 | `CERULION_ACCOUNT_SERVICE` | Base URL of the account service `cerulion login` talks to. For pointing a desk at a self-hosted or development issuer. |
 | `CERULION_NETD_DESK_KEY` | ABSOLUTE path to the desk's device key file: the desk's identity and the key a robot access-lists. Automatic account and saved pairing routes use the persisted machine identity without this setting. The manual WAN route uses an ephemeral key when this is unset, which a robot without that key in its access list refuses. WAN builds only. |
 | `CERULION_NETD_DEVICE_CERT` | Explicit ABSOLUTE path to the cached device cert `cerulion login` writes. Unset takes the sibling `device.cert` next to the desk key. A relative value in either variable makes `cerulion login` refuse rather than write a file `cerulion-netd`, which resolves it against its own working directory, may not read. WAN builds only. |

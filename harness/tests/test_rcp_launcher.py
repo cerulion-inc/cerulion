@@ -8,15 +8,20 @@ launcher the way cerulion does (`bash rcp.sh --home DIR [--packaged] <verb>
 reached stdout. No simulator, no network.
 """
 
+import fcntl
 import hashlib
 import os
 import pathlib
+import pty
+import re
 import shutil
 import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import termios
+import threading
 import time
 import unittest
 
@@ -38,11 +43,12 @@ code=0
 exit "$code"
 """
 
-# venv/bin/python: writes the folder it ran from and its words, prints PY-OUT
-# and exits 0.
+# venv/bin/python: writes the folder it ran from and its words, and the
+# directory it ran in to python-cwd.txt, prints PY-OUT and exits 0.
 PYTHON = """#!/usr/bin/env bash
 here=$(cd "$(dirname "$0")/../.." && pwd -P)
 { echo "$here"; printf '%s\\n' "$@"; } > "$here/python-ran.txt"
+pwd -P > "$here/python-cwd.txt"
 echo "PY-OUT"
 """
 
@@ -83,7 +89,11 @@ STOPS = [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGHUP, 129)]
 
 
 # What the stand-ins above write into the folder they run from.
-STAND_IN_OUTPUTS = {"installed", "install-runs.txt", "install-cwd.txt", "python-ran.txt", "verified.txt"}
+STAND_IN_OUTPUTS = {"installed", "install-runs.txt", "install-cwd.txt", "python-ran.txt", "python-cwd.txt",
+                    "verified.txt"}
+
+# The results folder run-cell names when it is given no --out: cerulion-bench-<UTC time>.
+DEFAULT_OUT = re.compile(r"cerulion-bench-\d{8}T\d{6}Z")
 
 
 def write(path, text, mode=0o644):
@@ -291,11 +301,38 @@ class Launcher(unittest.TestCase):
     def test_bench_hands_its_flags_to_run_cell_word_for_word(self):
         (self.harness / "installed").touch()
         run = self.run_launcher("bench", "--model", "my model", "--base-url", "https://example.test/v1",
-                                "--key-env", "MY_KEY", "--out", "out dir", env={"MY_KEY": "k"})
+                                "--key-env", "MY_KEY", "--cell", "pro_spatial_swap_t00_i00", "--out", "/data/out dir",
+                                env={"MY_KEY": "k"})
         self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout, "PY-OUT\n")
         self.assertEqual(self.python_ran()[1:], ["-P", "-m", "cerulion_harness", "run-cell", "--model", "my model",
                                                  "--base-url", "https://example.test/v1", "--key-env", "MY_KEY",
-                                                 "--out", "out dir"])
+                                                 "--cell", "pro_spatial_swap_t00_i00", "--out", "/data/out dir"])
+
+    def test_bench_runs_in_the_harness_folder_and_its_results_go_to_the_directory_it_starts_in(self):
+        (self.harness / "installed").touch()
+        start = self.tmp  # run_raw's directory
+        head = ["-P", "-m", "cerulion_harness", "run-cell", "--model", "m"]
+        for out, want in [(("--out", "out dir"), ["--out", f"{start}/out dir"]),
+                          (("--out", "a/../b"), ["--out", f"{start}/a/../b"]),
+                          (("--out", "/abs/out"), ["--out", "/abs/out"])]:
+            with self.subTest(out=out):
+                run = self.run_launcher("bench", "--model", "m", *out,
+                                        env={"OPENAI_BASE_URL": "https://example.test/v1", "OPENAI_API_KEY": "k"})
+                self.assertEqual(run.returncode, 0, run.stderr)
+                self.assertEqual(self.python_ran()[1:], head + want)
+                self.assertEqual((self.harness / "python-cwd.txt").read_text(), f"{self.harness}\n")
+        for out in [(), ("--out", "")]:
+            with self.subTest(out=out):
+                run = self.run_launcher("bench", "--model", "m", *out,
+                                        env={"OPENAI_BASE_URL": "https://example.test/v1", "OPENAI_API_KEY": "k"})
+                self.assertEqual(run.returncode, 0, run.stderr)
+                words = self.python_ran()[1:]
+                self.assertEqual(words[:-2], head + list(out))
+                self.assertEqual(words[-2], "--out")
+                folder = pathlib.Path(words[-1])
+                self.assertEqual(folder.parent, start, words)
+                self.assertRegex(folder.name, DEFAULT_OUT)
 
     def test_bench_without_an_endpoint_or_a_key_refuses_before_any_install(self):
         cases = [
@@ -477,7 +514,9 @@ class Launcher(unittest.TestCase):
         self.assertFalse(self.home.parent.exists())
 
     def test_a_usage_mistake_exits_2(self):
-        for words in [(), ("serve",), ("sim", "--port", "1"), ("sim", "--http"), ("verify", "--all")]:
+        for words in [(), ("serve",), ("sim", "--port", "1"), ("sim", "--http"), ("verify", "--all"),
+                      ("bench", "--model", "m", "--arm", "plain"), ("bench", "--model", "m", "--out"),
+                      ("bench", "--model", "m", "--out=x"), ("bench", "--model")]:
             with self.subTest(words=words):
                 run = self.run_launcher(*words)
                 self.assertEqual(run.returncode, 2, run.stderr)
@@ -571,31 +610,143 @@ class Launcher(unittest.TestCase):
         self.assertEqual(packaged.returncode, 0, packaged.stderr)
         self.assertEqual((self.home / "install-cwd.txt").read_text().splitlines(), [str(self.home), str(self.home)])
 
-    def test_bench_imports_nothing_from_the_directory_it_starts_in(self):
+    def safe_path_python(self):
+        """venv/bin/python as a real python3 of 3.11 or later, as the install's venv is, or a skip."""
         python = python_with_safe_path()
         if python is None:
             self.skipTest("needs a python3 of 3.11 or later, as the install's venv is")
         venv_python = self.harness / "venv" / "bin" / "python"
         venv_python.unlink()
         venv_python.symlink_to(python)
-        write(self.harness / "src" / "cerulion_harness" / "__main__.py",
-              "import os, sys\n"
-              "with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'bench-ran.txt'),"
-              " 'w') as f:\n"
-              "    f.write(' '.join(sys.argv[1:]))\n")
-        # The directory bench starts in, where its results go, holds a package of the same name.
-        write(self.tmp / "cerulion_harness" / "__init__.py", "")
-        write(self.tmp / "cerulion_harness" / "__main__.py",
-              f"open({str(self.tmp / 'caller-ran.txt')!r}, 'w').write('the caller package ran')\n")
         (self.harness / "installed").touch()
         # The install's .pth puts src/ on the venv's path; PYTHONPATH stands in for it here.
-        run = self.run_launcher("bench", "--model", "m", "--base-url", "https://example.test/v1",
-                                env={"OPENAI_API_KEY": "k", "PYTHONPATH": str(self.harness / "src")})
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertFalse((self.tmp / "caller-ran.txt").exists(), "bench ran the package of the directory it started in")
-        self.assertEqual((self.harness / "bench-ran.txt").read_text(),
-                         "run-cell --model m --base-url https://example.test/v1")
+        return {"OPENAI_API_KEY": "k", "PYTHONPATH": str(self.harness / "src")}
 
+    def test_bench_imports_nothing_from_the_directory_it_starts_in(self):
+        env = self.safe_path_python()
+        # run-cell, and a Python it starts as run-cell starts its body record check: python -m in the directory it
+        # inherits, with src/ on PYTHONPATH.
+        write(self.harness / "src" / "cerulion_harness" / "__main__.py",
+              "import os, subprocess, sys\n"
+              "with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'bench-ran.txt'),"
+              " 'w') as f:\n"
+              "    f.write(' '.join(sys.argv[1:]))\n"
+              "sys.exit(subprocess.run([sys.executable, '-m', 'cerulion_harness.child'],"
+              " stdin=subprocess.DEVNULL).returncode)\n")
+        write(self.harness / "src" / "cerulion_harness" / "child.py",
+              "import os\n"
+              "open(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'child-ran.txt'), 'w')"
+              ".write(os.getcwd())\n")
+        # The directory bench starts in, where its results go, holds a package of the same name.
+        for name in ("__init__.py", "__main__.py", "child.py"):
+            write(self.tmp / "cerulion_harness" / name,
+                  f"open({str(self.tmp / 'caller-ran.txt')!r}, 'a').write({name!r} + ' ran')\n")
+        run = self.run_launcher("bench", "--model", "m", "--base-url", "https://example.test/v1", env=env)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertFalse((self.tmp / "caller-ran.txt").exists(),
+                         "bench, or a Python it started, ran the package of the directory it started in")
+        said = (self.harness / "bench-ran.txt").read_text().split(" ")
+        self.assertEqual(said[:5], ["run-cell", "--model", "m", "--base-url", "https://example.test/v1"])
+        self.assertEqual(said[5], "--out")
+        self.assertEqual(pathlib.Path(said[6]).parent, self.tmp)
+        self.assertEqual((self.harness / "child-ran.txt").read_text(), str(self.harness))
+
+    def test_a_stop_sent_to_bench_alone_ends_every_process_of_the_run(self):
+        # run-cell starts the episode driver, which starts the episode; cerulion forwards a stop to the launcher's
+        # pid only. On a stop, run-cell's subprocess.run gives the driver a quarter of a second and then kills it,
+        # so the episode hears of the stop only when it reaches the episode itself.
+        env = self.safe_path_python()
+        driver = self.harness / "driver.py"
+        write(driver, "import subprocess\n"
+                      "episode = subprocess.Popen(['bash', '-c', 'echo $$ > \"$1/step.pid\"; exec sleep 30', '_',"
+                      f" {str(self.harness)!r}], stdin=subprocess.DEVNULL)\n"
+                      "episode.wait()\n")
+        write(self.harness / "src" / "cerulion_harness" / "__main__.py",
+              "import subprocess, sys\n"
+              f"subprocess.run([sys.executable, {str(driver)!r}], stdin=subprocess.DEVNULL)\n")
+        for sig, code in STOPS:
+            with self.subTest(signal=sig.name):
+                (self.harness / "step.pid").unlink(missing_ok=True)
+                launcher = self.start_launcher("bench", "--model", "m", "--base-url", "https://example.test/v1",
+                                               env=env)
+                episode = wait_for(self.harness / "step.pid")
+                self.assertIsNotNone(episode, "the episode never started")
+                self.kill_at_cleanup(int(episode))
+                launcher.send_signal(sig)
+                try:
+                    _out, err = launcher.communicate(timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.fail(f"{sig.name}: the launcher kept waiting for a run that never got the stop")
+                self.assertEqual(launcher.returncode, code, err)
+                self.assertTrue(ended(int(episode)), f"{sig.name}: the episode outlived the stop")
+
+    def test_at_a_terminal_set_to_tostop_the_install_and_the_run_go_to_their_end(self):
+        # With `stty tostop`, a process group that is not the terminal's foreground one is stopped when it writes
+        # there, unless it ignores SIGTTOU. The install and run-cell run as their own group and print progress on
+        # stderr, the terminal here.
+        write(self.harness / "venv" / "bin" / "python",
+              PYTHON.replace('echo "PY-OUT"', 'echo "RUN-PROGRESS" >&2\necho "PY-OUT"'), 0o755)
+        for words, env, progress in [(("sim",), {}, b"INSTALL-PROGRESS"),
+                                     (("bench", "--model", "m", "--base-url", "https://example.test/v1"),
+                                      {"OPENAI_API_KEY": "k"}, b"RUN-PROGRESS")]:
+            with self.subTest(verb=words[0]):
+                (self.harness / "installed").unlink(missing_ok=True)
+                code, terminal, stdout = self.run_at_a_terminal_with_tostop(words, env)
+                self.assertEqual(code, 0, f"the launcher stopped or hung; terminal={terminal!r} out={stdout!r}")
+                self.assertIn(b"INSTALL-PROGRESS", terminal)
+                self.assertIn(progress, terminal)
+                self.assertEqual(stdout, b"PY-OUT\n")
+                self.assertEqual(self.python_ran()[0], str(self.harness))
+
+    def run_at_a_terminal_with_tostop(self, words, env):
+        """The launcher with a terminal set to tostop as its controlling terminal, stdin and stderr, and stdout a
+        pipe: (its exit code, or None when it did not end within 20 s; what reached the terminal; its stdout)."""
+        master, slave = pty.openpty()
+        attrs = termios.tcgetattr(slave)
+        attrs[3] |= termios.TOSTOP
+        termios.tcsetattr(slave, termios.TCSANOW, attrs)
+
+        def own_terminal():
+            os.setsid()
+            fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+            sigint_deliverable()
+        launcher = subprocess.Popen(["bash", str(self.harness / "rcp.sh"), "--home", str(self.home), *words],
+                                    cwd=self.tmp, env={**self.env, **env}, stdin=slave, stdout=subprocess.PIPE,
+                                    stderr=slave, preexec_fn=own_terminal)
+        os.close(slave)
+        seen = []
+
+        def drain():
+            while True:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    return
+                if not data:
+                    return
+                seen.append(data)
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            stdout, _ = launcher.communicate(timeout=20)
+            code = launcher.returncode
+        except subprocess.TimeoutExpired:
+            # The launcher's group, and every group still running a stand-in of this folder.
+            groups = {launcher.pid}
+            for line in subprocess.run(["ps", "-A", "-o", "pgid=,command="], stdout=subprocess.PIPE,
+                                       text=True).stdout.splitlines():
+                if str(self.harness) in line:
+                    groups.add(int(line.split()[0]))
+            for group in groups:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except OSError:
+                    pass
+            stdout, _ = launcher.communicate()
+            code = None
+        reader.join(timeout=5)
+        os.close(master)
+        return code, b"".join(seen), stdout
 
 if __name__ == "__main__":
     unittest.main()

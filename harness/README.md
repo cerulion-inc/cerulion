@@ -12,11 +12,13 @@ cerulion rcp bench --model YOUR_MODEL            # one benchmark task, with and 
 cerulion rcp bench --verify                      # the code here is the code the benchmark measured
 ```
 
-The release packages install this folder beside the `cerulion` binary, and nothing writes into it there: the
-first run copies it once to `harness/<version>` under the Cerulion config directory and runs from the copy. In a
-source checkout, a `cerulion` built there (`cargo run -p cerulion_cli -- rcp --sim`, or `target/debug/cerulion`)
-finds this folder from any directory; for any other `cerulion`, point `CERULION_HARNESS_DIR` at it. Both run it
-in place while your user can write to it. The current directory is never searched for a harness.
+The release packages do not install this folder. A `cerulion` built in this checkout
+(`cargo run -p cerulion_cli -- rcp --sim`, or `target/debug/cerulion`) finds it from any directory; for any other
+`cerulion`, a release's included, point `CERULION_HARNESS_DIR` at it. Both run it in place while your user can
+write to it. A copy of this folder beside the `cerulion` binary is found too, and nothing writes into it there:
+the first run copies it once to `harness/<version>` under the Cerulion config directory and runs from the copy.
+The current directory is never searched for a harness, and the search takes nothing from a folder other users
+can write to.
 
 ## What is in it
 
@@ -37,8 +39,8 @@ in place while your user can write to it. The current directory is never searche
 
 The install writes `bx/` (the simulator environment and the benchmark trees), `venv/` (the episode server's
 environment) and `out/` (what the sim server keeps of each episode) inside the folder it runs from: this folder
-in a source checkout, the copy for a release package. Git ignores all three. Nothing of the benchmark's scenes is
-committed here: they are fetched and checked against their pins.
+when it runs in place, its copy when it sits beside the binary. Git ignores all three. Nothing of the benchmark's
+scenes is committed here: they are fetched and checked against their pins.
 
 The measured code keeps the package names it ran under, `rcpx` and `bench`, so that it stays byte for byte the
 code the benchmark measured. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](../docs/rcp.md).

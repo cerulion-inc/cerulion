@@ -7,23 +7,29 @@ and `cerulion rcp bench` run it; the user guide is `docs/harness.md`, the folder
 - The CLI finds this folder (`CERULION_HARNESS_DIR`, then beside the canonicalized binary, then
   the root of the checkout the binary sits in, proven by `crates/cerulion_cli/Cargo.toml`; never
   the current directory) by two marker files, `rcp.sh` and `install.sh`. Renaming any of the
-  three breaks the search. A test that runs the built binary without `CERULION_HARNESS_DIR`
-  finds this checkout's own harness: set the variable, or run a link to the binary from outside
-  the checkout (`login_gate_e2e_test` does both).
+  three breaks the search. The last two places take nothing from a folder other users can write
+  to (mode `o+w`, as `/tmp`): the walk up to a checkout root stops at the first one. No release
+  package installs this folder. A test that runs the built binary without
+  `CERULION_HARNESS_DIR` finds this checkout's own harness: set the variable, or run a link to
+  the binary from outside the checkout (`login_gate_e2e_test` does both).
 - It runs `bash rcp.sh --home DIR [--packaged] sim [--http ADDR] [--task NAME]`, `... bench --model M
   [--base-url URL] [--key-env NAME] [--cell ID] [--out DIR]` or `... verify`, with the terminal
   attached, and exits with the script's code. A flag added on one side is added on the other
   and in `harness/tests/test_rcp_launcher.py`.
 - `rcp.sh` maps them to `install.sh` (`--check` first; the install's stdout goes to stderr),
   `venv/bin/python playground --stdio|--http ADDR [--state NAME]`,
-  `venv/bin/python -P -m cerulion_harness run-cell ...` and `python -m cerulion_harness.verify`.
-- The check and the install run in this folder as their own process group with no stdin and
-  `GIT_TERMINAL_PROMPT=0`; the launcher passes a SIGINT, SIGTERM or SIGHUP it gets to that whole
-  group, then exits 128 + the signal's number. Nothing in the directory `cerulion` started in
-  is imported: the install runs here, and `run-cell` runs under `-P`.
+  `venv/bin/python -P -m cerulion_harness run-cell ... --out ABSOLUTE` and
+  `python -m cerulion_harness.verify`. bench takes exactly the flags above, each with one value.
+- The check, the install and `run-cell` run in this folder as their own process group with no
+  stdin, `GIT_TERMINAL_PROMPT=0` and SIGTTOU and SIGTTIN ignored (a terminal set to `stty tostop`
+  never stops them); the launcher passes a SIGINT, SIGTERM or SIGHUP it gets to that whole group,
+  then exits 128 + the signal's number once the group's first process has ended. Nothing in the
+  directory `cerulion` started in is imported, by them or by a Python they start that keeps its
+  directory: `--out` is made absolute against that directory first, and without one it names a
+  new `cerulion-bench-<UTC time>` folder there, as `run-cell` would.
 - STDOUT of `sim` is the MCP stream: nothing else may print there, the install included.
-- The install writes inside the folder it runs from; nothing may write into the folder a release
-  package installs. `--home DIR` is where the folder is copied once, byte for byte, and run from:
+- The install writes inside the folder it runs from; nothing may write into the folder beside
+  the binary. `--home DIR` is where the folder is copied once, byte for byte, and run from:
   always after `--packaged` (the CLI passes it for the folder beside the binary, also when
   `CERULION_HARNESS_DIR` names it), else only when this user cannot write the folder. A
   `--home` that resolves to the packaged folder itself is refused.

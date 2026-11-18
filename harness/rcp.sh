@@ -9,14 +9,16 @@
 #
 # sim     serves the harness's MCP tools with a simulated robot (playground/): over stdio, or over streamable HTTP
 #         at ADDR. --task NAME picks the task the robot is set up for (the server's --state).
-# bench   runs one benchmark cell with and without the harness: python -m cerulion_harness run-cell.
+# bench   runs one benchmark cell with and without the harness: python -m cerulion_harness run-cell, in this folder.
+#         --out is made absolute against the directory bench started in, and by default names a new
+#         cerulion-bench-<UTC time> folder there, so the results land where they would if run-cell ran there.
 # verify  checks the measured code against its manifests (cerulion_harness.verify), exit 0 only when every file
 #         matches. It installs nothing and needs only python3.
 #
 # sim and bench run install.sh first when install.sh --check finds a step missing, so the simulator and the
 # benchmark scenes are installed once. The install's progress goes to stderr: stdout stays the MCP stream. The
-# install runs in this folder with no stdin, as its own process group, and a stop that reaches this script
-# (SIGINT, SIGTERM or SIGHUP) is passed on to all of it.
+# install and run-cell run in this folder with no stdin, each as its own process group, and a stop that reaches
+# this script (SIGINT, SIGTERM or SIGHUP) is passed on to all of it.
 #
 # --home DIR  where this folder is copied, once, byte for byte, to run from there, because the install writes inside
 #             the folder it runs from: always after --packaged, else only when this user cannot write to this folder.
@@ -67,14 +69,16 @@ read_sim_flags() {
   done
 }
 
-# The two refusals run-cell gives before it starts, given here before a first install, which takes minutes.
-check_bench_endpoint() {
+# bench's flags, each with one value, and the two refusals run-cell gives before it starts, given here before a
+# first install, which takes minutes.
+check_bench_flags() {
   local base_url=${OPENAI_BASE_URL:-} key_env=OPENAI_API_KEY
   while [ $# -gt 0 ]; do
     case "$1" in
+      --model|--cell|--out) [ $# -ge 2 ] || usage; shift 2 ;;
       --base-url) [ $# -ge 2 ] || usage; base_url=$2; shift 2 ;;
       --key-env) [ $# -ge 2 ] || usage; key_env=$2; shift 2 ;;
-      *) shift ;;
+      *) usage ;;
     esac
   done
   [ -n "$base_url" ] || { echo "no endpoint: pass --base-url or set OPENAI_BASE_URL" >&2; exit 2; }
@@ -115,15 +119,16 @@ print("verify: ok, this folder holds the code the benchmark measured")
 ' "$RUN_FROM"
     ;;
   sim) read_sim_flags "$@" ;;
-  bench) check_bench_endpoint "$@" ;;
+  bench) check_bench_flags "$@" ;;
   *) usage ;;
 esac
 
 # A stop that reaches this script alone, as cerulion forwards one, would otherwise be lost: bash acts on a signal
-# only once the command it waits on returns, and that command never got the signal. So the install and its check run
-# as their own process group (run_stoppable), and the trap sends the signal to that whole group; once the install has
-# ended the script exits with 128 + the signal's number. A stop at any other point ends the script as soon as the
-# command running then returns, and a copy it cut short is removed.
+# only once the command it waits on returns, and that command never got the signal. So the check, the install and
+# run-cell run as their own process group (run_stoppable), and the trap sends the signal to that whole group; once
+# the group's first process (install.sh, or run-cell) has ended the script exits with 128 + the signal's number. A
+# stop at any other point ends the script as soon as the command running then returns, and a copy it cut short is
+# removed.
 CHILD=
 STARTING=
 STOPPED=
@@ -148,14 +153,16 @@ trap 'on_stop TERM 143' TERM
 trap 'on_stop HUP 129' HUP
 trap '[ -z "$PARTIAL" ] || rm -rf "$PARTIAL"' EXIT
 
-# run_stoppable CMD...: run CMD in this folder, so its Python imports nothing from the directory cerulion was
-# started in, as its own process group with no stdin (over stdio, stdin is the MCP stream the server reads). With
-# no terminal to answer on, git fails where it would ask for a login (GIT_TERMINAL_PROMPT=0) instead of waiting.
-# Returns CMD's code, or the stop's code once a stopped CMD has ended.
+# run_stoppable CMD...: run CMD in this folder, so neither it nor any process it starts that keeps its directory
+# imports anything from the directory cerulion was started in, as its own process group with no stdin (over stdio,
+# stdin is the MCP stream the server reads). With no terminal to answer on, git fails where it would ask for a login
+# (GIT_TERMINAL_PROMPT=0) instead of waiting. SIGTTOU and SIGTTIN are ignored in the group, so a terminal never
+# stops it: at one set to `stty tostop` its progress lines are written, and a read of the terminal fails. Returns
+# CMD's code, or the stop's code once a stopped CMD has ended.
 run_stoppable() {
   STARTING=1
   set -m
-  (cd "$HERE" && export GIT_TERMINAL_PROMPT=0 && exec "$@") </dev/null &
+  (cd "$HERE" && export GIT_TERMINAL_PROMPT=0 && trap '' TTOU TTIN && exec "$@") </dev/null &
   CHILD=$!
   set +m
   STARTING=
@@ -210,9 +217,28 @@ fi
 PY=$HERE/venv/bin/python
 
 if [ "$VERB" = bench ]; then
-  # -P: the directory cerulion was started in, where the results go, is not on the module path, so nothing in it
-  # is imported in place of the harness's own modules.
-  exec "$PY" -P -m cerulion_harness run-cell "$@"
+  # run-cell runs in this folder (run_stoppable), so neither it nor a Python it starts that keeps its directory
+  # imports anything from the directory bench started in, where its results go: --out is made absolute against
+  # that directory, and without one a new cerulion-bench-<UTC time> folder there, as run-cell would name it, is the
+  # results folder.
+  START=$(pwd -P)
+  OUT_GIVEN=
+  n=$#
+  while [ "$n" -gt 0 ]; do  # every bench flag has one value (check_bench_flags)
+    flag=$1
+    value=$2
+    shift 2
+    n=$((n - 2))
+    if [ "$flag" = --out ] && [ -n "$value" ]; then
+      OUT_GIVEN=1
+      case "$value" in /*) ;; *) value=$START/$value ;; esac
+    fi
+    set -- "$@" "$flag" "$value"
+  done
+  [ -n "$OUT_GIVEN" ] || set -- "$@" --out "$START/cerulion-bench-$(date -u +%Y%m%dT%H%M%SZ)"
+  code=0
+  run_stoppable "$PY" -P -m cerulion_harness run-cell "$@" || code=$?
+  exit "$code"
 fi
 set -- "$TRANSPORT"
 [ -z "$ADDR" ] || set -- "$@" "$ADDR"
