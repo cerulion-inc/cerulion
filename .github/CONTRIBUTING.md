@@ -332,13 +332,16 @@ and we'll help.
   versions by hand.
 - In your PR description, tell us **what** changed, **why**, and **how to test**
   it.
-- **Commit messages carry no attribution trailer.** The leak guard's message
-  scan refuses a line that starts with `Co-authored-by:` or `Coauthored-by:`
-  after optional indentation, matched without regard to case and followed by a
-  name, on every commit of the pull request and on its title and body. The
-  trailer stays on the pull request's own commits, which the forge keeps
-  publicly, and the identity policy in `docs/leak_guard.md` names who may
-  appear as an author. Amend such trailers out before you push:
+- **Commit messages carry no attribution trailer, with one exception.** The
+  leak guard's message scan refuses a line that starts with `Co-authored-by:`
+  or `Coauthored-by:` after optional indentation, matched without regard to
+  case and followed by a name, on every commit of the pull request and on its
+  title and body. The one trailer it lets through on a commit is the shape the
+  forge writes on a squash: in the trailer block, spelled exactly as the forge
+  spells it, with the noreply address of an identity that already authors
+  commits on `main`, or of an app that authors the commit itself.
+  `docs/leak_guard.md` gives the full rule, and its identity policy names who
+  may appear as an author. Amend any other trailer out before you push:
   `git commit --amend` for one commit, `git rebase -i <base>` with `reword`
   for several, then `git push --force-with-lease` to your branch.
 - Add tests for new behavior.

@@ -207,6 +207,36 @@ the branch name. `media` mode parses PNG, JPEG, GIF, WebP and the MP4 and MOV fa
 for comments, EXIF, XMP, location boxes and trailing bytes; a document, archive or
 container no walker can read is a hit until an allowlist entry names it.
 
+### Co-author trailers
+
+A line that starts with `Co-authored-by:` or `Coauthored-by:` and names someone is the
+`attribution-trailer` class, hard on every surface, with one exception: the trailer the
+forge writes when it squashes a pull request that more than one identity committed to.
+On a commit message in the scanned range, and on no other surface, a trailer passes when
+all of these hold:
+
+- it sits in the message's trailer block: the last paragraph, not the subject, with every
+  line in it a `Token: value` trailer;
+- it is spelled exactly as the forge writes it, `Co-authored-by: Name <address>`, with that
+  case, single spaces and nothing after the closing bracket;
+- the address is a numbered forge noreply address, `<id>+<login>` or, for an app,
+  `<id>+<slug>[bot]`, at `users.noreply.github.com` and no longer domain;
+- the identity is on record. A person is on record when that exact name and address author
+  a commit in the history the range builds on: for a pull request into `main`, a merge
+  queue batch and a push to `main`, the history of `main`. An app is on record the same
+  way, or when it authors the very commit that carries the trailer, and its name must be
+  its own login (`<slug>[bot]`).
+
+On such a line the name is judged the way an author name is: a private pattern tagged
+`@person` does not read it, while every other pattern and every generic class still reads
+the whole line, the address included. A line that reads differently in a decoded view of
+the text gets no exemption. Everything else stays a hard finding: a personal or unknown
+address, an identity not on record, a lookalike domain, a trailer outside the trailer
+block, and a trailer in a pull request title or body, a message file or an issue. The same
+name on an ordinary line of the message is judged as before. The summary line counts the
+trailers let through as `coauthors_on_record=N`. The commit-msg hook scans a message file,
+so it refuses every trailer; the pull request and merge queue scans apply the rule above.
+
 ## Install the hooks
 
 ```bash
