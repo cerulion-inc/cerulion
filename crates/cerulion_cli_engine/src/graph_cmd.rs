@@ -121,7 +121,7 @@ pub enum CpuDmaLockMode {
 
 /// How the live-loop CPU monitor-wait park is selected. Auto-ON for a
 /// LIVE graph on every target: a real shallow CPU monitor-wait where the CPU
-/// has a primitive (Linux x86_64 WAITPKG / Linux aarch64 WFE), the degraded
+/// has a primitive (Linux x86_64 WAITPKG or MWAITX / Linux aarch64 WFE), the degraded
 /// sleep-recheck park elsewhere; `--no-monitor-wait` is the hard opt-out. Env
 /// overrides `CERULION_MONITOR_WAIT` / `CERULION_DOORBELL` (`"1"` force-on /
 /// `"0"` disable) resolve through `Auto`; an explicit `CERULION_MONITOR_WAIT=0`
@@ -536,7 +536,7 @@ struct MonitorWaitInputs<'a> {
     /// parks).
     is_live: bool,
     /// `cerulion_core::monitor_wait::monitor_wait_available()` — false off
-    /// Linux-WAITPKG / Linux-aarch64, where the real CPU monitor-wait park is
+    /// Linux x86_64 with WAITPKG or MWAITX / Linux aarch64, where the real CPU monitor-wait park is
     /// unavailable and arm 2 substitutes the degraded sleep-recheck park.
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
@@ -573,7 +573,7 @@ struct MonitorWaitInputs<'a> {
 ///    the flag won, because a request that cannot be honoured is never dropped in
 ///    silence.
 /// 2. `!primitive_available` (no real CPU monitor-wait on this target, e.g.
-///    macOS or x86 without WAITPKG) → the DEGRADED park tier (default-ON
+///    macOS or x86 with neither WAITPKG nor MWAITX) → the DEGRADED park tier (default-ON
 ///    after the wake-latency sweep: base epoll-block
 ///    p50 was unstable 15-54µs on macOS; the degraded park held a
 ///    stable ~8.5-11.5µs p50 / 16.4µs p99 with zero busy-spin).
@@ -7201,8 +7201,8 @@ pub fn graph_run(
             // building the runtime (the policy is threaded into the
             // policy-aware live builder). The env reads are bound to owned
             // locals first so the `.as_deref()` borrows outlive the struct
-            // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
-            // host (e.g. aarch64 macOS) `monitor_wait_available()` is
+            // (mirrors `env_lock`/`env_us` above). On a host with no CPU
+            // monitor-wait primitive (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
             // default-ON for live: monitor_wait per the arm-3 flag ladder, and
             // the doorbell where a consumer can kernel-block on one. The
@@ -44036,12 +44036,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// facts, named so a table row reads as a host rather than two bools.
     #[derive(Clone, Copy, Debug)]
     enum MwHost {
-        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64): arm 3. The wake-word fact is run both ways for every row,
+        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// MWAITX, Linux aarch64): arm 3. The wake-word fact is run both ways for every row,
         /// because arm 3 must not read it.
         Primitive,
         /// No primitive, but a consumer can kernel-block on a doorbell wake
-        /// word (Linux without WAITPKG, macOS 14.4 and later): arm 2.
+        /// word (Linux with no CPU monitor-wait primitive, macOS 14.4 and
+        /// later): arm 2.
         WakeWord,
         /// Neither (macOS before 14.4, other targets): arm 2, doorbell inert.
         Neither,

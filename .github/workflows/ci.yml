@@ -1970,8 +1970,9 @@ jobs:
   # nowhere else.
   #
   # TWO LEGS, one per architecture, because the code differs between them: the
-  # park's monitor wait is `WFE` on aarch64 and `UMWAIT` on x86_64 (when the
-  # CPU has WAITPKG; the stock wait otherwise), and `c_char` is `u8` on Linux
+  # park's monitor wait is `WFE` on aarch64 and on x86_64 `UMWAIT` (when the
+  # CPU has WAITPKG), `MWAITX` (when it has MWAITX and no WAITPKG) or the stock
+  # wait otherwise, and `c_char` is `u8` on Linux
   # aarch64 and `i8` on x86_64, so a cast between it and `u8` lints on aarch64
   # only. `lint` and the test shards run on x86_64 alone.
   #

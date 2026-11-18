@@ -713,17 +713,17 @@ fn solo_context_park_reports_zero_barrier_wakes() {
 /// `barrier.rs::tests::parked_waiter_on_wake_word_wakes_on_arrival`).
 ///
 /// **Arm A — hardware CPU park performs** (`monitor_wait_available()` true:
-/// x86 WAITPKG, aarch64 WFE): `performed == true` means the
+/// x86 WAITPKG or MWAITX, aarch64 WFE): `performed == true` means the
 /// wake-word arm NEVER runs — `park_wake_word_blocks == 0` AND (the
 /// NO-FUTILE-WAKE pin) the parked bit was NEVER set
 /// during the run (`park_enter_call_count_for_test` delta == 0), so arrivers
 /// on hardware-park machines pay no wake syscall for a waiter the CPU monitor
-/// cannot hear. THIS is the arm WAITPKG/WFE hardware exercises.
+/// cannot hear. THIS is the arm WAITPKG/MWAITX/WFE hardware exercises.
 ///
 /// **Arm B — no hardware park, wake-word primitive present**
 /// (`monitor_wait_available()` false + `wake_word_block_primitive_available()`
 /// true: macOS ≥ 14.4; GH CI runners — macOS always, Linux
-/// runners without WAITPKG via the futex): the arm-swap pin
+/// runners with no CPU monitor-wait primitive via the futex): the arm-swap pin
 /// — `park_wake_word_blocks > 0` (reverting the arm swap zeroes it while
 /// pins 1–5 stay green), plus a POSITIVE `park_enter` delta (the
 /// anti-tautology twin of arm A's zero: the counter demonstrably moves).
@@ -802,7 +802,7 @@ fn solo_context_park_takes_wake_word_kernel_block() {
          blocks={wake_word_blocks} park_enters_delta={park_enters_delta}"
     );
     if hw_park {
-        // Arm A (x86 WAITPKG / aarch64 WFE): the hardware primitive performs the
+        // Arm A (x86 WAITPKG or MWAITX / aarch64 WFE): the hardware primitive performs the
         // park — the wake-word arm must be structurally unreached AND the
         // parked bit never set (the no-futile-wake pin: arrivers must not
         // pay a wake syscall the hardware park cannot hear).
@@ -816,7 +816,7 @@ fn solo_context_park_takes_wake_word_kernel_block() {
              taxes every arrive with a futile wake syscall)"
         );
     } else if primitive {
-        // Arm B (macOS ≥ 14.4; GH CI macOS + non-WAITPKG Linux):
+        // Arm B (macOS ≥ 14.4; GH CI macOS + Linux with no monitor-wait primitive):
         // the arm-swap pin.
         assert!(
             wake_word_blocks > 0,

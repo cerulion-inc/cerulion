@@ -4453,7 +4453,7 @@ pub struct GraphRuntime {
     /// moved after the loop-top poll, so no wait happened) yields but does
     /// NOT count, else doorbell-driven runs inflate slice telemetry. The
     /// yield is what
-    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`WFE`-parked thread
+    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`MWAITX`/`WFE`-parked thread
     /// is RUNNING to the OS scheduler, so without it a co-located runnable
     /// peer got the core only at CFS wakeup granularity (measured p50
     /// 6.997 ms RTT on a same-core pinned ping-pong). The sleeping tiers
@@ -13455,7 +13455,7 @@ impl GraphRuntime {
         // recheck loop now POLLS every external fd/doorbell source each recheck
         // (`monitor_wait_block` → `park_poll_fd_ready`) and drains Notified
         // listeners inline — so external readiness wakes the park at the recheck
-        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / degraded
+        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / MWAITX / degraded
         // sleep-recheck), NOT at the ≤250ms `live_timeout` sweep cadence the
         // earlier fd-skip left it at. Correctness always held (the sweep is
         // level-triggered / rings-delta'd and runs every live_step); the park's fd watch
@@ -14184,7 +14184,7 @@ impl GraphRuntime {
                 || self.has_credit_edges()
             {
                 // A shallow monitor-wait park replaces the blocking
-                // WaitSet wait, so the core stays in a SHALLOW C0.1/WFE state (no
+                // WaitSet wait, so the core stays in a SHALLOW C0.1/C0/WFE state (no
                 // deep cpuidle C-state) during the inter-step idle — removing the
                 // ~18µs C-state cold-wake the epoll-block suffers.
                 // Under the doorbell policy it ALSO arms on the
@@ -14460,7 +14460,7 @@ impl GraphRuntime {
     /// [`Self::monitor_wait_block`]'s recheck loop `poll(2)` every external
     /// fd/doorbell source each recheck (≤~100 µs, record-only via
     /// [`park_poll_fd_ready`]), so the park now wakes promptly on an fd on ALL
-    /// tiers (WFE / WAITPKG / degraded sleep-recheck) and the exclusion is GONE.
+    /// tiers (WFE / WAITPKG / MWAITX / degraded sleep-recheck) and the exclusion is GONE.
     /// This is still the ONE choke point every park-vs-reactor decision reads
     /// (reactor build in `run_live` + the test seam, the `live_step` park branch,
     /// the wait-policy telemetry line); external graphs now park uniformly. The
@@ -14755,7 +14755,7 @@ impl GraphRuntime {
     /// chunks [`Self::monitor_wait_block`] has performed, whichever mechanism
     /// paced each (see the `park_recheck_naps` field doc; the os_sync-paced
     /// subset is [`Self::park_os_sync_nap_count_for_test`]). 0 on primitive
-    /// targets — the real UMWAIT/WFE park never takes the `!performed` arm.
+    /// targets; the real UMWAIT/MWAITX/WFE park never takes the `!performed` arm.
     /// (Renamed from `park_recheck_sleep_count_for_test` with the field.)
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_recheck_nap_count_for_test(&self) -> u64 {
@@ -14781,7 +14781,7 @@ impl GraphRuntime {
     /// a context whose rung applies reports `> 0` here after
     /// parking; reverting the swap zeroes it while the pins stay green
     /// (the wake word is additive latency, not new semantics). 0 whenever that
-    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
+    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park host (Linux WAITPKG/MWAITX/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_wake_word_block_count_for_test(&self) -> u64 {
         self.park_wake_word_blocks
@@ -14998,7 +14998,7 @@ impl GraphRuntime {
     /// os_sync) the predicate above is no longer merely POLLED at the
     /// recheck cadence: the `!performed` arm sets the rank's `parked` bit
     /// (RAII `ParkedRankGuard`, scoped to the block: a
-    /// hardware CPU park never sets it, so arrivers on WAITPKG/WFE machines pay
+    /// hardware CPU park never sets it, so arrivers on WAITPKG/MWAITX/WFE machines pay
     /// no futile wake syscall) and kernel-blocks on the barrier's
     /// `wake_seq` epoch instead of the pacing sleep — every arrive/open/drop
     /// bumps the epoch (arrivers gate only the SYSCALL on the parked mask), so
@@ -15009,11 +15009,11 @@ impl GraphRuntime {
     /// kernel wake only gets us there sooner, so `park_wakes_barrier`
     /// semantics and the pins are untouched; the block itself is
     /// counted by `park_wake_word_blocks`, the mutation seam). The Linux
-    /// park-ON hardware arm (UMWAIT/WFE on the doorbell line) is untouched —
+    /// park-ON hardware arm (UMWAIT/MWAITX/WFE on the doorbell line) is untouched:
     /// the futex arm is not promoted into the scratch-word
     /// park.
     ///
-    /// **OS-cooperative hardware park:** a `UMWAIT`/`WFE`-parked
+    /// **OS-cooperative hardware park:** a `UMWAIT`/`MWAITX`/`WFE`-parked
     /// thread is RUNNING to the OS scheduler, so a park that sliced without
     /// yielding held its core for the whole idle and a co-located runnable
     /// peer (graph processes > cores under the multi-process default,
@@ -15025,7 +15025,7 @@ impl GraphRuntime {
     /// pacing chunk) and every hardware slice ends with
     /// `std::thread::yield_now()` (counted in `park_core_yields`, record-only):
     /// a co-located peer runs within one slice, the core still never enters a
-    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`WFE`
+    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`MWAITX`/`WFE`
     /// still wake instantly on the doorbell inside a slice. Cost: one ~0.5 µs
     /// `sched_yield` per slice, idle path only. The degraded sleep and
     /// wake-word arms keep their measured 100 µs pacing (a sleeping thread
@@ -15056,10 +15056,10 @@ impl GraphRuntime {
     /// a wakeup optimization, not part of the deterministic timeline.
     ///
     /// **No busy-spin:** on a target WITHOUT a real CPU monitor-wait primitive
-    /// (this macOS box, x86 without WAITPKG, or a forced-policy test seam) the
+    /// (macOS, x86 with neither WAITPKG nor MWAITX, or a forced-policy test seam) the
     /// park primitive returns `false` (a no-op); this method then
     /// `std::thread::sleep`s the recheck instead of re-looping immediately, so it
-    /// can never busy-spin at 100% CPU. On a real WAITPKG/WFE box the primitive
+    /// can never busy-spin at 100% CPU. On a real WAITPKG/MWAITX/WFE host the primitive
     /// parks for real and returns `true`. On the DEGRADED tier (the
     /// default-ON shape on no-primitive targets) the degraded sleep is ALWAYS
     /// the chunked ~100µs sleep-recheck. The single-sleep alternative was
@@ -15095,7 +15095,7 @@ impl GraphRuntime {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Loud over silent: name the DEGRADED tier once, at the FIRST
         // park of the runtime's life (`prior_entries == 0` — the counter is
-        // monotonic, never reset). Primitive (UMWAIT/WFE) targets skip this.
+        // monotonic, never reset). Primitive (UMWAIT/MWAITX/WFE) targets skip this.
         // The tier line names the NAP MECHANISM the degraded arm
         // resolved on THIS host — the os_sync timed wait (macOS ≥ 14.4, tier
         // active) or the plain chunked sleep — so an operator reading the log
@@ -15122,7 +15122,7 @@ impl GraphRuntime {
         let recheck = Duration::from_micros(100);
         // HARDWARE park slice: the shared 20µs
         // `monitor_wait::PARK_RECHECK` (the same constant rmw's `park_block`
-        // slices at). A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS
+        // slices at). A `UMWAIT`/`MWAITX`/`WFE`-parked thread is RUNNING to the OS
         // scheduler, so the hardware arm keeps its slices short and the loop
         // bottom YIELDS after every hardware slice (`park_core_yields`), so a co-located
         // runnable peer gets the core within one slice instead of at CFS
@@ -15237,7 +15237,7 @@ impl GraphRuntime {
         // eligibility — computed ONCE per park; the `parked` bit itself is now
         // set ONLY inside the `!performed` arm, scoped tightly around the
         // kernel block (its semantic: "a waiter is blocked on the wake word
-        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/WFE — `performed ==
+        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/MWAITX/WFE, `performed ==
         // true`) never reaches that arm and therefore NEVER sets the bit, so
         // arrivers on hardware-park machines pay no futile wake syscall for a
         // waiter the CPU monitor cannot hear on that line (the earlier
@@ -15293,7 +15293,7 @@ impl GraphRuntime {
                     }
                     // Poll external/doorbell raw fds (DeviceFd +
                     // DoorbellFd) each recheck. Earlier the park SKIPPED Fd
-                    // sources, so on a primitive target (WFE/WAITPKG) an external
+                    // sources, so on a primitive target (WFE/WAITPKG/MWAITX) an external
                     // node's only wake was the pre-step sweep at the ≤250ms
                     // `live_timeout` — ~1.9Hz per hop. `park_poll_fd_ready` is a
                     // non-blocking level-triggered readiness probe (record-only —
@@ -15433,7 +15433,7 @@ impl GraphRuntime {
             }
             // Shallow-park until the next recheck (or, with `single_park`, the
             // WHOLE remaining time) or the park deadline. With a doorbell, arm
-            // `UMONITOR`/`WFE` on the PRIMARY line against the pre-park snapshot so
+            // `UMONITOR`/`MONITORX`/`WFE` on the PRIMARY line against the pre-park snapshot so
             // a producer store wakes it early (the primitive's own arm-time
             // re-check closes the arm-window race); without one, park on a scratch
             // word (timer only). `single_park` passes `timeout` as the recheck cap
@@ -15777,10 +15777,12 @@ impl GraphRuntime {
     /// PARTICIPANT ignores this knob — the hardware monitor never arms on the
     /// barrier's `remaining` word, so a whole-window park (or single sleep)
     /// would blind the `peers_waiting` step-start wake until the park deadline.
-    /// Caveat: on x86 (`UMWAIT` honors the recheck cap) a single park
+    /// Caveat: under `MWAITX` (no OS limit on its timer) a single park
     /// covers the WHOLE window in one slice with no yield boundary, so a
     /// co-located runnable peer waits out the window — the exact same-core
-    /// starvation the default chunked-and-yielding shape fixes. Measurement
+    /// starvation the default chunked-and-yielding shape fixes. Under `UMWAIT`
+    /// Linux's time limit (`umwait_control/max_time`, 100000 TSC cycles by
+    /// default) ends each wait early, so the loop still yields. Measurement
     /// knob only; never set it on an oversubscribed box. (aarch64 `WFE` still
     /// returns at the ~100µs event stream regardless, so the loop — and its
     /// per-slice yield — keeps running there.)
