@@ -406,11 +406,19 @@ jobs:
       # script with the debug profile, so the package the smoke installs on
       # 20.04, 22.04 and 24.04 below carries programs linked the way the
       # released ones are. Writes target/x86_64-unknown-linux-gnu/debug/.
+      #
+      # WITHOUT DEBUG INFO (`CARGO_PROFILE_DEV_DEBUG=0`, this job only; the
+      # release workflow and its script are untouched). Debug info changes
+      # neither the glibc symbols the check below reads nor what the smoke
+      # runs, and it is most of the size of the four binaries, which the
+      # package step below compresses twice, once into the tarball and once
+      # into the `.deb`.
       - name: Build the four release binaries
         run: |
           docker run --rm \
             -e TARGET=x86_64-unknown-linux-gnu \
             -e CARGO_TERM_COLOR \
+            -e CARGO_PROFILE_DEV_DEBUG=0 \
             -e CERULION_BUILD_PROFILE=debug \
             -e CERULION_RELEASE_TOOLCHAIN=1.95.0 \
             -e CERULION_HOST_OWNER="$(id -u):$(id -g)" \
