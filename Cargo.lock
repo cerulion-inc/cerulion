@@ -1237,7 +1237,7 @@ dependencies = [
  "cerulion_pairing",
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",
- "jsonwebtoken",
+ "jsonwebtoken 12.0.0",
  "postcard",
  "reqwest",
  "rusqlite",
@@ -4865,13 +4865,28 @@ version = "10.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc"
 dependencies = [
- "aws-lc-rs",
  "base64 0.22.1",
  "getrandom 0.2.17",
  "js-sys",
  "serde",
  "serde_json",
  "signature 2.2.0",
+ "zeroize",
+]
+
+[[package]]
+name = "jsonwebtoken"
+version = "12.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f347a975eb5fa8f5c4eadce6c1152c11c326cf32cf839fb64ff12d5cb8f4ce8b"
+dependencies = [
+ "aws-lc-rs",
+ "base64 0.23.1",
+ "getrandom 0.4.3",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "signature 3.0.0",
  "zeroize",
 ]
 
@@ -5021,9 +5036,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.39.1"
+version = "0.40.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
+checksum = "b06e69070b7e12262b0cd90832f0a7396f142a2b330181255562decf9f0c6215"
 dependencies = [
  "cc",
  "pkg-config",
@@ -7078,7 +7093,7 @@ dependencies = [
  "http",
  "jiff",
  "js-sys",
- "jsonwebtoken",
+ "jsonwebtoken 10.4.0",
  "parking_lot",
  "rand 0.9.5",
  "re_analytics",
@@ -8248,9 +8263,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.41.1"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
+checksum = "a4edff0039f148731aee2fd80f76dbfeb12d204ab3d1c544838d34e02151049b"
 dependencies = [
  "bitflags 2.13.1",
  "fallible-iterator",
@@ -8978,6 +8993,9 @@ name = "signature"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28d567dcbaf0049cb8ac2608a76cd95ff9e4412e1899d389ee400918ca7537f5"
+dependencies = [
+ "rand_core 0.10.1",
+]
 
 [[package]]
 name = "simd-adler32"
@@ -9171,9 +9189,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-wasm-rs"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "36bd8e29bf08189a005b2df1df99823aa0861cabe9044e5f31ed54ca292ee618"
+checksum = "a6cd504cecbfe7eef649988840f9a6cb768d11085efec138f8e99f160632d867"
 dependencies = [
  "cc",
  "rsqlite-vfs",
