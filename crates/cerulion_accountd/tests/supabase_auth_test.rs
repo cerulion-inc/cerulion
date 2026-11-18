@@ -305,24 +305,40 @@ fn hs256_claims(subject: &str) -> serde_json::Value {
     })
 }
 
+/// HMAC-SHA256 with an EMPTY key. The key pads to 64 zero bytes, so the
+/// inner and outer pads are the bare ipad and opad bytes.
+fn hmac_sha256_empty_key(message: &[u8]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let inner = Sha256::new()
+        .chain_update([0x36u8; 64])
+        .chain_update(message)
+        .finalize();
+    Sha256::new()
+        .chain_update([0x5cu8; 64])
+        .chain_update(inner)
+        .finalize()
+        .to_vec()
+}
+
 /// An HS256 token signed with an EMPTY key, built by hand: jsonwebtoken
 /// refuses to sign with an empty HMAC key, but any client can send one.
 fn hs256_token_with_empty_key(subject: &str) -> String {
-    use sha2::{Digest, Sha256};
     let header = URL_SAFE_NO_PAD.encode(br#"{"typ":"JWT","alg":"HS256"}"#);
     let claims = URL_SAFE_NO_PAD.encode(hs256_claims(subject).to_string());
     let signing_input = format!("{header}.{claims}");
-    // HMAC-SHA256 with an empty key: the key pads to 64 zero bytes, so the
-    // inner and outer pads are the bare ipad and opad bytes.
-    let inner = Sha256::new()
-        .chain_update([0x36u8; 64])
-        .chain_update(signing_input.as_bytes())
-        .finalize();
-    let outer = Sha256::new()
-        .chain_update([0x5cu8; 64])
-        .chain_update(inner)
-        .finalize();
-    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(outer))
+    let signature = hmac_sha256_empty_key(signing_input.as_bytes());
+    format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature))
+}
+
+#[test]
+fn the_empty_key_hmac_matches_the_published_vector() {
+    // HMAC-SHA256 of the empty message under the empty key.
+    let tag = hmac_sha256_empty_key(b"");
+    let hex: String = tag.iter().map(|byte| format!("{byte:02x}")).collect();
+    assert_eq!(
+        hex,
+        "b613679a0814d9ec772f95d778c35fc5ff1697c493715653c6c712144292c5ad"
+    );
 }
 
 async fn spawn(
