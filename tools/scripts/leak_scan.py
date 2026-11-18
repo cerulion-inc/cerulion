@@ -2,7 +2,8 @@
 """leak_scan.py: the in-tree leak guard.
 
 Keeps machine names, addresses, home paths, logins, people, co-author trailers
-and location metadata out of everything this repository publishes: file
+(all but the forge's squash trailer naming an identity on record) and location
+metadata out of everything this repository publishes: file
 contents, file and branch names, commit messages and identities, pull request
 text, and media containers.
 
@@ -57,8 +58,9 @@ Entry forms, one per line, '#' comments:
   tagged hit reports as private#<index>@<tag>. A machine spoken about by a
   NICKNAME rather than by its host name is @nickname: no generic class can
   see that shape, so the list is the only place it is refused. A @person
-  entry does not read an author name or the name in a co-author trailer on
-  record; a @never entry reads both, for a person named on no surface. The two KEY
+  entry does not read an author or committer name or the name in a co-author
+  trailer on record; a @never entry reads all three, for a person named on no
+  surface. The two KEY
   forms carry their own category and take no tag; they behave in every other
   way like the entries above, and `tracker-host:` also tells the reference
   classes that a link to that host is a defect.
@@ -153,8 +155,8 @@ WITHHELD = '(text withheld: a private pattern touches this line)'
 # no address and no login, so no generic class can see it and only an entry in
 # this list can.
 # `never` is a person who is not named on any surface, their own commit identity
-# included. A `person` entry stands down on an author name and on the name in a
-# co-author trailer on record; a `never` entry stands down nowhere.
+# included. A `person` entry stands down on an author or committer name and on
+# the name in a co-author trailer on record; a `never` entry stands down nowhere.
 TAGS = ('host', 'device', 'person', 'login', 'lan', 'nickname', 'slug', 'hygiene', 'never')
 # The generic classes whose matched text IS the address, host, login or path
 # segment. Their value prints only where the private tier is loaded AND the
@@ -617,17 +619,18 @@ def build_classes(neuter=None):
         [DASH_EN, DASH_EM, DASH_ESCAPE], None,
         {'tree': _sev_dash, 'diff': _sev_dash, 'messages': 'HARD', 'names': 'REPORT'},
         'range 3' + DASH_EN + '5', what='an en dash or an em dash')
-    # A co-author trailer names a second author on a commit this repository
-    # publishes under one identity, and a squash concatenates every message it
-    # folds, so one trailer reaches main as text on a commit nobody can attach
-    # it to. The shape is assembled from fragments, like every literal here.
+    # A hand-written co-author trailer names a second author on a commit this
+    # repository publishes under one identity, and a squash concatenates every
+    # message it folds, so one trailer reaches main as text on a commit nobody can
+    # attach it to. The shape is assembled from fragments, like every literal here.
     # A real trailer is a git trailer: it STARTS its line and names someone. Prose
     # explaining the format mid-sentence is not one, and an authorless template
     # is not one either, so the match is anchored and needs a name after the
     # colon. Both shapes appear in documentation and neither is an attribution.
     # One trailer passes, on a commit message of a scanned range and nowhere else:
     # the exact shape the forge writes, in the trailer block, naming a noreply
-    # identity already on record as an author (COAUTHOR_RX, coauthors_on_record).
+    # identity already on record as an author, or the app that authors that
+    # commit (COAUTHOR_RX, coauthors_on_record).
     add('attribution-trailer', '^[ \t]*co-?' + 'authored-by' + r'[ \t]*:[ \t]*\S',
         ['authored-by'], None, CONTENT_HARD,
         'Co-' + 'authored-by' + ': A Contributor', what='a co-author trailer')
@@ -1720,7 +1723,7 @@ class Stats(object):
         self.oversize = self.skipped = self.pragmas = self.pragmas_refused = 0
         self.commits = self.media = 0
         # Co-author trailer lines let through: on record, no HARD finding left.
-        self.coauthors = 0
+        self.coauthors_passed = 0
 
 
 def gh_escape(s, prop=False):
@@ -2614,10 +2617,13 @@ COAUTHOR_RX = re.compile(
     r' <(?P<addr>[0-9]+\+(?P<login>[A-Za-z0-9][A-Za-z0-9-]{0,38})(?P<bot>\[bot\])?@'
     + re.escape(FORGE_NOREPLY) + r')>')
 # A git trailer line as the block test reads it: a token, a colon, one space, a
-# value. Strict on purpose: a line git would still parse (a continuation line, a
-# missing space) ends the block here, and the trailer in it stays a finding.
+# value. Strict on purpose: one line git would still parse (a continuation line, a
+# missing space) means the paragraph is no trailer block at all, so every trailer
+# in it stays a finding.
 TRAILER_LINE_RX = re.compile(r'[A-Za-z0-9][A-Za-z0-9-]*: \S')
-GIT_BLANK = ' \t\n\v\f\r'
+# What git counts as blank on a line: space, tab, newline and carriage return.
+# A vertical tab or a form feed is text to git, so it is text here.
+GIT_BLANK = ' \t\n\r'
 
 
 def trailer_block(lines):
@@ -2625,7 +2631,7 @@ def trailer_block(lines):
     is not also its first (the subject, which git finds after any leading blank
     lines) and every line in it is a trailer line. Anything else is an empty
     range, so a trailer above a later paragraph, in the subject, or beside a line
-    of prose is outside it. Blank means git's blank, ASCII whitespace only."""
+    of prose is outside it. Blank means git's blank (GIT_BLANK)."""
     end = len(lines)
     while end and not lines[end - 1].strip(GIT_BLANK):
         end -= 1
@@ -2773,7 +2779,7 @@ def run_messages(sc, git, args, env):
                 # scan: an identity on record whose line still fails was not let
                 # through, and the count says what was.
                 held = set(h.line for h in sc.hits[before:] if h.sev == 'HARD')
-                sc.stats.coauthors += sum(1 for li in exempt if li + 1 not in held)
+                sc.stats.coauthors_passed += sum(1 for li in exempt if li + 1 not in held)
             ident(label + ' author', an, ae)
             ident(label + ' committer', cn, ce)
     if args.message_file:
@@ -3516,8 +3522,8 @@ def _extras(sc):
         bits.append('skipped=%d' % st.skipped)
     if st.commits:
         bits.append('commits=%d' % st.commits)
-    if st.coauthors:
-        bits.append('coauthors_on_record=%d' % st.coauthors)
+    if st.coauthors_passed:
+        bits.append('coauthors_passed=%d' % st.coauthors_passed)
     if sc.suppressed:
         bits.append('suppressed=%d' % sc.suppressed)
     if sc.refs is not None and sc.refs.res.asked:
@@ -4463,7 +4469,7 @@ def self_test(out, base_env, argv0):
                         dict(penv, LEAK_PATTERNS=private_env))
         arm('messages-private-redacted', not any(PW.lower() in ln.lower() for ln in lines))
         # --- messages: the one co-author trailer that passes ----------------------------
-        # A scratch repository whose base history puts eleven identities on record.
+        # A scratch repository whose base history puts ten identities on record.
         # Each case is one commit on top of `base`, scanned as `base..<commit>` with the
         # tier loaded, so PERSON is a @person name, SU a @login and PW a @host the
         # tier knows. The bot `keeper` authors the LAST base commit, which is the one
@@ -4524,8 +4530,8 @@ def self_test(out, base_env, argv0):
 
         def counted(lines, n):
             """The summary's let-through count is exactly n (absent means 0)."""
-            want = 'coauthors_on_record=%d' % n
-            return any((want in ln) if n else ('coauthors_on_record=' not in ln)
+            want = 'coauthors_passed=%d' % n
+            return any((want in ln) if n else ('coauthors_passed=' not in ln)
                        for ln in summary(lines))
 
         line_a = tr + PERSON + ' <' + co_a + '>'
@@ -4704,6 +4710,10 @@ def self_test(out, base_env, argv0):
             and trailer_block(['s', '', 'Note:x', line_a]) == range(0)
             and trailer_block(['s', chr(0xA0), tl]) == range(0)
             and trailer_block(['s', '', line_a, chr(0xA0)]) == range(0)
+            and trailer_block(['s', chr(0x0B), line_a]) == range(0)
+            and trailer_block(['s', chr(0x0C), line_a]) == range(0)
+            and trailer_block(['s', ' ' + chr(0x09) + chr(0x0D), line_a]) == range(2, 3)
+            and trailer_block(['s', '', line_a, chr(0x0C)]) == range(0)
             and trailer_block([]) == range(0) and trailer_block(['', '']) == range(0))
         rec = {(PERSON, co_a), (keeper, keeper_addr)}.__contains__
         name_at = (len(tr), len(tr) + len(PERSON))

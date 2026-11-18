@@ -338,10 +338,11 @@ and we'll help.
   case and followed by a name, on every commit of the pull request and on its
   title and body. The one trailer it lets through on a commit is the shape the
   forge writes on a squash: in the trailer block, spelled exactly as the forge
-  spells it, with the noreply address of an identity that already authors
-  commits on `main`, or of an app that authors the commit itself.
-  `docs/leak_guard.md` gives the full rule, and its identity policy names who
-  may appear as an author. Amend any other trailer out before you push:
+  spells it, naming, by its exact name and numbered noreply address, an
+  identity that already authors a commit on `main`, or an app, named by its
+  own login, that authors the commit itself. `docs/leak_guard.md` gives the
+  full rule, and its identity policy names who may appear as an author. Amend
+  any other trailer out before you push:
   `git commit --amend` for one commit, `git rebase -i <base>` with `reword`
   for several, then `git push --force-with-lease` to your branch.
 - Add tests for new behavior.
