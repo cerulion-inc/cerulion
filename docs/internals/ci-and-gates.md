@@ -535,6 +535,12 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
 
+The repeat legs run one test binary 20 times in a row on one runner, on every event but a
+merge-queue batch, so a change that makes that test fail now and then shows as a red even when a single
+run passes: `rcpd-eye-host-repeat` runs `cerulion_rcpd`'s `eye_host_test`. Every step past
+the checkout is gated on the package's selection, and none reports a required context; the
+package's own step in its test job is the one a merge waits for.
+
 `examples` opens with a lockfile WALK: `cargo metadata --locked` over every tracked
 `Cargo.lock` outside the root (the benches, the examples, the Python wheel, the Android sample
 runtime; floor 13), ahead of any build step that could rewrite one, so a dependency change under
