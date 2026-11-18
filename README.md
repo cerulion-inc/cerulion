@@ -88,7 +88,7 @@ Give your own model the Cerulion harness's tools on a simulated robot, through C
 ```bash
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
-claude mcp add --transport http cerulion http://127.0.0.1:8765/mcp
+claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
 ```
 
 Then ask your model for a task, for example "Put the bowl on the plate." The first `cerulion rcp --sim` installs the simulator and the benchmark scenes once, which takes minutes. To rerun a task of the published benchmark with and without the harness against your own OpenAI-compatible endpoint, set `OPENAI_BASE_URL` and `OPENAI_API_KEY` and run:

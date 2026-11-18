@@ -7,7 +7,7 @@ through the `cerulion` command; the guide is [docs/harness.md](../docs/harness.m
 ```bash
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # the harness's MCP tools with a simulated robot
-claude mcp add --transport http cerulion http://127.0.0.1:8765/mcp
+claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
 cerulion rcp bench --model YOUR_MODEL            # one benchmark task, with and without the harness
 cerulion rcp bench --verify                      # the code here is the code the benchmark measured
 ```

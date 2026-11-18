@@ -28,7 +28,7 @@ cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
 In a second terminal, add it to your MCP client and ask for a task:
 
 ```bash
-claude mcp add --transport http cerulion http://127.0.0.1:8765/mcp
+claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
 claude "Put the bowl on the plate."
 ```
 
@@ -42,7 +42,7 @@ when no call arrives for a while; connect again for a new one.
 Without `--http`, `cerulion rcp --sim` serves MCP over stdio, so a client can start it itself:
 
 ```bash
-claude mcp add cerulion -- cerulion rcp --sim
+claude mcp add cerulion-sim -- cerulion rcp --sim
 ```
 
 Run `cerulion rcp --sim` once in a terminal before you add it this way: the first run installs the simulator

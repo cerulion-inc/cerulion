@@ -26,7 +26,7 @@ it to your client:
 ```bash
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
-claude mcp add --transport http cerulion http://127.0.0.1:8765/mcp
+claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
 ```
 
 Then ask your model for a task, for example "Put the bowl on the plate." Each MCP connection gets its own
