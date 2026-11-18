@@ -24,11 +24,11 @@ default = ["cdylib"]
 [dependencies]
 cerulion_core = { workspace = true }
 native_ros2_messages = { workspace = true }
-# Portable terminal raw-mode + key events. PINNED to 0.28 to match
+# Portable terminal raw-mode + key events. PINNED to 0.29 to match
 # cerulion_cli_tui/Cargo.toml (the ratatui/TUI family already vendors this
 # version). Third-party dep declared CRATE-LOCALLY (not a examples/go2 workspace
 # dep).
-crossterm = "0.28"
+crossterm = "0.29"
 # Structured logging in the hardware pump (no-TTY warn).
 tracing = "0.1"
 
