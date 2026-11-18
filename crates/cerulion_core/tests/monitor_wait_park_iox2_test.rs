@@ -4446,3 +4446,495 @@ mod box_same_core {
         );
     }
 }
+
+// ===========================================================================
+// A per-set Sync node keeps the wake for a frame that lands after its align
+// pass. The step's drain empties a per-set node's listeners and then runs the
+// one align pass that reads every input's queue; a frame published after that
+// pass must keep its notification, so the next idle wait (the park or the
+// WaitSet) wakes on it at once. The `set_sync_align_hook_for_test` seam
+// publishes that frame from inside the drain, right after the align pass, so
+// the order is fixed by the drain itself, not by timing.
+// ===========================================================================
+
+/// The join of `a` and `b` a node in [`joins_graph`] declares, by node id and
+/// its two outside topics.
+struct JoinSpec {
+    id: &'static str,
+    a: &'static str,
+    b: &'static str,
+}
+
+/// One join's record: the pairs it joined and its fire count.
+type JoinSlot = (Arc<Mutex<Vec<(f64, f64)>>>, Arc<AtomicU64>);
+
+/// One graph of per-set `Joiner` nodes, each joining two topics no node here
+/// produces, declared in order, all in one level. Each node records its pairs
+/// and counts its fires in its own slot.
+fn joins_graph(
+    identity: &str,
+    joins: &[JoinSpec],
+) -> (
+    GraphConfig,
+    IndexMap<String, Box<dyn NodeEntry>>,
+    Vec<JoinSlot>,
+) {
+    let input = |name: &str, source: &str| InputDef {
+        name: name.to_string(),
+        source: source.to_string(),
+        ..Default::default()
+    };
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: identity.to_string(),
+        prefix: "mwp".to_string(),
+        nodes: joins
+            .iter()
+            .map(|j| NodeDef {
+                isolate: None,
+                params: Default::default(),
+                ros2: None,
+                id: j.id.to_string(),
+                node_type: "joiner".to_string(),
+                inputs: vec![input("a", j.a), input("b", j.b)],
+                outputs: vec![],
+            })
+            .collect(),
+    };
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    let mut slots = Vec::new();
+    for j in joins {
+        let joined = Arc::new(Mutex::new(Vec::new()));
+        let fires = Arc::new(AtomicU64::new(0));
+        factories.insert(
+            j.id.to_string(),
+            Box::new(JoinerEntry::with_state(Joiner {
+                joined: Arc::clone(&joined),
+                fires: Arc::clone(&fires),
+                ..Default::default()
+            })),
+        );
+        slots.push((joined, fires));
+    }
+    (config, factories, slots)
+}
+
+/// A park timeout far longer than the arm: a wait that ends on it was ended by
+/// no frame.
+const DUE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One run of the lost-wakeup shape on one runtime under `policy`: a frame on
+/// `a`, then a live step whose drain publishes the frame on `b` right after
+/// the join's align pass. That step cannot fire the set (its align pass read
+/// `a` alone). Returns the pairs after the next step (at once under the park;
+/// with the park off it waits `WAKE_TIMEOUT`, since the WaitSet probe took b's
+/// wake), the park timeouts that step took, and, with the park off, which nodes
+/// the WaitSet found woken before it.
+fn join_after_a_frame_lands_past_the_align_pass(
+    tag: &str,
+    policy: MonitorWaitPolicy,
+) -> (Vec<(f64, f64)>, u64, Vec<String>) {
+    use std::sync::atomic::AtomicBool;
+    let a = "/mwp/lw/a";
+    let b = "/mwp/lw/b";
+    let (config, factories, slots) =
+        joins_graph(&format!("mwp_lw_{tag}"), &[JoinSpec { id: "joiner", a, b }]);
+    let park = policy.monitor_wait();
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        policy,
+    )
+    .expect("build the join graph");
+    let (mut pub_a, mut pub_b) = {
+        let mgr: &Arc<TransportManager> = runtime.test_transport().expect("test transport parked");
+        (
+            mgr.create_publisher(a, MaxSliceLen::const_new(256), 0)
+                .expect("attach a writer to a"),
+            mgr.create_publisher(b, MaxSliceLen::const_new(256), 0)
+                .expect("attach a writer to b"),
+        )
+    };
+    // Prime: one live iteration with no data drains connection noise.
+    runtime.run_live_step_once_for_test(WAKE_TIMEOUT);
+    assert_eq!(slots[0].1.load(Ordering::Acquire), 0, "no frame, no fire");
+    let armed = Arc::new(AtomicBool::new(true));
+    {
+        let armed = Arc::clone(&armed);
+        runtime.set_sync_align_hook_for_test(Some(Box::new(move || {
+            if armed.swap(false, Ordering::AcqRel) {
+                publish_one(&mut pub_b, 1.0);
+            }
+        })));
+    }
+    publish_one(&mut pub_a, 1.0);
+    runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    assert!(
+        !armed.load(Ordering::Acquire),
+        "the drain ran the join's align pass, and the hook published on b"
+    );
+    assert_eq!(
+        slots[0].1.load(Ordering::Acquire),
+        0,
+        "the step whose align pass read a alone cannot fire the set"
+    );
+    let woken = if park {
+        Vec::new()
+    } else {
+        runtime.run_waitset_reactor_once_for_test(WAKE_TIMEOUT)
+    };
+    let (_, _, _, timeouts_before) = runtime.park_wake_counts();
+    // The WaitSet seam above took b's notification, so with the park off the
+    // step's own wait finds none and ends on its timeout; the queued frame still
+    // fires there. `woken` is that arm's proof, so its step waits briefly.
+    runtime.run_live_step_once_for_test(if park { DUE_JOIN_TIMEOUT } else { WAKE_TIMEOUT });
+    let (_, _, _, timeouts_after) = runtime.park_wake_counts();
+    let pairs = slots[0].0.lock().expect("join log").clone();
+    runtime.shutdown();
+    (pairs, timeouts_after - timeouts_before, woken)
+}
+
+/// The monitor-wait park with the doorbell on (the shape that lost the wake):
+/// the step after a frame lands past the align pass fires the set without a
+/// park timeout, and two runs join the same pair.
+#[test]
+#[serial]
+fn a_frame_landing_after_a_joins_align_pass_wakes_the_park_at_once() {
+    let run = || {
+        join_after_a_frame_lands_past_the_align_pass(
+            "park",
+            MonitorWaitPolicy::new(true, true, mwp_ns("lwpark")),
+        )
+    };
+    let (pairs, timeouts, _) = run();
+    assert_eq!(
+        pairs,
+        vec![(1.0, 1.0)],
+        "the set fired once, joining both frames"
+    );
+    assert_eq!(
+        timeouts, 0,
+        "the park woke on b's notification; a park that slept its timeout lost it"
+    );
+    let (again, timeouts_again, _) = run();
+    assert_eq!(
+        (again, timeouts_again),
+        (pairs, 0),
+        "two runs, the same join"
+    );
+}
+
+/// The park off (the WaitSet idle): b's notification is still pending after
+/// the step, so the WaitSet finds the join woken (the proof here), and the next
+/// step fires the set.
+#[test]
+#[serial]
+fn a_frame_landing_after_a_joins_align_pass_keeps_its_waitset_wake() {
+    let (pairs, _, woken) = join_after_a_frame_lands_past_the_align_pass(
+        "waitset",
+        MonitorWaitPolicy::new(false, false, mwp_ns("lwwait")),
+    );
+    assert_eq!(
+        woken,
+        vec!["joiner".to_string()],
+        "b's notification survived the drain, so the WaitSet wakes on it"
+    );
+    assert_eq!(
+        pairs,
+        vec![(1.0, 1.0)],
+        "the set fired once, joining both frames"
+    );
+}
+
+/// Two per-set joins side by side in one level: the first one's frame on b
+/// lands past its align pass while the second already holds both frames. The
+/// second join's drain leaves the first join's wake alone: the second join
+/// fires in that step and the first in the next, at once, each set exactly
+/// once.
+#[test]
+#[serial]
+fn adjacent_joins_each_keep_their_own_wake_and_fire_their_own_set() {
+    use std::sync::atomic::AtomicBool;
+    let joins = [
+        JoinSpec {
+            id: "first",
+            a: "/mwp/lw2/a",
+            b: "/mwp/lw2/b",
+        },
+        JoinSpec {
+            id: "second",
+            a: "/mwp/lw2/c",
+            b: "/mwp/lw2/d",
+        },
+    ];
+    let (config, factories, slots) = joins_graph("mwp_lw2", &joins);
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("lwadj")),
+    )
+    .expect("build the two-join graph");
+    let mut pubs: Vec<_> = {
+        let mgr: &Arc<TransportManager> = runtime.test_transport().expect("test transport parked");
+        ["/mwp/lw2/a", "/mwp/lw2/b", "/mwp/lw2/c", "/mwp/lw2/d"]
+            .iter()
+            .map(|t| {
+                mgr.create_publisher(t, MaxSliceLen::const_new(256), 0)
+                    .expect("attach a writer")
+            })
+            .collect()
+    };
+    runtime.run_live_step_once_for_test(WAKE_TIMEOUT);
+    let mut pub_b = pubs.remove(1);
+    let armed = Arc::new(AtomicBool::new(true));
+    {
+        let armed = Arc::clone(&armed);
+        runtime.set_sync_align_hook_for_test(Some(Box::new(move || {
+            // The first align pass of the step is the first join's.
+            if armed.swap(false, Ordering::AcqRel) {
+                publish_one(&mut pub_b, 1.0);
+            }
+        })));
+    }
+    publish_one(&mut pubs[0], 1.0);
+    publish_one(&mut pubs[1], 2.0);
+    publish_one(&mut pubs[2], 2.0);
+    runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    assert!(
+        !armed.load(Ordering::Acquire),
+        "the drain ran the first join's align pass, and the hook published on b"
+    );
+    assert_eq!(
+        (
+            slots[0].1.load(Ordering::Acquire),
+            slots[1].1.load(Ordering::Acquire)
+        ),
+        (0, 1),
+        "the second join held both frames and fired; the first read a alone"
+    );
+    let (_, _, _, before) = runtime.park_wake_counts();
+    runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    let (_, _, _, after) = runtime.park_wake_counts();
+    let first = slots[0].0.lock().expect("join log").clone();
+    let second = slots[1].0.lock().expect("join log").clone();
+    runtime.shutdown();
+    assert_eq!(after - before, 0, "the first join's wake for b survived");
+    assert_eq!(
+        (first, second),
+        (vec![(1.0, 1.0)], vec![(2.0, 2.0)]),
+        "each join fired its own set once"
+    );
+}
+
+/// Frames on both inputs before the step: the join fires in that step, and its
+/// listeners hold no stale wake after it (the WaitSet finds nothing).
+#[test]
+#[serial]
+fn a_join_whose_frames_both_land_before_the_step_fires_once_and_leaves_no_stale_wake() {
+    let a = "/mwp/lw3/a";
+    let b = "/mwp/lw3/b";
+    let (config, factories, slots) = joins_graph("mwp_lw3", &[JoinSpec { id: "joiner", a, b }]);
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        MonitorWaitPolicy::new(false, false, mwp_ns("lwboth")),
+    )
+    .expect("build the join graph");
+    let (mut pub_a, mut pub_b) = {
+        let mgr: &Arc<TransportManager> = runtime.test_transport().expect("test transport parked");
+        (
+            mgr.create_publisher(a, MaxSliceLen::const_new(256), 0)
+                .expect("attach a writer to a"),
+            mgr.create_publisher(b, MaxSliceLen::const_new(256), 0)
+                .expect("attach a writer to b"),
+        )
+    };
+    runtime.run_live_step_once_for_test(WAKE_TIMEOUT);
+    publish_one(&mut pub_a, 3.0);
+    publish_one(&mut pub_b, 4.0);
+    runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    let woken = runtime.run_waitset_reactor_once_for_test(WAKE_TIMEOUT);
+    let pairs = slots[0].0.lock().expect("join log").clone();
+    runtime.shutdown();
+    assert_eq!(pairs, vec![(3.0, 4.0)], "one set, both frames");
+    assert!(woken.is_empty(), "no stale wake after the fire: {woken:?}");
+}
+
+/// Copies each frame on its trigger input to its output, so a node reading the
+/// output sits one level below it.
+#[cerulion_node]
+#[derive(Default)]
+struct Relay {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl Relay {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// A per-set join one level down, declared before a per-set join in the first
+/// level, so its bindings come first in the drain's list and the level filter
+/// skips them on the first level's pass. The first-level join's frame on b
+/// lands past its align pass; the later level's drain walks its own join's
+/// bindings only, so that wake survives: the join one level down fires in the
+/// step (its relayed frame and its outside frame), the first-level join in the
+/// next, at once.
+#[test]
+#[serial]
+fn a_join_one_level_down_never_takes_the_wake_of_a_join_drained_before_it() {
+    use std::sync::atomic::AtomicBool;
+    let input = |name: &str, source: &str| InputDef {
+        name: name.to_string(),
+        source: source.to_string(),
+        ..Default::default()
+    };
+    let node = |id: &str, ty: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
+        isolate: None,
+        params: Default::default(),
+        ros2: None,
+        id: id.to_string(),
+        node_type: ty.to_string(),
+        inputs,
+        outputs,
+    };
+    let config = GraphConfig {
+        level_assignments: None,
+        network: None,
+        process_groups: Default::default(),
+        process_group_order: Default::default(),
+        multi_publisher_topics: Vec::new(),
+        name: None,
+        identity: "mwp_lw4".to_string(),
+        prefix: "mwp".to_string(),
+        nodes: vec![
+            node(
+                "late",
+                "joiner",
+                vec![input("a", "relay/out"), input("b", "/mwp/lw4/z")],
+                vec![],
+            ),
+            node(
+                "relay",
+                "relay",
+                vec![input("inp", "/mwp/lw4/x")],
+                vec![OutputDef {
+                    name: "out".to_string(),
+                    schema: "geometry_msgs/Vector3".to_string(),
+                    max_slice_len: None,
+                    history_size: 0,
+                    topic: None,
+                }],
+            ),
+            node(
+                "early",
+                "joiner",
+                vec![input("a", "/mwp/lw4/a"), input("b", "/mwp/lw4/b")],
+                vec![],
+            ),
+        ],
+    };
+    let late = (
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let early = (
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+    );
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    for (id, slot) in [("late", &late), ("early", &early)] {
+        factories.insert(
+            id.to_string(),
+            Box::new(JoinerEntry::with_state(Joiner {
+                joined: Arc::clone(&slot.0),
+                fires: Arc::clone(&slot.1),
+                ..Default::default()
+            })),
+        );
+    }
+    factories.insert(
+        "relay".to_string(),
+        Box::new(RelayEntry::with_state(Relay::default())),
+    );
+    let mut runtime = GraphRuntime::build_for_test_with_policy(
+        config,
+        factories,
+        Arc::new(VirtualClock::new()),
+        8,
+        MonitorWaitPolicy::new(true, true, mwp_ns("lwlevel")),
+    )
+    .expect("build the two-level graph");
+    let mut pubs: Vec<_> = {
+        let mgr: &Arc<TransportManager> = runtime.test_transport().expect("test transport parked");
+        ["/mwp/lw4/x", "/mwp/lw4/z", "/mwp/lw4/a", "/mwp/lw4/b"]
+            .iter()
+            .map(|t| {
+                mgr.create_publisher(t, MaxSliceLen::const_new(256), 0)
+                    .expect("attach a writer")
+            })
+            .collect()
+    };
+    runtime.run_live_step_once_for_test(WAKE_TIMEOUT);
+    let mut pub_b = pubs.remove(3);
+    let armed = Arc::new(AtomicBool::new(true));
+    {
+        let armed = Arc::clone(&armed);
+        runtime.set_sync_align_hook_for_test(Some(Box::new(move || {
+            // The first align pass of the step is the first level's join.
+            if armed.swap(false, Ordering::AcqRel) {
+                publish_one(&mut pub_b, 1.0);
+            }
+        })));
+    }
+    publish_one(&mut pubs[0], 5.0);
+    publish_one(&mut pubs[1], 6.0);
+    publish_one(&mut pubs[2], 1.0);
+    runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    assert!(
+        !armed.load(Ordering::Acquire),
+        "the drain ran the first level's align pass, and the hook published on b"
+    );
+    assert_eq!(
+        (
+            early.1.load(Ordering::Acquire),
+            late.1.load(Ordering::Acquire)
+        ),
+        (0, 1),
+        "the join one level down fired on the relayed frame and its own; the first \
+         level's join read a alone"
+    );
+    let (_, _, _, before) = runtime.park_wake_counts();
+    runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    let (_, _, _, after) = runtime.park_wake_counts();
+    let early_pairs = early.0.lock().expect("join log").clone();
+    let late_pairs = late.0.lock().expect("join log").clone();
+    runtime.shutdown();
+    assert_eq!(
+        after - before,
+        0,
+        "the first level's join kept its wake for b"
+    );
+    assert_eq!(
+        (early_pairs, late_pairs),
+        (vec![(1.0, 1.0)], vec![(5.0, 6.0)]),
+        "each join fired its own set once"
+    );
+}
