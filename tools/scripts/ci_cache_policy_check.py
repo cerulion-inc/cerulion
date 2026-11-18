@@ -607,6 +607,12 @@ CACHE_HIT_PREFIX_RE = re.compile(r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.cache-hit 
 STEP_OUTPUT_GUARD_RE = re.compile(
     r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+ == '[A-Za-z0-9_.\-]+'$"
 )
+# The gate every step of a job whose `runs-on` follows the classifier's `code`
+# class carries. On a change that reaches no package that job's legs land on
+# another runner, and `runner.os` in the key then names THAT runner's
+# namespace, so a prune or save there would act on another job's archive. A
+# conjunct like the others, so it only ever narrows the gate.
+SELECTION_CODE_CLAUSE = "needs.changes.outputs.code == 'true'"
 TOOL_CACHE_PATH_RE = re.compile(r"^(?:~/\.cargo/bin/[A-Za-z0-9_.\-]+|"
                                 r"~/\.cache/cerulion-tool-tarballs)$")
 EVENT_NE_PULL_REQUEST = "github.event_name != 'pull_request'"
@@ -818,6 +824,8 @@ def classify_conjunct(part, ns_clauses):
         return "main-only"
     if part in ns_clauses:
         return "namespace"
+    if part == SELECTION_CODE_CLAUSE:
+        return "selection-code"
     if STEP_OUTPUT_GUARD_RE.match(part):
         return "step-output guard"
     return None
@@ -862,8 +870,16 @@ def _check_closed_conjunction(add, line, what, cond, allowed, ns_clauses):
 #
 #   prune  = [matrix.shard == 0 &&] [a step-output guard &&]
 #            github.event_name != 'merge_group' && <main-only>
+#            [&& needs.changes.outputs.code == 'true']
 #   save   = steps.<restore id>.outputs.cache-hit != 'true' && <the prune's if>
 #            && steps.cache-prune.outputs.proceed == 'true' && <namespace gate>
+#
+# The `code` conjunct is for a job whose runner follows that class. In a job
+# that needs `changes` it never narrows a default-branch run: the classifier
+# selects every package on `push` and `workflow_dispatch`, so `code` is `true`
+# there. In a job that does not, it reads the empty string, so that job's
+# prune and save never run and its namespace stays restore-only.
+# `ci_test_coverage_test` requires a routed job to need `changes`.
 #
 # The `proceed` conjunct is what keeps a default-branch run BEHIND THE TIP from
 # uploading. Such a run skips the prune (correctly: only the tip may delete) and
@@ -877,7 +893,7 @@ def _check_closed_conjunction(add, line, what, cond, allowed, ns_clauses):
 # time, so GitHub's idle eviction never fires on one). Now every default-branch
 # run of a job that has a prune step prunes, keeping exactly that job's current
 # key -- which empties a restore-only namespace, and that is the intent.
-PRUNE_ALLOWED = ("shard", "step-output guard", "merge-group", "main-only")
+PRUNE_ALLOWED = ("shard", "step-output guard", "merge-group", "main-only", "selection-code")
 SAVE_ALLOWED = ("cache-hit",) + PRUNE_ALLOWED + ("prune-proceed", "namespace")
 TOOL_CACHE_ALLOWED = ("cache-hit", "merge-group")
 
@@ -2024,6 +2040,17 @@ def _mutants():
         "          && steps.present.outputs.present == 'true'\n",
     )
     out.append(("R8 a reordered but complete conjunction passes", reordered, set()))
+    # R8: the `code` routing conjunct on both gates is a member of the set, and
+    # the same conjunct with its literal flipped is not.
+    routed = _mut(clean, CROSS_PRUNE_IF,
+                  CROSS_PRUNE_IF + "          && " + SELECTION_CODE_CLAUSE + "\n")
+    routed = _mut(routed, CROSS_SAVE_IF,
+                  CROSS_SAVE_IF + "          && " + SELECTION_CODE_CLAUSE + "\n")
+    out.append(("R8 the code routing conjunct on both gates passes", routed, set()))
+    flipped = SELECTION_CODE_CLAUSE.replace("'true'", "'false'")
+    inverted = _mut(clean, CROSS_PRUNE_IF, CROSS_PRUNE_IF + "          && " + flipped + "\n")
+    inverted = _mut(inverted, CROSS_SAVE_IF, CROSS_SAVE_IF + "          && " + flipped + "\n")
+    out.append(("R8 the code routing conjunct inverted", inverted, {"R8_CLOSED_CONJUNCTION"}))
     # R9: the container lane without the install step. `gh` and `jq` are on
     # every hosted image and on none of the ros: images.
     install_step = (

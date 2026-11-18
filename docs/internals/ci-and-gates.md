@@ -470,8 +470,10 @@ naming gate (pull requests only);
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
 
 EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_request` and
-`merge_group` events like everything else: there is no cost gate, no routing expression
-and no stub job standing in for a skipped required check.
+`merge_group` events like everything else: there is no cost gate and no stub job standing
+in for a skipped required check. There is ONE routing expression: `test-macos` takes its
+runner from the classifier's `code` class, described with that job below; the legs it
+routes to Linux are that job itself, under its own names.
 
 `lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
 `cli-e2e-latency`), which no pull request and no queued batch runs; a red `lint` saves their
@@ -519,6 +521,28 @@ there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
 shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, for the same
 reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
+
+`test-macos` takes its RUNNER from the classifier:
+`runs-on: ${{ needs.changes.outputs.code == 'true' && 'macos-latest' || 'ubuntu-latest' }}`.
+Where `code` is `true` every leg runs on macOS with every step its own conditions select: that
+is every run that selects every package (every `push` and `workflow_dispatch` run, every
+`merge_group` run that selects every package, every run under `CI_SELECTION=off`) and every
+narrowed run whose change reaches a package. A change that reaches no package (`code=false`, which the classifier only
+reports beside `pkgs=[]`) runs all three legs on `ubuntu-latest` with every step but the
+selection markers skipped: each step carries `needs.changes.outputs.code == 'true'` as a
+top-level `&&` term, or a per-package gate, so no toolchain install, cache restore,
+`cargo build --workspace`, fixture build or test runs, and each leg still reports its own
+`Test (macOS) shard <n>` context. A FAILED classifier leaves every output empty: the
+expression picks Linux, every `code` gate is false, and the first condition that reaches
+`fromJSON('')` is an expression error that fails its step. Every leg reaches one: the
+selection markers carry no leg selector to short-circuit ahead of it, so every leg reds. `routed_job_complaints` in `ci_test_coverage_test.rs`
+holds the job to that shape: the one routing spelling, a gate on every step and at least one
+marker. The cache prune and save carry the `code` term too, because `runner.os` in their key
+would name the Linux namespace on a Linux leg, and `tools/scripts/ci_cache_policy_check.py`
+admits it as a conjunct of those two gates. `crate-tests` is NOT routed: its two legs share
+their steps, and four of them (the development-issuer check, `cerulion_node_abi`,
+`cerulion_hygiene` and the umbrella crate) run on every pull request on both legs, so a
+`code` gate on them would stop them on the Linux leg as well.
 
 Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
@@ -620,7 +644,9 @@ direction: they SKIP test steps. Four rules bound them.
   gated step carries the one condition the coverage walk credits,
   `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')`, and a companion step
   under the exact negation of that condition prints one line beginning `selection:`, so
-  the log says what was skipped and why.
+  the log says what was skipped and why. A `test-macos` step gated on `code` carries no
+  marker of its own: it skips only on a change for which every per-package gate skips and
+  every marker prints.
 * THE SELECTION IS WIDER THAN CARGO. `pkgs` is the reverse cargo dependency closure over
   normal, build and dev edges UNIONED with the observation edges in
   `tools/ci/observation_edges.tsv`: a test that reads another package's tree, walks the
@@ -629,14 +655,18 @@ direction: they SKIP test steps. Four rules bound them.
   `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
   and on a stale one. A read the walk cannot place on one package, an unattributable literal or
   a walk over a tree holding more than one member, records the observing package as observing
-  `all`; such a package rides every selection that names a package, and no step of it is gated.
+  `all`; such a package rides every selection that names a package, and no step of it carries
+  a per-package gate (the `code` gate holds on every such selection).
   Four packages are in that state today, `cerulion_core` among them, which is why the
-  `cerulion_core` shard steps carry no condition of their own: the shard runner reads the
-  selection itself and prints the `selection:` line when it skips.
+  `cerulion_core` shard steps carry no per-package condition (the `test-macos` one carries the
+  `code` gate alone): the shard runner reads the selection itself and prints the `selection:`
+  line when it skips.
 
 The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
-requests. It does NOT narrow the workspace build, it does not gate a job, it does not apply
-to any event but `pull_request`, and it never removes a required status context.
+requests, and a change that reaches no package also moves `test-macos` to Linux with every
+step skipped. It does NOT narrow the workspace build of a change that reaches a package, it
+does not gate a job, it does not apply to any event but `pull_request`, and it never removes
+a required status context.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.

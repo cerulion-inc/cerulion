@@ -3423,10 +3423,42 @@ jobs:
           key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
-    runs-on: macos-latest
-    # `needs: [changes]` for the per-package selection only. Every leg still
-    # runs and still reports its own context, and every leg now waits for the
-    # classifier (about a minute) before it starts, on every event.
+    # THE RUNNER FOLLOWS THE `code` CLASS. Where `code` is `true` every leg runs
+    # on macOS with every step its own conditions select. That is every run
+    # that selects every package (`push`, `workflow_dispatch`, every
+    # `merge_group` run that selects every package, and every run under
+    # `CI_SELECTION=off`) and every narrowed run whose change reaches a
+    # package. A classifier that completed reports
+    # `code=false` only for a change that reaches no package at all; then
+    # every leg runs on `ubuntu-latest` and skips every step but the selection
+    # markers. The legs and their names do not depend on the runner, so each
+    # leg still reports its own required context.
+    #
+    # EVERY STEP IS GATED, so no step meets a runner it was not written for.
+    # Each one carries `needs.changes.outputs.code == 'true'` as a top-level
+    # `&&` term (alone, or beside its leg selector, event test or status
+    # call), or the per-package gate, which is false whenever `code` is: the
+    # classifier reports `pkgs=[]` whenever it reports `code=false`. The
+    # selection markers are the one exception: they print one line and read
+    # nothing from the checkout. The cache prune and save carry the `code` term
+    # too, because `runner.os` in their key would name the Linux namespace on
+    # a Linux leg.
+    #
+    # FAIL CLOSED WHEN THE CLASSIFIER FAILS. Its outputs are then the empty
+    # string: the expression below picks `ubuntu-latest`, every `code` gate is
+    # false, and the first condition that reaches `fromJSON('')` is an
+    # expression error that fails its step. Every leg reaches one: a per-package
+    # gate whose leg selector matches gets there first, and otherwise a
+    # selection marker does, whose condition carries no leg selector to
+    # short-circuit ahead of it. So every leg reds.
+    # `cerulion_cli_engine::ci_test_coverage_test` holds this job to that
+    # shape: this exact routing expression, a gate on every step, and at least
+    # one marker whose step only prints its line.
+    runs-on: ${{ needs.changes.outputs.code == 'true' && 'macos-latest' || 'ubuntu-latest' }}
+    # `needs: [changes]` for the selection and for the runner choice above.
+    # Every leg still runs and still reports its own context, and every leg
+    # waits for the classifier (about a minute) before it starts, on every
+    # event.
     needs: [changes]
     # `!cancelled()` is load bearing, and it is the only job-level condition
     # this file's coverage walk sanctions. `needs: [changes]` makes the
@@ -3434,8 +3466,9 @@ jobs:
     # when its dependency fails; a skipped required context counts as
     # SATISFIED, so without this guard a failed classifier would wave the pull
     # request through with this job's contexts never run. With it the job runs,
-    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
-    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    # `needs.changes.outputs.pkgs` is the empty string, and the first condition
+    # that reaches `fromJSON('')` is an expression error that fails its step
+    # (FAIL CLOSED above), so the job reds.
     if: ${{ !cancelled() }}
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
@@ -3497,9 +3530,10 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        if: needs.changes.outputs.code == 'true'
 
       - name: Release installer self-test
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.changes.outputs.code == 'true'
         run: ./tools/scripts/install.sh --self-test
 
       # This job has NO reclaim step and, until now, no `df` anywhere —
@@ -3520,7 +3554,7 @@ jobs:
       # An unparseable figure simply skips the reclaim (verified on real BSD `df`:
       # empty and non-numeric both fall through the guard, exit 0).
       - name: Report free disk (reclaim only if tight)
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && needs.changes.outputs.code == 'true'
         run: |
           df -h / || true
           avail=$(df -g / | awk 'NR==2 {print $4}') || true
@@ -3533,6 +3567,7 @@ jobs:
           fi
 
       - name: Raise the open-file limits
+        if: needs.changes.outputs.code == 'true'
         # A shared memory creation on shard 0 failed with ENFILE, which
         # iceoryx2 reports as "the system-wide file handle limit was reached"
         # and a caller sees only as a creation that failed with no errno. In
@@ -3567,6 +3602,7 @@ jobs:
           echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
 
       - name: Install Rust toolchain
+        if: needs.changes.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -3628,7 +3664,7 @@ jobs:
       # runner writes that key.)
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && needs.changes.outputs.code == 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -3642,7 +3678,7 @@ jobs:
             cargo-${{ runner.os }}-
 
       - name: Restore cargo (shards 1-2, no save)
-        if: matrix.shard != 0
+        if: matrix.shard != 0 && needs.changes.outputs.code == 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -3669,6 +3705,7 @@ jobs:
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && needs.changes.outputs.code == 'true'
         run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -3677,24 +3714,29 @@ jobs:
       # list (which had gone stale: a deleted crate + two missing ones). Same
       # spirit as the default-cover test model below.
       - name: Build test cdylibs
+        if: needs.changes.outputs.code == 'true'
         run: cargo build --workspace
 
       - name: Build modified raw-node delivery fixture
+        if: needs.changes.outputs.code == 'true'
         run: cargo build --locked -p test_node_raw_ffi_template_cdylib --example modified_raw
 
       # The pinned tool tarballs the `tool-tarballs` job verified and saved.
       # On a miss the install below downloads, as it does with no cache.
       - name: Tool tarball cache key
         id: tool-tarballs-key
+        if: needs.changes.outputs.code == 'true'
         run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
 
       - name: Restore the pinned tool tarballs
+        if: needs.changes.outputs.code == 'true'
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
 
       - name: Install cargo-nextest
+        if: needs.changes.outputs.code == 'true'
         env:
           CERULION_TOOL_TARBALLS: ~/.cache/cerulion-tool-tarballs
         run: ./tools/scripts/install_nextest.sh
@@ -3734,6 +3776,7 @@ jobs:
       # job. `lsof` runs at 1 Hz rather than 10 because it costs a process per
       # pid per tick.
       - name: Start the descriptor sampler
+        if: needs.changes.outputs.code == 'true'
         run: |
           cat > "$RUNNER_TEMP/sampler.py" <<'PY'
           import datetime, glob, os, signal, subprocess, sys, time
@@ -3889,11 +3932,13 @@ jobs:
       # covered set, and emptied the set that gate's floor requires to be
       # non-empty.
       - name: Credit death arms first (shard 0)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && needs.changes.outputs.code == 'true'
         run: cargo test -p cerulion_cli --test credit_death_e2e_test c7_
 
-      # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
-      # observes the whole tree, so the shard runner does the intersection.
+      # Gated on `code` alone, never on `cerulion_core` itself: see the twin
+      # step in `test-linux`, which carries no condition. `cerulion_core`
+      # observes the whole tree, so the shard runner does the intersection, and
+      # `code` is false only where that intersection is empty anyway.
       # The waiver gate asks OTHER test binaries what libtest will do with the
       # arms it declares waived. A shard builds only its own files, so on the
       # shard that runs the gate those binaries are absent, or are a
@@ -3919,6 +3964,7 @@ jobs:
       # here and is owed; the shard map above is packed against measured walls, so
       # the figure belongs beside its other terms once one run has it.
       - name: Build the binaries the waiver gate asks (its shard only)
+        if: needs.changes.outputs.code == 'true'
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: |
@@ -3973,6 +4019,7 @@ jobs:
           echo "built $total waived test binaries for the gate"
 
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
+        if: needs.changes.outputs.code == 'true'
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
@@ -3988,7 +4035,7 @@ jobs:
       # already-built rlib. Shard 0 for the same reason `--lib` does: it has to
       # happen exactly once.
       - name: cerulion_core doctests
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && needs.changes.outputs.code == 'true'
         run: cargo test -p cerulion_core --doc
 
       # Shard assignment is macOS's OWN 3-way tilt (it does not mirror
@@ -4079,12 +4126,12 @@ jobs:
       # is the single most expensive package step on this job (10.4 min warm)
       # and the engine's is the third (6.2 min).
       - name: CLI engine tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.changes.outputs.code == 'true'
         # --no-fail-fast so ONE run reports every failing binary: cargo stops at
         # the first by default, which is why a per-binary waiver took three heads.
         run: cargo test -p cerulion_cli_engine --no-fail-fast
       - name: CLI binary tests
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && needs.changes.outputs.code == 'true'
         # --no-fail-fast so ONE run reports every failing binary: cargo stops at
         # the first by default, which is why a per-binary waiver took three heads.
         run: cargo test -p cerulion_cli --no-fail-fast
@@ -4170,7 +4217,7 @@ jobs:
       # the red PRs. macOS has no measured ENOSPC — see the reclaim step at the
       # top of this job — so this line exists to say whether it ever gets close.
       - name: Report free disk before the wan step
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.changes.outputs.code == 'true'
         run: df -h / || true
 
       # cerulion_netd's iroh WAN plane (loopback iroh + iceoryx2). The
@@ -4236,7 +4283,8 @@ jobs:
       # its own, so the one line that says what the selection dropped lives
       # here, beside it, under the exact negation of its condition.
       # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
-      # for every gated step in this job.
+      # for every package a step of this job is gated on; a step gated on
+      # `code` alone needs none.
       - name: selection marker, cerulion_viz
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz') }}
         env:
@@ -4249,7 +4297,7 @@ jobs:
       # a process this step starts, because the limit a running process holds
       # is the one it inherited and not what `launchctl limit` reports.
       - name: Descriptor snapshot on failure
-        if: ${{ failure() }}
+        if: failure() && needs.changes.outputs.code == 'true'
         run: |
           sysctl kern.num_files kern.maxfiles kern.maxfilesperproc || true
           python3 -c 'import resource; s, h = resource.getrlimit(resource.RLIMIT_NOFILE); print("getrlimit RLIMIT_NOFILE soft", s, "hard", h)'
@@ -4282,7 +4330,7 @@ jobs:
           tail -200 "$RUNNER_TEMP/descriptors.log" 2>/dev/null || echo "no sampler log"
 
       - name: Stop the descriptor sampler
-        if: ${{ always() }}
+        if: always() && needs.changes.outputs.code == 'true'
         run: |
           pid="$(cat "$RUNNER_TEMP/sampler.pid" 2>/dev/null || true)"
           if [ -z "$pid" ]; then
@@ -4330,7 +4378,7 @@ jobs:
           fi
 
       - name: Upload the descriptor sampler log
-        if: ${{ always() }}
+        if: always() && needs.changes.outputs.code == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: descriptors-macos-shard-${{ matrix.shard }}-${{ github.sha }}
@@ -4456,6 +4504,7 @@ jobs:
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && needs.changes.outputs.code == 'true'
         run: bash tools/scripts/ci_cache_trim_target.sh trim target
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
@@ -4465,6 +4514,7 @@ jobs:
           matrix.shard == 0
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && needs.changes.outputs.code == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
@@ -4479,6 +4529,7 @@ jobs:
           && matrix.shard == 0
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && needs.changes.outputs.code == 'true'
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
