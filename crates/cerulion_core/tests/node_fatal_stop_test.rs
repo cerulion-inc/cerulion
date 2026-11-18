@@ -11,21 +11,30 @@
 //! pool, and a fire inside a Period catch-up burst. Every other `NodeError` kind keeps today's
 //! behaviour: logged, and the node keeps firing.
 //!
+//! `GraphRuntime::restore_stopped_nodes` restores such a stop before the first
+//! step: the node fires on no decide, no planned replay fire and no
+//! `trigger_external` mark, and the run records no failure for it. An unknown
+//! id, and a restore after the external sources are collected, are refused
+//! with nothing stopped and no `block` slot released. Releasing a restored
+//! consumer's `block` slot is pinned in `block_slot_release_iox2_test`, whose
+//! fixtures hold a consumer that never drains.
+//!
 //! The expected fire counts and delivered values are hand-written from the
 //! graph's shape (a 5 ms period producer on 5 ms steps fires once per step);
 //! nothing is derived from a second run of the code under test, except the
 //! determinism test, which compares two runs AND pins the hand oracle.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cerulion_core::clock::VirtualClock;
-use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
+use cerulion_core::graph::config::{GraphConfig, InputBackpressure, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
-use cerulion_core::scheduler::TraceEntry;
+use cerulion_core::scheduler::{ReplayFire, TraceEntry};
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 
@@ -152,6 +161,24 @@ impl Watcher {
     #[on_event(input = "inp")]
     fn on_stale(&mut self, _event: ExpectWithinEvent) {
         self.stale.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Fires only when the host marks it with `trigger_external`.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct Poked {
+    #[output]
+    out: Vector3,
+}
+#[cerulion_node_impl]
+impl Poked {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        Ok(())
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
     }
 }
 
@@ -741,4 +768,232 @@ fn a_fatal_sync_node_stops_while_both_upstreams_keep_publishing() {
         .map(|(id, _)| id)
         .collect();
     assert_eq!(ids, vec!["fuse".to_string()]);
+}
+
+/// The set of node ids a stop restore names.
+fn ids(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|n| (*n).to_string()).collect()
+}
+
+/// `prod0 -> cons0` and `prod1 -> cons1`, plus two host-driven nodes `poked`
+/// and `poked_live`. `prod0` and `poked` are restored stopped before step 0.
+///
+/// Hand oracle, 5 ms steps on 5 ms periods. Both host-driven nodes are marked
+/// before step 0: `poked_live` fires once, `poked` never. Steps 0 to 19 decide
+/// live: `prod1` fires once per step (20 fires, values 1.0 to 20.0 reach
+/// `cons1`) while `prod0` fires never and `cons0` receives nothing. Step 20
+/// runs a replay plan naming both producers: `prod1` takes its fire (21 in
+/// all) and `prod0`'s stays unconsumed.
+///
+/// Left to other files: a restored `block` consumer's slot release
+/// (`block_slot_release_iox2_test`) and the Flashback anchor that states the
+/// stop (`state_anchor_boundary_iox2_test`). No test here reaches a
+/// cross-process credit word.
+#[test]
+fn a_restored_stop_keeps_the_node_stopped_and_records_no_failure() {
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    let mut nodes = Vec::new();
+    let mut seen = Vec::new();
+    for i in 0..2 {
+        let (prod, cons) = (format!("prod{i}"), format!("cons{i}"));
+        nodes.push(node(&prod, "producer", None, true));
+        nodes.push(node(&cons, "consumer", Some(format!("{prod}/out")), false));
+        factories.insert(
+            prod,
+            Box::new(ProducerEntry::with_state(Producer::default())),
+        );
+        let s = Arc::new(Mutex::new(Vec::new()));
+        factories.insert(
+            cons,
+            Box::new(ConsumerEntry::with_state(Consumer {
+                seen: Arc::clone(&s),
+                ..Default::default()
+            })),
+        );
+        seen.push(s);
+    }
+    for id in ["poked", "poked_live"] {
+        nodes.push(node(id, "poked", None, true));
+        factories.insert(id.to_string(), Box::new(PokedEntry::new()));
+    }
+    let mut rt = finish(nodes, factories).expect("build restored-stop graph");
+
+    rt.restore_stopped_nodes(&ids(&["poked", "prod0"]))
+        .expect("both ids are in the graph");
+    for (id, stopped) in [
+        ("prod0", true),
+        ("poked", true),
+        ("prod1", false),
+        ("poked_live", false),
+        ("cons0", false),
+    ] {
+        assert_eq!(rt.is_node_stopped(id), stopped, "{id}");
+    }
+
+    // A `trigger_external` mark fires the running node and not the stopped one.
+    rt.trigger_external("poked").expect("poked is External");
+    rt.trigger_external("poked_live")
+        .expect("poked_live is External");
+    // The scheduler's own decide skips the restored node.
+    for _ in 0..20 {
+        rt.step(Duration::from_millis(5));
+    }
+    assert_eq!(
+        producer_fires(rt.trace(), "poked"),
+        0,
+        "a marked stopped node"
+    );
+    assert_eq!(
+        producer_fires(rt.trace(), "poked_live"),
+        1,
+        "the mark fires a running node, so the stopped one's silence is the stop"
+    );
+    assert_eq!(producer_fires(rt.trace(), "prod0"), 0, "no decided fire");
+    assert!(
+        seen[0].lock().unwrap().is_empty(),
+        "a stopped producer publishes nothing"
+    );
+    assert_eq!(producer_fires(rt.trace(), "prod1"), 20);
+    assert_eq!(
+        *seen[1].lock().unwrap(),
+        (1..=20).map(f64::from).collect::<Vec<_>>(),
+        "the rest of the graph delivers every frame"
+    );
+
+    // A planned replay fire of the restored node is unperformable. Step 20
+    // runs at t = 105 ms.
+    let planned = |node_id| ReplayFire {
+        node_id,
+        first_fire_ns: 105_000_000,
+        fire_count: 1,
+        interval_ns: 0,
+    };
+    rt.set_replay_fire_plan(20, &[planned("prod0"), planned("prod1")])
+        .expect("install plan");
+    rt.step(Duration::from_millis(5));
+    assert_eq!(
+        rt.unconsumed_replay_fires(),
+        vec!["prod0"],
+        "the plan's fire of the stopped node stays unconsumed"
+    );
+    assert_eq!(producer_fires(rt.trace(), "prod0"), 0);
+    assert_eq!(
+        producer_fires(rt.trace(), "prod1"),
+        21,
+        "the planned fire ran"
+    );
+
+    // Still stopped, and no failure recorded in this run.
+    assert!(rt.is_node_stopped("prod0"));
+    assert!(rt.is_node_stopped("poked"));
+    assert!(
+        rt.node_fatal_errors().is_empty(),
+        "{:?}",
+        rt.node_fatal_errors()
+    );
+}
+
+/// The fatal relay's message, as `node_fatal_errors()` reports it.
+const RELAY_FATAL: (&str, &str) = ("relay", FATAL_MSG);
+
+/// `prod -> relay -> cons`, the relay's input `block` at depth 2: the relay
+/// returns `Fatal` from its 3rd fire, and that live stop releases its slot.
+fn block_relay_chain() -> GraphRuntime {
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "prod".to_string(),
+        Box::new(ProducerEntry::with_state(Producer::default())),
+    );
+    factories.insert(
+        "relay".to_string(),
+        Box::new(RelayEntry::with_state(Relay {
+            fail_at: 3,
+            kind: "fatal".to_string(),
+            ..Default::default()
+        })),
+    );
+    factories.insert(
+        "cons".to_string(),
+        Box::new(ConsumerEntry::with_state(Consumer::default())),
+    );
+    let mut relay = node("relay", "relay", Some("prod/out".to_string()), true);
+    relay.inputs[0].backpressure = Some(InputBackpressure::Block);
+    relay.inputs[0].depth = Some(2);
+    let nodes = vec![
+        node("prod", "producer", None, true),
+        relay,
+        node("cons", "consumer", Some("relay/out".to_string()), false),
+    ];
+    finish(nodes, factories).expect("build block relay chain")
+}
+
+/// After a refused restore, the chain runs exactly as one never restored:
+/// the relay fires 3 times (a stopped relay fires none), and its own fatal
+/// return then releases its slot once. That one counted release proves the
+/// slot was still armed: a slot already released counts no second release.
+fn assert_the_chain_ran_unrestored(mut rt: GraphRuntime) {
+    assert!(!rt.is_node_stopped("relay"), "nothing was stopped");
+    assert_eq!(
+        rt.block_credits()
+            .map(|c| (c.consumer_node, c.outstanding))
+            .collect::<Vec<_>>(),
+        vec![("relay", 0)],
+        "the relay holds one block slot, with nothing counted"
+    );
+    for _ in 0..20 {
+        rt.step(Duration::from_millis(5));
+    }
+    assert_eq!(
+        producer_fires(rt.trace(), "relay"),
+        3,
+        "fires up to its fatal one"
+    );
+    assert_eq!(producer_fires(rt.trace(), "prod"), 20, "never held");
+    assert_eq!(
+        rt.node_handle("relay")
+            .expect("relay handle")
+            .backpressure_block_slot_releases_count("inp"),
+        1,
+        "the relay's own stop released an armed slot"
+    );
+    let fatal = rt.node_fatal_errors();
+    assert_eq!(
+        fatal
+            .iter()
+            .map(|(id, msg)| (id.as_str(), msg.as_str()))
+            .collect::<Vec<_>>(),
+        vec![RELAY_FATAL],
+        "only the live stop is recorded"
+    );
+}
+
+#[test]
+fn restoring_an_unknown_node_changes_nothing() {
+    let mut rt = block_relay_chain();
+    // "relay" sorts before "unknown", so a restore that stopped nodes while it
+    // walked the set would have stopped the relay before it met the unknown id.
+    match rt.restore_stopped_nodes(&ids(&["relay", "unknown"])) {
+        Err(TransportError::NodeNotFound { node_id }) => assert_eq!(node_id, "unknown"),
+        Err(other) => panic!("expected NodeNotFound, got {other}"),
+        Ok(()) => panic!("an unknown id must be refused"),
+    }
+    assert_the_chain_ran_unrestored(rt);
+}
+
+/// The refusal's whole text, hand-written.
+const COLLECTED_REFUSAL: &str = "graph 'node_fatal_stop_test': a stop restore was attempted on \
+     a runtime that has already collected its external sources (it has run a live session), so \
+     the stop would land part way through a run rather than before its first step. Fix: restore \
+     on a FRESHLY BUILT runtime (restore runs after the build and before the first step)";
+
+#[test]
+fn a_stop_restore_after_external_sources_are_collected_is_refused() {
+    let mut rt = block_relay_chain();
+    rt.collect_external_sources_for_test();
+    match rt.restore_stopped_nodes(&ids(&["relay"])) {
+        Err(TransportError::GraphError { reason }) => assert_eq!(reason, COLLECTED_REFUSAL),
+        Err(other) => panic!("expected GraphError, got {other}"),
+        Ok(()) => panic!("a restore after the collection must be refused"),
+    }
+    assert_the_chain_ran_unrestored(rt);
 }
