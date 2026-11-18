@@ -1252,18 +1252,28 @@ mod x86 {
             return true;
         }
         let count = mwaitx_timer_for(deadline.saturating_duration_since(now).min(recheck));
-        // The watched word lives on this stack frame and nothing writes it;
-        // a touch of its line returns MWAITX early at worst (the caller loops).
-        let scratch: u64 = 0;
+        // The watched line is a static of its own that nothing ever writes. A
+        // word on this stack frame does not work: the frame's own stores land
+        // on the same 64-byte line between MONITORX and MWAITX, so MWAITX
+        // returns at once (measured on an AMD part: about 1 us instead of the
+        // requested 2 ms, every time).
         // SAFETY: reached only on `AmdMwaitx`, which is resolved only when
-        // CPUID enumerates MONITORX/MWAITX; `scratch` is a live local, and
-        // `count` comes from `mwaitx_timer_count`, so it is at least 1.
+        // CPUID enumerates MONITORX/MWAITX; `MWAITX_TIMER_LINE` is a static,
+        // so its address is valid for the whole program, and `count` comes
+        // from `mwaitx_timer_count`, so it is at least 1.
         unsafe {
-            monitorx(&scratch as *const u64 as *const u8);
+            monitorx(MWAITX_TIMER_LINE.0.as_ptr() as *const u8);
             mwaitx(count);
         }
         true
     }
+
+    /// The line a timer-only `MWAITX` park watches: aligned to its own cache
+    /// line and never written, so only the timer or an interrupt ends the wait.
+    #[repr(align(64))]
+    struct TimerLine(core::sync::atomic::AtomicU64);
+
+    static MWAITX_TIMER_LINE: TimerLine = TimerLine(core::sync::atomic::AtomicU64::new(0));
 
     /// `MONITORX` the doorbell `addr` so a producer's store wakes `MWAITX`,
     /// with the same layer-2 lost-wakeup guard as
