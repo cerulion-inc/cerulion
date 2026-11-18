@@ -28,7 +28,7 @@ check_listing() {
     fi
     while IFS= read -r path; do
         [ -n "$path" ] || continue
-        if ! printf '%s\n' "$path" | grep -qE "$allowed"; then
+        if ! grep -qE "$allowed" <<<"$path"; then
             echo "publish preflight: $label: refusing to package '$path'" >&2
             fail=1
         fi

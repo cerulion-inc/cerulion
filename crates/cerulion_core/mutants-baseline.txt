@@ -1,7 +1,8 @@
-# Mutation baseline for cerulion_core: the ROS IDL parser decision functions.
+# Mutation baseline for cerulion_core: the ROS IDL parser and framework-section codec decision functions.
 #
-# Scope: the two pure parser files, and the oracle mutants listed below, each
-# on one pure decision function. The rest of the crate holds transport and
+# Scope: the two pure parser files, the framework-section codec in
+# state_restore.rs (its changed lines), and the oracle mutants listed below,
+# each on one pure decision function. The rest of the crate holds transport and
 # scheduler paths that the mutation rule does not cover.
 #
 # Run:     cargo mutants -p cerulion_core \
@@ -16,6 +17,15 @@
 #
 # First-`#` comment cut, re-run on the changed lines only (--in-diff): 7
 # mutants, 1 caught, 6 unviable, 0 missed.
+#
+# Framework-section codec: the stopped node's flags byte (version 5) in
+# NodeFrameworkState::{is_empty, wire_version, encoded_len, encode, decode},
+# run on the changed lines only:
+#
+# Run:     cargo mutants -p cerulion_core \
+#            -f crates/cerulion_core/src/state_restore.rs \
+#            --in-diff <the change's diff of that file> -- --test state_restore_test
+# Result:  46 mutants: 43 caught, 3 unviable (do not compile), 0 missed.
 #
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
