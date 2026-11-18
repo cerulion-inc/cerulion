@@ -765,26 +765,6 @@ checksum = "230c5f1ca6a325a32553f8640d31ac9b49f2411e901e427570154868b46da4f7"
 
 [[package]]
 name = "bindgen"
-version = "0.70.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f49d8fed880d473ea71efb9bf597651e77201bdd4893efe54c9e5d65ae04ce6f"
-dependencies = [
- "bitflags 2.13.1",
- "cexpr",
- "clang-sys",
- "itertools 0.13.0",
- "log",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash 1.1.0",
- "shlex 1.3.0",
- "syn 2.0.114",
-]
-
-[[package]]
-name = "bindgen"
 version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
@@ -798,7 +778,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "regex",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "shlex 1.3.0",
  "syn 2.0.114",
 ]
@@ -4152,7 +4132,7 @@ name = "iceoryx2-pal-os-api"
 version = "0.10.0"
 source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
- "bindgen 0.72.1",
+ "bindgen",
  "cc",
  "iceoryx2-pal-posix",
  "libc",
@@ -4163,7 +4143,7 @@ name = "iceoryx2-pal-posix"
 version = "0.10.0"
 source = "git+https://github.com/cerulion-inc/iceoryx2?rev=8e8766a361ac78fb792c6ba6c7180fe886245e2d#8e8766a361ac78fb792c6ba6c7180fe886245e2d"
 dependencies = [
- "bindgen 0.72.1",
+ "bindgen",
  "cc",
  "iceoryx2-pal-concurrency-sync",
  "iceoryx2-pal-configuration",
@@ -4498,7 +4478,7 @@ dependencies = [
  "portmapper",
  "rand 0.10.2",
  "reqwest",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "serde",
@@ -5676,7 +5656,7 @@ dependencies = [
  "noq-proto",
  "noq-udp",
  "pin-project-lite",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "rustls",
  "socket2 0.6.5",
  "thiserror 2.0.21",
@@ -5702,7 +5682,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "ring",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -6766,7 +6746,7 @@ dependencies = [
  "pin-project-lite",
  "quinn-proto",
  "quinn-udp",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "rustls",
  "socket2 0.6.5",
  "thiserror 2.0.21",
@@ -6789,7 +6769,7 @@ dependencies = [
  "rand 0.10.2",
  "rand_pcg",
  "ring",
- "rustc-hash 2.1.1",
+ "rustc-hash",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -8201,7 +8181,7 @@ dependencies = [
 name = "rmw_cerulion"
 version = "2.0.0"
 dependencies = [
- "bindgen 0.70.1",
+ "bindgen",
  "cc",
  "cerulion_bag",
  "cerulion_core",
@@ -8266,12 +8246,6 @@ name = "rustc-demangle"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
-
-[[package]]
-name = "rustc-hash"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d43f7aa6b08d49f382cde6a7982047c3426db949b1424bc4b7ec9ae12c6ce2"
 
 [[package]]
 name = "rustc-hash"

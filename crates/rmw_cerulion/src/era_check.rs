@@ -658,11 +658,11 @@ const _: () = {
 /// input at every guarded export, so an ambiguous claim could refuse a
 /// wrong-layout write at none of them: only a build-time decision is
 /// sound).
-/// Parses both bindgen layout-test spellings — the const form
-/// (`size_of::<rmw_init_options_s>() - 160usize`, bindgen 0.71+, the
-/// vendored snapshot) and the assert form
-/// (`size_of::<rmw_init_options_s>(), 168usize`, bindgen 0.70, the
-/// generated path) — and the pre-Galactic `_t` tag. `None` when no
+/// Parses both bindgen layout-test spellings, the const form
+/// (`size_of::<rmw_init_options_s>() - 160usize`, bindgen 0.71+, which the
+/// vendored snapshot and the generated bindings both use) and the assert
+/// form (`size_of::<rmw_init_options_s>(), 168usize`, bindgen 0.70), and
+/// the pre-Galactic `_t` tag. `None` when no
 /// layout test is found (a bindgen format change): the caller treats
 /// the pair as UNDISAMBIGUATED and fails the build rather than guess.
 pub fn probe_init_options_size(bindings: &str) -> Option<usize> {
@@ -1807,10 +1807,10 @@ mod tests {
 
     #[test]
     fn the_init_options_probe_reads_both_bindgen_layout_test_formats() {
-        // The const form (bindgen 0.71+ — the vendored snapshot).
+        // The const form (bindgen 0.71+: the vendored snapshot and the generated path).
         let const_form = r#"["Size of rmw_init_options_s"][::std::mem::size_of::<rmw_init_options_s>() - 168usize];"#;
         assert_eq!(probe_init_options_size(const_form), Some(168));
-        // The assert form (bindgen 0.70 — the generated path).
+        // The assert form (bindgen 0.70).
         let assert_form = r#"assert_eq!(::std::mem::size_of::<rmw_init_options_s>(), 160usize,"#;
         assert_eq!(probe_init_options_size(assert_form), Some(160));
         // The pre-Galactic `_t` tag spelling.
