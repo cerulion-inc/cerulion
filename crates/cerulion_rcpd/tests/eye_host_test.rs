@@ -2,7 +2,7 @@
 //! The `rcp-eye` thread's own guarantees, on a private shared-memory root:
 //!
 //! - An ask flood is answered up to the ask bound and no further: the asks
-//!   over it get no answer and no receipt.
+//!   over it get no answer and no receipt, and each is counted as dropped.
 //! - A key placed after the eye started still gets the data notice, logged
 //!   before the first request leaves.
 //! - An answer whose receipt cannot be written is not published.
@@ -27,7 +27,7 @@ use cerulion_core::{TransportConfig, TransportManager};
 use cerulion_rcpd::eye::config::JevConfig;
 use cerulion_rcpd::eye::host::{EyeHost, EyeSettings};
 use cerulion_rcpd::eye::limits::{jpeg_header_for_test, ASKS_PER_SECOND, ASK_BURST};
-use cerulion_rcpd::eye::switch::write_switch;
+use cerulion_rcpd::eye::switch::{read_status, write_switch};
 use cerulion_rcpd::eye::verdict::Outcome;
 use cerulion_rcpd::eye::{EYE_CALLER, JEV_VERB};
 use cerulion_rcpd::manifest::RcpManifest;
@@ -77,6 +77,9 @@ fn install_logs() -> Logs {
 
 /// The words every data notice line holds.
 const NOTICE: &str = "so those frames leave this robot";
+
+/// The asks in the flood.
+const FLOOD: u64 = 1_000;
 
 /// The gate's side of the eye's topics; it lives on the thread that made it.
 struct Gate {
@@ -273,6 +276,17 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
     let gate_sink = sink.clone();
     let gate_requests = Arc::clone(&requests);
     let gate = std::thread::spawn(move || {
+        // The graph creates the ask topic deep enough to hold the whole
+        // flood, so the eye reads every ask and the ask bound alone decides
+        // which are answered. At the transport's default depth, below the
+        // bound's burst, the queue drops the oldest asks while the eye writes
+        // its synced receipts, and slow receipts let the refill cover every
+        // ask the eye does read.
+        let mut deep = gate_mgr.default_topic_config();
+        deep.subscriber_max_buffer_size = FLOOD as usize;
+        let _ask_topic = gate_mgr
+            .precreate_topic_services(&gate_jev.ask_topic, deep)
+            .expect("the graph creates its ask topic");
         let mut gate = Gate::open(&gate_mgr, &gate_jev);
         let seq = gate.publish_frame();
 
@@ -288,7 +302,7 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         assert_eq!(outcome(&first).0, Outcome::Disabled);
         let before = eye_receipts(&gate_receipts);
         let flood = Instant::now();
-        for id in 0..1_000u64 {
+        for id in 0..FLOOD {
             gate.ask(10_000 + id, seq);
             if id % 10 == 9 {
                 std::thread::sleep(Duration::from_millis(1));
@@ -302,7 +316,7 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         let bound = ASK_BURST as usize
             + (f64::from(ASKS_PER_SECOND) * elapsed.as_secs_f64()).ceil() as usize;
         assert!(
-            bound < 1_000 / 2,
+            bound < FLOOD as usize / 2,
             "the flood outran the ask bound ({published:?} to publish 1,000 asks)"
         );
         assert!(
@@ -329,6 +343,9 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         gate.ask(1, seq);
         let first = gate.answer(1, Duration::from_secs(5)).expect("answer 1");
         assert_eq!(outcome(&first).0, Outcome::NoCredential);
+        // Ask 1 is read after every ask of the flood, so each flood ask the
+        // eye answered is receipted by now, before ask 1's own receipt.
+        let flood_answered = eye_receipts(&gate_receipts) - before - 1;
         // The owner places the key: the next look sends, after the notice.
         cerulion_rcpd::eye::credential::write_credential(&gate_key, eye_common::TEST_KEY)
             .expect("key");
@@ -355,13 +372,22 @@ async fn the_eye_bounds_asks_gives_the_notice_first_and_publishes_only_receipted
         gate.ask(4, seq);
         let fourth = gate.answer(4, Duration::from_secs(5)).expect("answer 4");
         assert_eq!(outcome(&fourth).0, Outcome::Ok, "{fourth}");
+        flood_answered
     });
-    tokio::task::spawn_blocking(move || gate.join())
+    let flood_answered = tokio::task::spawn_blocking(move || gate.join())
         .await
         .expect("join")
         .expect("gate");
     drop(eye);
 
+    // Every ask of the flood was answered with a receipt or dropped and
+    // counted; the stopped eye wrote its counts.
+    let status = read_status(&state_dir).expect("status file");
+    assert_eq!(
+        status.dropped_asks_today + flood_answered as u64,
+        FLOOD,
+        "{flood_answered} flood asks answered: {status:?}"
+    );
     let text = logs.text();
     assert!(
         text.contains("dropped an ask over the ask bound"),
