@@ -101,7 +101,7 @@ no change either way, it just publishes the Twist.
 
 ## Notes
 
-- `crossterm` is pinned to `0.28` to match `cerulion_cli_tui` (one workspace
+- `crossterm` is pinned to `0.29` to match `cerulion_cli_tui` (one workspace
   version of the TUI family).
 - The node is portable: it runs on the companion computer (`teleop.yaml`,
   no network hop) as well as on a desk (`teleop_desk.yaml`).
