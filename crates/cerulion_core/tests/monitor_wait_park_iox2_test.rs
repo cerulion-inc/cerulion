@@ -4531,9 +4531,10 @@ const DUE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// One run of the lost-wakeup shape on one runtime under `policy`: a frame on
 /// `a`, then a live step whose drain publishes the frame on `b` right after
 /// the join's align pass. That step cannot fire the set (its align pass read
-/// `a` alone). Returns the pairs after the step that must follow at once, the
-/// park timeouts that step took, and, with the park off, which nodes the
-/// WaitSet found woken before it.
+/// `a` alone). Returns the pairs after the next step (at once under the park;
+/// with the park off it waits `WAKE_TIMEOUT`, since the WaitSet probe took b's
+/// wake), the park timeouts that step took, and, with the park off, which nodes
+/// the WaitSet found woken before it.
 fn join_after_a_frame_lands_past_the_align_pass(
     tag: &str,
     policy: MonitorWaitPolicy,
@@ -4590,7 +4591,10 @@ fn join_after_a_frame_lands_past_the_align_pass(
         runtime.run_waitset_reactor_once_for_test(WAKE_TIMEOUT)
     };
     let (_, _, _, timeouts_before) = runtime.park_wake_counts();
-    runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    // The WaitSet seam above took b's notification, so with the park off the
+    // step's own wait finds none and ends on its timeout; the queued frame still
+    // fires there. `woken` is that arm's proof, so its step waits briefly.
+    runtime.run_live_step_once_for_test(if park { DUE_JOIN_TIMEOUT } else { WAKE_TIMEOUT });
     let (_, _, _, timeouts_after) = runtime.park_wake_counts();
     let pairs = slots[0].0.lock().expect("join log").clone();
     runtime.shutdown();
@@ -4628,7 +4632,8 @@ fn a_frame_landing_after_a_joins_align_pass_wakes_the_park_at_once() {
 }
 
 /// The park off (the WaitSet idle): b's notification is still pending after
-/// the step, so the WaitSet finds the join woken and the next step fires it.
+/// the step, so the WaitSet finds the join woken (the proof here), and the next
+/// step fires the set.
 #[test]
 #[serial]
 fn a_frame_landing_after_a_joins_align_pass_keeps_its_waitset_wake() {
@@ -4650,7 +4655,7 @@ fn a_frame_landing_after_a_joins_align_pass_keeps_its_waitset_wake() {
 
 /// Two per-set joins side by side in one level: the first one's frame on b
 /// lands past its align pass while the second already holds both frames. The
-/// drain's walk over the first join stops at its own bindings: the second join
+/// second join's drain leaves the first join's wake alone: the second join
 /// fires in that step and the first in the next, at once, each set exactly
 /// once.
 #[test]
@@ -4704,6 +4709,10 @@ fn adjacent_joins_each_keep_their_own_wake_and_fire_their_own_set() {
     publish_one(&mut pubs[1], 2.0);
     publish_one(&mut pubs[2], 2.0);
     runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    assert!(
+        !armed.load(Ordering::Acquire),
+        "the drain ran the first join's align pass, and the hook published on b"
+    );
     assert_eq!(
         (
             slots[0].1.load(Ordering::Acquire),
@@ -4726,9 +4735,8 @@ fn adjacent_joins_each_keep_their_own_wake_and_fire_their_own_set() {
     );
 }
 
-/// Frames on both inputs before the step: the join fires in that step, with
-/// or without the seam, and its listeners hold no stale wake after it (the
-/// WaitSet finds nothing).
+/// Frames on both inputs before the step: the join fires in that step, and its
+/// listeners hold no stale wake after it (the WaitSet finds nothing).
 #[test]
 #[serial]
 fn a_join_whose_frames_both_land_before_the_step_fires_once_and_leaves_no_stale_wake() {
@@ -4900,6 +4908,10 @@ fn a_join_one_level_down_never_takes_the_wake_of_a_join_drained_before_it() {
     publish_one(&mut pubs[1], 6.0);
     publish_one(&mut pubs[2], 1.0);
     runtime.run_live_step_once_for_test(DUE_JOIN_TIMEOUT);
+    assert!(
+        !armed.load(Ordering::Acquire),
+        "the drain ran the first level's align pass, and the hook published on b"
+    );
     assert_eq!(
         (
             early.1.load(Ordering::Acquire),

@@ -290,7 +290,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `waitset_busyspin_test.rs` | The live loop sleeps its heartbeat only when the WaitSet reported nothing (busy-spin guard). | `#[serial]` | none |
 | `waitset_reactor_iox2_test.rs` / `waitset_live_loop_iox2_test.rs` / `chunk25b_live_default_iox2_test.rs` | WaitSet reactor wake/dispatch; the live loop seam; live-default behavior. | `#[serial]` | none |
 | `wake_set_iox2_test.rs` | Public `WakeSource`/`WakeSet` over real iceoryx2 (data-service-gates-first; fired-index ordering). | `#[serial]` | none |
-| `monitor_wait_park_iox2_test.rs` | Park FUNCTIONAL behavior (pure-Period park, doorbell data path, no-data-input degrade); CPU-park latency needs park-capable hardware and is not asserted here. | `#[serial]` | none |
+| `monitor_wait_park_iox2_test.rs` | Park FUNCTIONAL behavior (pure-Period park, doorbell data path, no-data-input degrade); a per-set Sync join keeps the wake for a frame published after its align pass (a test hook publishes it from inside the drain), under the park with no park timeout and under the WaitSet with the wake still pending, and two adjacent joins, or a join one level down declared first, each fire their own set once; CPU-park latency needs park-capable hardware and is not asserted here. | `#[serial]` | none |
 | `unified_stale_wake_park_test.rs` | Stale unified-binding events are drained (timeout-paced idle; re-arm still delivers), the free-run regression pin. | `#[serial]` tt1 | none |
 | `live_spin_budget_test.rs` | Scheduled spin-then-block receive path budget semantics. | `#[serial]` | none |
 | `polled_vs_live_iox2_test.rs` | Replay=Live firewall: polled seam == live seam == hand oracle; parked live seam identical. | `#[serial]` | none |

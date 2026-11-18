@@ -10377,6 +10377,11 @@ impl GraphRuntime {
             .now_ns()
             .saturating_add(EXTERNAL_TOPIC_SILENCE_GRACE_MS.saturating_mul(1_000_000));
 
+        debug_assert!(
+            sync_bindings_contiguous(sync_input_bindings.iter().map(|b| b.node_id.as_ref())),
+            "every node's Sync bindings must sit in one contiguous run: the drain walks a \
+             node's bindings from its first one and stops at another node's"
+        );
         // Fail fast if the live-loop WaitSet would exceed the
         // FD-set attachment bound — the loop attaches one notification per
         // data-trigger input + per sync input. Past the cap, iceoryx2 silently
@@ -14740,10 +14745,10 @@ impl GraphRuntime {
     }
 
     /// Test seam: run `hook` in the step's drain right after each per-set Sync
-    /// node's align pass has read every one of its inputs, before the rest of
-    /// that node's bindings are walked. A frame the hook publishes then lands
-    /// after the pass that read the node's queues, at a fixed point in the
-    /// drain. `None` removes it.
+    /// node's listeners are emptied and its align pass has read every one of
+    /// its inputs. A frame the hook publishes then lands after the pass that
+    /// read the node's queues, at a fixed point in the drain. `None` removes
+    /// it.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_sync_align_hook_for_test(&mut self, hook: Option<Box<dyn FnMut() + Send>>) {
         self.sync_align_hook = hook;
@@ -19810,6 +19815,51 @@ fn log_tick_failure_recovery(node_id: &str, suppressed: u64) {
     );
 }
 
+/// PURE: whether, in list order, every node id's entries sit in one
+/// contiguous run. The Sync drain's per-set walk relies on it: it empties a
+/// node's listeners from the node's first binding and stops at the first
+/// binding of another node.
+// hot-path-alloc-ok-fn: cold: build-time check only (one debug_assert per graph build)
+fn sync_bindings_contiguous<'a>(node_ids: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen: Vec<&'a str> = Vec::new();
+    for id in node_ids {
+        if seen.last() == Some(&id) {
+            continue;
+        }
+        if seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+    }
+    true
+}
+
+#[cfg(test)]
+mod sync_binding_order_tests {
+    use super::sync_bindings_contiguous;
+
+    #[test]
+    fn a_node_whose_bindings_are_split_by_another_nodes_is_not_contiguous() {
+        // (node ids in binding order, contiguous)
+        let cases: [(&[&str], bool); 7] = [
+            (&[], true),
+            (&["a"], true),
+            (&["a", "a"], true),
+            (&["a", "a", "b", "b", "c"], true),
+            (&["a", "b", "a"], false),
+            (&["a", "a", "b", "c", "a"], false),
+            (&["a", "b", "b", "a", "b"], false),
+        ];
+        for (ids, want) in cases {
+            assert_eq!(
+                sync_bindings_contiguous(ids.iter().copied()),
+                want,
+                "{ids:?}"
+            );
+        }
+    }
+}
+
 fn log_drain_failure(
     already_suppressed: bool,
     node_id: &str,
@@ -20301,44 +20351,62 @@ impl GraphRuntime {
                 continue;
             }
             // On the PER-SET path this binding's `trigger_subscribers`
-            // slot is a listener-only WAKE SOURCE, not a data receiver. Two
-            // things happen here instead of the legacy timestamp drain:
+            // slot is a listener-only WAKE SOURCE, not a data receiver. At the
+            // node's FIRST per-set binding, two things happen instead of the
+            // legacy timestamp drain, in this order:
             //
-            // 1. DRAIN ITS STALE NOTIFICATIONS. A publish onto a unified input
-            //    leaves its `SentSample` event in the standalone listener
-            //    forever if nothing on the step path takes it, and the live
-            //    loop's next idle poll reads the stale event as a data wake —
-            //    one spurious wake+step per publish, which under the multi-process
-            //    split is self-sustaining (the free-run class).
+            // 1. DRAIN THE STALE NOTIFICATIONS of every per-set binding of the
+            //    node. A publish onto a unified input leaves its `SentSample`
+            //    event in the standalone listener forever if nothing on the step
+            //    path takes it, and the live loop's next idle poll reads the
+            //    stale event as a data wake: one spurious wake+step per publish,
+            //    which under the multi-process split is self-sustaining (the
+            //    free-run class).
             // 2. RUN THE ALIGN PASS. It fills every unfilled head through the
             //    node lock and drives the matcher's verdicts, leaving a
-            //    complete in-window set for `decide_node` to fire — or not.
+            //    complete in-window set for `decide_node` to fire, or not.
+            //
+            // The order is the unified data-trigger drain's: empty, then read.
+            // A frame that lands after the align pass read its queue keeps its
+            // notification, so the next idle wait wakes on it. Emptying a later
+            // binding's listener after the pass would erase that notification
+            // while its sample stays queued, and the park or WaitSet would then
+            // sleep its full timeout. A frame that lands between the empty and
+            // the read is read by the pass if its head is empty, and leaves one
+            // stale wake either way: at most one spurious step, which needs a new
+            // publish in that window to recur.
             //
             // The align pass's own verdict is deliberately ignored here:
             // `decide_node` re-derives it from the heads, so there is ONE
             // authority for whether a node fires, and the burst loop is the
             // only other consumer of the outcome.
             if self.sync_input_bindings[i].per_set {
-                {
-                    let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    // iceoryx2 0.10: one `try_wait` empties the queue.
-                    let _ = wake_listener.try_wait(|_activation| {});
-                }
                 // ONCE PER NODE, not once per binding. The align pass is a
-                // WHOLE-NODE operation — it walks every declared trigger input —
+                // WHOLE-NODE operation (it walks every declared trigger input),
                 // so running it k times would re-probe every input k times, and
                 // each pass resets the per-input advance clamp, handing a k-input
                 // node k times the descent budget its own contract states.
                 //
                 // A node's bindings are pushed contiguously by the build loop
-                // (one per trigger input of one node), and the level filter above
-                // preserves that, so remembering the PREVIOUS node id is enough
-                // and costs no allocation on a path that runs every level of
-                // every step.
+                // (one per trigger input of one node; `sync_bindings_contiguous`
+                // checks it at build in debug builds), and the level filter above
+                // keeps or skips a node's bindings together, so remembering the
+                // PREVIOUS node id is enough, and the walk below stops at the
+                // first binding of another node. No allocation on a path that
+                // runs every level of every step.
                 if aligned_node.as_deref() == Some(node_id.as_ref()) {
                     continue;
                 }
                 aligned_node = Some(Arc::clone(&node_id));
+                for binding in self.sync_input_bindings[i..]
+                    .iter()
+                    .take_while(|b| b.node_id == node_id)
+                    .filter(|b| b.per_set)
+                {
+                    let wake_listener = self.trigger_subscribers[binding.subscriber_idx].listener();
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
+                }
                 if let Err(e) = self
                     .scheduler
                     .align_sync_heads(&node_id, crate::scheduler::SyncAlignSite::Boundary)
