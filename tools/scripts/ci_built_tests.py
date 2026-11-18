@@ -5,9 +5,9 @@ A `cargo test -p X` step per package resolves features for X alone, so each step
 rebuilds the crates X shares with the leg's other packages. `build` compiles a
 group of packages in ONE `cargo test --no-run`, then runs `cargo test` over the
 same packages (it compiles nothing) with this script as cargo's target runner,
-recording the environment and working directory cargo gives each test binary
-the build listed; cargo then runs the packages' doctests, which rustdoc hands to
-the same runner and which it runs, against the libraries the build compiled. `run -- cargo test -p X ...` then runs the prebuilt binaries
+recording the environment and working directory cargo gives each test binary;
+cargo then runs the packages' doctests against the libraries the build compiled,
+and rustdoc hands each doctest it runs to the same runner, which runs it. `run -- cargo test -p X ...` then runs the prebuilt binaries
 that command selects: one process per binary, cargo's order, cargo's
 environment, the same arguments, cargo's fail-fast rule. `audit` fails when a
 built binary had no unfiltered run, when a full leg built fewer binaries than
@@ -333,13 +333,12 @@ def cmd_phase(name, cmd):
 
 
 def cmd_record(argv):
-    """Record a test binary the build listed; run anything else for real. Cargo
-    hands rustdoc the same runner (`--test-runtool`), so a doctest arrives here
-    too, and it runs."""
+    """Record a binary under the target directory; run anything else for real.
+    Cargo hands rustdoc the same runner (`--test-runtool`), so each doctest
+    rustdoc runs arrives here from its temporary directory, and it runs. A
+    target binary the build did not list is recorded, and the build refuses it."""
     exe, seq = os.path.realpath(argv[0]), time.monotonic_ns()
-    with open(os.environ['CI_BUILT_TESTS_ARTIFACTS']) as f:
-        listed = set(json.load(f))
-    if exe not in listed:
+    if not exe.startswith(os.path.realpath(target_dir()) + os.sep):
         env = {k: v for k, v in os.environ.items() if not k.startswith('CI_BUILT_TESTS_')}
         if os.environ.get('CI_BUILT_TESTS_DYLD') and 'DYLD_FALLBACK_LIBRARY_PATH' not in env:
             env['DYLD_FALLBACK_LIBRARY_PATH'] = os.environ['CI_BUILT_TESTS_DYLD']
@@ -390,10 +389,7 @@ def cmd_build(group, features, specs):
         runner = 'CARGO_TARGET_' + host_triple().upper().replace('-', '_') + '_RUNNER'
         if runner in os.environ or any(c.isspace() for c in sys.executable + SELF):
             die(f'{runner} is already set, or a path holds whitespace a cargo runner cannot carry')
-        with open(state_path(f'artifacts-{group}.json'), 'w') as f:
-            json.dump(sorted(artifacts), f)
-        env = dict(os.environ, CI_BUILT_TESTS_RECORD_DIR=record_dir,
-                   CI_BUILT_TESTS_ARTIFACTS=state_path(f'artifacts-{group}.json'))
+        env = dict(os.environ, CI_BUILT_TESTS_RECORD_DIR=record_dir)
         if sys.platform == 'darwin':
             env['CI_BUILT_TESTS_DYLD'] = cargo_dylib_path(
                 sorted(native), target_dir(), rustc('--print', 'sysroot').strip(), host_triple(),
@@ -671,7 +667,7 @@ def self_test():
 
 FAKE_CARGO = """import json, os, subprocess, sys
 a, tmp = sys.argv[1:], os.environ['FAKE_TMP']
-exes = [os.path.join(tmp, n) for n in ('pkg-lib', 'one_test')]
+exes = [os.path.join(tmp, 'target', 'debug', 'deps', n) for n in ('pkg-lib', 'one_test')]
 if a[:2] == ['test', '--no-run']:
     for exe, kind, name in zip(exes, (['lib'], ['test']), ('pkg', 'one_test')):
         print(json.dumps({'reason': 'compiler-artifact', 'executable': exe, 'profile': {'test': True},
@@ -686,9 +682,10 @@ elif a[:1] == ['test']:
     doctest = os.path.join(tmp, 'rustdoctest', 'rust_out')
     os.makedirs(os.path.dirname(doctest))
     with open(doctest, 'w') as f:
-        f.write('#!/bin/sh\\necho "doctest $CI_BUILT_TESTS_RECORD_DIR" >> "$FAKE_TMP/trace"\\n')
+        f.write('#!/bin/sh\\necho "doctest $CI_BUILT_TESTS_RECORD_DIR" >> "$FAKE_TMP/trace"\\n'
+                '[ -z "$FAKE_DOCTEST_FAILS" ]\\n')
     os.chmod(doctest, 0o755)
-    subprocess.run(runner + [doctest], check=True)
+    sys.exit(101 if subprocess.run(runner + [doctest]).returncode else 0)
 """
 
 
@@ -697,13 +694,14 @@ def end_to_end(check, refused):
     saved = dict(os.environ)
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, 'bin'))
+        os.makedirs(os.path.join(tmp, 'target', 'debug', 'deps'))
         os.makedirs(os.path.join(tmp, 'pkg', 'src'))
         for name, body in (('cargo', f'#!{sys.executable}\n' + FAKE_CARGO),
                            ('rustc', '#!/bin/sh\n[ "$1" = -vV ] && echo "host: fake-host" || echo /sysroot\n'),
                            ('pkg-lib', '#!/bin/sh\necho "lib $* $CARGO_PKG_NAME $FROM_CARGO $(pwd)" >> "$FAKE_TMP/trace"\n'
                                        '[ "$1" != fail ]\n'),
                            ('one_test', '#!/bin/sh\necho "one_test $*" >> "$FAKE_TMP/trace"\n')):
-            path = os.path.join(tmp, 'bin' if name in ('cargo', 'rustc') else '', name)
+            path = os.path.join(tmp, 'bin' if name in ('cargo', 'rustc') else 'target/debug/deps', name)
             with open(path, 'w') as f:
                 f.write(body)
             os.chmod(path, 0o755)
@@ -717,7 +715,7 @@ def end_to_end(check, refused):
         try:
             cmd_phase('workspace', ['true'])
             check('end to end: build', cmd_build('g', ['pkg/f'], ['pkg']), 0)
-            check('end to end: the recording ran no test, and a doctest ran without the runner env',
+            check('end to end: the recording ran no test, and a doctest ran without the recorder state',
                   trace(), ['doctest '])
             check('end to end: one test, serial', cmd_run('cargo test -p pkg --test one_test -- --test-threads=1'
                                                          .split()), 0)
@@ -733,30 +731,34 @@ def end_to_end(check, refused):
             check('end to end: an unknown --not-run entry', cmd_audit(2, {'pkg:gone'}), 1)
             refused('end to end: a feature the build lacks', lambda: cmd_run('cargo test -p pkg --features g'.split()))
             deps = os.path.join(tmp, 'target', 'debug', 'deps')
-            os.makedirs(deps)
-            for name in ('stale-1', 'lib.rlib', 'one_test'):
+            for name in ('stale-1', 'lib.rlib', 'one_test-2'):
                 path = os.path.join(deps, name)
                 with open(path, 'w') as f:
                     f.write('#!/bin/sh\n')
                 os.chmod(path, 0o755)
             groups = load_groups()
-            groups['g']['binaries'][1]['executable'] = os.path.realpath(os.path.join(deps, 'one_test'))
+            groups['g']['binaries'][1]['executable'] = os.path.realpath(os.path.join(deps, 'one_test-2'))
             with open(state_path('groups.json'), 'w') as f:
                 json.dump(groups, f)
             check('end to end: reclaim keeps what is still to run', (cmd_reclaim(), sorted(os.listdir(deps))),
-                  (0, ['lib.rlib', 'one_test']))
+                  (0, ['lib.rlib', 'one_test-2']))
             check('end to end: a binary run only under a filter has not run', cmd_audit(2, set()), 1)
             check('end to end: a run with --ignored is no whole run', cmd_run(
                 'cargo test -p pkg --test one_test -- --ignored'.split()), 0)
             check('end to end: so the binary is still unrun', cmd_audit(2, set()), 1)
             open(state_path('ran.jsonl'), 'a').write(json.dumps({'executable': os.path.realpath(
-                os.path.join(deps, 'one_test')), 'rc': 0, 'whole': True}) + '\n')
+                os.path.join(deps, 'one_test-2')), 'rc': 0, 'whole': True}) + '\n')
             check('end to end: a whole run clears it', cmd_audit(2, set()), 0)
             stray = os.path.join(tmp, 'target', 'debug', '.fingerprint', 'stray-1')
             os.makedirs(stray)
             open(os.path.join(stray, 'invoked.timestamp'), 'w').close()
             check('end to end: a unit compiled after every step', cmd_audit(2, set()), 1)
             refused('end to end: a floor that is no number', lambda: main(['audit', '--floor', 'x']))
+            os.environ.update(RUNNER_TEMP=os.path.join(tmp, 'second'), FAKE_DOCTEST_FAILS='1')
+            shutil.rmtree(os.path.join(tmp, 'rustdoctest'))
+            refused('end to end: a failing doctest fails the build', lambda: cmd_build('g', [], ['pkg']))
+        except SystemExit:
+            check('end to end: no mode stopped the run', sys.stderr.getvalue().strip()[-300:], '')
         finally:
             sys.stdout, sys.stderr = quiet
             os.environ.clear()
