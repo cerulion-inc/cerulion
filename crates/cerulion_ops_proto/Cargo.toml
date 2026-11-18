@@ -32,6 +32,8 @@ path = "src/lib.rs"
 # No workspace crate: a closed client links no AGPL code. Envelopes derive
 # Serialize/Deserialize; binary session chunks use standard padded base64.
 base64 = "0.22"
+# Audit event commitments use SHA-256.
+sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Compile-time derive for the error enum.

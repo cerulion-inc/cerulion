@@ -272,8 +272,8 @@ jobs:
           # among them, stays hard, so a reference the forge answers 404 for is
           # still a finding. On the merge queue PR_AUTHOR is empty and the
           # escalation holds; that scan reads the commit range only, and the
-          # squash message there is PR_TITLE alone by repository setting, so no
-          # body text reaches it.
+          # squash message there is PR_TITLE plus the forge's co-author trailers,
+          # by repository setting, so no body text reaches it.
           set -uo pipefail
           # Read with the filters in `env:` above. A payload that cannot be read
           # is a scan that did not happen, never an empty title and body, so the

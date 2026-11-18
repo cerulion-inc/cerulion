@@ -7,7 +7,8 @@
 //! test the change could have broken. The population that a
 //! `crates/<package>/**` rule cannot see is small and identifiable: the test
 //! binaries that open the repository's SHARED trees (`docs`, `tools`,
-//! `.github`, `benches`, `examples`) or a markdown file at the repository root.
+//! `.github`, `benches`, `examples`, `harness`) or a markdown file at the
+//! repository root.
 //! Those binaries fail on an edit to a file their own crate does not contain.
 //!
 //! So the membership of that population is DERIVED here rather than listed. A
@@ -44,7 +45,7 @@
 //! and it has to be USED as one.
 //!
 //! THE SHAPE. A literal is rooted at a shared tree when, after any leading run
-//! of `./` and `../` segments is stripped, it opens with one of the five
+//! of `./` and `../` segments is stripped, it opens with one of the six
 //! directory names followed by `/`; or when the WHOLE literal is one of the
 //! root markdown file names. Three rules keep that from drowning in false hits,
 //! each one measured against the tree:
@@ -146,7 +147,7 @@
 //! # What this pin covers, and what it does not
 //!
 //! It covers the SHARED trees: a test binary that opens `docs`, `tools`,
-//! `.github`, `benches`, `examples` or a root markdown file. That is one of the
+//! `.github`, `benches`, `examples`, `harness` or a root markdown file. That is one of the
 //! ways a test observes something no `crates/<package>/**` rule attributes to
 //! it. The other is a cargo dependency edge, and
 //! `tools/scripts/ci_selected_packages.py` closes over those: normal, build
@@ -164,7 +165,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Spelled without a trailing separator because that is how a marker names them;
 /// [`doc_root_of`] requires the separator on the LITERAL it is matching.
-const DOC_ROOT_DIRS: &[&str] = &[".github", "benches", "docs", "examples", "tools"];
+const DOC_ROOT_DIRS: &[&str] = &[".github", "benches", "docs", "examples", "harness", "tools"];
 
 /// The root markdown files, by STEM.
 ///
@@ -1922,6 +1923,7 @@ const CLASSIFIER_ORACLE: &[(&str, &str, Option<&str>, Option<&str>)] = &[
     ("benches", "/latency/bench.py", Some("benches"), None),
     ("docs", "/internals/cli.md", Some("docs"), None),
     ("examples", "/go2/Cargo.toml", Some("examples"), None),
+    ("harness", "/install.sh", Some("harness"), None),
     ("tools", "/scripts/ci_test_shard.sh", Some("tools"), None),
     // One row per root markdown file, as the WHOLE literal.
     ("AGENTS", ".md", None, Some("AGENTS")),
