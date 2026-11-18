@@ -207,16 +207,26 @@ env:
 #     archive holds none from an earlier run.
 #   * `Upload the cargo timing reports` uploads that directory as the artifact
 #     `cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7
-#     days. `runner.txt` is always there, so a job whose cargo steps the path
+#     days, a shard leg's value reading `shard-<n>`: for example
+#     `cargo-timings-lint-attempt-1` and `cargo-timings-test-linux-shard-0-attempt-1`.
+#     `runner.txt` is always there, so a job whose cargo steps the path
 #     selection skipped uploads an artifact holding only that file.
 #
 # The last two run under `always()`, so a failed, cancelled or timed-out job
-# still uploads what it built. The collect step exits 0 on every path (a report
-# it cannot move is a warning), and the upload carries `continue-on-error:
-# true` and a 5 minute step timeout, so a failed or stalled upload never fails
-# a job. `deb-smoke` and `stable-node-compiler-skew` build inside scripts, and
-# `fuzz` and `miri` build through cargo plugins on the pinned nightly; those
-# four carry none of these steps. `cargo install` builds a tool in a temporary
+# still uploads what it built. A report the collect step cannot move it
+# deletes, with a warning. It fails the job only when it can neither move nor
+# delete a report, or runs past its 2 minute step timeout, and a failed job
+# skips every cache save, so no archive carries a report on any path. That is
+# why the collect step takes no `continue-on-error`. The upload carries
+# `continue-on-error: true` and a 5 minute step timeout, so a failed or
+# stalled upload never fails a job. `tools/scripts/ci_cache_policy_check.py`
+# (rule TIMINGS_REPORTS) requires both steps in every job that passes
+# `--timings`, after its last such command and before its cache save, holds
+# the collect step's script to one text, and requires its list to name every
+# target directory the job's cache steps archive.
+# `deb-smoke` and `stable-node-compiler-skew` build inside scripts, and `fuzz`
+# and `miri` build through cargo plugins on the pinned nightly; those four
+# carry none of these steps. `cargo install` builds a tool in a temporary
 # target directory and writes no report anywhere.
 jobs:
   # WHICH PATHS A PULL REQUEST TOUCHED, classified once and read by the jobs
@@ -1268,7 +1278,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -1381,7 +1391,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -1543,7 +1553,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -1728,7 +1738,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target crates/cerulion_android/android/runtime/target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -1905,7 +1915,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -2061,7 +2071,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -2231,7 +2241,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in examples/*/target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -2475,7 +2485,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in examples/go2/target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -3575,7 +3585,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -4600,7 +4610,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -5066,7 +5076,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -5201,7 +5211,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -5355,7 +5365,7 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: |
           for dir in target crates/cerulion_py/target crates/cerulion_py/target/pynodes; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -5525,7 +5535,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -5665,7 +5675,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -5990,7 +6000,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -6120,7 +6130,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
@@ -6631,7 +6641,7 @@ jobs:
         timeout-minutes: 2
         run: |
           for dir in target; do
-            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/" || echo "::warning::$dir/cargo-timings was not moved out of the target directory"; fi
+            if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" "$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi
           done
 
       - name: Upload the cargo timing reports
