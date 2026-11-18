@@ -10,14 +10,28 @@
 # Run:     cargo mutants -p cerulion_cli_engine \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --re 'BudgetTally::add|RunOutTime::from_targets|ReadLogOverrun::sentence|FrameIndexOverrun::sentence|seconds_text|VerifierDecline::remedy|declined_census_detail|enforcement_blocked_by_decline' \
-#            --timeout 300 -- --lib
-#          (run in 5 shards, --shard k/5, with the lib tests' fixture cdylibs built first)
-# Result:  22 mutants: 10 caught, 12 unviable, 0 missed. The unviable ones replace
-#          a whole function body with a constant: the parameters go unused, and
-#          the workspace denies unused variables, so they do not compile.
+#            --timeout 300 --cap-lints true -- --lib
+#          (run in 5 shards, --shard k/5, in place in a scratch checkout, with
+#          the lib tests' fixture cdylibs built first; the unmutated baseline
+#          passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  22 mutants: 19 caught, 2 unviable, 1 missed. The unviable ones
+#          replace a body with Default::default() on a type that has no
+#          Default (RunOutTime, ReplayError), so they do not compile. Two of
+#          the 22 are field deletions the tool generated in functions outside
+#          the list (InjectionWindow::cross_rank, caught, and
+#          prepare_pass_verification, listed below).
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
 # it with a test, or list it here with a reason.
 
-(none)
+replay_engine.rs: delete field channel from struct SidecarReading expression
+in prepare_pass_verification
+  Equivalent. The field is set only when no injected topic is listed in
+  multi_publisher_topics, and with the field deleted the reading falls back to
+  its default channel, Unreadable. Every reader of that reading in
+  prepare_pass_verification (the label join, describe_label_reading and
+  classify_label_reading) runs only for a topic in that empty set, so no
+  output changes.
