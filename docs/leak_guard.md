@@ -221,21 +221,22 @@ all of these hold:
   case, single spaces and nothing after the closing bracket;
 - the address is a numbered forge noreply address, `<id>+<login>` or, for an app,
   `<id>+<slug>[bot]`, at `users.noreply.github.com` and no longer domain;
-- the identity is on record. A person is on record when that exact name and address author
-  a commit in the history the range builds on: for a pull request into `main`, a merge
-  queue batch and a push to `main`, the history of `main`. An app is on record the same
-  way, or when it authors the very commit that carries the trailer, and its name must be
-  its own login (`<slug>[bot]`).
+- the identity is on record. A person is on record when that exact name and address, as
+  written (no mailmap), author a commit reachable from the start of the scanned range: on
+  a pull request and on the merge queue, the commit the change sits on; on a push to
+  `main`, the previous tip. An app is on record the same way, or when it authors the very
+  commit that carries the trailer, and its name must be its own login (`<slug>[bot]`).
 
 On such a line the name is judged the way an author name is: a private pattern tagged
-`@person` does not read it, while every other pattern and every generic class still reads
-the whole line, the address included. A line that reads differently in a decoded view of
-the text gets no exemption. Everything else stays a hard finding: a personal or unknown
-address, an identity not on record, a lookalike domain, a trailer outside the trailer
-block, and a trailer in a pull request title or body, a message file or an issue. The same
-name on an ordinary line of the message is judged as before. The summary line counts the
-trailers let through as `coauthors_on_record=N`. The commit-msg hook scans a message file,
-so it refuses every trailer; the pull request and merge queue scans apply the rule above.
+`@person` does not read it, while a `@never` entry, every other pattern and every generic
+class still read the whole line, the address included. A line that reads differently in a
+decoded view of the text gets no exemption. Everything else stays a hard finding: a
+personal or unknown address, an identity not on record, a lookalike domain, a trailer
+outside the trailer block, and a trailer in a pull request title or body, a message file
+or an issue. The same name on an ordinary line of the message is judged as before. The
+summary line counts the trailers let through, those on record with no hard finding left on
+their line, as `coauthors_on_record=N`. The commit-msg hook scans a message file, so it
+refuses every trailer; the pull request and merge queue scans apply the rule above.
 
 ## Install the hooks
 
@@ -322,8 +323,12 @@ reported as `private#<index>@host` and `private#<index>@slug`. Neither value shi
 tree.
 
 The trailing tag is optional and comes from a fixed vocabulary (`@host` `@device`
-`@person` `@login` `@lan` `@nickname` `@slug` `@hygiene`, in any letter case); it
-labels a hit's category without naming anything. The grammar is strict and there is exactly one
+`@person` `@login` `@lan` `@nickname` `@slug` `@hygiene` `@never`, in any letter case); it
+labels a hit's category without naming anything. Two tags also change where an entry
+reads. A `@person` entry does not read a commit's author or committer name, or the name
+in a co-author trailer on record (below), because that name is the person's own forge
+identity. A `@never` entry reads both: use it for a person who is named on no surface at
+all, their own commit identity included. The grammar is strict and there is exactly one
 shape per line: blank; a comment (`#` first); or one entry, `word:<literal>`,
 `text:<literal>` or `<regex>`, then optionally whitespace and the tag, then optionally
 whitespace, `#` and a comment. Anything else refuses the whole run with exit 3, naming
