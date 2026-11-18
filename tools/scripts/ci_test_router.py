@@ -6,9 +6,13 @@
     python3 -B tools/scripts/ci_test_router.py --live-check
 
 SHADOW MODE. This script computes a selection and nothing reads it: no job,
-step or required context is gated on its answer. A binary that failed in the
-full run while this selection skipped it is an ESCAPE, and routing stays off
-until the shadow period shows none.
+step or required context is gated on its answer. The `router-shadow` job in
+`.github/workflows/ci.yml` runs it on every pull request and merge-queue run,
+prints the answer and uploads it as an artifact. Run by hand on that artifact
+and the run's job logs, `tools/scripts/ci_router_escapes.py` scores it against
+the full run's verdicts.
+A binary that failed in the full run while this selection skipped it is an
+ESCAPE, and routing stays off until the shadow period shows none.
 
 WHAT IT ANSWERS. Given a base commit and a head commit it lists every test
 binary of the root workspace (package plus target, named the way nextest names
@@ -110,7 +114,8 @@ the escape scorer reads to judge a library that failed to compile. The document
 is a function of the two commits alone: no clock, no hash order, no random.
 
 `--self-test` reads only its hand-built fixture. `--live-check` reads this
-checkout and pins shapes the real tree keeps; it runs in no CI job.
+checkout and pins shapes the real tree keeps; the shadow job runs it, never a
+required one.
 
 Stdlib only. Python 3.8 or newer. Exit 0 with an answer, 1 when the self-test
 or the live check found a miss, 2 on a usage error or a repository it cannot
@@ -3375,8 +3380,8 @@ def live_self_check():
     `--live-check` runs this over the checkout: the wiring to git, to cargo
     metadata and to the committed table and markers. The fixture rows pin the
     rules; these pin shapes on the real tree no rule change should flip, so a
-    reader that finds nothing in the real tree reports it. It runs in no CI
-    job.
+    reader that finds nothing in the real tree reports it. It runs in the
+    shadow job, never in a required one.
     """
     repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     metadata = load_metadata(repo, None)
