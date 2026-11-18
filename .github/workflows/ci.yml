@@ -1124,11 +1124,15 @@ jobs:
       - name: Changed-path classifier self-test
         run: ./tools/scripts/ci_changed_paths.sh --self-test
 
-      # The per-binary test router. Its table is a hand-built workspace with
-      # every selection written out beside it; it reads no file of this
-      # checkout, so a change to the real tree cannot red this step.
+      # The per-binary test router, and the scorer that judges its answer
+      # against a full run. Both tables are hand-built fixtures with every
+      # answer written out beside them; neither reads this checkout, so a
+      # change to the real tree cannot red this step.
       - name: Test router self-test (shadow mode)
         run: python3 -B tools/scripts/ci_test_router.py --self-test
+
+      - name: Test router escape scorer self-test
+        run: python3 -B tools/scripts/ci_router_escapes.py --self-test
 
       # THE SHARD PARTITION AND ITS SELECTION READER. `--check` proves the
       # partition of `cerulion_core`'s test files is total and disjoint, that
