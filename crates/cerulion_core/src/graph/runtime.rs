@@ -3071,8 +3071,9 @@ struct LivelinessWatch {
 /// outlier sat on the 250 ms comb). The [`crate::transport::LivelinessCleaner`]
 /// holds only a `Config` clone and the reclaim is an associated fn keyed by it,
 /// so nothing of the live loop's transport crosses to this thread. Stopped and
-/// JOINED on drop (bounded by one in-flight pass). The cadence is an atomic so
-/// the test seam can shorten or park it without restarting the thread.
+/// JOINED on drop (bounded by one in-flight pass). The cadence lives in the
+/// shared schedule so the test seam can shorten or park it without restarting
+/// the thread.
 struct DeadNodeCleanupThread {
     shared: Arc<DeadNodeCleanupShared>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -3084,59 +3085,164 @@ struct DeadNodeCleanupThread {
 
 /// What the owner and the reclaim thread share.
 struct DeadNodeCleanupShared {
-    /// `true` once the owner asked the thread to exit; under the mutex so the
-    /// condvar wait cannot miss the flip.
-    stop: Mutex<bool>,
+    /// The thread's schedule, under one mutex so neither condvar wait can miss
+    /// a change.
+    gate: Mutex<CleanupGate>,
+    /// Wakes the thread: a stop, or a cadence change.
     wake: std::sync::Condvar,
+    /// Signalled when a pass ends (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pass_done: std::sync::Condvar,
+}
+
+/// The reclaim thread's schedule.
+struct CleanupGate {
+    /// `true` once the owner asked the thread to exit.
+    stopped: bool,
     /// Cadence (ms); re-read after every wake so a change applies at once.
-    period_ms: AtomicU64,
+    period_ms: u64,
+    /// Bumped by every cadence change. A wait that sees it move re-arms with
+    /// the new period, also when the old period ran out before the wait took
+    /// the lock back. Only the test seam changes the cadence.
+    #[cfg(any(test, feature = "test-helpers"))]
+    period_changes: u64,
+    /// `true` from the moment the thread decides to run a pass until that
+    /// pass returns (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_pass: bool,
+    /// `true` from the lock hold that enters a timed wait until the thread
+    /// takes the lock back, so a reader that holds the lock and sees it set
+    /// holds it while the thread is inside `wait_timeout` (a unit test reads
+    /// it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_wait: bool,
+}
+
+/// Ends the pass [`DeadNodeCleanupShared::wait_period`] started when dropped,
+/// so a pass that panics still ends. Only `wait_period` makes one, in the same
+/// lock hold that marks the pass as under way.
+#[cfg(any(test, feature = "test-helpers"))]
+struct PassEnd<'a>(&'a DeadNodeCleanupShared);
+
+/// The pass [`DeadNodeCleanupShared::wait_period`] decided to run. Under the
+/// test seam it is the [`PassEnd`] that ends it; otherwise it carries nothing.
+#[cfg(any(test, feature = "test-helpers"))]
+type PassToken<'a> = PassEnd<'a>;
+#[cfg(not(any(test, feature = "test-helpers")))]
+type PassToken<'a> = std::marker::PhantomData<&'a DeadNodeCleanupShared>;
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PassEnd<'_> {
+    fn drop(&mut self) {
+        self.0.lock_gate().in_pass = false;
+        self.0.pass_done.notify_all();
+    }
 }
 
 impl DeadNodeCleanupShared {
-    /// Wait one period. `true` when the period elapsed (run a pass), `false`
-    /// when the owner asked the thread to stop. A wake that is neither (the
-    /// period was changed) re-arms with the new value.
-    fn wait_period(&self) -> bool {
-        let mut stopped = self
-            .stop
+    fn new(period_ms: u64) -> Self {
+        Self {
+            gate: Mutex::new(CleanupGate {
+                stopped: false,
+                period_ms,
+                #[cfg(any(test, feature = "test-helpers"))]
+                period_changes: 0,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_pass: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_wait: false,
+            }),
+            wake: std::sync::Condvar::new(),
+            #[cfg(any(test, feature = "test-helpers"))]
+            pass_done: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock_gate(&self) -> std::sync::MutexGuard<'_, CleanupGate> {
+        // Every update under this lock is a plain assignment or increment, so
+        // a poisoned lock still holds a consistent schedule.
+        self.gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `pass` once per period until the owner stops the thread.
+    fn run_passes(&self, mut pass: impl FnMut()) {
+        while let Some(_end) = self.wait_period() {
+            pass();
+        }
+    }
+
+    /// Wait one period. `Some` when the period elapsed (run a pass; the pass
+    /// ends when the token drops), `None` when the owner asked the thread to
+    /// stop. A cadence change re-arms the wait with the new value, also when
+    /// it landed after the old period ran out but before this thread took the
+    /// lock back: the condvar reports that wake as a timeout.
+    fn wait_period(&self) -> Option<PassToken<'_>> {
+        let mut gate = self.lock_gate();
         loop {
-            if *stopped {
-                return false;
+            if gate.stopped {
+                return None;
             }
-            let period = Duration::from_millis(self.period_ms.load(Ordering::Relaxed));
+            #[cfg(any(test, feature = "test-helpers"))]
+            let changes = gate.period_changes;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = true;
+            }
+            let period = Duration::from_millis(gate.period_ms);
             let (guard, timeout) = self
                 .wake
-                .wait_timeout(stopped, period)
+                .wait_timeout(gate, period)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            stopped = guard;
-            if *stopped {
-                return false;
+            gate = guard;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = false;
             }
-            if timeout.timed_out() {
-                return true;
+            if gate.stopped {
+                return None;
+            }
+            #[cfg(any(test, feature = "test-helpers"))]
+            let unchanged = gate.period_changes == changes;
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            let unchanged = true;
+            if timeout.timed_out() && unchanged {
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    gate.in_pass = true;
+                    return Some(PassEnd(self));
+                }
+                #[cfg(not(any(test, feature = "test-helpers")))]
+                return Some(std::marker::PhantomData);
             }
         }
     }
 
-    /// Test seam only (the production cadence never changes).
+    /// Test seam only (the production cadence never changes). Returns once
+    /// the change is in force: a pass already under way has ended, and the
+    /// next one starts only after the new period elapses.
     #[cfg(any(test, feature = "test-helpers"))]
     fn set_period_ms(&self, ms: u64) {
-        self.period_ms.store(ms, Ordering::Relaxed);
-        // Take the lock so the store is ordered before the thread's next wait.
-        let _guard = self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.change_period(self.lock_gate(), ms);
+    }
+
+    /// [`Self::set_period_ms`] with the schedule lock already held.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn change_period(&self, mut gate: std::sync::MutexGuard<'_, CleanupGate>, ms: u64) {
+        gate.period_ms = ms;
+        gate.period_changes = gate.period_changes.wrapping_add(1);
         self.wake.notify_all();
+        while gate.in_pass {
+            gate = self
+                .pass_done
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     fn stop(&self) {
-        *self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.lock_gate().stopped = true;
         self.wake.notify_all();
     }
 }
@@ -3146,11 +3252,7 @@ impl DeadNodeCleanupThread {
     /// the thread: the graph still runs, but a CRASHED publisher's port is then
     /// not reclaimed by this runtime (graceful disconnects are unaffected).
     fn spawn(cleaner: crate::transport::LivelinessCleaner) -> Option<Self> {
-        let shared = Arc::new(DeadNodeCleanupShared {
-            stop: Mutex::new(false),
-            wake: std::sync::Condvar::new(),
-            period_ms: AtomicU64::new(LIVELINESS_CLEANUP_PERIOD_MS),
-        });
+        let shared = Arc::new(DeadNodeCleanupShared::new(LIVELINESS_CLEANUP_PERIOD_MS));
         #[cfg(any(test, feature = "test-helpers"))]
         let call_count = cleaner.call_count_handle();
         let worker = Arc::clone(&shared);
@@ -3178,13 +3280,9 @@ impl DeadNodeCleanupThread {
 
     fn run(shared: &DeadNodeCleanupShared, cleaner: &crate::transport::LivelinessCleaner) {
         Self::lower_own_priority();
-        tracing::debug!(
-            period_ms = shared.period_ms.load(Ordering::Relaxed),
-            "liveliness: dead-node reclaim thread started"
-        );
-        while shared.wait_period() {
-            cleaner.cleanup_dead_nodes();
-        }
+        let period_ms = shared.lock_gate().period_ms;
+        tracing::debug!(period_ms, "liveliness: dead-node reclaim thread started");
+        shared.run_passes(|| cleaner.cleanup_dead_nodes());
     }
 
     /// Renice THIS thread to [`DEAD_NODE_SWEEP_NICE`]. Linux and Android:
@@ -4400,6 +4498,11 @@ pub struct GraphRuntime {
     /// the `#[cfg(any(test, feature = "test-helpers"))]`
     /// [`Self::set_single_park_for_test`] (gate the SETTER, not the field).
     single_park_override: Option<bool>,
+    /// Test seam: a closure the Sync drain runs right after a node's align
+    /// pass; see [`Self::set_sync_align_hook_for_test`]. Test and test-helpers
+    /// builds only (`GraphRuntime` never crosses an FFI boundary).
+    #[cfg(any(test, feature = "test-helpers"))]
+    sync_align_hook: Option<Box<dyn FnMut() + Send>>,
     /// Wake sources collected from `external`-policy ingress (driver)
     /// nodes — one per node whose [`NodeEntry::external_source`] returned an
     /// [`ExternalSource::Fd`] / [`ExternalSource::Blocking`]. Populated ONCE at
@@ -10383,6 +10486,11 @@ impl GraphRuntime {
             .now_ns()
             .saturating_add(EXTERNAL_TOPIC_SILENCE_GRACE_MS.saturating_mul(1_000_000));
 
+        debug_assert!(
+            sync_bindings_contiguous(sync_input_bindings.iter().map(|b| b.node_id.as_ref())),
+            "every node's Sync bindings must sit in one contiguous run: the drain walks a \
+             node's bindings from its first one and stops at another node's"
+        );
         // Fail fast if the live-loop WaitSet would exceed the
         // FD-set attachment bound — the loop attaches one notification per
         // data-trigger input + per sync input. Past the cap, iceoryx2 silently
@@ -10592,6 +10700,8 @@ impl GraphRuntime {
             park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
             credit_baseline_full_override: None,
             single_park_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            sync_align_hook: None,
             // External ingress sources are collected lazily at run_live
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
@@ -14744,6 +14854,16 @@ impl GraphRuntime {
         self.single_park_override = forced;
     }
 
+    /// Test seam: run `hook` in the step's drain right after each per-set Sync
+    /// node's listeners are emptied and its align pass has read every one of
+    /// its inputs. A frame the hook publishes then lands after the pass that
+    /// read the node's queues, at a fixed point in the drain. `None` removes
+    /// it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_sync_align_hook_for_test(&mut self, hook: Option<Box<dyn FnMut() + Send>>) {
+        self.sync_align_hook = hook;
+    }
+
     /// Holistic-review L6 (test seam): is a WaitSet reactor currently
     /// built/parked? A monitor-wait-park run drives every inter-step idle via
     /// [`Self::monitor_wait_block`] and never calls `reactor.run_once`, so
@@ -17245,10 +17365,13 @@ impl GraphRuntime {
 
     /// Test-only: change the dead-node reclaim thread's cadence (production:
     /// [`LIVELINESS_CLEANUP_PERIOD_MS`]). Applies at once, including to a wait
-    /// already in progress. A huge value PARKS the walk (the zero-alloc gates
-    /// use this to keep it out of their measured windows); a small one lets a
-    /// test observe a pass without waiting the production 2 s. No-op when the
-    /// runtime has no liveliness watches (no thread).
+    /// already in progress, and returns only after a pass already under way
+    /// has ended, so [`Self::liveliness_cleanup_call_count`] read after it
+    /// moves only when the new period elapses. A huge value PARKS the walk
+    /// (the zero-alloc gates use this to keep it out of their measured
+    /// windows); a small one lets a test observe a pass without waiting the
+    /// production 2 s. No-op when the runtime has no liveliness watches (no
+    /// thread).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_liveliness_cleanup_period_for_test(&mut self, ms: u64) {
         if let Some(c) = &self.liveliness_cleanup {
@@ -19815,6 +19938,51 @@ fn log_tick_failure_recovery(node_id: &str, suppressed: u64) {
     );
 }
 
+/// PURE: whether, in list order, every node id's entries sit in one
+/// contiguous run. The Sync drain's per-set walk relies on it: it empties a
+/// node's listeners from the node's first binding and stops at the first
+/// binding of another node.
+// hot-path-alloc-ok-fn: cold: build-time check only (one debug_assert per graph build)
+fn sync_bindings_contiguous<'a>(node_ids: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen: Vec<&'a str> = Vec::new();
+    for id in node_ids {
+        if seen.last() == Some(&id) {
+            continue;
+        }
+        if seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+    }
+    true
+}
+
+#[cfg(test)]
+mod sync_binding_order_tests {
+    use super::sync_bindings_contiguous;
+
+    #[test]
+    fn a_node_whose_bindings_are_split_by_another_nodes_is_not_contiguous() {
+        // (node ids in binding order, contiguous)
+        let cases: [(&[&str], bool); 7] = [
+            (&[], true),
+            (&["a"], true),
+            (&["a", "a"], true),
+            (&["a", "a", "b", "b", "c"], true),
+            (&["a", "b", "a"], false),
+            (&["a", "a", "b", "c", "a"], false),
+            (&["a", "b", "b", "a", "b"], false),
+        ];
+        for (ids, want) in cases {
+            assert_eq!(
+                sync_bindings_contiguous(ids.iter().copied()),
+                want,
+                "{ids:?}"
+            );
+        }
+    }
+}
+
 fn log_drain_failure(
     already_suppressed: bool,
     node_id: &str,
@@ -20306,44 +20474,62 @@ impl GraphRuntime {
                 continue;
             }
             // On the PER-SET path this binding's `trigger_subscribers`
-            // slot is a listener-only WAKE SOURCE, not a data receiver. Two
-            // things happen here instead of the legacy timestamp drain:
+            // slot is a listener-only WAKE SOURCE, not a data receiver. At the
+            // node's FIRST per-set binding, two things happen instead of the
+            // legacy timestamp drain, in this order:
             //
-            // 1. DRAIN ITS STALE NOTIFICATIONS. A publish onto a unified input
-            //    leaves its `SentSample` event in the standalone listener
-            //    forever if nothing on the step path takes it, and the live
-            //    loop's next idle poll reads the stale event as a data wake —
-            //    one spurious wake+step per publish, which under the multi-process
-            //    split is self-sustaining (the free-run class).
+            // 1. DRAIN THE STALE NOTIFICATIONS of every per-set binding of the
+            //    node. A publish onto a unified input leaves its `SentSample`
+            //    event in the standalone listener forever if nothing on the step
+            //    path takes it, and the live loop's next idle poll reads the
+            //    stale event as a data wake: one spurious wake+step per publish,
+            //    which under the multi-process split is self-sustaining (the
+            //    free-run class).
             // 2. RUN THE ALIGN PASS. It fills every unfilled head through the
             //    node lock and drives the matcher's verdicts, leaving a
-            //    complete in-window set for `decide_node` to fire — or not.
+            //    complete in-window set for `decide_node` to fire, or not.
+            //
+            // The order is the unified data-trigger drain's: empty, then read.
+            // A frame that lands after the align pass read its queue keeps its
+            // notification, so the next idle wait wakes on it. Emptying a later
+            // binding's listener after the pass would erase that notification
+            // while its sample stays queued, and the park or WaitSet would then
+            // sleep its full timeout. A frame that lands between the empty and
+            // the read is read by the pass if its head is empty, and leaves one
+            // stale wake either way: at most one spurious step, which needs a new
+            // publish in that window to recur.
             //
             // The align pass's own verdict is deliberately ignored here:
             // `decide_node` re-derives it from the heads, so there is ONE
             // authority for whether a node fires, and the burst loop is the
             // only other consumer of the outcome.
             if self.sync_input_bindings[i].per_set {
-                {
-                    let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    // iceoryx2 0.10: one `try_wait` empties the queue.
-                    let _ = wake_listener.try_wait(|_activation| {});
-                }
                 // ONCE PER NODE, not once per binding. The align pass is a
-                // WHOLE-NODE operation — it walks every declared trigger input —
+                // WHOLE-NODE operation (it walks every declared trigger input),
                 // so running it k times would re-probe every input k times, and
                 // each pass resets the per-input advance clamp, handing a k-input
                 // node k times the descent budget its own contract states.
                 //
                 // A node's bindings are pushed contiguously by the build loop
-                // (one per trigger input of one node), and the level filter above
-                // preserves that, so remembering the PREVIOUS node id is enough
-                // and costs no allocation on a path that runs every level of
-                // every step.
+                // (one per trigger input of one node; `sync_bindings_contiguous`
+                // checks it at build in debug builds), and the level filter above
+                // keeps or skips a node's bindings together, so remembering the
+                // PREVIOUS node id is enough, and the walk below stops at the
+                // first binding of another node. No allocation on a path that
+                // runs every level of every step.
                 if aligned_node.as_deref() == Some(node_id.as_ref()) {
                     continue;
                 }
                 aligned_node = Some(Arc::clone(&node_id));
+                for binding in self.sync_input_bindings[i..]
+                    .iter()
+                    .take_while(|b| b.node_id == node_id)
+                    .filter(|b| b.per_set)
+                {
+                    let wake_listener = self.trigger_subscribers[binding.subscriber_idx].listener();
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
+                }
                 if let Err(e) = self
                     .scheduler
                     .align_sync_heads(&node_id, crate::scheduler::SyncAlignSite::Boundary)
@@ -20353,6 +20539,10 @@ impl GraphRuntime {
                         error = %e,
                         "sync alignment skipped (node absent from the scheduler)"
                     );
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(hook) = self.sync_align_hook.as_mut() {
+                    hook();
                 }
                 continue;
             }
@@ -23180,5 +23370,174 @@ mod fire_site_tests {
             ),
             (7, 10, 2, FireCause::Period, FireFlags::TICK_ERROR, 0b101)
         );
+    }
+}
+
+#[cfg(test)]
+mod dead_node_cleanup_schedule_tests {
+    use super::*;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    /// How long a negative check watches for a pass that must not start. A
+    /// broken schedule shows within it; a correct one can never fail it, since
+    /// the parked period is an hour.
+    const QUIET_WINDOW: Duration = Duration::from_millis(200);
+
+    /// Guards a hang only: every wait below ends as soon as its condition holds.
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+
+    const PARKED_MS: u64 = 3_600_000;
+
+    /// The reclaim loop on its own thread, counting passes.
+    fn start_counting(
+        period_ms: u64,
+    ) -> (
+        Arc<DeadNodeCleanupShared>,
+        Arc<AtomicU64>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let shared = Arc::new(DeadNodeCleanupShared::new(period_ms));
+        let passes = Arc::new(AtomicU64::new(0));
+        let worker = {
+            let (shared, passes) = (Arc::clone(&shared), Arc::clone(&passes));
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    passes.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        (shared, passes, worker)
+    }
+
+    fn wait_for_passes(passes: &AtomicU64, at_least: u64) {
+        let deadline = Instant::now() + HANG_GUARD;
+        while passes.load(Ordering::Relaxed) < at_least {
+            assert!(
+                Instant::now() < deadline,
+                "no pass ran within {HANG_GUARD:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn passes_keep_running_at_a_short_period() {
+        let (shared, passes, worker) = start_counting(5);
+        wait_for_passes(&passes, 3);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// The test keeps the schedule lock only once it sees the thread inside
+    /// its 20 ms wait after a pass, then holds it for 100 ms, so that wait
+    /// runs out before the thread takes the lock back and the park lands
+    /// first: the condvar reports a timeout, and the park must still win.
+    #[test]
+    fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
+        let (shared, passes, worker) = start_counting(20);
+        wait_for_passes(&passes, 1);
+        let deadline = Instant::now() + HANG_GUARD;
+        let gate = loop {
+            let gate = shared.lock_gate();
+            // A pass already ran, so the wait the thread sits in follows a
+            // pass, and the thread released the lock only inside it.
+            if gate.in_wait {
+                break gate;
+            }
+            drop(gate);
+            assert!(
+                Instant::now() < deadline,
+                "the thread never re-entered its wait after a pass"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        // The lock is held and no pass is under way, so none can start or
+        // count until the park below releases the lock: this is the count the
+        // park must keep.
+        let parked = passes.load(Ordering::Relaxed);
+        shared.change_period(gate, PARKED_MS);
+        std::thread::sleep(QUIET_WINDOW);
+        assert_eq!(
+            passes.load(Ordering::Relaxed),
+            parked,
+            "a pass started under the old period after the park returned"
+        );
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A park issued while a pass runs returns only once that pass has ended,
+    /// so a count read after the park already holds it.
+    #[test]
+    fn a_park_returns_only_after_the_pass_under_way_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                })
+            })
+        };
+        started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the first pass starts");
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let parker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.set_period_ms(PARKED_MS);
+                parked_tx.send(()).expect("test thread listening");
+            })
+        };
+        // The park has stored the new period and now waits on the pass.
+        let deadline = Instant::now() + HANG_GUARD;
+        while shared.lock_gate().period_changes == 0 {
+            assert!(Instant::now() < deadline, "the park never took the lock");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            parked_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "the park returned while a pass was still running"
+        );
+        release_tx.send(()).expect("pass waiting for release");
+        parked_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the park returns once the pass ends");
+        parker.join().expect("parker");
+        assert_eq!(
+            started_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "another pass started after the park"
+        );
+        drop(release_tx);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A pass that panics still ends, so a later park does not wait for it.
+    #[test]
+    fn a_pass_that_panics_still_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.run_passes(|| panic!("reclaim pass panicked")))
+        };
+        assert!(worker.join().is_err(), "the pass panicked");
+        assert!(!shared.lock_gate().in_pass, "the panicked pass ended");
+        shared.set_period_ms(PARKED_MS);
+    }
+
+    #[test]
+    fn a_stop_ends_a_parked_wait() {
+        let (shared, passes, worker) = start_counting(PARKED_MS);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+        assert_eq!(passes.load(Ordering::Relaxed), 0);
     }
 }

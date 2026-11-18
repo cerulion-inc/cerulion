@@ -30,6 +30,7 @@ impl<S: Read + Write> OpsClient<S> {
         let hello = Hello {
             min_version,
             max_version,
+            session: Default::default(),
         };
         let payload = protocol::encode(&hello)?;
         protocol::write_frame(&mut stream, &payload)?;
@@ -40,12 +41,18 @@ impl<S: Read + Write> OpsClient<S> {
             HandshakeReply::Ack {
                 chosen_version,
                 server_name,
-            } => Ok(OpsClient {
+            } if chosen_version >= min_version
+                && chosen_version <= max_version
+                && (protocol::MIN_PROTOCOL_VERSION..=protocol::PROTOCOL_VERSION)
+                    .contains(&chosen_version) => Ok(OpsClient {
                 stream,
                 negotiated_version: chosen_version,
                 server_name,
                 next_id: 0,
             }),
+            HandshakeReply::Ack { chosen_version, .. } => Err(OpsProtoError::Decode(format!(
+                "server chose unsupported version {chosen_version} (offered {min_version}..={max_version})"
+            ))),
             HandshakeReply::Reject {
                 server_min,
                 server_max,

@@ -1478,6 +1478,12 @@ pub(crate) fn http_client_without_redirects() -> CliResult<reqwest::blocking::Cl
     build_http_client(reqwest::redirect::Policy::none())
 }
 
+/// [`http_client_without_redirects`] with a per-request timeout of `timeout`, for
+/// callers that make several requests inside a fixed overall deadline.
+pub(crate) fn http_client_bounded(timeout: Duration) -> CliResult<reqwest::blocking::Client> {
+    build_http_client_with_timeout(reqwest::redirect::Policy::none(), timeout)
+}
+
 fn build_http_client(redirect: reqwest::redirect::Policy) -> CliResult<reqwest::blocking::Client> {
     build_http_client_with_timeout(redirect, HTTP_TIMEOUT)
 }

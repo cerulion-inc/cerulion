@@ -43356,6 +43356,220 @@ fn a_fed_replay_of_a_consumer_whose_bag_states_no_staging_rows_is_refused_by_nam
     assert!(replayed.is_empty(), "no step ran: {replayed:?}");
 }
 
+/// The warning a `BagWriter` dropped without `finalize` logs.
+const RO_UNFINALIZED_WARNING: &str = "BagWriter dropped without finalize()";
+
+/// The eviction graph's one produced topic, which `src` writes.
+const RO_SRC_TOPIC: &str = "/riev/src/out";
+
+/// The payloads `bag` holds on `topic`, in file order.
+fn ro_frames(bag: &std::path::Path, topic: &str) -> Vec<Vec<u8>> {
+    BagReader::open(bag)
+        .expect("the bag opens")
+        .messages()
+        .expect("the bag's messages")
+        .map(|m| m.expect("a readable message"))
+        .filter(|m| m.topic == topic)
+        .map(|m| m.data)
+        .collect()
+}
+
+/// A `--verify` of the eviction graph's `bag` that writes `--record-out` to
+/// `out` and `--report` to `report` when it is given.
+fn ro_verify(
+    bag: &std::path::Path,
+    out: &std::path::Path,
+    report: Option<std::path::PathBuf>,
+) -> Result<ReplayOutcome, ReplayError> {
+    ri_replay_stamped(
+        bag,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        report,
+        RecordHealthReport::Absent,
+        Some(out.to_path_buf()),
+    )
+    .0
+}
+
+/// A finished `--record-out` bag of a passing `--verify` of the eviction
+/// graph holds `src`'s re-executed frames, which equal the frames `bag`
+/// recorded live.
+fn ro_assert_finished(outcome: &ReplayOutcome, out: &std::path::Path, bag: &std::path::Path) {
+    assert!(outcome.passed, "{:?}", outcome.violations);
+    assert_eq!(
+        outcome.record_out.as_deref(),
+        Some(out.display().to_string().as_str()),
+        "{:?}",
+        outcome.record_out_error
+    );
+    assert!(
+        matches!(
+            BagReader::open(out)
+                .expect("the output bag opens")
+                .completeness()
+                .expect("the output bag states its completeness"),
+            cerulion_bag::BagCompleteness::Finalized
+        ),
+        "the output bag is finalized"
+    );
+    let recorded = ro_frames(bag, RO_SRC_TOPIC);
+    assert!(
+        recorded.len() >= RI_MIN_READS,
+        "PREMISE: src recorded frames: {}",
+        recorded.len()
+    );
+    assert_eq!(
+        ro_frames(out, RO_SRC_TOPIC),
+        recorded,
+        "the output holds src's re-executed frames"
+    );
+}
+
+/// No captured line is the writer's warning that a bag was left unfinished.
+fn ro_assert_no_writer_warning(lines: &[&str]) -> Result<(), String> {
+    match lines
+        .iter()
+        .filter(|l| l.contains(RO_UNFINALIZED_WARNING))
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] => Ok(()),
+        warned => Err(format!("no writer warning after a refusal: {warned:?}")),
+    }
+}
+
+/// **A `--verify` refused before its first step writes no `--record-out`
+/// bag and logs no writer warning.**
+///
+/// The refusal is the read-log budget's: under a budget of one read the rank's
+/// read log is declined and the verify is refused before rank 0 runs a step,
+/// with exit 2. The output path is never created, and a path whose directory
+/// does not exist does not change the verdict, because the output is opened
+/// only after the bag's whole-run checks. CONTROL on the same bag: at the
+/// shipped budget the verify passes and its output bag is finished.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_refused_before_its_first_step_writes_no_output_bag() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let control = dir.path().join("ro_control.mcap");
+    let outcome = ro_verify(&bag, &control, None).expect("the control verifies");
+    ro_assert_finished(&outcome, &control, &bag);
+
+    let _budget = replay_engine::override_read_log_record_budget(1);
+    let refused = |out: &std::path::Path| {
+        let err = ro_verify(&bag, out, None)
+            .expect_err("a read log over its budget is refused before the first step");
+        assert_eq!(err.exit_code(), 2, "{err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("read_identity_unplanned")
+                && msg.contains("verifier_declined_read_log_budget"),
+            "the refusal is the read-log budget's: {msg}"
+        );
+    };
+    let out = dir.path().join("ro_refused.mcap");
+    refused(&out);
+    assert!(!out.exists(), "a refused verify writes no output bag");
+    let uncreatable = dir.path().join("no_such_dir").join("ro_refused.mcap");
+    refused(&uncreatable);
+    assert!(
+        !uncreatable.parent().unwrap().exists(),
+        "nothing is created"
+    );
+    logs_assert(ro_assert_no_writer_warning);
+}
+
+/// **A `--verify` refused at its first pass leaves no `--record-out` bag and
+/// logs no writer warning.**
+///
+/// The refusal is the frame budget's: under a budget of one frame, the rank's
+/// pass declines its frame index and the verify is refused with exit 2. The
+/// output bag is created before the pass, so this is the drop path: the bag is
+/// removed and its writer abandoned. PREMISE in the same body: under the same
+/// budget a path in a missing directory fails the run with exit 5 instead,
+/// because the open comes before this refusal.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_verify_refused_at_its_first_pass_leaves_no_output_bag() {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = ri_evict_bag(dir.path());
+    let _budget = replay_engine::override_frame_index_record_budget(1);
+    let uncreatable = dir
+        .path()
+        .join("no_such_dir")
+        .join("ro_refused_at_pass.mcap");
+    let err = ro_verify(&bag, &uncreatable, None).expect_err("the output cannot be created");
+    assert_eq!(err.exit_code(), 5, "PREMISE: the open comes first: {err}");
+    assert!(
+        err.to_string().contains("--record-out cannot create"),
+        "{err}"
+    );
+    let out = dir.path().join("ro_refused_at_pass.mcap");
+    let err = ro_verify(&bag, &out, None).expect_err("a frame index over its budget is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert!(
+        err.to_string()
+            .contains("verifier_declined_frame_index_budget"),
+        "the refusal is the frame budget's: {err}"
+    );
+    assert!(!out.exists(), "a refused verify leaves no output bag");
+    logs_assert(ro_assert_no_writer_warning);
+}
+
+/// **A `--verify` aborted after a rank wrote frames leaves no `--record-out`
+/// bag and logs no writer warning.**
+///
+/// `src` runs on rank 0 and its two readers on rank 1. Rank 0 reads nothing,
+/// so a frame budget of one frame holds its pass, which writes `src`'s frames
+/// to the output; rank 1 reads `src`'s recorded frames, more than one, so its
+/// pass is refused with exit 2. The partial report names rank 1 as the
+/// failing rank and rank 0 as completed. CONTROL on the same bag: at the
+/// shipped budget the verify passes and its output bag holds `src`'s frames.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_resim_aborted_after_a_rank_wrote_frames_leaves_no_output_bag() {
+    let live = ri_record(ri_evict_yaml(), ri_evict_factories);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("ro_two_rank.mcap");
+    ri_two_rank_bag(&live.rec, &bag, |id| id != "src");
+    let control = dir.path().join("ro_two_rank_control.mcap");
+    let outcome = ro_verify(&bag, &control, None).expect("the control verifies");
+    ro_assert_finished(&outcome, &control, &bag);
+
+    let out = dir.path().join("ro_two_rank_aborted.mcap");
+    let report = dir.path().join("ro_two_rank_aborted.json");
+    let err = {
+        let _budget = replay_engine::override_frame_index_record_budget(1);
+        ro_verify(&bag, &out, Some(report.clone())).expect_err("rank 1 is refused")
+    };
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert!(
+        err.to_string()
+            .contains("verifier_declined_frame_index_budget"),
+        "the refusal is the frame budget's: {err}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&report).expect("the partial report is written"))
+            .expect("the partial report is JSON");
+    assert_eq!(json["aborted"]["failed_at_rank"], 1, "{json}");
+    assert_eq!(
+        json["rank_execution"]
+            .as_array()
+            .map(|ranks| ranks.iter().map(|r| r["rank"].clone()).collect::<Vec<_>>()),
+        Some(vec![serde_json::json!(0)]),
+        "rank 0 completed its pass: {json}"
+    );
+    assert!(!out.exists(), "an aborted verify leaves no output bag");
+    logs_assert(ro_assert_no_writer_warning);
+}
+
 /// The feed index bytes a fed replay of `bag` needs, read off the refusal a
 /// zero budget answers.
 fn ri_feed_index_need(bag: &std::path::Path, duration_bound_ns: Option<u64>) -> u64 {

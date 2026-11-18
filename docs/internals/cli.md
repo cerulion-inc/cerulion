@@ -35,7 +35,10 @@ modes. `--duration D` bounds the run in SECONDS OF BAG TIME and is legal in both
 per-rank resim has k step axes and no shared step number, which is why there is no tick
 bound); `--record-out` shapes what the run PRODUCES and is legal in both modes
 (`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic labelled
-with the schema the re-executed graph publishes, a partial file removed on any run that does not finish, and the
+with the schema the re-executed graph publishes, opened only after the whole-run checks so a refused
+bag creates none, a partial file removed on any run that does not finish, its writer abandoned first
+when the run stops before finalize (`BagWriter::abandon`, so no unfinalized-writer warning; a removal
+that fails warns), and the
 engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
 REQUIRE `--verify`, and so does `--feed-index-budget`, the bytes a fed replay's frame
 index and the producer labels it reads are charged (`replay_feed::FeedNeed::check_budget`;
