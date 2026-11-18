@@ -71,6 +71,21 @@ struct Pin {
 }
 
 const RESTORATION_BUDGET: Duration = Duration::from_secs(5);
+/// How long a serving start waits for a controller state held by another
+/// operation before it cancels its live WAN pins. It covers the short holders
+/// (demand admission, a release, an identity refresh apply) and stops well short
+/// of the metadata I/O that holds the state for seconds, so the new child is
+/// supervised promptly either way.
+const RESTORATION_LOCK_GRACE: Duration = Duration::from_millis(250);
+/// The first pause between attempts on a held state; each later pause doubles up
+/// to [`RESTORATION_LOCK_MAX_PAUSE`], so a short holder is met within about a
+/// millisecond and a holder that outlasts the grace costs a few wakes.
+const RESTORATION_LOCK_FIRST_PAUSE: Duration = Duration::from_millis(1);
+const RESTORATION_LOCK_MAX_PAUSE: Duration = Duration::from_millis(64);
+const _: () = assert!(
+    RESTORATION_LOCK_GRACE.as_millis() < RESTORATION_BUDGET.as_millis(),
+    "the wait for the state is spent from the restoration budget"
+);
 
 fn restoration_time_left(deadline: Instant, now: Instant) -> Option<Duration> {
     deadline
@@ -353,7 +368,18 @@ impl AccountWanController {
         if !state.account_mode {
             return Ok(());
         }
-        let current = match self.read_identity() {
+        let current = self.read_identity();
+        Self::apply_identity(state, current)
+    }
+
+    /// Compare a loaded identity with the installed one and apply it: a changed
+    /// account or device key invalidates, a renewed proof replaces the owner
+    /// certificate, and an unchanged stamp is a no-op.
+    fn apply_identity(
+        state: &mut State,
+        current: Result<IdentitySnapshot, SnapshotError>,
+    ) -> Result<(), String> {
+        let current = match current {
             Ok(current) => current,
             Err(SnapshotError::Busy) => return Err(IDENTITY_BUSY.into()),
             Err(_) => {
@@ -511,16 +537,47 @@ impl AccountWanController {
         self.fence_reply(&mut state, &stamp)
     }
 
+    /// The periodic identity check. The identity files are read and decoded with
+    /// the state unlocked; the state is held only to retire pending keys and to
+    /// compare and apply the loaded identity.
     fn refresh(&self, registry: &mut DemandRegistry) -> Result<(), String> {
+        let Some(loaded_against) = self.refresh_start(registry)? else {
+            return Ok(());
+        };
+        let current = self.read_identity();
+        self.refresh_apply(registry, &loaded_against, current)
+    }
+
+    /// Retire pending keys and return the installed identity's stamp, or `None`
+    /// outside account mode.
+    fn refresh_start(
+        &self,
+        registry: &mut DemandRegistry,
+    ) -> Result<Option<crate::identity_snapshot::IdentityStamp>, String> {
         let mut state = self.state()?;
         self.retire_pending(&mut state, registry)?;
         if !state.account_mode {
-            return Ok(());
+            return Ok(None);
         }
-        if state.identity.is_none() {
-            return Err(NEED_INSTALL.into());
+        Ok(Some(
+            state.identity.as_ref().ok_or(NEED_INSTALL)?.stamp().clone(),
+        ))
+    }
+
+    /// Apply an identity loaded against `loaded_against`. An identity installed,
+    /// synchronized or cleared during the load was applied by that operation from
+    /// its own read, so this older load is dropped and the next refresh reads again.
+    fn refresh_apply(
+        &self,
+        registry: &mut DemandRegistry,
+        loaded_against: &crate::identity_snapshot::IdentityStamp,
+        current: Result<IdentitySnapshot, SnapshotError>,
+    ) -> Result<(), String> {
+        let mut state = self.state()?;
+        if state.identity.as_ref().map(IdentitySnapshot::stamp) != Some(loaded_against) {
+            return self.retire_pending(&mut state, registry);
         }
-        match self.read_identity() {
+        match current {
             Err(SnapshotError::Busy) => {
                 let now = Instant::now();
                 let since = *state.busy_since.get_or_insert(now);
@@ -530,9 +587,9 @@ impl AccountWanController {
                 }
                 Err(IDENTITY_BUSY.into())
             }
-            _ => {
+            current => {
                 state.busy_since = None;
-                let result = self.sync_identity(&mut state);
+                let result = Self::apply_identity(&mut state, current);
                 self.retire_pending(&mut state, registry)?;
                 result
             }
