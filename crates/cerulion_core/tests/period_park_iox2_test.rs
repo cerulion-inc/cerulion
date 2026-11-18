@@ -62,7 +62,7 @@ fn refusal_reading(tag: &str, feed: &str, doorbell: bool) -> Option<&'static str
         "sink".to_string(),
         Box::new(SinkEntry::with_state(Sink::default())),
     );
-    let mut rt = GraphRuntime::build_live_with_schema_hashes_and_policy(
+    let rt = GraphRuntime::build_live_with_schema_hashes_and_policy(
         config(
             &format!("ppk_{tag}"),
             &format!("ppk{tag}"),
