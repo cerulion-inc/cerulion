@@ -474,19 +474,17 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 and no stub job standing in for a skipped required check.
 
 `lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
-`cli-e2e-latency`), which no pull request and no queued batch runs; a red `lint` saves their
-runner minutes, and none of the four reports a required context. It gates none of the four
-dependants that DO report one (`docs`, `netd-wan`, `crate-tests`, `viz-tests`): each carries
-the `!cancelled()` guard, which replaces the implicit `success()` over the whole `needs:` set;
-GitHub offers no per-dependency form, so all four run and report through a red `lint`, and the
-dependency buys the ordering alone. A skipped required context counts as satisfied, which is
-what the guard is there to stop. It does NOT gate the two that set the wall: `test-linux` and
-`test-macos`. Both list `changes` and nothing else in `needs:`, so both start after the
-classifier, which is a checkout and a path classification, about a minute, and no build. No
-REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
-in front of either job is a data dependency for compilation. A `lint` verdict was never one
-either, and while it gated them the wall was `lint` plus the longest test job instead of the
-longest test job.
+`cli-e2e-latency`), which no pull request and no queued batch runs: their `if:` carries no
+status function, so a red `lint` skips them and saves their runner minutes. `python-client`
+also lists it, but carries `!cancelled()` because it needs `changes`, so it runs through a red
+`lint` and the dependency only orders it; it reports no required context. No job that reports
+a required context waits for `lint`. `docs` and `netd-wan` list no `needs:` at all and start at once;
+`test-linux`, `test-macos`, `crate-tests` and `viz-tests` list `changes` and nothing else, so
+they start after the classifier, which is a checkout and a path classification, about a
+minute, and no build. No REBUILD waits on `lint`: each job builds what it runs, so nothing in
+front of any of them is a data dependency for compilation. A `lint` verdict was never one
+either, and while it gated a job that job started a whole `lint` run late. `Lint` is its own
+required context, so a red one still blocks the pull request.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
@@ -534,6 +532,12 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 `demos-go2`, `netd-wan`, `docs`, `deps` (cargo-deny,
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
+
+The repeat legs run one test binary 20 times in a row on one runner, on every event but a
+merge-queue batch, so a change that makes that test fail now and then shows as a red even when a single
+run passes: `rcpd-eye-host-repeat` runs `cerulion_rcpd`'s `eye_host_test`. Every step past
+the checkout is gated on the package's selection, and none reports a required context; the
+package's own step in its test job is the one a merge waits for.
 
 `examples` opens with a lockfile WALK: `cargo metadata --locked` over every tracked
 `Cargo.lock` outside the root (the benches, the examples, the Python wheel, the Android sample
