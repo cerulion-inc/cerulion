@@ -1961,19 +1961,39 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
     // direction that puts the tail back on a runner chosen by an unrelated PR.
     // The second pin, the waiver gate whose shard also builds the binaries it
     // asks about, is held to the same line for the same reason.
-    for expected_pin in [
-        "pinned: macro_compile_fail_test -> shard 2",
-        "pinned: upstream_waivers_test -> shard 1",
+    // Both lanes are held: the bare `--check` is the Linux count, and the macOS
+    // lane's three shards are checked as well, so a pin index that lands right on
+    // one lane and wrong on the other is a red.
+    let macos = std::process::Command::new("bash")
+        .arg(&script)
+        .args(["--check", "cerulion_core", "3"])
+        .current_dir(repo_root())
+        .output()
+        .expect("running tools/scripts/ci_test_shard.sh --check cerulion_core 3");
+    assert!(
+        macos.status.success(),
+        "tools/scripts/ci_test_shard.sh --check cerulion_core 3 FAILED:\n{}",
+        String::from_utf8_lossy(&macos.stderr)
+    );
+    let macos_stdout = String::from_utf8_lossy(&macos.stdout).into_owned();
+    for (got, expected_pin) in [
+        (&*stdout, "pinned: macro_compile_fail_test -> shard 2/4"),
+        (&*stdout, "pinned: upstream_waivers_test -> shard 1/4"),
+        (
+            &*macos_stdout,
+            "pinned: macro_compile_fail_test -> shard 2/3",
+        ),
+        (&*macos_stdout, "pinned: upstream_waivers_test -> shard 0/3"),
     ] {
         assert!(
-            stdout.contains(expected_pin),
+            got.contains(expected_pin),
             "the --check pin line is missing.\n\
              Expected a line containing: {expected_pin}\n\
              Either the pin moved (re-balance the package map in \
              .github/workflows/ci.yml to match), or its target file was renamed \
              or deleted (see PINNED_TEST and WAIVER_PINNED_TEST in \
              tools/scripts/ci_test_shard.sh).\n\
-             got:\n{stdout}"
+             got:\n{got}"
         );
     }
 }
