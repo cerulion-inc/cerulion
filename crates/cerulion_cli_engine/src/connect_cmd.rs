@@ -42,6 +42,7 @@ const CONNECTD_CHILD: ChildName = ChildName {
     not_found_hint: "The release packages place `cerulion-connectd` beside `cerulion`; from a \
                      checkout of the Cerulion source tree build it with `cargo build -p \
                      cerulion_connectd`, or set CERULION_CONNECTD_BIN.",
+    shutdown_grace: CONNECTD_SHUTDOWN_GRACE,
 };
 
 /// How [`spawn_child_and_wait`] names the child it runs in its own messages.
@@ -53,6 +54,9 @@ pub struct ChildName {
     /// What to do when the program is not there, appended to the spawn error
     /// for that one cause.
     pub not_found_hint: &'static str,
+    /// How long the program has to exit after the forwarded SIGINT before the
+    /// SIGKILL backstop.
+    pub shutdown_grace: Duration,
 }
 
 /// The `cerulion-connectd` binary name (+ the platform exe suffix).
@@ -712,7 +716,7 @@ pub fn spawn_child_and_wait(
             // not get it) — forward + reap so nothing is orphaned. A missing final
             // status (the wait errored) maps to a nonzero (1), NEVER a synthesized
             // 0 — the child's fate is unknown, which is not a clean success.
-            let status = forward_shutdown_to_child(&mut child, name);
+            let status = forward_shutdown_to_child(&mut child, label);
             return Ok(status.map(exit_code_of).unwrap_or(1));
         }
         std::thread::sleep(CONNECT_POLL_INTERVAL);
@@ -749,11 +753,12 @@ fn signal_exit_code(_status: ExitStatus) -> i32 {
 /// Forward a graceful shutdown to the child + reap it, returning its final status
 /// (mirrors `graph_cmd::GatewayChild::forward_shutdown`).
 ///
-/// Unix: SIGINT (the signal `cerulion-connectd`'s `ctrl_c` handler honors) for a
-/// [`CONNECTD_SHUTDOWN_GRACE`] window, then a SIGKILL backstop. Non-Unix: `kill`
-/// (there is no `libc::kill`).
+/// Unix: SIGINT (the signal `cerulion-connectd`'s `ctrl_c` handler honors) for
+/// the child's [`ChildName::shutdown_grace`] window, then a SIGKILL backstop.
+/// Non-Unix: `kill` (there is no `libc::kill`).
 #[cfg(unix)]
-fn forward_shutdown_to_child(child: &mut Child, name: &'static str) -> Option<ExitStatus> {
+fn forward_shutdown_to_child(child: &mut Child, label: &ChildName) -> Option<ExitStatus> {
+    let name = label.name;
     let pid = child.id();
     // SAFETY: FFI `kill` of OUR OWN un-reaped child pid with SIGINT. The child is
     // owned + un-reaped (nothing calls `wait` on it until the poll loop below), so it
@@ -773,7 +778,7 @@ fn forward_shutdown_to_child(child: &mut Child, name: &'static str) -> Option<Ex
         }
     }
     // Poll for graceful exit within the grace window.
-    let deadline = Instant::now() + CONNECTD_SHUTDOWN_GRACE;
+    let deadline = Instant::now() + label.shutdown_grace;
     while Instant::now() < deadline {
         match child.try_wait() {
             Ok(Some(status)) => return Some(status),
@@ -788,7 +793,7 @@ fn forward_shutdown_to_child(child: &mut Child, name: &'static str) -> Option<Ex
 
 /// Non-Unix: no `libc::kill` — SIGKILL + reap is the only teardown.
 #[cfg(not(unix))]
-fn forward_shutdown_to_child(child: &mut Child, _name: &'static str) -> Option<ExitStatus> {
+fn forward_shutdown_to_child(child: &mut Child, _label: &ChildName) -> Option<ExitStatus> {
     let _ = child.kill();
     child.wait().ok()
 }
@@ -1384,6 +1389,44 @@ mod tests {
             result.unwrap(),
             130,
             "a signal-killed child maps to 128 + SIGINT(2) = 130, never a synthesized 0"
+        );
+    }
+
+    /// The forwarded SIGINT gives the child its own [`ChildName::shutdown_grace`]:
+    /// a child that takes one second to stop on SIGINT exits 0 inside a 20 s
+    /// grace, and is killed by the backstop (128 + SIGKILL(9) = 137) when its
+    /// grace is 200 ms.
+    #[cfg(unix)]
+    #[test]
+    fn spawn_child_and_wait_holds_the_backstop_for_the_childs_own_grace() {
+        let stop_in_a_second = || ConnectPlan {
+            bin: PathBuf::from("sh"),
+            argv: vec![
+                "-c".to_string(),
+                "trap 'sleep 1; exit 0' INT; while :; do sleep 0.1; done".to_string(),
+            ],
+        };
+        let run = |grace: Duration| {
+            let running = Arc::new(AtomicBool::new(true));
+            let running_flip = running.clone();
+            // Flip the flag once the child has set its trap (a directed SIGTERM to
+            // `cerulion` only).
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                running_flip.store(false, Ordering::SeqCst);
+            });
+            let label = ChildName {
+                name: "a child that stops in a second",
+                not_found_hint: "",
+                shutdown_grace: grace,
+            };
+            spawn_child_and_wait(&stop_in_a_second(), running, &label).unwrap()
+        };
+        assert_eq!(run(Duration::from_secs(20)), 0, "stopped inside its grace");
+        assert_eq!(
+            run(Duration::from_millis(200)),
+            137,
+            "killed at the backstop"
         );
     }
 

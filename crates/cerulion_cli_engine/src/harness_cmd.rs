@@ -25,6 +25,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::connect_cmd::{ChildName, ConnectPlan};
 use crate::error::{CliError, CliResult};
@@ -45,10 +46,18 @@ pub const INSTALL_SCRIPT: &str = "install.sh";
 /// The shell the launcher is written for.
 const SHELL: &str = "bash";
 
-/// How the spawn names the launcher in its messages.
+/// How long the sim server has to stop after the forwarded SIGINT: it scores
+/// and stops the simulator of every live episode, waits for a simulator that is
+/// still starting, and over HTTP waits up to its `stop_grace_s` setting (10 s by
+/// default) for the open connections. A launcher killed at the backstop leaves its
+/// simulators running until the next `cerulion rcp --sim` stops them.
+pub const HARNESS_SHUTDOWN_GRACE: Duration = Duration::from_secs(60);
+
+/// How the spawn names the launcher in its messages, and its shutdown grace.
 pub const HARNESS_CHILD: ChildName = ChildName {
     name: "the Cerulion harness",
     not_found_hint: "The harness runs under `bash`; install it, or put it on PATH.",
+    shutdown_grace: HARNESS_SHUTDOWN_GRACE,
 };
 
 /// What a harness invocation runs, with its parsed flags.
