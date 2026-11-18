@@ -6215,6 +6215,91 @@ jobs:
         run: |
           echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
 
+  # The owner pair serving transition test, run 20 times in a row on one
+  # runner, so a change that makes it fail now and then shows as a red here
+  # even when a single run passes. It runs on every event but a merge-queue
+  # batch, whose pull request ran it already. Every step past the checkout is
+  # gated on `cerulion_netd` being in the classifier's selection, so a pull
+  # request that selects nothing here spends one checkout. It restores the
+  # `test-linux` cache for the shared dependencies only (shard 0 saves it,
+  # trimmed to the units its own commands read), builds the rest itself, and
+  # saves nothing. Each run must report exactly one passed test, so a filter
+  # that matches nothing is a red rather than twenty empty passes. It reports
+  # no required context; the `cerulion_netd` step of `test-linux` shard 3 is
+  # the one a merge waits for.
+  netd-owner-pair-transition-repeat:
+    name: netd owner pair transition test, 20 runs (ubuntu-latest)
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Reclaim preinstalled SDK bloat (crib netd-wan) so the restored target
+      # and the iroh tree fit on the stock runner.
+      - name: Free disk space
+        if: >-
+          runner.environment == 'github-hosted'
+          && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        run: |
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /usr/local/share/powershell \
+                      /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install Rust toolchain
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
+            cargo-${{ runner.os }}-
+
+      - name: cerulion_netd owner pair transition test, 20 runs
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        run: |
+          set -euo pipefail
+          cargo build -p cerulion_cli -p cerulion_remoted
+          for run in $(seq 1 20); do
+            echo "owner pair transition test: run $run of 20"
+            cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- \
+              --exact owner_pair::controller::transition::serving_transition_restores_canonical_and_observer_pins_on_the_same_subscribers \
+              --test-threads=1 2>&1 | tee "$RUNNER_TEMP/run-$run.log"
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed' "$RUNNER_TEMP/run-$run.log"; then
+              echo "owner pair transition test: run $run of 20 did not report exactly one passed test" >&2
+              exit 1
+            fi
+          done
+
+      - name: selection marker, cerulion_netd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_netd (selected: $SELECTED)"
+
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
     needs: [changes]

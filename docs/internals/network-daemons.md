@@ -165,6 +165,12 @@ remove them before committing.
   `serving_ready` to restore retained WAN pins once the owned socket admits work,
   and `end_serving` after child and fetch reap, also on transfer or spawn failure.
   Controllers preserve holders and schema pins or notify holders of failed restores.
+  `serving_ready` waits up to 250 ms for a controller state another operation holds,
+  then cancels every live WAN pin, names the first in its error, and leaves each
+  holder's loss to registry retirement. `AccountWanController` counts the
+  serving starts that met a held state (`restoration_contentions`) and the ones that
+  cancelled pins (`restoration_busy_cancellations`). The identity watch reads the
+  identity files with that state unlocked.
   Incoming TLS handshakes run in at most 32 concurrent workers for at most 10 s.
   Arrivals other than paired relay keys fill at most 24: unvalidated addresses
   retry at half capacity, validated IPs hold at most four, unpaired relay arrivals
