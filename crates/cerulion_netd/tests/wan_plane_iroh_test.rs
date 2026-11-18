@@ -470,22 +470,55 @@ fn oracle_frame(seq: u32) -> Vec<u8> {
 }
 
 /// Spawn a producer publishing `oracle_frame(seq)` for seq = 0,1,2,… until `stop`.
+/// Returns once `manager` counts exactly one live publisher on `topic`.
 fn spawn_producer(
     manager: Arc<TransportManager>,
     topic: String,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
-        let mut publisher = manager
-            .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
-            .expect("producer");
-        let mut seq = 0u32;
-        while !stop.load(Ordering::Relaxed) {
-            let _ = publisher.publish_raw(&oracle_frame(seq));
-            seq = seq.wrapping_add(1);
-            std::thread::sleep(Duration::from_millis(5));
+    let producer = {
+        let manager = manager.clone();
+        let topic = topic.clone();
+        std::thread::spawn(move || {
+            let mut publisher = manager
+                .create_publisher_simple(&topic, MaxSliceLen::const_new(256))
+                .expect("producer");
+            let mut seq = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                let _ = publisher.publish_raw(&oracle_frame(seq));
+                seq = seq.wrapping_add(1);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })
+    };
+    wait_for_one_producer(&manager, &topic, &producer);
+    producer
+}
+
+/// Wait until `manager` counts exactly one live publisher on `topic`. A robot
+/// refuses a graph ingress demand under any other count, and a publisher's
+/// service exists, with no publisher counted, before the publisher itself does.
+fn wait_for_one_producer(
+    manager: &TransportManager,
+    topic: &str,
+    producer: &std::thread::JoinHandle<()>,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let count = manager.topic_publisher_count_checked(topic);
+        if count == Some(1) {
+            return;
         }
-    })
+        assert!(
+            !producer.is_finished(),
+            "the producer on {topic} ended before it was counted"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "{topic} never counted exactly one live publisher; last count {count:?}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Attach a desk-local data-only tap on `topic` (poll-retry until the ingress service
