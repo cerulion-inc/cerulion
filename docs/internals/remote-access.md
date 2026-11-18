@@ -204,6 +204,16 @@ Load-bearing boundary contracts:
   or validated them. Authentication, session ownership and watchdogs remain
   the caller's responsibility.
 
+- **Session outcome rules**: `remote_session::termination_reason` checks reached
+  duration or idle limits before revocation, including equality at a limit.
+  `delivered_count` counts all observed bytes with saturation, returns only the
+  permitted prefix, and keeps truncation sticky. The caller keeps separate
+  counters for stdout and stderr. `forward_drained_output` permits natural-exit
+  output for Exited or CleanupFailed only while no independent stop is present.
+  `final_receipt_outcome` makes witness failure an Error regardless of leader
+  status; a successful witness earns Ok only for ordinary exit. These functions
+  use caller-supplied state; they perform no clock, process or transport I/O.
+
 - **Session context**: `session_context::{SessionContext, SessionLimits}` holds
   transport-supplied identity, callbacks and unchanged resource limits. Its limits
   re-export the type used by `RemotedConfig::remote_shell_limits`; defaults and
