@@ -336,11 +336,15 @@ node (`sync_unfired_since_anchor`). Each of these stand-downs, the
 two-subscriber one included, prints a warning on stderr on every run, naming
 the node, the code, the bag's `trace_format` and the checkpoint step, and
 changes no exit code; its `stand_down` note is in the `--report` JSON, which
-only a `--verify` run writes. For a `Sync` node a `--verify` replay reaches
-this rule only on a bag below trace format 8: from format 8 a free-run
+only a `--verify` run writes. For a per-set `Sync` node a `--verify` replay
+reaches this rule only on a bag below trace format 8: from format 8 a free-run
 `--verify` is fed by read identity, which refuses a per-set `Sync` stage
 before its first step (`read_identity_ungateable_stage`, exit 2), so on such
-a bag a neutral `--resim all` is the replay that reaches it.
+a bag a neutral `--resim all` is the replay that reaches it. A node that
+exports no state shape, such as a Python node, has no checkpoint part on any
+trace format, so the recording never states its stop: on a resumed pass where
+it neither fires nor reads in its body, these rules stand it down by name from
+trace format 10 too.
 
 ### Divergence LOCALIZES to the producing rank
 

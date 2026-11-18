@@ -2914,7 +2914,7 @@ fn verify_sync(
     // no verdict on it rests on carried heads, a finding that it fired
     // included. Nor does one on a node the pass never ran whose stop the
     // checkpoint does not state (`OwedFire::StandsDown`): it has no recorded
-    // fire for arms A and B to judge, and arm C stands down for it.
+    // fire for arms A and B to judge, and arm C reads only the narrow map.
     let note_at = report.carried_heads.len();
     if node.has_non_trigger_inputs
         && matches!(owed_fire, OwedFire::Judged)

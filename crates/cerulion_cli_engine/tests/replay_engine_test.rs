@@ -28094,7 +28094,8 @@ fn assert_format_nine_bag_and_young_capture_stand_the_sink_down(
 /// The same records and `parts` stamped at trace format 10, at which the
 /// sink's part without the stopped flag states it running: a neutral
 /// `--resim all` stands nothing down and reports the fire-schedule difference
-/// whose detail holds each of `divergence`, which `--verify` exits 6 on.
+/// whose detail holds each of `divergence`, a verdict that maps to exit 6
+/// under `--verify`.
 fn assert_format_ten_states_the_sink_running(
     stem: &str,
     rec: &Recording,
@@ -28150,7 +28151,7 @@ fn sink_part(part: Vec<u8>) -> (&'static str, u32, Vec<Vec<u8>>) {
 /// difference there, and a `--verify` replay of the slice as a young capture
 /// holds it, fed by that one drain read, does the same; each logs one WARN.
 /// At trace format 10 the same part states the sink running, so the same
-/// pop is a finding at step 4, exit 6 under `--verify`.
+/// pop is a finding at step 4, whose verdict maps to exit 6 under `--verify`.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
