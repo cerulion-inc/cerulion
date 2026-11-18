@@ -599,3 +599,120 @@ fn rcp_without_the_network_switch_stays_behind_the_login_gate() {
     assert!(stdout.is_empty(), "stdout={stdout}");
     assert_no_identity_was_written(home.path());
 }
+
+/// A harness folder whose launcher writes the words it was run with to
+/// `<dir>/ran.txt`, prints `MCP-STREAM` on stdout and exits 3: a run that
+/// reached the launcher leaves the file, and the exit code and stdout show the
+/// CLI handed both back untouched.
+fn recording_harness(dir: &Path) {
+    std::fs::write(
+        dir.join("rcp.sh"),
+        "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/ran.txt\"\nprintf 'MCP-STREAM\\n'\nexit 3\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("install.sh"), "exit 9\n").unwrap();
+}
+
+/// Every form of the simulated robot and the benchmark.
+const HARNESS_FORMS: &[&[&str]] = &[
+    &["rcp", "--sim"],
+    &["rcp", "--sim", "--http", "127.0.0.1:8765"],
+    &["rcp", "bench", "--model", "m"],
+    &["rcp", "bench", "--verify"],
+];
+
+#[test]
+fn the_simulated_robot_and_the_bench_stay_behind_the_login_gate() {
+    // A machine that never signed in is refused before the harness runs, with
+    // or without the network switch: the launcher never starts.
+    for args in HARNESS_FORMS {
+        for network in ["", "off"] {
+            let home = tempfile::tempdir().unwrap();
+            let harness = tempfile::tempdir().unwrap();
+            recording_harness(harness.path());
+            let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+            let dir = harness.path().to_str().unwrap();
+            let (code, stdout, stderr) = run_cerulion_at(
+                home.path(),
+                cwd.path(),
+                &[("CERULION_NETWORK", network), ("CERULION_HARNESS_DIR", dir)],
+                args,
+            );
+            assert!(
+                stderr.contains(REFUSAL_A_USER_READS),
+                "{args:?} network={network:?}: the whole refusal; stderr={stderr}"
+            );
+            assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
+            assert!(stdout.is_empty(), "stdout={stdout}");
+            assert!(
+                !harness.path().join("ran.txt").exists(),
+                "{args:?} network={network:?}: the launcher ran before the gate"
+            );
+            assert_no_identity_was_written(home.path());
+        }
+    }
+}
+
+#[test]
+fn a_signed_in_machine_runs_the_harness_launcher_and_hands_back_its_stream_and_code() {
+    // The control for the arm above: on a signed-in home every form runs the
+    // launcher of the folder CERULION_HARNESS_DIR names, under bash, with the
+    // words hand-written below, and the CLI adds nothing to its stdout and
+    // returns its exit code.
+    let version = env!("CARGO_PKG_VERSION");
+    for (args, words) in [
+        (HARNESS_FORMS[0], &["sim"][..]),
+        (HARNESS_FORMS[1], &["sim", "--http", "127.0.0.1:8765"][..]),
+        (HARNESS_FORMS[2], &["bench", "--model", "m"][..]),
+        (HARNESS_FORMS[3], &["verify"][..]),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
+        let harness = tempfile::tempdir().unwrap();
+        recording_harness(harness.path());
+        let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+        let dir = harness.path().to_str().unwrap();
+        let (code, stdout, stderr) = run_cerulion_at(
+            home.path(),
+            cwd.path(),
+            &[("CERULION_NETWORK", "off"), ("CERULION_HARNESS_DIR", dir)],
+            args,
+        );
+        assert_eq!(code, Some(3), "{args:?}: stderr={stderr}");
+        assert_eq!(stdout, "MCP-STREAM\n", "{args:?}: stderr={stderr}");
+        let ran = std::fs::read_to_string(harness.path().join("ran.txt")).unwrap();
+        let mut want = vec![
+            "--home".to_string(),
+            home.path()
+                .join("harness")
+                .join(version)
+                .display()
+                .to_string(),
+        ];
+        want.extend(words.iter().map(|w| w.to_string()));
+        assert_eq!(ran.lines().collect::<Vec<_>>(), want, "{args:?}");
+    }
+}
+
+#[test]
+fn a_harness_folder_that_does_not_exist_is_named_and_nothing_runs() {
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let missing = cwd.path().join("no-harness-here");
+    let (code, stdout, stderr) = run_cerulion_at(
+        home.path(),
+        cwd.path(),
+        &[("CERULION_HARNESS_DIR", missing.to_str().unwrap())],
+        &["rcp", "--sim"],
+    );
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "Error: CERULION_HARNESS_DIR names '{}', which does not exist",
+            missing.display()
+        )),
+        "stderr={stderr}"
+    );
+}

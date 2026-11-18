@@ -36,6 +36,25 @@ const CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// before the SIGKILL backstop (mirrors the gateway's `GATEWAY_SHUTDOWN_GRACE`).
 const CONNECTD_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// The child [`spawn_and_wait`] runs, as its messages name it.
+const CONNECTD_CHILD: ChildName = ChildName {
+    name: "cerulion-connectd",
+    not_found_hint: "The release packages place `cerulion-connectd` beside `cerulion`; from a \
+                     checkout of the Cerulion source tree build it with `cargo build -p \
+                     cerulion_connectd`, or set CERULION_CONNECTD_BIN.",
+};
+
+/// How [`spawn_child_and_wait`] names the child it runs in its own messages.
+#[derive(Debug, Clone, Copy)]
+pub struct ChildName {
+    /// The program as a user knows it: the wait error and the shutdown warning
+    /// carry it.
+    pub name: &'static str,
+    /// What to do when the program is not there, appended to the spawn error
+    /// for that one cause.
+    pub not_found_hint: &'static str,
+}
+
 /// The `cerulion-connectd` binary name (+ the platform exe suffix).
 fn connectd_bin_name() -> String {
     format!("cerulion-connectd{}", std::env::consts::EXE_SUFFIX)
@@ -634,6 +653,19 @@ pub fn plan(args: &ConnectArgs) -> CliResult<ConnectPlan> {
 /// `128 + signo` (NEVER a synthesized 0), so a keystroke-killed child never reads
 /// as a clean success (a graceful signal handler still exits 0 on its own).
 pub fn spawn_and_wait(plan: &ConnectPlan, running: Arc<AtomicBool>) -> CliResult<i32> {
+    spawn_child_and_wait(plan, running, &CONNECTD_CHILD)
+}
+
+/// [`spawn_and_wait`] for any program: spawn `plan` with inherited stdio, wait
+/// for it, forward a termination signal that reached `cerulion` alone and reap
+/// the child, and return its exit code under the same mapping. `label` is how
+/// the messages name the program.
+pub fn spawn_child_and_wait(
+    plan: &ConnectPlan,
+    running: Arc<AtomicBool>,
+    label: &ChildName,
+) -> CliResult<i32> {
+    let name = label.name;
     let mut cmd = std::process::Command::new(&plan.bin);
     cmd.args(&plan.argv);
     // Make the forwarded shutdown SIGINT
@@ -651,18 +683,14 @@ pub fn spawn_and_wait(plan: &ConnectPlan, running: Arc<AtomicBool>) -> CliResult
     // `ctrl_c` handler over SIG_DFL cleanly, and an un-handled child dies by
     // SIGINT → 128+2. This NEVER weakens the non-zero guard.
     crate::child_signals::make_sigint_deliverable(&mut cmd);
+    let hint = label.not_found_hint;
     let mut child = cmd.spawn().map_err(|e| {
         // The "build it" remedy is right for ENOENT and WRONG for anything else —
         // including a `pre_exec` refusal from `make_sigint_deliverable`, which
         // would otherwise send the operator to rebuild a binary that is already
         // there. `ros2_graph::Ros2Children::spawn` splits the same two cases.
         CliError::Validation(if e.kind() == std::io::ErrorKind::NotFound {
-            format!(
-                "failed to spawn '{}': {e}. The release packages place `cerulion-connectd` \
-                 beside `cerulion`; from a checkout of the Cerulion source tree build it with \
-                 `cargo build -p cerulion_connectd`, or set CERULION_CONNECTD_BIN.",
-                plan.bin.display()
-            )
+            format!("failed to spawn '{}': {e}. {hint}", plan.bin.display())
         } else {
             format!("failed to spawn '{}': {e}", plan.bin.display())
         })
@@ -675,7 +703,7 @@ pub fn spawn_and_wait(plan: &ConnectPlan, running: Arc<AtomicBool>) -> CliResult
             Ok(None) => {}
             Err(e) => {
                 return Err(CliError::Validation(format!(
-                    "waiting on cerulion-connectd failed: {e}"
+                    "waiting on {name} failed: {e}"
                 )))
             }
         }
@@ -684,7 +712,7 @@ pub fn spawn_and_wait(plan: &ConnectPlan, running: Arc<AtomicBool>) -> CliResult
             // not get it) — forward + reap so nothing is orphaned. A missing final
             // status (the wait errored) maps to a nonzero (1), NEVER a synthesized
             // 0 — the child's fate is unknown, which is not a clean success.
-            let status = forward_shutdown_to_child(&mut child);
+            let status = forward_shutdown_to_child(&mut child, name);
             return Ok(status.map(exit_code_of).unwrap_or(1));
         }
         std::thread::sleep(CONNECT_POLL_INTERVAL);
@@ -725,7 +753,7 @@ fn signal_exit_code(_status: ExitStatus) -> i32 {
 /// [`CONNECTD_SHUTDOWN_GRACE`] window, then a SIGKILL backstop. Non-Unix: `kill`
 /// (there is no `libc::kill`).
 #[cfg(unix)]
-fn forward_shutdown_to_child(child: &mut Child) -> Option<ExitStatus> {
+fn forward_shutdown_to_child(child: &mut Child, name: &'static str) -> Option<ExitStatus> {
     let pid = child.id();
     // SAFETY: FFI `kill` of OUR OWN un-reaped child pid with SIGINT. The child is
     // owned + un-reaped (nothing calls `wait` on it until the poll loop below), so it
@@ -738,8 +766,9 @@ fn forward_shutdown_to_child(child: &mut Child) -> Option<ExitStatus> {
         if err.raw_os_error() != Some(libc::ESRCH) {
             tracing::warn!(
                 pid,
+                child = name,
                 error = %err,
-                "kill(SIGINT) to cerulion-connectd FAILED — falling back to the SIGKILL backstop"
+                "kill(SIGINT) to the child FAILED, falling back to the SIGKILL backstop"
             );
         }
     }
@@ -759,7 +788,7 @@ fn forward_shutdown_to_child(child: &mut Child) -> Option<ExitStatus> {
 
 /// Non-Unix: no `libc::kill` — SIGKILL + reap is the only teardown.
 #[cfg(not(unix))]
-fn forward_shutdown_to_child(child: &mut Child) -> Option<ExitStatus> {
+fn forward_shutdown_to_child(child: &mut Child, _name: &'static str) -> Option<ExitStatus> {
     let _ = child.kill();
     child.wait().ok()
 }

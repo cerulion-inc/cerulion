@@ -228,6 +228,7 @@ fn command(
         .env_remove("DO_NOT_TRACK")
         .env_remove("CERULION_TELEMETRY")
         .env_remove("CERULION_CONNECTD_BIN")
+        .env_remove("CERULION_HARNESS_DIR")
         .env("CERULION_HOME", home)
         .env("CERULION_ACCOUNT_SERVICE", &rec.url)
         .env("CERULION_RELAY_URL", &rec.url)

@@ -701,8 +701,16 @@ fn every_arg_that_completes_nothing_is_a_declared_free_form_value() {
         "cerulion connect::addrs",
         "cerulion connect::relay_url",
         "cerulion rcp::addrs",
+        "cerulion rcp::http",
         "cerulion rcp::relay_url",
         "cerulion ros2 attach::iface",
+        // ---- The simulated robot's task and the benchmark's model, key
+        // variable and cell: names the harness and the user's own endpoint
+        // define, which nothing local lists.
+        "cerulion rcp::task",
+        "cerulion rcp bench::cell",
+        "cerulion rcp bench::key_env",
+        "cerulion rcp bench::model",
         "cerulion graph fires::connect",
         "cerulion graph live::connect",
         "cerulion topic find::connect",
