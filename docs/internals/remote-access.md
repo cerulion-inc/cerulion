@@ -183,7 +183,7 @@ the same entry instead of running the daemon.
 | `cerulion_pairing` | both | MIT OR Apache-2.0 | yes | formats + crypto + state machines, plus the machine identity files (`identity`: config directory, machine key, high-water file); no network I/O, no iroh dep (embeds in firmware and in the closed Studio client) |
 | `cerulion_link` | both | MIT OR Apache-2.0 | **no** (pulls iroh, ~390 crates) | thin iroh wrapper: endpoints, dial, framing, relay seam, ops-stream adapter; never depends on `cerulion_core` |
 | `cerulion-wire` | desk | MIT OR Apache-2.0 | yes | standalone wire-format decoder so CLOSED apps decode frames without linking the AGPL `cerulion_core` |
-| `cerulion_ops_proto` | both | MIT OR Apache-2.0 | yes | the `cerulion/ops/1` wire types: BE-`u32`-length JSON framing, `Hello`/`HandshakeReply` version handshake, `Request`/`Response` envelopes, the `Inventory` result, and the protocol-only `OpsClient`; depends on serde, serde_json and thiserror only |
+| `cerulion_ops_proto` | both | MIT OR Apache-2.0 | yes | the `cerulion/ops/1` wire types: BE-`u32`-length JSON framing, `Hello`/`HandshakeReply` version handshake, `Request`/`Response` envelopes, the `Inventory` result, the protocol-only `OpsClient`, bounded session codecs and audit commitments; depends on serde, serde_json, thiserror, base64 and sha2 only |
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
 | `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust; links `cerulion_wireclient` for `sanitize_peer_text` only |
 | `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
@@ -214,7 +214,25 @@ Load-bearing boundary contracts:
   `CerudError::kind`, so the `kind` strings stay in `cerud`. The bytes are
   pinned to golden frames in
   `crates/cerulion_ops_proto/tests/fixtures/ops_wire_golden.txt` by
-  `crates/cerulion_ops_proto/tests/wire_golden_test.rs`.
+  `crates/cerulion_ops_proto/tests/wire_golden_test.rs`. Its `session` module
+  also supplies the shell and exec frame vocabulary for callers that negotiate
+  a command session: at most 1 MiB of JSON per envelope and 64 KiB of decoded
+  bytes per data chunk. Unknown fields, noncanonical base64 and malformed
+  terminal or argv parameters are refused. `RecordingWitness` carries the
+  session id, recording chain head and event count; validating its shape does
+  not verify the recording. `session_test.rs` pins the frame bytes and refusal
+  boundaries. `OpsClient` continues to issue ordinary verb calls.
+- **Session audit commitments** use a domain-separated SHA-256 chain over the
+  canonical event JSON documented in `cerulion_ops_proto::recording`. The builder
+  requires exactly one initial Started event, monotonic timestamps and no event
+  after Exit; a refused append preserves its state. Verification requires a
+  session id, event count and chain head retained by the client outside the
+  recording's storage. A locally rewritten, self-consistent chain does not prove
+  authenticity. `verify_recording` requires Exit; `verify_recording_prefix`
+  verifies only the exact prefix covered by its witness. The JSON audit events
+  describe process I/O; graph recording bags remain MCAP. Independent shell and
+  exec vectors are in `crates/cerulion_ops_proto/tests/fixtures/recording_shell_golden.jsonl`
+  and `crates/cerulion_ops_proto/tests/fixtures/recording_exec_golden.jsonl`.
 - **`cerulion-wire` deliberately duplicates the wire structs** (40-byte header,
   8-byte offset entry) so the permissive decode seam stands alone. Byte
   compatibility is pinned by `crates/cerulion_core/tests/wire_lockstep_test.rs` (the
@@ -508,6 +526,23 @@ refused when its subscriber wait plus its frames at the rate exceed 90 s, and
 is stopped if it is still running 100 s after it started (a frame that takes
 longer to send than its period delays the rest). A topic under
 `/__cerulion` is refused. `service-call` also returns `response_text`.
+
+Each verb answers in one order: `topic-publish` and `service-call` read the
+e-stop first; every verb then checks its arguments (required keys, numbers,
+limits and the type's resolution), and only then reads the topic's mirror
+marker and remote access policy (`servable`) and takes its remote lease; the
+`message` or `request` text is parsed and encoded after that, inside the
+`cerulion_msgio` publish or call. Such a malformed request is a usage error and
+an engaged e-stop is the refusal whatever state the topic's markers are in
+(`act_verbs_test.rs`:
+`a_malformed_request_on_an_excluded_topic_is_a_usage_error`,
+`an_engaged_estop_is_the_refusal_on_an_excluded_topic`). A policy or mirror
+marker whose last holder is dropping it is opened again within
+`cerulion_core::transport::marker_teardown`'s budget (20 opens 25 ms apart,
+`TeardownWait::Bounded`) and refuses naming that budget only once it outlasts
+it. The wire plane's demand and schema reads wait the same way; its catalog
+filter and catalog peek pass `TeardownWait::Never`, so a listing opens each
+marker once and leaves out a topic whose marker is being torn down.
 
 ## 6. The wire plane (robot side)
 
@@ -1119,7 +1154,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 |---|---|
 | `crates/cerulion_remoted/tests/act_verbs_daemon_test.rs` | Every act verb is registered in the production `serve_endpoint` daemon: each answers `{}` with its own usage error over a real ops session |
 | `crates/cerulion_remoted/tests/act_verbs_cloud_test.rs` | The act verbs under the allow-from-cloud switch: a cloud device is refused publish and snapshot only while the switch is off |
-| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, live mirror refusal, reserved-topic usage errors, contextual producer exclusions and local oracle delivery |
+| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, live mirror refusal, reserved-topic usage errors, contextual producer exclusions, usage errors and the e-stop refusal ahead of an excluded topic's policy, and local oracle delivery |
 | `crates/cerulion_pairing/tests/format_vectors_test.rs` | Byte-exact canonical signing vectors from independent hand-serializers; strict epoch-envelope decode |
 | `crates/cerulion_pairing/tests/chain_verify_test.rs` | Chain positive path + full negative matrix (M-of-N, peer binding, expiry, delegation cap, epoch, rollback) |
 | `crates/cerulion_pairing/tests/store_test.rs` | MAC tamper-evidence, atomic save/load, anti-rollback persistence, claim/reset lifecycle, epoch monotonicity |

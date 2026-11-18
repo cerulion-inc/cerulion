@@ -146,7 +146,9 @@ fn native_and_plugin_raw_sdk_preserve_oracle_bytes_and_recover_after_bad_frames(
             drop(receiver);
             drop(publisher);
             assert!(
-                manager.remote_topic_allowed(topic).unwrap(),
+                manager
+                    .remote_topic_allowed(topic, cerulion_core::transport::TeardownWait::Bounded)
+                    .unwrap(),
                 "destroyed raw port must release its private scope while the host remains live"
             );
         }

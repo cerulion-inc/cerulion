@@ -1,8 +1,11 @@
-# Mutation baseline for cerulion_core: the ROS IDL parser decision functions.
+# Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
+# the live loop's wait sizing and the framework-section codec.
 #
-# Scope: the two pure parser files, and the oracle mutants listed below, each
-# on one pure decision function. The rest of the crate holds transport and
-# scheduler paths that the mutation rule does not cover.
+# Scope: the two pure parser files, the three pure wait-sizing functions named
+# below, the framework-section codec in state_restore.rs (its changed lines),
+# and the oracle mutants listed below, each on one pure decision function. The
+# rest of the crate holds transport and scheduler paths that the mutation rule
+# does not cover.
 #
 # Run:     cargo mutants -p cerulion_core \
 #            -f crates/cerulion_core/src/codegen/rosmsg_parser.rs \
@@ -16,6 +19,29 @@
 #
 # First-`#` comment cut, re-run on the changed lines only (--in-diff): 7
 # mutants, 1 caught, 6 unviable, 0 missed.
+#
+# Live-loop wait sizing: `Scheduler::next_fire_split` (a Period deadline
+# still ahead is exact, every other pending fire is a poll), `NextFire::soonest`
+# and `live_wait_ns` (the wait from the two halves and the quantum boundary).
+#
+# Run:     cargo mutants -p cerulion_core --in-place \
+#            -f crates/cerulion_core/src/graph/runtime.rs \
+#            -f crates/cerulion_core/src/scheduler/mod.rs \
+#            --re "live_wait_ns|next_fire_split|NextFire::soonest" \
+#            -- --lib -- live_wait_tests next_fire_split_tests deferred_external
+# Result:  30 mutants: 26 caught, 3 unviable (do not compile), 1 missed. The
+#          missed mutant is outside the three functions: a struct-field
+#          deletion in `CrossProcessWiring::validation_options` that the run
+#          also tried. Every mutant inside the three functions is caught.
+#
+# Framework-section codec: the stopped node's flags byte (version 5) in
+# NodeFrameworkState::{is_empty, wire_version, encoded_len, encode, decode},
+# run on the changed lines only:
+#
+# Run:     cargo mutants -p cerulion_core \
+#            -f crates/cerulion_core/src/state_restore.rs \
+#            --in-diff <the change's diff of that file> -- --test state_restore_test
+# Result:  46 mutants: 43 caught, 3 unviable (do not compile), 0 missed.
 #
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail

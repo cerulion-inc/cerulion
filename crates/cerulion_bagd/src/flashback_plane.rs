@@ -2554,6 +2554,14 @@ pub(crate) enum AnchorReport {
         /// between them is missing because the bag is missing all of it. That
         /// state is stated by `achieved_from_ns: null` rather than by inventing a
         /// span for it.
+        ///
+        /// REPORT ONLY, and NOT a frame-coverage signal. Both instants are the
+        /// recorder's own drain readings (the anchor's first drained record and
+        /// the first held batch), not the run's step clock, so frames the run
+        /// published before the taps attached are invisible here: a capture
+        /// missing them reads about 0. The verdict does not read this field;
+        /// it checks every frame the kept trace reads against the frames held
+        /// (`cerulion_core::flashback::resim::first_frame_gap`).
         frames_missing_after_anchor_ms: u64,
         /// The SET, one entry per rank, keyed by rank.
         ///
