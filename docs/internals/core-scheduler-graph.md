@@ -271,6 +271,18 @@ naming here because they are easy to get wrong:
   macro forwards the head ops but not the stamp accessor; only `ClosureNodeEntry` opts in. The opt-in is the `#[doc(hidden)]` builder
   `NodeInfo::with_sync_capture_stamps`: no macro key or graph-load path sets it yet. Nodes
   that do not opt in run the publish-time path unchanged.
+- **A stopped node's section.**
+  A node the scheduler has stopped (`ScheduledNode::disabled`: a `NodeError::Fatal` return, the
+  consecutive-panic breaker, or `restore_stopped_nodes` on a resumed run) writes its section, when it
+  has one, at version 5: every earlier tail, each stated empty or absent where the node has
+  nothing to say there, then one flags byte whose bit 0 (`NODE_FLAG_STOPPED`) states the stop. A
+  running node's section keeps the version and bytes it had before. A node whose entry a host-side
+  panic poisoned is not stopped: the scheduler keeps firing it. In a version-5 section a reader refuses
+  any other flag bit; a later version's unknown bits are read past. `GraphRuntime::restore_stopped_nodes` keeps
+  each named node stopped on a runtime about to resume (it sets `disabled` only, through
+  `Scheduler::restore_stopped_nodes`) and releases each `block` slot the node holds as a consumer, as
+  its stop released it live. That release emits no event and moves no backpressure counter, because
+  the recorded run already reported it.
 - `External` nodes are ingress/drivers: `external_source()` returns
   `Fd` (pollable, attached non-owning), `Blocking` (helper thread + doorbell pipe), or
   `HostDriven` (polled seam only). `run_live` refuses any external node provably inert
@@ -336,8 +348,10 @@ idling the core watching a memory address (ring-3, no kernel block, no cache flu
   the 1 ms poll floor, and nothing pending waits the 250 ms liveliness cap. A 1 ms floor
   on a deadline less than 1 ms ahead would start each late fire's next wait late, so a
   1 kHz node would drift until it skipped a slot and double-fired. Pins:
-  `live_exact_deadline_iox2_test` (delivery on every host; the grid and wait arms on
-  Linux, since the degraded macOS nap can wake later than a busy tick's slack), the
+  `live_exact_deadline_iox2_test` (the wait sizing on a controlled clock; every frame
+  received or counted as evicted on every host, every frame received on Linux),
+  `exact_deadline_grid_latency_test` (the grid and the wait after a slow step against
+  wall time, release only, on Linux, in the `test-latency` job), the
   held-producer poll rate in
   `credit_block_iox2_test`, and the `live_wait_tests` oracle.
 - Period-park (`CERULION_PERIOD_PARK=1`, `graph/period_park.rs`): inside `monitor_wait_block`, a

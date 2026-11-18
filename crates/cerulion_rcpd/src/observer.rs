@@ -79,7 +79,10 @@ impl GraphFeed {
             manager
                 .topic_publisher_count_checked(&entry.topic)
                 .is_some_and(|count| count > 0)
-                && manager.remote_topic_allowed(&entry.topic).unwrap_or(false)
+                // A listing filter never waits for a marker being torn down.
+                && manager
+                    .remote_topic_allowed(&entry.topic, cerulion_core::transport::TeardownWait::Never)
+                    .unwrap_or(false)
         });
         graph.monitors.retain(|row| {
             graph

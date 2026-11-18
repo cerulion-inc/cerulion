@@ -8,28 +8,38 @@
 //! one step: roughly one fire in four. With the exact deadline every fire lands
 //! on its 1 ms grid.
 //!
-//! The pin is at the delivery level: a downstream consumer receives every
-//! frame the producer published, and the producer's own tick times show no
-//! two fires closer than half a period (a double fire) beyond a small budget.
-//! The budget is wide on purpose, so a loaded CI runner passes: the two
-//! behaviours differ by an order of magnitude, not by a margin.
+//! Two pins, neither judged against the wall clock:
 //!
-//! Drives the production `live_step` with its own `live_timeout`, on the
-//! monitor-wait park the live loop runs by default (the degraded sleep-recheck
-//! park on a host without the CPU primitive). Per-test SHM roots; `#[serial]`
-//! because the assertions are about wall-clock timing.
+//! - **The wait sizing, on a controlled clock.** A one-rank lockstep runtime
+//!   reads its gating clock as `now` before the loop anchors, so the wait
+//!   `live_timeout` sizes is a function of where the test puts that clock: a
+//!   deadline 700 µs ahead is waited for exactly, one closer than 10 µs waits
+//!   10 µs, and a deadline already passed keeps the 1 ms poll. The pure halves
+//!   are pinned by `next_fire_split_tests` and `live_wait_tests`; this pins
+//!   the live loop composing them.
+//! - **Delivery, as an account.** A `period_ms = 1` producer with a 300 µs
+//!   tick runs on the production `live_step` and its own `live_timeout`, on
+//!   the monitor-wait park the live loop runs by default (the degraded
+//!   sleep-recheck park on a host without the CPU primitive). Every frame
+//!   published after the warm-up is received or counted by the consumer's own
+//!   eviction counter (`backpressure_drop_oldest_count`); on Linux every frame
+//!   is received. A node that falls behind its grid catches up in a burst, and
+//!   a burst longer than the consumer's queue evicts the oldest frames: on
+//!   macOS the degraded park nap can wake later than the 700 µs the tick leaves
+//!   in each period.
 //!
-//! The grid and wait-sizing assertions need a park that wakes within a few
-//! hundred µs of its deadline, so they run on Linux. macOS has no CPU
-//! monitor-wait primitive and parks in a degraded nap, whose wake on a hosted
-//! runner can land later than the 700 µs this tick leaves in each period;
-//! there the first arm judges delivery and the fire count only.
+//! Whether the node keeps its grid is a wall-clock claim, so it is measured in
+//! the release latency tier and not here: `exact_deadline_grid_latency_test`
+//! (release only, Linux only, run by the `test-latency` job on pushes to main)
+//! judges the fire gaps and the wait after a slow step against wall time.
+//! Per-test SHM roots; `#[serial]` because the delivery run is live.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use cerulion_core::clock::Clock;
+use cerulion_core::barrier::MappedBarrier;
+use cerulion_core::clock::{Clock, VirtualClock};
 use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::GraphRuntime;
@@ -40,30 +50,28 @@ use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 use serial_test::serial;
 
-/// The producer's period and the time each of its ticks takes.
-#[cfg(target_os = "linux")]
-const PERIOD: Duration = Duration::from_millis(1);
+/// The time each of the producer's ticks takes.
 const TICK_WORK: Duration = Duration::from_micros(300);
 /// Fires the run collects before it judges.
 const FIRES: usize = 1_000;
 /// Fires discarded first. The node's first deadline is set when the graph is
 /// built, so the first live step finds it several periods behind and catches
-/// up with a burst (each tick costing `TICK_WORK`); the grid is judged after.
+/// up with a burst (each tick costing `TICK_WORK`); delivery is judged after.
 const WARMUP: usize = 100;
+/// The producer's period, in ns.
+const PERIOD_NS: u64 = 1_000_000;
 /// The longest the run may take; a stalled loop fails instead of hanging.
 const BUDGET: Duration = Duration::from_secs(6);
-/// The most fires closer than half a period to the previous one that a passing
-/// run may have, as a share of all fires: 2 %, where a 1 ms floor gives about
-/// 25 %.
-#[cfg(target_os = "linux")]
-const DOUBLE_FIRE_BUDGET: f64 = 0.02;
+/// The longest the consumer may take to empty its queue, at the warm-up and at
+/// the end; a consumer that never catches up fails instead of hanging.
+const SETTLE_BUDGET: Duration = Duration::from_secs(2);
 
 #[cerulion_node(period_ms = 1)]
 #[derive(Default)]
 struct SlowTicker {
     #[output]
     out: Vector3,
-    /// Each tick's start, `real_ns()` (the wall clock this test judges).
+    /// Each tick's start, `real_ns()`.
     ticks: Arc<Mutex<Vec<u64>>>,
     n: u64,
 }
@@ -91,23 +99,25 @@ struct Receiver {
     #[input(trigger)]
     inp: Vector3,
     received: Arc<AtomicU64>,
-    last: f64,
+    /// The producer's number on the last frame received (frames are numbered
+    /// from 1, one per fire).
+    last: Arc<AtomicU64>,
 }
 
 #[cerulion_node_impl]
 impl Receiver {
     fn tick(&mut self) -> Result<(), NodeError> {
-        self.last = self.inp.x;
+        self.last.store(self.inp.x as u64, Ordering::Relaxed);
         self.received.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 }
 
-fn transport() -> Arc<TransportManager> {
+fn transport(clock: Arc<dyn Clock>) -> Arc<TransportManager> {
     TransportManager::init_for_test(
         TransportConfig {
             node_name: "cerulion_exact_deadline".into(),
-            clock: Arc::new(RealClock) as Arc<dyn Clock>,
+            clock,
             subscriber_buffer_size: 8,
             network: None,
         },
@@ -119,6 +129,7 @@ fn transport() -> Arc<TransportManager> {
 fn graph(
     ticks: Arc<Mutex<Vec<u64>>>,
     received: Arc<AtomicU64>,
+    last: Arc<AtomicU64>,
 ) -> (GraphConfig, IndexMap<String, Box<dyn NodeEntry>>) {
     let node =
         |id: &str, node_type: &str, inputs: Vec<InputDef>, outputs: Vec<OutputDef>| NodeDef {
@@ -176,6 +187,7 @@ fn graph(
         "receiver".to_string(),
         Box::new(ReceiverEntry::with_state(Receiver {
             received,
+            last,
             ..Default::default()
         })),
     );
@@ -188,13 +200,55 @@ fn park_policy() -> cerulion_core::MonitorWaitPolicy {
     cerulion_core::MonitorWaitPolicy::new(true, false, format!("xdl{}", std::process::id()))
 }
 
+/// The delivery account at one step boundary: the producer's fires, the
+/// frames the consumer received, and the frames its queue evicted.
+#[derive(Debug, Clone, Copy)]
+struct Account {
+    fires: u64,
+    received: u64,
+    evicted: u64,
+}
+
+fn fire_count(rt: &GraphRuntime) -> u64 {
+    rt.node_handle("ticker")
+        .expect("ticker handle")
+        .fire_count()
+}
+
+/// Step `rt` until the consumer's queue is empty: the last frame it received
+/// is the producer's last fire, so every earlier frame was received or evicted
+/// and the eviction counter has seen each gap. The account there, or `None`
+/// when the queue does not empty within [`SETTLE_BUDGET`].
+fn settle(rt: &mut GraphRuntime, received: &AtomicU64, last: &AtomicU64) -> Option<Account> {
+    let started = Instant::now();
+    loop {
+        let fires = fire_count(rt);
+        if last.load(Ordering::Relaxed) == fires {
+            return Some(Account {
+                fires,
+                received: received.load(Ordering::Relaxed),
+                evicted: rt
+                    .node_handle("receiver")
+                    .expect("receiver handle")
+                    .backpressure_drop_oldest_count("inp"),
+            });
+        }
+        if started.elapsed() >= SETTLE_BUDGET {
+            return None;
+        }
+        let timeout = rt.live_timeout_for_test();
+        rt.run_live_step_once_for_test(timeout);
+    }
+}
+
 #[test]
 #[serial]
-fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_frame() {
-    let transport = transport();
+fn every_frame_a_slow_one_kilohertz_node_publishes_is_received_or_counted_evicted() {
+    let transport = transport(Arc::new(RealClock));
     let ticks = Arc::new(Mutex::new(Vec::with_capacity(FIRES + 64)));
     let received = Arc::new(AtomicU64::new(0));
-    let (config, factories) = graph(Arc::clone(&ticks), Arc::clone(&received));
+    let last = Arc::new(AtomicU64::new(0));
+    let (config, factories) = graph(Arc::clone(&ticks), Arc::clone(&received), Arc::clone(&last));
     let mut rt = GraphRuntime::build_live_with_schema_hashes_and_policy(
         config,
         factories,
@@ -205,26 +259,30 @@ fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_fr
     )
     .expect("build the live graph");
 
-    let fired = |rt: &GraphRuntime| {
-        rt.node_handle("ticker")
-            .expect("ticker handle")
-            .fire_count()
-    };
     let started = Instant::now();
-    // (fires, frames received) at the first step boundary past the warm-up:
-    // the burst the warm-up catches up with can overrun the consumer's queue,
-    // so delivery is judged from here on.
+    // The account once the warm-up has run and the consumer has emptied its
+    // queue: the burst the warm-up catches up with can overrun that queue, and
+    // the eviction counter starts counting only at the first frame it sees, so
+    // delivery is judged from here on.
     let mut at_warmup = None;
     while ticks.lock().expect("tick log").len() < WARMUP + FIRES && started.elapsed() < BUDGET {
         let timeout = rt.live_timeout_for_test();
         rt.run_live_step_once_for_test(timeout);
         if at_warmup.is_none() && ticks.lock().expect("tick log").len() >= WARMUP {
-            at_warmup = Some((fired(&rt), received.load(Ordering::Relaxed)));
+            at_warmup = Some(
+                settle(&mut rt, &received, &last)
+                    .expect("the consumer emptied its queue after the warm-up"),
+            );
         }
     }
-    // One more pass so the last frame reaches the consumer.
-    let timeout = rt.live_timeout_for_test();
-    rt.run_live_step_once_for_test(timeout);
+    let at_end = settle(&mut rt, &received, &last).unwrap_or_else(|| {
+        panic!(
+            "the consumer did not empty its queue within {SETTLE_BUDGET:?}: the last frame it \
+             received is {} of {} published",
+            last.load(Ordering::Relaxed),
+            fire_count(&rt)
+        )
+    });
 
     let all = ticks.lock().expect("tick log").clone();
     assert!(
@@ -233,92 +291,94 @@ fn a_one_kilohertz_node_with_a_slow_tick_stays_on_its_grid_and_delivers_every_fr
         all.len(),
         WARMUP + FIRES
     );
-    #[cfg(target_os = "linux")]
-    assert_on_grid(&all[WARMUP..]);
 
-    let fires = fired(&rt);
-    assert_eq!(fires as usize, all.len(), "every fire logged its tick");
-    let (fires_at, received_at) = at_warmup.expect("the run passed its warm-up");
     assert_eq!(
-        received.load(Ordering::Relaxed) - received_at,
-        fires - fires_at,
+        at_end.fires as usize,
+        all.len(),
+        "every fire logged its tick"
+    );
+    let at_warmup = at_warmup.expect("the run passed its warm-up");
+    let published = at_end.fires - at_warmup.fires;
+    let delivered = at_end.received - at_warmup.received;
+    let evicted = at_end.evicted - at_warmup.evicted;
+    assert_eq!(
+        delivered + evicted,
+        published,
+        "every frame published after the warm-up is received or counted as evicted by the \
+         consumer's queue: {delivered} received, {evicted} evicted, {published} published"
+    );
+    // The Linux park wakes promptly enough that the producer never falls far
+    // enough behind to overrun the consumer's queue, so every frame arrives.
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        delivered, published,
         "the consumer received every frame the producer published after the warm-up"
     );
 }
 
-/// No more than [`DOUBLE_FIRE_BUDGET`] of the gaps between `ticks` are under
-/// half a period, and the median gap is the period.
-#[cfg(target_os = "linux")]
-fn assert_on_grid(ticks: &[u64]) {
-    let half = PERIOD / 2;
-    let gaps: Vec<Duration> = ticks
-        .windows(2)
-        .map(|w| Duration::from_nanos(w[1].saturating_sub(w[0])))
-        .collect();
-    let doubles = gaps.iter().filter(|g| **g < half).count();
-    let share = doubles as f64 / gaps.len() as f64;
-    assert!(
-        share <= DOUBLE_FIRE_BUDGET,
-        "{doubles} of {} fires came less than half a period after the previous one \
-         ({:.1} %, budget {:.1} %): the loop is not waiting to the exact deadline",
-        gaps.len(),
-        share * 100.0,
-        DOUBLE_FIRE_BUDGET * 100.0
-    );
-    let mut sorted = gaps.clone();
-    sorted.sort();
-    let median = sorted[sorted.len() / 2];
-    assert!(
-        median >= PERIOD - Duration::from_micros(100)
-            && median <= PERIOD + Duration::from_micros(100),
-        "the median gap between fires is {median:?}; the grid is {PERIOD:?}"
-    );
-}
-
-/// The same graph, stepped by hand: once the node is on its grid, the wait the
-/// loop sizes after a step that fired is the time left to the next deadline,
-/// not a whole period.
-#[cfg(target_os = "linux")]
+/// The wait the live loop sizes, on a controlled clock: a one-rank lockstep
+/// runtime (the `CERULION_EXECUTION_MODE=lockstep` worker shape) whose gating
+/// clock is a `VirtualClock` the test moves. Before the loop anchors, the wait
+/// sizing reads that clock as `now`, so each wait below is exact. The handed
+/// quantum is the period (it cannot be coarser than the node's own timing),
+/// and with `now` on the gating clock its cap is one whole quantum, 1 ms,
+/// which binds none of the three waits: the Period deadline alone sizes them.
 #[test]
 #[serial]
-fn after_a_slow_step_the_wait_is_the_time_left_not_a_period() {
-    let transport = transport();
-    let ticks = Arc::new(Mutex::new(Vec::new()));
-    let received = Arc::new(AtomicU64::new(0));
-    let (config, factories) = graph(Arc::clone(&ticks), Arc::clone(&received));
-    let mut rt = GraphRuntime::build_live_with_schema_hashes_and_policy(
+fn a_period_deadline_still_ahead_is_waited_for_exactly_on_a_controlled_clock() {
+    let clock = Arc::new(VirtualClock::new());
+    let transport = transport(clock.clone());
+    // The producer alone: a one-rank barrier carries one level.
+    let (mut config, mut factories) = graph(
+        Arc::new(Mutex::new(Vec::new())),
+        Arc::new(AtomicU64::new(0)),
+        Arc::new(AtomicU64::new(0)),
+    );
+    config.nodes.retain(|n| n.id == "ticker");
+    factories.shift_remove("receiver");
+    let ns = format!("xdlv_{}", std::process::id());
+    let barrier = Arc::new(MappedBarrier::create_owned(&ns, "g", 1).expect("barrier owner"));
+    let rt = GraphRuntime::build_live_deterministic_with_manager_and_barrier(
         config,
         factories,
         &transport,
-        Arc::new(RealClock),
+        Arc::clone(&clock),
         None,
-        park_policy(),
+        cerulion_core::MonitorWaitPolicy::off(),
+        barrier,
+        vec![Some(0)],
+        vec![false],
+        0,
+        Duration::from_nanos(PERIOD_NS),
+        cerulion_core::graph::runtime::CrossProcessWiring::requirements_only(None),
     )
-    .expect("build the live graph");
-    let started = Instant::now();
-    let mut judged = 0;
-    while judged < 20 && started.elapsed() < BUDGET {
-        let before = ticks.lock().expect("tick log").len();
-        let timeout = rt.live_timeout_for_test();
-        rt.run_live_step_once_for_test(timeout);
-        let log = ticks.lock().expect("tick log").clone();
-        // Judge only a step that fired exactly once, past the warm-up burst.
-        if log.len() < WARMUP || log.len() != before + 1 {
-            continue;
-        }
-        let fired_at = log[log.len() - 1];
-        let wait = rt.live_timeout_for_test();
-        let since = Duration::from_nanos(cerulion_core::clock::real_ns().saturating_sub(fired_at));
-        let left = PERIOD.saturating_sub(since);
-        assert!(
-            wait < PERIOD,
-            "the wait after a {TICK_WORK:?} step that fired is {wait:?}: a whole period or more"
-        );
-        assert!(
-            wait <= left + Duration::from_micros(100),
-            "the wait {wait:?} overshoots the {left:?} left to the deadline"
-        );
-        judged += 1;
-    }
-    assert_eq!(judged, 20, "the run reached 20 judged steps in {BUDGET:?}");
+    .expect("build the lockstep graph");
+    assert_eq!(clock.now_ns(), 0, "the gating clock starts at 0");
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        Duration::from_nanos(PERIOD_NS),
+        "a freshly built node's first deadline is one period ahead"
+    );
+
+    clock.advance(300_000);
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        Duration::from_micros(700),
+        "300 µs into the period the wait is the 700 µs left, not a 1 ms floor"
+    );
+
+    clock.advance(695_000);
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        Duration::from_micros(10),
+        "5 µs before the deadline the wait is the 10 µs deadline floor"
+    );
+
+    clock.advance(205_000);
+    assert_eq!(
+        rt.live_timeout_for_test(),
+        Duration::from_millis(1),
+        "a deadline already passed keeps the 1 ms poll"
+    );
+    rt.shutdown();
 }

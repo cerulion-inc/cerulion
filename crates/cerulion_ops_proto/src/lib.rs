@@ -10,6 +10,11 @@
 //! - [`client`]: [`OpsClient`], a blocking client that performs the handshake
 //!   and issues verb calls over any `Read + Write` byte stream.
 //! - [`inventory`]: [`Inventory`], the result the `inventory` verb returns.
+//! - [`session`]: bounded shell and exec frame codecs, with separate limits on
+//!   JSON envelopes and binary chunks. These codecs require session negotiation
+//!   by their caller; [`OpsClient`] issues ordinary verb calls only.
+//! - [`recording`]: hash-chained session events, [`RecordingWitness`] commitments
+//!   and complete or prefix verification against an independently retained witness.
 //! - [`error`]: [`OpsProtoError`], the errors the functions above return.
 //!
 //! The robot-side service `cerud` (AGPL-3.0-only) depends on this crate. It
@@ -30,11 +35,22 @@ pub mod client;
 pub mod error;
 pub mod inventory;
 pub mod protocol;
+pub mod recording;
+pub mod session;
 
 pub use client::OpsClient;
 pub use error::{ErrorKind, OpsProtoError, OpsProtoResult};
 pub use inventory::Inventory;
 pub use protocol::{
     decode, encode, negotiate_version, read_frame, write_frame, HandshakeReply, Hello, Request,
-    Response, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    Response, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, MIN_SESSION_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
+};
+pub use recording::{
+    verify_recording, verify_recording_prefix, RecordingChain, RecordingEvent, RecordingPayload,
+    RecordingWitness,
+};
+pub use session::{
+    decode_data, encode_data, ClientFrame, ExecRequest, ExitReason, OutputStream, ServerFrame,
+    SessionExit, SessionKind, ShellRequest, WindowSize, MAX_DATA_BYTES, MAX_SESSION_FRAME_BYTES,
 };

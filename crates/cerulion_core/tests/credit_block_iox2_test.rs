@@ -4290,7 +4290,7 @@ fn a_send_that_reaches_no_subscriber_keeps_its_count() {
 /// The configuration that makes an `Err` from `send()` mean that no consumer's
 /// queue received the frame, which is what lets the take-back above be exact.
 ///
-/// Read in the pinned iceoryx2 revision (282f479):
+/// Read in the pinned iceoryx2 revision (8e8766a3):
 ///
 /// - `iceoryx2/src/port/publisher.rs:373-384`: `send_sample` fails before it
 ///   delivers anything when the port is inactive or `update_connections`

@@ -1,10 +1,12 @@
 # Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
-# the live loop's wait sizing and its period-park decisions.
+# the live loop's wait sizing, its period-park decisions and the
+# framework-section codec.
 #
 # Scope: the two pure parser files, the pure wait-sizing and period-park
-# functions named below, and the oracle mutants listed below, each on one pure
-# decision function. The rest of the crate holds transport and scheduler paths that the
-# mutation rule does not cover.
+# functions named below, the framework-section codec in state_restore.rs (its
+# changed lines), and the oracle mutants listed below, each on one pure
+# decision function. The rest of the crate holds transport and scheduler
+# paths that the mutation rule does not cover.
 #
 # Run:     cargo mutants -p cerulion_core \
 #            -f crates/cerulion_core/src/codegen/rosmsg_parser.rs \
@@ -32,6 +34,15 @@
 #          missed mutant is outside the three functions: a struct-field
 #          deletion in `CrossProcessWiring::validation_options` that the run
 #          also tried. Every mutant inside the three functions is caught.
+#
+# Framework-section codec: the stopped node's flags byte (version 5) in
+# NodeFrameworkState::{is_empty, wire_version, encoded_len, encode, decode},
+# run on the changed lines only:
+#
+# Run:     cargo mutants -p cerulion_core \
+#            -f crates/cerulion_core/src/state_restore.rs \
+#            --in-diff <the change's diff of that file> -- --test state_restore_test
+# Result:  46 mutants: 43 caught, 3 unviable (do not compile), 0 missed.
 #
 # Live-loop period-park (`graph/period_park.rs`, `CERULION_PERIOD_PARK=1`):
 # `refusal` and `admits` (where it applies), `NotEngaged::as_str` (the
