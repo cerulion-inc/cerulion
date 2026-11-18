@@ -208,11 +208,11 @@ const LEAN_CRATES: &[LeanCrate] = &[
     },
     LeanCrate {
         package: "cerulion_ops_proto",
-        allowed: &["base64", "serde", "serde_json", "thiserror"],
+        allowed: &["base64", "serde", "serde_json", "sha2", "thiserror"],
         source: "crates/cerulion_ops_proto/Cargo.toml: \"No workspace crate: a closed client \
                  links no AGPL code. Envelopes derive Serialize/Deserialize; binary session \
                  chunks use standard padded base64.\" docs/internals/remote-access.md names \
-                 serde, serde_json, thiserror and base64 only.",
+                 serde, serde_json, thiserror, base64 and sha2 only.",
     },
     LeanCrate {
         package: "cerulion_hygiene",
