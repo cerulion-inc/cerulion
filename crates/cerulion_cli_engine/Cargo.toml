@@ -145,10 +145,10 @@ if-addrs = "0.15"
 # `#[cerulion_node]` attribute on actual structs (not in
 # comments / strings / etc.). `full` enables the item-level
 # (struct/fn/mod/...) AST nodes we walk. `parsing` enables
-# `syn::parse_file`; in syn 2.x it's part of the default
+# `syn::parse_file`; in syn 3.x it's part of the default
 # feature set, but we list it explicitly so a future
 # `default-features = false` doesn't silently break parsing.
-syn = { version = "2", features = ["full", "parsing"] }
+syn = { version = "3", features = ["full", "parsing"] }
 # `proc-macro2` is already pulled in transitively by `syn`; we
 # depend on it directly so we can name `TokenTree::Ident` when
 # scanning macro-arg tokens (see `node_metadata.rs::macro_attr_carries_external`).
