@@ -306,6 +306,22 @@ jobs:
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
           chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
+          # The agent harness ships beside the binaries on every target: the
+          # CLI resolves `harness/` in its own directory, the sibling rule the
+          # rmw library and cerulion-connectd follow. The tree copy holds
+          # regular files and directories only, the one shape build_deb.sh
+          # and install.sh accept.
+          if [ ! -d harness ] || [ -L harness ]; then
+            echo "::error::the tagged tree has no harness/ directory to ship beside the CLI"
+            exit 1
+          fi
+          odd=$(find harness ! -type f ! -type d -print)
+          if [ -n "$odd" ]; then
+            echo "::error::harness/ holds entries that are not regular files or directories:"
+            printf '%s\n' "$odd"
+            exit 1
+          fi
+          cp -R harness "$stage/harness"
           case "$TARGET" in
             *-unknown-linux-gnu)
               rmw="$RUNNER_TEMP/rmw/librmw_cerulion.so"
@@ -733,6 +749,17 @@ jobs:
               [ -f "$RUNNER_TEMP/cerulion-bin/$library" ] ||
                 { echo "::error::the installer did not place $library beside the CLI"; exit 1; }
             done
+          fi
+          # Every archive of a tag whose tree holds harness/ carries it, and
+          # the installer places it beside the CLI byte for byte. A tag cut
+          # before harness/ existed carries none.
+          if [ -d source-checkout/harness ]; then
+            if [ ! -d "$RUNNER_TEMP/cerulion-bin/harness" ] || [ -L "$RUNNER_TEMP/cerulion-bin/harness" ]; then
+              echo "::error::the installer did not place harness/ beside the CLI"
+              exit 1
+            fi
+            diff -r source-checkout/harness "$RUNNER_TEMP/cerulion-bin/harness" ||
+              { echo "::error::the installed harness/ differs from the tagged tree's"; exit 1; }
           fi
 
       # release.yml publishes on the SAME tag push and verifies all 20 crates

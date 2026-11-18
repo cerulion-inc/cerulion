@@ -4,8 +4,9 @@
 # cutting a release.
 #
 # What it asserts: the rendered file is valid Ruby, it names all four platform
-# archives with the checksums the file gave it, it carries the caveat and the
-# setup wrapper, and a checksum file missing one archive is refused instead of
+# archives with the checksums the file gave it, it installs the harness tree
+# beside the binaries, it carries the caveat and the setup wrapper, and a
+# checksum file missing one archive is refused instead of
 # rendering an empty sha256. The Ruby syntax check is the headline assertion,
 # so it is refused rather than skipped under CI; on a machine with no ruby at
 # hand it is skipped loudly and every other assertion still runs.
@@ -94,6 +95,11 @@ sha_count=$(grep -c '^ *sha256 "' "$formula")
 want_line '  version "9.8.7"'
 want_line '    ["cerulion", "cerulion-netd", "cerulion-connectd", "cerulion-remoted"].each do |binary|'
 want_line '  def caveats'
+# The harness tree installs beside the binaries in bin, the directory the CLI
+# resolves it from, and a release archive without it stops the install.
+want_line '    harness = Dir["{,*/}harness"].find { |candidate| File.directory?(candidate) && !File.symlink?(candidate) }'
+want_line '    odie "release archive is missing harness" unless harness'
+want_line '    bin.install harness'
 want_line '    (share/"cerulion/install.json").write "{\"method\":\"brew\",\"version\":\"#{version}\"}\n"'
 want_line '        cerulion-install-rust'
 want_text 'Homebrew itself never writes into your'

@@ -152,10 +152,12 @@ Run from the workspace root, in order:
       `publish = false`: they must never reach crates.io.
 - [ ] The shipped programs: every release archive, the Debian package and the
       Homebrew formula carry `cerulion`, `cerulion-netd`, `cerulion-connectd`
-      and `cerulion-remoted`. `./tools/scripts/install.sh --self-test`,
+      and `cerulion-remoted`, and from 2.1.0 the agent harness tree `harness/`
+      beside them, copied from the tagged tree. `./tools/scripts/install.sh --self-test`,
       `./tools/scripts/test_render_homebrew_formula.sh` and, on Linux,
       `./tools/scripts/test_build_deb.sh` check the three lists; the install
-      smoke of `release-artifacts.yml` checks the installed release.
+      smoke of `release-artifacts.yml` checks the installed release, the
+      harness tree byte for byte against the tag's.
 - [ ] crates.io ownership: confirm publishing account / `cargo owner` team
       access for all twenty-two publishable crates listed above.
 - [ ] After each `cargo publish`, wait for the crates.io index to pick up
@@ -397,8 +399,9 @@ with contents read and write and pull requests read and write. The job keeps
 the branch push and the pull request are the token's two jobs, and the tap's
 `main` keeps its protection.
 
-The rendered formula installs the four binaries, plus the ROS 2 Jazzy rmw and
-the heap hook on Linux, generates shell completions, and carries the release's
+The rendered formula installs the four binaries and the agent harness tree
+beside them, plus the ROS 2 Jazzy rmw and the heap hook on Linux, generates
+shell completions, and carries the release's
 own `install_rust.sh` in `libexec` behind a `cerulion-install-rust` command,
 which installs current stable Rust (1.95 or newer). Homebrew runs installs with `HOME` pointing at
 a directory it deletes, so a formula cannot provision a Rust toolchain itself;
