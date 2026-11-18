@@ -109,6 +109,7 @@ fn serving_ready_cancels_each_wan_pin_when_the_controller_stays_busy_past_its_gr
     state.handover = Some(vec![(wan.clone(), 7)]);
     let started = Instant::now();
     let error = controller.serving_ready().unwrap_err();
+    assert!(started.elapsed() >= RESTORATION_LOCK_GRACE);
     assert!(started.elapsed() < Duration::from_secs(1));
     assert!(
         error.contains("arm") && error.contains("/vector"),
@@ -170,8 +171,9 @@ fn serving_ready_waits_out_a_brief_holder_and_keeps_every_outbound_pin() {
     // The held state stands in for a short holder such as the identity refresh.
     // The waiter's contention counter, not a clock, says when to release it.
     let ready = std::thread::scope(|scope| {
-        // A long grace keeps this test free of scheduling delays; the production
-        // grace is pinned by the stays-busy test above.
+        // A long grace keeps this test free of scheduling delays. The stays-busy
+        // test above pins the production grace: it waits at least
+        // RESTORATION_LOCK_GRACE and cancels within 1 s.
         let waiter = scope.spawn(|| controller.serving_ready_within(Duration::from_secs(60)));
         let hang_guard = Instant::now() + Duration::from_secs(30);
         while controller.restoration_contentions() == 0 {
@@ -204,6 +206,18 @@ fn serving_ready_waits_out_a_brief_holder_and_keeps_every_outbound_pin() {
     assert_eq!(registry.active_demand_count(), 1);
 }
 
+fn installed_stamp(controller: &AccountWanController) -> identity_snapshot::IdentityStamp {
+    controller
+        .state
+        .lock()
+        .unwrap()
+        .identity
+        .as_ref()
+        .unwrap()
+        .stamp()
+        .clone()
+}
+
 #[test]
 fn a_refresh_whose_load_raced_a_new_install_keeps_the_new_identity() {
     let login = Login::new();
@@ -212,7 +226,8 @@ fn a_refresh_whose_load_raced_a_new_install_keeps_the_new_identity() {
     controller
         .install_account_snapshot(&login.snapshot(vec![robot(1, true)]), &mut registry)
         .unwrap();
-    let loaded_against = controller.refresh_start(&mut registry).unwrap().unwrap();
+    let first = installed_stamp(&controller);
+    let loaded_at = controller.refresh_start(&mut registry).unwrap().unwrap();
     let older_load = controller.read_identity();
     assert!(older_load.is_ok());
     // A different login lands and is installed while that load is in flight.
@@ -220,23 +235,70 @@ fn a_refresh_whose_load_raced_a_new_install_keeps_the_new_identity() {
     controller
         .install_account_snapshot(&login.snapshot(vec![robot(1, true)]), &mut registry)
         .unwrap();
-    let installed = controller
-        .state
-        .lock()
-        .unwrap()
-        .identity
-        .as_ref()
-        .unwrap()
-        .stamp()
-        .clone();
-    assert!(installed != loaded_against);
+    let installed = installed_stamp(&controller);
+    assert!(installed != first);
     assert_eq!(
-        controller.refresh_apply(&mut registry, &loaded_against, older_load),
+        controller.refresh_apply(&mut registry, loaded_at, older_load),
         Ok(())
     );
     let state = controller.state.lock().unwrap();
     assert!(state.identity.as_ref().map(IdentitySnapshot::stamp) == Some(&installed));
     assert!(state.snapshot.is_some());
+    assert!(!state.pending_all);
+}
+
+#[test]
+fn a_refresh_whose_load_raced_a_round_trip_install_keeps_the_installed_identity() {
+    let login = Login::new();
+    let controller = login.controller(true, false);
+    let mut registry = DemandRegistry::new(Instant::now());
+    controller
+        .install_account_snapshot(&login.snapshot(vec![robot(1, true)]), &mut registry)
+        .unwrap();
+    let first = installed_stamp(&controller);
+    let loaded_at = controller.refresh_start(&mut registry).unwrap().unwrap();
+    // The load reads a second login, which is installed and then replaced by the
+    // first login again before the load is applied.
+    login.write([6; 32], [8; 32]);
+    let older_load = controller.read_identity();
+    assert!(older_load.is_ok());
+    controller
+        .install_account_snapshot(&login.snapshot(vec![robot(1, true)]), &mut registry)
+        .unwrap();
+    login.write(ACCOUNT, SEED);
+    controller
+        .install_account_snapshot(&login.snapshot(vec![robot(1, true)]), &mut registry)
+        .unwrap();
+    assert!(installed_stamp(&controller) == first);
+    assert_eq!(
+        controller.refresh_apply(&mut registry, loaded_at, older_load),
+        Ok(())
+    );
+    let state = controller.state.lock().unwrap();
+    assert!(state.identity.as_ref().map(IdentitySnapshot::stamp) == Some(&first));
+    assert!(state.snapshot.is_some());
+    assert!(!state.pending_all);
+}
+
+#[test]
+fn a_refresh_whose_load_raced_a_cleared_identity_reports_it_needs_an_install() {
+    let login = Login::new();
+    let controller = login.controller(true, false);
+    let mut registry = DemandRegistry::new(Instant::now());
+    controller
+        .install_account_snapshot(&login.snapshot(vec![robot(1, true)]), &mut registry)
+        .unwrap();
+    let loaded_at = controller.refresh_start(&mut registry).unwrap().unwrap();
+    let older_load = controller.read_identity();
+    assert!(older_load.is_ok());
+    // Another operation clears the identity while that load is in flight.
+    AccountWanController::invalidate(&mut controller.state.lock().unwrap()).unwrap();
+    assert_eq!(
+        controller.refresh_apply(&mut registry, loaded_at, older_load),
+        Err(NEED_INSTALL.to_owned())
+    );
+    let state = controller.state.lock().unwrap();
+    assert!(state.identity.is_none());
     assert!(!state.pending_all);
 }
 

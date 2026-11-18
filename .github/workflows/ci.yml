@@ -5880,9 +5880,12 @@ jobs:
   # batch, whose pull request ran it already. Every step past the checkout is
   # gated on `cerulion_netd` being in the classifier's selection, so a pull
   # request that selects nothing here spends one checkout. It restores the
-  # `test-linux` cache, whose workspace build holds the netd, CLI and remoted
-  # tree, and saves nothing. It reports no required context; the
-  # `cerulion_netd` step of `test-linux` shard 3 is the one a merge waits for.
+  # `test-linux` cache for the shared dependencies only (shard 0 saves it,
+  # trimmed to the units its own commands read), builds the rest itself, and
+  # saves nothing. Each run must report exactly one passed test, so a filter
+  # that matches nothing is a red rather than twenty empty passes. It reports
+  # no required context; the `cerulion_netd` step of `test-linux` shard 3 is
+  # the one a merge waits for.
   netd-owner-pair-transition-repeat:
     name: netd owner pair transition test, 20 runs (ubuntu-latest)
     needs: [changes]
@@ -5942,7 +5945,11 @@ jobs:
             echo "owner pair transition test: run $run of 20"
             cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- \
               --exact owner_pair::controller::transition::serving_transition_restores_canonical_and_observer_pins_on_the_same_subscribers \
-              --test-threads=1
+              --test-threads=1 2>&1 | tee "$RUNNER_TEMP/run-$run.log"
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed' "$RUNNER_TEMP/run-$run.log"; then
+              echo "owner pair transition test: run $run of 20 did not report exactly one passed test" >&2
+              exit 1
+            fi
           done
 
       - name: selection marker, cerulion_netd

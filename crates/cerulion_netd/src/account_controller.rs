@@ -99,6 +99,10 @@ struct State {
     plane: Option<IrohMirrorPlane>,
     account_mode: bool,
     identity: Option<IdentitySnapshot>,
+    /// Advances on every write of `identity`, so a load taken with the state
+    /// unlocked can tell that the installed identity was replaced meanwhile,
+    /// even when it was replaced back to the same content.
+    identity_generation: u64,
     snapshot: Option<AccountSnapshot>,
     catalogs: HashMap<[u8; 32], CatalogReply>,
     pending_all: bool,
@@ -158,6 +162,7 @@ impl AccountWanController {
                 plane: None,
                 account_mode: false,
                 identity: None,
+                identity_generation: 0,
                 snapshot: None,
                 catalogs: HashMap::new(),
                 pending_all: false,
@@ -272,7 +277,7 @@ impl AccountWanController {
         state.pending_robots.clear();
         state.pending_restores.clear();
         state.handover = None;
-        state.identity = None;
+        Self::set_identity(state, None);
         state.snapshot = None;
         state.catalogs.clear();
         match state.plane.take() {
@@ -398,10 +403,16 @@ impl AccountWanController {
             state
                 .registry
                 .replace_owner_certificate(current.owner_chain().cloned().map(Arc::new))?;
-            state.identity = Some(current);
+            Self::set_identity(state, Some(current));
             state.catalogs.clear();
         }
         Ok(())
+    }
+
+    /// Write the installed identity and advance its generation.
+    fn set_identity(state: &mut State, identity: Option<IdentitySnapshot>) {
+        state.identity = identity;
+        state.identity_generation = state.identity_generation.wrapping_add(1);
     }
 
     fn fence_reply(
@@ -527,7 +538,7 @@ impl AccountWanController {
                 .replace_owner_certificate(identity.owner_chain().cloned().map(Arc::new))?;
         }
         state.account_mode = true;
-        state.identity = Some(identity);
+        Self::set_identity(&mut state, Some(identity));
         state.snapshot = Some(snapshot.clone());
         state.catalogs.clear();
         state.busy_since = None;
@@ -541,41 +552,44 @@ impl AccountWanController {
     /// the state unlocked; the state is held only to retire pending keys and to
     /// compare and apply the loaded identity.
     fn refresh(&self, registry: &mut DemandRegistry) -> Result<(), String> {
-        let Some(loaded_against) = self.refresh_start(registry)? else {
+        let Some(loaded_at) = self.refresh_start(registry)? else {
             return Ok(());
         };
         let current = self.read_identity();
-        self.refresh_apply(registry, &loaded_against, current)
+        self.refresh_apply(registry, loaded_at, current)
     }
 
-    /// Retire pending keys and return the installed identity's stamp, or `None`
-    /// outside account mode.
-    fn refresh_start(
-        &self,
-        registry: &mut DemandRegistry,
-    ) -> Result<Option<crate::identity_snapshot::IdentityStamp>, String> {
+    /// Retire pending keys and return the installed identity's generation, or
+    /// `None` outside account mode.
+    fn refresh_start(&self, registry: &mut DemandRegistry) -> Result<Option<u64>, String> {
         let mut state = self.state()?;
         self.retire_pending(&mut state, registry)?;
         if !state.account_mode {
             return Ok(None);
         }
-        Ok(Some(
-            state.identity.as_ref().ok_or(NEED_INSTALL)?.stamp().clone(),
-        ))
+        if state.identity.is_none() {
+            return Err(NEED_INSTALL.into());
+        }
+        Ok(Some(state.identity_generation))
     }
 
-    /// Apply an identity loaded against `loaded_against`. An identity installed,
-    /// synchronized or cleared during the load was applied by that operation from
-    /// its own read, so this older load is dropped and the next refresh reads again.
+    /// Apply an identity loaded at generation `loaded_at`. An identity installed,
+    /// synchronized or cleared during the load was written by that operation from
+    /// its own read, so this older load is dropped and the next refresh reads again;
+    /// a cleared identity still reports that it needs an install.
     fn refresh_apply(
         &self,
         registry: &mut DemandRegistry,
-        loaded_against: &crate::identity_snapshot::IdentityStamp,
+        loaded_at: u64,
         current: Result<IdentitySnapshot, SnapshotError>,
     ) -> Result<(), String> {
         let mut state = self.state()?;
-        if state.identity.as_ref().map(IdentitySnapshot::stamp) != Some(loaded_against) {
-            return self.retire_pending(&mut state, registry);
+        if state.identity_generation != loaded_at {
+            self.retire_pending(&mut state, registry)?;
+            if state.identity.is_none() {
+                return Err(NEED_INSTALL.into());
+            }
+            return Ok(());
         }
         match current {
             Err(SnapshotError::Busy) => {
