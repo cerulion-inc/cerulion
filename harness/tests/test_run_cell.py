@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """run-cell, the engine behind cerulion rcp bench: what it refuses before anything starts, the one test request
-to the model endpoint, and the row it reads from a scored episode. Standard library only: the endpoint is a
-server on the loopback address inside the test, and the episode results are hand-written fixtures."""
+to the model endpoint, where its scratch folder goes, and the row and the prices it reads from a scored episode.
+Standard library only: the endpoint is a server on the loopback address inside the test, and the episode results
+are hand-written fixtures. A whole run and its interrupts: test_run_cell_episode.py."""
 import contextlib
 import http.server
 import io
@@ -294,6 +295,135 @@ class Results(unittest.TestCase):
             f.write("{")
         row = cli.read_result(args("--out", self.out), "rcp", self.out)
         self.assertEqual(row["state"], "not started")
+
+
+class Scratch(unittest.TestCase):
+    """The scratch folder: a new short folder under /tmp, and the socket paths an episode binds under it."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.base, ignore_errors=True))
+
+    def test_the_longest_socket_path_is_the_plain_setups_truth_socket_of_the_last_attempt(self):
+        # "/w" + "/p" + "/run_without" + "/_scoring" + "/pro_spatial_swap_t00_i00_a3" + "/truth.sock"
+        # = 2 + 2 + 12 + 9 + 28 + 11 = 64 bytes
+        self.assertEqual(cli.longest_socket_path("/w", "run", CELL), 64)
+        self.assertEqual(cli.longest_socket_path("/w", "longer", CELL), 67)
+
+    def test_a_new_folder_under_the_parent_each_time(self):
+        first, second = cli.scratch_for(self.base), cli.scratch_for(self.base)
+        self.assertNotEqual(first, second)
+        for path in (first, second):
+            self.assertEqual(os.path.dirname(path), self.base)
+            self.assertRegex(os.path.basename(path), r"^cerulion-bench-[A-Za-z0-9_]{8}$")
+            self.assertTrue(os.path.isdir(path))
+
+    def test_the_default_folder_leaves_room_for_every_socket_path(self):
+        # "/tmp/cerulion-bench-" and 8 characters: 28 bytes; then "/p/", the label, "_without/_scoring/", the
+        # cell, "_a3/truth.sock": 59 bytes and the label. The default label "run": 90; a label of 16 fits in 103.
+        path = os.path.join(cli.SCRATCH_PARENT, cli.SCRATCH_PREFIX + "x" * 8)
+        self.assertEqual(len(path), 28)
+        self.assertEqual(cli.longest_socket_path(path, "run", CELL), 90)
+        self.assertEqual(cli.longest_socket_path(path, "l" * 16, CELL), 103)
+        self.assertEqual(cli.longest_socket_path(path, "l" * 17, CELL), 104)
+
+    def test_a_label_too_long_for_any_scratch_folder_is_refused_before_start(self):
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": KEY}, clear=True):
+            ns = args("--base-url", "http://127.0.0.1:9/v1", "--out", os.path.join(self.base, "o"),
+                      "--label", "l" * 17)
+            code, text = cli.refusal_before_start(ns, ["plain"])
+            self.assertEqual(code, 2)
+            self.assertEqual(text, "the episode's socket paths under /tmp would be longer than 103 bytes: use a "
+                                   "shorter --label")
+            ns = args("--base-url", "http://127.0.0.1:9/v1", "--out", os.path.join(self.base, "o"),
+                      "--work", self.base + "/" + "w" * 60)
+            code, text = cli.refusal_before_start(ns, ["plain"])
+            self.assertEqual(code, 2)
+            self.assertTrue(text.endswith("use a shorter --label or --work"), text)
+
+    def test_a_base_url_that_is_not_http_with_a_host_is_refused_before_start(self):
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": KEY}, clear=True):
+            for url in ("ftp://example.com/v1", "example.com/v1", "http://", "http://[::1"):
+                code, text = cli.refusal_before_start(args("--base-url", url, "--out", self.base), ["plain"])
+                self.assertEqual((code, text), (2, f"the base URL must be http or https with a host, not {url!r}"))
+
+
+class Prices(unittest.TestCase):
+    """The cost a scored row prints: the package's list price, and the endpoint's own figure when it gives one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = self.tmp.name
+        self.group = os.path.join(self.out, "rcp", "libero_pro", "run_with")
+        write_json(os.path.join(self.group, CELL + ".json"), {"success": True, "grid": {"attempt": 1}})
+        os.makedirs(os.path.join(self.group, "_episodes", CELL, "a1"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def log(self, *usages):
+        with open(os.path.join(self.group, "_episodes", CELL, "a1", "operator.jsonl"), "w", encoding="utf-8") as f:
+            for u in usages:
+                f.write(json.dumps({"kind": "reply", "usage": u}) + "\n")
+
+    def test_both_prices_are_read_and_labelled(self):
+        # gemini-3.8-flash, per reply: 50,000 x 0.75 + 150,000 x 0.075 + 2,000 x 3.75 = 0.05625 USD; two: 0.1125.
+        usage = {"prompt_tokens": 200_000, "completion_tokens": 2_000,
+                 "prompt_tokens_details": {"cached_tokens": 150_000}}
+        self.log(dict(usage, cost=0.06), dict(usage, cost=0.07))
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        self.assertEqual((row["list_price_usd"], row["reported_usd"], row["reported_cost_replies"],
+                          row["usage_replies"]), (0.1125, 0.13, 2, 2))
+        self.assertEqual(cli.cost_text(row), "0.1125 USD at list price (the package's price table of 2026-11-17); "
+                                             "0.1300 USD reported by the endpoint (usage.cost of 2 of 2 replies)")
+
+    def test_an_endpoint_that_reports_no_cost_shows_the_list_price_only(self):
+        self.log({"prompt_tokens": 1_000_000, "completion_tokens": 0}, {"prompt_tokens": 0, "cost": "free"})
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        self.assertEqual((row["reported_usd"], row["reported_cost_replies"]), (None, 0))
+        self.assertEqual(cli.cost_text(row), "0.7500 USD at list price (the package's price table of 2026-11-17)")
+
+    def test_a_cost_on_some_replies_says_on_how_many(self):
+        self.log({"prompt_tokens": 0, "cost": 0.25}, {"prompt_tokens": 0})
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        self.assertTrue(cli.cost_text(row).endswith("; 0.2500 USD reported by the endpoint (usage.cost of 1 of 2 "
+                                                    "replies)"), cli.cost_text(row))
+
+    def test_a_model_the_table_lacks_still_shows_the_endpoints_figure(self):
+        self.log({"prompt_tokens": 10, "cost": 0.5})
+        ns = cli.parser().parse_args(["run-cell", "--model", "a-local-model", "--out", self.out])
+        row = cli.read_result(ns, "rcp", self.out)
+        self.assertEqual(cli.cost_text(row), "no list price for this model name in the package's price table; "
+                                             "0.5000 USD reported by the endpoint (usage.cost of 1 of 1 replies)")
+
+    def test_the_verdict_lines(self):
+        self.log({"prompt_tokens": 1_000_000, "completion_tokens": 0, "cost": 0.8})
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.show(row)
+            cli.show({"arm": "plain", "scored": False, "state": "failed", "reasons": ["endpoint", "endpoint"]})
+        self.assertEqual(out.getvalue().splitlines(), [
+            "  rcp    solved: True  within the published step limit: None  false claim: None",
+            "         replies: None  control steps: None  operator seconds: None",
+            "         cost: 0.7500 USD at list price (the package's price table of 2026-11-17); 0.8000 USD reported "
+            "by the endpoint (usage.cost of 1 of 1 replies)",
+            "  plain  NOT SCORED: failed; endpoint; endpoint"])
+
+
+class PathsAsGiven(unittest.TestCase):
+    def test_a_folder_that_holds_a_result_is_named_as_given(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = os.getcwd()
+        os.chdir(tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        write_json(os.path.join("o", "plain", "libero_pro", "run_without", CELL + ".json"), {})
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": KEY}, clear=True):
+            code, text = cli.refusal_before_start(args("--base-url", "http://127.0.0.1:9/v1", "--out", "o"), ["plain"])
+        self.assertEqual(text, f"o already holds a plain result of {CELL} (o/plain/libero_pro/run_without/"
+                               f"{CELL}.json), which the driver would report again instead of running a new episode: "
+                               f"name a new --out folder")
 
 
 if __name__ == "__main__":

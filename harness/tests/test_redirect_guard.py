@@ -112,9 +112,9 @@ class RedirectGuard(unittest.TestCase):
     def run_cell(self, *extra):
         err, out = io.StringIO(), io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            # No --work: the default scratch folder under /tmp, short enough for the episode's socket paths.
             code = cli.main(["run-cell", "--model", "m", "--base-url", self.url, "--key-env", "TEST_KEY",
-                             "--arm", "plain", "--out", self.out, "--work", os.path.join(self.tmp.name, "w"),
-                             *extra])
+                             "--arm", "plain", "--out", self.out, *extra])
         return code, err.getvalue()
 
     def test_with_the_endpoint_check_the_redirect_is_named_and_no_episode_starts(self):
