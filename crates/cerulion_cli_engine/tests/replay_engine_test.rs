@@ -27931,8 +27931,9 @@ fn sync_stopped_at_two_reference() -> Recording {
 /// window holds it: the trim keeps every record from that step and re-states
 /// each read site's last dropped producer annotation directly before that
 /// site's first kept read, so the capture names the writer of the reads that
-/// continue a run begun before it (the rule `cerulion_bagd`'s trace window
-/// applies).
+/// continue a run begun before it. A copy of the re-stated writer note of
+/// `walk` in `crates/cerulion_bagd/src/trace_window.rs`, which a change to
+/// that rule must follow.
 fn make_mid_run_with_writer_carry(rec: &Recording) -> Recording {
     use cerulion_core::trace_ring::{
         unpack_read_outcome_meta_full, READ_OUTCOME_PRODUCER, READ_OUTCOME_TRUNCATED,
@@ -28000,7 +28001,10 @@ fn unfired_warns(lines: &[&str], code: &str, formats: &[u32]) -> Result<(), Stri
             l.contains("node_id=sink")
                 && l.contains(&format!("trace_format={format}"))
                 && l.contains(&format!("anchor_step={}", LS_FIRST_STEP - 1))
-                && l.contains("under --verify the --report carries a stand_down note")
+                && l.contains(
+                    "where a --verify replay reaches this rule, its --report carries a \
+                     stand_down note",
+                )
                 && !l.contains("report-only")
         });
     if named {
@@ -28048,7 +28052,7 @@ fn assert_sink_stands_down_by(outcome: &ReplayOutcome, code: &str) {
 /// records as a capture of a run younger than its window under `--verify`,
 /// fed by read identity with `fed_reads` reads of one frame each, and check
 /// that both stand the sink down by `code` ([`assert_sink_stands_down_by`]).
-fn assert_old_bag_and_young_capture_stand_the_sink_down(
+fn assert_format_nine_bag_and_young_capture_stand_the_sink_down(
     stem: &str,
     rec: &Recording,
     parts: &[(&str, u32, Vec<Vec<u8>>)],
@@ -28087,6 +28091,46 @@ fn assert_old_bag_and_young_capture_stand_the_sink_down(
     assert_sink_stands_down_by(&verified, code);
 }
 
+/// The same records and `parts` stamped at trace format 10, at which the
+/// sink's part without the stopped flag states it running: a neutral
+/// `--resim all` stands nothing down and reports the fire-schedule difference
+/// whose detail holds each of `divergence`, which `--verify` exits 6 on.
+fn assert_format_ten_states_the_sink_running(
+    stem: &str,
+    rec: &Recording,
+    parts: &[(&str, u32, Vec<Vec<u8>>)],
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    divergence: &[&str],
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_stop_bag_with(
+        &dir,
+        &format!("{stem}_10.mcap"),
+        rec,
+        parts,
+        ri_free_run_recorder_json(),
+    );
+    let (running, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
+    let running = running.expect("the resumed neutral resim runs");
+    assert!(
+        stand_down_details(&running).is_empty(),
+        "{:?}",
+        stand_down_details(&running)
+    );
+    let d = running
+        .trace_divergence
+        .as_ref()
+        .expect("a node stated running that misses its owed fire is a finding");
+    for part in divergence {
+        assert!(
+            d.detail.contains(part),
+            "{part:?} missing from: {}",
+            d.detail
+        );
+    }
+    assert_eq!(resim_exit(&running, true), 6, "{running:?}");
+}
+
 /// The checkpoint records of the sink's `part`, at ring index 1.
 fn sink_part(part: Vec<u8>) -> (&'static str, u32, Vec<Vec<u8>>) {
     (
@@ -28105,18 +28149,32 @@ fn sink_part(part: Vec<u8>) -> (&'static str, u32, Vec<Vec<u8>>) {
 /// name (`fifo_unfired_since_anchor`) instead of reporting a fire-schedule
 /// difference there, and a `--verify` replay of the slice as a young capture
 /// holds it, fed by that one drain read, does the same; each logs one WARN.
+/// At trace format 10 the same part states the sink running, so the same
+/// pop is a finding at step 4, exit 6 under `--verify`.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn an_old_resumed_bag_stands_a_stopped_fifo_sink_down_by_name_and_warns() {
+fn a_format_nine_resumed_bag_stands_a_stopped_fifo_sink_down_by_name_and_warns() {
     let rec = fifo_stopped_at_anchor_reference();
-    assert_old_bag_and_young_capture_stand_the_sink_down(
+    let parts = [sink_part(fifo_sink_unflagged_part(&rec))];
+    let make = || fifo_sink_factories(3.0);
+    assert_format_nine_bag_and_young_capture_stand_the_sink_down(
         "fifo_unflagged",
         &rec,
-        &[sink_part(fifo_sink_unflagged_part(&rec))],
-        || fifo_sink_factories(3.0),
+        &parts,
+        make,
         "fifo_unfired_since_anchor",
         1,
+    );
+    assert_format_ten_states_the_sink_running(
+        "fifo_unflagged",
+        &rec,
+        &parts,
+        make,
+        &[
+            "node 'sink' step 4 FIFO pop count",
+            "re-derived 1 fire(s), recorded 0 fire(s)",
+        ],
     );
     logs_assert(|lines: &[&str]| unfired_warns(lines, "fifo_unfired_since_anchor", &[9, 9]));
 }
@@ -28128,11 +28186,12 @@ fn an_old_resumed_bag_stands_a_stopped_fifo_sink_down_by_name_and_warns() {
 /// subscriber: a neutral `--resim all` and a fed `--verify` replay of the
 /// slice as a young capture holds it stand that rule down by name
 /// (`latest_unfired_since_anchor`, the code the separate-drain stand-down
-/// carries too), and each logs one WARN.
+/// carries too), and each logs one WARN. At trace format 10 the same part
+/// states the sink running, so its first pop is a finding at step 4.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn an_old_resumed_bag_stands_a_stopped_unified_latest_sink_down_by_name_and_warns() {
+fn a_format_nine_resumed_bag_stands_a_stopped_unified_latest_sink_down_by_name_and_warns() {
     let make = || unified_factories(SinkFailure::Fatal(2.0));
     let rec = stopped_at_two_reference("stopping_unified_sink_node", make);
     let (_, drained) = ls_sink_records(
@@ -28149,14 +28208,27 @@ fn an_old_resumed_bag_stands_a_stopped_unified_latest_sink_down_by_name_and_warn
         pending_data_count: rec.pending_after[LS_SINK][(LS_FIRST_STEP - 1) as usize],
         ..Default::default()
     };
-    let part = part_with_section(&StoppingUnifiedSinkNode::default(), &section);
-    assert_old_bag_and_young_capture_stand_the_sink_down(
+    let parts = [sink_part(part_with_section(
+        &StoppingUnifiedSinkNode::default(),
+        &section,
+    ))];
+    assert_format_nine_bag_and_young_capture_stand_the_sink_down(
         "unified_unflagged",
         &rec,
-        &[sink_part(part)],
+        &parts,
         make,
         "latest_unfired_since_anchor",
         LS_STEPS - LS_FIRST_STEP as usize,
+    );
+    assert_format_ten_states_the_sink_running(
+        "unified_unflagged",
+        &rec,
+        &parts,
+        make,
+        &[
+            "node 'sink' step 4 consume = latest fire count",
+            "re-derived 1 fire(s), recorded 0 fire(s)",
+        ],
     );
     logs_assert(|lines: &[&str]| unfired_warns(lines, "latest_unfired_since_anchor", &[9, 9]));
 }
@@ -28168,14 +28240,16 @@ fn an_old_resumed_bag_stands_a_stopped_unified_latest_sink_down_by_name_and_warn
 /// the restored pair is aligned at every step: a neutral `--resim all`
 /// stands the Sync owed-fire rule down by name (`sync_unfired_since_anchor`)
 /// instead of reporting a fire-schedule difference at step 4. A `--verify`
-/// replay fed by read identity refuses a per-set Sync stage before its first
-/// step, so the `--verify` that reaches the rule replays its queues: the same
-/// bag stamped at trace format 7, which passes with the same note. Each logs
-/// one WARN.
+/// of that bag is fed by read identity, which refuses a per-set Sync stage
+/// before its first step (`read_identity_ungateable_stage`, exit 2), so the
+/// `--verify` that reaches the rule replays its queues: the same bag stamped
+/// at trace format 7, which passes with the same note. Each replay that
+/// reaches the rule logs one WARN. At trace format 10 the same part states
+/// the sink running, so the restored pair is a finding at step 4.
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn an_old_resumed_bag_stands_a_stopped_sync_sink_down_by_name_and_warns() {
+fn a_format_nine_resumed_bag_stands_a_stopped_sync_sink_down_by_name_and_warns() {
     let dir = tempfile::tempdir().unwrap();
     let make = || sync_sink_factories(SinkFailure::Fatal(2.0));
     let rec = sync_stopped_at_two_reference();
@@ -28214,6 +28288,13 @@ fn an_old_resumed_bag_stands_a_stopped_sync_sink_down_by_name_and_warns() {
         &outcome.expect("the resumed neutral resim runs"),
         "sync_unfired_since_anchor",
     );
+    let (refused, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let err = refused.expect_err("a fed --verify refuses the per-set Sync stage");
+    let ReplayError::ReadLogNotEnforceable { cause, .. } = &err else {
+        panic!("expected ReadLogNotEnforceable, got {err:?}");
+    };
+    assert_eq!(cause, "read_identity_ungateable_stage", "{err:?}");
+    assert_eq!(err.exit_code(), 2);
     let unfed = write_stop_bag_with(
         &dir,
         "sync_unflagged_7.mcap",
@@ -28232,6 +28313,16 @@ fn an_old_resumed_bag_stands_a_stopped_sync_sink_down_by_name_and_warns() {
         verified.read_identity
     );
     assert_sink_stands_down_by(&verified, "sync_unfired_since_anchor");
+    assert_format_ten_states_the_sink_running(
+        "sync_unflagged",
+        &rec,
+        &parts,
+        make,
+        &[
+            "node 'sink' step 4 sync alignment",
+            "re-derived 1 fire(s), recorded 0 fire(s)",
+        ],
+    );
     logs_assert(|lines: &[&str]| unfired_warns(lines, "sync_unfired_since_anchor", &[9, 7]));
 }
 
@@ -28243,7 +28334,7 @@ fn an_old_resumed_bag_stands_a_stopped_sync_sink_down_by_name_and_warns() {
 #[test]
 #[serial]
 #[tracing_test::traced_test]
-fn a_new_bag_with_no_part_for_a_stopped_node_stands_it_down_by_name() {
+fn a_format_ten_bag_with_no_part_for_a_stopped_node_stands_it_down_by_name() {
     let dir = tempfile::tempdir().unwrap();
     let make = || fifo_sink_factories(3.0);
     let rec = fifo_stopped_at_anchor_reference();
@@ -28274,7 +28365,8 @@ fn a_new_bag_with_no_part_for_a_stopped_node_stands_it_down_by_name() {
 }
 
 /// Two neutral resims of the format 9 FIFO bag report the same
-/// `rederivation_notes`, and two `--report` runs write the same bytes.
+/// `rederivation_notes`, its one `fifo_unfired_since_anchor` stand-down, and
+/// two neutral resims that write a report file write the same bytes.
 #[test]
 #[serial]
 fn two_neutral_resims_of_an_unstated_stop_bag_give_equal_notes() {
@@ -28288,17 +28380,22 @@ fn two_neutral_resims_of_an_unstated_stop_bag_give_equal_notes() {
         &fifo_sink_unflagged_part(&rec),
         ri_recorder_json_at(9),
     );
-    let notes = || {
+    let resim = || {
         let (outcome, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
-        outcome
-            .expect("the resumed neutral resim runs")
-            .rederivation_notes
+        outcome.expect("the resumed neutral resim runs")
     };
-    let first = notes();
-    assert_eq!(first.len(), 1, "{first:?}");
+    let first = resim();
     assert_eq!(
-        first,
-        notes(),
+        rederivation_note_rows(&first),
+        vec![(
+            "stand_down".to_string(),
+            LS_SINK.to_string(),
+            Some("fifo_unfired_since_anchor".to_string()),
+        )]
+    );
+    assert_eq!(
+        first.rederivation_notes,
+        resim().rederivation_notes,
         "two resims of one bag give one set of notes"
     );
     let (a, b) = two_reports(&dir, &bag, make);

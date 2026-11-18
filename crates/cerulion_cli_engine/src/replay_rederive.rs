@@ -1349,8 +1349,8 @@ pub enum StandDownReason {
     /// keeps aligning a stopped node's heads. Raised where
     /// [`Self::LatestUnfiredSinceAnchor`] is, for the same reason, at the
     /// first aligned step the owed-fire rule would convict; that rule stops
-    /// for the node, and the feasibility and set-supply rules, which judge
-    /// recorded fires, keep running.
+    /// for the node. The feasibility and set-supply rules judge only recorded
+    /// fires, and such a node has none.
     SyncUnfiredSinceAnchor,
 }
 
@@ -2909,13 +2909,17 @@ fn verify_sync(
     // (`withdraw_carried_heads`) on the three in-loop stand-downs below, since
     // a node that was not judged cannot have been judged on carried heads;
     // a FINDING keeps it. `SuppressibleFire` above is not a
-    // withdrawal: arms A and B still run under it, and the same holds for
-    // the `SyncUnfiredSinceAnchor` stand-down arm C latches.
+    // withdrawal: arms A and B still run under it.
     // A node the checkpoint states as stopped owes no fire at any step, so
     // no verdict on it rests on carried heads, a finding that it fired
-    // included.
+    // included. Nor does one on a node the pass never ran whose stop the
+    // checkpoint does not state (`OwedFire::StandsDown`): it has no recorded
+    // fire for arms A and B to judge, and arm C stands down for it.
     let note_at = report.carried_heads.len();
-    if node.has_non_trigger_inputs && !matches!(stop, Some(StopPoint::AtAnchor { .. })) {
+    if node.has_non_trigger_inputs
+        && matches!(owed_fire, OwedFire::Judged)
+        && !matches!(stop, Some(StopPoint::AtAnchor { .. }))
+    {
         report.carried_heads.push(CarriedHeadsNote {
             node_id: node.node_id.clone(),
         });
@@ -3174,27 +3178,30 @@ fn verify_sync(
         // A node the pass never ran, whose stop the checkpoint does not
         // state, can be one stopped before the anchor, which owes no fire:
         // its first owed fire stands arm C down by name, once, and arm C
-        // owes nothing at any later step. Arms B and A judge recorded fires,
-        // so they keep running.
+        // owes nothing at any later step. Arms B and A judge only recorded
+        // fires, and such a node has none.
         if k == 0 && sync_aligned(&narrow, trigger_inputs, window_ns) && !suppressible {
-            if owed_fire == OwedFire::Judged {
-                report.findings.push(ScheduleFinding {
-                    node_id: node.node_id.clone(),
-                    step: step.step,
-                    decider: Decider::Sync,
-                    expected: StepFires::count(1),
-                    recorded,
-                    unread: None,
-                });
-                return;
-            }
-            if !unfired_noted {
-                report.stand_downs.push(StandDown {
-                    node_id: node.node_id.clone(),
-                    decider: Decider::Sync,
-                    reason: StandDownReason::SyncUnfiredSinceAnchor,
-                });
-                unfired_noted = true;
+            match owed_fire {
+                OwedFire::Judged => {
+                    report.findings.push(ScheduleFinding {
+                        node_id: node.node_id.clone(),
+                        step: step.step,
+                        decider: Decider::Sync,
+                        expected: StepFires::count(1),
+                        recorded,
+                        unread: None,
+                    });
+                    return;
+                }
+                OwedFire::StandsDown if !unfired_noted => {
+                    report.stand_downs.push(StandDown {
+                        node_id: node.node_id.clone(),
+                        decider: Decider::Sync,
+                        reason: StandDownReason::SyncUnfiredSinceAnchor,
+                    });
+                    unfired_noted = true;
+                }
+                OwedFire::StandsDown => {}
             }
         }
 
@@ -3375,7 +3382,7 @@ fn carried_heads(wide_carry: &BTreeMap<String, Vec<u64>>, input: &str) -> u32 {
         .map_or(0, |v| u32::try_from(v.len()).unwrap_or(u32::MAX))
 }
 
-// Nine parameters, each a distinct type, mirroring `verify_sync`'s.
+// Nine parameters, mirroring the shape of `verify_sync`'s.
 #[allow(clippy::too_many_arguments)]
 fn verify_fifo(
     node: &NodeDecl,
@@ -3446,26 +3453,25 @@ fn verify_fifo(
                 Err(_) => false,
             },
         };
-        // A node the pass never ran, whose stop the checkpoint does not
-        // state, can be one stopped before the anchor, which owes no fire for
-        // any pop: the rule stops for it by name.
-        if !agrees && owed_fire == OwedFire::StandsDown {
-            report.stand_downs.push(StandDown {
-                node_id: node.node_id.clone(),
-                decider: Decider::FifoPop,
-                reason: StandDownReason::FifoUnfiredSinceAnchor,
-            });
-            return;
-        }
         if !agrees {
-            report.findings.push(ScheduleFinding {
-                node_id: node.node_id.clone(),
-                step: step.step,
-                decider: Decider::FifoPop,
-                expected: StepFires::count(supply),
-                recorded,
-                unread: None,
-            });
+            match owed_fire {
+                OwedFire::Judged => report.findings.push(ScheduleFinding {
+                    node_id: node.node_id.clone(),
+                    step: step.step,
+                    decider: Decider::FifoPop,
+                    expected: StepFires::count(supply),
+                    recorded,
+                    unread: None,
+                }),
+                // A node the pass never ran, whose stop the checkpoint does
+                // not state, can be one stopped before the anchor, which owes
+                // no fire for any pop: the rule stops for it by name.
+                OwedFire::StandsDown => report.stand_downs.push(StandDown {
+                    node_id: node.node_id.clone(),
+                    decider: Decider::FifoPop,
+                    reason: StandDownReason::FifoUnfiredSinceAnchor,
+                }),
+            }
             return;
         }
     }
@@ -3659,7 +3665,6 @@ fn verify_latest(
     let mut unread: Option<Vec<LatestUnread>> = (drain != LatestDrain::Unified
         && node.throttle_ns.is_none())
     .then(|| trigger_inputs.iter().map(|_| LatestUnread::new()).collect());
-    let unfired = owed_fire == OwedFire::StandsDown;
     let mut unrecorded_noted = false;
     let mut block_noted = false;
     let mut unfired_noted = false;
@@ -3729,7 +3734,10 @@ fn verify_latest(
             && !at_stop;
         // A node the pass never ran can be one stopped before the anchor,
         // which owes no fire for a pop.
-        let owes_one = pop_owes_fire && !unfired;
+        let owes_one = match owed_fire {
+            OwedFire::Judged => pop_owes_fire,
+            OwedFire::StandsDown => false,
+        };
         let expected = if owes_one { 1 } else { recorded.count.min(1) };
         if recorded.count != expected {
             report.findings.push(ScheduleFinding {
@@ -3771,13 +3779,16 @@ fn verify_latest(
             });
             block_noted = true;
         }
-        if pop_owes_fire && unfired && !unfired_noted {
-            report.stand_downs.push(StandDown {
-                node_id: node.node_id.clone(),
-                decider: Decider::LatestFire,
-                reason: StandDownReason::LatestUnfiredSinceAnchor,
-            });
-            unfired_noted = true;
+        match owed_fire {
+            OwedFire::StandsDown if pop_owes_fire && !unfired_noted => {
+                report.stand_downs.push(StandDown {
+                    node_id: node.node_id.clone(),
+                    decider: Decider::LatestFire,
+                    reason: StandDownReason::LatestUnfiredSinceAnchor,
+                });
+                unfired_noted = true;
+            }
+            OwedFire::StandsDown | OwedFire::Judged => {}
         }
         // The stopping step's fire ends the node, so nothing it counted is
         // owed a later fire.
@@ -3830,23 +3841,25 @@ fn verify_latest(
                             });
                         }
                     }
-                    // A stop before the anchor owes no fire, and nothing in
-                    // the pass can show the node was not stopped there.
-                    LatestUnreadVerdict::Owed(_) if unfired => {
-                        unbounded = Some(StandDownReason::LatestUnfiredSinceAnchor);
-                        break;
-                    }
-                    LatestUnreadVerdict::Owed(frames) => {
-                        report.findings.push(ScheduleFinding {
-                            node_id: node.node_id.clone(),
-                            step: step.step,
-                            decider: Decider::LatestFire,
-                            expected: StepFires::count(1),
-                            recorded,
-                            unread: Some(frames),
-                        });
-                        return;
-                    }
+                    LatestUnreadVerdict::Owed(frames) => match owed_fire {
+                        OwedFire::Judged => {
+                            report.findings.push(ScheduleFinding {
+                                node_id: node.node_id.clone(),
+                                step: step.step,
+                                decider: Decider::LatestFire,
+                                expected: StepFires::count(1),
+                                recorded,
+                                unread: Some(frames),
+                            });
+                            return;
+                        }
+                        // A stop before the anchor owes no fire, and nothing
+                        // in the pass can show the node was not stopped there.
+                        OwedFire::StandsDown => {
+                            unbounded = Some(StandDownReason::LatestUnfiredSinceAnchor);
+                            break;
+                        }
+                    },
                     LatestUnreadVerdict::Unbounded(reason) => {
                         unbounded = Some(reason);
                         break;
@@ -6046,10 +6059,10 @@ mod tests {
     /// an aligned `(cam, lidar)` pair: where the checkpoint states it running
     /// that step owes a fire, a finding at step 4; where the stop is
     /// unstated, arm C stands down by name instead. On a node that wires a
-    /// non-trigger input the carried-heads note stays beside the stand-down,
-    /// as it does beside a finding, because arms B and A still ran. A pair
-    /// that a restored `cam` head and a fresh `lidar` arrival align stands
-    /// down the same way.
+    /// non-trigger input the carried-heads note stays beside the finding, and
+    /// none is pushed beside the stand-down: such a node has no recorded fire,
+    /// so no rule judged it on carried heads. A pair that a restored `cam`
+    /// head and a fresh `lidar` arrival align stands down the same way.
     #[test]
     fn an_unstated_sync_node_with_an_aligned_set_and_no_fire_stands_down_at_arm_c() {
         let slice = sync_slice(1, &[]);
@@ -6067,7 +6080,6 @@ mod tests {
                 unstated,
                 RederivationReport {
                     stand_downs: vec![sync_unfired()],
-                    carried_heads: notes.clone(),
                     ..RederivationReport::default()
                 },
                 "wide: {wide}"
@@ -6198,10 +6210,11 @@ mod tests {
     }
 
     /// A node the checkpoint states as running, and every node of a
-    /// from-start pass, is judged as before: the quiet slices of the three
-    /// rules convict at step 4 under both restores.
+    /// from-start pass, is judged by every rule: the quiet slices of the
+    /// three rules convict at step 4, their first owed fire, under both
+    /// restores.
     #[test]
-    fn a_stated_running_node_and_a_from_start_pass_are_judged_as_before() {
+    fn a_stated_running_node_and_a_from_start_pass_convict_at_their_first_owed_fire() {
         let unified = latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH);
         /// `(nodes, quiet slice, trust, node id, the rule that convicts)`.
         type Case<'a> = (
@@ -6274,11 +6287,11 @@ mod tests {
     /// The latched stand-downs are pushed once however many later steps
     /// would have convicted: five popping steps of a unified latest node, and
     /// three aligned pairs of a Sync node wiring a non-trigger input, each
-    /// give exactly one stand-down and no finding, and the Sync node keeps
-    /// its carried-heads note. Where the checkpoint states the node running,
-    /// each convicts at its first owed step.
+    /// give exactly one stand-down and no finding or note. Where the
+    /// checkpoint states the node running, each convicts at its first owed
+    /// step, the Sync node beside its carried-heads note.
     #[test]
-    fn a_latched_stand_down_is_pushed_once_and_keeps_the_judged_notes() {
+    fn a_latched_stand_down_is_pushed_once_however_many_steps_would_convict() {
         let unified = latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH);
         let latest = judge_unstopped(
             &unified,
@@ -6300,21 +6313,24 @@ mod tests {
             sync,
             RederivationReport {
                 stand_downs: vec![sync_unfired()],
-                carried_heads: vec![CarriedHeadsNote {
-                    node_id: "fuse".to_string(),
-                }],
                 ..RederivationReport::default()
             }
         );
         let running = judge_unstopped(&wide, &aligned, SYNC_TRUST, &stated_running("fuse"));
         assert_eq!(finding_steps(&running), vec![(4, Decider::Sync)]);
+        assert_eq!(
+            running.carried_heads,
+            vec![CarriedHeadsNote {
+                node_id: "fuse".to_string(),
+            }]
+        );
     }
 
     /// One resumed slice of three nodes no step fires, judged twice: the two
     /// reports are equal, and hold one stand-down per rule in declaration
     /// order and no finding.
     #[test]
-    fn two_verify_calls_return_equal_reports() {
+    fn three_unfired_nodes_stand_down_in_declaration_order_on_two_verify_calls() {
         let nodes = vec![
             node(
                 "fifo",

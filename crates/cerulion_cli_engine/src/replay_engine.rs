@@ -16956,8 +16956,10 @@ fn run_rank_pass(
                 // change to the exit code, and a node the scheduler never fired
                 // records the same resumed slice as a stopped one; each is
                 // raised at most once per node per pass, and only on a resumed
-                // pass, which has one rank. A `--report` needs `--verify`, so
-                // their text names where the note lands. The generic loop
+                // pass, which has one rank. A `--report` needs `--verify`, and
+                // a fed `--verify` can refuse such a bag before its first step,
+                // so their text says the note lands where a `--verify` replay
+                // reaches the rule. The generic loop
                 // stays `debug!` because a healthy multi-rank replay
                 // legitimately declines several deciders per rank and a warn
                 // per decline is the flood class.
@@ -16982,8 +16984,8 @@ fn run_rank_pass(
                         "replay: the resumed pass holds no fire and no body read of this node, \
                          and the recording does not state whether it was stopped at the \
                          anchor, so its FIFO pop rule was not verified. The exit code is \
-                         unchanged; under --verify the --report carries a stand_down note \
-                         (see `code` and `detail`)"
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
                     );
                 } else if sd.reason == replay_rederive::StandDownReason::LatestUnfiredSinceAnchor {
                     tracing::warn!(
@@ -16996,8 +16998,8 @@ fn run_rank_pass(
                         "replay: the resumed pass holds no fire and no body read of this node, \
                          and the recording does not state whether it was stopped at the \
                          anchor, so its consume = latest fire rule was not verified. The exit \
-                         code is unchanged; under --verify the --report carries a stand_down \
-                         note (see `code` and `detail`)"
+                         code is unchanged; where a --verify replay reaches this rule, its \
+                         --report carries a stand_down note (see `code` and `detail`)"
                     );
                 } else if sd.reason == replay_rederive::StandDownReason::SyncUnfiredSinceAnchor {
                     tracing::warn!(
@@ -17010,8 +17012,8 @@ fn run_rank_pass(
                         "replay: the resumed pass holds no fire and no body read of this node, \
                          and the recording does not state whether it was stopped at the \
                          anchor, so its Sync owed-fire rule was not verified. The exit code is \
-                         unchanged; under --verify the --report carries a stand_down note \
-                         (see `code` and `detail`)"
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
                     );
                 } else {
                     tracing::debug!(

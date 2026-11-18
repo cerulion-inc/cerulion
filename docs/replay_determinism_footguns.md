@@ -332,12 +332,15 @@ state, the other rules that owe a fire stand down the same way, at the first
 step they would convict: the FIFO pop count (`fifo_unfired_since_anchor`), the
 fire a pop owes a `consume = latest` input read through one subscriber
 (`latest_unfired_since_anchor`), and the fire an aligned set owes a `Sync`
-node (`sync_unfired_since_anchor`), whose checks on its recorded fires keep
-running. Each of these stand-downs, the two-subscriber one included, prints a
-warning on stderr on every run, naming the node, the code, the bag's
-`trace_format` and the checkpoint step, and changes no exit code; its
-`stand_down` note is in the `--report` JSON, which only a `--verify` run
-writes.
+node (`sync_unfired_since_anchor`). Each of these stand-downs, the
+two-subscriber one included, prints a warning on stderr on every run, naming
+the node, the code, the bag's `trace_format` and the checkpoint step, and
+changes no exit code; its `stand_down` note is in the `--report` JSON, which
+only a `--verify` run writes. For a `Sync` node a `--verify` replay reaches
+this rule only on a bag below trace format 8: from format 8 a free-run
+`--verify` is fed by read identity, which refuses a per-set `Sync` stage
+before its first step (`read_identity_ungateable_stage`, exit 2), so on such
+a bag a neutral `--resim all` is the replay that reaches it.
 
 ### Divergence LOCALIZES to the producing rank
 
