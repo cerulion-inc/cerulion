@@ -9142,8 +9142,8 @@ fn resolve_backlog_admission(
 ) -> Result<BacklogAdmission, ReplayError> {
     let mut claims: Vec<BacklogClaim> = Vec::new();
     for node in &config.nodes {
-        // A stopped node's trigger keeps counting arrivals it will never
-        // consume, so its count claims no backlog a replay must re-feed.
+        // A stopped node's count is arrivals it will never consume, so it
+        // claims no backlog a replay must re-feed.
         if stops.is_stopped(&node.id) {
             continue;
         }
