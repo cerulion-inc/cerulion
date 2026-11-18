@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """A stand-in for the measured launcher (python -m bench.ext.episode_ext start | score | stop), for the sim
 server's tests: no simulator runs. Every call is appended to the JSON lines file FAKE_SIM_LOG with its arguments
-and the environment the server gave it. FAKE_SIM_FAIL=start makes start fail; FAKE_SIM_STOP_S=N makes stop take N
-seconds."""
+and the environment the server gave it. FAKE_SIM_FAIL=start makes start fail, and FAKE_SIM_FAIL=stop makes stop say
+a process still runs and exit 1; FAKE_SIM_SCORE_S=N and FAKE_SIM_STOP_S=N make score and stop take N seconds."""
 import json
 import os
 import sys
@@ -32,6 +32,7 @@ def main(argv):
             json.dump({"absent": []}, f)
         return 0
     if verb == "score":
+        time.sleep(float(os.environ.get("FAKE_SIM_SCORE_S", "0")))
         claimed = os.path.exists(os.path.join(ep, "episode_end.json"))
         print("scoring\n" + json.dumps({"success": claimed, "claimed_success": claimed, "false_claim": False,
                                         "steps_used": 7, "first_success_step": 5 if claimed else None,
@@ -40,6 +41,9 @@ def main(argv):
         return 0
     if verb == "stop":
         time.sleep(float(os.environ.get("FAKE_SIM_STOP_S", "0")))
+        if os.environ.get("FAKE_SIM_FAIL") == "stop":
+            print("episode server: still running; env host: stopped")
+            return 1
         return 0
     return 2
 

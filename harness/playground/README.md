@@ -1,7 +1,7 @@
 # The sim server
 
 Experimental. `cerulion rcp --sim` starts this server: the harness's MCP tools on a simulated robot arm, one
-episode per connection, on your own machine. Your model client does the thinking; the simulator runs here.
+episode per client session, on your own machine. Your model client does the thinking; the simulator runs here.
 
 It also runs on its own, with the Python of the harness install (it carries the MCP SDK and the server's pins):
 
@@ -30,10 +30,13 @@ Over stdio the server has one client. Once its episode has ended, listing the to
 The transcript and the pictures of every episode are kept in `~/.cerulion/sim/episodes/ID/` (under
 `CERULION_HOME` when that is set).
 
-Over HTTP each MCP session gets its own episode, which no other client reaches; `?state=LABEL` on the URL
-picks the start state, and `&episode=N` a second episode for a client that keeps no session. An idle client
-connection is kept open for the idle limit (the episode clock when no limit is set), so a client can keep one
-connection between turns. The pages beside `/mcp`:
+Over HTTP each MCP session gets its own episode, which no other client reaches, and `?state=LABEL` on the URL
+picks the start state. A request that keeps no session names its episode with `episode=LABEL` in the URL's query
+(`/mcp?episode=a`, `/mcp?state=open-drawer&episode=a`): clients that name the same label share one robot, and a
+request that names none is refused with a message that says so. A client that probes with `server/discover` and
+falls back to the session handshake when refused, as the MCP Python SDK's client does by default, gets its own
+episode. An idle client connection is kept open for the idle limit (the episode clock when no limit is set), so
+a client can keep one connection between turns. The pages beside `/mcp`:
 
 | path | what |
 |---|---|

@@ -131,9 +131,10 @@ def build_routes(settings, pool, url):
     async def home(request):
         name = html.escape(settings.name)
         body = (f"<h1>{name} simulated robot, on this machine</h1>"
-                "<p>Add one MCP URL to your own model client. Each session gets its own simulated robot arm on a "
-                "tabletop task, with the robot's tools served as MCP tools. Your model does the thinking; the "
-                "simulator runs here, on this machine.</p>"
+                "<p>Add one MCP URL to your own model client. Each client session gets its own simulated robot "
+                "arm on a tabletop task, with the robot's tools served as MCP tools. A client that keeps no session "
+                "names its episode with <code>?episode=LABEL</code> on the URL, and clients that name the same "
+                "label share one robot. Your model does the thinking; the simulator runs here, on this machine.</p>"
                 f"<h2>Add it to your client</h2><pre>{html.escape(url)}</pre>"
                 f"<p><small>For example, in Claude Code:</small></p>"
                 f"<pre>claude mcp add --transport http cerulion-sim {html.escape(url)}</pre>")

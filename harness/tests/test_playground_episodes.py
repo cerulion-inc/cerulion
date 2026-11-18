@@ -16,6 +16,7 @@ from playground import episode as episode_mod
 from playground.history import History
 from playground.pool import AGAIN_HTTP, AGAIN_STDIO, Pool, Refused, make_pool
 from playground.settings import Settings
+from playground.simulator import Simulator
 from playground.common import OWNER_FILE
 
 SOLVED = {"success": True, "claimed_success": True, "false_claim": False, "steps_used": 150,
@@ -109,6 +110,74 @@ class Episodes(unittest.TestCase):
         self.assertEqual([c[0] for c in sim.calls], ["start begins", "start", "score", "stop"])
         self.assertEqual((ep.status, ep.reason), ("ended", "server_stopped"))
         self.assertTrue(ep.ready.is_set())
+
+    def test_an_end_asked_for_during_the_start_ends_the_episode_even_when_its_caller_is_cancelled(self):
+        # The SDK unwinds a closed session's cleanup under a bound of a few seconds and cancels what is still
+        # running: an end waiting for a slow start is cut off, and the start must still end the episode.
+        class SlowSim(FakeSim):
+            def __init__(self):
+                super().__init__(SOLVED)
+                self.gate = asyncio.Event()
+
+            async def start(self, ep):
+                self.calls.append(("start begins", ep.eid))
+                await self.gate.wait()
+                await super().start(ep)
+
+        async def go():
+            sim = SlowSim()
+            pool = self.pool(sim)
+            ep = pool.open("bowl-on-plate", None)
+            await asyncio.sleep(0)
+            end = asyncio.ensure_future(ep.finish("session_closed"))
+            await asyncio.sleep(0.05)
+            end.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await end
+            self.assertEqual((ep.status, ep.ending), ("starting", "session_closed"))
+            sim.gate.set()
+            await asyncio.wait_for(ep.ready.wait(), 10)
+            return pool, sim, ep
+        pool, sim, ep = self.run_async(go())
+        self.assertEqual([c[0] for c in sim.calls], ["start begins", "start", "score", "stop"])
+        self.assertEqual((ep.status, ep.reason), ("ended", "session_closed"))
+        self.assertEqual([r["reason"] for r in pool.history.episodes()], ["session_closed"])
+        self.assertEqual(pool.live(), [])
+
+    def test_a_simulator_stop_that_fails_is_logged_by_episode_and_the_episode_still_ends(self):
+        class NoStop(FakeSim):
+            async def stop(self, ep_dir):
+                self.calls.append(("stop", ep_dir))
+                raise RuntimeError("the launcher's stop ended with exit code 1: episode server: still running")
+
+        async def go():
+            pool = self.pool(NoStop(SOLVED))
+            ep = pool.open("bowl-on-plate", "k")
+            await ep.ready.wait()
+            with self.assertLogs("cerulion.sim", "WARNING") as logs:
+                await pool.close()
+            return pool, ep, logs
+        pool, ep, logs = self.run_async(go())
+        self.assertEqual(logs.output, [f"WARNING:cerulion.sim:episode {ep.eid}: the simulator stop failed: the "
+                                       "launcher's stop ended with exit code 1: episode server: still running"])
+        self.assertEqual((ep.status, ep.reason), ("ended", "server_stopped"))
+        self.assertEqual([c[0] for c in pool.sim.calls], ["start", "score", "stop"])
+        self.assertEqual([r["reason"] for r in pool.history.episodes()], ["server_stopped"])
+
+    def test_the_launchers_stop_raises_with_its_own_words_when_a_process_still_runs(self):
+        sim = Simulator(Settings(write_settings(self.folder), platform="linux"))
+        ep_dir = self.folder.at("ep")
+        os.makedirs(ep_dir)
+        log = self.folder.at("sim.jsonl")
+        with mock.patch.dict(os.environ, {"FAKE_SIM_LOG": log, "FAKE_SIM_FAIL": "stop"}):
+            with self.assertRaises(RuntimeError) as caught:
+                self.run_async(sim.stop(ep_dir))
+        self.assertEqual(str(caught.exception), "the launcher's stop ended with exit code 1: episode server: still "
+                                                "running; env host: stopped")
+        with mock.patch.dict(os.environ, {"FAKE_SIM_LOG": log}):
+            self.assertIsNone(self.run_async(sim.stop(ep_dir)))               # exit 0: nothing raised
+        with open(log, encoding="utf-8") as f:
+            self.assertEqual([json.loads(line)["verb"] for line in f], ["stop", "stop"])
 
     def without_ps(self):
         """PATH holds only an empty folder: ps does not run, as on a machine without it."""
@@ -389,6 +458,27 @@ class Episodes(unittest.TestCase):
         self.assertEqual(cleared, 1)
         self.assertEqual(sorted(os.listdir(work)), ["foreign", "mine"])
         self.assertEqual(pool.sim.calls, [("stop", os.path.join(work, "gone", "ep"))])
+
+    def test_a_work_folder_whose_simulator_does_not_stop_is_logged_and_still_cleared(self):
+        class NoStop(FakeSim):
+            async def stop(self, ep_dir):
+                self.calls.append(("stop", ep_dir))
+                raise RuntimeError("the launcher's stop ended with exit code 1: env host: still running")
+
+        async def go():
+            pool = self.pool(NoStop())
+            gone = os.path.join(pool.s.work_root, "gone")
+            os.makedirs(os.path.join(gone, "ep"))
+            with open(os.path.join(gone, OWNER_FILE), "w", encoding="utf-8") as f:
+                f.write("999999999")
+            with self.assertLogs("cerulion.sim", "WARNING") as logs:
+                cleared = await pool.clear_orphans()
+            return pool, gone, cleared, logs
+        pool, gone, cleared, logs = self.run_async(go())
+        self.assertEqual((cleared, os.path.exists(gone)), (1, False))
+        self.assertEqual(logs.output, [f"WARNING:cerulion.sim:the simulator of the work folder {gone}, left by a "
+                                       "stopped server, did not stop: the launcher's stop ended with exit code 1: env "
+                                       "host: still running"])
 
     def test_two_runs_of_one_script_record_the_same_episode(self):
         def once():

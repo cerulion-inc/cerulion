@@ -49,6 +49,20 @@ def _number(doc, key, default, kind=float, low=0.0, allow_low=False):
     return number
 
 
+def _shown(value):
+    """A settings value as the file writes it: null for None."""
+    return "null" if value is None else repr(value)
+
+
+def _text(doc, key, default, name=None):
+    """doc[key] (or default), which must be text: null, a number or any other value is refused. name: how the
+    error names the setting (default: key)."""
+    value = doc.get(key, default)
+    if not isinstance(value, str):
+        raise SettingsError(f"{name or key} must be text, not {_shown(value)}")
+    return value
+
+
 class Settings:
     """The settings of one server. state: the start state a connection gets when it names none (the command
     line's --state; default: the file's default_state). root: the folder relative paths are read against.
@@ -109,7 +123,7 @@ class Settings:
         self.budget_requests = int(_number(doc, "budget_requests", 80, int))
         self.budget_steps = int(_number(doc, "budget_steps", 900, int))
         self.clock_s = _number(doc, "clock_s", 5400.0)
-        self.packages = str(doc.get("packages", "all,place"))
+        self.packages = _text(doc, "packages", "all,place")
         # The idle limit. idle_reap: the limit is factor times the stated percentile of the gaps between calls
         # (gap_at_percentile_s, read from gaps_counted gaps: source says which), or of this server's own history
         # once it holds more gaps than that and puts the percentile higher (Pool.idle_limit). idle_s, when stated,
@@ -139,8 +153,11 @@ class Settings:
 
         # The renderer. On macOS the simulator host starts through macos_envhost (Apple's OpenGL, offscreen): the
         # CPU renderer of the measured runs does not load there. Elsewhere it renders with gl.
-        self.gl = str(doc.get("gl", "osmesa"))
-        self.env = {str(k): str(v) for k, v in (doc.get("env") or {}).items()}
+        self.gl = _text(doc, "gl", "osmesa")
+        env = {} if doc.get("env") is None else doc["env"]
+        if not isinstance(env, dict):
+            raise SettingsError("env must be an object of names and their text values")
+        self.env = {str(k): _text(env, k, None, f"env.{k}") for k in env}
         self.envhost = None
         if self.macos:
             template = doc.get("macos_envhost")
@@ -152,7 +169,7 @@ class Settings:
 
         self.progress_every_s = _number(doc, "progress_every_s", 2.0)
         self.call_timeout_s = _number(doc, "call_timeout_s", 900.0)   # the bridge's own transport bound
-        self.name = str(doc.get("product_name", "Cerulion"))
+        self.name = _text(doc, "product_name", "Cerulion")
         self.source_url = str(doc.get("source_url") or "https://github.com/cerulion-inc/cerulion").strip()
 
         # What is kept of an episode for its viewer page, and for how long.

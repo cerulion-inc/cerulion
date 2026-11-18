@@ -106,7 +106,10 @@ class Episode:
             await self.finish("start_failed")
             return
         if self.ending is not None:
-            return                    # an end waits for this start; it sets ready once the episode has ended
+            # an end came during the start: it runs here too, so the episode ends even when the call that asked
+            # for it was cancelled while it waited; whichever runs first ends it, and it sets ready once ended
+            await self.finish(self.ending)
+            return
         self.ready_s = round(time.monotonic() - self.started_m, 1)
         if self.status == "starting":
             self.status = "ready"
@@ -239,7 +242,7 @@ class Episode:
         """End the episode once: score it, stop the simulator, record it, clear its work folder. An end that
         comes while the simulator is starting waits for the start to return first (a body record being measured
         stops at once), so the stop finds every process the start made. A score that fails never skips the
-        stop."""
+        stop, and a stop that fails is logged with the episode's id."""
         if self.ending is None:
             self.ending = reason
         if reason != "start_failed":
@@ -252,8 +255,10 @@ class Episode:
             if reason != "start_failed":
                 await self._score()
             if started:
-                with contextlib.suppress(Exception):
+                try:
                     await self.pool.sim.stop(self.ep_dir)
+                except Exception as exc:
+                    log.warning("episode %s: the simulator stop failed: %s", self.eid, exc)
             self._close_books()
             if not self.s.keep_work:
                 await asyncio.to_thread(shutil.rmtree, self.work_dir, True)

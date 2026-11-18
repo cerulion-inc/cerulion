@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The MCP handlers: one connection, one simulated robot episode; its tools are the episode server's own."""
+"""The MCP handlers: one client session, one simulated robot episode; its tools are the episode server's own."""
 import asyncio
 import contextlib
 import json
@@ -11,6 +11,11 @@ from .pool import Refused
 
 SERVER_NAME = "cerulion-rcp-sim"
 SERVER_VERSION = "0.1"
+# The refusal of an HTTP request that keeps no MCP session and names no episode: such requests from two clients
+# cannot be told apart, so they would drive one robot.
+NO_LABEL = ("This server gives each MCP session its own simulated robot episode. A request without a session "
+            "names its episode: add episode=LABEL to the URL's query (for example ?episode=a). Clients that name "
+            "the same label share one robot.")
 
 
 def build_mcp(settings, pool, viewer_url=None):
@@ -19,9 +24,11 @@ def build_mcp(settings, pool, viewer_url=None):
 
     A client that keeps an MCP session (HTTP) gets one episode per session, its own: no other session and no
     client without a session reaches it, whatever start state and `episode` label they name, and once it has
-    ended the session's calls are answered "ended". A client with no session (stdio, or the per-request form of
-    HTTP) gets one episode per start state and `episode` label; once it has ended, its next connection
-    (initialize, server/discover or tools/list) starts a new one, never the ended one."""
+    ended the session's calls are answered "ended". A client with no session gets one episode per start state
+    and `episode` label: over stdio the label is 1, and over HTTP the URL must name one (a request that names
+    none is refused, and a client that falls back to the session handshake then gets its own episode). Once that
+    episode has ended, the client's next connection (initialize, server/discover or tools/list) starts a new
+    one, never the ended one."""
     import mcp.types as types
     from mcp.server.lowlevel import Server
     from mcp.shared.exceptions import MCPError
@@ -32,9 +39,9 @@ def build_mcp(settings, pool, viewer_url=None):
     offer = source_offer(settings)
 
     def query(ctx):
-        """The URL's query of this request (HTTP), or {} (stdio)."""
+        """The URL's query of this request (HTTP), or None (stdio)."""
         req = getattr(ctx, "request", None)
-        return dict(req.query_params) if req is not None else {}
+        return dict(req.query_params) if req is not None else None
 
     def opened(state, key):
         try:
@@ -48,14 +55,19 @@ def build_mcp(settings, pool, viewer_url=None):
         if ep is not None:
             return ep
         q = query(ctx)
-        state = q.get("state") or settings.default_state
+        state = (q or {}).get("state") or settings.default_state
         if conn.session_id:
-            # the session's own episode: kept on the session alone, never in by_key, and ended when it closes
+            # the session's own episode: kept on the session alone, never in by_key, and ended when it closes. The
+            # SDK unwinds a closed session's exit stack under a bound of a few seconds, so the end runs as a pool
+            # task of its own: a slow score or stop, or an end that waits for the start, runs to its last step.
             ep = opened(state, None)
             conn.state["episode"] = ep
-            conn.exit_stack.push_async_callback(ep.finish, "session_closed")
+            conn.exit_stack.callback(lambda: pool.spawn(ep.finish("session_closed")))
             return ep
-        key = f"{state}:{q.get('episode', '1')}"
+        label = "1" if q is None else q.get("episode")
+        if not label:
+            raise MCPError(types.INVALID_REQUEST, NO_LABEL)
+        key = f"{state}:{label}"
         ep = pool.by_key.get(key)
         if ep is None or (ep.status in ENDED and ctx.method in NEW_CONNECTION):
             ep = opened(state, key)

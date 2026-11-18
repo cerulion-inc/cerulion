@@ -111,6 +111,23 @@ class Refusals(unittest.TestCase):
         s = Settings(self.with_null("idle_s", "pool_size"), platform="linux")
         self.assertEqual((s.idle_s, s.pool_size), (None, None))
 
+    def test_a_text_setting_refuses_null_and_any_value_that_is_not_text(self):
+        # Read with str(), a null would be the text "None", and a renderer named None would fail only at the
+        # simulator start.
+        for key in ("packages", "gl", "product_name"):
+            with self.assertRaises(SettingsError, msg=key) as caught:
+                Settings(self.with_null(key), platform="linux")
+            self.assertEqual(str(caught.exception), f"{key} must be text, not null")
+        self.refused("gl must be text, not 5", gl=5)
+        self.refused("env.MUJOCO_GL must be text, not null", env={"MUJOCO_GL": None})
+        self.refused("env.OMP_NUM_THREADS must be text, not 1", env={"OMP_NUM_THREADS": 1})
+        self.refused("env must be an object of names and their text values", env=["OMP_NUM_THREADS=1"])
+        self.refused("env must be an object of names and their text values", env=[])
+        s = Settings(self.with_null("env"), platform="linux")                 # null env: no extra variables
+        self.assertEqual(s.env, {"PYOPENGL_PLATFORM": "osmesa"})
+        s = Settings(write_settings(self.folder, gl="egl", env={"OMP_NUM_THREADS": "1"}), platform="linux")
+        self.assertEqual((s.gl, s.env), ("egl", {"OMP_NUM_THREADS": "1", "PYOPENGL_PLATFORM": "egl"}))
+
     def test_macos_needs_the_host_script(self):
         path = write_settings(self.folder, macos_envhost=None)
         Settings(path, platform="linux")

@@ -125,8 +125,11 @@ class Pool:
             if pid_alive(owner):
                 continue
             if os.path.isdir(os.path.join(folder, "ep")):
-                with contextlib.suppress(Exception):
+                try:
                     await self.sim.stop(os.path.join(folder, "ep"))
+                except Exception as exc:
+                    log.warning("the simulator of the work folder %s, left by a stopped server, did not stop: %s",
+                                folder, exc)
             await asyncio.to_thread(shutil.rmtree, folder, True)
             cleared += 1
         return cleared

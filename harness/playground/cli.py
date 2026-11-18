@@ -24,7 +24,7 @@ USAGE = 2
 def parser():
     p = argparse.ArgumentParser(prog="python harness/playground",
                                 description="The Cerulion sim server: the harness's MCP tools on a simulated "
-                                            "robot, one episode per connection.")
+                                            "robot, one episode per client session.")
     how = p.add_mutually_exclusive_group()
     how.add_argument("--stdio", action="store_true", help="serve MCP over stdin and stdout (the default)")
     how.add_argument("--http", nargs="?", const=DEFAULT_HTTP, default=None, metavar="ADDR",

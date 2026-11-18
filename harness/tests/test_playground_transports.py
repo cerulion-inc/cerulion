@@ -3,6 +3,7 @@
 bridge: no simulator runs). These need the MCP SDK in the interpreter that runs them (the harness's own venv);
 without it they are skipped. The command line's refusals and the connection keep-alive need nothing and always
 run."""
+import asyncio
 import importlib.util
 import json
 import os
@@ -22,6 +23,7 @@ from http.client import HTTPConnection
 from playground_support import FIXTURE, HARNESS, FakeSim, Folder, write_settings
 
 from playground.app import AddressError, http_names, keep_alive_s, parse_addr
+from playground.mcp_server import NO_LABEL
 from playground.pool import AGAIN_HTTP, AGAIN_STDIO, make_pool
 from playground.settings import Settings
 
@@ -34,6 +36,10 @@ def initialize(n=1):
     return {"jsonrpc": "2.0", "id": n, "method": "initialize",
             "params": {"protocolVersion": "2025-06-18", "capabilities": {},
                        "clientInfo": {"name": "playground-test", "version": "0"}}}
+
+
+def server_discover(n):
+    return {"jsonrpc": "2.0", "id": n, "method": "server/discover", "params": {}}
 
 
 def call(n, name, arguments=None):
@@ -268,8 +274,9 @@ class Http:
         got = {k.lower(): v for k, v in got.items()}
         return status, got, answer_of(message, got.get("content-type", ""), body)
 
-    def mcp_without_session(self, message):
-        """POST message to /mcp in the per-request form: the protocol version in the request itself, no session."""
+    def mcp_without_session(self, message, query=""):
+        """POST message to /mcp in the per-request form: the protocol version in the request itself, no session.
+        query: the URL's query, with its ?."""
         version = "2026-07-28"
         body = dict(message, params={**message.get("params", {}), "_meta": {
             "io.modelcontextprotocol/protocolVersion": version, "io.modelcontextprotocol/clientCapabilities": {}}})
@@ -277,11 +284,14 @@ class Http:
                    "mcp-protocol-version": version, "mcp-method": message["method"]}
         if message["method"] == "tools/call":
             headers["mcp-name"] = message["params"]["name"]
-        req = urllib.request.Request(self.base + "/mcp", data=json.dumps(body).encode(), headers=headers,
+        req = urllib.request.Request(self.base + "/mcp" + query, data=json.dumps(body).encode(), headers=headers,
                                      method="POST")
-        with urllib.request.urlopen(req, timeout=60) as r:
-            got = {k.lower(): v for k, v in r.headers.items()}
-            return r.status, got, answer_of(message, got.get("content-type", ""), r.read().decode())
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                status, got, text = r.status, {k.lower(): v for k, v in r.headers.items()}, r.read().decode()
+        except urllib.error.HTTPError as exc:
+            status, got, text = exc.code, {k.lower(): v for k, v in exc.headers.items()}, exc.read().decode()
+        return status, got, answer_of(message, got.get("content-type", ""), text)
 
     def mcp_on(self, conn, message, session=None):
         """POST message to /mcp over the caller's own connection, which stays open for the next request."""
@@ -383,13 +393,77 @@ class StreamableHttpSessions(unittest.TestCase):
         http = Http(self)
         session, eid = self.open_session(http, 1)
         self.assertEqual(tool_doc(http.mcp(call(2, "look"), session)[2]["result"])["frames"], ["frames/look001.png"])
-        status, _, listed = http.mcp_without_session({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+        status, _, listed = http.mcp_without_session({"jsonrpc": "2.0", "id": 3, "method": "tools/list"},
+                                                     "?episode=a")
         self.assertEqual((status, [t["name"] for t in listed["result"]["tools"]]), (200, ["look", "claim"]))
-        status, _, look = http.mcp_without_session(call(4, "look"))
+        status, _, look = http.mcp_without_session(call(4, "look"), "?episode=a")
         self.assertEqual((status, tool_doc(look["result"])), (200, {"ok": True, "frames": ["frames/look001.png"]}))
         live = [e["id"] for e in json.loads(http.get("/episodes")[2])["live"]]
         self.assertEqual((len(live), live[0]), (2, eid))
         self.assertEqual([c["verb"] for c in http.run.launcher()], ["start", "start"])
+
+    def test_a_request_without_a_session_or_an_episode_label_is_refused_and_starts_no_simulator(self):
+        # Two such clients cannot be told apart: served, they would drive one robot.
+        http = Http(self)
+        for n, (message, query) in enumerate(((server_discover(1), ""), (server_discover(2), "?state=open-drawer"),
+                                              (call(3, "look"), "?episode="))):
+            answer = http.mcp_without_session(message, query)[2]
+            self.assertEqual(answer["error"]["message"], NO_LABEL, n)
+        self.assertEqual(json.loads(http.get("/health")[2])["live_simulators"], 0)
+        self.assertFalse(os.path.exists(http.run.log))                        # the launcher never ran
+        # the same client, naming a label, is served
+        status, _, look = http.mcp_without_session(call(4, "look"), "?state=open-drawer&episode=a")
+        self.assertEqual((status, tool_doc(look["result"])), (200, {"ok": True, "frames": ["frames/look001.png"]}))
+        start = http.run.launcher()[0]
+        self.assertTrue(start["argv"][start["argv"].index("--cell") + 1].startswith("pro_goal_swap_t00_i00 "))
+
+    def test_two_default_sdk_clients_on_the_advertised_url_each_drive_their_own_robot(self):
+        # The SDK's own client probes server/discover first; refused, it falls back to the session handshake.
+        from mcp.client.client import Client
+        from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
+
+        http = Http(self)
+
+        def doc(result):
+            return json.loads(result.content[0].text)
+
+        async def go():
+            async with Client(f"{http.base}/mcp") as a, Client(f"{http.base}/mcp") as b:
+                versions = (a.protocol_version, b.protocol_version)
+                live = json.loads((await asyncio.to_thread(http.get, "/health"))[2])["live_simulators"]
+                looks = [doc(await a.call_tool("look", {})), doc(await b.call_tool("look", {}))]
+                claim = await a.call_tool("claim", {"success": True})
+                after = [doc(await b.call_tool("look", {})), doc(await a.call_tool("look", {}))]
+            return versions, live, looks, claim, after
+        versions, live, looks, claim, after = asyncio.run(go())
+        self.assertTrue(all(v in HANDSHAKE_PROTOCOL_VERSIONS for v in versions), versions)
+        self.assertEqual(live, 2)
+        self.assertEqual(looks, [{"ok": True, "frames": ["frames/look001.png"]}] * 2)
+        self.assertTrue(claim.content[-1].text.startswith("The episode has ended: the claim was recorded."))
+        # the claim ended the first client's episode only: the second client's robot runs on
+        self.assertEqual(after[0], {"ok": True, "frames": ["frames/look002.png"]})
+        self.assertEqual((after[1]["episode"], after[1]["reason"]), ("ended", "claim"))
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and len(json.loads(http.get("/episodes")[2])["ended"]) < 2:
+            time.sleep(0.2)
+        self.assertEqual([r[2] for r in http.run.history()], ["claim", "session_closed"])   # the client closed
+
+    def test_a_closed_session_whose_score_outlasts_the_sdks_cleanup_bound_still_stops_its_simulator(self):
+        # The SDK gives a closed session's cleanup 5 s and then cancels it: an end run inside that cleanup would be
+        # cut off by a score of 7 s, before the stop.
+        os.environ["FAKE_SIM_SCORE_S"] = "7"
+        self.addCleanup(os.environ.pop, "FAKE_SIM_SCORE_S", None)
+        http = Http(self)
+        session, eid = self.open_session(http, 1)
+        self.assertEqual(json.loads(http.get("/health")[2])["live_simulators"], 1)
+        http.mcp(None, session, method="DELETE")
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not json.loads(http.get("/episodes")[2])["ended"]:
+            time.sleep(0.2)
+        self.assertEqual([(e["id"], e["reason"]) for e in json.loads(http.get("/episodes")[2])["ended"]],
+                         [(eid, "session_closed")])
+        self.assertEqual([c["verb"] for c in http.run.launcher()], ["start", "score", "stop"])
+        self.assertEqual(json.loads(http.get("/health")[2])["live_simulators"], 0)
 
 
 @unittest.skipUnless(HAS_MCP, "the MCP SDK is not in this interpreter (the harness venv has it)")

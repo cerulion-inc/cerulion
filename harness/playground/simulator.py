@@ -121,4 +121,9 @@ class Simulator:
             return {}
 
     async def stop(self, ep_dir):
-        await self._run("stop", "--ep", ep_dir)
+        """Stops the episode's processes; raises RuntimeError with the launcher's last lines when the launcher
+        exits with another code than 0 (it does when one of the processes still runs)."""
+        rc, out = await self._run("stop", "--ep", ep_dir)
+        if rc != 0:
+            raise RuntimeError(f"the launcher's stop ended with exit code {rc}: "
+                               + " ".join(out.strip().splitlines()[-2:]))
