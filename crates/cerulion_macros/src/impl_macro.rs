@@ -2071,7 +2071,7 @@ fn validate_external_source_sig(method: &ImplItemFn) -> syn::Result<()> {
     if let Some(asyncness) = &sig.asyncness {
         return Err(bad(asyncness));
     }
-    if let Some(unsafety) = &sig.unsafety {
+    if let syn::Safety::Unsafe(unsafety) = &sig.safety {
         return Err(bad(unsafety));
     }
     if let Some(abi) = &sig.abi {
@@ -2090,7 +2090,7 @@ fn validate_external_source_sig(method: &ImplItemFn) -> syn::Result<()> {
     let mut inputs = sig.inputs.iter();
     match inputs.next() {
         Some(FnArg::Receiver(r))
-            if r.reference.is_some() && r.mutability.is_some() && r.colon_token.is_none() => {}
+            if matches!(r.kind, syn::ReceiverKind::Reference(_, _, Some(_))) => {}
         Some(other) => return Err(bad(other)),
         None => return Err(bad(&sig.ident)),
     }

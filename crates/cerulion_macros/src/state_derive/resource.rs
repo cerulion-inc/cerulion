@@ -135,7 +135,7 @@ const TRANSPARENT_WRAPPERS: &[&str] = &[
 pub fn is_resource(ty: &Type) -> bool {
     match ty {
         // STRUCTURAL: no list needed, and no false positive is possible.
-        Type::TraitObject(_) | Type::Ptr(_) | Type::BareFn(_) => true,
+        Type::TraitObject(_) | Type::Ptr(_) | Type::FnPtr(_) => true,
         Type::ImplTrait(_) => true,
         Type::Reference(r) => is_resource(&r.elem),
         Type::Paren(p) => is_resource(&p.elem),
