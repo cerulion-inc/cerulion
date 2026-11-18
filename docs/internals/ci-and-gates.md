@@ -469,9 +469,10 @@ naming gate (pull requests only);
 `tools/scripts/**` recursively and over the extensionless hooks in `tools/hooks` (`-type f`
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
 
-EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_request` and
-`merge_group` events like everything else: there is no cost gate, no routing expression
-and no stub job standing in for a skipped required check.
+EVERY job runs on a GitHub-hosted runner. The macOS test jobs run on `merge_group`, `push`
+and `workflow_dispatch` and not on `pull_request`; `macos-contexts` reports their four
+required contexts on every event (see the macOS paragraph below). There is no other cost gate
+or routing expression.
 
 `lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
 `cli-e2e-latency`), which no pull request and no queued batch runs; a red `lint` saves their
@@ -510,6 +511,22 @@ macOS, and `--check` proves the pin), and execs `cargo nextest run --profile ci`
 (install via `tools/scripts/install_nextest.sh`). It does NOT pass `--test-threads=1`; see the
 serialisation fence below. The split across runners is legal because each VM has its own
 `/dev/shm`.
+
+The macOS test jobs do not run on a pull request: `test-macos`, the macOS leg of `crate-tests`
+(a matrix `exclude:` on `pull_request`) and the macOS leg of `python-client` (excluded on
+`pull_request` and `merge_group`, since it reports no required context). `test-macos` and the
+macOS `crate-tests` leg run in full on every merge-queue batch, push to main and dispatch, so a
+commit reaches main only through a batch that passed them. A job that a job-level `if:` skips
+does not expand its matrix, so it reports no per-leg context; `macos-contexts` reports the four
+required macOS contexts (`Test (macOS) shard 0` to `2`, `Crate tests (macos-latest)`) on every
+event instead. It `needs:` both jobs and carries the bare `!cancelled()` guard: on a pull
+request it succeeds with one line that says where the tests run, and on every other event it
+concludes as `test-macos` (the three shard names) or `crate-tests` (the macOS name) did, so a
+red macOS shard reds all three shard names. `macos-clippy` (`Clippy (macOS, pull
+requests)`) runs `cargo clippy --workspace --all-targets -- -D warnings` on macOS on a pull
+request for early compile and lint feedback; it reports no required context. No required
+context name changes.
+
 `--lib` and the doctests ride shard 0; the non-core packages are distributed across the
 shards (one per shard on Linux; a hand-balanced 3-way tilt on macOS), with the iroh-tree
 packages kept together so that large tree compiles once. On macOS, shard 2 also carries the
@@ -590,7 +607,8 @@ because those are the only pull requests that can break it and "caught on the me
 main" means a revert rather than a red check. EVERY job that `needs:` the classifier opens
 its job-level `if:` with `!cancelled()`, not `deb-smoke` alone: `needs:` by itself lets a
 failed classifier skip a dependant, and a skipped required context reads as satisfied.
-`test-linux`, `test-macos`, `crate-tests` and `viz-tests` carry the bare call; `deb-smoke`
+`test-linux`, `crate-tests` and `viz-tests` carry the bare call; `test-macos` carries it in
+front of its `pull_request` gate, and `macos-contexts` carries it bare; `deb-smoke`
 carries it in front of its own event gate, so it keeps its `push` run whatever the
 classifier did. `cerulion_cli_engine::ci_test_coverage_test` holds the rule over every
 dependant, however the job consumes the outputs, rather than over the jobs with a one-line
