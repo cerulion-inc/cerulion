@@ -232,7 +232,20 @@ class Episode:
         if not self.sessions:
             await self.finish("session_closed")
 
+    def verdict_note(self):
+        """The benchmark's verdict as one sentence, for an episode that was scored; else nothing."""
+        v = self.verdict
+        if not v:
+            return ""
+        if v.get("solved"):
+            return " The benchmark's own success check says the task is solved."
+        if v.get("claimed_success"):
+            return " The benchmark's own success check says the task is not solved, although the claim said it was."
+        return " The benchmark's own success check says the task is not solved."
+
     def ended_message(self):
+        """What a call is answered once the episode has ended. The verdict is in it once the episode was scored,
+        so a client learns the benchmark's own check from the answer to the call that ended the episode."""
         ran = f" The simulator ran for {self.sim_wall_s:g} s." if self.sim_wall_s is not None else ""
         again = " " + self.pool.again
         if self.reason == "start_failed":
@@ -240,7 +253,7 @@ class Episode:
         if self.reason == "idle":
             limit = f"{self.idle_limit_s:g} s" if self.idle_limit_s is not None else "the idle limit"
             return (f"The episode has ended: no call arrived for {limit}, the idle limit, so the simulator was "
-                    "stopped." + ran + again)
+                    "stopped." + self.verdict_note() + ran + again)
         if self.reason == "over":   # the simulator's own halt: at the first success, or at the step budget
             v = self.verdict or {}
             if v.get("solved"):
@@ -251,4 +264,4 @@ class Episode:
                     "benchmark's success check had not turned true." + ran + again)
         why = {"claim": "the claim was recorded", "clock": f"the {self.s.clock_s:g} s episode clock ran out",
                "session_closed": "the client closed its session", "server_stopped": "the sim server was stopped"}
-        return f"The episode has ended: {why.get(self.reason, self.reason)}." + ran + again
+        return f"The episode has ended: {why.get(self.reason, self.reason)}." + self.verdict_note() + ran + again

@@ -108,9 +108,9 @@ class Settings:
         self.clock_s = _number(doc, "clock_s", 5400.0)
         self.packages = str(doc.get("packages", "all,place"))
         # The idle limit. idle_reap: the limit is factor times the stated percentile of the gaps between calls
-        # (gap_at_percentile_s, read from gaps_counted gaps: source says which), until this server's own history
-        # holds more gaps than that. idle_s, when stated, is the operator's own figure and wins. Neither: an idle
-        # episode runs on to the clock.
+        # (gap_at_percentile_s, read from gaps_counted gaps: source says which), or of this server's own history
+        # once it holds more gaps than that and puts the percentile higher (Pool.idle_limit). idle_s, when stated,
+        # is the operator's own figure and wins. Neither: an idle episode runs on to the clock.
         self.idle_s = _number(doc, "idle_s", None)
         reap = doc.get("idle_reap") or {}
         if not isinstance(reap, dict):

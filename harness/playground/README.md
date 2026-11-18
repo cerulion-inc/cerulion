@@ -21,8 +21,10 @@ Each episode is one simulator: the measured snapshot's episode server and its si
 client connects and is ready in seconds. The first episode of a robot body that has no calibration record on
 this machine measures one first, once (one to two minutes), and says so. An episode ends at the claim, when the
 simulator halts it (its success check turned true, or its 900 control steps are used), at the 5,400 s episode
-clock, when no call has arrived for the idle limit, when the client goes away, or when the server stops. A stop
-signal (SIGINT, SIGTERM) scores and stops every live episode before the server exits.
+clock, when no call has arrived for the idle limit, when the client goes away, or when the server stops. The
+answer to the call that ended it, and to every call after, says how it ended and, once it was scored, the
+benchmark's own verdict. A stop signal (SIGINT, SIGTERM) scores and stops every live episode before the server
+exits.
 
 Over stdio the server has one client. Once its episode has ended, listing the tools again starts the next one.
 The transcript and the pictures of every episode are kept in `~/.cerulion/sim/episodes/ID/` (under
@@ -61,7 +63,7 @@ against the harness folder; a path may name `{uid}` (this user's id) and `{cerul
 | `data_dir`, `keep_root` | where the episode history (`episodes.sqlite`) and the kept episodes go |
 | `work_root` | each running episode's simulator files and sockets; short, because a socket path must fit 103 bytes |
 | `states`, `default_state` | the start states offered (`cell`, `title`, `note`) and the default |
-| `idle_reap`, `idle_s` | the idle limit: factor times a stated percentile of the gaps between calls, with the figure's source, until this server's own history holds more gaps; `idle_s` is a fixed limit in seconds |
+| `idle_reap`, `idle_s` | the idle limit: factor times a stated percentile of the gaps between calls, with the figure's source, or of this server's own history once it holds more gaps and puts the percentile higher (it never shortens the limit); `idle_s` is a fixed limit in seconds |
 | `lazy_records`, `body_record_module` | measure a missing robot body record before an episode, and the module that does it |
 | `gl`, `macos_envhost`, `env` | the renderer on Linux, the macOS simulator host script, the simulator's environment |
 | `budget_requests`, `budget_steps`, `clock_s`, `pool_size` | the episode's replies, control steps and clock; how many simulators at once |

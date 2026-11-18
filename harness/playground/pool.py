@@ -29,8 +29,10 @@ class Pool:
 
     def idle_limit(self):
         """(seconds, where the figure comes from), or (None, why) when no idle limit is set. The operator's own
-        idle_s wins. Else idle_reap: factor times the stated percentile of the gaps between calls; the history's
-        own gaps once it holds more of them than the stated source."""
+        idle_s wins. Else idle_reap: factor times the stated percentile of the gaps between calls, or times the
+        history's own percentile once the history holds more gaps than the stated source and its percentile is
+        the longer one. The history can lengthen the limit and never shortens it: its gaps are every call's, and a
+        client that sends calls in a quick loop (a script reading a resource) fills it with gaps of milliseconds."""
         if self._idle is None:
             reap = self.s.idle_reap
             if self.s.idle_s is not None:
@@ -39,15 +41,18 @@ class Pool:
                 self._idle = (None, "no idle limit is set")
             else:
                 factor, pct, held = float(reap["factor"]), float(reap["percentile"]), self.history.gap_count()
+                stated = float(reap["gap_at_percentile_s"])
                 p = self.history.gap_percentile(pct) if held > int(reap["gaps_counted"]) else None
-                if p is not None:
+                if p is not None and p >= stated:
                     self._idle = (round(factor * p, 1), f"{factor:g} times the {pct:g}th percentile ({p:g} s) of "
                                                         f"the {held} gaps between calls in this server's history")
                 else:
-                    p = float(reap["gap_at_percentile_s"])
-                    self._idle = (round(factor * p, 1), f"{factor:g} times the {pct:g}th percentile ({p:g} s) of "
-                                                        f"{int(reap['gaps_counted'])} gaps between calls: "
-                                                        f"{reap['source']} (this server's history holds {held})")
+                    held_note = (f"this server's history holds {held}" if p is None else
+                                 f"this server's history of {held} gaps puts it at {p:g} s, and a history never "
+                                 "shortens the limit")
+                    self._idle = (round(factor * stated, 1), f"{factor:g} times the {pct:g}th percentile "
+                                                             f"({stated:g} s) of {int(reap['gaps_counted'])} gaps "
+                                                             f"between calls: {reap['source']} ({held_note})")
         return self._idle
 
     def gaps_changed(self):

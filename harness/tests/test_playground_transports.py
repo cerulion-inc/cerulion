@@ -116,11 +116,17 @@ class Stdio(unittest.TestCase):
         self.assertEqual(read["result"]["contents"][0]["text"], "fixture task")
         claim = run.answer(call(5, "claim", {"success": True, "cannot": None}))["result"]
         self.assertEqual(tool_doc(claim), {"claimed": True, "args": {"success": True}})   # null taken as absent
+        # the answer to the claim carries the end and the benchmark's verdict after the tool's own text
+        self.assertEqual(len(claim["content"]), 2)
+        self.assertTrue(claim["content"][1]["text"].startswith(
+            "The episode has ended: the claim was recorded. The benchmark's own success check says the task is "
+            "solved. The simulator ran for "), claim["content"][1]["text"])
+        self.assertTrue(claim["content"][1]["text"].endswith(AGAIN_STDIO))
         after = run.answer(call(6, "look"))["result"]
         self.assertTrue(after["isError"])
         ended = tool_doc(after)
         self.assertEqual((ended["episode"], ended["reason"]), ("ended", "claim"))
-        self.assertTrue(ended["message"].endswith(AGAIN_STDIO))
+        self.assertEqual(ended["message"], claim["content"][1]["text"])
         again = run.answer({"jsonrpc": "2.0", "id": 7, "method": "tools/list"})["result"]["tools"]
         self.assertEqual(len(again), 2)
         run.proc.stdin.close()                            # the client goes away
@@ -267,7 +273,8 @@ class StreamableHttp(unittest.TestCase):
         eid = text.split("/view/", 1)[1].split(" ", 1)[0]
         http.mcp({"jsonrpc": "2.0", "method": "notifications/initialized"}, session)
         self.assertEqual(tool_doc(http.mcp(call(2, "look"), session)[2]["result"])["frames"], ["frames/look001.png"])
-        http.mcp(call(3, "claim", {"success": True}), session)
+        claim = http.mcp(call(3, "claim", {"success": True}), session)[2]["result"]
+        self.assertIn("The benchmark's own success check says the task is solved.", claim["content"][-1]["text"])
         ended = http.mcp(call(4, "look"), session)[2]["result"]
         self.assertTrue(tool_doc(ended)["message"].endswith(AGAIN_HTTP))
 

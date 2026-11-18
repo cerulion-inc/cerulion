@@ -139,10 +139,13 @@ def build_mcp(settings, pool, viewer_url=None):
         reason = ep.end_reason()
         if reason is not None:
             # the claim (or a stop the robot itself made) ended the episode: score and stop the simulator before
-            # this answer goes out, so the next request already sees the ended state
+            # this answer goes out, so the next request already sees the ended state, and the answer carries the
+            # end and the benchmark's verdict after the tool's own text
             await ep.finish(reason)
             if result.is_error:
                 return ended_result(ep)
+            result = result.model_copy(update={"content": [*result.content,
+                                                           types.TextContent(text=ep.ended_message())]})
         return result
 
     async def on_list_resources(ctx, params):

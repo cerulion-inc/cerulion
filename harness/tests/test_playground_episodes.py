@@ -134,6 +134,8 @@ class Episodes(unittest.TestCase):
             await ep.finish("clock")
             return ep
         ep = self.run_async(go())
+        self.assertEqual(ep.verdict["solved"], True)
+        ep.verdict = None                         # an episode that could not be scored
         ran = f" The simulator ran for {ep.sim_wall_s:g} s. "
         cases = {"clock": "The episode has ended: the 5400 s episode clock ran out." + ran + AGAIN_STDIO,
                  "claim": "The episode has ended: the claim was recorded." + ran + AGAIN_STDIO,
@@ -150,6 +152,28 @@ class Episodes(unittest.TestCase):
         self.assertIn("turned true at control step 136", ep.ended_message())
         ep.verdict = {"solved": False}
         self.assertIn("at its budget of control steps", ep.ended_message())
+
+    def test_an_ended_message_carries_the_verdict_of_a_scored_episode(self):
+        async def go():
+            pool = self.pool(again=AGAIN_HTTP)
+            ep = pool.open("bowl-on-plate", "k")
+            await ep.ready.wait()
+            await ep.finish("claim")
+            return ep
+        ep = self.run_async(go())
+        ran = f" The simulator ran for {ep.sim_wall_s:g} s. "
+        check = " The benchmark's own success check says the task is "
+        cases = [({"solved": True, "claimed_success": True}, "solved."),
+                 ({"solved": False, "claimed_success": True, "false_claim": True},
+                  "not solved, although the claim said it was."),
+                 ({"solved": False, "claimed_success": False}, "not solved.")]
+        for verdict, says in cases:
+            ep.verdict = verdict
+            self.assertEqual(ep.ended_message(), "The episode has ended: the claim was recorded." + check + says + ran
+                             + AGAIN_HTTP)
+        ep.reason, ep.idle_limit_s, ep.verdict = "idle", 430.2, {"solved": False, "claimed_success": None}
+        self.assertEqual(ep.ended_message(), "The episode has ended: no call arrived for 430.2 s, the idle limit, "
+                                             "so the simulator was stopped." + check + "not solved." + ran + AGAIN_HTTP)
 
     def test_gaps_count_only_the_time_with_no_call_in_flight(self):
         clock = Clock()
@@ -176,16 +200,31 @@ class Episodes(unittest.TestCase):
         self.assertEqual(ep.gaps, [4.0, 2.5])
         self.assertEqual(pool.history.gap_count(), 2)
 
-    def test_the_idle_limit_comes_from_the_stated_source_until_the_history_holds_more_gaps(self):
+    def test_the_idle_limit_comes_from_the_stated_source_until_the_history_holds_more_and_longer_gaps(self):
         pool = self.pool()
         self.assertEqual(pool.idle_limit()[0], 430.2)                          # 10 x 43.02 s
         self.assertIn("2386 gaps between calls: 72 model-driven episodes", pool.idle_limit()[1])
-        reap = dict(pool.s.idle_reap, gaps_counted=3)
-        pool.s.idle_reap = reap
-        pool.history.record({"id": "ep000001", "state": "x", "verdict": None}, [1.0, 2.0, 3.0, 4.0])
+        self.assertTrue(pool.idle_limit()[1].endswith("(this server's history holds 0)"))
+        pool.s.idle_reap = dict(pool.s.idle_reap, gaps_counted=3)
+        pool.history.record({"id": "ep000001", "state": "x", "verdict": None}, [10.0, 20.0, 30.0, 50.0])
         pool.gaps_changed()
-        self.assertEqual(pool.idle_limit(), (40.0, "10 times the 99th percentile (4 s) of the 4 gaps between "
-                                                   "calls in this server's history"))
+        self.assertEqual(pool.idle_limit(), (500.0, "10 times the 99th percentile (50 s) of the 4 gaps between "
+                                                    "calls in this server's history"))
+
+    def test_a_history_of_quick_calls_never_shortens_the_idle_limit_even_after_a_restart(self):
+        # A client that reads a resource in a loop fills the history with gaps of 20 ms. Read as the history's
+        # 99th percentile, the limit would be 0.2 s, and every later episode would end idle before its first answer.
+        reap = None
+        for restart in range(2):
+            pool = self.pool()
+            pool.s.idle_reap = reap = dict(reap or pool.s.idle_reap, gaps_counted=3)
+            if restart == 0:
+                pool.history.record({"id": "ep000001", "state": "x", "verdict": None}, [0.02] * 500)
+                pool.gaps_changed()
+            limit, source = pool.idle_limit()
+            self.assertEqual(limit, 430.2, restart)
+            self.assertTrue(source.endswith("(this server's history of 500 gaps puts it at 0.02 s, and a history "
+                                            "never shortens the limit)"), source)
 
     def test_an_idle_limit_stated_by_the_operator_wins_and_none_means_no_limit(self):
         self.assertEqual(self.pool(idle_s=60).idle_limit(), (60.0, "idle_s, stated in the settings"))
