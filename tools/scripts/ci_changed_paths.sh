@@ -41,9 +41,9 @@
 # is a file the job reads or a script it executes, DIRECTLY or through another
 # script: `check_version_sync.sh` and `check_citation_release.sh` are in because
 # `test_workspace_version.sh` and `test_release_debian_gate.sh` execute them, and
-# the root `LICENSE` and the `harness/` tree are in because the job stages them
-# and `build_deb.sh` refuses an archive that does not carry them. `apt-repo.yml`
-# is in because it publishes what this job smoke-tests.
+# the root `LICENSE` is in because the job stages it and `build_deb.sh` refuses
+# an archive that does not carry it. `apt-repo.yml` is in because it publishes
+# what this job smoke-tests.
 #
 # Two files the job does touch are deliberately OUT. `ci.yml`, because a workflow
 # edit that does not touch packaging should not pay 22 minutes to learn that. And
@@ -141,7 +141,6 @@ tools/release/
 docs/packaging/
 docs/legal/
 LICENSE
-harness/
 .github/workflows/apt-repo.yml
 '
 
@@ -477,8 +476,6 @@ docs/legal/NOTICE|true
 tools/scripts/check_version_sync.sh|true
 tools/scripts/check_citation_release.sh|true
 LICENSE|true
-harness/README.md|true
-harness|false
 LICENSE-BSD-3-CLAUSE|false
 crates/cerulion_core/src/wire.rs|false
 .github/workflows/ci.yml|false

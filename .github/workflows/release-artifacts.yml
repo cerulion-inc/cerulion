@@ -309,15 +309,16 @@ jobs:
           # The agent harness ships beside the binaries on every target: the
           # CLI resolves `harness/` in its own directory, the sibling rule the
           # rmw library and cerulion-connectd follow. The copy is the tagged
-          # tree's tracked files and nothing else, and holds regular files and
-          # directories only, the one shape build_deb.sh and install.sh accept.
+          # commit's tree exactly (no untracked, ignored or changed file), and
+          # holds regular files and directories only, the one shape
+          # build_deb.sh and install.sh accept.
           if [ ! -d harness ] || [ -L harness ]; then
             echo "::error::the tagged tree has no harness/ directory to ship beside the CLI"
             exit 1
           fi
           stray=$(git status --porcelain --ignored -- harness)
           if [ -n "$stray" ]; then
-            echo "::error::harness/ holds files the tagged commit does not track:"
+            echo "::error::harness/ differs from the tagged commit:"
             printf '%s\n' "$stray"
             exit 1
           fi
@@ -341,7 +342,10 @@ jobs:
               chmod +x "$stage/libcerulion_heaphook.so"
               ;;
           esac
-          tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
+          # COPYFILE_DISABLE keeps macOS tar from adding `._` metadata files
+          # for any extended attribute, so every archive holds the staged
+          # files and nothing else.
+          COPYFILE_DISABLE=1 tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
           if command -v sha256sum >/dev/null 2>&1; then
             (cd "$RUNNER_TEMP" && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
           else
