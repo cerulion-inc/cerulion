@@ -295,8 +295,7 @@ before the recording starts its read log and a resumed pass starts after reads
 its bag does not keep; a count past that queue is judged as one after a fire
 is, on a resumed pass too. A resumed pass that holds no fire of the node and no
 read its body made stands down by name once a count passes that queue (a
-`stand_down` of code `latest_unfired_since_anchor`, which also prints a warning
-on stderr and changes no exit code), because a node that
+`stand_down` of code `latest_unfired_since_anchor`), because a node that
 returned `NodeError::Fatal` before the pass's anchor records exactly
 that, and so does a running node the scheduler never fired in the pass, and the
 recording does not state which it was: the bag is below trace format 10 and the
@@ -327,6 +326,18 @@ count of more than one frame is named whole from `trace_format` 9, when its
 batch frames fit the read stage. On a bag that does not record whether a
 `drop_oldest` input was read through one subscriber or two, a step that popped
 and fired nothing stands down rather than being judged as one.
+
+For a node a resumed pass never runs and whose stop the recording does not
+state, the other rules that owe a fire stand down the same way, at the first
+step they would convict: the FIFO pop count (`fifo_unfired_since_anchor`), the
+fire a pop owes a `consume = latest` input read through one subscriber
+(`latest_unfired_since_anchor`), and the fire an aligned set owes a `Sync`
+node (`sync_unfired_since_anchor`), whose checks on its recorded fires keep
+running. Each of these stand-downs, the two-subscriber one included, prints a
+warning on stderr on every run, naming the node, the code, the bag's
+`trace_format` and the checkpoint step, and changes no exit code; its
+`stand_down` note is in the `--report` JSON, which only a `--verify` run
+writes.
 
 ### Divergence LOCALIZES to the producing rank
 
