@@ -635,7 +635,10 @@ to any event but `pull_request`, and it never removes a required status context.
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
 `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` is the walk that holds it, counting only
-steps and jobs that can actually fail a pull request, and it drives
+steps and jobs that can actually fail a pull request. A step credits the packages a
+`cargo test` or `cargo nextest run` command names with `-p`, or the one `ci_test_shard.sh` takes;
+a command carrying `--doc` or `--no-run` credits none, because it runs none of the package's unit
+or integration tests. The walk drives
 `tools/scripts/ci_test_shard.sh --check` to prove the shard partition is TOTAL and DISJOINT, so a
 broken split is a local red rather than a silent gap.
 

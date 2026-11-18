@@ -160,6 +160,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod ci_test_line;
+use ci_test_line::line_runs_tests_of;
+
 /// The shared directory trees a test may read from outside its own crate.
 ///
 /// Spelled without a trailing separator because that is how a marker names them;
@@ -1615,37 +1618,11 @@ fn job_key(line: &str) -> Option<String> {
 
 /// Does ONE workflow line name `package` as a package it runs tests for?
 ///
-/// The two forms `ci.yml` uses, matched by WHOLE TOKEN so `cerulion_viz` and
-/// `cerulion_vizd` stay apart: `cargo test … -p <package>` in every spelling
-/// cargo accepts, and `ci_test_shard.sh <package> …`, which takes the name as
-/// its first argument precisely so the name stays literally in the workflow.
+/// The shared reader ([`line_runs_tests_of`]) decides, so this gate and
+/// `ci_test_coverage_test` credit exactly the same runner forms. A doc-pin
+/// marker line itself never vouches for the package it names.
 fn line_names_package(line: &str, package: &str) -> bool {
-    if line.trim().starts_with(MARKER_PREFIX) {
-        return false;
-    }
-    if let Some(pos) = line.find("ci_test_shard.sh ") {
-        let tail = &line[pos + "ci_test_shard.sh ".len()..];
-        if tail.split_whitespace().next() == Some(package) {
-            return true;
-        }
-    }
-    let Some(pos) = line.find("cargo test") else {
-        return false;
-    };
-    let mut it = line[pos..].split_whitespace();
-    while let Some(tok) = it.next() {
-        let named = match tok {
-            "-p" | "--package" => it.next() == Some(package),
-            _ => tok
-                .strip_prefix("--package=")
-                .or_else(|| tok.strip_prefix("-p"))
-                .is_some_and(|rest| rest == package),
-        };
-        if named {
-            return true;
-        }
-    }
-    false
+    !line.trim().starts_with(MARKER_PREFIX) && line_runs_tests_of(line, package)
 }
 
 // ---------------------------------------------------------------------------
@@ -2225,6 +2202,15 @@ fn a_two_space_comment_does_not_open_a_job_and_a_marker_never_names_its_own_pack
     assert!(line_names_package("      - run: cargo test -p pkg", "pkg"));
     assert!(line_names_package(
         "      - run: ./tools/scripts/ci_test_shard.sh pkg 0 4",
+        "pkg"
+    ));
+    assert!(line_names_package(
+        "      - run: cargo nextest run --profile ci -p pkg -E 'not kind(lib)'",
+        "pkg"
+    ));
+    // A doctest-only step runs none of the package's test binaries.
+    assert!(!line_names_package(
+        "      - run: cargo test -p pkg --doc",
         "pkg"
     ));
     // Whole-token matching, which is what keeps a name off its own prefix.
