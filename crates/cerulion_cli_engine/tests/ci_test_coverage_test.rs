@@ -1822,6 +1822,187 @@ fn the_ci_test_shard_partition_is_total_and_disjoint() {
     );
 }
 
+/// The test binaries one `CI_TEST_SHARD_EXTRA` line filters out, read in the
+/// one spelling this file accepts, `-E !binary(=<name>)`, plus every part of
+/// the line that is some other filter (`--filterset`, `--skip`, a `binary(`,
+/// `binary_id(` or `test(` matcher, `not`), which a reader of names alone would
+/// pass over in silence.
+fn shard_extra_exclusions(line: &str) -> (Vec<String>, Vec<String>) {
+    const FORM: &str = "-E !binary(=";
+    let mut names = Vec::new();
+    let mut rest = String::new();
+    let mut tail = line;
+    while let Some(at) = tail.find(FORM) {
+        rest.push_str(&tail[..at]);
+        let after = &tail[at + FORM.len()..];
+        let name: String = after.chars().take_while(|c| is_name_char(*c)).collect();
+        match after[name.len()..].strip_prefix(')') {
+            Some(next) if !name.is_empty() => {
+                names.push(name);
+                tail = next;
+            }
+            _ => {
+                rest.push_str(FORM);
+                tail = after;
+            }
+        }
+    }
+    rest.push_str(tail);
+    let unread = [
+        "-E",
+        "--filterset",
+        "--skip",
+        "binary(",
+        "binary_id(",
+        "test(",
+        "not ",
+    ]
+    .iter()
+    .filter(|form| rest.contains(*form))
+    .map(|form| (*form).to_string())
+    .collect();
+    (names, unread)
+}
+
+/// Every complaint about a test binary a shard step filters out of its run,
+/// over one PR-blocking workflow text: a filter in another spelling, a name
+/// that is no test file of `cerulion_core`, or no OTHER job running the shard
+/// step without filtering it. Also returns how many exclusions were read.
+fn shard_exclusion_gaps(text: &str, files: &BTreeSet<String>) -> (Vec<String>, usize) {
+    let mut lanes: Vec<(String, BTreeSet<String>)> = Vec::new();
+    let mut unreadable: Vec<String> = Vec::new();
+    for (job, block) in jobs_of(text) {
+        if !block
+            .lines()
+            .any(|l| l.contains("ci_test_shard.sh cerulion_core"))
+        {
+            continue;
+        }
+        let mut excluded: BTreeSet<String> = BTreeSet::new();
+        for line in block
+            .lines()
+            .filter(|l| l.trim_start().starts_with("CI_TEST_SHARD_EXTRA:"))
+        {
+            let (names, unread) = shard_extra_exclusions(line);
+            excluded.extend(names);
+            for form in unread {
+                unreadable.push(format!(
+                    "  {job}: `CI_TEST_SHARD_EXTRA` carries `{form}` outside the one \
+                     spelling this rule reads, `-E !binary(=<name>)`"
+                ));
+            }
+        }
+        lanes.push((job, excluded));
+    }
+    let mut gaps = unreadable;
+    let mut read = 0usize;
+    for (job, excluded) in &lanes {
+        for name in excluded {
+            read += 1;
+            if !files.contains(name) {
+                gaps.push(format!(
+                    "  {job}: filters out `{name}`, which is no test file of cerulion_core"
+                ));
+            }
+            if !lanes
+                .iter()
+                .any(|(other, theirs)| other != job && !theirs.contains(name))
+            {
+                gaps.push(format!(
+                    "  {job}: filters out `{name}`, and no other job runs the shard step \
+                     without filtering it"
+                ));
+            }
+        }
+    }
+    (gaps, read)
+}
+
+/// A test binary a shard step filters out must run in another job's shard step.
+///
+/// `CI_TEST_SHARD_EXTRA` reaches nextest as extra arguments, and a
+/// `!binary(=<name>)` filter there leaves that binary out of the step while the
+/// package walk above still credits `cerulion_core` to the job. `test-macos`
+/// filters `macro_compile_fail_test` out on pull requests and queue batches
+/// because `test-linux` runs it; this holds that second half true.
+#[test]
+fn a_test_binary_filtered_out_of_a_shard_step_runs_in_another_jobs_shard_step() {
+    let texts = pr_blocking_workflow_texts();
+    let text = texts
+        .get("ci.yml")
+        .expect("ci.yml is classified as PR-blocking");
+    let files: BTreeSet<String> = std::fs::read_dir(repo_root().join("crates/cerulion_core/tests"))
+        .expect("crates/cerulion_core/tests is readable")
+        .flatten()
+        .filter_map(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .strip_suffix(".rs")
+                .map(str::to_string)
+        })
+        .collect();
+    let (gaps, read) = shard_exclusion_gaps(text, &files);
+    assert!(
+        gaps.is_empty(),
+        "a shard step filters out a test binary nothing else runs:\n{}",
+        gaps.join("\n")
+    );
+    // `test-macos` filters one binary today; a reader that finds none is not
+    // reading the env line any more (update this floor deliberately).
+    assert!(
+        read >= 1,
+        "no `CI_TEST_SHARD_EXTRA` exclusion was read, so this rule judged nothing"
+    );
+
+    // The control: the same filter in the only job that runs the shard step.
+    let alone = "jobs:\n  lane:\n    steps:\n      - name: shard\n        env:\n          \
+                 CI_TEST_SHARD_EXTRA: '-E !binary(=a_test)'\n        run: \
+                 ./tools/scripts/ci_test_shard.sh cerulion_core 0 1\n";
+    let known: BTreeSet<String> = ["a_test".to_string()].into_iter().collect();
+    let (gaps, read) = shard_exclusion_gaps(alone, &known);
+    assert_eq!(read, 1, "the control's one exclusion is read");
+    assert_eq!(
+        gaps.len(),
+        1,
+        "a filter with no other lane is named: {gaps:?}"
+    );
+    let (gaps, _) = shard_exclusion_gaps(alone, &BTreeSet::new());
+    assert_eq!(
+        gaps.len(),
+        2,
+        "a filter naming no test file is named too: {gaps:?}"
+    );
+    // Two lanes that both filter it leave it running nowhere.
+    let both = format!(
+        "{alone}  other:\n    steps:\n      - name: shard\n        env:\n          \
+         CI_TEST_SHARD_EXTRA: '-E !binary(=a_test)'\n        run: \
+         ./tools/scripts/ci_test_shard.sh cerulion_core 0 1\n"
+    );
+    let (gaps, read) = shard_exclusion_gaps(&both, &known);
+    assert_eq!(read, 2, "both lanes' exclusions are read");
+    assert_eq!(gaps.len(), 2, "each lane's filter is named: {gaps:?}");
+    // Any other spelling is refused rather than read as no filter.
+    for line in [
+        "CI_TEST_SHARD_EXTRA: '-E !binary(~a_test)'",
+        "CI_TEST_SHARD_EXTRA: '-E not binary(=a_test)'",
+        "CI_TEST_SHARD_EXTRA: '--skip a_test'",
+        "CI_TEST_SHARD_EXTRA: '-E !binary_id(cerulion_core::a_test)'",
+    ] {
+        let (names, unread) = shard_extra_exclusions(line);
+        assert!(
+            names.is_empty() && !unread.is_empty(),
+            "`{line}` must read as an unread filter, got names {names:?} unread {unread:?}"
+        );
+    }
+    let (names, unread) =
+        shard_extra_exclusions("CI_TEST_SHARD_EXTRA: x && '-E !binary(=a_test)' || ''");
+    assert_eq!(names, vec!["a_test".to_string()]);
+    assert!(
+        unread.is_empty(),
+        "the accepted spelling leaves nothing unread: {unread:?}"
+    );
+}
+
 /// `--check` finds the pinned file in a listing far longer than a pipe holds.
 ///
 /// The pinned name is the listing's FIRST line and the listing runs to several
@@ -2088,7 +2269,8 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         .map(|(name, _)| name)
         .collect();
     // The cdylib feature is required to compile the node context migration
-    // cases; required Linux and macOS shards run this fixture's lib harness.
+    // cases; the required Linux shards run this fixture's lib harness on every
+    // event, and the macOS shards on a push and a dispatch.
     let allowed = BTreeSet::from(["test_node_macro_cdylib"]);
     let unexpected: Vec<_> = fixtures
         .iter()

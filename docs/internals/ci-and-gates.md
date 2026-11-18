@@ -520,6 +520,16 @@ shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, f
 reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
+The two trybuild suites run on macOS on a push to `main` and on a dispatch only:
+`macro_compile_fail_test` and `test_node_macro_cdylib`'s context compile tests. On a pull
+request and a merge-queue batch both run on `test-linux` shard 2; the macOS shards pass
+`-E !binary(=macro_compile_fail_test)` to nextest through `CI_TEST_SHARD_EXTRA`, and macOS
+shard 2 skips the context helper step with a line saying where it runs. `ci_test_coverage_test`
+requires every test binary a shard step filters out that way to run in another job's shard step
+that does not filter it, and refuses any other filter spelling in that variable. What both suites check is mostly
+this repository's own `compile_error!` wording, so a difference that shows only on macOS can
+merge, and shows on `main`'s push run of the commit the queue passed.
+
 Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
 what it built. There is no shared archive of test binaries and no job that builds one.

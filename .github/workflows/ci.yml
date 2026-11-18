@@ -3966,9 +3966,19 @@ jobs:
           fi
           echo "built $total waived test binaries for the gate"
 
+      # THE PINNED TRYBUILD TAIL RUNS HERE ON A PUSH AND A DISPATCH ONLY. On a
+      # pull request and a merge-queue batch `macro_compile_fail_test` (the
+      # shard script's PINNED_TEST, on shard 2) runs on `test-linux` shard 2
+      # and is filtered out here: the text it checks is mostly this
+      # repository's own `compile_error!` wording. `main`'s push run and every
+      # dispatch still run it on macOS.
+      # The shard script splits the value on whitespace into nextest
+      # arguments, so the filterset after `-E` carries no space. Every macOS
+      # shard gets it; only shard 2 holds the test.
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+          CI_TEST_SHARD_EXTRA: ${{ (github.event_name == 'pull_request' || github.event_name == 'merge_group') && '-E !binary(=macro_compile_fail_test)' || '' }}
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
@@ -3992,8 +4002,9 @@ jobs:
       #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
       #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
       #            tree kept together (wireclient, connectd, netd-wan)
-      #   shard 2  the pinned trybuild tail, native_ros2_messages, macros,
-      #            discovery, and the folded viz suites
+      #   shard 2  the pinned trybuild tail and the context helper's trybuild
+      #            suite (push and dispatch only), native_ros2_messages,
+      #            macros, discovery, and the folded viz suites
       #
       # Every `run:` line is byte-identical to the 2-way map, so nothing about
       # WHAT runs changed and both nightly mirrors still cover the job; only
@@ -4058,9 +4069,17 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
+      # THE CONTEXT HELPER'S TRYBUILD SUITE RUNS HERE ON A PUSH AND A DISPATCH
+      # ONLY, for the reason given above the cerulion_core shard step: on a
+      # pull request and a merge-queue batch it runs on `test-linux` shard 2,
+      # and the step after this one says so in the log.
       - name: node context helper compile tests
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         run: cargo test -p test_node_macro_cdylib --lib
+      - name: node context helper compile tests ran on Linux
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+        run: |
+          echo "macOS before merge: test_node_macro_cdylib's trybuild suite runs on Test (Linux) shard 2; macOS runs it on a push to main and on a dispatch"
       - name: selection marker, test_node_macro_cdylib
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
         env:
