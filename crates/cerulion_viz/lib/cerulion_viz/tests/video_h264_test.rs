@@ -16,8 +16,9 @@
 //!
 //! The second rendition's SPS is BUILT ([`build_sps`]) rather than captured,
 //! because the committed 720p capture is a non-IDR access unit and therefore
-//! carries no parameter set. It is a real conforming Baseline SPS — `h264_reader`
-//! parses it, and the test asserts the dimensions it recovers against the
+//! carries no parameter set. It is a Baseline SPS that declares level 3.0, which
+//! under-declares a 720p frame the way some encoders do; `sps_dimensions` still
+//! recovers its picture size, and the test asserts the dimensions against the
 //! macroblock counts that were encoded, so the builder cannot silently agree with
 //! a broken parse.
 //!
@@ -534,6 +535,20 @@ const KEY_720: StreamKey = StreamKey {
     width: 1280,
     height: 720,
 };
+
+#[test]
+fn an_sps_that_under_declares_its_level_still_yields_its_picture_size() {
+    // Level 3.0 allows 1620 macroblocks a frame and 80 by 45 is 3600, so this
+    // SPS under-declares its level, as some encoders do. The picture size comes
+    // from the macroblock counts, whatever the level says.
+    let sps = build_sps(0, 80, 45);
+    assert_eq!(sps[3], 30, "byte 3 of the NAL is level_idc");
+    assert_eq!(sps_dimensions(&sps), Some((1280, 720)));
+    // And with a level that does cover the frame, the same answer.
+    let mut declared = sps.clone();
+    declared[3] = 40;
+    assert_eq!(sps_dimensions(&declared), Some((1280, 720)));
+}
 
 #[test]
 fn a_built_sps_decodes_to_the_macroblock_geometry_it_was_given() {

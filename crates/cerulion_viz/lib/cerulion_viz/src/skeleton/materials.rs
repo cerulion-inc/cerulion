@@ -24,7 +24,7 @@ fn error(message: impl std::fmt::Display) -> UrdfError {
 }
 
 fn attribute<'a>(node: Node<'a, '_>, name: &str) -> Result<&'a str, UrdfError> {
-    node.attribute(name)
+    super::plain_attribute(node, name)
         .filter(|s| !s.trim().is_empty())
         .ok_or_else(|| error(format!("<{}> requires {name}", node.tag_name().name())))
 }
@@ -276,14 +276,14 @@ pub(super) fn verify(bytes: &[u8], required: &[&Declaration]) -> Result<(), Urdf
         return Err(error("material declarations require a COLLADA document"));
     }
     // dae-parser, used by the native renderer, accepts only this version.
-    if root.attribute("version") != Some("1.4.1") {
+    if super::plain_attribute(root, "version") != Some("1.4.1") {
         return Err(error(
             "material verification requires COLLADA version 1.4.1",
         ));
     }
     let mut ids = BTreeMap::new();
     for node in doc.descendants().filter(|n| n.is_element()) {
-        if let Some(id) = node.attribute("id") {
+        if let Some(id) = super::plain_attribute(node, "id") {
             if ids.insert(id, node).is_some() {
                 return Err(error(format!("ambiguous duplicate DAE id {id:?}")));
             }
@@ -294,8 +294,7 @@ pub(super) fn verify(bytes: &[u8], required: &[&Declaration]) -> Result<(), Urdf
         // COLLADA 1.4.1 defaults an absent `meter` attribute to 1.0; only a
         // present attribute can declare another scale.
         if node.has_tag_name("unit")
-            && node
-                .attribute("meter")
+            && super::plain_attribute(node, "meter")
                 .map_or(Some(1.0), |meter| meter.trim().parse::<f64>().ok())
                 != Some(1.0)
         {

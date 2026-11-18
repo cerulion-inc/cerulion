@@ -672,12 +672,24 @@ pub enum UrdfError {
 
 /// Read an optional vector attribute. Defaults apply only when the attribute is
 /// absent; malformed values never become plausible geometry at the origin.
+/// The attribute `name` in no namespace, which is what a URDF or COLLADA
+/// reader means by a bare attribute name. roxmltree's `attribute("name")`
+/// also matches a namespaced attribute with that local name (`xml:id` for
+/// `id`), the first one in document order, so these readers look up through
+/// here instead.
+pub(crate) fn plain_attribute<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+    node.attributes()
+        .find(|a| a.namespace().is_none() && a.name() == name)
+        .map(|a| a.value())
+}
+
 fn vector_attribute(
     node: Option<roxmltree::Node<'_, '_>>,
     attribute: &str,
     default: [f64; 3],
 ) -> Result<[f64; 3], UrdfError> {
-    let Some((node, value)) = node.and_then(|n| n.attribute(attribute).map(|v| (n, v))) else {
+    let Some((node, value)) = node.and_then(|n| plain_attribute(n, attribute).map(|v| (n, v)))
+    else {
         return Ok(default);
     };
     let invalid = || UrdfError::InvalidVector {
@@ -706,7 +718,7 @@ fn joint_link_ref(joint: roxmltree::Node<'_, '_>, tag: &str) -> String {
     joint
         .children()
         .find(|n| n.is_element() && n.tag_name().name() == tag)
-        .and_then(|n| n.attribute("link"))
+        .and_then(|n| plain_attribute(n, "link"))
         .unwrap_or("")
         .to_string()
 }
@@ -757,7 +769,7 @@ fn parse_mesh_visual(visual: roxmltree::Node<'_, '_>) -> Result<Option<RawVisual
         .and_then(|n| n.children().find(|n| n.has_tag_name("mesh")));
     let Some(mesh) = mesh else { return Ok(None) };
     let scale = vector_attribute(Some(mesh), "scale", [1.0; 3])?;
-    let Some(filename) = mesh.attribute("filename").filter(|f| !f.is_empty()) else {
+    let Some(filename) = plain_attribute(mesh, "filename").filter(|f| !f.is_empty()) else {
         return Ok(None);
     };
     Ok(Some(RawVisual {
@@ -796,7 +808,7 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
     for node in robot.children().filter(|n| n.is_element()) {
         match node.tag_name().name() {
             "link" => {
-                if let Some(name) = node.attribute("name") {
+                if let Some(name) = plain_attribute(node, "name") {
                     links.push(name.to_string());
                     if let Some(vis) = parse_link_visual(node)? {
                         link_visuals.insert(name.to_string(), vis);
@@ -804,8 +816,8 @@ fn parse_urdf_with_config(xml: &str, cfg: &UrdfConfig) -> Result<UrdfModel, Urdf
                 }
             }
             "joint" => {
-                let name = node.attribute("name").unwrap_or("").to_string();
-                let kind = match node.attribute("type") {
+                let name = plain_attribute(node, "name").unwrap_or("").to_string();
+                let kind = match plain_attribute(node, "type") {
                     Some("revolute") | Some("continuous") => JointKind::Revolute,
                     Some("fixed") => JointKind::Fixed,
                     _ => JointKind::Other,
@@ -1379,6 +1391,21 @@ mod tests {
     use super::*;
     use cerulion_core::codegen::NamedValue;
     use std::f64::consts::{FRAC_PI_2, PI};
+
+    #[test]
+    fn a_namespaced_attribute_never_stands_in_for_the_plain_one() {
+        // The namespaced attribute comes first, where a local-name match
+        // would pick it.
+        let urdf = r#"<robot name="ns" xmlns:x="urn:example">
+  <link x:name="namespaced" name="plain"/>
+  <link x:name="only-namespaced"/>
+</robot>"#;
+        let model = parse_urdf(urdf).expect("parses");
+        assert_eq!(model.links, vec!["plain".to_string()]);
+        let doc =
+            roxmltree::Document::parse(r#"<e xmlns:x="urn:example" x:id="a"/>"#).expect("xml");
+        assert_eq!(plain_attribute(doc.root_element(), "id"), None);
+    }
 
     /// A compact hermetic URDF fixture: base → {FR_hip → FR_thigh, radar}. Two
     /// revolute leg joints (distinct axes) + one fixed radar mount (the real Go2

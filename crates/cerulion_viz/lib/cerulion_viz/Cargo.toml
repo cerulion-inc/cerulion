@@ -60,17 +60,17 @@ serde_yaml = "0.9"
 # unknown license into this isolated workspace (and we only need joint
 # origins/axes + link names), whereas roxmltree keeps the resolve deny-clean and
 # the extraction fully under our control + hermetically testable.
-roxmltree = "0.20"
+roxmltree = "0.21"
 # H.264 Sequence Parameter Set parsing for the desk-side video demux
 # (`src/video.rs`). NOT a decoder — rerun's viewer decodes; this reads the SPS to
 # learn a sub-stream's picture size so an interleaved multi-rendition topic
 # (alternating 360p and 720p on one topic) is split into per-resolution
 # child entities instead of being fed to one decoder that cannot survive it.
 #
-# NO new resolve: `h264-reader` 0.8.0 is ALREADY in the workspace lockfile as a
-# transitive dep of rerun's own `re_video`, so naming it directly here adds an
-# edge, not a crate. License MIT — already on the root deny.toml allow-list.
-h264-reader = "0.8"
+# rerun's own `re_video` stays on h264-reader 0.8, so 0.9 here is a second copy
+# with its own bitstream reader (bitstream-io 4). License MIT OR Apache-2.0,
+# already on the root deny.toml allow-list.
+h264-reader = "0.9"
 # The desk-side H.264 DECODER. Measured, rerun 0.34's native video path
 # spawns an `ffmpeg` CLI and leaves `-threads` unset, so libavcodec's FRAME
 # threading holds ~one frame per core before it emits anything: 567 ms of lag on a
@@ -115,8 +115,7 @@ openh264-sys2 = { version = "0.9", default-features = false }
 # variant — a request for one answers 403, measured), and a SHA-256.
 #
 # All three are EDGES, not new crates: every one is already in the workspace
-# lockfile, so naming them here resolves nothing new (the `h264-reader`
-# precedent above).
+# lockfile, so naming them here resolves nothing new.
 #
 # `ureq` 3 — blocking HTTPS with rustls + webpki-roots, already present via
 # rerun's `ehttp`. Blocking is the right shape: the fetch runs on its own

@@ -478,11 +478,40 @@ pub fn scan_annex_b(bytes: &[u8]) -> Option<AccessUnit<'_>> {
 /// `None` when the bytes are not a parseable SPS: the caller treats that as "no
 /// dimension evidence in this access unit", never as a decode failure worth
 /// surfacing per frame.
+///
+/// The SPS's declared level does not bound the picture it describes. Encoders
+/// under-declare their level, and `h264_reader` refuses an SPS whose frame is
+/// larger than its level allows, so the level byte is read as an unknown level,
+/// which `h264_reader` holds only to the largest level's frame size (139264
+/// macroblocks). The picture size comes from the macroblock counts and cropping
+/// alone, as it does for the decoder.
 pub fn sps_dimensions(sps_nal: &[u8]) -> Option<(u32, u32)> {
     use h264_reader::nal::{sps::SeqParameterSet, Nal as _, RefNal};
-    let nal = RefNal::new(sps_nal, &[], true);
+    let unbounded = sps_with_unknown_level(sps_nal);
+    let nal = RefNal::new(unbounded.as_deref().unwrap_or(sps_nal), &[], true);
     let sps = SeqParameterSet::from_bits(nal.rbsp_bits()).ok()?;
     sps.pixel_dimensions().ok()
+}
+
+/// Byte offset of `level_idc` in an SPS NAL: the header byte, `profile_idc`,
+/// then the constraint flags.
+const SPS_LEVEL_IDC_OFFSET: usize = 3;
+
+/// `level_idc` 255 names no level, and being non-zero it cannot form an
+/// emulation-prevention pattern with the bytes around it.
+const UNKNOWN_LEVEL_IDC: u8 = 0xff;
+
+/// A copy of `sps_nal` with `level_idc` set to [`UNKNOWN_LEVEL_IDC`], or `None`
+/// when the NAL is too short to carry one or `profile_idc` is 0. A zero
+/// `profile_idc` (no real profile) could pair with zero constraint flags to put
+/// an emulation-prevention byte at the level offset, so that NAL is left as is.
+fn sps_with_unknown_level(sps_nal: &[u8]) -> Option<Vec<u8>> {
+    if sps_nal.len() <= SPS_LEVEL_IDC_OFFSET || sps_nal[1] == 0 {
+        return None;
+    }
+    let mut copy = sps_nal.to_vec();
+    copy[SPS_LEVEL_IDC_OFFSET] = UNKNOWN_LEVEL_IDC;
+    Some(copy)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1236,6 +1265,29 @@ impl VideoDemux {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_level_rewrite_touches_only_a_level_byte_it_can_find() {
+        // Too short to carry a level: left alone.
+        assert_eq!(sps_with_unknown_level(&[0x67, 0x64, 0x00]), None);
+        // A zero profile_idc: left alone, the level offset may hold an
+        // emulation-prevention byte.
+        assert_eq!(
+            sps_with_unknown_level(&[0x67, 0x00, 0x00, 0x03, 0x28]),
+            None
+        );
+        // Otherwise only byte 3 changes.
+        let copy = sps_with_unknown_level(GO2_REAL_SPS).expect("a real SPS");
+        assert_eq!(copy[SPS_LEVEL_IDC_OFFSET], UNKNOWN_LEVEL_IDC);
+        assert_eq!(
+            copy[..SPS_LEVEL_IDC_OFFSET],
+            GO2_REAL_SPS[..SPS_LEVEL_IDC_OFFSET]
+        );
+        assert_eq!(
+            copy[SPS_LEVEL_IDC_OFFSET + 1..],
+            GO2_REAL_SPS[SPS_LEVEL_IDC_OFFSET + 1..]
+        );
+    }
 
     /// The REAL Sequence Parameter Set from a live Unitree Go2 `/frontvideostream`
     /// sample — bytes 0x18..0x32 of

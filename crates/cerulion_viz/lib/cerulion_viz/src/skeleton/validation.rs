@@ -333,7 +333,7 @@ fn required_attribute<'a>(
     node: roxmltree::Node<'a, '_>,
     attribute: &str,
 ) -> Result<&'a str, UrdfError> {
-    node.attribute(attribute)
+    super::plain_attribute(node, attribute)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| invalid(node, format!("{attribute} must be present and nonempty")))
 }
