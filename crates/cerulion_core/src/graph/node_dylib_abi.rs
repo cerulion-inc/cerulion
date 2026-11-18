@@ -634,6 +634,14 @@ impl NodeEntry for DylibNodeEntry {
             });
         }
     }
+    fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+        self.context.is_some_and(|context| {
+            host::with_context(context, |ctx| {
+                Ok(ctx.native_for_runtime().output_commit_counts(out))
+            })
+            .unwrap_or(false)
+        })
+    }
     fn snapshot_inputs(&mut self, inputs: &[String]) {
         if self.snapshot_failed || self.context.is_none() {
             return;

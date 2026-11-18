@@ -3469,6 +3469,20 @@ shape. Values are matched exactly where noted; a malformed value never
 silently changes behavior (it warns and falls back to the documented
 default: loud over silent).
 
+**When the live loop wakes.** Between data events the loop waits for the
+soonest pending fire. A `period_ms` deadline still ahead is waited for
+exactly, so a node whose park wakes on time fires on its own grid even after a
+step or a wake ran late; a deadline less than 10 µs away waits 10 µs, which
+costs at most one extra wake per fire. How promptly the park wakes is the
+host's: on macOS the degraded park nap can wake later than the slack a busy
+tick leaves in its period, and such a node can still fall behind its grid and
+catch up with a double fire. A node that is due but cannot fire yet (a Data or Sync backlog, a
+`period_ms` node past its deadline, a `throttle_ms` window, a `block` slot
+waiting for its drain or its `block_timeout_ms` release) is read again at no
+less than a 1 ms poll, so no node is polled faster than once a millisecond,
+and with nothing pending the loop wakes every 250 ms for its liveliness sweep.
+A data wake returns at once, whatever the wait.
+
 | Variable | Meaning |
 |---|---|
 | `CERULION_MONITOR_WAIT` | Live-loop monitor-wait **park** override. `1` forces the park on, `0` disables it (exact match; any other non-empty value warns and uses the auto default). `0` is a real off on every host: an unset `CERULION_DOORBELL` follows the park, so the doorbell is off too. `CERULION_DOORBELL=1` turns the park back on only where a monitor-wait primitive exists, and then warns once at startup, naming both variables; on a host without one, `0` stands even then, and a warning says the doorbell was forced off because the park is off. With the park off, `graph run` and `node run` on Linux apply the automatic C-state cap (`CERULION_CPU_DMA_LOCK` below) to a latency-sensitive graph; add `--no-cpu-dma-lock` or `CERULION_CPU_DMA_LOCK=0` to let the CPU idle deep as well. **Auto default: ON for live runs** (`--time-source real`/`external`) and in every worker of a multi-process run, off for a single-process `--time-source virtual` run. On Linux x86_64 (WAITPKG) / Linux aarch64 the park is a real shallow CPU monitor-wait (`UMWAIT`/`WFE`) that slices at 20 µs and **yields the core after every slice** (a monitor-wait-parked thread is RUNNING to the OS scheduler, so without the yield a co-located runnable process waited a scheduler tick, ~7 ms, whenever graph processes outnumber cores). On aarch64 the effective slice is the generic-timer event-stream period (base `WFE` has no timeout operand), so a same-core peer wakes within ~one period there (machine-specific, and on an Orin-class board it is around 130 µs; x86 `UMWAIT` honors the 20 µs slice); cross-core wake latency is unaffected. On targets **without** a CPU monitor-wait primitive (macOS, x86 without WAITPKG) the park runs in the **degraded sleep-recheck tier**; see below. The `--no-monitor-wait` flag beats this variable and `CERULION_DOORBELL` in both directions: it turns the park off on every host, the degraded tier included, and no environment value turns it back on. **Also read by `rmw_cerulion`'s event-driven `rmw_wait`** through the same classification; there unset means the measured platform default (a one-rung park on aarch64, off on x86), `1` forces the rmw park on, `0` off; see "ROS 2 rmw wait tuning" below. |

@@ -9872,6 +9872,7 @@ fn judge_capture_resimmable(
     trace_rings: TraceRingCoverage,
     ranks_missing: &[u32],
     rank_space_walked: bool,
+    frame_gap: Option<cerulion_core::flashback::resim::FrameGap>,
 ) -> Result<(), cerulion_core::flashback::resim::ResimGap> {
     let (anchor_run_id, runs_at_step) = match anchor {
         flashback_plane::AnchorReport::Embedded { run_id, .. } => (*run_id, 1),
@@ -9943,8 +9944,53 @@ fn judge_capture_resimmable(
             // bag carries no record of a rank's removed steps.
             ranks_without_a_kept_step: &trimmed.ranks_without_a_kept_step,
             anchor_facts,
+            // The first frame a kept read consumed that the window does not
+            // hold. The recorder alone knows it: its taps hold frames from the
+            // moment they attached, while it can read the trace and the checkpoint
+            // rings from their first record.
+            frame_gap,
         },
     )
+}
+
+/// The frames a capture's window holds, per WRITER TOKEN: the key a read
+/// annotation names its writer by, so the capture judge looks a kept read's
+/// frame up the way a `--verify` replay does.
+///
+/// A labeled frame carries its publisher; an unlabeled one is its tap's FIRST
+/// origin, which every frame staged before labeling armed carried (see
+/// [`ProducerLabeling`]). A headerless frame has no sequence to name and is
+/// skipped, as the replay's index skips it.
+fn held_frames_by_writer(
+    batches: &[(String, std::sync::Arc<StagedFrames>)],
+    first_origins: &std::collections::HashMap<String, u128>,
+) -> BTreeMap<u64, cerulion_core::flashback::resim::HeldFrames> {
+    let mut held: BTreeMap<u64, (&str, Vec<u32>)> = BTreeMap::new();
+    for (topic, staged) in batches {
+        for (header, origin, _) in staged.iter() {
+            let (Some((sequence, _)), Some(id)) = (
+                header,
+                origin.id().or_else(|| first_origins.get(topic).copied()),
+            ) else {
+                continue;
+            };
+            // The token the recorder mints producer annotations with:
+            // FNV-1a over the publisher id's little-endian bytes.
+            let token = cerulion_core::wire::fnv1a_hash(&id.to_le_bytes());
+            held.entry(token)
+                .or_insert_with(|| (topic.as_str(), Vec::new()))
+                .1
+                .push(sequence);
+        }
+    }
+    held.into_iter()
+        .map(|(token, (topic, sequences))| {
+            (
+                token,
+                cerulion_core::flashback::resim::HeldFrames::new(topic.to_string(), sequences),
+            )
+        })
+        .collect()
 }
 
 /// Flashback phase 2: resolve and bank the anchors one drain closed.
@@ -17414,6 +17460,12 @@ impl Recorder {
             // …and whether the walk that fills it ran at all, read at the same
             // place and for the same borrow reason.
             state_rank_space_walked,
+            // Every frame the kept reads consumed, against the frames this
+            // capture writes.
+            cerulion_core::flashback::resim::first_frame_gap(
+                &trimmed.named_frames,
+                &held_frames_by_writer(&batches, &first_origins),
+            ),
         );
         // The earlier handoff, with the seam it left OPEN now CLOSED.
         //
@@ -29067,6 +29119,236 @@ mod judge_remedy_tests {
             }
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod frame_coverage_judge_tests {
+    //! The frame-coverage gate over its pure parts: a hand-built rank-0 trace
+    //! trimmed at a complete step-0 checkpoint, a window built to begin where
+    //! each arm says, and the verdict. No shared memory, no race.
+    use super::*;
+    use cerulion_core::flashback::resim::{FrameGap, HeldFrom, ResimGap};
+    use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
+    use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
+    use cerulion_core::trace_ring::{ReadRun, TraceRingRecord};
+
+    const MS: u64 = 1_000_000;
+    const RUN: u64 = 0xC1E5;
+    const TICKER_TOPIC: &str = "/p/ticker/cmd";
+    /// The ticker's publisher id, and a second writer's.
+    const TICKER_ID: u128 = 0x007A_C4E2;
+    const OTHER_ID: u128 = 0x0DD5;
+    const TICKER: u32 = 0;
+    const RELAY: u32 = 1;
+
+    /// The token relay.trigger_in's annotation names the ticker by.
+    fn w() -> u64 {
+        cerulion_core::wire::fnv1a_hash(&TICKER_ID.to_le_bytes())
+    }
+
+    /// Steps 0..=5 of ticker -> relay: STEP_BOUNDARY at (k+1) x 50 ms, the two
+    /// FIREs, then relay.trigger_in's read of `read_seq(k)` (none at a `None`),
+    /// with one producer annotation before its first serving read, the
+    /// single-writer shape of trace format 8 on.
+    fn trace(read_seq: impl Fn(u64) -> Option<u32>) -> Vec<TraceRingRecord> {
+        let mut records = Vec::new();
+        let mut annotated = false;
+        for k in 0..=5u64 {
+            let boundary = TraceRingRecord {
+                step: k,
+                fire_time_ns: (k + 1) * 50 * MS,
+                duration_ns: 0,
+                node_idx: 0,
+                global_level: 0,
+                record_type: cerulion_core::trace_ring::RECORD_TYPE_STEP_BOUNDARY,
+                reserved: 0,
+            };
+            let fire = |node_idx| TraceRingRecord {
+                node_idx,
+                duration_ns: 7,
+                record_type: cerulion_core::trace_ring::RECORD_TYPE_FIRE,
+                ..boundary
+            };
+            records.extend([boundary, fire(TICKER), fire(RELAY)]);
+            let seq = read_seq(k);
+            if seq.is_some() && !annotated {
+                annotated = true;
+                records.push(TraceRingRecord::read_outcome_producer(
+                    k,
+                    RELAY,
+                    0,
+                    seq,
+                    w(),
+                    ReadSiteRole::Drain,
+                ));
+            }
+            let (kind, popped) = match seq {
+                Some(_) => (ReadOutcomeKind::Served, 1),
+                None => (ReadOutcomeKind::NoFrame, 0),
+            };
+            records.push(TraceRingRecord::read_outcome(
+                k,
+                RELAY,
+                0,
+                kind,
+                seq,
+                ReadRun::once(popped),
+                ReadSiteRole::Drain,
+            ));
+        }
+        records
+    }
+
+    /// The ticker's frames in the window at `seqs`, each stamped at its step's
+    /// target, under `origin`.
+    fn window(
+        seqs: impl IntoIterator<Item = u32>,
+        origin: FrameOrigin,
+    ) -> Vec<(String, Arc<StagedFrames>)> {
+        let mut staged = StagedFrames::default();
+        for s in seqs {
+            staged.push(Some((s, (u64::from(s) + 1) * 50 * MS)), origin, b"cmd");
+        }
+        vec![(TICKER_TOPIC.to_string(), Arc::new(staged))]
+    }
+
+    /// The verdict on `records` trimmed at the step-0 checkpoint, against
+    /// `frames`, whose unlabeled frames the tap attributes to the ticker.
+    fn verdict(
+        records: Vec<TraceRingRecord>,
+        frames: &[(String, Arc<StagedFrames>)],
+    ) -> Result<(), ResimGap> {
+        let trimmed = trace_window::trim_to_anchor(
+            records.into_iter(),
+            &BTreeMap::from([(0, 0)]),
+            &BTreeMap::from([(0, vec!["ticker".to_string(), "relay".to_string()])]),
+        );
+        let first_origins =
+            std::collections::HashMap::from([(TICKER_TOPIC.to_string(), TICKER_ID)]);
+        let anchors: Vec<AnchorFact> = ["ticker", "relay"]
+            .iter()
+            .map(|node| AnchorFact {
+                run_id: RUN,
+                step: 0,
+                node: node.to_string(),
+                outcome: AnchorOutcome::Complete,
+            })
+            .collect();
+        let report = flashback_plane::AnchorReport::Embedded {
+            run_id: RUN,
+            step: 0,
+            nodes: 2,
+            complete: 2,
+            records: 2,
+            fit: anchor_window::AnchorFit::CoversTheClaimedWindow,
+            taken_at_ns: 0,
+            frames_before_anchor_ms: 0,
+            frames_missing_after_anchor_ms: 0,
+            per_rank: BTreeMap::new(),
+            missing_ranks: Vec::new(),
+        };
+        judge_capture_resimmable(
+            &trimmed,
+            &report,
+            &anchors,
+            1,
+            &[(
+                GRAPH_ATTACHMENT.to_string(),
+                b"prefix: p\nnodes:\n  - id: ticker\n    type: t\n  - id: relay\n    type: t\n"
+                    .to_vec(),
+            )],
+            true,
+            &[0],
+            cerulion_core::trace_ring::first_trace_record_refusal(trimmed.records.iter(), &[2]),
+            None,
+            TraceRingCoverage {
+                declared: 1,
+                unreadable: 0,
+            },
+            &[],
+            true,
+            cerulion_core::flashback::resim::first_frame_gap(
+                &trimmed.named_frames,
+                &held_frames_by_writer(frames, &first_origins),
+            ),
+        )
+    }
+
+    /// Step k reads sequence k (the lockstep shape), or the frame of step k - 1
+    /// (the free-run shape, whose step-1 read is the frame published before the
+    /// checkpoint).
+    fn lockstep() -> Vec<TraceRingRecord> {
+        trace(|k| u32::try_from(k).ok())
+    }
+    fn free_run() -> Vec<TraceRingRecord> {
+        trace(|k| k.checked_sub(1).and_then(|s| u32::try_from(s).ok()))
+    }
+
+    fn not_held(step: u64, sequence: u32, first: Option<u32>) -> Result<(), ResimGap> {
+        Err(ResimGap::FrameNotHeld {
+            resume_step: 1,
+            gap: FrameGap {
+                step,
+                writer: w(),
+                sequence,
+                held_from: first.map(|first_sequence| HeldFrom {
+                    topic: TICKER_TOPIC.to_string(),
+                    first_sequence,
+                }),
+            },
+        })
+    }
+
+    /// The defect: the capture resumes at step 1 off the step-0 checkpoint and
+    /// its ticker frames begin at sequence 3, so its first kept read names a
+    /// frame it never held, in the "frames begin late" form. Twice, to the same
+    /// verdict.
+    #[test]
+    fn a_capture_whose_frames_begin_after_its_checkpoint_is_not_resimmable() {
+        let held = window(3..=6, FrameOrigin::Unlabeled);
+        let refused = verdict(lockstep(), &held);
+        assert_eq!(refused, not_held(1, 1, Some(3)));
+        assert_eq!(refused, verdict(lockstep(), &held), "two runs, one verdict");
+        let reason = refused.unwrap_err().reason();
+        assert!(
+            reason.contains("begin at sequence 3, but its trace resumes at step 1"),
+            "{reason}"
+        );
+        assert_eq!(verdict(free_run(), &held), not_held(1, 0, Some(3)));
+    }
+
+    /// The controls, every frame from sequence 0 held, unlabeled or labeled,
+    /// are resimmable; with sequence 4 missing between held 3 and 5 the step-4
+    /// read is refused in the "a frame its window lost" form.
+    #[test]
+    fn a_capture_is_judged_on_every_frame_its_kept_reads_name() {
+        for origin in [FrameOrigin::Unlabeled, FrameOrigin::Labeled(TICKER_ID)] {
+            let held = window(0..=6, origin);
+            assert_eq!(verdict(lockstep(), &held), Ok(()), "{origin:?}");
+            assert_eq!(verdict(free_run(), &held), Ok(()), "{origin:?}");
+        }
+        let lost = verdict(
+            lockstep(),
+            &window([0, 1, 2, 3, 5, 6], FrameOrigin::Unlabeled),
+        );
+        assert_eq!(lost, not_held(4, 4, Some(0)));
+        let reason = lost.unwrap_err().reason();
+        assert!(
+            reason.contains("sequence 4, a frame its window lost"),
+            "{reason}"
+        );
+    }
+
+    /// Adversarial: frames at the right sequences from ANOTHER writer hold none
+    /// of the ticker's, and a headerless frame names no sequence.
+    #[test]
+    fn frames_of_another_writer_or_without_a_header_do_not_cover_a_read() {
+        let mut held = window(0..=6, FrameOrigin::Labeled(OTHER_ID));
+        let mut headerless = StagedFrames::default();
+        headerless.push(None, FrameOrigin::Labeled(TICKER_ID), b"cmd");
+        held.push((TICKER_TOPIC.to_string(), Arc::new(headerless)));
+        assert_eq!(verdict(lockstep(), &held), not_held(1, 1, None));
     }
 }
 

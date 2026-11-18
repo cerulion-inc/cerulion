@@ -387,7 +387,9 @@ pub enum TransportError {
     #[error("Heap allocation failed for topic '{topic}': could not allocate {requested} bytes for the overflow fallback buffer. The system is in OOM — shut down the graph and investigate memory usage.")]
     AllocationFailed { topic: String, requested: usize },
     /// A network re-injector's shared-memory identity marker for `topic` could
-    /// not be opened, verified or held, so the publisher was not exposed.
+    /// not be opened, verified or held, so the publisher was not exposed; or
+    /// the check of whether `topic` is a network mirror found its marker still
+    /// being torn down after the opens its caller allows.
     #[error("Network mirror identity for topic '{topic}' could not be established: {reason}")]
     MirrorIdentity { topic: String, reason: String },
     /// A reserved network mirror marker service carries no valid topic
