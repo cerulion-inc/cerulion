@@ -4520,6 +4520,99 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
+  # REPEAT RUNS of three `cerulion_core` test binaries whose tests wait on
+  # counters the product exposes, on the hosted macOS runner, where thread
+  # scheduling varies most. Each binary runs 20 times in a row, so a wait that
+  # still depends on how a loaded host schedules threads shows up here as a
+  # counted failed run rather than as a one-off red on an unrelated pull
+  # request.
+  #
+  # NOT a required status context (`tools/ci/required_contexts.txt` does not
+  # name it): a red here reports a flake and blocks no merge. Pushes to `main`
+  # and `workflow_dispatch` runs run it; pull requests and merge-queue batches do
+  # not, because it would hold one more macOS runner that a pull request's own
+  # macOS test shards wait for. Restore-only cache: it reads the macOS test
+  # shards' archive and saves nothing.
+  core-repeat:
+    name: Repeat runs (cerulion_core, macOS)
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'merge_group' && github.event_name != 'pull_request' }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    env:
+      # The profile the macOS test shards build with, so the restored archive
+      # is reused.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
+            cargo-${{ runner.os }}-
+
+      - name: Build the repeated test binaries
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo build -p cerulion_core --test gateway_egress_congestion_iox2_test --test liveliness_sweep_iox2_test --test free_run_ctor_iox2_test
+
+      # The whole binary per run, serially: the stall tests each want the host
+      # to themselves (their nextest timing fence) and the liveliness tests
+      # share the iceoryx2 singleton. A run counts as passed only when cargo
+      # exits 0 AND libtest reports at least one passed test and none failed,
+      # so a run that executed nothing is a failure. Every run of every binary
+      # goes ahead whatever an earlier one did, and the step fails at the end
+      # on any failed run.
+      - name: Repeat each binary 20 times
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: |
+          # The step shell is `bash -e`; pipefail makes the pipe below carry
+          # cargo's exit status rather than tee's.
+          set -o pipefail
+          runs=20
+          failed=0
+          for test_binary in gateway_egress_congestion_iox2_test liveliness_sweep_iox2_test free_run_ctor_iox2_test; do
+            binary_failed=0
+            for run in $(seq 1 "$runs"); do
+              log="$RUNNER_TEMP/repeat-$test_binary-$run.log"
+              if cargo test -p cerulion_core --test "$test_binary" -- --test-threads=1 2>&1 | tee "$log" \
+                && grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$log"; then
+                echo "repeat: $test_binary run $run of $runs passed"
+              else
+                echo "repeat: $test_binary run $run of $runs FAILED"
+                binary_failed=$((binary_failed + 1))
+              fi
+            done
+            echo "repeat: $test_binary failed $binary_failed of $runs runs"
+            failed=$((failed + binary_failed))
+          done
+          [ "$failed" -eq 0 ]
+
+      - name: selection marker, cerulion_core
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_core (selected: $SELECTED)"
+
   crate-tests:
     name: Crate tests (${{ matrix.os }})
     needs: [changes]
