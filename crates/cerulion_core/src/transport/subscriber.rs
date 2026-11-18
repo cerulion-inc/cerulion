@@ -7609,6 +7609,143 @@ mod tests {
         assert_eq!(batch_frames_staged(1, false, false, 0), 0);
     }
 
+    /// At a checkpoint window head both read sites reopen their writer runs, so
+    /// a multi-frame read whose frames fit below the rim mid-window can find
+    /// them pushed past it by the two openings alone, and then stages none.
+    ///
+    /// Hand oracle: a single-writer drain stage declared at depth 2 with one
+    /// fire derives 8 (`max(2 + 1, 2 * 2 + 1) + 1`, plus the two run-opening
+    /// records), on a subscriber whose reads carry their writer. Each window is
+    /// three real drains of one publisher: a body read of one frame, a drain
+    /// read of one frame, then a drain read of three frames that names two
+    /// other frames, which the fit rule needs `(2 + 1) * 2 = 6` slots for.
+    /// Mid-window both runs continue, the two single reads stage bare and leave
+    /// R = 6 slots, and the batch stages both frames. In the recording's first
+    /// window and in a reopened one the two single reads stage their annotation
+    /// too and leave R - 2 = 4, and the batch stages its read alone.
+    #[test]
+    fn a_batch_at_a_reopen_window_stages_no_frames_when_only_the_openings_push_it_past_the_rim() {
+        use crate::read_outcome::{ProducerAnnotation, ReadStageRole, StagedReadOutcome};
+        use crate::transport::{TransportConfig, TransportManager};
+        use crate::wire::MaxSliceLen;
+        use ReadOutcomeKind::{BatchFrame, DrainedBatch, Producer};
+        use ReadSiteRole::{Body, Drain};
+
+        let mgr = TransportManager::init_for_test(
+            TransportConfig {
+                node_name: "reopen_fit".into(),
+                clock: Arc::new(crate::clock::RealClock),
+                subscriber_buffer_size: 8,
+                network: None,
+            },
+            crate::testing::iceoryx_test_config(),
+        )
+        .expect("per-test SHM transport");
+        let topic = "reopen_fit";
+        let mut publisher = mgr
+            .create_publisher(topic, MaxSliceLen::try_new(1024).expect("len"), 0)
+            .expect("publisher");
+        let mut sub = mgr.create_subscriber(topic).expect("subscriber");
+        let sizing = shallow_drain_sizing(2, ProducerAnnotation::WriterRuns);
+        assert_eq!(
+            crate::read_outcome::derive_stage_capacity(ReadStageRole::Drain, sizing),
+            8,
+            "PREMISE: the stage's derived capacity"
+        );
+        let stage = Arc::new(ReadOutcomeStage::new(0, ReadStageRole::Drain, sizing));
+        stage.arm();
+        sub.set_read_outcome_stage(Arc::clone(&stage));
+        sub.mark_multi_publisher_edge();
+        let token = crate::wire::fnv1a_hash(&publisher.publisher_id().to_le_bytes());
+
+        // One window's three drains, from wire sequence `first`.
+        let mut window = |first: u32| {
+            publisher
+                .publish_raw(&batch_frame_bytes(first))
+                .expect("publish");
+            let body = sub.try_receive(|_msg| {}).expect("the body read");
+            publisher
+                .publish_raw(&batch_frame_bytes(first + 1))
+                .expect("publish");
+            let single = sub
+                .try_receive_for_drain(|_msg| {})
+                .expect("the drain read");
+            for seq in first + 2..=first + 4 {
+                publisher
+                    .publish_raw(&batch_frame_bytes(seq))
+                    .expect("publish");
+            }
+            let batch = sub
+                .try_receive_for_drain(|_msg| {})
+                .expect("the batch read");
+            assert_eq!((body, single, batch), (1, 1, 3), "PREMISE: the pops");
+        };
+        let drained = |stage: &ReadOutcomeStage| {
+            let mut staged = Vec::new(); // hot-path-alloc-ok: test-only collector.
+            stage.drain_into(|r| {
+                staged.push(r);
+                true
+            });
+            staged
+        };
+        let rec = |kind, seq: u32, popped, token, role| StagedReadOutcome {
+            kind,
+            served_seq: u64::from(seq),
+            popped,
+            token,
+            role,
+            run_count: 1,
+        };
+
+        // The recording's first window: the arm opened both runs, so the batch
+        // finds 4 slots and stages its read alone.
+        window(1);
+        assert_eq!(
+            drained(&stage),
+            // hot-path-alloc-ok: test-only hand oracle.
+            vec![
+                rec(Producer, 1, 0, Some(token), Body),
+                rec(DrainedBatch, 1, 1, None, Body),
+                rec(Producer, 2, 0, Some(token), Drain),
+                rec(DrainedBatch, 2, 1, None, Drain),
+                rec(DrainedBatch, 5, 3, None, Drain),
+            ],
+            "the first window: the frames do not fit at R - 2"
+        );
+
+        // Mid-window: both runs continue, the batch finds 6 slots.
+        window(6);
+        assert_eq!(
+            drained(&stage),
+            // hot-path-alloc-ok: test-only hand oracle.
+            vec![
+                rec(DrainedBatch, 6, 1, None, Body),
+                rec(DrainedBatch, 7, 1, None, Drain),
+                rec(BatchFrame, 8, 0, None, Drain),
+                rec(BatchFrame, 9, 0, None, Drain),
+                rec(DrainedBatch, 10, 3, None, Drain),
+            ],
+            "mid-window: the frames fit at R"
+        );
+
+        // A reopened window: both runs open again, as in the first window.
+        stage.reopen_writer_runs();
+        window(11);
+        assert_eq!(
+            drained(&stage),
+            // hot-path-alloc-ok: test-only hand oracle.
+            vec![
+                rec(Producer, 11, 0, Some(token), Body),
+                rec(DrainedBatch, 11, 1, None, Body),
+                rec(Producer, 12, 0, Some(token), Drain),
+                rec(DrainedBatch, 12, 1, None, Drain),
+                rec(DrainedBatch, 15, 3, None, Drain),
+            ],
+            "a reopened window: the openings alone push the frames past the rim"
+        );
+        assert_eq!(stage.dropped(), 0, "no record was refused on the way");
+    }
+
     /// MUTANT (`oracle-mutants`): one slot per frame on an annotated edge fails
     /// the annotated fit test and the fit rule test.
     #[cfg(feature = "oracle-mutants")]
