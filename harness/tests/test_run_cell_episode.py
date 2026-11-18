@@ -55,10 +55,6 @@ DRIVER = str(FIXTURES / "fake_driver")
 SRC = str(pathlib.Path(__file__).resolve().parent.parent / "src")
 
 
-def tmp_names():
-    return {n for n in os.listdir("/tmp") if n.startswith("cerulion-bench-")}
-
-
 def signal_inside_popen(test, sig):
     """For the length of a test: the first subprocess.Popen started sends sig to this process once its child exists
     and before Popen returns, as a signal that arrives while a child starts does. Returns the list that gets that
@@ -123,10 +119,20 @@ class Bench(unittest.TestCase):
                       mock.patch.object(progress, "utc_now", return_value=T)):
             patch.start()
             self.addCleanup(patch.stop)
+        # Each scratch folder this test's runs make, where run-cell makes it. Only these are looked at afterwards:
+        # another run-cell on this machine (a second test run, a bench run) makes its own under /tmp meanwhile.
+        self.made, make = [], cli.scratch_for
+
+        def scratch_for(*args, **kwargs):
+            self.made.append(make(*args, **kwargs))
+            return self.made[-1]
+
+        patch = mock.patch.object(cli, "scratch_for", scratch_for)
+        patch.start()
+        self.addCleanup(patch.stop)
         self.cwd = os.getcwd()
         os.chdir(self.base)
         self.addCleanup(os.chdir, self.cwd)
-        self.before = tmp_names()
 
     def run_cell(self, *extra, out="out"):
         self.stdout, self.stderr = io.StringIO(), io.StringIO()
@@ -144,8 +150,9 @@ class Bench(unittest.TestCase):
         return lines[0][len("  scratch folder: "):].replace(" (removed at the end)", "")
 
     def assert_nothing_left(self):
-        self.assertFalse(os.path.exists(self.scratch_line()))
-        self.assertEqual(tmp_names(), self.before)
+        """The run made one scratch folder, the one its start line names, and removed it."""
+        self.assertEqual(self.made, [self.scratch_line()])
+        self.assertFalse(os.path.exists(self.made[0]))
 
     def relays(self):
         """Each row's relay record, with the loopback address it was reached at checked and taken out."""
@@ -403,7 +410,7 @@ class Interrupts(Bench):
             self.assertEqual(self.run_cell("--arm", "plain"), 130)
         self.assertEqual(self.stderr.getvalue(), f"{T} stopped by SIGINT: no episode had started\n")
         self.assertFalse(os.path.exists("out"))
-        self.assertEqual(tmp_names(), self.before)
+        self.assertEqual(self.made, [])
 
 
 class IgnoredSignals(Bench):
