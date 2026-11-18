@@ -21,8 +21,8 @@ pub enum OpsProtoError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 
-    /// A frame's declared or actual length exceeds
-    /// [`crate::protocol::MAX_FRAME_BYTES`].
+    /// A declared or actual length exceeds the applicable frame or binary
+    /// chunk cap. `max` identifies the limit enforced by the codec.
     #[error("protocol frame too large: {size} bytes exceeds the {max}-byte cap")]
     FrameTooLarge { size: usize, max: usize },
 

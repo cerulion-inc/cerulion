@@ -30,8 +30,15 @@ fn remote_marker_survives_failed_attribution_and_consumer_first_attach() {
     assert!(writer
         .register_mirror_provenance(topic, &"x".repeat(257))
         .is_err());
-    assert!(reader.is_network_mirror(topic).unwrap());
-    assert_eq!(reader.network_mirror_topics().unwrap(), vec![topic]);
+    assert!(reader
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
+    assert_eq!(
+        reader
+            .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+            .unwrap(),
+        vec![topic]
+    );
     let mut frame = [0u8; WireHeader::SIZE + 4];
     let mut header = WireHeader::new(0x1234, 42, 100);
     header.total_size = frame.len() as u32;
@@ -52,9 +59,13 @@ fn remote_marker_survives_failed_attribution_and_consumer_first_attach() {
         .unwrap();
     assert_eq!(received, frame);
     drop(injector);
-    assert!(!reader.is_network_mirror(topic).unwrap());
+    assert!(!reader
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     let _local = writer.create_publisher(topic, SLICE, 0).unwrap();
-    assert!(!reader.is_network_mirror(topic).unwrap());
+    assert!(!reader
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 }
 
 #[test]
@@ -71,11 +82,17 @@ fn failed_remote_publisher_removes_only_its_owned_marker() {
     assert!(manager
         .create_remote_ingress_injector(topic, 0x1234, SLICE)
         .is_err());
-    assert!(manager.is_network_mirror(topic).unwrap());
+    assert!(manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     drop(first);
-    assert!(manager.is_network_mirror(topic).unwrap());
+    assert!(manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     drop(second);
-    assert!(!manager.is_network_mirror(topic).unwrap());
+    assert!(!manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 }
 
 #[test]
@@ -88,8 +105,13 @@ fn refused_remote_publisher_leaves_local_topic_unmarked() {
     assert!(manager
         .create_remote_ingress_injector(topic, 0x1234, SLICE)
         .is_err());
-    assert!(!manager.is_network_mirror(topic).unwrap());
-    assert!(manager.network_mirror_topics().unwrap().is_empty());
+    assert!(!manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
+    assert!(manager
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -113,8 +135,12 @@ fn marker_attribute_collision_refuses_observation_listing_and_publisher_creation
         .create_with_attributes(&attributes)
         .unwrap();
     let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
-    assert!(manager.is_network_mirror(topic).is_err());
-    assert!(manager.network_mirror_topics().is_err());
+    assert!(manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .is_err());
+    assert!(manager
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .is_err());
     assert!(manager
         .create_remote_ingress_injector(topic, 0x1234, SLICE)
         .is_err());
@@ -180,8 +206,13 @@ fn missing_reserved_marker_attribute_fails_listing_closed() {
     let name: ServiceName = marker_service_name(topic).as_str().try_into().unwrap();
     let _service = node.service_builder(&name).event().create().unwrap();
     let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
-    assert!(manager.is_network_mirror(topic).is_err());
-    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    assert!(manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .is_err());
+    let listing = manager
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap_err()
+        .to_string();
     assert!(
         listing.starts_with(&format!(
             "Reserved network mirror marker '{}' is malformed: it carries no topic attribute",
@@ -225,7 +256,10 @@ fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
         .unwrap();
     let nameless = node.service_builder(&name).event().create().unwrap();
     let manager = TransportManager::init_for_test(TransportConfig::default(), config).unwrap();
-    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    let listing = manager
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap_err()
+        .to_string();
     assert!(!listing.chars().any(raw_hazard), "{listing:?}");
     assert!(
         listing.contains(&format!(
@@ -251,7 +285,10 @@ fn hostile_marker_text_cannot_inject_terminal_escapes_into_listing_errors() {
         .event()
         .create_with_attributes(&attributes)
         .unwrap();
-    let listing = manager.network_mirror_topics().unwrap_err().to_string();
+    let listing = manager
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap_err()
+        .to_string();
     assert!(!listing.chars().any(raw_hazard), "{listing:?}");
     assert!(
         listing.starts_with(&format!(
@@ -345,8 +382,13 @@ fn local_leases_keep_source_local_until_the_last_lease_exits() {
     let first = manager.acquire_local_topic_lease(topic).unwrap();
     let second = manager.acquire_local_topic_lease(topic).unwrap();
     let subscriber = manager.create_subscriber_open_only(topic).unwrap();
-    assert!(!manager.is_network_mirror(topic).unwrap());
-    assert!(manager.network_mirror_topics().unwrap().is_empty());
+    assert!(!manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
+    assert!(manager
+        .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap()
+        .is_empty());
     drop(local);
     assert!(manager
         .create_remote_ingress_injector(topic, 0x1234, SLICE)
@@ -365,11 +407,15 @@ fn local_leases_keep_source_local_until_the_last_lease_exits() {
         .create_remote_ingress_injector(topic, 0x1234, SLICE)
         .unwrap();
     drop(remote);
-    assert!(manager.is_network_mirror(topic).unwrap());
+    assert!(manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     assert!(manager.acquire_local_topic_lease(topic).is_err());
     drop(second_remote);
     let _local_again = manager.acquire_local_topic_lease(topic).unwrap();
-    assert!(!manager.is_network_mirror(topic).unwrap());
+    assert!(!manager
+        .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
 }
 
 #[test]
@@ -389,8 +435,13 @@ fn local_lease_quota_preserves_configured_creation_and_existing_open_limits() {
             leases.push(opener.acquire_local_topic_lease(topic).unwrap());
         }
         assert!(opener.acquire_local_topic_lease(topic).is_err());
-        assert!(!opener.is_network_mirror(topic).unwrap());
-        assert!(opener.network_mirror_topics().unwrap().is_empty());
+        assert!(!opener
+            .is_network_mirror(topic, cerulion_core::transport::TeardownWait::Bounded)
+            .unwrap());
+        assert!(opener
+            .network_mirror_topics(cerulion_core::transport::TeardownWait::Bounded)
+            .unwrap()
+            .is_empty());
         assert!(opener
             .create_remote_ingress_injector(topic, 0x1234, SLICE)
             .is_err());
@@ -569,12 +620,16 @@ fn a_child_remote_publisher_respects_the_local_source_lifetime() {
     timeouts(&stream);
     stream.write_all(b"T").unwrap();
     assert_eq!(receive(&mut stream), b'R');
-    assert!(!manager.is_network_mirror(TOPIC).unwrap());
+    assert!(!manager
+        .is_network_mirror(TOPIC, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     drop(subscriber);
     drop(lease);
     stream.write_all(b"A").unwrap();
     assert_eq!(receive(&mut stream), b'O');
-    assert!(manager.is_network_mirror(TOPIC).unwrap());
+    assert!(manager
+        .is_network_mirror(TOPIC, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     assert!(manager.acquire_local_topic_lease(TOPIC).is_err());
     let subscriber = manager.create_subscriber_open_only(TOPIC).unwrap();
     stream.write_all(b"P").unwrap();
@@ -603,7 +658,9 @@ fn a_child_remote_publisher_respects_the_local_source_lifetime() {
         std::thread::yield_now();
     };
     assert!(status.success(), "child failed: {status}");
-    assert!(!manager.is_network_mirror(TOPIC).unwrap());
+    assert!(!manager
+        .is_network_mirror(TOPIC, cerulion_core::transport::TeardownWait::Bounded)
+        .unwrap());
     drop(subscriber);
     let _local_again = manager.acquire_local_topic_lease(TOPIC).unwrap();
 }

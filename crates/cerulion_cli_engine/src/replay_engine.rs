@@ -252,7 +252,29 @@ fn resim_slot_lock_dir(base: &iceoryx2::config::Config) -> PathBuf {
 struct ResimSlot {
     slot: u32,
     /// Kept only to hold the lock.
-    _lock: std::fs::File,
+    _lock: SlotLock,
+}
+
+/// A slot's lock file with its exclusive `flock` held, released on drop.
+///
+/// A `flock` lock belongs to the open file description, not to one
+/// descriptor. A child this process forks holds a copy of every descriptor
+/// until it execs, so closing the file alone would leave the lock held for as
+/// long as such a copy lives. Drop therefore unlocks the description first,
+/// which releases the lock whatever copies exist, and then closes the file.
+#[derive(Debug)]
+struct SlotLock(std::fs::File);
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        if let Err(error) = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock) {
+            tracing::warn!(
+                error = %error,
+                "replay: could not unlock a resim namespace slot before closing its lock file; \
+                 the slot stays held until every copy of the descriptor is closed"
+            );
+        }
+    }
 }
 
 /// Why a claim passed over a slot whose lock a running resim does not hold.
@@ -345,7 +367,8 @@ fn log_passed_over_slot(
 ///
 /// A slot whose lock another process holds is skipped. A slot whose lock file
 /// cannot be opened or locked (another user's, say) or that `ready` refuses
-/// is passed over, its lock released, and logged through one
+/// is passed over, its lock released (unlocked, then closed, see
+/// [`SlotLock`]), and logged through one
 /// [`FailureRegimeLatch`](cerulion_core::transport::failure_regime_latch::FailureRegimeLatch)
 /// per claim ([`log_passed_over_slot`]); a claim that then takes a slot after
 /// suppressed repeats logs how many. With no slot left the claim is
@@ -373,7 +396,7 @@ fn claim_resim_slot(
             .and_then(|lock| {
                 match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
                 {
-                    Ok(()) => Ok(Some(lock)),
+                    Ok(()) => Ok(Some(SlotLock(lock))),
                     Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
                     Err(e) => Err(format!("{}: {e}", path.display())),
                 }
@@ -577,6 +600,10 @@ fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
 /// process ends. The process has one transport, so every resim it runs uses
 /// that one namespace, and a later resim never reclaims the namespace the
 /// transport is running on.
+///
+/// A static is never dropped, so the claimed slot's [`SlotLock`] never runs its
+/// unlock: the kernel releases the lock when the last copy of the descriptor
+/// closes, at process exit, or at the exec of a child forked just before it.
 static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
 
 /// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
@@ -38870,8 +38897,8 @@ mod unlisted_macro_output_tests {
 mod resim_namespace_tests {
     use super::{
         claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
-        resim_namespace_slot, ResimSlot, SlotPassedOver, SlotReclaim, RESIM_NAMESPACE_MARKER,
-        RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+        resim_namespace_slot, ResimSlot, SlotLock, SlotPassedOver, SlotReclaim,
+        RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
     };
     use cerulion_core::testing::IsolatedRoot;
     use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
@@ -39075,6 +39102,52 @@ mod resim_namespace_tests {
         .expect("slot 1 is ready");
         assert_eq!((claimed.slot, tried), (1, vec![0, 1]));
         assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
+    }
+
+    /// Dropping a holder releases its lock while another descriptor of the
+    /// same open file description stays open, as one does in a child forked
+    /// between a claim and the child's exec: the next claim takes the slot.
+    #[test]
+    fn a_dropped_slot_is_released_while_a_copy_of_its_descriptor_is_open() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        assert_eq!(first.slot, 0);
+        let copy = first._lock.0.try_clone().expect("a second descriptor");
+        drop(first);
+        assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
+        drop(copy);
+    }
+
+    /// The lock a passed-over slot drops is released the same way: a second
+    /// open of the file can lock it while a copy of the first descriptor is
+    /// still open.
+    #[test]
+    fn a_slot_lock_unlocks_its_file_description_when_dropped() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let path = dir.path().join("cer_resim_00000000.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("the lock file opens")
+        };
+        let file = open();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("the first lock is free");
+        let lock = SlotLock(file);
+        let copy = lock.0.try_clone().expect("a second descriptor");
+        drop(lock);
+        let second = open();
+        rustix::fs::flock(
+            &second,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("the dropped lock was released while a copy of its descriptor stayed open");
+        drop(second);
+        drop(copy);
     }
 
     /// A reclaim that leaves a node: what the dead-node sweep did, from

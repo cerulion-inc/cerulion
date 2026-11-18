@@ -106,10 +106,6 @@ pub struct FireRecord {
 }
 
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "crate-private producer surface consumed by graph tick instrumentation"
-)]
 pub(crate) struct FireBody {
     pub at_ns: u64,
     pub dur_ns: u32,
@@ -206,10 +202,6 @@ struct Slot {
 }
 
 impl FireTap {
-    #[allow(
-        dead_code,
-        reason = "crate-private constructor consumed by graph tap installation"
-    )]
     pub(crate) fn new(
         config: FireTapConfig,
         node_count: u16,
@@ -270,19 +262,11 @@ impl FireTap {
 
     /// Call after `armed_now` admitted a tick. No clock read is needed again;
     /// a lease explicitly cleared during that tick suppresses its record.
-    #[allow(
-        dead_code,
-        reason = "crate-private producer consumed by graph tick instrumentation"
-    )]
     pub(crate) fn push(&self, body: FireBody) {
         self.push_with(body, |_| {});
     }
 
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "shared producer path with a deterministic test scheduling seam"
-    )]
     fn push_with(&self, body: FireBody, after_claim: impl FnOnce(u64)) {
         if self.lease_until_ns.load(Ordering::Relaxed) == 0 {
             return;
@@ -340,6 +324,8 @@ impl FireTap {
     /// A sequence that is neither committed, overwritten nor dropped by its own
     /// claim ends the page without advancing its cursor.
     /// A zero limit arms the lease without consuming any sequence or loss.
+    /// A lost sequence takes no row of the limit, so a page with fewer rows
+    /// ended at the newest assigned sequence or at a pending claim.
     pub fn serve(&self, cursor: Cursor, max: usize) -> FireBatch {
         let arming = self.arming.lock().unwrap_or_else(|e| e.into_inner());
         let mut old = self.lease_until_ns.load(Ordering::Relaxed);
@@ -395,7 +381,7 @@ impl FireTap {
             batch.lost = floor - batch.next;
             batch.next = floor;
         }
-        for _ in 0..max {
+        while batch.records.len() < max {
             if batch.next >= head {
                 break;
             }
@@ -451,7 +437,7 @@ impl FireTap {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::clock::Clock;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -648,6 +634,41 @@ mod tests {
         let future = tap.serve(Cursor::After(u64::MAX), 512);
         assert!(future.records.is_empty());
         assert_eq!(future.next, u64::MAX);
+    }
+
+    /// A full page may have nothing after it: exactly a page of records
+    /// returns them all with `next` at the head, and the next read is empty.
+    #[test]
+    fn an_exactly_full_page_ends_at_the_head() {
+        let (tap, _) = tap(1024);
+        tap.serve(Cursor::Now, 0);
+        for id in 0..FIRE_SERVE_MAX as u64 {
+            tap.push(body(id));
+        }
+        let page = tap.serve(Cursor::After(0), FIRE_SERVE_MAX);
+        assert_eq!(page.records.len(), FIRE_SERVE_MAX);
+        assert_eq!((page.next, page.lost), (FIRE_SERVE_MAX as u64, 0));
+        let after = tap.serve(Cursor::After(page.next), FIRE_SERVE_MAX);
+        assert!(after.records.is_empty());
+        assert_eq!((after.next, after.lost), (page.next, 0));
+    }
+
+    /// A reader reads on only after a full page, so a lost sequence must not
+    /// take a row: a short page reached the newest assigned sequence.
+    #[test]
+    fn a_lost_sequence_inside_the_page_does_not_shorten_it() {
+        let (tap, _) = tap(1024);
+        tap.serve(Cursor::Now, 0);
+        // A busy slot makes the claim of seq 1 drop it.
+        tap.slots[0].stamp.store(1, Ordering::SeqCst);
+        for id in 0..700 {
+            tap.push(body(id));
+        }
+        let page = tap.serve(Cursor::After(0), FIRE_SERVE_MAX);
+        assert_eq!((page.next, page.lost, page.records.len()), (513, 1, 512));
+        assert_eq!(page.records[0].seq, 2);
+        let tail = tap.serve(Cursor::After(page.next), FIRE_SERVE_MAX);
+        assert_eq!((tail.next, tail.lost, tail.records.len()), (700, 0, 187));
     }
 
     #[test]
@@ -1322,7 +1343,9 @@ mod tests {
     }
 
     thread_local! {
-        static ALLOCATIONS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// This thread's allocation count while `Some`; the lib test binary's
+        /// allocator counts into it.
+        pub(crate) static ALLOCATIONS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     }
 
     struct CountingAllocator;
