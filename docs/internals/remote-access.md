@@ -183,7 +183,7 @@ the same entry instead of running the daemon.
 | `cerulion_pairing` | both | MIT OR Apache-2.0 | yes | formats + crypto + state machines, plus the machine identity files (`identity`: config directory, machine key, high-water file); no network I/O, no iroh dep (embeds in firmware and in the closed Studio client) |
 | `cerulion_link` | both | MIT OR Apache-2.0 | **no** (pulls iroh, ~390 crates) | thin iroh wrapper: endpoints, dial, framing, relay seam, ops-stream adapter; never depends on `cerulion_core` |
 | `cerulion-wire` | desk | MIT OR Apache-2.0 | yes | standalone wire-format decoder so CLOSED apps decode frames without linking the AGPL `cerulion_core` |
-| `cerulion_ops_proto` | both | MIT OR Apache-2.0 | yes | the `cerulion/ops/1` wire types: BE-`u32`-length JSON framing, `Hello`/`HandshakeReply` version handshake, `Request`/`Response` envelopes, the `Inventory` result, and the protocol-only `OpsClient`; depends on serde, serde_json and thiserror only |
+| `cerulion_ops_proto` | both | MIT OR Apache-2.0 | yes | the `cerulion/ops/1` wire types: BE-`u32`-length JSON framing, `Hello`/`HandshakeReply` version handshake, `Request`/`Response` envelopes, the `Inventory` result, the protocol-only `OpsClient`, bounded session codecs and audit commitments; depends on serde, serde_json, thiserror, base64 and sha2 only |
 | `cerud` | robot | AGPL-3.0-only | yes | deliberately-dumb ops verbs + authz seam + hash-chained receipts + the lease/deadman; transport-agnostic |
 | `cerulion_remoted` | robot | AGPL-3.0-only | **no** (links link + core) | THE robot daemon: endpoint, accept gate, wire plane, pairing verbs, live trust; links `cerulion_wireclient` for `sanitize_peer_text` only |
 | `cerulion_wireclient` | desk | AGPL-3.0-only | **no** (links link + core) | shared `cerulion/wire/2` client substrate (protocol mirror, dial-config parsers, reader loop, epoch push) |
@@ -214,7 +214,25 @@ Load-bearing boundary contracts:
   `CerudError::kind`, so the `kind` strings stay in `cerud`. The bytes are
   pinned to golden frames in
   `crates/cerulion_ops_proto/tests/fixtures/ops_wire_golden.txt` by
-  `crates/cerulion_ops_proto/tests/wire_golden_test.rs`.
+  `crates/cerulion_ops_proto/tests/wire_golden_test.rs`. Its `session` module
+  also supplies the shell and exec frame vocabulary for callers that negotiate
+  a command session: at most 1 MiB of JSON per envelope and 64 KiB of decoded
+  bytes per data chunk. Unknown fields, noncanonical base64 and malformed
+  terminal or argv parameters are refused. `RecordingWitness` carries the
+  session id, recording chain head and event count; validating its shape does
+  not verify the recording. `session_test.rs` pins the frame bytes and refusal
+  boundaries. `OpsClient` continues to issue ordinary verb calls.
+- **Session audit commitments** use a domain-separated SHA-256 chain over the
+  canonical event JSON documented in `cerulion_ops_proto::recording`. The builder
+  requires exactly one initial Started event, monotonic timestamps and no event
+  after Exit; a refused append preserves its state. Verification requires a
+  session id, event count and chain head retained by the client outside the
+  recording's storage. A locally rewritten, self-consistent chain does not prove
+  authenticity. `verify_recording` requires Exit; `verify_recording_prefix`
+  verifies only the exact prefix covered by its witness. The JSON audit events
+  describe process I/O; graph recording bags remain MCAP. Independent shell and
+  exec vectors are in `crates/cerulion_ops_proto/tests/fixtures/recording_shell_golden.jsonl`
+  and `crates/cerulion_ops_proto/tests/fixtures/recording_exec_golden.jsonl`.
 - **`cerulion-wire` deliberately duplicates the wire structs** (40-byte header,
   8-byte offset entry) so the permissive decode seam stands alone. Byte
   compatibility is pinned by `crates/cerulion_core/tests/wire_lockstep_test.rs` (the
