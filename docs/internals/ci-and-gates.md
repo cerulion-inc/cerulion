@@ -862,8 +862,10 @@ prune, under the prune's own condition (R9); nothing shadows the policy in a job
 `env` (R10); a prune whose keep key carries no `-main-`/`-pr-` scope segment -- one the scope rule
 cannot narrow, so it clears the whole namespace -- lives only in a job whose `if:` can never be
 true on a pull request, either a `github.event_name != 'pull_request'` conjunct or an allowlist of
-events naming none (R11); a lockfile-keyed save in a job whose matrix declares `shard` runs on
-shard 0 alone or puts `matrix.shard` in its key, so shards never race for one archive (R12); a
+events naming none (R11); a lockfile-keyed save in a job whose matrix declares `shard` (as a
+key or in an `include` entry) runs on shard 0 alone or carries the shard in its key in one of
+two forms, `${{ matrix.shard }}` or nothing on shard 0 and `-shard<k>` on shard k, so shards
+never race for one archive; any other key expression naming `matrix.shard` is refused (R12); a
 key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
 the
 combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and a job whose

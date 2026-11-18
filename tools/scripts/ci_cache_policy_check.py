@@ -1117,12 +1117,30 @@ def _check_tool_cache(add, steps, index, step, key):
             )
 
 
+# The key segments R12 reads as one archive per shard: the shard number
+# itself, or nothing on shard 0 and `-shard<k>` on every other shard. Any other
+# expression naming `matrix.shard` can give two shards one key, so it is refused
+# rather than read.
+SHARD_KEY_SEGMENTS = (
+    "${{ matrix.shard }}",
+    "${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}",
+)
+
+
 def _job_declares_shard_matrix(job):
+    """Whether the job's matrix declares `shard`, as a key or in an `include` entry."""
     strategy = job.node.get("strategy") if job.node.has("strategy") else None
     if not isinstance(strategy, Map) or not strategy.has("matrix"):
         return False
     matrix = strategy.get("matrix")
-    return isinstance(matrix, Map) and matrix.has("shard")
+    if not isinstance(matrix, Map):
+        return False
+    if matrix.has("shard"):
+        return True
+    include = matrix.get("include") if matrix.has("include") else None
+    return isinstance(include, Seq) and any(
+        isinstance(entry, Map) and entry.has("shard") for entry in include.items
+    )
 
 
 def _check_one_writer(add, job, step, key, cond):
@@ -1131,13 +1149,24 @@ def _check_one_writer(add, job, step, key, cond):
     `actions/cache` reserves a key at save time, so shards sharing one key race:
     all but the first upload an archive that is refused, and which shard's build
     lands is arbitrary. A save in a job whose matrix declares `shard` therefore
-    either runs on shard 0 alone (the `matrix.shard == 0` conjunct) or puts the
-    shard in its key, so every shard writes an archive of its own.
+    either runs on shard 0 alone (the `matrix.shard == 0` conjunct) or carries
+    one of SHARD_KEY_SEGMENTS in its key, so every shard writes an archive of
+    its own.
     """
     if not _job_declares_shard_matrix(job):
         return
     conjuncts, _ = split_conjuncts(cond)
-    if SHARD_CLAUSE in conjuncts or "matrix.shard" in key:
+    if SHARD_CLAUSE in conjuncts or any(seg in key for seg in SHARD_KEY_SEGMENTS):
+        return
+    if "matrix.shard" in key:
+        add(
+            step.line,
+            "R12_ONE_WRITER",
+            "save step %r in sharded job %s names `matrix.shard` in its key in a form that "
+            "can give two shards one key; use one of %s, or run the save on shard 0 alone "
+            "(`%s`)"
+            % (step.label(), job.job_id, " or ".join(SHARD_KEY_SEGMENTS), SHARD_CLAUSE),
+        )
         return
     add(
         step.line,
@@ -1874,6 +1903,18 @@ def _mutants():
         "matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))",
     )
     out.append(("R12 near-miss: a key per shard", per_shard, set()))
+    # A key that names the shard but gives shards 1 to 3 one value.
+    repeated = per_shard.replace(seg, "${{ matrix.shard != 0 && '-shard' || '' }}")
+    repeated = repeated.replace(
+        "matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))",
+        "matrix.shard != 0 && '-shard' || '')))",
+    )
+    assert repeated != per_shard
+    out.append(("R12 key names the shard but repeats a value", repeated, {"R12_ONE_WRITER"}))
+    # The shard declared through `include` entries is still a sharded job.
+    included = _mut(shared, "        shard: [0, 1, 2, 3]\n",
+                    "        include:\n          - shard: 0\n          - shard: 1\n")
+    out.append(("R12 shard declared by include entries", included, {"R12_ONE_WRITER"}))
 
     # R1: the lint job's token no longer matches its own key template.
     out.append((
