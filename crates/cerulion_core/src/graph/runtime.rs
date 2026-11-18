@@ -3070,8 +3070,9 @@ struct LivelinessWatch {
 /// outlier sat on the 250 ms comb). The [`crate::transport::LivelinessCleaner`]
 /// holds only a `Config` clone and the reclaim is an associated fn keyed by it,
 /// so nothing of the live loop's transport crosses to this thread. Stopped and
-/// JOINED on drop (bounded by one in-flight pass). The cadence is an atomic so
-/// the test seam can shorten or park it without restarting the thread.
+/// JOINED on drop (bounded by one in-flight pass). The cadence lives in the
+/// shared schedule so the test seam can shorten or park it without restarting
+/// the thread.
 struct DeadNodeCleanupThread {
     shared: Arc<DeadNodeCleanupShared>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -3083,59 +3084,133 @@ struct DeadNodeCleanupThread {
 
 /// What the owner and the reclaim thread share.
 struct DeadNodeCleanupShared {
-    /// `true` once the owner asked the thread to exit; under the mutex so the
-    /// condvar wait cannot miss the flip.
-    stop: Mutex<bool>,
+    /// The thread's schedule, under one mutex so neither condvar wait can miss
+    /// a change.
+    gate: Mutex<CleanupGate>,
+    /// Wakes the thread: a stop, or a cadence change.
     wake: std::sync::Condvar,
+    /// Signalled when a pass ends (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pass_done: std::sync::Condvar,
+}
+
+/// The reclaim thread's schedule.
+struct CleanupGate {
+    /// `true` once the owner asked the thread to exit.
+    stopped: bool,
     /// Cadence (ms); re-read after every wake so a change applies at once.
-    period_ms: AtomicU64,
+    period_ms: u64,
+    /// Bumped by every cadence change. A wait that sees it move re-arms with
+    /// the new period, also when the old period ran out before the wait took
+    /// the lock back.
+    period_changes: u64,
+    /// `true` from the moment the thread decides to run a pass until that
+    /// pass returns (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_pass: bool,
+}
+
+/// Ends the pass [`DeadNodeCleanupShared::wait_period`] started when dropped,
+/// so a pass that panics still ends.
+#[cfg(any(test, feature = "test-helpers"))]
+struct PassEnd<'a>(&'a DeadNodeCleanupShared);
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PassEnd<'_> {
+    fn drop(&mut self) {
+        self.0.lock_gate().in_pass = false;
+        self.0.pass_done.notify_all();
+    }
 }
 
 impl DeadNodeCleanupShared {
-    /// Wait one period. `true` when the period elapsed (run a pass), `false`
-    /// when the owner asked the thread to stop. A wake that is neither (the
-    /// period was changed) re-arms with the new value.
-    fn wait_period(&self) -> bool {
-        let mut stopped = self
-            .stop
+    fn new(period_ms: u64) -> Self {
+        Self {
+            gate: Mutex::new(CleanupGate {
+                stopped: false,
+                period_ms,
+                period_changes: 0,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_pass: false,
+            }),
+            wake: std::sync::Condvar::new(),
+            #[cfg(any(test, feature = "test-helpers"))]
+            pass_done: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock_gate(&self) -> std::sync::MutexGuard<'_, CleanupGate> {
+        // Every update under this lock is a plain assignment or increment, so
+        // a poisoned lock still holds a consistent schedule.
+        self.gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `pass` once per period until the owner stops the thread.
+    fn run_passes(&self, mut pass: impl FnMut()) {
+        while self.wait_period() {
+            #[cfg(any(test, feature = "test-helpers"))]
+            let _end = PassEnd(self);
+            pass();
+        }
+    }
+
+    /// Wait one period. `true` when the period elapsed (run a pass), `false`
+    /// when the owner asked the thread to stop. A cadence change re-arms the
+    /// wait with the new value, also when it landed after the old period ran
+    /// out but before this thread took the lock back: the condvar reports
+    /// that wake as a timeout.
+    fn wait_period(&self) -> bool {
+        let mut gate = self.lock_gate();
         loop {
-            if *stopped {
+            if gate.stopped {
                 return false;
             }
-            let period = Duration::from_millis(self.period_ms.load(Ordering::Relaxed));
+            let changes = gate.period_changes;
+            let period = Duration::from_millis(gate.period_ms);
             let (guard, timeout) = self
                 .wake
-                .wait_timeout(stopped, period)
+                .wait_timeout(gate, period)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            stopped = guard;
-            if *stopped {
+            gate = guard;
+            if gate.stopped {
                 return false;
             }
-            if timeout.timed_out() {
+            if timeout.timed_out() && gate.period_changes == changes {
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    gate.in_pass = true;
+                }
                 return true;
             }
         }
     }
 
-    /// Test seam only (the production cadence never changes).
+    /// Test seam only (the production cadence never changes). Returns once
+    /// the change is in force: a pass already under way has ended, and the
+    /// next one starts only after the new period elapses.
     #[cfg(any(test, feature = "test-helpers"))]
     fn set_period_ms(&self, ms: u64) {
-        self.period_ms.store(ms, Ordering::Relaxed);
-        // Take the lock so the store is ordered before the thread's next wait.
-        let _guard = self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.change_period(self.lock_gate(), ms);
+    }
+
+    /// [`Self::set_period_ms`] with the schedule lock already held.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn change_period(&self, mut gate: std::sync::MutexGuard<'_, CleanupGate>, ms: u64) {
+        gate.period_ms = ms;
+        gate.period_changes = gate.period_changes.wrapping_add(1);
         self.wake.notify_all();
+        while gate.in_pass {
+            gate = self
+                .pass_done
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     fn stop(&self) {
-        *self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.lock_gate().stopped = true;
         self.wake.notify_all();
     }
 }
@@ -3145,11 +3220,7 @@ impl DeadNodeCleanupThread {
     /// the thread: the graph still runs, but a CRASHED publisher's port is then
     /// not reclaimed by this runtime (graceful disconnects are unaffected).
     fn spawn(cleaner: crate::transport::LivelinessCleaner) -> Option<Self> {
-        let shared = Arc::new(DeadNodeCleanupShared {
-            stop: Mutex::new(false),
-            wake: std::sync::Condvar::new(),
-            period_ms: AtomicU64::new(LIVELINESS_CLEANUP_PERIOD_MS),
-        });
+        let shared = Arc::new(DeadNodeCleanupShared::new(LIVELINESS_CLEANUP_PERIOD_MS));
         #[cfg(any(test, feature = "test-helpers"))]
         let call_count = cleaner.call_count_handle();
         let worker = Arc::clone(&shared);
@@ -3177,13 +3248,9 @@ impl DeadNodeCleanupThread {
 
     fn run(shared: &DeadNodeCleanupShared, cleaner: &crate::transport::LivelinessCleaner) {
         Self::lower_own_priority();
-        tracing::debug!(
-            period_ms = shared.period_ms.load(Ordering::Relaxed),
-            "liveliness: dead-node reclaim thread started"
-        );
-        while shared.wait_period() {
-            cleaner.cleanup_dead_nodes();
-        }
+        let period_ms = shared.lock_gate().period_ms;
+        tracing::debug!(period_ms, "liveliness: dead-node reclaim thread started");
+        shared.run_passes(|| cleaner.cleanup_dead_nodes());
     }
 
     /// Renice THIS thread to [`DEAD_NODE_SWEEP_NICE`]. Linux and Android:
@@ -3215,6 +3282,157 @@ impl Drop for DeadNodeCleanupThread {
                 tracing::warn!("liveliness: the dead-node reclaim thread panicked");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dead_node_cleanup_schedule_tests {
+    use super::*;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    /// How long a negative check watches for a pass that must not start. A
+    /// broken schedule shows within it; a correct one can never fail it, since
+    /// the parked period is an hour.
+    const QUIET_WINDOW: Duration = Duration::from_millis(200);
+
+    /// Guards a hang only: every wait below ends as soon as its condition holds.
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+
+    const PARKED_MS: u64 = 3_600_000;
+
+    /// The reclaim loop on its own thread, counting passes.
+    fn start_counting(
+        period_ms: u64,
+    ) -> (
+        Arc<DeadNodeCleanupShared>,
+        Arc<AtomicU64>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let shared = Arc::new(DeadNodeCleanupShared::new(period_ms));
+        let passes = Arc::new(AtomicU64::new(0));
+        let worker = {
+            let (shared, passes) = (Arc::clone(&shared), Arc::clone(&passes));
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    passes.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        (shared, passes, worker)
+    }
+
+    fn wait_for_passes(passes: &AtomicU64, at_least: u64) {
+        let deadline = Instant::now() + HANG_GUARD;
+        while passes.load(Ordering::Relaxed) < at_least {
+            assert!(
+                Instant::now() < deadline,
+                "no pass ran within {HANG_GUARD:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn passes_keep_running_at_a_short_period() {
+        let (shared, passes, worker) = start_counting(5);
+        wait_for_passes(&passes, 3);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// The thread's 20 ms wait runs out while the test holds the schedule
+    /// lock, and the park lands before the thread takes the lock back: the
+    /// condvar reports a timeout, and the park must still win.
+    #[test]
+    fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
+        let (shared, passes, worker) = start_counting(20);
+        wait_for_passes(&passes, 1);
+        let gate = shared.lock_gate();
+        std::thread::sleep(Duration::from_millis(100));
+        shared.change_period(gate, PARKED_MS);
+        let parked = passes.load(Ordering::Relaxed);
+        std::thread::sleep(QUIET_WINDOW);
+        assert_eq!(
+            passes.load(Ordering::Relaxed),
+            parked,
+            "a pass started under the old period after the park returned"
+        );
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A park issued while a pass runs returns only once that pass has ended,
+    /// so a count read after the park already holds it.
+    #[test]
+    fn a_park_returns_only_after_the_pass_under_way_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                })
+            })
+        };
+        started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the first pass starts");
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let parker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.set_period_ms(PARKED_MS);
+                parked_tx.send(()).expect("test thread listening");
+            })
+        };
+        // The park has stored the new period and now waits on the pass.
+        let deadline = Instant::now() + HANG_GUARD;
+        while shared.lock_gate().period_changes == 0 {
+            assert!(Instant::now() < deadline, "the park never took the lock");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            parked_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "the park returned while a pass was still running"
+        );
+        release_tx.send(()).expect("pass waiting for release");
+        parked_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the park returns once the pass ends");
+        parker.join().expect("parker");
+        assert_eq!(
+            started_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "another pass started after the park"
+        );
+        drop(release_tx);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A pass that panics still ends, so a later park does not wait for it.
+    #[test]
+    fn a_pass_that_panics_still_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.run_passes(|| panic!("reclaim pass panicked")))
+        };
+        assert!(worker.join().is_err(), "the pass panicked");
+        assert!(!shared.lock_gate().in_pass, "the panicked pass ended");
+        shared.set_period_ms(PARKED_MS);
+    }
+
+    #[test]
+    fn a_stop_ends_a_parked_wait() {
+        let (shared, passes, worker) = start_counting(PARKED_MS);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+        assert_eq!(passes.load(Ordering::Relaxed), 0);
     }
 }
 
@@ -17233,10 +17451,13 @@ impl GraphRuntime {
 
     /// Test-only: change the dead-node reclaim thread's cadence (production:
     /// [`LIVELINESS_CLEANUP_PERIOD_MS`]). Applies at once, including to a wait
-    /// already in progress. A huge value PARKS the walk (the zero-alloc gates
-    /// use this to keep it out of their measured windows); a small one lets a
-    /// test observe a pass without waiting the production 2 s. No-op when the
-    /// runtime has no liveliness watches (no thread).
+    /// already in progress, and returns only after a pass already under way
+    /// has ended, so [`Self::liveliness_cleanup_call_count`] read after it
+    /// moves only when the new period elapses. A huge value PARKS the walk
+    /// (the zero-alloc gates use this to keep it out of their measured
+    /// windows); a small one lets a test observe a pass without waiting the
+    /// production 2 s. No-op when the runtime has no liveliness watches (no
+    /// thread).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_liveliness_cleanup_period_for_test(&mut self, ms: u64) {
         if let Some(c) = &self.liveliness_cleanup {
