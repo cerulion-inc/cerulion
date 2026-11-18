@@ -3,16 +3,19 @@
 
 A `cargo test -p X` step per package resolves features for X alone, so each step
 rebuilds the crates X shares with the leg's other packages. `build` compiles a
-group of packages in ONE `cargo test --no-run`, then runs `cargo test --tests`
-over the same packages (it compiles nothing) with this script as cargo's target
-runner, recording the environment and working directory cargo gives each test
-binary. `run -- cargo test -p X ...` then runs the prebuilt binaries that command
-selects: one process per binary, cargo's order, cargo's environment, the same
-arguments, cargo's fail-fast rule. `audit` fails when a built binary ran in no
-step, when a full leg built fewer binaries than its floor, or when cargo compiled
-a unit outside a declared build step (`phase`), dated by the unit's
-`invoked.timestamp`. State lives in `$RUNNER_TEMP/ci-built-tests`. Usage and the
-rules: `docs/internals/ci-and-gates.md`, "Build once per shard".
+group of packages in ONE `cargo test --no-run`, then runs `cargo test` over the
+same packages (it compiles nothing) with this script as cargo's target runner,
+recording the environment and working directory cargo gives each test binary;
+cargo runs the packages' doctests at the end of that run, against the libraries
+the build compiled. `run -- cargo test -p X ...` then runs the prebuilt binaries
+that command selects: one process per binary, cargo's order, cargo's
+environment, the same arguments, cargo's fail-fast rule. `audit` fails when a
+built binary had no unfiltered run, when a full leg built fewer binaries than
+its floor, when `--not-run` names a binary the leg does not build, or when cargo
+compiled a unit or ran a build script outside a declared build step (`phase`).
+`check-workflow FILE` holds a workflow's wiring to these rules. State lives in
+`$RUNNER_TEMP/ci-built-tests`. The rules: `docs/internals/ci-and-gates.md`,
+"Build once per shard".
 """
 
 import io
@@ -29,6 +32,8 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 SELF = os.path.abspath(__file__)
 SKIP_ENV = {'PWD', 'OLDPWD', 'SHLVL', '_'}
 SLACK_NS = 2_000_000_000
+# libtest arguments that still run every test of a binary
+WHOLE_RUN_ARGS = {'--nocapture', '--show-output', '--include-ignored', '-q', '--quiet'}
 
 
 def die(msg):
@@ -233,11 +238,13 @@ def compiled_units(profile_dir, since):
 
 
 def attribute(units, phases, slack_ns):
-    """(units per declared step, library builds per crate, units outside every step)."""
+    """(units per declared step, library builds per crate, units outside every step).
+    A file's mtime can trail the clock, so a unit just before a step begins counts
+    as the step's; nothing after a step ends does."""
     counts, libs, stray = {p['name']: 0 for p in phases}, {}, []
     for name, t in units:
         home = ([p for p in phases if p['begin'] <= t <= p['end']]
-                or [p for p in phases if p['begin'] - slack_ns <= t <= p['end'] + slack_ns])
+                or [p for p in phases if p['begin'] - slack_ns <= t <= p['end']])
         if not home:
             stray.append(name)
             continue
@@ -276,6 +283,10 @@ def workflow_complaints(text):
             r'shard: \[([\d, ]+)\]', text.split(f'  {job}:', 1)[1])
         legs = [int(x) for x in legs.group(1).split(',')] if legs else [0]
         built, ran, seen_build = {l: {} for l in legs}, {l: {} for l in legs}, False
+        audits = [i for i, st in enumerate(steps) if 'ci_built_tests.py audit' in st]
+        runs = [i for i, st in enumerate(steps) if 'ci_built_tests.py run --' in st]
+        if not audits or re.search(r'^\s+if:', steps[audits[-1]], re.M) or (runs and audits[-1] < runs[-1]):
+            out.append(f'{job}: needs an audit step with no condition after its last run step')
         for st in steps:
             if 'ci_built_tests.py build' in st:
                 seen_build = True
@@ -358,8 +369,9 @@ def cmd_build(group, features, specs):
                                   'src_path': msg['target']['src_path']}
         if proc.wait() != 0:
             die(f'group {group}: the build failed')
-        # The recording run is outside the declared step: `audit` refuses it
-        # if it compiles anything.
+        # The recording run is outside the declared step, so `audit` refuses it
+        # if it compiles anything. It is a whole `cargo test`, so cargo runs the
+        # group's doctests after the recorder, over the same units.
         append('phases.jsonl', {'name': f'build {group}', 'begin': begin, 'end': time.time_ns()})
         record_dir = state_path(f'record-{group}')
         shutil.rmtree(record_dir, ignore_errors=True)
@@ -369,8 +381,8 @@ def cmd_build(group, features, specs):
             die(f'{runner} is already set, or a path holds whitespace a cargo runner cannot carry')
         env = dict(os.environ, CI_BUILT_TESTS_RECORD_DIR=record_dir)
         env[runner] = f'{sys.executable} -B {SELF} record'
-        if subprocess.run(['cargo', 'test', '--tests'] + args, env=env, cwd=ROOT).returncode != 0:
-            die(f'group {group}: the recording run failed')
+        if subprocess.run(['cargo', 'test'] + args, env=env, cwd=ROOT).returncode != 0:
+            die(f'group {group}: the recording run or the doctests failed')
         records = sorted((json.load(open(os.path.join(record_dir, f))) for f in os.listdir(record_dir)),
                          key=lambda r: r['seq'])
         seen = [r['executable'] for r in records]
@@ -408,7 +420,7 @@ def cmd_run(argv):
     args = ([sel['filter']] if sel['filter'] else []) + sel['args']
     # A run with a name filter runs part of the binary, so it does not count as
     # the binary's run for `audit`.
-    whole = not sel['filter'] and all(a.startswith('-') for a in sel['args'])
+    whole = not sel['filter'] and all(a in WHOLE_RUN_ARGS or a.startswith('--test-threads=') for a in sel['args'])
     failed = []
     for b in select_binaries(group['binaries'], sel):
         env = replay_env(os.environ, b['delta'], set(group['base_keys']), soft)
@@ -428,23 +440,6 @@ def cmd_run(argv):
     if failed:
         print(f'error: {len(failed)} target(s) failed: {", ".join(failed)}', file=sys.stderr)
         return 101
-    return 0
-
-
-def cmd_doctests():
-    groups = load_groups()
-    if not groups:
-        die('no group was built; run `build` first')
-    for name, g in sorted(groups.items()):
-        if not any(b['kind'] == 'lib' for b in g['binaries']):
-            print(f'group {name}: no built package carries a library, so it has no doctests')
-            continue
-        args = ['cargo', 'test', '--locked', '--doc'] + [a for p in g['packages'] for a in ('-p', p)]
-        args += ['--features', ','.join(g['features'])] if g['features'] else []
-        print(f'group {name}: {" ".join(args)}', flush=True)
-        if subprocess.run(args, cwd=ROOT).returncode != 0:
-            return 101
-        append('doctests.jsonl', {'group': name})
     return 0
 
 
@@ -477,11 +472,6 @@ def cmd_audit(floor, not_run):
     bad = []
     if never:
         bad.append(f'{len(never)} built test binaries ran unfiltered in no step: {", ".join(never)}')
-    documented = {r['group'] for r in read_lines('doctests.jsonl')}
-    undoc = sorted(n for n, g in groups.items() if any(b['kind'] == 'lib' for b in g['binaries'])
-                   and n not in documented)
-    if undoc:
-        bad.append(f'the doctests of group(s) {", ".join(undoc)} did not run')
     if full and set(not_run) - names:
         bad.append(f'--not-run names binaries this leg does not build: {", ".join(sorted(set(not_run) - names))}')
     print(f'binaries: {len(built)} built, {len(ran)} run')
@@ -489,7 +479,10 @@ def cmd_audit(floor, not_run):
         bad.append(f'{len(built)} test binaries were built, below this leg\'s floor of {floor}')
     elif floor is not None and not full:
         print('floor: not applied, the selection left packages out of this leg')
-    units = compiled_units(os.path.join(target_dir(), 'debug'), min(p['begin'] for p in phases))
+    profile = os.path.join(target_dir(), 'debug')
+    if not os.path.isdir(os.path.join(profile, '.fingerprint')):
+        die(f'{profile}/.fingerprint does not exist, so no compile could be dated')
+    units = compiled_units(profile, min(p['begin'] for p in phases))
     counts, libs, stray = attribute(units, phases, SLACK_NS)
     for name, n in counts.items():
         print(f'compiled units, {name}: {n}')
@@ -590,8 +583,8 @@ def self_test():
 
     phases = [{'name': 'w', 'begin': 100, 'end': 200}, {'name': 'b', 'begin': 300, 'end': 400}]
     check('attribution', attribute([('x (build)', 150), ('y (test)', 350), ('z (build)', 250),
-                                    ('x (build)', 205), ('v (build)', 395)], phases, 10),
-          ({'w': 2, 'b': 2}, {'x': 2, 'v': 1}, ['z (build)']))
+                                    ('x (build)', 295), ('w (build)', 205)], phases, 10),
+          ({'w': 1, 'b': 2}, {'x': 2}, ['w (build)', 'z (build)']))
     close = [{'name': 'a', 'begin': 100, 'end': 200}, {'name': 'b', 'begin': 205, 'end': 300}]
     check('a unit inside a step belongs to it, not to a neighbour within the slack',
           attribute([('x (build)', 210)], close, 50)[0], {'a': 0, 'b': 1})
@@ -633,6 +626,8 @@ def self_test():
         run: |
           python3 ci_built_tests.py phase x -- cargo build -p y
           python3 ci_built_tests.py run -- cargo test -p c
+      - name: Audit
+        run: python3 ci_built_tests.py audit --floor 3
 """)
     check('wiring: a consistent job', workflow_complaints(good), [])
     for name, bad, want in (
@@ -642,7 +637,9 @@ def self_test():
             ('a feature the build lacks', good.replace('--features b/w', ''), 1),
             ('an undeclared cargo build', good.replace('phase x -- cargo build', 'cargo build'), 1),
             ('a run before the build', good.replace('      - name: Build', '      - name: e\n        run: python3 '
-                                                     'ci_built_tests.py run -- cargo test -p a\n      - name: Build'), 2)):
+                                                     'ci_built_tests.py run -- cargo test -p a\n      - name: Build'), 2),
+            ('no audit', good.split('      - name: Audit')[0], 1),
+            ('a gated audit', good.replace('      - name: Audit\n', '      - name: Audit\n        if: always()\n'), 1)):
         check(f'wiring: {name}', len(workflow_complaints(bad)), want)
     end_to_end(check, refused)
     for f in fails:
@@ -660,18 +657,17 @@ if a[:2] == ['test', '--no-run']:
                           'target': {'kind': kind, 'name': name, 'src_path': os.path.join(tmp, 'pkg', 'src', name)}}))
     print(json.dumps({'reason': 'compiler-artifact', 'executable': exe + '-bin', 'profile': {'test': False},
                       'target': {'kind': ['bin'], 'name': 'pkg', 'src_path': 'x'}}))
-elif a[:2] == ['test', '--tests']:
+elif a[:1] == ['test']:
     runner = [v for k, v in os.environ.items() if k.endswith('_RUNNER')][0].split()
     for exe in exes:
         env = dict(os.environ, CARGO_PKG_NAME='pkg', FROM_CARGO='yes')
         subprocess.run(runner + [exe, 'x'], env=env, cwd=os.path.join(tmp, 'pkg'), check=True)
-elif '--doc' in a:
-    open(os.path.join(tmp, 'trace'), 'a').write('doc ' + ' '.join(a) + '\\n')
+    open(os.path.join(tmp, 'trace'), 'a').write('doctests ' + ' '.join(a) + '\\n')
 """
 
 
 def end_to_end(check, refused):
-    """build, run, doctests and audit over a fake cargo and fake test binaries."""
+    """build, run, reclaim and audit over a fake cargo and fake test binaries."""
     saved = dict(os.environ)
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, 'bin'))
@@ -685,6 +681,7 @@ def end_to_end(check, refused):
             with open(path, 'w') as f:
                 f.write(body)
             os.chmod(path, 0o755)
+        os.makedirs(os.path.join(tmp, 'target', 'debug', '.fingerprint'))
         os.environ.update(PATH=os.path.join(tmp, 'bin') + os.pathsep + saved['PATH'], FAKE_TMP=tmp,
                           RUNNER_TEMP=tmp, CARGO_TARGET_DIR=os.path.join(tmp, 'target'), CI_SELECTED_PACKAGES='["pkg"]')
         trace = lambda: open(os.path.join(tmp, 'trace')).read().splitlines() if os.path.exists(
@@ -694,7 +691,8 @@ def end_to_end(check, refused):
         try:
             cmd_phase('workspace', ['true'])
             check('end to end: build', cmd_build('g', ['pkg/f'], ['pkg']), 0)
-            check('end to end: the recording ran nothing', trace(), [])
+            check('end to end: the recording ran no test, then the doctests', trace(),
+                  ['doctests test --locked -p pkg --features pkg/f'])
             check('end to end: one test, serial', cmd_run('cargo test -p pkg --test one_test -- --test-threads=1'
                                                          .split()), 0)
             check('end to end: whole package, filter, cargo env and cwd',
@@ -702,7 +700,6 @@ def end_to_end(check, refused):
                   (0, [f'lib c7_ pkg yes {os.path.realpath(os.path.join(tmp, "pkg"))}', 'one_test c7_']))
             check('end to end: fail fast stops at the first failure', (cmd_run('cargo test -p pkg fail'.split()),
                                                                      trace()[-1].split()[:2]), (101, ['lib', 'fail']))
-            check('end to end: doctests', (cmd_doctests(), trace()[-1]), (0, 'doc test --locked --doc -p pkg --features pkg/f'))
             check('end to end: filtered runs alone leave the lib unrun', cmd_audit(2, set()), 1)
             check('end to end: the whole package', cmd_run('cargo test -p pkg'.split()), 0)
             check('end to end: audit passes', cmd_audit(2, set()), 0)
@@ -713,7 +710,8 @@ def end_to_end(check, refused):
             os.makedirs(deps)
             for name in ('stale-1', 'lib.rlib', 'one_test'):
                 path = os.path.join(deps, name)
-                open(path, 'w').close()
+                with open(path, 'w') as f:
+                    f.write('#!/bin/sh\n')
                 os.chmod(path, 0o755)
             groups = load_groups()
             groups['g']['binaries'][1]['executable'] = os.path.realpath(os.path.join(deps, 'one_test'))
@@ -722,10 +720,17 @@ def end_to_end(check, refused):
             check('end to end: reclaim keeps what is still to run', (cmd_reclaim(), sorted(os.listdir(deps))),
                   (0, ['lib.rlib', 'one_test']))
             check('end to end: a binary run only under a filter has not run', cmd_audit(2, set()), 1)
+            check('end to end: a run with --ignored is no whole run', cmd_run(
+                'cargo test -p pkg --test one_test -- --ignored'.split()), 0)
+            check('end to end: so the binary is still unrun', cmd_audit(2, set()), 1)
             open(state_path('ran.jsonl'), 'a').write(json.dumps({'executable': os.path.realpath(
                 os.path.join(deps, 'one_test')), 'rc': 0, 'whole': True}) + '\n')
-            os.remove(state_path('doctests.jsonl'))
-            check('end to end: a group whose doctests did not run', cmd_audit(2, set()), 1)
+            check('end to end: a whole run clears it', cmd_audit(2, set()), 0)
+            stray = os.path.join(tmp, 'target', 'debug', '.fingerprint', 'stray-1')
+            os.makedirs(stray)
+            open(os.path.join(stray, 'invoked.timestamp'), 'w').close()
+            check('end to end: a unit compiled after every step', cmd_audit(2, set()), 1)
+            refused('end to end: a floor that is no number', lambda: main(['audit', '--floor', 'x']))
         finally:
             sys.stdout, sys.stderr = quiet
             os.environ.clear()
@@ -748,8 +753,6 @@ def main(argv):
             print(f'::error::{msg}')
         print(f'check-workflow: {len(job_blocks(open(rest[0]).read()))} job(s), {len(found)} complaint(s)')
         return 1 if found or not job_blocks(open(rest[0]).read()) else 0
-    if mode == 'doctests' and not rest:
-        return cmd_doctests()
     if mode == 'reclaim' and not rest:
         return cmd_reclaim()
     if mode == 'build':
@@ -777,8 +780,8 @@ def main(argv):
                 die(f'unknown audit flag {flag!r}')
         return cmd_audit(floor, not_run)
     die('usage: ' + ' | '.join(('build --group NAME [--features PKG/F] SPEC...', 'run -- cargo test ...',
-                                'doctests', 'reclaim', 'phase NAME -- CMD...', 'audit [--floor N] [--not-run P:T]',
-                                '--self-test')))
+                                'reclaim', 'phase NAME -- CMD...', 'audit [--floor N] [--not-run P:T]',
+                                'check-workflow FILE', '--self-test')))
 
 
 if __name__ == '__main__':
