@@ -3,10 +3,12 @@
 //!
 //! On a registered robot the network daemon's supervisor runs a sync worker
 //! that fetches this robot's signed access-list epoch from the account service
-//! (with the robot's own login) and writes it to [`EPOCH_PENDING_FILE`] in the
-//! remoted state directory, as `hex(postcard(EpochSyncWire))`, the encoding a
-//! desk's push carries. [`EpochPull`] picks it up every
-//! [`EPOCH_POLL_INTERVAL`] and applies it through [`SharedTrust::apply_epoch`]:
+//! (proving possession of the robot's transport key, or with the robot's own
+//! login where the service has no such route) and writes it to
+//! [`EPOCH_PENDING_FILE`] in the remoted state directory, as
+//! `hex(postcard(EpochSyncWire))`, the encoding a desk's push carries.
+//! [`EpochPull`] picks it up every [`EPOCH_POLL_INTERVAL`] and applies it
+//! through [`SharedTrust::apply_epoch`]:
 //! the intermediate is re-verified against this robot's root set, the epoch's
 //! signature, issuer and robot id are checked, and only a strictly newer epoch
 //! changes anything. A missing, unreadable or rejected file changes nothing.
@@ -78,9 +80,10 @@ pub fn resolve_key_recheck(env_value: Option<&str>) -> Duration {
 pub fn key_recheck_from_env() -> Duration {
     resolve_key_recheck(std::env::var(KEY_RECHECK_ENV).ok().as_deref())
 }
-/// The largest pending artifact read (far above a real epoch); a larger file is
+/// The largest pending artifact read
+/// ([`cerulion_pairing::verify::MAX_EPOCH_PENDING_BYTES`]); a larger file is
 /// discarded unread.
-const MAX_PENDING_BYTES: u64 = 1024 * 1024;
+const MAX_PENDING_BYTES: u64 = cerulion_pairing::verify::MAX_EPOCH_PENDING_BYTES as u64;
 /// Keys remembered for the recheck interval, bounding the map's memory; past
 /// this the expired entries, then all, are dropped.
 const MAX_REMEMBERED_KEYS: usize = 4096;

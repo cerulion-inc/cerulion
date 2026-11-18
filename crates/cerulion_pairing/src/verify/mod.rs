@@ -281,6 +281,13 @@ pub struct EpochSyncWire {
 /// literal duplicated on both sides that could silently drift apart.
 pub const NO_EPOCH_SINK_NEEDLE: &str = "does not accept access-list epoch sync";
 
+/// The largest epoch file a robot's remote-plane daemon reads: the hex text of
+/// one postcard-encoded [`EpochSyncWire`], two bytes of text per byte, which the
+/// robot's revocation sync writes and the daemon applies. A larger file is
+/// discarded unread. `cerulion_remoted`'s epoch pull reads up to it, and the
+/// CLI's revocation sync refuses an epoch above it before writing.
+pub const MAX_EPOCH_PENDING_BYTES: usize = 1024 * 1024;
+
 /// The desk's on-disk epoch-cache file name for `robot` (inside the epochs
 /// directory): `<robot>.epoch`, mirroring A5's `<robot>.grant`.
 ///

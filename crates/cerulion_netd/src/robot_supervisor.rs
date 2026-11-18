@@ -529,9 +529,10 @@ pub fn resolve_epoch_sync_stop_grace(env_value: Option<&str>) -> Duration {
 fn epoch_sync_stop_grace_from_env() -> Duration {
     resolve_epoch_sync_stop_grace(std::env::var(EPOCH_SYNC_STOP_GRACE_ENV).ok().as_deref())
 }
-/// The bound on one revocation fetch: above the worker's own worst case (a
-/// 30 s wait for the session refresh lock, a 30 s refresh request, a 30 s
-/// access request), so the deadline never cuts a refresh in flight.
+/// The bound on one revocation fetch: above the worker's own bound (a robot-proof
+/// fetch bounded at 24 s, then a 30 s wait for the session refresh lock, a
+/// 30 s refresh request and its 1 s save, and a 30 s access request: 115 s), so
+/// the deadline never cuts a refresh in flight.
 const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(120);
 /// The shortest gap between two fetches started by connection requests: caps
 /// the account-service load connecting keys can cause at 12 requests a minute.
