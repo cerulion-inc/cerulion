@@ -590,6 +590,8 @@ jobs:
                 test -x /usr/bin/cerulion-netd
                 test -x /usr/bin/cerulion-connectd
                 test -x /usr/bin/cerulion-remoted
+                test -d /usr/bin/harness
+                test ! -L /usr/bin/harness
                 cerulion-remoted --version
                 test "$(dirname "$(readlink -f "$(command -v cerulion)")")" = \
                   "$(dirname "$(readlink -f /usr/bin/cerulion-connectd)")"

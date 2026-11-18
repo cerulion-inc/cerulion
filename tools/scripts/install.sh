@@ -1070,6 +1070,15 @@ $(system_bin_dir)"
     if [ ! -d "$un_dir" ]; then
         printf 'Nothing installed in %s\n' "$un_dir"
     else
+        # The agent harness tree, when the marker records that this installer
+        # placed it; read before the marker itself goes. Anything else named
+        # harness stays, a link included.
+        if [ -d "$un_dir/harness" ] && [ ! -L "$un_dir/harness" ] && harness_is_ours "$un_dir"; then
+            rm -rf "$un_dir/harness" || {
+                printf 'warning: could not remove %s\n' "$un_dir/harness" >&2
+                un_status=1
+            }
+        fi
         for un_file in cerulion cerulion-netd cerulion-connectd cerulion-remoted \
             librmw_cerulion.so libcerulion_heaphook.so .cerulion-provenance.json; do
             if [ -f "$un_dir/$un_file" ] || [ -L "$un_dir/$un_file" ]; then
@@ -1079,19 +1088,6 @@ $(system_bin_dir)"
                 }
             fi
         done
-        # The agent harness tree beside the programs. A link in its place is
-        # removed, never followed.
-        if [ -L "$un_dir/harness" ]; then
-            rm -f "$un_dir/harness" || {
-                printf 'warning: could not remove %s\n' "$un_dir/harness" >&2
-                un_status=1
-            }
-        elif [ -d "$un_dir/harness" ]; then
-            rm -rf "$un_dir/harness" || {
-                printf 'warning: could not remove %s\n' "$un_dir/harness" >&2
-                un_status=1
-            }
-        fi
         un_removed=1
         if rmdir "$un_dir" 2>/dev/null; then
             printf 'Removed %s\n' "$un_dir"
@@ -1162,15 +1158,38 @@ $(system_bin_dir)"
 # The install-provenance marker: one line of JSON beside the binaries naming
 # this installer, which the CLI reports as its install method in usage
 # telemetry. It is best effort; a failure warns and never fails the install.
+# The tree at <dir>/harness is this installer's when the directory's marker,
+# a regular file and not a link, names install.sh and records that the install
+# placed the tree ("harness":true). A tree without that record is the user's:
+# the installer neither replaces nor removes it.
+harness_is_ours() {
+    harness_marker="$1/.cerulion-provenance.json"
+    [ -f "$harness_marker" ] && [ ! -L "$harness_marker" ] &&
+        grep -Fq '"method":"install.sh"' "$harness_marker" 2>/dev/null &&
+        grep -Fq '"harness":true' "$harness_marker" 2>/dev/null
+}
+
+# A plain mv onto a directory that appeared after the destination check moves
+# the staged tree inside it, as <install dir>/harness/harness. That is the
+# shape here when the archive's own tree has no harness entry at its top.
+harness_nested() {
+    { [ -e "$install_dir/harness/harness" ] || [ -L "$install_dir/harness/harness" ]; } &&
+        [ ! -e "$archive_dir/harness/harness" ] && [ ! -L "$archive_dir/harness/harness" ]
+}
+
 write_install_marker() {
     marker_path="$install_dir/.cerulion-provenance.json"
+    marker_harness=
+    if [ "${archive_harness:-0}" -eq 1 ]; then
+        marker_harness=',"harness":true'
+    fi
     marker_tmp=$(mktemp "$install_dir/.cerulion-provenance.json.XXXXXX" 2>/dev/null || :)
     if [ -z "$marker_tmp" ]; then
         printf 'warning: could not write the install marker in %s\n' "$install_dir" >&2
         return 0
     fi
     if [ -L "$marker_path" ] || { [ -e "$marker_path" ] && [ ! -f "$marker_path" ]; } ||
-        ! printf '{"method":"install.sh","version":"%s"}\n' "${version#v}" > "$marker_tmp" ||
+        ! printf '{"method":"install.sh","version":"%s"%s}\n' "${version#v}" "$marker_harness" > "$marker_tmp" ||
         ! chmod 0644 "$marker_tmp" ||
         ! back_up_install_marker ||
         ! mv -f "$marker_tmp" "$marker_path"; then
@@ -2391,13 +2410,14 @@ EOF
     done
 
     # The agent harness tree. An archive that carries harness/ installs it
-    # beside the CLI with its bytes and its executable bit, and says so; a
-    # second install replaces the tree whole; a failure after the binaries
-    # moved in puts the previous binaries and tree back; an archive without
-    # harness/ removes the tree from a directory this installer marked; a tree
-    # in a directory it never marked, and an archive tree holding a symbolic
-    # link, are refused before anything changes; --uninstall removes the tree.
-    # The library-less upgrade archive above is the control: it carries no
+    # beside the CLI with its bytes and its executable bit, records it in the
+    # marker and says so; a second install replaces the tree whole; a failure
+    # or a TERM after the binaries moved in puts the previous binaries and tree
+    # back; an archive without harness/ removes a recorded tree and leaves any
+    # other alone; a tree the marker does not record, a link or a file at the
+    # name, and an archive whose tree is not a plain tree, are refused before
+    # anything changes; --uninstall removes a recorded tree only. The
+    # library-less upgrade archive above is the control: it carries no
     # harness/, installs none and says nothing about one.
     harness_root="$owner_test_dir/harness"
     mkdir -p "$harness_root"
@@ -2409,13 +2429,22 @@ EOF
             printf '%s\n' "$1-$binary" > "$harness_stage/$binary"
         done
         printf '%s\n' 'license' > "$harness_stage/LICENSE"
-        if [ "$1" != none ]; then
-            mkdir -p "$harness_stage/harness/sim"
-            printf '%s\n' "$1 readme" > "$harness_stage/harness/README.md"
-            printf '%s\n' '#!/bin/sh' > "$harness_stage/harness/sim/run.sh"
-            chmod 0644 "$harness_stage/harness/README.md"
-            chmod 0755 "$harness_stage/harness/sim/run.sh"
-        fi
+        case "$1" in
+            first|second|link)
+                mkdir -p "$harness_stage/harness/sim"
+                printf '%s\n' "$1 readme" > "$harness_stage/harness/README.md"
+                printf '%s\n' '#!/bin/sh' > "$harness_stage/harness/sim/run.sh"
+                chmod 0644 "$harness_stage/harness/README.md"
+                chmod 0755 "$harness_stage/harness/sim/run.sh"
+                ;;
+            file)
+                printf '%s\n' 'not a tree' > "$harness_stage/harness"
+                ;;
+            toplink)
+                mkdir -p "$harness_stage/elsewhere"
+                ln -s elsewhere "$harness_stage/harness"
+                ;;
+        esac
         if [ "$1" = first ]; then
             printf '%s\n' 'first only' > "$harness_stage/harness/sim/first-only.txt"
         fi
@@ -2432,6 +2461,13 @@ EOF
         "$0" --version v0.1.0 --dir "$2" --base-url "file://$harness_root/fixture-$1" \
             >"$harness_root/$3-output" 2>"$harness_root/$3-error"
     }
+    harness_assert_clean() {
+        for harness_leftover in "$1"/.cerulion-install.*; do
+            [ -e "$harness_leftover" ] ||
+                continue
+            die "self-test: $2: left $harness_leftover behind"
+        done
+    }
     harness_assert_tree() {
         [ "$(cat "$1/harness/README.md" 2>/dev/null)" = "$2 readme" ] ||
             die "self-test: $3: harness/README.md does not hold the $2 bytes"
@@ -2443,17 +2479,29 @@ EOF
         elif [ -e "$1/harness/sim/first-only.txt" ]; then
             die "self-test: $3: a file of the replaced harness tree survived"
         fi
+        if [ -e "$1/harness/harness" ]; then
+            die "self-test: $3: the harness tree was moved inside another"
+        fi
         for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
             [ "$(cat "$1/$binary")" = "$2-$binary" ] ||
                 die "self-test: $3: $binary does not hold the $2 bytes"
         done
-        for harness_leftover in "$1"/.cerulion-install.*; do
-            [ -e "$harness_leftover" ] ||
-                continue
-            die "self-test: $3: left the transaction $harness_leftover behind"
-        done
+        harness_assert_clean "$1" "$3"
     }
-    for harness_shape in first second none link; do
+    # An install that must be refused before anything changes: the named
+    # diagnostic, no binary, and the destination's own harness entry as it was.
+    harness_assert_refused() {
+        if harness_install "$1" "$2" "$3"; then
+            die "self-test: $3: the install was not refused"
+        fi
+        grep -Fq "$4" "$harness_root/$3-error" ||
+            die "self-test: $3: the refusal had the wrong diagnostic: $(cat "$harness_root/$3-error")"
+        if [ -e "$2/cerulion" ]; then
+            die "self-test: $3: the refused install activated a binary"
+        fi
+        harness_assert_clean "$2" "$3"
+    }
+    for harness_shape in first second none link file toplink; do
         harness_archive "$harness_shape"
     done
 
@@ -2463,29 +2511,44 @@ EOF
     harness_assert_tree "$harness_dir" first 'first harness install'
     grep -Fq 'The agent harness (harness/) is installed beside the CLI' "$harness_root/first-output" ||
         die "self-test: the harness install did not say where the harness went"
+    grep -Fq '"harness":true' "$harness_dir/.cerulion-provenance.json" ||
+        die "self-test: the install marker does not record the harness tree"
     if grep -Fq 'harness' "$upgrade_output"; then
         die "self-test: an archive without harness/ reported one"
     fi
-    if [ -e "$upgrade_install_dir/harness" ]; then
-        die "self-test: an archive without harness/ produced one"
+    if [ -e "$upgrade_install_dir/harness" ] ||
+        grep -Fq '"harness"' "$upgrade_install_dir/.cerulion-provenance.json"; then
+        die "self-test: an archive without harness/ produced or recorded one"
     fi
 
     harness_install second "$harness_dir" second ||
         die "self-test: the harness upgrade failed: $(cat "$harness_root/second-error")"
     harness_assert_tree "$harness_dir" second 'harness upgrade'
 
-    # A move of the staged tree that fails, after every binary moved in,
-    # rolls the binaries and the previous tree back.
-    harness_fault_dir="$harness_root/fault-install"
+    # The move of the staged tree fails, before it moves and after it, and a
+    # TERM arrives just after it: each rolls the binaries and the previous
+    # tree back.
     harness_fault_bin="$harness_root/fault-bin"
     mkdir -p "$harness_fault_bin"
-    harness_install first "$harness_fault_dir" fault-first ||
-        die "self-test: the harness rollback setup failed: $(cat "$harness_root/fault-first-error")"
     cat > "$harness_fault_bin/mv" <<'MV_EOF'
 #!/bin/sh
 for harness_arg in "$@"; do
     case "$harness_arg" in
-        */staged/harness) exit 1 ;;
+        */staged/harness)
+            case "$CERULION_SELF_TEST_HARNESS_FAULT" in
+                before) exit 1 ;;
+                after)
+                    "$CERULION_SELF_TEST_REAL_MV" "$@" || exit 1
+                    exit 1
+                    ;;
+                term)
+                    "$CERULION_SELF_TEST_REAL_MV" "$@" || exit 1
+                    kill -TERM "$PPID"
+                    sleep 5
+                    exit 0
+                    ;;
+            esac
+            ;;
     esac
 done
 exec "$CERULION_SELF_TEST_REAL_MV" "$@"
@@ -2494,16 +2557,26 @@ MV_EOF
     CERULION_SELF_TEST_REAL_MV=$(command -v mv)
     export CERULION_SELF_TEST_REAL_MV
     harness_previous_path=$PATH
-    PATH="$harness_fault_bin:$PATH"
-    export PATH
-    if harness_install second "$harness_fault_dir" fault; then
-        die "self-test: a harness move that failed did not fail the install"
-    fi
-    PATH=$harness_previous_path
-    export PATH
-    grep -Fq 'could not activate harness' "$harness_root/fault-error" ||
-        die "self-test: the failed harness move was not reported: $(cat "$harness_root/fault-error")"
-    harness_assert_tree "$harness_fault_dir" first 'harness rollback'
+    for harness_fault in before after term; do
+        harness_fault_dir="$harness_root/fault-$harness_fault-install"
+        harness_install first "$harness_fault_dir" "fault-$harness_fault-first" ||
+            die "self-test: the harness $harness_fault rollback setup failed"
+        CERULION_SELF_TEST_HARNESS_FAULT=$harness_fault
+        export CERULION_SELF_TEST_HARNESS_FAULT
+        PATH="$harness_fault_bin:$harness_previous_path"
+        export PATH
+        if harness_install second "$harness_fault_dir" "fault-$harness_fault"; then
+            die "self-test: a harness move that failed ($harness_fault) did not fail the install"
+        fi
+        PATH=$harness_previous_path
+        export PATH
+        unset CERULION_SELF_TEST_HARNESS_FAULT
+        if [ "$harness_fault" != term ]; then
+            grep -Fq 'could not activate harness' "$harness_root/fault-$harness_fault-error" ||
+                die "self-test: the failed harness move ($harness_fault) was not reported: $(cat "$harness_root/fault-$harness_fault-error")"
+        fi
+        harness_assert_tree "$harness_fault_dir" first "harness $harness_fault rollback"
+    done
 
     harness_install none "$harness_dir" none ||
         die "self-test: the harness-less downgrade failed: $(cat "$harness_root/none-error")"
@@ -2512,47 +2585,106 @@ MV_EOF
     fi
     [ "$(cat "$harness_dir/cerulion")" = none-cerulion ] ||
         die "self-test: the harness-less downgrade did not install its binaries"
+    grep -Fq 'Removed the agent harness (harness/)' "$harness_root/none-output" ||
+        die "self-test: the harness-less downgrade did not say it removed the tree"
+    harness_assert_clean "$harness_dir" 'harness-less downgrade'
 
-    harness_foreign_dir="$harness_root/foreign-install"
-    mkdir -p "$harness_foreign_dir/harness"
-    printf '%s\n' 'mine' > "$harness_foreign_dir/harness/notes.txt"
-    if harness_install first "$harness_foreign_dir" foreign; then
-        die "self-test: a harness directory this installer never marked was replaced"
-    fi
-    grep -Fq "$harness_foreign_dir/harness was not installed by this installer" \
-        "$harness_root/foreign-error" ||
-        die "self-test: the unmarked harness refusal had the wrong diagnostic: $(cat "$harness_root/foreign-error")"
-    [ "$(cat "$harness_foreign_dir/harness/notes.txt")" = mine ] ||
-        die "self-test: the refused install changed the unmarked harness directory"
-    if [ -e "$harness_foreign_dir/cerulion" ]; then
-        die "self-test: the refused install activated a binary"
+    # Trees the marker does not record: an unmarked directory, a marker of
+    # this installer from before it placed trees, a marker naming another
+    # method, and a marker that is a link to one recording a tree.
+    for harness_owner in unmarked unrecorded deb linked; do
+        harness_foreign_dir="$harness_root/foreign-$harness_owner"
+        mkdir -p "$harness_foreign_dir/harness"
+        printf '%s\n' 'mine' > "$harness_foreign_dir/harness/notes.txt"
+        case "$harness_owner" in
+            unrecorded)
+                printf '%s\n' '{"method":"install.sh","version":"2.0.0"}' \
+                    > "$harness_foreign_dir/.cerulion-provenance.json"
+                ;;
+            deb)
+                printf '%s\n' '{"method":"deb","version":"2.1.0","harness":true}' \
+                    > "$harness_foreign_dir/.cerulion-provenance.json"
+                ;;
+            linked)
+                printf '%s\n' '{"method":"install.sh","version":"2.1.0","harness":true}' \
+                    > "$harness_root/linked-marker.json"
+                ln -s "$harness_root/linked-marker.json" \
+                    "$harness_foreign_dir/.cerulion-provenance.json"
+                ;;
+        esac
+        harness_assert_refused first "$harness_foreign_dir" "foreign-$harness_owner" \
+            "$harness_foreign_dir/harness was not installed by this installer"
+        [ "$(cat "$harness_foreign_dir/harness/notes.txt")" = mine ] ||
+            die "self-test: foreign-$harness_owner: the refused install changed the tree"
+    done
+    # An archive without harness/ leaves such a tree alone, and so does
+    # --uninstall afterwards, which removes everything else it installed.
+    harness_install none "$harness_root/foreign-unmarked" foreign-older ||
+        die "self-test: an archive without harness/ was refused over an unrecorded tree: $(cat "$harness_root/foreign-older-error")"
+    [ "$(cat "$harness_root/foreign-unmarked/harness/notes.txt")" = mine ] ||
+        die "self-test: an archive without harness/ changed an unrecorded tree"
+    if grep -Fq 'Removed the agent harness' "$harness_root/foreign-older-output"; then
+        die "self-test: an archive without harness/ claimed to remove an unrecorded tree"
     fi
 
-    harness_link_dir="$harness_root/link-install"
-    if harness_install link "$harness_link_dir" link; then
-        die "self-test: an archive harness holding a symbolic link was installed"
-    fi
-    grep -Fq "archive's harness holds an entry that is not a regular file or a directory" \
-        "$harness_root/link-error" ||
-        die "self-test: the archive harness link refusal had the wrong diagnostic: $(cat "$harness_root/link-error")"
-    if [ -e "$harness_link_dir/cerulion" ] || [ -e "$harness_link_dir/harness" ]; then
-        die "self-test: the refused harness link archive installed something"
-    fi
+    # A link or a file at the name: refused for an archive that carries
+    # harness/, left alone by one that does not.
+    for harness_squatter in link file; do
+        harness_squat_dir="$harness_root/squat-$harness_squatter"
+        mkdir -p "$harness_squat_dir"
+        if [ "$harness_squatter" = link ]; then
+            mkdir -p "$harness_root/squat-target"
+            ln -s "$harness_root/squat-target" "$harness_squat_dir/harness"
+            harness_squat_message="installation destination is a symbolic link: $harness_squat_dir/harness"
+        else
+            printf '%s\n' 'a file' > "$harness_squat_dir/harness"
+            harness_squat_message="installation destination is not a directory: $harness_squat_dir/harness"
+        fi
+        harness_assert_refused first "$harness_squat_dir" "squat-$harness_squatter" \
+            "$harness_squat_message"
+        harness_install none "$harness_squat_dir" "squat-$harness_squatter-older" ||
+            die "self-test: an archive without harness/ was refused over a $harness_squatter: $(cat "$harness_root/squat-$harness_squatter-older-error")"
+        if [ "$harness_squatter" = link ]; then
+            [ -L "$harness_squat_dir/harness" ] ||
+                die "self-test: an archive without harness/ removed a link named harness"
+        else
+            [ "$(cat "$harness_squat_dir/harness")" = 'a file' ] ||
+                die "self-test: an archive without harness/ changed a file named harness"
+        fi
+    done
 
-    harness_install second "$harness_dir" reinstall ||
-        die "self-test: the harness reinstall failed: $(cat "$harness_root/reinstall-error")"
+    # Archive trees that are not a plain tree are refused before anything
+    # is installed.
+    harness_assert_refused link "$harness_root/link-install" link \
+        "archive's harness holds an entry that is not a regular file or a directory"
+    harness_assert_refused file "$harness_root/file-install" archive-file \
+        "archive's harness is not a directory"
+    harness_assert_refused toplink "$harness_root/toplink-install" archive-toplink \
+        "archive's harness is not a directory"
+
     harness_home="$harness_root/home"
     mkdir -p "$harness_home"
-    if ! env -u CERULION_HOME -u CERULION_INSTALL_DIR \
-        HOME="$harness_home" ZDOTDIR="$harness_home" \
-        XDG_CONFIG_HOME="$harness_home/.config" \
-        CERULION_SYSTEM_BIN_DIR="$harness_home/no-system-bin" \
-        "$0" --uninstall --dir "$harness_dir" \
-        >"$harness_root/uninstall-output" 2>"$harness_root/uninstall-error"; then
+    harness_uninstall() {
+        env -u CERULION_HOME -u CERULION_INSTALL_DIR \
+            HOME="$harness_home" ZDOTDIR="$harness_home" \
+            XDG_CONFIG_HOME="$harness_home/.config" \
+            CERULION_SYSTEM_BIN_DIR="$harness_home/no-system-bin" \
+            "$0" --uninstall --dir "$1" \
+            >"$harness_root/$2-output" 2>"$harness_root/$2-error"
+    }
+    harness_install second "$harness_dir" reinstall ||
+        die "self-test: the harness reinstall failed: $(cat "$harness_root/reinstall-error")"
+    harness_uninstall "$harness_dir" uninstall ||
         die "self-test: --uninstall of a harness install failed: $(cat "$harness_root/uninstall-error")"
-    fi
     if [ -e "$harness_dir/harness" ] || [ -e "$harness_dir" ]; then
         die "self-test: --uninstall left the harness tree"
+    fi
+    harness_uninstall "$harness_root/foreign-unmarked" uninstall-foreign ||
+        die "self-test: --uninstall beside an unrecorded tree failed: $(cat "$harness_root/uninstall-foreign-error")"
+    [ "$(cat "$harness_root/foreign-unmarked/harness/notes.txt")" = mine ] ||
+        die "self-test: --uninstall removed a tree the marker did not record"
+    if [ -e "$harness_root/foreign-unmarked/cerulion" ]; then
+        die "self-test: --uninstall beside an unrecorded tree left the programs"
     fi
 
     retry_install_dir="$owner_test_dir/retry-install"
@@ -3984,6 +4116,25 @@ cleanup_lock() {
     exit "$status"
 }
 trap cleanup_lock EXIT
+# The harness destination is read here, under the lock and before anything is
+# provisioned or replaced. An archive that carries harness/ replaces a tree
+# this installer placed and refuses anything else at that name; an archive
+# without one removes a tree this installer placed and leaves anything else
+# alone.
+harness_replace=0
+if [ -L "$install_dir/harness" ]; then
+    [ "$archive_harness" -eq 0 ] ||
+        die "installation destination is a symbolic link: $install_dir/harness; move it away and run the install again"
+elif [ -d "$install_dir/harness" ]; then
+    if harness_is_ours "$install_dir"; then
+        harness_replace=1
+    elif [ "$archive_harness" -eq 1 ]; then
+        die "installation destination $install_dir/harness was not installed by this installer; move it away and run the install again"
+    fi
+elif [ -e "$install_dir/harness" ]; then
+    [ "$archive_harness" -eq 0 ] ||
+        die "installation destination is not a directory: $install_dir/harness; move it away and run the install again"
+fi
 # Provision only while owning the install lock, before staging any binaries.
 if [ "$rust_setup" -eq 1 ]; then
     # rustup fetches its own installer and one minimal toolchain here, which is
@@ -4080,12 +4231,16 @@ cleanup_install() {
     fi
     # The harness tree: the staged tree comes back out of the install
     # directory if it moved in, then the tree it replaced moves back.
+    # A move onto a directory that appeared meanwhile put the tree inside it;
+    # only that inner tree is this install's to remove.
+    harness_not_restored=0
     if [ "$status" -ne 0 ] && [ -n "$transaction_dir" ]; then
-        harness_not_restored=0
-        if [ "$harness_activated" -eq 1 ] &&
-            [ ! -e "$transaction_dir/staged/harness" ] &&
-            ! rm -rf "$install_dir/harness"; then
-            harness_not_restored=1
+        if [ "$harness_activated" -eq 1 ] && [ ! -e "$transaction_dir/staged/harness" ]; then
+            harness_moved_in="$install_dir/harness"
+            if harness_nested; then
+                harness_moved_in="$install_dir/harness/harness"
+            fi
+            rm -rf "$harness_moved_in" || harness_not_restored=1
         fi
         if [ "$harness_backed_up" -eq 1 ] && [ -d "$transaction_dir/backup/harness" ]; then
             if [ -e "$install_dir/harness" ] || [ -L "$install_dir/harness" ] ||
@@ -4095,7 +4250,6 @@ cleanup_install() {
         fi
         if [ "$harness_not_restored" -eq 1 ]; then
             rollback_failed=1
-            not_restored="$not_restored harness"
         fi
     fi
     # A link removed for a program this install took out is put back once the
@@ -4145,6 +4299,9 @@ cleanup_install() {
         for binary in $not_restored; do
             printf 'error: binary was not restored: %s\n' "$binary" >&2
         done
+        if [ "$harness_not_restored" -eq 1 ]; then
+            printf 'error: the harness tree was not restored: %s\n' "$install_dir/harness" >&2
+        fi
         rm -rf "$workdir" || :
         release_lock
         exit 1
@@ -4186,25 +4343,10 @@ for binary in $archive_files; do
         die "installation destination is a non-regular, non-symlink file ($(destination_type "$install_dir/$binary")): $install_dir/$binary"
     fi
 done
-# The harness tree is staged beside the binaries. A tree already in the install
-# directory is replaced, or removed by an archive without one, only when this
-# installer marked the directory; a tree anywhere else is the user's and stops
-# the install before anything changes. A link or a file in its place is refused.
+# The harness tree is staged beside the binaries.
 if [ "$archive_harness" -eq 1 ]; then
     run_foreground cp -R "$archive_dir/harness" "$transaction_dir/staged/harness" ||
         die "could not stage harness"
-fi
-harness_replace=0
-if [ -L "$install_dir/harness" ]; then
-    die "installation destination is a symbolic link: $install_dir/harness"
-elif [ -d "$install_dir/harness" ]; then
-    if grep -Fq '"method":"install.sh"' "$install_dir/.cerulion-provenance.json" 2>/dev/null; then
-        harness_replace=1
-    elif [ "$archive_harness" -eq 1 ]; then
-        die "installation destination $install_dir/harness was not installed by this installer; move it away and run the install again"
-    fi
-elif [ -e "$install_dir/harness" ]; then
-    die "installation destination is not a directory ($(destination_type "$install_dir/harness")): $install_dir/harness"
 fi
 # An archive without cerulion-remoted removes the one a later release left in
 # the install directory, so the directory holds the programs of one release.
@@ -4276,6 +4418,9 @@ fi
 if [ "$archive_harness" -eq 1 ]; then
     lock_claim_is_current ||
         die "could not activate harness: installer lock changed"
+    if [ -e "$install_dir/harness" ] || [ -L "$install_dir/harness" ]; then
+        die "could not activate harness: $install_dir/harness appeared during the install"
+    fi
     harness_activated=1
     if mv --version 2>/dev/null | grep -qF 'GNU coreutils'; then
         run_foreground mv -T "$transaction_dir/staged/harness" "$install_dir/harness" || :
@@ -4284,6 +4429,9 @@ if [ "$archive_harness" -eq 1 ]; then
     fi
     if [ "$foreground_status" -ne 0 ]; then
         die "could not activate harness"
+    fi
+    if harness_nested; then
+        die "could not activate harness: $install_dir/harness appeared during the install"
     fi
     if [ -e "$transaction_dir/staged/harness" ] ||
         [ -L "$install_dir/harness" ] || [ ! -d "$install_dir/harness" ]; then
@@ -4295,6 +4443,8 @@ write_install_marker
 printf 'Installed Cerulion %s for %s into %s\n' "$version" "$target" "$install_dir"
 if [ "$archive_harness" -eq 1 ]; then
     printf 'The agent harness (harness/) is installed beside the CLI\n'
+elif [ "$harness_replace" -eq 1 ]; then
+    printf 'Removed the agent harness (harness/), which this release does not carry\n'
 fi
 for library in $installed_libraries; do
     case "$library" in

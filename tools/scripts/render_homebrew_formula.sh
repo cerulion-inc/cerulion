@@ -176,6 +176,7 @@ class Cerulion < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/cerulion --version")
+    assert_predicate bin/"harness", :directory?
   end
 end
 RUBY

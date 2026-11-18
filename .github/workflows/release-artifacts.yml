@@ -308,11 +308,17 @@ jobs:
           chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           # The agent harness ships beside the binaries on every target: the
           # CLI resolves `harness/` in its own directory, the sibling rule the
-          # rmw library and cerulion-connectd follow. The tree copy holds
-          # regular files and directories only, the one shape build_deb.sh
-          # and install.sh accept.
+          # rmw library and cerulion-connectd follow. The copy is the tagged
+          # tree's tracked files and nothing else, and holds regular files and
+          # directories only, the one shape build_deb.sh and install.sh accept.
           if [ ! -d harness ] || [ -L harness ]; then
             echo "::error::the tagged tree has no harness/ directory to ship beside the CLI"
+            exit 1
+          fi
+          stray=$(git status --porcelain --ignored -- harness)
+          if [ -n "$stray" ]; then
+            echo "::error::harness/ holds files the tagged commit does not track:"
+            printf '%s\n' "$stray"
             exit 1
           fi
           odd=$(find harness ! -type f ! -type d -print)
@@ -760,6 +766,11 @@ jobs:
             fi
             diff -r source-checkout/harness "$RUNNER_TEMP/cerulion-bin/harness" ||
               { echo "::error::the installed harness/ differs from the tagged tree's"; exit 1; }
+            # diff compares bytes only; the executable files must match too.
+            (cd source-checkout/harness && find . -type f -perm -0100 | LC_ALL=C sort) > "$RUNNER_TEMP/harness-exec.want"
+            (cd "$RUNNER_TEMP/cerulion-bin/harness" && find . -type f -perm -0100 | LC_ALL=C sort) > "$RUNNER_TEMP/harness-exec.got"
+            diff "$RUNNER_TEMP/harness-exec.want" "$RUNNER_TEMP/harness-exec.got" ||
+              { echo "::error::the installed harness/ marks other files executable than the tagged tree"; exit 1; }
           fi
 
       # release.yml publishes on the SAME tag push and verifies all 20 crates
