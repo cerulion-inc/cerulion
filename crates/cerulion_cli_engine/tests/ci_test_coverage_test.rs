@@ -5840,8 +5840,8 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         triggers.join("\n")
     );
     // The populations are not empty, so a reader that pairs nothing is not a
-    // pass: ten jobs of ci.yml and three of leak-guard.yml carry these names,
-    // all thirteen carry steps, and six of them list a `needs:` set.
+    // pass: eleven jobs of ci.yml and three of leak-guard.yml carry these
+    // names, all fourteen carry steps, and five of them list a `needs:` set.
     assert!(
         judged >= 13,
         "only {judged} job(s) carry a name that produces a required context: \
@@ -5869,7 +5869,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
          payload field, so the exclusion is no longer finding them"
     );
     assert!(
-        dependants >= 6,
+        dependants >= 5,
         "only {dependants} judged job(s) list a `needs:` set: the guard rule is \
          judging a population the reader is no longer finding"
     );
@@ -6892,4 +6892,199 @@ fn all_workflow_texts() -> BTreeMap<String, String> {
     }
     assert!(!out.is_empty(), "no workflow files under {}", dir.display());
     out
+}
+
+// ---------------------------------------------------------------------------
+// The harness path rule, per path and per event, and the harness job.
+// ---------------------------------------------------------------------------
+
+/// The job id of the job that checks the `harness/` folder.
+const HARNESS_JOB: &str = "harness";
+
+/// What one classifier run printed: the `selection: reason=` token and every
+/// `<class>=<value>` line, by class name.
+#[cfg(unix)]
+struct ClassifierAnswer {
+    reason: String,
+    classes: BTreeMap<String, String>,
+}
+
+/// `tools/scripts/ci_changed_paths.sh` on `paths`, with the event and the
+/// switch set explicitly, so the job environment of a CI run reaches neither.
+#[cfg(unix)]
+fn run_classifier(event: &str, switch: &str, paths: &[&str]) -> ClassifierAnswer {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let script = repo_root().join("tools/scripts/ci_changed_paths.sh");
+    let mut child = Command::new("bash")
+        .arg(&script)
+        .env("GITHUB_EVENT_NAME", event)
+        .env("CI_SELECTION", switch)
+        .current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
+    let input: String = paths.iter().map(|p| format!("{p}\n")).collect();
+    child
+        .stdin
+        .take()
+        .expect("the classifier's stdin is piped")
+        .write_all(input.as_bytes())
+        .unwrap_or_else(|e| panic!("writing the changed paths to the classifier: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("waiting for the classifier: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "[{event} {switch}] {paths:?}: the classifier failed\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut reason = None;
+    let mut classes = BTreeMap::new();
+    for line in stdout.lines() {
+        if let Some(token) = line.strip_prefix("selection: reason=") {
+            reason = Some(token.to_string());
+        } else if let Some((class, value)) = line.split_once('=') {
+            classes.insert(class.to_string(), value.to_string());
+        }
+    }
+    ClassifierAnswer {
+        reason: reason.unwrap_or_else(|| {
+            panic!("[{event} {switch}] {paths:?}: no `selection: reason=` line in\n{stdout}")
+        }),
+        classes,
+    }
+}
+
+/// The harness path rule, evaluated per path and per event against
+/// hand-written answers.
+///
+/// A harness-only change selects no package on a pull request AND on a merge
+/// group; a harness path beside any other path selects every package; a
+/// `push` or a dispatch selects every package whatever it touched; and the
+/// switch stops the rule on both events it applies to.
+///
+/// Each row is `<event>|<switch>|<paths>|<code>|<pkgs>|<reason>`,
+/// `,` separating paths. `<pkgs>` is `[]`, `every` for the array a `push` run
+/// prints, or a package name: neither of those, and holding that package.
+#[cfg(unix)]
+#[test]
+fn the_harness_path_rule_is_evaluated_per_path_and_per_event() {
+    const ROWS: &[&str] = &[
+        "pull_request|on|harness/install.sh|false|[]|harness",
+        "pull_request|on|harness/install.sh,harness/tests/test_pins.py|false|[]|harness",
+        "pull_request|on|harness/README.md|false|[]|docs:md,harness",
+        "pull_request|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|harness-mixed",
+        "pull_request|on|harness/install.sh,README.md|true|every|harness-mixed",
+        "pull_request|on|harness/Cargo.toml|true|every|workspace-input:Cargo.toml",
+        "pull_request|on|harnessx/install.sh|true|every|unknown-path",
+        "pull_request|on|crates/cerulion_viz/bin/cerulion_vizd/src/harness/mod.rs\
+         |true|cerulion_vizd|crates:cerulion_vizd",
+        "pull_request|on||false|[]|none",
+        "pull_request|off|harness/install.sh|true|every|switch:off",
+        "merge_group|on|harness/install.sh|false|[]|harness",
+        "merge_group|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|event:merge_group",
+        "merge_group|on|crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|event:merge_group",
+        "merge_group|on||true|every|event:merge_group",
+        "merge_group|off|harness/install.sh|true|every|switch:off",
+        "push|on|harness/install.sh|true|every|event:push",
+        "workflow_dispatch|on|harness/install.sh|true|every|event:workflow_dispatch",
+    ];
+
+    // The whole-workspace array, read once off a run every rule answers with
+    // everything, and floored so an empty listing cannot stand in for it.
+    let every = run_classifier("push", "on", &["Cargo.lock"])
+        .classes
+        .get("pkgs")
+        .cloned()
+        .expect("a push run prints `pkgs=`");
+    assert!(
+        every.starts_with('[')
+            && every.matches('"').count() >= 40
+            && every.contains("\"cerulion_core\""),
+        "the every-member array reads `{every}`: the listing is not reaching the workspace"
+    );
+
+    let mut complaints = Vec::new();
+    for row in ROWS {
+        let fields: Vec<&str> = row.split('|').collect();
+        let [event, switch, paths, code, pkgs, reason] = fields[..] else {
+            panic!("the row `{row}` does not carry six fields");
+        };
+        let paths: Vec<&str> = paths.split(',').filter(|p| !p.is_empty()).collect();
+        let got = run_classifier(event, switch, &paths);
+        let class = |name: &str| got.classes.get(name).cloned().unwrap_or_default();
+        let got_pkgs = class("pkgs");
+        let pkgs_ok = match pkgs {
+            "[]" => got_pkgs == "[]",
+            "every" => got_pkgs == every,
+            package => {
+                got_pkgs != "[]"
+                    && got_pkgs != every
+                    && got_pkgs.contains(&format!("\"{package}\""))
+            }
+        };
+        if class("code") != code || !pkgs_ok || got.reason != reason {
+            complaints.push(format!(
+                "  [{event} {switch}] {paths:?}: code={} reason={} pkgs={got_pkgs}; \
+                 wanted code={code} reason={reason} pkgs {pkgs}",
+                class("code"),
+                got.reason
+            ));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "the classifier disagrees with the hand-written rows:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The `harness` job runs its checks on every event: no `needs:`, no job
+/// condition, no matrix and no step condition, so nothing the classifier
+/// answers can skip a check of the folder.
+#[test]
+fn the_harness_job_runs_its_checks_on_every_event() {
+    let texts = workflow_texts();
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+    let job = jobs_of(ci)
+        .into_iter()
+        .find(|(name, _)| name == HARNESS_JOB)
+        .map(|(_, block)| block)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{HARNESS_JOB}` job"));
+
+    assert!(
+        job_if_of(&job).is_none(),
+        "the `{HARNESS_JOB}` job carries a job condition, which can skip it"
+    );
+    assert!(
+        job_needs_of(&job).is_empty(),
+        "the `{HARNESS_JOB}` job lists `needs:`: a failed dependency skips it"
+    );
+    assert!(
+        !job.lines().any(|l| l.trim() == "strategy:"),
+        "the `{HARNESS_JOB}` job carries a matrix: a matrix job reports per-leg names"
+    );
+    let steps = step_blocks(&job);
+    assert!(
+        steps.len() >= 2,
+        "the `{HARNESS_JOB}` job has no check after its checkout"
+    );
+    for step in &steps {
+        assert_eq!(
+            step_if_of(step),
+            Ok(None),
+            "`{}` carries a step condition, which can skip a check",
+            step_name_of(step).unwrap_or_else(|| "<unnamed>".to_string())
+        );
+    }
 }
