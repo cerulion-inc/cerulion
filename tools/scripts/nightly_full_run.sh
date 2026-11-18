@@ -275,18 +275,25 @@ rerun=()
 failed2=()
 started=0
 
-# Whether run $1 reads as rerun: a rerun request that the server took but
-# answered with an error still starts attempt 2. The refusal stays in err_file.
+# Whether run $1 has reached attempt $2: a rerun request that the server took
+# but answered with an error still starts that attempt. The refusal stays in
+# err_file.
 rerun_started() {
-    local json attempt saved
+    local attempt saved
     saved=$(cat "$err_file")
-    json=$(api_try "repos/${repository}/actions/runs/$1") || {
+    attempt=$(latest_attempt "$1") || {
         printf '%s\n' "$saved" > "$err_file"
         return 1
     }
     printf '%s\n' "$saved" > "$err_file"
-    attempt=$(jq -r '.run_attempt // 1' <<< "$json")
-    [ "$attempt" -ge 2 ]
+    [ "$attempt" -ge "$2" ]
+}
+
+# The newest attempt number of run $1.
+latest_attempt() {
+    local json
+    json=$(api_try "repos/${repository}/actions/runs/$1") || return 1
+    jq -r '.run_attempt // 1' <<< "$json"
 }
 
 past_deadline() {
@@ -331,7 +338,7 @@ wait_all() {
 }
 
 cmd_run() {
-    local wf before id i red=0 reran=0 issue number
+    local wf before id i next red=0 reran=0 issue number
     started=$(now)
     for wf in $WORKFLOWS; do
         before=$(bot_runs "$wf")
@@ -360,10 +367,17 @@ cmd_run() {
         failed1[i]=$(failed_jobs "${ids[i]}" 1)
         if past_deadline; then
             rerun[i]="not requested: past the $((DEADLINE_SECONDS / 60))-minute deadline"
-        elif api_try -X POST "repos/${repository}/actions/runs/${ids[i]}/rerun-failed-jobs" > /dev/null \
-            || rerun_started "${ids[i]}"; then
+            continue
+        fi
+        # The rerun starts the attempt after the newest one, which is not 2
+        # when someone has rerun the run by hand already.
+        next=$(latest_attempt "${ids[i]}") ||
+            die "gh api repos/${repository}/actions/runs/${ids[i]} failed three times: $(tr '\n' ' ' < "$err_file")" 2
+        next=$((next + 1))
+        if api_try -X POST "repos/${repository}/actions/runs/${ids[i]}/rerun-failed-jobs" > /dev/null \
+            || rerun_started "${ids[i]}" "$next"; then
             rerun[i]=pending
-            want[i]=2
+            want[i]=$next
             finished[i]=0
             reran=1
         else
@@ -375,7 +389,7 @@ cmd_run() {
         [ "${rerun[i]}" = pending ] || continue
         rerun[i]=${concl[i]}
         [ "${finished[i]}" -eq 1 ] || continue
-        [ "${rerun[i]}" = success ] || failed2[i]=$(failed_jobs "${ids[i]}" 2)
+        [ "${rerun[i]}" = success ] || failed2[i]=$(failed_jobs "${ids[i]}" "${want[i]}")
     done
 
     issue=$(open_issue)

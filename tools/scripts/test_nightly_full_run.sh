@@ -22,7 +22,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=33
+CASES_EXPECTED=34
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-nightly-test.XXXXXX")
@@ -340,6 +340,8 @@ ok 'two green runs close the open issue'
 make_red_then_green() {
     standard_dispatch
     run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+    # The newest attempt, read before the rerun request: 1.
+    run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200"
     for n in 1 2 3; do
         printf 'FAIL: HTTP 404: Not Found\n' | answer GET "$R/actions/runs/200/attempts/2" "$n"
     done
@@ -400,8 +402,10 @@ new_case red_twice_issue_open
 standard_dispatch
 issue_open '2026-11-15T05:00:00Z'
 run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200"
 run_json 200 completed '"failure"' 2 | answer GET "$R/actions/runs/200/attempts/2"
 run_json 400 completed '"timed_out"' 1 | answer GET "$R/actions/runs/400/attempts/1"
+run_json 400 completed '"timed_out"' 1 | answer GET "$R/actions/runs/400"
 run_json 400 completed '"success"' 2 | answer GET "$R/actions/runs/400/attempts/2"
 printf '%s\n' '{"total_count":2,"jobs":[{"name":"Lint","conclusion":"failure"},{"name":"Documentation","conclusion":"cancelled"}]}' |
     answer GET "$(jobs_path 200 1)"
@@ -471,6 +475,7 @@ ok 'a refused rerun is reported and the result still recorded'
 new_case rerun_taken_despite_an_error
 standard_dispatch
 run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200" 1
 run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200"
 run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200/attempts/2"
 run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
@@ -616,6 +621,7 @@ ok 'a run whose triggering actor is the bot is found'
 new_case rerun_unfinished_at_deadline
 standard_dispatch
 run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200"
 run_json 200 in_progress null 2 | answer GET "$R/actions/runs/200/attempts/2"
 run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf '%s\n' '{"total_count":150,"jobs":[{"name":"Lint","conclusion":"failure"},{"name":"Gate","conclusion":"neutral"}]}' |
@@ -690,13 +696,33 @@ run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200/attempts/
 run_json 200 completed '"success"' 2 | answer GET "$R/actions/runs/200"
 run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
 printf '%s\n' '{"total_count":1,"jobs":[{"name":"Lint","conclusion":"failure"}]}' | answer GET "$(jobs_path 200 1)"
-: | answer POST "$R/actions/runs/200/rerun-failed-jobs"
+# Its newest attempt passed, so there is nothing left to rerun.
+printf 'FAIL: HTTP 422: no failed jobs to rerun\n' | answer POST "$R/actions/runs/200/rerun-failed-jobs"
 run_case run
 expect_status 0
 expect_output 'opened the issue'
 expect_no_call 'issue close'
 grep -Fq -- '  - first attempt: failure' "$case_dir/body" || fail "$case_name: attempt 1's failure is not reported"
 ok "a rerun someone started by hand never stands in for attempt 1"
+
+# Someone reran the failed jobs by hand and that attempt failed too, before the
+# nightly's rerun: the nightly's rerun is attempt 3, and attempt 3 is the one
+# waited on and reported, never the hand-run attempt 2.
+new_case rerun_after_a_rerun_by_hand
+standard_dispatch
+run_json 200 completed '"failure"' 1 | answer GET "$R/actions/runs/200/attempts/1"
+run_json 200 completed '"failure"' 2 | answer GET "$R/actions/runs/200"
+run_json 200 completed '"failure"' 2 | answer GET "$R/actions/runs/200/attempts/2"
+run_json 200 in_progress null 3 | answer GET "$R/actions/runs/200/attempts/3" 1
+run_json 200 completed '"success"' 3 | answer GET "$R/actions/runs/200/attempts/3"
+run_json 400 completed '"success"' 1 | answer GET "$R/actions/runs/400/attempts/1"
+printf '%s\n' '{"total_count":1,"jobs":[{"name":"Lint","conclusion":"failure"}]}' | answer GET "$(jobs_path 200 1)"
+: | answer POST "$R/actions/runs/200/rerun-failed-jobs"
+run_case run
+expect_status 0
+expect_no_call "$R/actions/runs/200/attempts/2"
+grep -Fq -- '  - rerun of the failed jobs: success' "$case_dir/body" || fail "$case_name: attempt 3's result is not the one reported"
+ok "the nightly's rerun is read at the attempt it started"
 
 # The dispatch errors but the server started the run: it is found on the
 # first listing after the error, and no second request is sent.
