@@ -64,7 +64,10 @@ impl ConfigFile {
 
 /// Deserialize a config file's text into iceoryx2's own `Config`, as
 /// `Config::from_file` does, so a file iceoryx2 refuses (a wrong type in any
-/// section, an invalid prefix) is refused here too.
+/// section, an invalid prefix) is refused here too. The text goes through
+/// this crate's toml 1.0 where iceoryx2 reads with toml 0.9: toml 1.0 also
+/// accepts a table reopened through a dotted key below a subtable already
+/// defined, which toml 0.9 refuses as a duplicate key.
 pub(super) fn parse(text: &str) -> ConfigFile {
     match toml::from_str::<iceoryx2::config::Config>(text) {
         Ok(config) => ConfigFile::Read(namespace_of(&config)),

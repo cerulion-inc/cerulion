@@ -153,7 +153,7 @@ ed25519-dalek = "2"
 # Isolated temp dirs/files for the device-index persistence round-trip tests.
 tempfile = "3"
 # `#[serial]` makes `tests/act_verbs_test.rs` and `tests/rcp_forward_e2e_test.rs` take one lock around the process-global iceoryx2 manager.
-serial_test = "3"
+serial_test = "4"
 # `tests/act_verbs_test.rs` creates a topic's data service with a raw iceoryx2
 # node, with safe overflow disabled. Exact `=0.10.0` like every iceoryx2
 # dependency in the tree; the root patch block resolves it to the pinned fork.

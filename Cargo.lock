@@ -1233,7 +1233,7 @@ name = "cerulion_accountd"
 version = "2.0.0"
 dependencies = [
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "cerulion_pairing",
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",
@@ -1274,7 +1274,7 @@ dependencies = [
  "test_node_macro_period_panic_cdylib",
  "test_node_macro_relay_rlib",
  "thiserror 2.0.21",
- "toml 0.9.11+spec-1.1.0",
+ "toml 1.0.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "zenoh",
@@ -1362,7 +1362,7 @@ dependencies = [
  "serde_yaml",
  "serial_test",
  "tempfile",
- "toml 0.9.11+spec-1.1.0",
+ "toml 1.0.6+spec-1.1.0",
  "tracing",
 ]
 
@@ -1370,7 +1370,7 @@ dependencies = [
 name = "cerulion_cli_engine"
 version = "2.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "cerulion_accountd",
  "cerulion_bag",
  "cerulion_bagd",
@@ -1408,7 +1408,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "toml 0.9.11+spec-1.1.0",
+ "toml 1.0.6+spec-1.1.0",
  "tracing",
  "tracing-test",
 ]
@@ -1449,7 +1449,7 @@ dependencies = [
 name = "cerulion_core"
 version = "2.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytemuck",
  "cerulion-wire",
  "cerulion_cli_engine",
@@ -1458,7 +1458,7 @@ dependencies = [
  "cerulion_node_abi",
  "cerulion_pairing",
  "codegen_fixture_msgs",
- "dirs",
+ "dirs 7.0.0",
  "ed25519-dalek 2.2.0",
  "iceoryx2",
  "iceoryx2-bb-concurrency",
@@ -1526,7 +1526,7 @@ dependencies = [
 name = "cerulion_discovery"
 version = "2.0.0"
 dependencies = [
- "dirs",
+ "dirs 7.0.0",
  "serde",
  "serde_json",
  "tracing",
@@ -1549,7 +1549,7 @@ dependencies = [
  "rustix 1.1.6",
  "serde",
  "serde_json",
- "toml 0.9.11+spec-1.1.0",
+ "toml 1.0.6+spec-1.1.0",
  "tracing",
  "tracing-test",
 ]
@@ -1593,7 +1593,7 @@ dependencies = [
 name = "cerulion_msgio"
 version = "2.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "cerulion_core",
  "image",
  "native_ros2_messages",
@@ -1608,7 +1608,7 @@ dependencies = [
 name = "cerulion_netd"
 version = "2.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "cerulion_core",
  "cerulion_discovery",
  "cerulion_hygiene",
@@ -1650,7 +1650,7 @@ dependencies = [
 name = "cerulion_ops_proto"
 version = "2.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1661,7 +1661,7 @@ name = "cerulion_pairing"
 version = "2.0.0"
 dependencies = [
  "data-encoding",
- "dirs",
+ "dirs 7.0.0",
  "ed25519-dalek 2.2.0",
  "getrandom 0.3.4",
  "hmac",
@@ -1685,7 +1685,7 @@ dependencies = [
 name = "cerulion_rcpd"
 version = "2.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "cerud",
  "cerulion_bag",
  "cerulion_core",
@@ -1759,7 +1759,7 @@ dependencies = [
 name = "cerulion_telemetry"
 version = "2.0.0"
 dependencies = [
- "dirs",
+ "dirs 7.0.0",
  "reqwest",
  "rustls",
  "serde",
@@ -1768,7 +1768,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
- "toml 0.9.11+spec-1.1.0",
+ "toml 1.0.6+spec-1.1.0",
  "uuid",
 ]
 
@@ -1846,7 +1846,7 @@ dependencies = [
 name = "cerulion_wireclient"
 version = "2.0.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "cerulion_core",
  "cerulion_link",
  "cerulion_pairing",
@@ -2809,6 +2809,15 @@ name = "dirs"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3e8aa94d75141228480295a7d0e7feb620b1a5ad9f12bc40be62411e38cce4e"
+dependencies = [
+ "dirs-sys",
+]
+
+[[package]]
+name = "dirs"
+version = "7.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d57d423b3c82e89b9a24ca3091fee61f456a26edbd28d26c65906f4bc1dcd8f"
 dependencies = [
  "dirs-sys",
 ]
@@ -8492,15 +8501,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3fc4972f129a0ea378b69fa7c186d63255606e362ad00795f00b869dea5265eb"
 
 [[package]]
-name = "scc"
-version = "2.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
-dependencies = [
- "sdd",
-]
-
-[[package]]
 name = "schannel"
 version = "0.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8589,12 +8589,6 @@ name = "scuffle-workspace-hack"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8028ded836a0d9fabdfa4d713389b76a2098b5153f50a135c8faed7e3a3d5ae2"
-
-[[package]]
-name = "sdd"
-version = "3.0.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "secrecy"
@@ -8824,28 +8818,27 @@ dependencies = [
 
 [[package]]
 name = "serial_test"
-version = "3.4.0"
+version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "911bd979bf1070a3f3aa7b691a3b3e9968f339ceeec89e08c280a8a22207a32f"
+checksum = "a6df5ed973ad8d834e09f824f9e9f449af6b9a3745f78dec7cc752770bd3bf11"
 dependencies = [
  "futures-executor",
  "futures-util",
  "log",
  "once_cell",
  "parking_lot",
- "scc",
  "serial_test_derive",
 ]
 
 [[package]]
 name = "serial_test_derive"
-version = "3.4.0"
+version = "4.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a7d91949b85b0d2fb687445e448b40d322b6b3e4af6b44a29b21d9a5f33e6d9"
+checksum = "a22144e767da4ddd8416dbf383700542ffd8a5dc493dfecedfe1fe3ad03c98ae"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.114",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -8918,7 +8911,7 @@ version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32824fab5e16e6c4d86dc1ba84489390419a39f97699852b66480bb87d297ed8"
 dependencies = [
- "dirs",
+ "dirs 6.0.0",
 ]
 
 [[package]]
