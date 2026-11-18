@@ -9,7 +9,9 @@ import io
 import json
 import os
 import pathlib
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -409,6 +411,38 @@ class Prices(unittest.TestCase):
             "         cost: 0.7500 USD at list price (the package's price table of 2026-11-17); 0.8000 USD reported "
             "by the endpoint (usage.cost of 1 of 1 replies)",
             "  plain  NOT SCORED: failed; endpoint; endpoint"])
+
+
+class Bytecode(unittest.TestCase):
+    """run-cell started without -B and without PYTHONDONTWRITEBYTECODE, in a copy of the harness folder: what it
+    imports from the folder, the plain tree builder among them, leaves no bytecode there but the package's own
+    first file's."""
+
+    def run_python(self, *flags):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        shutil.copytree(pathlib.Path(cli.__file__).resolve().parent, root / "src" / "cerulion_harness",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        (root / "measured").mkdir()
+        (root / "measured" / "assemble.py").write_text("ABSENT_LIST = 'plain-absent.txt'\n", encoding="utf-8")
+        # -I: the environment's PYTHON* variables are not read, PYTHONDONTWRITEBYTECODE among them.
+        code = ("import runpy, sys; src, measured = sys.argv[1:3]; sys.path.insert(0, src); "
+                "from cerulion_harness import body_record, layout; layout.assembler(measured); "
+                "sys.argv[1:] = ['run-cell', '--model', 'm']; "
+                "runpy.run_module('cerulion_harness', run_name='__main__')")
+        done = subprocess.run([sys.executable, "-I", *flags, "-c", code, str(root / "src"), str(root / "measured")],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("no endpoint", done.stderr)
+        return sorted(str(p.relative_to(root)) for p in root.rglob("*.pyc"))
+
+    def test_only_the_packages_first_file_is_compiled_to_bytecode(self):
+        tag = sys.implementation.cache_tag
+        self.assertEqual(self.run_python(), [f"src/cerulion_harness/__pycache__/__init__.{tag}.pyc"])
+
+    def test_with_dash_b_nothing_is(self):
+        self.assertEqual(self.run_python("-B"), [])
 
 
 class PathsAsGiven(unittest.TestCase):

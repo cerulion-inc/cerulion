@@ -151,7 +151,8 @@ class RedirectGuard(unittest.TestCase):
         probe = ("import urllib.request\n"
                  "print(urllib.request.HTTPRedirectHandler().redirect_request(None, None, 302, '', {}, "
                  "'http://127.0.0.1:9/'))\n")
-        env = dict(os.environ, PYTHONPATH=os.pathsep.join((link, redirects.SITE, hidden)))
+        # PYTHONDONTWRITEBYTECODE as the episode has it (cli.THREADS): no bytecode written into the source folder.
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join((link, redirects.SITE, hidden)), PYTHONDONTWRITEBYTECODE="1")
         done = subprocess.run([sys.executable, "-c", probe], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60)
         self.assertEqual((done.returncode, done.stdout.strip(), done.stderr), (0, "None", ""))
