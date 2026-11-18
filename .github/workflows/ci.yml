@@ -61,7 +61,7 @@ permissions:
 #     run's verdict to decide whether to merge, so a cancelled required
 #     context reads as "not passed" forever and the batch stalls. The one
 #     cancel a queue run takes is `queue-watchdog.yml`'s, once a required job
-#     has already failed the batch.
+#     has already failed the batch or the batch has left the queue.
 #   * push / workflow_dispatch / schedule ⇒ group = `github.run_id`, which is
 #     unique per run, so every main commit keeps its own run, nothing is
 #     ever queued behind a sibling, and nothing is ever cancelled.
