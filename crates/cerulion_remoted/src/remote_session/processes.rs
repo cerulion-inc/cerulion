@@ -73,7 +73,7 @@ impl Identity {
     }
 }
 
-/// Check non-reaping waits, process enumeration and identity support before spawn.
+/// Check non-reaping waits, enumeration, identity and signal syscalls before spawn.
 ///
 /// `force_fallback` exercises the revalidation path even when pidfds are available.
 /// Otherwise only an unavailable pidfd syscall permits that path; permission or
@@ -111,6 +111,8 @@ pub fn preflight(force_fallback: bool) -> io::Result<Mode> {
             };
             let own = platform::FallbackIdentity::capture(rustix::process::getpid())?;
             own.running()?;
+            // Signal zero checks this syscall without delivering a signal.
+            rustix::process::test_kill_process(rustix::process::getpid())?;
             rustix::process::getsid(None)?;
             platform::pids()?;
             // One warning per session, without command, environment, or PID data.

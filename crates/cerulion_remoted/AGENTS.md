@@ -3,8 +3,9 @@
 One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
 
 ## Invariants
-- Linux cleanup: pin SID with unreaped leader; capture before SID check. Prefer
-  pidfds; fallback rechecks SID/birth with a check/signal race. No containment.
+- Linux: unreaped leader pins SID; capture identity before SID. Use pidfds.
+  Fallback rechecks SID/birth nonatomically. No containment.
+  Probe waits/readiness/signals before spawn.
 - Catalog/schema/demand/acts gate producer scope/origin before ports (acts: e-stop, args, then scope); taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
   final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive

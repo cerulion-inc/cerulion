@@ -151,10 +151,33 @@ impl Identity {
 }
 
 pub(super) fn preflight() -> io::Result<()> {
-    Identity::capture(rustix::process::getpid())?;
+    Identity::capture(rustix::process::getpid())?
+        .running()
+        .map_err(required_capability)?;
+    // A pipe cannot name a process, so this probes the actual cleanup signal
+    // syscall without delivering a signal. Its expected rejection is EBADF;
+    // sandbox denials must refuse native cleanup before the child is spawned.
+    let (pipe, _) = io::pipe().map_err(required_capability)?;
+    signal_probe(pidfd_send_signal(&pipe, Signal::KILL))?;
     // /proc is also required for enumerating the other job-control groups.
-    pids()?;
+    pids().map_err(required_capability)?;
     Ok(())
+}
+
+// Only pidfd open/send ENOSYS permits fallback. Preserve other failures' kinds,
+// but wrap their errno so denied readiness or pipe setup cannot select fallback.
+fn required_capability(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), error)
+}
+
+fn signal_probe(result: rustix::io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(rustix::io::Errno::BADF) => Ok(()),
+        Err(error) => Err(error.into()),
+        Ok(()) => Err(io::Error::other(
+            "unexpected pidfd signal result for a pipe",
+        )),
+    }
 }
 
 pub(super) fn pids() -> io::Result<Vec<Pid>> {
@@ -184,6 +207,38 @@ mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    #[test]
+    fn signal_probe_refuses_permission_errors_and_unexpected_success() {
+        for _ in 0..2 {
+            signal_probe(Err(rustix::io::Errno::BADF)).unwrap();
+            for errno in [
+                rustix::io::Errno::PERM,
+                rustix::io::Errno::ACCESS,
+                rustix::io::Errno::INVAL,
+                rustix::io::Errno::NOSYS,
+            ] {
+                let error = signal_probe(Err(errno)).unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(errno.raw_os_error()));
+                assert_eq!(fallback_allowed(&error), errno == rustix::io::Errno::NOSYS);
+                let required = required_capability(io::Error::from(errno));
+                assert_eq!(required.kind(), error.kind());
+                assert!(!fallback_allowed(&required));
+            }
+            let error = signal_probe(Ok(())).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(!fallback_allowed(&error));
+        }
+    }
+
+    #[test]
+    fn signal_capability_probe_cannot_deliver_to_a_process() {
+        let (pipe, _) = io::pipe().unwrap();
+        assert_eq!(
+            pidfd_send_signal(&pipe, Signal::KILL),
+            Err(rustix::io::Errno::BADF)
+        );
     }
 
     #[test]

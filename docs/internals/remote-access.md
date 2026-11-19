@@ -193,8 +193,8 @@ the same entry instead of running the daemon.
 Load-bearing boundary contracts:
 
 - **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
-  process enumeration and identity support before spawn. Native pidfds bind each
-  signal to its captured process. Only an unavailable pidfd syscall permits the
+  process enumeration, readiness and signal syscalls before spawn. Native pidfds
+  bind each signal to its captured process. Only an unavailable pidfd syscall permits the
   ordinary fallback; its last SID/birth-time check cannot be atomic with the
   numeric-PID signal. The caller retains the unreaped session leader until cleanup
   returns, pinning its SID. Repeated scans include ordinary job-control groups;
