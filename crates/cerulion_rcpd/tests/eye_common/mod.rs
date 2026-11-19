@@ -356,12 +356,13 @@ pub fn key_file(dir: &Path) -> PathBuf {
     path
 }
 
-/// The budget [`wait_for_subscribers`] and the eye host test give the eye to
-/// open a topic, or to answer or drop an ask, before they fail. The eye's
-/// thread syncs each answer's receipt to disk before it publishes the answer,
-/// and a loaded machine can hold one synced write, or leave the eye's thread
-/// or the test's thread unscheduled, for seconds. Each wait returns once its
-/// state is reached, so a passing run never waits this out.
+/// The budget the eye tests give the eye to open a topic, to answer or drop
+/// an ask, to write a receipt or to report a request, and the stand-in route
+/// to count a refused handshake, before they fail. The eye's thread syncs
+/// each answer's receipt to disk before it publishes the answer, and a loaded
+/// machine can hold one synced write, or leave the eye's thread or the test's
+/// thread unscheduled, for seconds. Each wait returns once its state is
+/// reached, so a passing run never waits this out.
 pub const EYE_WAIT: Duration = Duration::from_secs(30);
 
 /// Wait until `topic` has at least `n` subscribers, failing after
