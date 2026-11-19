@@ -21,6 +21,7 @@ use cerulion_link::{
     alpn, build_endpoint, dial, open_frame_stream, read_frame, write_frame, EndpointAddr,
     EndpointConfig, RelayConfig, DEFAULT_MAX_FRAME_LEN,
 };
+use cerulion_netd::hygiene::{pidfile_for, read_pidfile};
 use cerulion_netd::protocol::{Hello, Request, Response};
 use cerulion_pairing::client::DeviceIdentity;
 use cerulion_pairing::format::{AccountId, PrincipalKind, RobotId, RootSet};
@@ -173,13 +174,18 @@ impl Daemon {
             socket,
             root,
         };
+        // The socket path exists from bind(2), before listen(2), and a connect
+        // in that gap is refused. The daemon writes its pid to the pidfile only
+        // after the socket listens, so once the pidfile holds the child's pid a
+        // connect is accepted.
+        let pidfile = pidfile_for(&daemon.socket);
         until(|| {
             assert!(
                 daemon.child.try_wait().unwrap().is_none(),
                 "{}",
                 std::fs::read_to_string(daemon.root.path().join("stderr")).unwrap()
             );
-            daemon.socket.exists()
+            read_pidfile(&pidfile) == Some(daemon.child.id())
         });
         daemon
     }
@@ -1056,10 +1062,12 @@ wait "$server_pid"
         .path()
         .join("robot-state/remoted/beacon_facts.json");
     let child_pid = daemon.root.path().join("child-pid");
-    until(|| facts.exists() && child_pid.exists());
+    // The wrapper's redirection creates the marker before printf fills it, so
+    // the wait is for a pid in it, not for the file.
+    until(|| facts.exists() && read_pidfile(&child_pid).is_some());
     let old = children(daemon.child.id());
     assert_eq!(old.len(), 1);
-    let old_actual = std::fs::read_to_string(&child_pid).unwrap();
+    let old_actual = read_pidfile(&child_pid).unwrap();
     assert!(matches!(
         request(&mut first, Request::ReleaseEgress { id: 2 }),
         Response::EgressRelease(_)
@@ -1087,7 +1095,7 @@ wait "$server_pid"
         let current = children(daemon.child.id());
         current.len() == 1
             && current != old
-            && std::fs::read_to_string(&child_pid).is_ok_and(|pid| pid != old_actual)
+            && read_pidfile(&child_pid).is_some_and(|pid| pid != old_actual)
             && facts.exists()
     });
     let replacement = children(daemon.child.id());
