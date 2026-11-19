@@ -1834,6 +1834,529 @@ fn the_shard_check_finds_the_pinned_file_in_a_listing_longer_than_a_pipe_holds()
     }
 }
 
+/// The shells a shard-script test runs under: `bash` from `PATH`, and the
+/// system `/bin/bash` when it is another program (bash 3.2 on macOS, the
+/// oldest the script's header promises).
+#[cfg(unix)]
+fn shard_script_shells() -> Vec<PathBuf> {
+    let mut shells = vec![PathBuf::from("bash")];
+    let system = PathBuf::from("/bin/bash");
+    if system.is_file() {
+        shells.push(system);
+    }
+    shells
+}
+
+/// A synthetic checkout for the shard script's `--with` arms: a copy of the
+/// script and a `crates/` tree whose packages each break one rule.
+#[cfg(unix)]
+fn with_tree() -> tempfile::TempDir {
+    let root = tempfile::tempdir().expect("a synthetic checkout");
+    let write = |rel: &str, text: &str| {
+        let path = root.path().join(rel);
+        std::fs::create_dir_all(path.parent().expect("a parent directory"))
+            .expect("the file's directory");
+        std::fs::write(&path, text).expect("a synthetic file");
+    };
+    let script = std::fs::read_to_string(repo_root().join("tools/scripts/ci_test_shard.sh"))
+        .expect("read tools/scripts/ci_test_shard.sh");
+    write("tools/scripts/ci_test_shard.sh", &script);
+    let manifest = |name: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n");
+    // The shard's package: three files, so shard 1 of 4 holds `b` and shard 3
+    // holds none.
+    write("crates/core/Cargo.toml", &manifest("core"));
+    for t in ["a", "b", "c"] {
+        write(&format!("crates/core/tests/{t}.rs"), "");
+    }
+    // Two clean extras. `ok` carries a binary with `test = false`, a
+    // `#[cfg(test)]` (not a test) and inline code in a doc comment (not a block).
+    write(
+        "crates/fx/ok/Cargo.toml",
+        &format!(
+            "{}\n[[bin]]\nname = \"p\"\npath = \"tests/ui/p.rs\"\ntest = false\n",
+            manifest("ok")
+        ),
+    );
+    write(
+        "crates/fx/ok/src/lib.rs",
+        "//! Inline `code` only.\n#[cfg(test)]\nmod t {}\n",
+    );
+    write("crates/fx/ok/tests/ok_one.rs", "");
+    write("crates/fx/ok/tests/ok_two.rs", "");
+    write("crates/fx/ok/tests/ui/p.rs", "fn main() {}\n");
+    write("crates/fx/ok2/Cargo.toml", &manifest("ok2"));
+    write("crates/fx/ok2/tests/ok2_t.rs", "");
+    // One package per refusal, each with a test file of its own name so the
+    // refusal is the only thing wrong with it.
+    let broken: &[(&str, &str, &str)] = &[
+        ("ut1", "src/lib.rs", "#[test]\nfn t() {}\n"),
+        (
+            "ut2",
+            "src/lib.rs",
+            "#[tokio::test(flavor = \"multi_thread\")]\nasync fn t() {}\n",
+        ),
+        ("ut3", "src/lib.rs", "#[test_log::test]\nfn t() {}\n"),
+        ("ut4", "src/lib.rs", "#[rstest]\nfn t() {}\n"),
+        ("dc1", "src/lib.rs", "//! ```\n//! let x = 1;\n//! ```\n"),
+        (
+            "dc2",
+            "src/lib.rs",
+            "/// ~~~\n/// let x = 1;\n/// ~~~\npub fn f() {}\n",
+        ),
+        ("dc3", "src/lib.rs", "#[doc = \"text\"]\npub fn f() {}\n"),
+        (
+            "dc4",
+            "src/lib.rs",
+            "#![doc = include_str!(\"../README.md\")]\n",
+        ),
+        ("dc5", "src/lib.rs", "/** text */\npub fn f() {}\n"),
+        ("nm", "tests/sub/main.rs", ""),
+        ("col", "tests/b.rs", ""),
+    ];
+    for (name, rel, text) in broken {
+        write(&format!("crates/fx/{name}/Cargo.toml"), &manifest(name));
+        write(&format!("crates/fx/{name}/{rel}"), text);
+        if *name != "col" {
+            write(&format!("crates/fx/{name}/tests/{name}_t.rs"), "");
+        }
+    }
+    write(
+        "crates/fx/tt/Cargo.toml",
+        &format!(
+            "{}\n[[test]]\nname = \"extra\"\npath = \"t/extra.rs\"\n",
+            manifest("tt")
+        ),
+    );
+    write("crates/fx/tt/tests/tt_t.rs", "");
+    write(
+        "crates/fx/bn/Cargo.toml",
+        &format!(
+            "{}\n[[bin]]\nname = \"p\"\npath = \"tests/ui/p.rs\"\n",
+            manifest("bn")
+        ),
+    );
+    write("crates/fx/bn/tests/bn_t.rs", "");
+    write("crates/fx/nt/Cargo.toml", &manifest("nt"));
+    write("crates/fx/et/Cargo.toml", &manifest("et"));
+    std::fs::create_dir_all(root.path().join("crates/fx/et/tests")).expect("an empty tests dir");
+    // Two manifests that claim one name.
+    write("crates/d1/Cargo.toml", &manifest("dup"));
+    write("crates/d1/tests/d.rs", "");
+    write("crates/d2/Cargo.toml", &manifest("dup"));
+    write("crates/d2/tests/d.rs", "");
+    // A stub `cargo` that prints the command it was handed, and a
+    // `cargo-nextest` for the script's install check.
+    write(
+        "stub/cargo",
+        "#!/bin/sh\nprintf 'cargo'; printf ' %s' \"$@\"; printf '\\n'\n",
+    );
+    write("stub/cargo-nextest", "#!/bin/sh\nexit 0\n");
+    for stub in ["stub/cargo", "stub/cargo-nextest"] {
+        let path = root.path().join(stub);
+        let mut perms = std::fs::metadata(&path).expect("the stub").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).expect("make the stub executable");
+    }
+    root
+}
+
+/// Run the synthetic checkout's script: `(exit code, stdout, stderr)`.
+#[cfg(unix)]
+fn run_with_tree(
+    shell: &Path,
+    root: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, String, String) {
+    let mut cmd = std::process::Command::new(shell);
+    cmd.arg(root.join("tools/scripts/ci_test_shard.sh"))
+        .args(args)
+        .current_dir(root)
+        .env_remove("CI_SELECTED_PACKAGES")
+        .env_remove("CI_TEST_SHARD_EXTRA")
+        .env_remove("CI_TEST_SHARD_ARCHIVE")
+        .env_remove("CI_TEST_SHARD_ARCHIVE_RUSTC")
+        .env_remove("CI_TEST_SHARD_ARCHIVE_PROFILE_DEBUG")
+        .env_remove("CI_TEST_SHARD_EXTRACT_DIR")
+        .env_remove("CARGO_PROFILE_DEV_DEBUG")
+        .env(
+            "PATH",
+            format!(
+                "{}:{}",
+                root.join("stub").display(),
+                std::env::var("PATH").unwrap_or_default()
+            ),
+        );
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
+    let out = cmd.output().expect("run the synthetic shard script");
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// `--with`: each package rides the selection on its own, in command-line
+/// order, the shard's own `-p` only with a target after it, and the archive
+/// filterset joins one clause per riding package. Every vector is written out
+/// by hand.
+#[cfg(unix)]
+#[test]
+fn a_with_package_rides_the_selection_on_its_own() {
+    let tree = with_tree();
+    let root = tree.path();
+    let lines = |v: &[&str]| v.iter().map(|l| format!("{l}\n")).collect::<String>();
+    let core_b = ["-p", "core", "--test", "b"];
+    let ok = ["-p", "ok", "--test", "ok_one", "--test", "ok_two"];
+    let both: Vec<&str> = core_b.iter().chain(ok.iter()).copied().collect();
+    let skip_core = |sel: &str| format!("selection: skipped core shard 1 (selected: {sel})\n");
+    let skip_ok =
+        |sel: &str| format!("selection: skipped ok beside core shard 1 (selected: {sel})\n");
+    let cases: Vec<(Vec<&str>, Option<&str>, String, String)> = vec![
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            None,
+            lines(&both),
+            String::new(),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            Some("[\"core\"]"),
+            lines(&core_b),
+            skip_ok("[\"core\"]"),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            Some("[\"ok\"]"),
+            lines(&ok),
+            skip_core("[\"ok\"]"),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok"],
+            Some("[]"),
+            String::new(),
+            format!("{}{}", skip_core("[]"), skip_ok("[]")),
+        ),
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok2", "--with", "ok"],
+            Some("[\"ok\", \"ok2\"]"),
+            lines(&[
+                "-p", "ok2", "--test", "ok2_t", "-p", "ok", "--test", "ok_one", "--test", "ok_two",
+            ]),
+            skip_core("[\"ok\", \"ok2\"]"),
+        ),
+        // Shard 3 holds none of core's files: core's `-p` would select every
+        // test it has, so only the extra is named.
+        (
+            vec!["--list", "core", "3", "4", "--with", "ok"],
+            None,
+            lines(&ok),
+            String::new(),
+        ),
+        // The package directory may come before or after `--with`.
+        (
+            vec!["--list", "core", "1", "4", "--with", "ok", "crates/core"],
+            None,
+            lines(&both),
+            String::new(),
+        ),
+    ];
+    for shell in shard_script_shells() {
+        for (args, sel, stdout, stderr) in &cases {
+            let env: Vec<(&str, &str)> = sel
+                .map(|s| ("CI_SELECTED_PACKAGES", s))
+                .into_iter()
+                .collect();
+            let got = run_with_tree(&shell, root, args, &env);
+            assert_eq!(
+                got,
+                (Some(0), stdout.clone(), stderr.clone()),
+                "{} {args:?} under selection {sel:?}",
+                shell.display()
+            );
+        }
+        // The run mode hands that vector to nextest, and says what it runs.
+        let (code, stdout, _) =
+            run_with_tree(&shell, root, &["core", "3", "4", "--with", "ok"], &[]);
+        assert_eq!(code, Some(0), "{}", shell.display());
+        assert!(
+            stdout.contains("shard 3/4 of core holds none of its files")
+                && stdout.contains("shard 3/4 of core, running ok\n")
+                && stdout
+                    .contains("cargo nextest run --profile ci -p ok --test ok_one --test ok_two\n"),
+            "{}: {stdout}",
+            shell.display()
+        );
+        // With no extra riding, an empty shard is still the EMPTY notice.
+        let (code, stdout, _) = run_with_tree(
+            &shell,
+            root,
+            &["core", "3", "4", "--with", "ok"],
+            &[("CI_SELECTED_PACKAGES", "[\"core\"]")],
+        );
+        assert_eq!(code, Some(0));
+        assert!(
+            stdout.contains("is EMPTY") && !stdout.contains("cargo nextest"),
+            "{stdout}"
+        );
+        // The archive mode: one clause per riding package.
+        let archive = root.join("a.tar.zst");
+        std::fs::write(&archive, "").expect("a stand-in archive");
+        let archive = archive.display().to_string();
+        let (code, stdout, _) = run_with_tree(
+            &shell,
+            root,
+            &["--list", "core", "1", "4", "--with", "ok"],
+            &[("CI_TEST_SHARD_ARCHIVE", archive.as_str())],
+        );
+        assert_eq!(code, Some(0));
+        assert_eq!(
+            stdout.lines().last(),
+            Some("(package(core) and (binary(=b))) or (package(ok) and (binary(=ok_one) + binary(=ok_two)))"),
+            "{stdout}"
+        );
+        let (_, stdout, _) = run_with_tree(
+            &shell,
+            root,
+            &["--list", "core", "1", "4", "--with", "ok"],
+            &[
+                ("CI_TEST_SHARD_ARCHIVE", archive.as_str()),
+                ("CI_SELECTED_PACKAGES", "[\"ok\"]"),
+            ],
+        );
+        assert_eq!(
+            stdout.lines().last(),
+            Some("package(ok) and (binary(=ok_one) + binary(=ok_two))"),
+            "{stdout}"
+        );
+    }
+}
+
+/// Every refusal of `--with`, each from a package that breaks only that rule,
+/// with its exit code and message; and `#[cfg(test)]` plus inline doc code
+/// pass (the `ok` package carries both).
+#[cfg(unix)]
+#[test]
+fn every_with_refusal_names_the_package_and_the_rule() {
+    let tree = with_tree();
+    let root = tree.path();
+    let cases: &[(&[&str], &str)] = &[
+        (&["--with"], "--with needs a package name"),
+        (&["--with", "-x"], "--with needs a package name (got '-x')"),
+        (
+            &["--with", "core"],
+            "--with core names the shard's own package",
+        ),
+        (
+            &["--with", "ok", "--with", "ok"],
+            "--with ok is given twice",
+        ),
+        (
+            &["--with", "nosuch"],
+            "--with nosuch: 0 manifests under crates/ name that package",
+        ),
+        (
+            &["--with", "dup"],
+            "--with dup: 2 manifests under crates/ name that package",
+        ),
+        (&["--bogus"], "unknown option '--bogus'"),
+        (
+            &["crates/core", "crates/core"],
+            "a second package directory",
+        ),
+        (
+            &["--with", "ut1"],
+            "--with ut1: crates/fx/ut1/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "ut2"],
+            "--with ut2: crates/fx/ut2/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "ut3"],
+            "--with ut3: crates/fx/ut3/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "ut4"],
+            "--with ut4: crates/fx/ut4/src/lib.rs holds a unit test",
+        ),
+        (
+            &["--with", "dc1"],
+            "--with dc1: crates/fx/dc1/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc2"],
+            "--with dc2: crates/fx/dc2/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc3"],
+            "--with dc3: crates/fx/dc3/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc4"],
+            "--with dc4: crates/fx/dc4/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "dc5"],
+            "--with dc5: crates/fx/dc5/src/lib.rs holds a doc comment code block",
+        ),
+        (
+            &["--with", "tt"],
+            "--with tt: crates/fx/tt/Cargo.toml declares a [[test]] target",
+        ),
+        (
+            &["--with", "nm"],
+            "--with nm: crates/fx/nm/tests/sub/main.rs is a test target",
+        ),
+        (
+            &["--with", "bn"],
+            "--with bn: a [[bin]] in crates/fx/bn/Cargo.toml lacks `test = false`",
+        ),
+        (
+            &["--with", "nt"],
+            "--with nt: crates/fx/nt/tests does not exist",
+        ),
+        (
+            &["--with", "et"],
+            "--with et: crates/fx/et/tests holds no *.rs files",
+        ),
+        (
+            &["--with", "col"],
+            "--with col: tests/b.rs shares its name with crates/core/tests/b.rs",
+        ),
+    ];
+    for shell in shard_script_shells() {
+        for (extra, message) in cases {
+            let args: Vec<&str> = ["--list", "core", "1", "4"]
+                .iter()
+                .chain(extra.iter())
+                .copied()
+                .collect();
+            let (code, stdout, stderr) = run_with_tree(&shell, root, &args, &[]);
+            assert!(
+                code == Some(2) && stdout.is_empty() && stderr.contains(message),
+                "{} {args:?}: expected exit 2 and {message:?}, got {code:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                shell.display()
+            );
+        }
+        // Shard 0 carries `--lib`, which cargo would hand to the extra.
+        let (code, _, stderr) = run_with_tree(
+            &shell,
+            root,
+            &["--list", "core", "0", "4", "--with", "ok"],
+            &[],
+        );
+        assert!(
+            code == Some(2) && stderr.contains("--with on shard 0"),
+            "{}: {code:?} {stderr}",
+            shell.display()
+        );
+    }
+}
+
+/// The repository's own CI shape: shard 2 with `--with node_macro_ui` names
+/// that package and each of its `tests/*.rs`, read off the disk here, and adds
+/// no `--lib`.
+#[cfg(unix)]
+#[test]
+fn the_shipped_with_package_brings_every_test_file_it_has() {
+    let dir = repo_root().join("crates/test_fixtures/node_macro_ui/tests");
+    let mut files: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        .map(|entry| entry.expect("a directory entry").path())
+        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
+        .map(|path| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .expect("a stem")
+                .to_owned()
+        })
+        .collect();
+    files.sort();
+    assert!(!files.is_empty(), "{} holds no test file", dir.display());
+    for shell in shard_script_shells() {
+        let out = std::process::Command::new(&shell)
+            .arg(repo_root().join("tools/scripts/ci_test_shard.sh"))
+            .args([
+                "--list",
+                "cerulion_core",
+                "2",
+                "4",
+                "--with",
+                "node_macro_ui",
+            ])
+            .current_dir(repo_root())
+            .env_remove("CI_SELECTED_PACKAGES")
+            .env_remove("CI_TEST_SHARD_ARCHIVE")
+            .output()
+            .expect("run tools/scripts/ci_test_shard.sh --list");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{}: {}",
+            shell.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let args: Vec<&str> = stdout.lines().collect();
+        let at = args
+            .windows(2)
+            .position(|pair| pair == ["-p", "node_macro_ui"])
+            .unwrap_or_else(|| panic!("no `-p node_macro_ui` in:\n{stdout}"));
+        let mut named: Vec<String> = args[at + 2..]
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "--test", "after `-p node_macro_ui`: {pair:?}");
+                pair[1].to_owned()
+            })
+            .collect();
+        named.sort();
+        assert_eq!(named, files, "{}", shell.display());
+        assert!(
+            !args.contains(&"--lib"),
+            "shard 2 carries no --lib:\n{stdout}"
+        );
+    }
+}
+
+/// Every `binary_id(=<package>::<binary>)` in `.config/nextest.toml` names a
+/// `tests/<binary>.rs` of a member: a renamed file would leave the override
+/// matching nothing, and nextest would say nothing.
+#[test]
+fn every_nextest_binary_id_names_a_test_file() {
+    let config = std::fs::read_to_string(repo_root().join(".config/nextest.toml"))
+        .expect("read .config/nextest.toml");
+    let members = packages_with_tests();
+    let mut checked = 0usize;
+    for line in config.lines() {
+        let code = line.split('#').next().unwrap_or("");
+        let mut rest = code;
+        while let Some(at) = rest.find("binary_id(=") {
+            rest = &rest[at + "binary_id(=".len()..];
+            let end = rest.find(')').expect("a closing parenthesis");
+            let id = &rest[..end];
+            let (package, binary) = id
+                .split_once("::")
+                .unwrap_or_else(|| panic!("`{id}` is not <package>::<binary>"));
+            let dir = members.get(package).unwrap_or_else(|| {
+                panic!("`{id}` names `{package}`, which is no member with tests")
+            });
+            assert!(
+                dir.join("tests").join(format!("{binary}.rs")).is_file(),
+                "`{id}` names {}/tests/{binary}.rs, which does not exist",
+                dir.display()
+            );
+            checked += 1;
+            rest = &rest[end..];
+        }
+    }
+    assert!(
+        checked >= 1,
+        "no binary_id(=...) in .config/nextest.toml was read"
+    );
+}
+
 /// Split a command tail into arguments, treating a whole `${{ ... }}`
 /// expression as ONE argument.
 ///

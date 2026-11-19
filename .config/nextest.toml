@@ -156,25 +156,34 @@ filter = '''
 + binary(=streaming_latency_bench_test)
 '''
 threads-required = 'num-cpus'
+# First in the run, each alone, before anything long has started; see the
+# next block for why the order matters.
+priority = 100
 
 # ---------------------------------------------------------------------------
-# The `#[cerulion_node]` trybuild suites start first.
+# The `#[cerulion_node]` trybuild suites start next.
 #
 # The diagnostics suite's compile-fail test and the node context helper
 # suite ride the `cerulion_core` shard's invocation (`ci_test_shard.sh ...
 # --with node_macro_ui --with test_node_macro_cdylib`, shard 2 of both lanes);
 # each holds a test that runs trybuild over its fixtures, the first for
-# minutes. nextest starts tests in binary order, and both binaries sort after
-# every `cerulion_core` binary, so at the default priority they would start
-# only once every core test had started, and run on alone. A higher priority
-# starts them first, the diagnostics suite before the helper suite (equal
-# priority keeps binary order), and the core tests run beside them. They join
-# no test group and claim one slot each, so they fence nothing, and
-# `slow-timeout` below reports them without ending them.
+# minutes. nextest starts tests in priority order and, within one priority,
+# in binary order, and both binaries sort after every `cerulion_core` binary,
+# so at the default priority they would start only once every core test had
+# started, and run on alone. nextest's queue does not start a later test past
+# the one at its head, and a test that claims every slot (the block above)
+# waits at the head until every running test ends, so one queued after a
+# minutes-long test holds every other test back that long. Hence the order:
+# the slot-claiming timing tests first (100), then these two (99, the
+# diagnostics suite before the helper suite by binary order), then the rest
+# beside them. They join no group and claim one slot each, so they fence
+# nothing, and `slow-timeout` below reports them without ending them. A test
+# in `cli_engine`'s coverage suite holds every `binary_id` here to a real test
+# file.
 # ---------------------------------------------------------------------------
 [[profile.default.overrides]]
 filter = 'binary_id(=node_macro_ui::compile_fail) | binary_id(=test_node_macro_cdylib::context_helpers)'
-priority = 100
+priority = 99
 
 # ---------------------------------------------------------------------------
 # Run-shape defaults.

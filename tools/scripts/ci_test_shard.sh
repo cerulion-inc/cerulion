@@ -47,12 +47,26 @@
 # the same cargo invocation. The `#[cerulion_node]` diagnostics suite and the
 # node context helper suite ride shard 2 of both lanes this way: each holds a
 # test that runs trybuild over its fixtures, for minutes in the diagnostics
-# suite, and an override in `.config/nextest.toml` starts them first. An extra package adds `-p <package> --test <name>` for each of its
+# suite, and `.config/nextest.toml` starts them right after the timing tests
+# that claim every slot. An extra package adds `-p <package> --test <name>` for each of its
 # `tests/*.rs` at depth 1. Cargo applies `--lib` and every `--test` to all the
-# packages one command selects, so the script refuses an extra that holds a
-# unit test or a doctest under `src/` (neither could run here), or a
-# `tests/*.rs` named like one of this package's (cargo would run that file of
-# this package too). Each package is read against the selection on its own.
+# packages one command selects, so the script refuses `--with` on shard 0,
+# which carries `--lib`, and refuses an extra that holds a test this
+# invocation could not run (see `check_extra`), or a `tests/*.rs` named like
+# one of this package's (cargo would run that file of this package too). Each
+# package is read against the selection on its own.
+#
+# THE EXTRAS' FEATURES ARE MEASURED, NOT GATED. Building an extra in this
+# invocation unions its dev-dependency features into this package's test
+# build. For `node_macro_ui` that union adds nothing: its dev-dependencies ask
+# for `test-helpers` on `cerulion_core` and `native_ros2_messages`, which
+# `cerulion_core`'s own test build already turns on. To check it again after
+# an extra's manifest changes, compare two unit graphs of the shard-2 build,
+# `cargo test --no-run $(ci_test_shard.sh --list cerulion_core 2 4) --unit-graph
+# -Z unstable-options` with and without `--with <extra>` inside the `$( )`
+# (on stable cargo, with `__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly`
+# set): every unit both graphs hold must carry the same features, and the
+# second may add only the extra's own units.
 #
 # USAGE
 #   ci_test_shard.sh <package> <shard_index> <shard_count> [package_dir] [--with <extra>]...
@@ -382,8 +396,7 @@ shard_riders() {
 # whose `[package]` table carries that name. Anything but exactly one match is
 # fatal, because a `--with` that found no package would run nothing for it.
 package_dir_of() {
-    _hits=$(find crates -maxdepth 4 -name Cargo.toml -print | LC_ALL=C sort | while IFS= read -r _manifest; do
-        case "$_manifest" in */target/*) continue ;; esac
+    _hits=$(find crates -maxdepth 4 -name Cargo.toml -not -path '*/target/*' -print | LC_ALL=C sort | while IFS= read -r _manifest; do
         if awk -v want="$1" '
             /^\[/ { inpkg = ($0 == "[package]"); next }
             inpkg && /^name[ \t]*=/ {
@@ -400,18 +413,38 @@ package_dir_of() {
 }
 
 # Refuse an extra package (name $1, directory $2) whose tests this invocation
-# could not run in full: a unit test or a doctest under `src/` (cargo builds an
-# extra's library tests only under `--lib`, which would select the shard
-# package's own, and nextest runs no doctest), or an integration test named like
-# one of the shard package's (`--test` selects that name in every package of
-# the command). The forms are the ones the coverage walk in
-# `cerulion_cli_engine/tests/ci_test_coverage_test.rs` reads as tests. Called in
-# this shell, so `die` ends the script.
+# could not run in full:
+#   * a test attribute under `src/` (`#[test]`, `#[<path>::test]`,
+#     `#[test_case`, `#[rstest`): cargo builds an extra's library and binary
+#     tests only under `--lib` or `--bins`, which would select the shard
+#     package's own;
+#   * a doctest's possible source under `src/`: a fenced block (three
+#     backticks or tildes) in a `//!` or `///` comment, any `#[doc`/`#![doc`
+#     attribute (a `#[doc = "..."]` string or an `include_str!` can hold a
+#     block too) or a `/**`/`/*!` block comment, because nextest runs no
+#     doctest;
+#   * a test target the depth-1 list does not name: a `[[test]]` table, a
+#     `tests/<dir>/main.rs`, or a `[[bin]]` without `test = false`;
+#   * an integration test named like one of the shard package's, because
+#     `--test` selects that name in every package of the command.
+# The test attribute forms include the ones the coverage walk in
+# `cerulion_cli_engine/tests/ci_test_coverage_test.rs` reads as tests. Called
+# in this shell, so `die` ends the script.
 check_extra() {
-    _unit=$(grep -rlF -e '#[test]' -e '#[tokio::test' -e '#[test_case' -e '#[rstest' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
+    _unit=$(grep -rlE -e '#\[([A-Za-z_][A-Za-z0-9_]*::)*test[](]' -e '#\[(test_case|rstest)' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
     [ -z "$_unit" ] || die "--with $1: $_unit holds a unit test, which this invocation cannot run (move it to $2/tests/)"
-    _doc=$(grep -rlE '^[[:space:]]*//[/!].*```' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
-    [ -z "$_doc" ] || die "--with $1: $_doc holds a doc comment code block, and nextest runs no doctest"
+    _doc=$(grep -rlE -e '^[[:space:]]*//[/!].*(```|~~~)' -e '#!?\[doc' -e '/\*[*!]' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
+    [ -z "$_doc" ] || die "--with $1: $_doc holds a doc comment code block or a doc attribute, and nextest runs no doctest"
+    grep -q '^\[\[test\]\]' "$2/Cargo.toml" \
+        && die "--with $1: $2/Cargo.toml declares a [[test]] target, which the tests/*.rs list does not name"
+    _nested=$(find "$2/tests" -mindepth 2 -maxdepth 2 -name main.rs -print 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
+    [ -z "$_nested" ] || die "--with $1: $_nested is a test target the tests/*.rs list does not name"
+    awk '
+        /^\[/ { if (inbin && !off) bad = 1; inbin = ($0 == "[[bin]]"); off = 0; next }
+        inbin && /^test[ \t]*=[ \t]*false/ { off = 1 }
+        END { if (inbin && !off) bad = 1; exit bad }' "$2/Cargo.toml" \
+        || die "--with $1: a [[bin]] in $2/Cargo.toml lacks \`test = false\`, so its tests would run only under --bins"
+    [ -d "$2/tests" ] || die "--with $1: $2/tests does not exist, so it would add nothing to the shard"
     _xtests=$(enumerate "$2")
     [ -n "$_xtests" ] || die "--with $1: $2/tests holds no *.rs files, so it would add nothing to the shard"
     while IFS= read -r _xt; do
@@ -680,6 +713,8 @@ require_index "shard index" "$INDEX"
 require_index "shard count" "$COUNT"
 [ "$COUNT" -ge 1 ] || die "shard count must be >= 1 (got '$COUNT')"
 [ "$INDEX" -lt "$COUNT" ] || die "shard index $INDEX is out of range for $COUNT shard(s)"
+[ "$INDEX" -ne 0 ] || [ -z "$EXTRAS" ] \
+    || die "--with on shard 0: that shard carries --lib, and cargo would hand it to every --with package too"
 
 # THE SELECTION, before anything is enumerated or built, in the run mode and
 # in `--list` alike. One line with the fixed `selection:` prefix for each
@@ -688,7 +723,7 @@ require_index "shard count" "$COUNT"
 # `--with` package rides on its own reading: a change that selects only the
 # diagnostics suite runs that suite and none of this package's files.
 #
-# The workflow step that runs this shard is deliberately NOT gated by an `if:`:
+# The workflow step that runs this shard is deliberately NOT gated on the selection:
 # `cerulion_core` observes the whole repository tree (its whole-tree walks,
 # `serial_discipline_test` among them, read every `.rs` file in the source tree), and
 # `tools/ci/observation_edges.tsv` records it as observing `all`; a package
@@ -744,7 +779,8 @@ TOTAL_TESTS=$(printf '%s\n' "$ALL_TESTS" | grep -c . || true)
     || die "$PKG_DIR/tests holds no *.rs files — nothing to shard (pass the package DIRECTORY as the 4th argument if it differs from the package name)"
 
 # Every `--with` package, checked whether or not it rides, so a wrong one fails
-# on every change rather than only on the changes that select it.
+# on every change that runs any package of this invocation, not only on the
+# changes that select it. A change that runs none exited above.
 # `<package>:<directory>` pairs, space separated.
 EXTRA_PAIRS=
 for _extra in $EXTRAS; do
@@ -797,6 +833,8 @@ artifacts."
 fi
 
 # Read the argument vector into a positional list (bash 3.2 has no readarray).
+# RUNNING collects the packages that bring at least one target to it.
+RUNNING=
 set -- # clear
 OLDIFS=$IFS
 IFS='
@@ -850,10 +888,12 @@ if [ -n "$ARCHIVE" ]; then
     if [ -n "$_filter" ]; then
         _clauses="package($PACKAGE) and ($_filter)"
         _nclauses=1
+        RUNNING=$PACKAGE
     fi
     IFS=$OLDIFS
     for _pair in $EXTRA_PAIRS; do
         rides "${_pair%%:*}" || continue
+        RUNNING="${RUNNING:+$RUNNING }${_pair%%:*}"
         _filter=""
         for t in $(enumerate "${_pair#*:}"); do
             _filter="${_filter:+$_filter + }binary(=$t)"
@@ -882,11 +922,13 @@ else
             for a in $_own; do
                 set -- "$@" "$a"
             done
+            RUNNING=$PACKAGE
         fi
     fi
     IFS=$OLDIFS
     for _pair in $EXTRA_PAIRS; do
         rides "${_pair%%:*}" || continue
+        RUNNING="${RUNNING:+$RUNNING }${_pair%%:*}"
         set -- "$@" -p "${_pair%%:*}"
         for t in $(enumerate "${_pair#*:}"); do
             set -- "$@" --test "$t"
@@ -920,7 +962,14 @@ if [ $# -eq "$_empty_argc" ]; then
 fi
 
 if [ -n "$EXTRAS" ]; then
-    printf 'ci_test_shard: shard %s/%s of %s, running %s\n' "$INDEX" "$COUNT" "$PACKAGE" "$RIDERS"
+    case " $RUNNING " in
+        *" $PACKAGE "*) ;;
+        *)
+            rides "$PACKAGE" && printf 'ci_test_shard: shard %s/%s of %s holds none of its files (fewer test files than shards)\n' \
+                "$INDEX" "$COUNT" "$PACKAGE"
+            ;;
+    esac
+    printf 'ci_test_shard: shard %s/%s of %s, running %s\n' "$INDEX" "$COUNT" "$PACKAGE" "$RUNNING"
 else
     printf 'ci_test_shard: shard %s/%s of %s\n' "$INDEX" "$COUNT" "$PACKAGE"
 fi
