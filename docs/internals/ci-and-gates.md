@@ -536,10 +536,11 @@ packages that way rebuilds every crate they share (`cerulion_core` and the third
 under it, up to a dozen times per leg). The runner builds a group of packages in ONE cargo
 invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 
-* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run` over the group's
-  packages, then `cargo test` over the same packages with the script as cargo's target
-  runner. That recording run compiles nothing; for each test binary it records the
-  environment and working directory cargo gives it, in cargo's run order. Cargo then runs
+* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run --timings` over the
+  group's packages, so the job's timing report covers the grouped compile, then
+  `cargo test` over the same packages with the script as cargo's target runner. That
+  recording run compiles nothing; for each test binary it records the environment and
+  working directory cargo gives it, in cargo's run order. Cargo then runs
   the group's doctests against the libraries the build compiled; rustdoc hands each doctest
   it runs to the same runner, which runs any binary outside the target directory. They run
   without a step's `-- --test-threads=1` or env. A package builds
@@ -576,6 +577,25 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 * **Reclaim.** `reclaim` deletes the executables in `target/debug/deps` except the prebuilt
   binaries a later step still runs, libraries (`.so`, `.so.N`, `.dylib`, `.dll`, `.rlib`, `.a`)
   and cargo's `.rmeta` and `.d` files.
+
+Every `test-linux` and `test-macos` leg uses it: the step `Build this shard's package tests
+once and run their doctests` builds the leg's packages, every package step runs through
+`run`, and the leg ends with the audit. `cerulion_core` keeps its own build in its shard step,
+unchanged. A Lint step runs `check-workflow .github/workflows/ci.yml`.
+
+* **Groups.** One unified build changes some packages' features: a package's tests link a
+  shared crate with the union of what every package of the group enables. The unions in
+  these legs are additive APIs or test seams that stay inert until a test arms them: among
+  them `test-helpers` and `test-seams`, `jazzy` and `live` on `cerulion_dds`, `default` and
+  `wan` on `cerulion_netd`'s library (macOS shard 1 links it into the `cerulion_cli_engine`,
+  `cerulion_cli_tui` and `cerulion_connectd` tests), `test-util` on tokio, and a second
+  rustls provider beside the ring one every client installs. The one that switches
+  behavior is `cerulion_viz`'s `decoder-from-source`, so `cerulion_vizd` builds in a group
+  of its own on macOS shard 2.
+* **Doctests here.** The executing doctests of these legs (`native_ros2_messages`,
+  `cerulion_bag`, `cerulion_cli_engine`) belong to packages whose steps pass no
+  `--test-threads=1`, so they run as they did.
+* **Disk.** The pre-wan reclaim on Linux shard 3 runs `reclaim`.
 
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
