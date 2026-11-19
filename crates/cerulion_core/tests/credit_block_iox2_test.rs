@@ -2578,6 +2578,56 @@ fn prc_a_held_period_producer_polls_no_faster_than_the_millisecond_floor() {
     assert_eq!(fires(&rt), 0, "still held: nothing fired");
 }
 
+/// The period-park (`CERULION_PERIOD_PARK=1`) stays off for a producer that
+/// waits on a cross-process credit word: the peer's drain cannot end a kernel
+/// nap, so the park keeps running exactly as with the switch off, and the drain
+/// still wakes it through the credit word.
+#[test]
+#[serial]
+fn prc_the_period_park_stays_off_for_a_credit_waiting_producer() {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let w = supervisor_word("ppoff", "consumer", "inp", DEPTH as u32);
+    let clock = Arc::new(VirtualClock::new());
+    let bind = [binding(
+        &w.producer_side,
+        "consumer",
+        "inp",
+        DEPTH,
+        CreditRole::Producer,
+    )];
+    let mgr = manager("cb_ppoff_p", ix, Arc::clone(&clock));
+    let (cfg, fac) = producer_graph("cbpo");
+    let mut rt = GraphRuntime::build_live_free_run(
+        cfg,
+        fac,
+        &mgr,
+        Arc::clone(&clock) as Arc<dyn Clock>,
+        None,
+        forced_park_policy(),
+        CrossProcessWiring::with_credit(None, &bind),
+    )
+    .expect("build the producer context with its credit binding");
+    rt.set_period_park_for_test(Some(true));
+    w.producer_side.record_published_n(DEPTH);
+    let credit_before = rt.park_wakes_credit_count_for_test();
+    let peer = Arc::clone(&w.consumer_side);
+    let drainer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(PARK_ENTRY_SETTLE_MS));
+        peer.record_drained(1);
+    });
+    rt.run_live_step_once_for_test(Duration::from_millis(PARK_WINDOW_MS));
+    drainer.join().expect("the drainer thread");
+    assert_eq!(
+        rt.period_park_stats_for_test(),
+        cerulion_core::graph::PeriodParkStats::default(),
+        "the period-park planned no block for a credit-waiting producer"
+    );
+    assert!(
+        rt.park_wakes_credit_count_for_test() > credit_before,
+        "the drain still woke the park through the credit word"
+    );
+}
+
 /// THE NO-FALSE-WAKE CONTROL — and the reason the predicate is gated on
 /// was-full-at-park-entry rather than on the word's state alone.
 ///

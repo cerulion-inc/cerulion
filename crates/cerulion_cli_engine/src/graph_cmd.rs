@@ -7096,6 +7096,9 @@ pub fn graph_run(
                 clock.clone(),
                 Some(&schema_hashes),
             )?;
+            // This single process owns the run: it reports what its one build
+            // left out of the nodes' environment.
+            runtime.node_env_left_out().warn();
             // Production trace cap — `--trace-limit` (defaults to
             // PRODUCTION_TRACE_LIMIT; 0 rejected at the CLI parse).
             runtime.set_trace_limit(trace_limit);
@@ -7243,6 +7246,9 @@ pub fn graph_run(
                     Some(&schema_hashes),
                     mw_policy,
                 )?;
+            // This single process owns the run: it reports what its one build
+            // left out of the nodes' environment.
+            runtime.node_env_left_out().warn();
             let gateway_child = establish_network_egress(
                 gateway_launch.as_ref(),
                 graph_name,
@@ -11592,6 +11598,10 @@ fn graph_run_supervisor(
         // the top of every recorded run read as the run's result.
         cerulion_core::graph::BuildPurpose::PlanningOnly,
     )?;
+    // The supervisor owns the run: it reports what the planning build left out
+    // of the nodes' environment, once, before any worker spawns. Each worker
+    // builds its subgraph from the same environment and reports nothing.
+    runtime.node_env_left_out().warn();
     // Snapshot the impure planner inputs, then tear the planning runtime down
     // (releases its ports). `Levels` is `Clone`. `shutdown` consumes the runtime.
     let levels = runtime.levels().clone();
@@ -15503,6 +15513,9 @@ pub fn graph_profile(
         Some(&schema_hashes),
         mw_policy,
     )?;
+    // This single process owns the profiling run: it reports what its one
+    // build left out of the nodes' environment.
+    runtime.node_env_left_out().warn();
     runtime.set_live_transport(transport.clone());
 
     // Size the trace ring for the profiling window: per-node target × nodes
@@ -22627,6 +22640,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
             mw_policy,
             Some(&recorded_set),
         )?;
+    // This single process owns the recorded run: it reports what its one build
+    // left out of the nodes' environment.
+    runtime.node_env_left_out().warn();
     configure_recording_runtime(&mut runtime, trace_limit)?;
 
     // CREATE and ARM this run's capture plane HERE,
@@ -29706,6 +29722,73 @@ process_groups:
                 "{other} must receive the resolved mode, never re-read the env"
             );
         }
+    }
+
+    /// The process that owns a run reports what its graph build left out of
+    /// the nodes' environment, once, and a worker never does.
+    ///
+    /// A build logs nothing about it (`cerulion_core`'s
+    /// `env_snapshot_isolation_test` pins that over real builds), so how often
+    /// the line prints is decided here, by which code path calls
+    /// `NodeEnvLeftOut::warn`: each single-process build of `graph_run` (the
+    /// virtual and the live arm), the single-process recording, `graph
+    /// profile`, and the supervisor after its planning build and before it
+    /// spawns any worker. Hand-written counts over the comment- and
+    /// literal-stripped source: the worker builds and reports nothing, so a
+    /// 3-worker run prints the line once, not four times.
+    #[test]
+    fn the_run_owner_reports_the_node_environment_once_and_a_worker_never_does() {
+        const REPORT: &str = ".node_env_left_out().warn()";
+        fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+            fn_body(src, sig).unwrap_or_else(|| panic!("`{sig}` must still exist"))
+        }
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let recording = body(
+            &src,
+            "fn run_graph_recording(run: RecordingRun) -> CliResult<()> {\n    let \
+             RecordingRun {\n        workspace_root,",
+        );
+        for (owner, builds, reports) in [
+            (body(&src, "pub fn graph_run("), 2, 2),
+            (recording, 1, 1),
+            (body(&src, "pub fn graph_profile("), 1, 1),
+            (body(&src, "fn graph_run_supervisor("), 1, 1),
+        ] {
+            assert_eq!(owner.matches("GraphRuntime::build").count(), builds);
+            assert_eq!(
+                owner.matches(REPORT).count(),
+                reports,
+                "one report per build of a process that owns its run"
+            );
+        }
+        let supervisor = body(&src, "fn graph_run_supervisor(");
+        let planning = supervisor
+            .find("BuildPurpose::PlanningOnly")
+            .expect("the supervisor's planning build");
+        let report = supervisor.find(REPORT).expect("the supervisor's report");
+        let spawn = supervisor
+            .find("spawn_order(&plan)")
+            .expect("the supervisor spawns workers in plan order");
+        assert!(
+            planning < report && report < spawn,
+            "the supervisor reports after its planning build and before any worker spawns"
+        );
+        let worker = body(&src, "fn graph_run_worker(");
+        assert_eq!(
+            worker.matches("GraphRuntime::build").count(),
+            3,
+            "the worker's three build paths"
+        );
+        assert_eq!(
+            worker.matches(REPORT).count(),
+            0,
+            "a worker reports nothing"
+        );
+        assert_eq!(
+            src.matches(REPORT).count(),
+            5,
+            "no other path in this file reports"
+        );
     }
 
     /// The checked rank → ring-header-rank conversion.

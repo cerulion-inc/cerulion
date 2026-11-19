@@ -6,6 +6,7 @@ mod completion;
 mod families;
 mod install_marker;
 mod network_switch;
+mod not_utf8_args;
 mod telemetry;
 mod telemetry_events;
 // Pins for the shell-facing WIRING (which arg carries
@@ -26,6 +27,7 @@ mod cfg_symmetry_tests;
 #[cfg(test)]
 mod clean_diagnostic_tests;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,7 +111,10 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let matches = families::cli_command().get_matches();
+    let matches = match families::cli_command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(e) => return exit_on_parse_error(e),
+    };
     // The internal workers `cerulion-netd` starts on a robot (first-serve
     // registration, the revocation sync): dispatched before telemetry,
     // logging and the login gate, so they never start a browser login, record
@@ -986,6 +991,25 @@ fn connect_exit_code(command: Commands) -> ExitCode {
     }
 }
 
+/// A clap parse error (a usage error, or `--help` / `--version` output),
+/// printed and exited as clap does it, except a usage error that refused an
+/// argument that is not valid UTF-8 (in a text field, in the place of a verb
+/// or a flag name, past the last argument a verb takes, or as a value given to
+/// a flag that takes none): clap's text for that names no position, so the
+/// refusal prints in its place, with clap's usage-error code, 2.
+/// [`not_utf8_args::refusal_for_parse_error`] decides, and while another
+/// argument holds a typed U+FFFD it replaces only the text-field error.
+fn exit_on_parse_error(e: clap::Error) -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    match not_utf8_args::refusal_for_parse_error(&e, &args) {
+        Some(refusal) => {
+            eprint!("{refusal}");
+            ExitCode::from(2)
+        }
+        None => e.exit(),
+    }
+}
+
 /// The raw-argv half of the `cerulion ros2` pass-through: recognize
 /// `cerulion [-v|--verbose]... ros2 run|launch [anything...]` and dispatch it
 /// WITHOUT clap, so every forwarded token — hyphenated or not — reaches the
@@ -996,17 +1020,18 @@ fn connect_exit_code(command: Commands) -> ExitCode {
 /// `tracing`); a runtime verb, so the `info` default applies.
 #[cfg(unix)]
 fn ros2_passthrough_intercept() -> Option<ExitCode> {
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os`: a forwarded argument keeps its bytes, UTF-8 or not.
+    let argv: Vec<OsString> = std::env::args_os().collect();
     let mut i = 1;
     let mut verbose = false;
     while i < argv.len() && (argv[i] == "-v" || argv[i] == "--verbose") {
         verbose = true;
         i += 1;
     }
-    if argv.get(i).map(String::as_str) != Some("ros2") {
+    if argv.get(i).is_none_or(|a| a != "ros2") {
         return None;
     }
-    let verb = match argv.get(i + 1).map(String::as_str) {
+    let verb = match argv.get(i + 1).and_then(|a| a.to_str()) {
         Some("run") => cerulion_cli_engine::ros2_cmd::Ros2NativeVerb::Run,
         Some("launch") => cerulion_cli_engine::ros2_cmd::Ros2NativeVerb::Launch,
         _ => return None,
@@ -1028,7 +1053,7 @@ fn ros2_passthrough_intercept() -> Option<ExitCode> {
 #[cfg(unix)]
 fn ros2_exit_code(
     verb: cerulion_cli_engine::ros2_cmd::Ros2NativeVerb,
-    args: Vec<String>,
+    args: Vec<OsString>,
 ) -> ExitCode {
     use cerulion_cli_engine::ros2_cmd;
     // ONE engine call: the ordering (refuse BEFORE staging) is the engine's
@@ -1063,7 +1088,7 @@ fn ros2_exit_code(
 #[cfg(not(unix))]
 fn ros2_exit_code(
     _verb: cerulion_cli_engine::ros2_cmd::Ros2NativeVerb,
-    _args: Vec<String>,
+    _args: Vec<OsString>,
 ) -> ExitCode {
     eprintln!(
         "Error: `cerulion ros2` is only supported on Unix platforms (LD_PRELOAD + rmw_cerulion \

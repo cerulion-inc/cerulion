@@ -5351,6 +5351,293 @@ fn env_names_only_null_var_absent_is_missing_divergence() {
     );
 }
 
+/// The bag the non-UTF-8 environment child replays. Set only on that child;
+/// the child test returns at once without it.
+const NON_UTF8_ENV_CHILD_BAG_ENV: &str = "CER_NON_UTF8_ENV_CHILD_BAG";
+
+/// The graph of that bag, as a [`ChildGraph`] spells it. Set only on that
+/// child.
+const NON_UTF8_ENV_CHILD_GRAPH_ENV: &str = "CER_NON_UTF8_ENV_CHILD_GRAPH";
+
+/// The graph a non-UTF-8 environment child replays, which picks its node
+/// factories.
+#[derive(Clone, Copy)]
+enum ChildGraph {
+    /// [`source_relay_yaml`]: one rank, one pass.
+    SourceRelay,
+    /// [`mp_three_source_yaml`] over the two ranks [`mp_rank_of`] assigns: two
+    /// passes, each its own graph build.
+    MpThreeSource,
+}
+
+impl ChildGraph {
+    fn as_str(self) -> &'static str {
+        match self {
+            ChildGraph::SourceRelay => "source_relay",
+            ChildGraph::MpThreeSource => "mp_three_source",
+        }
+    }
+}
+
+/// The node-environment warning, typed out by hand.
+const NODE_ENV_WARNING: &str = "node environment: variables whose name or value is not valid \
+                                UTF-8 are left out, so ctx.env and ctx.env_str return the \
+                                default for them";
+
+/// The start of the line on which that child prints its replay's
+/// `env_divergence`, serialized as the `--report` JSON writes it.
+const ENV_DIVERGENCE_LINE: &str = "ENV_DIVERGENCE_JSON=";
+
+/// The child: install the logging a default `cerulion bag play` installs
+/// (`cerulion=warn`, on stderr), replay the bag [`NON_UTF8_ENV_CHILD_BAG_ENV`]
+/// names with the factories of [`NON_UTF8_ENV_CHILD_GRAPH_ENV`] under this
+/// process's environment, which the parent seeds with variables that are not
+/// valid UTF-8, require a pass, and print every env divergence.
+#[test]
+#[ignore = "subprocess child of the non-UTF-8 environment resim arms"]
+#[serial]
+fn replay_non_utf8_env_child() {
+    let Some(bag) = std::env::var_os(NON_UTF8_ENV_CHILD_BAG_ENV) else {
+        return; // Not the re-executed child: a no-op.
+    };
+    let graph = std::env::var(NON_UTF8_ENV_CHILD_GRAPH_ENV).expect("the parent names the graph");
+    let make_factories = match graph.as_str() {
+        "source_relay" => source_relay_factories,
+        "mp_three_source" => mp_three_source_factories,
+        other => panic!("no child graph {other:?}"),
+    };
+    cerulion_core::init_logging(false, true);
+    let outcome = replay(std::path::Path::new(&bag), make_factories, None, None)
+        .expect("the child's replay runs");
+    assert!(
+        outcome.passed,
+        "env divergence never fails the run: {:?}",
+        outcome.violations
+    );
+    // A leading newline, because libtest's `--nocapture` progress line ends
+    // without one.
+    println!(
+        "\n{ENV_DIVERGENCE_LINE}{}",
+        serde_json::to_string(&outcome.env_divergence).expect("the entries serialize")
+    );
+}
+
+/// How long [`replay_in_child_with_env`] waits for its child before it kills
+/// the child and fails, reporting what the child printed.
+const REPLAY_CHILD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What one resim child printed.
+struct ReplayChildOutput {
+    /// The env divergence entries, as the `--report` JSON writes them.
+    env_divergence: Vec<serde_json::Value>,
+    /// The child's stderr, where its logging writes.
+    stderr: String,
+}
+
+impl ReplayChildOutput {
+    /// The lines of the child's stderr that carry [`NODE_ENV_WARNING`].
+    fn node_env_warnings(&self) -> Vec<&str> {
+        self.stderr
+            .lines()
+            .filter(|line| line.contains(NODE_ENV_WARNING))
+            .collect()
+    }
+}
+
+/// Replay `bag`, a bag of `graph`, in a re-executed child whose environment
+/// adds `vars` (raw bytes) and return what it printed. The child inherits this
+/// process's environment without `RUST_LOG`, so its logging takes the default
+/// filter, and without any variable whose name or value is not valid UTF-8,
+/// so the only such variables in the child are the ones in `vars`. Fails
+/// unless the child builds its graph, passes and exits 0.
+fn replay_in_child_with_env(
+    bag: &std::path::Path,
+    graph: ChildGraph,
+    vars: &[(&[u8], &[u8])],
+) -> ReplayChildOutput {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut cmd = std::process::Command::new(std::env::current_exe().expect("current_exe"));
+    cmd.args([
+        "--exact",
+        "replay_non_utf8_env_child",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1",
+    ])
+    .env(NON_UTF8_ENV_CHILD_BAG_ENV, bag)
+    .env(NON_UTF8_ENV_CHILD_GRAPH_ENV, graph.as_str())
+    .env("NO_COLOR", "1")
+    .env_remove("RUST_LOG");
+    for (name, value) in std::env::vars_os() {
+        if name.to_str().is_none() || value.to_str().is_none() {
+            cmd.env_remove(name);
+        }
+    }
+    for (name, value) in vars {
+        cmd.env(
+            std::ffi::OsStr::from_bytes(name),
+            std::ffi::OsStr::from_bytes(value),
+        );
+    }
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn the replay child");
+    // Each pipe drains on its own thread, so neither can fill while the other
+    // is read, and a killed child's output is still reported.
+    let drain = |mut pipe: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            pipe.read_to_end(&mut bytes)
+                .expect("read the replay child's pipe to its end");
+            bytes
+        })
+    };
+    let out = drain(Box::new(child.stdout.take().expect("the child's stdout")));
+    let err = drain(Box::new(child.stderr.take().expect("the child's stderr")));
+    let deadline = std::time::Instant::now() + REPLAY_CHILD_TIMEOUT;
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll the replay child") {
+            break Some(status);
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    let stdout_bytes = out.join().expect("the stdout reader");
+    let stderr_bytes = err.join().expect("the stderr reader");
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_bytes);
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "the replay child did not exit within {REPLAY_CHILD_TIMEOUT:?} and was killed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        )
+    });
+    assert!(
+        status.success(),
+        "the replay child must build its graph and pass (status {:?})\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status.code()
+    );
+    let line = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix(ENV_DIVERGENCE_LINE))
+        .unwrap_or_else(|| panic!("the child printed no {ENV_DIVERGENCE_LINE} line:\n{stdout}"));
+    ReplayChildOutput {
+        env_divergence: serde_json::from_str(line).expect("the child's env divergence is JSON"),
+        stderr: stderr.into_owned(),
+    }
+}
+
+/// A recorded hash of a value that is not valid UTF-8 matches the same bytes
+/// at replay: the resim builds its graph under that value, and under a NAME
+/// that is not valid UTF-8 beside it, and reports no divergence for the
+/// variable. The control: other bytes report `HashChanged` with both hashes,
+/// so the silent case is a real match and not a skipped compare. Each replay
+/// runs in a child, so the bytes are set only in the child's environment.
+#[test]
+#[serial]
+fn env_non_utf8_value_matching_its_recorded_hash_is_not_a_divergence() {
+    let rec = record_uniform(source_relay_yaml(), source_relay_factories, &[], 3);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("env_not_utf8.mcap");
+    // FNV-1a 64 of the bytes `ff fe` is `0a99c807b6f645b0`.
+    let env = serde_json::json!({
+        "CER_REPLAY_NOT_UTF8": {"redacted": true, "fnv64": "0a99c807b6f645b0"},
+    });
+    write_bag(&rec, &bag, Some(&serde_json::to_vec(&env).unwrap()));
+    let ours = |entries: Vec<serde_json::Value>| -> Vec<serde_json::Value> {
+        entries
+            .into_iter()
+            .filter(|entry| entry["name"] == "CER_REPLAY_NOT_UTF8")
+            .collect()
+    };
+
+    let same = replay_in_child_with_env(
+        &bag,
+        ChildGraph::SourceRelay,
+        &[
+            (b"CER_REPLAY_NOT_UTF8", b"\xff\xfe"),
+            (b"CER_REPLAY_NAME_\xff", b"v"),
+        ],
+    );
+    assert_eq!(
+        ours(same.env_divergence.clone()),
+        Vec::<serde_json::Value>::new(),
+        "the same bytes hash to the recorded value"
+    );
+    match same.node_env_warnings().as_slice() {
+        [line] => assert!(
+            line.contains(r#"names=["CER_REPLAY_NAME_\xFF", "CER_REPLAY_NOT_UTF8"]"#),
+            "{line}"
+        ),
+        other => panic!(
+            "one node-environment line: {other:#?}\nstderr:\n{}",
+            same.stderr
+        ),
+    }
+
+    // FNV-1a 64 of the bytes `ff fd` is `0a99cb07b6f64ac9`.
+    let changed = replay_in_child_with_env(
+        &bag,
+        ChildGraph::SourceRelay,
+        &[(b"CER_REPLAY_NOT_UTF8", b"\xff\xfd")],
+    );
+    assert_eq!(
+        ours(changed.env_divergence),
+        [serde_json::json!({
+            "name": "CER_REPLAY_NOT_UTF8",
+            "kind": {"kind": "HashChanged"},
+            "detail": "redacted variable 'CER_REPLAY_NOT_UTF8' hash changed since recording \
+                       (recorded 0a99c807b6f645b0, now 0a99cb07b6f64ac9)",
+            "read_by": null,
+        })]
+    );
+}
+
+/// A resim prints the node-environment line once, however many graphs it
+/// builds. A two-rank free-run bag replays as two passes in one process, one
+/// per rank, each its own graph build; under a name and a value that are not
+/// valid UTF-8 the line prints once, at the level a default `cerulion bag
+/// play` shows, naming both in byte order and carrying no value.
+#[test]
+#[serial]
+fn a_two_pass_resim_beside_non_utf8_variables_prints_the_node_environment_line_once() {
+    let rec = record_uniform(mp_three_source_yaml(), mp_three_source_factories, &[], 5);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("free_run_env_not_utf8.mcap");
+    write_free_run_skewed_bag(&rec, &bag, replay_engine::CoordinationMode::FreeRun);
+    let out = replay_in_child_with_env(
+        &bag,
+        ChildGraph::MpThreeSource,
+        &[
+            (b"CER_REPLAY_NAME_\xff", b"plainvalue"),
+            (b"CER_REPLAY_NOT_UTF8", b"\xffhunter2"),
+        ],
+    );
+    match out.node_env_warnings().as_slice() {
+        [line] => {
+            assert!(line.contains(" WARN "), "a WARN line: {line}");
+            assert!(
+                line.contains(r#"names=["CER_REPLAY_NAME_\xFF", "CER_REPLAY_NOT_UTF8"]"#),
+                "both names, in byte order: {line}"
+            );
+        }
+        other => panic!(
+            "one node-environment line for two passes: {other:#?}\nstderr:\n{}",
+            out.stderr
+        ),
+    }
+    for value in ["plainvalue", "hunter2"] {
+        assert!(
+            !out.stderr.contains(value),
+            "no value is printed, {value} was:\n{}",
+            out.stderr
+        );
+    }
+}
+
 /// The singular NOTE line, hand-written: one differing variable that no
 /// runtime Cerulion starts reads.
 const ENV_NOTE_ONE: &str = "NOTE: 1 other environment variable differs from the recording. \
