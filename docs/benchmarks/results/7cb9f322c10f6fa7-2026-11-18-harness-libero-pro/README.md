@@ -120,7 +120,7 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 | replies_tool_calls | replies of the scored attempt whose finish reason, as the model endpoint returned it, was `tool_calls`: a reply with a tool call |
 | replies_stop | replies whose finish reason was `stop`: the reply ended on its own |
 | replies_length | replies whose finish reason was `length`: the reply was cut off at the output limit |
-| replies_content_filter | replies whose finish reason was `content_filter`: the provider's content filter stopped the reply |
+| replies_content_filter | replies whose finish reason was `content_filter`: the provider's content filter stopped the reply, and every such reply here came back with no text and no tool call |
 | replies_other | replies with any other finish reason; the five replies columns add up to `requests` |
 | requests_no_reply | requests of the scored attempt that got no reply: a failed request (counted in failed_requests, sent again) or one the endpoint refused for a request field it does not take (sent again without the field) |
 | content_filter_at_end | the replies in a row at the end of the scored attempt that came back `content_filter`, 0 when its last reply did not; three replies in a row with no tool call end an episode, so 3 or more on an episode that ended `stopped_calling_tools` means the provider's content filter stopped every reply that ended it |
@@ -129,8 +129,9 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 
 - Both arms: 80 model replies, one tool call a reply, 900 control steps, temperature 1.0, high reasoning
   effort, the last 4 images kept in context, a 90 minute clock, environment seed 142 plus the start state,
-  sampling seed 1 sent with each model request. The endpoint of the four Claude models refused the seed field,
-  so it was dropped and every request that endpoint answered ran without a seed. Zero-shot: nothing learned on
+  sampling seed 1 sent with each model request. The endpoint of the four Claude models refused the seed and
+  parallel_tool_calls fields, so both were dropped and every request that endpoint answered ran without them (the
+  operator still ran only the first call of a reply). Zero-shot: nothing learned on
   any task is carried in. The score is the benchmark's own success predicate, read from the simulator's log
   after the episode. The model never sees it.
 - `without`: three tools (move_to, done, give_up) and the prompt of arXiv 2610.30051, word for word.

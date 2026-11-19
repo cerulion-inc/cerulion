@@ -444,8 +444,9 @@ def filtered_item(c, arm, f, name):
 
 def false_claims_filtered(cols, name):
     """The false-claim figures read with the content filter: for each arm whose unsolved episodes ended on filtered
-    replies (the model made no claim in them, true or false), its rate per unsolved episode with and without those
-    episodes beside the other arm's; then the pooled rate over every model and without the models of those arms."""
+    replies, whether a claim from the model reached any of them (ended_by claim), and its rate per unsolved episode
+    with and without those episodes beside the other arm's; then the pooled rate over every model and without the
+    models of those arms."""
     hit = [(c, arm, f) for c, arm, f in filtered_arms(cols) if f["ended_unsolved"]]
     if not hit:
         return []
@@ -454,10 +455,18 @@ def false_claims_filtered(cols, name):
         other = "with" if arm == "without" else "without"
         s, o, w, wo = c.stats(arm), c.stats(other), c.stats("with"), c.stats("without")
         left, fl = s["unsolved"] - f["ended_unsolved"], s["false_claims"] - f["ended_false_claims"]
+        ended_un = [e for e in f["ended"] if not int(e["solved"])]
+        by_model = sum(1 for e in ended_un if e["ended_by"] == "claim")
+        whole = all(e["ended_by"] == "stopped_calling_tools" and int(e["content_filter_at_end"]) >= STOP_STREAK
+                    for e in ended_un)
         L.append(f"- Read with the content filter: {c.model} {arm} {name} ended {f['ended_unsolved']} of its "
                  f"{s['unsolved']} unsolved episodes on filtered replies, and "
-                 + ("in those the model made no claim, true or false." if not f["ended_claims"] else
-                    f"the model claimed success in {f['ended_claims']} of those.")
+                 + (("no claim from the model reached any of them"
+                     + (": every reply that ended them came back content_filter, with no text and no tool call."
+                        if whole else "."))
+                    if not by_model else
+                    f"{by_model} of those ended on the model's own claim, {f['ended_claims']} of them a claim of "
+                    f"success.")
                  + f" Its false claims per unsolved episode: {s['false_claims']} of {s['unsolved']} "
                  f"({r3(s['false_claims'], s['unsolved'])}) with them counted, {fl} of the {left} "
                  f"that did not end that way ({r3(fl, left) or 'none left'}); {other} {name}, "

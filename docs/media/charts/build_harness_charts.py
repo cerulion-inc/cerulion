@@ -209,7 +209,8 @@ def filter_footer(filtered):
     for c, arm, f in named:
         s.append(f"{c.model} {arm} {NAME}: the provider's content filter stopped {f['content_filter']:,} of its "
                  f"{f['replies']:,} replies; {len(f['ended'])} of its {c.stats(arm)['scored']} scored episodes ended "
-                 f"on them" + (", with no claim from the model." if not f["ended_claims"] else "."))
+                 f"on them" + (", with no claim from the model."
+                               if not any(e["ended_by"] == "claim" for e in f["ended"]) else "."))
     if rest:
         n = sum(f["filtered"] for f in rest)
         word = NUMBER_WORDS.get(len(rest), str(len(rest))).capitalize()
