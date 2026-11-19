@@ -153,11 +153,19 @@ fn authorize_via_magic_link(port: u16, email: &CapturingEmailSender, user_code: 
 /// Log in for real against the running service and return the session-bearing
 /// [`AuthState`] (writes `auth.json`, `identity/device.key` (aliased as `desk.key`)
 /// and `device.cert` under the current `CERULION_HOME`).
+///
+/// The login runs inside a `login_cmd::PollWaitLog`: each device-flow poll wait
+/// records the interval it asked for and sleeps 5 ms in its place. accountd here
+/// sends `interval: 0` and never answers `slow_down`, so every recorded wait is
+/// the client's 1 s floor; the loop keeps polling until the code is authorized,
+/// so the number of waits varies.
 fn login(port: u16, email: &Arc<CapturingEmailSender>) -> AuthState {
     let buf = SharedBuf::new();
+    let waits = login_cmd::PollWaitLog::default();
     let worker = std::thread::spawn({
         let mut b = buf.clone();
-        move || login_cmd::run_login(&mut b)
+        let waits = waits.clone();
+        move || waits.shorten_during(|| login_cmd::run_login(&mut b))
     });
     let code = wait_for(
         || extract_user_code(&buf.snapshot()),
@@ -165,10 +173,16 @@ fn login(port: u16, email: &Arc<CapturingEmailSender>) -> AuthState {
     )
     .expect("run_login printed a user_code");
     authorize_via_magic_link(port, email, &code);
-    worker
+    let state = worker
         .join()
         .expect("worker thread")
-        .expect("login succeeds")
+        .expect("login succeeds");
+    let requested = waits.requested();
+    assert!(
+        !requested.is_empty() && requested.iter().all(|w| *w == Duration::from_secs(1)),
+        "every poll wait asks for the 1 s floor: {requested:?}"
+    );
+    state
 }
 
 // ===========================================================================

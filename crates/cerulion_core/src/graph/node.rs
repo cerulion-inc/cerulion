@@ -1687,8 +1687,10 @@ pub struct NodeContext {
     /// produce such a state; the only
     /// constructors are `with_runtime_env` (production canonical,
     /// fully-explicit) and `for_tests` (test-only, empty snapshot).
-    /// Code that genuinely needs live env must call
-    /// `with_runtime_env(.., Arc::new(std::env::vars().collect()))`.
+    /// Code that genuinely needs live env must build the map from
+    /// `std::env::vars_os()`, keeping each variable whose name and value
+    /// are valid UTF-8, and pass it to `with_runtime_env`;
+    /// `std::env::vars()` panics on the first variable that is not.
     /// The runtime does this automatically; only hand-rolled
     /// NodeContext callers need to supply it.
     env_snapshot: Arc<std::collections::HashMap<String, String>>,
@@ -2427,7 +2429,9 @@ impl NodeContext {
     /// Reads the snapshot of the environment taken when the graph was built,
     /// never live `std::env`, so every read in a run returns the same value; a
     /// resim takes the snapshot from the shell it runs in. A key that was unset
-    /// at build time returns `default` for the whole run.
+    /// at build time returns `default` for the whole run. A variable whose name
+    /// or value is not valid UTF-8 is not in the snapshot, so `ctx.env` and
+    /// `ctx.env_str` return the default for it.
     ///
     /// # Example
     ///
@@ -2486,7 +2490,9 @@ impl NodeContext {
     ///
     /// Reads from the runtime's frozen env snapshot, so every read in a run
     /// returns the same value. There is no live `std::env::var` fallback;
-    /// keys absent from the snapshot return `default`.
+    /// keys absent from the snapshot return `default`. A variable whose name
+    /// or value is not valid UTF-8 is not in the snapshot, so `ctx.env` and
+    /// `ctx.env_str` return the default for it.
     ///
     /// See [`Self::env`] for an example in a node's `init`.
     pub fn env_str(&self, key: &str, default: &str) -> String {
