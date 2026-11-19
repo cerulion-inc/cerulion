@@ -848,6 +848,11 @@ jobs:
       - name: Advisory issue bookkeeping self-test
         run: ./tools/scripts/test_advisory_issue.sh
 
+      # `nightly.yml` and `nightly-alarm.yml` run on a clock, so the script
+      # they share is pinned here, on every pull request.
+      - name: Nightly full run bookkeeping self-test
+        run: ./tools/scripts/test_nightly_full_run.sh
+
       # `queue-watchdog.yml` runs on merge-queue runs only, so its decision is
       # pinned here, on every pull request.
       - name: Queue run watchdog self-test

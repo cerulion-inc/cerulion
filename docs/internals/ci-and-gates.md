@@ -456,7 +456,8 @@ against the type it has to parse as by a unit test in
 `lint` runs: `cargo fmt --all --check` plus a workspace-root WALK
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
 `examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`;
-the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
+the hot-path alloc lint and its self-test; the advisory issue and nightly full run
+bookkeeping self-tests;
 the agent-docs gate; the leak guard's self-test and generic-class tree scan; the three
 crates.io script self-tests (the index wait, the publish retry, and the post-publish
 archive reader `release.yml` runs after an upload); the nextest, actionlint and cargo-deny
@@ -768,19 +769,50 @@ writes no report.
 
 ## Scheduled workflows
 
-Five workflows run on a clock, and none of them reports a required status context.
-Three of the five run on nothing but the clock and a manual dispatch:
-`.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy MoveIt image
-and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC runs the
-dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC labels and
-closes `needs-info` items. The fourth, `.github/workflows/examples-replay.yml`, runs
+Seven workflows run on a clock, and none of them reports a required status context.
+Five of the seven run on nothing but the clock and a manual dispatch:
+`.github/workflows/nightly.yml` at 03:30 UTC runs the nightly full run (below),
+`.github/workflows/nightly-alarm.yml` every six hours at minute 47 checks that it
+still runs, `.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy
+MoveIt image and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC
+runs the dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC
+labels and closes `needs-info` items. The sixth, `.github/workflows/examples-replay.yml`, runs
 the replay-tolerance demo at 07:30 UTC and ALSO on a push to `main` and on a pull
 request, both path-filtered to `examples/perception/**` and its own file, so for that
 one the clock is the second trigger rather than the only one: it is what notices a
 change outside the filter breaking the demo. Every minute is off the hour, where
-GitHub queues the world's hourly crons at once. The fifth,
+GitHub queues the world's hourly crons at once. The seventh,
 `.github/workflows/android-e2e.yml`, runs at 06:13 UTC and also on
 Android-affecting pushes and pull requests.
+
+`nightly.yml` dispatches `ci.yml` and `rmw-distros.yml` on `main` with the job's own token,
+so every job a push runs also runs once a day, and so does every distro lane, which a push
+outside `rmw-distros.yml`'s paths never starts. The clock is not in `ci.yml` itself because a
+workflow that reports a required context may trigger only on a pull request, a merge-queue
+batch, a push or a dispatch (`ci_test_coverage_test`). `tools/scripts/nightly_full_run.sh run`
+takes each run's id from the dispatch's answer, or, when the answer carries none, finds the one
+new dispatch run whose actor or triggering actor is the token's bot account; a dispatch that
+errors is sent again only when four reads of the listing show no new run. It waits for both
+runs, reading each attempt by its number so that a rerun someone else starts never stands in for
+it, reruns the failed jobs (as the attempt after the newest, which it then waits on) of a red run once (a failed step skips every later step of its
+job, and the rerun shows whether the failure repeats), and records the result on ONE issue
+labelled `bug`, found by the exact title `Nightly full run of main failed or did not run`. A
+red run, or one not finished after 330 minutes, opens that issue or comments on it, naming the
+failed jobs of each attempt; every run green on its first attempt comments on an open one and
+closes it. A job that passed only on the rerun is reported as failed on the first attempt, and
+no rerun is requested past the deadline. The script exits 0 once the result is recorded, red
+or green, or every run passed with no issue open to close, so a successful run of
+`nightly.yml` means a result was reached.
+
+`nightly-alarm.yml` runs `nightly_full_run.sh alarm` every six hours. It writes to the same
+issue when `nightly.yml` is not active, or when no run of it is in progress and none reached a
+result on `main` in the last 26 hours (counted from the workflow's creation until one has),
+naming the newest run when it did not succeed; it writes at most once a day. It lives in a
+file of its own, with a concurrency group of its own, so that a disabled or broken
+`nightly.yml` does not take the alarm with it and a queued alarm never replaces a queued
+nightly. Two open issues carrying the title hold both modes at exit 2 until one is closed. The
+script's oracle is `tools/scripts/test_nightly_full_run.sh`, cases over a `gh` shim with answer
+files per call, run as a step of `lint`.
 
 `advisories.yml` runs `cargo deny --format json --config tools/release/deny.toml
 check advisories` and nothing else. Licences, bans and sources are decided by
@@ -1066,6 +1098,7 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
+| `tools/scripts/test_nightly_full_run.sh` | the oracle table for `tools/scripts/nightly_full_run.sh`: every issue write of both modes (none, open, comment, comment and close) with its exact text; the run id taken from the dispatch's answer, and found by listing when the answer has none, late, by either actor field, and never a person's dispatch; a dispatch that errors after starting a run is not sent again, one that starts nothing is, and three that start nothing are refused; attempt 1 read by number when someone reran the run by hand, and the nightly's own rerun read at the attempt it started after a rerun by hand; a rerun's attempt answering 404 until it exists; a rerun that reads `completed` on the old attempt for a moment, a refused rerun, a rerun unfinished at the 330-minute deadline and none requested past it; a neutral job and a jobs page cut at 100; the alarm's findings, its silence while a nightly is in progress or in the workflow's first 26 hours, and its once-a-day limit; every refusal; and the same fixtures giving the same calls and text twice. The run ends on a case-count floor | n/a |
 | `tools/scripts/test_ci_queue_watchdog.sh` | the oracle table for `tools/scripts/ci_queue_watchdog.sh`: a failed, timed-out or cancelled required job cancels the run once under its rendered matrix name, read through the committed required list too; a failed job that is not required and a skipped required job cancel nothing; the first of two failed required jobs is the one named; the run itself is read only once no job is left running, and the watch ends when it has completed, with jobs or without any, and keeps going while jobs are still to be listed; the run is found by its commit, after a listing that holds only a run of another commit, and two runs or none are refused; a jobs read, a run read and a run listing each failing three times; a cancel retried, refused while the run runs, and refused because it had completed; a jobs page cut at 100; every argument and environment refusal, a missing `jq` and a base ref naming no branch among them, before any call; the exact waits between reads; the same answers giving the same calls twice. The batch liveness read, over a stubbed merge queue and compare: a live queue entry keeps the watch to the run's end and is never compared; dead on one poll then live cancels nothing; dead on two polls in a row (`ahead`, then `diverged`) cancels once, naming the commit, and a cancel refused because the run completed exits 0; off the queue once and then `behind` main, and `identical` with main on the first poll, never cancel and stop the queue reads; dead, live, dead cancels nothing; a queue read failing on every poll (a timeout), a failed read between two dead polls, a compare failing on every poll, a queue answer missing its entry list, an entry's head commit field or oid, its page flag or its next cursor, an oid that is not a string, a queue or compare body that is not JSON, and an unknown compare status each cancel nothing; a queue read or compare refused to the job token (`Resource not accessible`, a `FORBIDDEN` or an `INSUFFICIENT_SCOPES` error body) is read once, said, and turns only the dead check off, a failed required job still cancelling after either, while a rate-limit error body is retried; the first live read said once; the entry found on the second page through the first page's cursor, and a commit on no page read as dead; pages that never end read ten deep; the base branch read off the event for both the queue and the compare; the exact calls of each, the query's fields, and the same dead answers giving the same calls and output twice. The run ends on a case-count floor | n/a |
 | `tools/scripts/test_android_e2e_probe_verdict.sh` | the oracle table for `tools/scripts/android_e2e_probe_verdict.sh`, the verdict the Android emulator e2e applies to each run of the direct data demand probe: a passing report and every failing rule for each of the four expectations (`paired`, `open`, `schema-mismatch`, where every frame on the wire must die on the schema, and `connect`, the open rules over a link the app dialed), the `dialer=` field (missing or not `probe` or `app` is refused; `connect` needs `dialer=app`, every other expectation `dialer=probe`), every rule that holds for all four (every counted ack from the app's robot identity and none named without an ack, no ack from a peer the probe did not name because its peer set was full or the name too long, no more acks than demand passes, no more frames delivered or dropped on the schema than crossed the wire, no wire-header refusal, no decode, re-injection or LAN-posture drop), a report line that is absent, repeated, missing a field, carrying a field twice or a non-number or an `ack_peers=` that is not a list of robot names, `wire_frames=` never read as `frames=`, the three usage refusals (an unknown expectation, a missing argument, an app identity that is not a robot name), and the same report giving the same bytes twice. The run ends on a case-count floor | n/a |
 | `tools/scripts/test_android_release_docs.py` | the Android app copy step in `docs/android.md` against the root `Cargo.toml`: the app runtime example plus the root table's `iceoryx2*` entries parse as one `[patch.crates-io]` table, the same entries pasted under a second header do not parse, the root table holds entries beyond the `iceoryx2*` family (`re_grpc_server`), the family `cerulion workspace create` writes is the root table's family, and the step text says entries under the existing header and not a complete block; and the `CHANGELOG.md` entry for the empty trust-store MAC key, which appears once and names no key length | n/a |
