@@ -30,8 +30,13 @@ The form of both charts:
     without Cerulion reads "from 0%" on the success chart and "no figure" on the cost chart;
   - a model whose column had not finished at the package's read carries a star, and a footnote gives
     its finished counts and the read time;
+  - the success chart's footer counts the models that solved fewer start states with Cerulion and
+    names each under its verdict in the package's per-model SOLVED family (Holm over every model,
+    worded by the package's verdict()) with its exact p as the package prints it; a column still
+    running gets no verdict, as in the package;
   - the cost chart's footer says what its figure leaves out (the episodes that ended without a score
-    and every attempt in no row) and that part of each factor is caching.
+    and every attempt in no row) and for how many models part of the factor is caching: "each factor"
+    only when every model's arm without Cerulion had the lower cached share of input, else that count.
 """
 import decimal
 import html
@@ -119,11 +124,14 @@ def bar(y, width, fill, title):
 
 def rows_of(rc):
     _cells, cols, _uns = rc.columns(PACKAGE)
+    family = rc.holm({c.model: c.paired("solved")["p"] for c in cols})   # the grid's per-model SOLVED family
     out = []
     for c in cols:
         wo, wi = c.stats("without"), c.stats("with")
+        pr = c.paired("solved")
         out.append({"model": c.model, "complete": c.complete, "late": c.model in rc.ADDED_LATE, "without": wo,
-                    "with": wi})
+                    "with": wi, "p": None if pr["p"] is None else rc.fp(pr["p"]),
+                    "verdict": rc.verdict(pr, family.get(c.model), "solved") if c.complete else None})
     for r in out:
         if not r["without"]["finished"] or not r["with"]["finished"]:
             raise SystemExit(f"build_harness_charts: {r['model']} has an arm with no finished episode")
@@ -168,8 +176,24 @@ def star_footer(rows, when, cells):
                        f"start states finished without {NAME} and {r['with']['finished']} with.")
     late = [r["model"] for r in rows if r["late"]]
     if late:
-        out.append(f"\u2020 {', '.join(late)}: added to the grid after its first rows had been seen.")
+        out.append(f"\u2020 {', '.join(late)}: added after the grid's first rows had been seen.")
     return out
+
+
+def fewer_footer(rows, joined):
+    """The models that solved fewer start states with Cerulion, in the chart's order, each under the verdict the
+    package's per-model SOLVED family gives it, with its exact p as the package prints it. A column still running
+    gets no verdict, as in the package."""
+    fewer = [r for r in rows if r["with"]["solved"] < r["without"]["solved"]]
+    if not fewer:
+        return []
+    groups = {}
+    for r in fewer:
+        v = r["verdict"] if r["complete"] else "no verdict yet (still running)"
+        groups.setdefault(v, []).append(r["model"] + ("" if r["p"] is None else f" (p = {r['p']})"))
+    return [f"With {NAME}, {len(fewer)} of the {len(rows)} models solved fewer start states than without it. "
+            "Exact paired sign test on SOLVED, read after Holm's correction:",
+            "; ".join(f"{v} for {joined(ms)}" for v, ms in groups.items()) + "."]
 
 
 def scope(cells, task_rows):
@@ -183,7 +207,7 @@ def label(r):
     return r["model"] + ("" if r["complete"] else "*") + ("\u2020" if r["late"] else "")
 
 
-def success_chart(rows, when, cells, task_rows):
+def success_chart(rows, when, cells, task_rows, joined):
     def rate(s):
         return s["solved"] / s["finished"]
 
@@ -205,10 +229,9 @@ def success_chart(rows, when, cells, task_rows):
         return parts
 
     ticks = [(LEFT + k / 100 * (PCT_FULL - LEFT), f"{k}%") for k in range(0, 101, 20)]
-    below = any(rate(r["without"]) > rate(r["with"]) for r in rows)
     footer = ([f"Success rate: solved of finished episodes. The factor is the success rate with {NAME} over the "
                f"rate without."]
-              + ([f"Below 1.0× the model did a little better without {NAME}."] if below else [])
+              + fewer_footer(rows, joined)
               + star_footer(rows, when, cells))
     return frame(f"Success rate, without and with {NAME}",
                  scope(cells, task_rows)
@@ -260,14 +283,17 @@ def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd):
     lower_cache = sum(1 for r in rows if r["without"]["cached_share"] is not None
                       and r["with"]["cached_share"] is not None
                       and r["without"]["cached_share"] < r["with"]["cached_share"])
+    caching = (f"Part of each factor is caching: cached input costs less, and the arm without {NAME} had the lower "
+               f"cached share of input for {lower_cache} of the {len(rows)} models." if lower_cache == len(rows) else
+               f"Part of the factor is caching for the {lower_cache} of the {len(rows)} models whose arm without "
+               f"{NAME} had the lower cached share of input: cached input costs less.")
     footer = ["Model spend only; the simulator is not counted. Failed scored episodes are included: their cost is "
               "spread over the successes.",
               f"The {unscored} episodes that ended without a score and every attempt in no row are left "
               f"out (${fnum(lost_usd, 2)} of spend in all; lost_attempts.csv).",
               f"The factor is the cost per success without {NAME} over the cost with it."
               + (f" A broken bar runs past ${USD_CUT:.0f}." if broken else ""),
-              f"Part of each factor is caching: cached input costs less, and the arm without {NAME} had the lower "
-              f"cached share of input for {lower_cache} of the {len(rows)} models."] \
+              caching] \
         + star_footer(rows, when, cells)
     return frame(f"Model cost per successful episode, without and with {NAME}",
                  scope(cells, task_rows)
@@ -285,7 +311,7 @@ def main(argv):
     listed, _cols, uns = rc.columns(PACKAGE)
     task_rows = len({x["task_row"] for x in listed})
     lost_usd = sum(float(x["usd_list"]) for x in rc.load(PACKAGE, "lost_attempts.csv"))
-    outputs = {"harness-success-rate.svg": success_chart(rows, when, cells, task_rows),
+    outputs = {"harness-success-rate.svg": success_chart(rows, when, cells, task_rows, rc.joined),
                "harness-cost-per-success.svg": cost_chart(rows, when, cells, task_rows, rc.fnum, len(uns), lost_usd)}
     stale = []
     for name, svg in outputs.items():
