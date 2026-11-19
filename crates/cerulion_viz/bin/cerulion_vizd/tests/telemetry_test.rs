@@ -377,6 +377,7 @@ fn read_body(stream: &mut TcpStream) -> Option<serde_json::Value> {
 fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_budget() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let home = isolated_home("lifecycle");
+    let _restore = CiVarsCleared::new();
     let mut collector = Collector::start();
     let telemetry =
         Telemetry::start_with(loopback_client(&collector.host), Duration::from_millis(20))
@@ -448,6 +449,7 @@ fn start_sends_started_then_heartbeats_until_a_live_opt_out_and_stops_within_bud
 fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let home = isolated_home("abandon");
+    let _restore = CiVarsCleared::new();
     let mut collector = Collector::start();
     let host = collector.host.clone();
     let (release, blocked) = mpsc::channel::<()>();
@@ -495,6 +497,16 @@ fn a_start_still_blocked_at_the_deadline_is_abandoned_and_sends_nothing() {
 fn a_start_blocked_on_the_consent_lock_at_the_deadline_is_abandoned_and_sends_nothing() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let home = isolated_home("abandon-locked");
+    // Under CI detection the anonymous id comes from a per-process value that
+    // never takes the consent lock, so the starter would not block on the lock
+    // held below. The CI variables are cleared, and the precondition shows the
+    // consent file path is the one in use.
+    let _restore = CiVarsCleared::new();
+    assert!(
+        !cerulion_telemetry::ci::detected(),
+        "precondition: CI detection is off, so the starter reads its anonymous id \
+         from the consent file and blocks on the lock this arm holds"
+    );
     // Mint the consent file first, so the lock file exists to be held.
     consent::anon_id().expect("mint the consent file");
     let mut collector = Collector::start();
