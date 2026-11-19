@@ -23,7 +23,7 @@ Both run under the free Cerulion account, as the other `cerulion` commands do: r
 Every release package installs the harness folder beside `cerulion`: the install script, the release archives,
 the Debian package (`/usr/bin/harness`) and the Homebrew formula. A release's `cerulion` finds it there with no
 clone and no setting, and a `cerulion` built in a checkout of this repository finds that checkout's own
-([Where the harness lives](#where-the-harness-lives)).
+([Where the harness lives](#where-the-harness-lives)). A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder.
 
 ```bash
 cerulion login                                   # once, on this machine
@@ -48,6 +48,12 @@ Without `--http`, `cerulion rcp --sim` serves MCP over stdio, so a client can st
 
 ```bash
 claude mcp add cerulion-sim -- cerulion rcp --sim
+```
+
+For a `cerulion` installed with `cargo install`, pass the variable to the server the client starts:
+
+```bash
+claude mcp add cerulion-sim -e CERULION_HARNESS_DIR="$CERULION_HARNESS_DIR" -- cerulion rcp --sim
 ```
 
 Run `cerulion rcp --sim` once in a terminal before you add it this way: the first run installs the simulator
@@ -152,8 +158,9 @@ in this order:
    (`CARGO_TARGET_DIR`) does not, and needs `CERULION_HARNESS_DIR`.
 
 The current directory is never searched, so a folder you run `cerulion` in, such as a repository you downloaded,
-cannot supply a harness. Places 2 and 3 never take a folder that other users of the machine can write to, such
-as `/tmp`: the search for a checkout stops at the first one, so a `harness/` someone else put there never runs.
+cannot supply a harness. `CERULION_HARNESS_DIR` is taken as given. Places 2 and 3 never take a folder that every
+user of the machine can write to, such as `/tmp`: the search for a checkout stops at the first one, so a
+`harness/` someone else put there never runs.
 When none of the three holds a harness, the error names where it looked.
 
 The install writes inside the folder the harness runs from. Nothing writes into the folder beside the `cerulion`

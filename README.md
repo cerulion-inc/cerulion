@@ -83,7 +83,7 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 
 ## Try the harness
 
-Give your own model the Cerulion harness's tools on a simulated robot, through Cerulion's MCP server. Experimental. Every release package installs the harness folder beside `cerulion`, so there is nothing to clone or set:
+Give your own model the Cerulion harness's tools on a simulated robot, through Cerulion's MCP server. Experimental. Every release package installs the harness folder beside `cerulion`, so there is nothing to clone or set. Only a `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder. Then:
 
 ```bash
 cerulion login                                   # once, on this machine

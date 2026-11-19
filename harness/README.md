@@ -17,8 +17,9 @@ files, and nothing writes into it there: the first run copies it once to `harnes
 config directory and runs from the copy. A `cerulion` built in this checkout (`cargo run -p cerulion_cli -- rcp
 --sim`, or `target/debug/cerulion`) finds this folder from any directory, and `CERULION_HARNESS_DIR` points any
 `cerulion` at it; both run it in place while your user can write to it.
-The current directory is never searched for a harness, and the search takes nothing from a folder other users
-can write to.
+The current directory is never searched for a harness. `CERULION_HARNESS_DIR` is taken as given; this folder
+beside the binary, or in a checkout, is never taken from a folder that every user can write to, such as `/tmp`.
+A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder.
 
 ## What is in it
 
