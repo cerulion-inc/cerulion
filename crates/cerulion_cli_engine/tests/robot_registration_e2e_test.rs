@@ -31,6 +31,10 @@ use cerulion_cli_engine::error::CliError;
 use cerulion_cli_engine::{login_cmd, robot_cmd};
 use serial_test::serial;
 
+/// The stop flag of a revocation sync nothing stops.
+#[cfg(unix)]
+static NOT_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 // ===========================================================================
 // harness (self-contained, mirrors login_flow_e2e_test.rs)
 // ===========================================================================
@@ -944,7 +948,8 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
     // Refused loudly where no robot registration exists.
     let unregistered = home_path.join("not-a-robot");
     std::fs::create_dir(&unregistered).unwrap();
-    let err = robot_bootstrap::sync_epoch(&unregistered, &mut Vec::new()).unwrap_err();
+    let err =
+        robot_bootstrap::sync_epoch(&unregistered, &mut Vec::new(), &NOT_STOPPING).unwrap_err();
     assert!(
         err.to_string().contains("no robot registration exists"),
         "{err}"
@@ -955,7 +960,7 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
     let robot_id: [u8; 32] = hex::decode(&prepared.robot_id).unwrap().try_into().unwrap();
     // Nothing revoked yet: no epoch, nothing written.
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":null,\"version\":1}\n"
@@ -973,7 +978,7 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
     )
     .unwrap();
     // Refused while the remote-plane state is not provisioned; never created.
-    let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap_err();
+    let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap_err();
     assert!(err.to_string().contains("not provisioned"), "{err}");
     assert!(!root.join("remoted").exists());
     {
@@ -984,7 +989,7 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
             .unwrap();
     }
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -998,4 +1003,234 @@ fn the_robots_own_sync_fetches_its_revocations_and_refuses_without_a_registratio
         wire.signed_epoch.epoch_data.revoked_devices,
         vec![cerulion_pairing::format::PublicKey(revoked)]
     );
+}
+
+/// A pass-through proxy to `upstream` that holds its first connection until
+/// `release` is sent, then answers that connection's request with a bare 404;
+/// `arrived` fires once the connection is accepted. Later connections pass
+/// through.
+#[cfg(unix)]
+fn start_holding_proxy(
+    upstream: u16,
+) -> (
+    u16,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    use std::net::{Shutdown, TcpListener, TcpStream};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (arrived_tx, arrived) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let pipe = |client: TcpStream| {
+            let server = TcpStream::connect(("127.0.0.1", upstream)).unwrap();
+            let (mut client_in, mut server_out) =
+                (client.try_clone().unwrap(), server.try_clone().unwrap());
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut client_in, &mut server_out);
+                let _ = server_out.shutdown(Shutdown::Write);
+            });
+            let (mut server_in, mut client_out) = (server, client);
+            std::thread::spawn(move || {
+                let _ = std::io::copy(&mut server_in, &mut client_out);
+                let _ = client_out.shutdown(Shutdown::Write);
+            });
+        };
+        let mut first = true;
+        for client in listener.incoming() {
+            let Ok(mut client) = client else { continue };
+            if first {
+                first = false;
+                let _ = arrived_tx.send(());
+                let _ = release_rx.recv();
+                // Read the request head and body, then answer 404.
+                use std::io::{BufRead, BufReader, Read, Write};
+                let mut reader = BufReader::new(client.try_clone().unwrap());
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        length = v.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                let _ = reader.read_exact(&mut body);
+                let _ = client.write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = client.shutdown(Shutdown::Both);
+                continue;
+            }
+            pipe(client);
+        }
+    });
+    (port, arrived, release)
+}
+
+/// netd's stop signal reaches the real `cerulion robot-sync-epoch` while its
+/// first robot-proof request is in flight: the worker keeps running through it,
+/// and when that request then answers 404 it does not fall back to its stale
+/// login session: it refreshes nothing, says it was told to stop, and exits
+/// with a failure, not by the signal.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn the_revocation_sync_outlives_netds_stop_signal_and_then_refreshes_nothing() {
+    use cerulion_cli_engine::robot_bootstrap;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap());
+    let state = login(port, &email);
+    let root = home_path.join("robot-state");
+    robot_bootstrap::prepare(&root).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join("remoted"))
+        .unwrap();
+    // A stale session with a live refresh token: a fallback would refresh it.
+    let auth_path = home_path.join("auth.json");
+    let mut stale = state.clone();
+    stale.expires_at_ns = 1;
+    cerulion_cli_engine::auth::write_to(&auth_path, &stale).unwrap();
+
+    let (proxy, arrived, release) = start_holding_proxy(port);
+    let mut worker = ProcessGuard(
+        Command::new(built_binary("cerulion"))
+            .arg("robot-sync-epoch")
+            .arg("--state-root")
+            .arg(&root)
+            .env(
+                "CERULION_ACCOUNT_SERVICE",
+                format!("http://127.0.0.1:{proxy}"),
+            )
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the real revocation sync"),
+    );
+    arrived
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the challenge request reached the proxy");
+    // netd's stop signal while that request is held.
+    let signalled = Command::new("kill")
+        .args(["-TERM", &worker.0.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signalled.success());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        worker.0.try_wait().unwrap().is_none(),
+        "the worker outlived the stop signal"
+    );
+    release.send(()).unwrap();
+    let status = wait_for(|| worker.0.try_wait().unwrap(), Duration::from_secs(30))
+        .expect("the worker exited after its fetch");
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    use std::io::Read;
+    worker
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut stdout)
+        .unwrap();
+    worker
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_eq!(status.signal(), None, "{stderr}");
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the revocation sync was told to stop"),
+        "{stderr}"
+    );
+    assert!(stdout.is_empty(), "{stdout}");
+    assert_eq!(
+        cerulion_cli_engine::auth::load_from(&auth_path)
+            .state()
+            .unwrap(),
+        &stale,
+        "no refresh spent the stored token"
+    );
+}
+
+/// The real `cerulion robot-sync-epoch` logs to stderr. With this machine's
+/// certificate due and its login lapsed (expired, with a refresh token the
+/// service never issued), the sync still fetches with the robot's key and
+/// succeeds, and the renewal's failure warning reaches stderr, beside an
+/// hour's backoff recorded, with no colour codes on the pipe, while stdout
+/// carries only the result.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn the_revocation_sync_warns_on_stderr_when_a_due_renewal_cannot_run() {
+    use cerulion_cli_engine::device_cert_renewal::RENEW_WINDOW_ENV;
+    use cerulion_cli_engine::robot_bootstrap;
+    use std::os::unix::fs::DirBuilderExt;
+    use std::process::Command;
+
+    let email = Arc::new(CapturingEmailSender::new());
+    let port = start_accountd(email.clone());
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap());
+    let state = login(port, &email);
+    let root = home_path.join("robot-state");
+    robot_bootstrap::prepare(&root).unwrap();
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(root.join("remoted"))
+        .unwrap();
+    let mut lapsed = state.clone();
+    lapsed.expires_at_ns = 1;
+    lapsed.refresh_token = "a-refresh-token-the-service-never-issued".into();
+    cerulion_cli_engine::auth::write_to(&home_path.join("auth.json"), &lapsed).unwrap();
+
+    let output = bounded_output(
+        Command::new(built_binary("cerulion"))
+            .arg("robot-sync-epoch")
+            .arg("--state-root")
+            .arg(&root)
+            .env(RENEW_WINDOW_ENV, "2592000")
+            .env_remove("RUST_LOG")
+            .env_remove("NO_COLOR"),
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(output.status.success(), "{stderr}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "{\"epoch\":null,\"version\":1}\n"
+    );
+    assert!(
+        stderr.contains("this machine's device certificate could not be renewed"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains('\u{1b}'),
+        "no colour codes on a pipe: {stderr:?}"
+    );
+    assert!(home_path.join(".device-renew.failed").exists());
 }

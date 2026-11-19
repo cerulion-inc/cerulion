@@ -116,21 +116,26 @@ fn main() -> ExitCode {
         Err(e) => return exit_on_parse_error(e),
     };
     // The internal workers `cerulion-netd` starts on a robot (first-serve
-    // registration, the revocation sync): dispatched before telemetry,
-    // logging and the login gate, so they never start a browser login, record
-    // no event, and their JSON stdout carries nothing else. The engine
-    // requires an existing login.
+    // registration, the revocation sync): dispatched before telemetry and the
+    // login gate, so they never start a browser login, record no event, and
+    // their JSON stdout carries nothing else. The engine requires an existing
+    // login. The revocation sync logs to stderr, which netd passes through, at
+    // its verb class's default level and in colour only on a terminal;
+    // first-serve registration's stderr is netd's error text and carries only
+    // its error.
     #[cfg(unix)]
     if matches!(
         matches.subcommand_name(),
         Some("bootstrap-robot" | "robot-sync-epoch")
     ) {
-        let worker = match Cli::from_arg_matches(&matches)
-            .unwrap_or_else(|e| e.exit())
-            .command
-        {
+        let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        let quiet_default = cli.command.log_verb_class().is_quiet_default();
+        let worker = match cli.command {
             Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
-            Commands::RobotSyncEpoch { state_root } => robot_sync_epoch(&state_root),
+            Commands::RobotSyncEpoch { state_root } => {
+                cerulion_core::init_worker_logging(cli.verbose, quiet_default);
+                robot_sync_epoch(&state_root)
+            }
             _ => unreachable!("the subcommand name selected an internal worker"),
         };
         return match worker {
@@ -1189,9 +1194,28 @@ fn bootstrap_robot(state_root: &std::path::Path) -> CliResult<()> {
     cerulion_cli_engine::robot_bootstrap::run(state_root, &mut std::io::stdout().lock())
 }
 
+/// The revocation sync netd runs for a registered robot. netd's stop sends it
+/// SIGTERM: the handler only sets `stopping`, after which the sync starts no
+/// session refresh or certificate renewal, and an exchange in flight finishes
+/// inside netd's stop grace.
 #[cfg(unix)]
 fn robot_sync_epoch(state_root: &std::path::Path) -> CliResult<()> {
-    cerulion_cli_engine::robot_bootstrap::sync_epoch(state_root, &mut std::io::stdout().lock())
+    let stopping = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stopping);
+    if let Err(e) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
+        // Without the handler, netd's stop signal would end the sync in the
+        // middle of an exchange, so this run spends no refresh token at all.
+        stopping.store(true, Ordering::SeqCst);
+        eprintln!(
+            "warning: the revocation sync cannot watch for netd's stop signal, so it refreshes \
+             no session and renews no certificate this run: {e}"
+        );
+    }
+    cerulion_cli_engine::robot_bootstrap::sync_epoch(
+        state_root,
+        &mut std::io::stdout().lock(),
+        &stopping,
+    )
 }
 
 fn run(cli: Cli) -> CliResult<()> {
