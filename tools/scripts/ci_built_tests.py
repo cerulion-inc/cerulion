@@ -305,15 +305,25 @@ def workflow_complaints(text):
                 if re.search(r'\bcargo (test|build|nextest|check)\b', line) and not re.match(r'\s+- name:', line) \
                         and 'ci_built_tests.py run --' not in line and 'ci_built_tests.py phase' not in line:
                     out.append(f'{job}: cargo outside a declared build step: {line.strip()}')
-            for pkg, rest in re.findall(r'ci_built_tests\.py run -- cargo test -p (\S+)(.*)', st):
+            for cmd in re.findall(r'ci_built_tests\.py run -- (cargo test\b.*)', st):
+                # The runner's own reader, so the check accepts exactly the
+                # command lines `run` does.
+                quiet, sys.stderr = sys.stderr, io.StringIO()
+                try:
+                    sel = parse_cargo_test(cmd.split())
+                except SystemExit:
+                    out.append(f'{job}: the runner refuses `{cmd.strip()}`: {sys.stderr.getvalue().strip()}')
+                    continue
+                finally:
+                    sys.stderr = quiet
+                pkg = sel['package']
                 if not seen_build:
                     out.append(f'{job}: `{pkg}` runs before the build step')
                 cond = (re.search(r'^\s+if: (.*)$', st, re.M) or re.search('()', '')).group(1)
                 gate = re.findall(r"contains\(fromJSON\(needs\.changes\.outputs\.pkgs\), '([^']+)'\)", cond)
                 if gate and gate != [pkg]:
                     out.append(f'{job}: the `{pkg}` step is gated on {gate}')
-                feats = [f if '/' in f else f'{pkg}/{f}' for v in re.findall(r'--features[ =](\S+)', rest)
-                         for f in v.split(',') if f]
+                feats = sel['features']
                 for leg in [int(x) for x in re.findall(r'matrix\.shard == (\d+)', cond)] or legs:
                     ran[leg][pkg] = (not gate, feats)
         for leg in legs:
@@ -654,6 +664,11 @@ def self_test():
         run: python3 ci_built_tests.py audit --floor 3
 """)
     check('wiring: a consistent job', workflow_complaints(good), [])
+    for spelling in ('--package a', '--locked -p a'):
+        check(f'wiring: the runner\'s spelling `{spelling}` reads as `-p a`',
+              workflow_complaints(good.replace('run -- cargo test -p a', f'run -- cargo test {spelling}')), [])
+    check('wiring: a run line the runner refuses', len(workflow_complaints(
+        good.replace('run -- cargo test -p a', 'run -- cargo test -p a --release'))), 2)
     check('wiring: comma feature lists compare as sets', workflow_complaints(
         good.replace('--features b/w', '--features b/v,b/w').replace('--features w --', '--features v,w --')), [])
     for name, bad, want in (
