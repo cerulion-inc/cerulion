@@ -530,8 +530,11 @@ tests by priority, then in binary order, and its queue does not start a test pas
 at its head, where a test that claims every slot waits for every running test to end; so
 `.config/nextest.toml` gives the timing tests that claim every slot priority 100 and the
 two suites' test binaries 99 (at the default priority they sort after every
-`cerulion_core` binary and would start last). On the other shards the timing tests then
-run first, each alone, which costs no slot they would not have waited for anyway.
+`cerulion_core` binary and would start last), in a `trybuild` test group of one slot: the
+suites share `target/tests/trybuild`, and each re-checks its fixtures when the other has
+run there since, so at the same time they took several times as long as one after the
+other. On the other shards the timing tests run first, each alone, which costs no slot
+they would not have waited for anyway.
 Cargo applies `--lib` and each `--test` to every package one command selects, so the
 script refuses `--with` on shard 0, which carries `--lib`, and an extra package that holds
 a test attribute, a doctest source or a test target outside `tests/*.rs` (see `check_extra`

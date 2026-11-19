@@ -2256,37 +2256,27 @@ fn every_with_refusal_names_the_package_and_the_rule() {
     }
 }
 
-/// The repository's own CI shape: shard 2 with `--with node_macro_ui` names
-/// that package and each of its `tests/*.rs`, read off the disk here, and adds
-/// no `--lib`.
+/// The repository's own CI shape: shard 2 with `--with node_macro_ui --with
+/// test_node_macro_cdylib` names each package and each of its `tests/*.rs`,
+/// read off the disk here, in that order, and adds no `--lib`.
 #[cfg(unix)]
 #[test]
-fn the_shipped_with_package_brings_every_test_file_it_has() {
-    let dir = repo_root().join("crates/test_fixtures/node_macro_ui/tests");
-    let mut files: Vec<String> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
-        .map(|entry| entry.expect("a directory entry").path())
-        .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
-        .map(|path| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .expect("a stem")
-                .to_owned()
-        })
-        .collect();
-    files.sort();
-    assert!(!files.is_empty(), "{} holds no test file", dir.display());
+fn the_shipped_with_packages_bring_every_test_file_they_have() {
+    let shipped = [
+        (
+            "node_macro_ui",
+            repo_root().join("crates/test_fixtures/node_macro_ui/tests"),
+        ),
+        (
+            "test_node_macro_cdylib",
+            repo_root().join("crates/test_fixtures/test_node_macro_cdylib/tests"),
+        ),
+    ];
     for shell in shard_script_shells() {
         let out = std::process::Command::new(&shell)
             .arg(repo_root().join("tools/scripts/ci_test_shard.sh"))
-            .args([
-                "--list",
-                "cerulion_core",
-                "2",
-                "4",
-                "--with",
-                "node_macro_ui",
-            ])
+            .args(["--list", "cerulion_core", "2", "4"])
+            .args(shipped.iter().flat_map(|(package, _)| ["--with", *package]))
             .current_dir(repo_root())
             .env_remove("CI_SELECTED_PACKAGES")
             .env_remove("CI_TEST_SHARD_ARCHIVE")
@@ -2300,22 +2290,47 @@ fn the_shipped_with_package_brings_every_test_file_it_has() {
             String::from_utf8_lossy(&out.stderr)
         );
         let args: Vec<&str> = stdout.lines().collect();
-        let at = args
-            .windows(2)
-            .position(|pair| pair == ["-p", "node_macro_ui"])
-            .unwrap_or_else(|| panic!("no `-p node_macro_ui` in:\n{stdout}"));
-        let mut named: Vec<String> = args[at + 2..]
-            .chunks(2)
-            .map(|pair| {
-                assert_eq!(pair[0], "--test", "after `-p node_macro_ui`: {pair:?}");
-                pair[1].to_owned()
-            })
-            .collect();
-        named.sort();
-        assert_eq!(named, files, "{}", shell.display());
         assert!(
             !args.contains(&"--lib"),
             "shard 2 carries no --lib:\n{stdout}"
+        );
+        let mut after = 0usize;
+        for (package, dir) in &shipped {
+            let mut files: Vec<String> = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .map(|entry| entry.expect("a directory entry").path())
+                .filter(|path| path.is_file() && path.extension().is_some_and(|ext| ext == "rs"))
+                .map(|path| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .expect("a stem")
+                        .to_owned()
+                })
+                .collect();
+            files.sort();
+            assert!(!files.is_empty(), "{} holds no test file", dir.display());
+            let at = args
+                .windows(2)
+                .position(|pair| pair == ["-p", *package])
+                .unwrap_or_else(|| panic!("no `-p {package}` in:\n{stdout}"));
+            assert!(
+                at >= after,
+                "`-p {package}` is out of command-line order:\n{stdout}"
+            );
+            let named: Vec<String> = args[at + 2..]
+                .chunks(2)
+                .take_while(|pair| pair[0] == "--test")
+                .map(|pair| pair[1].to_owned())
+                .collect();
+            after = at + 2 + 2 * named.len();
+            let mut named = named;
+            named.sort();
+            assert_eq!(named, files, "{} {package}", shell.display());
+        }
+        assert_eq!(
+            after,
+            args.len(),
+            "arguments after the last package:\n{stdout}"
         );
     }
 }
