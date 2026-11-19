@@ -1291,3 +1291,166 @@ pub fn assert_single_bag(recordings: &Path) -> PathBuf {
     );
     bags.into_iter().next().unwrap()
 }
+
+/// One read stage's checkpoint window heads in a bag: the records it staged in
+/// each head's step, against its rim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowHeadOccupancy {
+    /// `r<rank>:<node>[<input>]/<body|drain>`.
+    pub stage: String,
+    /// The stage's rim, from its rank manifest's `read_log_capacities` row.
+    pub rim: u32,
+    /// The most records the stage staged in one window head's step.
+    pub max_occupancy: usize,
+    /// Window heads at which the stage staged at least one record.
+    pub windows: usize,
+    /// Overflow markers the stage staged at window heads.
+    pub truncated: usize,
+}
+
+impl WindowHeadOccupancy {
+    /// The one line a measurement prints per stage.
+    pub fn line(&self) -> String {
+        format!(
+            "WINDOW_HEADS stage={} rim={} max_occupancy={} windows={} truncated={}",
+            self.stage, self.rim, self.max_occupancy, self.windows, self.truncated
+        )
+    }
+}
+
+/// A read stage in a bag: `(rank, node, input index, stage role byte)`, the
+/// role byte as `read_log_capacities` rows write it (0 body, 1 drain).
+type RimKey = (u32, String, u16, u8);
+
+/// One stage's records per window head's step, and its overflow markers there.
+#[derive(Default)]
+struct StageHeads {
+    per_step: BTreeMap<u64, usize>,
+    truncated: usize,
+}
+
+/// PURE: per read stage, the records each checkpoint window head held.
+///
+/// A window head is a step whose STEP_BOUNDARY record on a rank sets bit 0 of
+/// `global_level` (`STEP_BOUNDARY_FLAG_RUNS_REOPENED`): its recorder reopened
+/// every read site's writer run right before that step. A stage stages one
+/// merge window per step, so the READ_OUTCOME records of a rank and a head's
+/// step that a stage holds are that head's window, each record one slot
+/// (a folded run is one record). A record belongs to the stage its rank's
+/// `(node, input)` rows and its read site name, as the replay places it: the
+/// drain stage for a `drain` or `peek` site where the input owns one, else the
+/// body stage. `ranks` maps each rank
+/// to its manifest's `node_ids` and `read_log_capacities` value. Every stage a
+/// row names is reported, sorted by its label; a record no row names panics.
+pub fn window_head_occupancy_of(
+    trace: &[TraceRingRecord],
+    ranks: &BTreeMap<u32, (Vec<String>, serde_json::Value)>,
+) -> Vec<WindowHeadOccupancy> {
+    use cerulion_core::read_outcome::ReadSiteRole;
+    use cerulion_core::trace_ring::{
+        read_site_role, unpack_read_outcome_meta_full, READ_OUTCOME_TRUNCATED,
+        RECORD_TYPE_READ_OUTCOME, STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+    };
+    let mut rims: BTreeMap<RimKey, u32> = BTreeMap::new();
+    for (rank, (_, rows)) in ranks {
+        let Some(rows) = rows.as_object() else {
+            continue;
+        };
+        for (node, stages) in rows {
+            for row in stages.as_array().expect("a node's rows are an array") {
+                let cell = |i: usize| row[i].as_u64().expect("a rim row is three integers");
+                rims.insert(
+                    (*rank, node.clone(), cell(0) as u16, cell(1) as u8),
+                    cell(2) as u32,
+                );
+            }
+        }
+    }
+    let heads: std::collections::BTreeSet<(u32, u64)> = trace
+        .iter()
+        .filter(|r| {
+            r.record_type == RECORD_TYPE_STEP_BOUNDARY
+                && r.global_level & STEP_BOUNDARY_FLAG_RUNS_REOPENED != 0
+        })
+        .map(|r| (r.rank(), r.step))
+        .collect();
+    let mut per_stage: BTreeMap<RimKey, StageHeads> = BTreeMap::new();
+    for r in trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
+    {
+        if !heads.contains(&(r.rank(), r.step)) {
+            continue;
+        }
+        let node = ranks
+            .get(&r.rank())
+            .and_then(|(ids, _)| ids.get(r.node_idx as usize))
+            .unwrap_or_else(|| panic!("rank {} names no node {}", r.rank(), r.node_idx))
+            .clone();
+        let (input, kind, _) = unpack_read_outcome_meta_full(r.global_level);
+        let drain_owned = rims.contains_key(&(r.rank(), node.clone(), input, 1));
+        let scheduler_site = matches!(
+            read_site_role(r.global_level),
+            ReadSiteRole::Drain | ReadSiteRole::Peek
+        );
+        let role = u8::from(drain_owned && scheduler_site);
+        let key = (r.rank(), node, input, role);
+        assert!(
+            rims.contains_key(&key),
+            "no read_log_capacities row names the stage of {r:?}: {key:?}"
+        );
+        let entry = per_stage.entry(key).or_default();
+        *entry.per_step.entry(r.step).or_default() += 1;
+        if kind == READ_OUTCOME_TRUNCATED {
+            entry.truncated += 1;
+        }
+    }
+    rims.into_iter()
+        .map(|(key, rim)| {
+            let heads = per_stage.remove(&key).unwrap_or_default();
+            let (rank, node, input, role) = key;
+            WindowHeadOccupancy {
+                stage: format!(
+                    "r{rank}:{node}[{input}]/{}",
+                    if role == 1 { "drain" } else { "body" }
+                ),
+                rim,
+                max_occupancy: heads.per_step.values().copied().max().unwrap_or(0),
+                windows: heads.per_step.len(),
+                truncated: heads.truncated,
+            }
+        })
+        .collect()
+}
+
+/// [`window_head_occupancy_of`] over a finished bag: its scheduler trace and
+/// the manifest of every rank the trace names.
+pub fn window_head_occupancy(bag: &Path) -> Vec<WindowHeadOccupancy> {
+    let reader = BagReader::open(bag).expect("open the bag");
+    let (msgs, _) = reader.recover_messages().expect("recover the bag");
+    let trace: Vec<TraceRingRecord> = msgs
+        .iter()
+        .filter(|m| m.topic == cerulion_bag::SCHEDULER_TRACE_TOPIC)
+        .map(|m| TraceRingRecord::from_bytes(m.data[..40].try_into().expect("a 40-byte record")))
+        .filter(|r| r.record_type != RECORD_TYPE_DEPARTURE)
+        .collect();
+    let mut ranks: BTreeMap<u32, (Vec<String>, serde_json::Value)> = BTreeMap::new();
+    for rank in trace.iter().map(TraceRingRecord::rank) {
+        if ranks.contains_key(&rank) {
+            continue;
+        }
+        let att = reader
+            .attachment(&format!("__cerulion/trace_manifest_rank{rank}.json"))
+            .expect("read attachments")
+            .unwrap_or_else(|| panic!("the bag carries rank {rank}'s trace manifest"));
+        let v: serde_json::Value = serde_json::from_slice(&att.data).expect("manifest json parses");
+        let node_ids = v["node_ids"]
+            .as_array()
+            .expect("manifest node_ids array")
+            .iter()
+            .map(|s| s.as_str().expect("node id string").to_string())
+            .collect();
+        ranks.insert(rank, (node_ids, v["read_log_capacities"].clone()));
+    }
+    window_head_occupancy_of(&trace, &ranks)
+}

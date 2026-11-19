@@ -200,9 +200,19 @@ When the run reports no standing consumer, the attach discovers available state
 rings. It does not arm checkpoints itself, so discovery alone does not promise
 a usable anchor. `bag info` reports the captured state coverage and
 `bag play --resim all --verify` checks the actual trace and resume boundary.
-Mid-run free-run recordings require independent per-rank resume support, which
-is not supported; recordings beginning at step zero do not need a resume
-anchor.
+Recordings beginning at step zero do not need a resume anchor.
+
+A free-run capture of one worker rank that begins mid-run resumes from its
+checkpoint, and from trace format 11 `bag play --resim all --verify` feeds its
+reads by read identity: at every checkpoint the recorder names each read
+site's writer again at its first read that serves a frame after it, so a
+capture whose window starts after the run's first reads still names the writer
+of every read it holds. A capture recorded below format 11 is refused under
+`--verify` when a single-writer read in it continues a writer run begun before
+the capture (`read_identity_absent`, with a message to record the run again);
+`--resim all` without `--verify` replays it. A process that runs several
+executor units takes no checkpoints. A mid-run free-run recording of several
+worker ranks is refused, since per-rank resume is not supported.
 
 ---
 

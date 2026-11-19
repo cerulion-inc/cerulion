@@ -13,6 +13,10 @@
 //! — `worker_pids_of`'s `pgrep` against a real supervisor — stays covered by the
 //! e2e arms, which is the only place a real `run-worker` subtree exists.
 //!
+//! It also pins `window_head_occupancy_of` on hand records: the count the
+//! Linux window-head measurement in `plain_run_resim_e2e_test` runs on, which
+//! that binary does not build on macOS.
+//!
 //! Its OWN binary rather than a `#[cfg(test)]` module inside `mp_support`:
 //! that module is `mod mp_support;`-included by fourteen e2e binaries, so an
 //! inline test would be compiled and RUN fourteen times.
@@ -532,4 +536,99 @@ fn an_unreaped_child_is_still_signalled_on_teardown() {
              (leader={leader})"
         );
     }
+}
+
+/// `window_head_occupancy_of` counts each stage's records at the steps a
+/// rank's STEP_BOUNDARY flags as checkpoint window heads, and nowhere else.
+///
+/// Hand oracle. Rank 0: heads at steps 3 and 7 (bit 0), step 4 unflagged.
+/// `relay` owns one stage (rim 12): two records at step 3, three at step 4 that
+/// are not a head, and at step 7 an annotation, a read and an overflow marker.
+/// `sink` owns a body stage and a drain stage (rim 8 each): at step 3 one body
+/// read, one drain read and one peek, which the drain stage holds, nothing at
+/// step 7. Rank 1: its one head is step 5, and its `meter` (rim 6) reads at
+/// steps 3 and 5, so only its step-5 read is at a head, while rank 0's heads at
+/// 3 and 7 are not its own. So `relay` measures two windows of at most three
+/// records with one marker, `sink`'s body stage one window of one record and
+/// its drain stage one of two, and `meter` one window of one record.
+#[test]
+fn window_head_occupancy_counts_each_stage_at_its_ranks_flagged_steps_only() {
+    use cerulion_core::read_outcome::ReadOutcomeKind::{DrainedBatch, Served};
+    use cerulion_core::read_outcome::ReadSiteRole::Peek;
+    use cerulion_core::read_outcome::ReadSiteRole::{Body, Drain};
+    use cerulion_core::trace_ring::{
+        ReadRun, TraceRingRecord, RECORD_TYPE_STEP_BOUNDARY, STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+    };
+    let boundary = |rank: u32, step: u64, flags: u32| TraceRingRecord {
+        step,
+        fire_time_ns: step * 50_000_000,
+        duration_ns: 0,
+        node_idx: 0,
+        global_level: flags,
+        record_type: RECORD_TYPE_STEP_BOUNDARY,
+        reserved: rank,
+    };
+    let on_rank = |rank: u32, r: TraceRingRecord| TraceRingRecord {
+        reserved: rank,
+        ..r
+    };
+    let read = |step: u64, node: u32, kind, seq: u32, role| {
+        TraceRingRecord::read_outcome(step, node, 0, kind, Some(seq), ReadRun::once(1), role)
+    };
+    let trace = vec![
+        boundary(0, 3, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        TraceRingRecord::read_outcome_producer(3, 1, 0, Some(3), 0xA, Drain),
+        read(3, 1, DrainedBatch, 3, Drain),
+        read(3, 2, Served, 3, Body),
+        read(3, 2, DrainedBatch, 3, Drain),
+        read(3, 2, DrainedBatch, 4, Peek),
+        boundary(1, 3, 0),
+        on_rank(1, read(3, 0, Served, 3, Body)),
+        boundary(0, 4, 0),
+        read(4, 1, DrainedBatch, 4, Drain),
+        read(4, 1, DrainedBatch, 5, Drain),
+        read(4, 1, DrainedBatch, 6, Drain),
+        boundary(1, 5, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        on_rank(1, read(5, 0, Served, 5, Body)),
+        boundary(0, 7, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        TraceRingRecord::read_outcome_producer(7, 1, 0, Some(7), 0xA, Drain),
+        read(7, 1, DrainedBatch, 7, Drain),
+        TraceRingRecord::read_outcome_truncated(7, 1, 0, 1, Body),
+    ];
+    let ranks = std::collections::BTreeMap::from([
+        (
+            0,
+            (
+                vec![
+                    "ticker".to_string(),
+                    "relay".to_string(),
+                    "sink".to_string(),
+                ],
+                serde_json::json!({"relay": [[0, 0, 12]], "sink": [[0, 0, 8], [0, 1, 8]]}),
+            ),
+        ),
+        (
+            1,
+            (
+                vec!["meter".to_string()],
+                serde_json::json!({"meter": [[0, 0, 6]]}),
+            ),
+        ),
+    ]);
+    let stage = |stage: &str, rim, max_occupancy, windows, truncated| WindowHeadOccupancy {
+        stage: stage.to_string(),
+        rim,
+        max_occupancy,
+        windows,
+        truncated,
+    };
+    assert_eq!(
+        window_head_occupancy_of(&trace, &ranks),
+        vec![
+            stage("r0:relay[0]/body", 12, 3, 2, 1),
+            stage("r0:sink[0]/body", 8, 1, 1, 0),
+            stage("r0:sink[0]/drain", 8, 2, 1, 0),
+            stage("r1:meter[0]/body", 6, 1, 1, 0),
+        ]
+    );
 }
