@@ -11,6 +11,14 @@
 //! with `logged_in_ever: true`, the device cert cached, and the gate now
 //! proceeding.
 //!
+//! Poll waits: every login here but one runs inside a `login_cmd::PollWaitLog`,
+//! which records the interval each device-flow poll wait asked for and sleeps
+//! 5 ms in its place. The recorded intervals are asserted against hand-written
+//! values: the 1 s floor the client puts under a server `interval` of 0 or 1,
+//! and the `slow_down` back-off. The one other login, in
+//! `login_against_an_issuer_with_no_device_surface_signs_in_via_me`, runs the
+//! shipped wait and asserts it slept the floor.
+//!
 //! `#[serial]` — the tests mutate the process env (`CERULION_ACCOUNT_SERVICE` /
 //! `CERULION_HOME`), which is global.
 
@@ -169,6 +177,61 @@ fn authorize_as(port: u16, email: &CapturingEmailSender, user_code: &str, addres
     );
 }
 
+/// The client's floor under the device-flow poll interval: against a server
+/// `interval` of 0 or 1 the loop asks for a wait of this long.
+const POLL_INTERVAL_FLOOR: Duration = Duration::from_secs(1);
+
+/// Run `login` on this thread inside a fresh `login_cmd::PollWaitLog`, and pin
+/// that it asked for exactly one poll wait, of the floor. The issuer stubs it
+/// wraps send `interval: 0` and answer the first poll with tokens, so one wait
+/// and one poll is the whole loop. The message carries the login's result, so
+/// a login that stops before its first poll reports why.
+fn with_one_floor_wait<T: std::fmt::Debug>(login: impl FnOnce() -> T) -> T {
+    let waits = login_cmd::PollWaitLog::default();
+    let result = waits.shorten_during(login);
+    assert_eq!(
+        waits.requested(),
+        [POLL_INTERVAL_FLOOR],
+        "one poll wait of the 1 s floor before the one poll the stub answers with tokens; \
+         the login returned {result:?}"
+    );
+    result
+}
+
+/// A login running on a worker thread inside its own `login_cmd::PollWaitLog`.
+struct LoginWorker<T> {
+    handle: std::thread::JoinHandle<T>,
+    waits: login_cmd::PollWaitLog,
+}
+
+fn spawn_login<T: Send + 'static>(login: impl FnOnce() -> T + Send + 'static) -> LoginWorker<T> {
+    let waits = login_cmd::PollWaitLog::default();
+    let handle = std::thread::spawn({
+        let waits = waits.clone();
+        move || waits.shorten_during(login)
+    });
+    LoginWorker { handle, waits }
+}
+
+impl<T, E> LoginWorker<Result<T, E>> {
+    /// Join the login and, when it succeeded, pin that every poll wait it made
+    /// asked for the floor. accountd here sends `interval: 0` and never answers
+    /// `slow_down`; the loop keeps polling until the test has authorized the
+    /// code, so the number of waits varies and their interval does not. A failed
+    /// login is returned as it is, for the caller's `expect` to report.
+    fn join(self) -> std::thread::Result<Result<T, E>> {
+        let joined = self.handle.join();
+        if matches!(joined, Ok(Ok(_))) {
+            let requested = self.waits.requested();
+            assert!(
+                !requested.is_empty() && requested.iter().all(|w| *w == POLL_INTERVAL_FLOOR),
+                "every poll wait asks for the 1 s floor: {requested:?}"
+            );
+        }
+        joined
+    }
+}
+
 // ===========================================================================
 // tests
 // ===========================================================================
@@ -186,15 +249,20 @@ fn device_code_login_writes_auth_json_and_caches_cert() {
     );
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
-    // Drive `run_login` on a worker thread; it blocks polling for authorization.
+    // Drive `run_login` on a worker thread. Its first poll wait is held until
+    // the code is authorized below, so the first poll comes after the
+    // authorization by construction.
     let buf = SharedBuf::new();
+    let waits = login_cmd::PollWaitLog::default();
+    let release = waits.hold_next_wait();
     let worker = std::thread::spawn({
         let mut b = buf.clone();
-        move || login_cmd::run_login(&mut b)
+        let waits = waits.clone();
+        move || waits.shorten_during(|| login_cmd::run_login(&mut b))
     });
 
     // The prompt (with the user_code + "Waiting for authorization...") must print
-    // BEFORE any token is issued — i.e. the poll starts pending.
+    // BEFORE any token is issued, while the first poll wait is still held.
     let code = wait_for(
         || extract_user_code(&buf.snapshot()),
         Duration::from_secs(15),
@@ -206,11 +274,29 @@ fn device_code_login_writes_auth_json_and_caches_cert() {
     );
 
     authorize_via_magic_link(port, &email, &code);
+    // Release the held first poll wait now that the code is authorized.
+    release
+        .send(())
+        .expect("the held wait keeps the receiver until it is released");
 
     let state = worker
         .join()
         .expect("worker thread")
         .expect("run_login succeeds after authorization");
+
+    // One wait of the floor, then one poll, which found the code authorized: a
+    // poll answered `authorization_pending` prints a dot and asks for a second
+    // wait.
+    assert_eq!(
+        waits.requested(),
+        [POLL_INTERVAL_FLOOR],
+        "one poll wait of the 1 s floor, then the poll that redeemed the authorized code"
+    );
+    let printed = buf.snapshot();
+    assert!(
+        printed.contains("Waiting for authorization...\n\nSigned in as "),
+        "no poll answered pending between the prompt and the sign-in: {printed:?}"
+    );
 
     // Closed loop: the returned state + the persisted auth.json agree.
     assert!(state.logged_in_ever, "logged_in_ever set");
@@ -286,7 +372,7 @@ fn ensure_login_gate_at_a_terminal_auto_triggers_device_flow() {
     );
 
     let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
+    let worker = spawn_login({
         let mut b = buf.clone();
         move || login_cmd::ensure_login_gate_with(&mut b, true)
     });
@@ -335,7 +421,7 @@ fn stale_session_refreshes_against_the_real_service() {
 
     // Full device-code login.
     let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
+    let worker = spawn_login({
         let mut b = buf.clone();
         move || login_cmd::run_login(&mut b)
     });
@@ -423,7 +509,7 @@ fn run_login_carries_a_preexisting_robot_role_forward() {
 
     // A fresh device-code login.
     let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
+    let worker = spawn_login({
         let mut b = buf.clone();
         move || login_cmd::run_login(&mut b)
     });
@@ -485,7 +571,7 @@ fn refresh_session_carries_a_stamped_robot_role_forward() {
 
     // Full device-code login → a real, refreshable session (role: None on a fresh machine).
     let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
+    let worker = spawn_login({
         let mut b = buf.clone();
         move || login_cmd::run_login(&mut b)
     });
@@ -559,7 +645,7 @@ fn run_login_survives_and_drops_a_foreign_role_value() {
     .unwrap();
 
     let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
+    let worker = spawn_login({
         let mut b = buf.clone();
         move || login_cmd::run_login(&mut b)
     });
@@ -770,7 +856,7 @@ fn a_broken_device_surface_refuses_the_login_rather_than_discarding_the_cert() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("a device surface that answers 500 is not a service that certifies nothing")
         .to_string();
 
@@ -818,8 +904,17 @@ fn login_against_an_issuer_with_no_device_surface_signs_in_via_me() {
     );
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
+    // The one login in this file that runs the shipped poll wait (no
+    // `PollWaitLog`): the stub sends `interval: 0`, so the loop really sleeps
+    // the 1 s floor before its only poll.
     let mut buf = SharedBuf::new();
+    let started = Instant::now();
     let state = login_cmd::run_login(&mut buf).expect("a 404 on /v1/devices is not a login error");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= POLL_INTERVAL_FLOOR,
+        "the shipped poll wait sleeps the 1 s floor before the first poll, the login took {elapsed:?}"
+    );
 
     // The account id came from /v1/me, and the session is usable.
     assert_eq!(state.account_id, "supabase-user-uuid");
@@ -858,6 +953,118 @@ fn login_against_an_issuer_with_no_device_surface_signs_in_via_me() {
     );
 }
 
+/// Serve a device flow whose polls answer `polls` in order: `Some(code)` answers
+/// 400 with that RFC 8628 `error`, `None` answers the tokens. `device/start`
+/// sends `interval` and `expires_in`; after the tokens every `/v1/devices*` path
+/// answers 404 and `/v1/me` names `account-b`, as
+/// [`start_identity_only_issuer`] does.
+fn start_scripted_poll_issuer(
+    interval: u64,
+    expires_in: u64,
+    polls: &'static [Option<&'static str>],
+) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let mut script = polls.iter();
+        // `device/start`, the scripted polls, the challenge and `/v1/me`.
+        for stream in listener.incoming().take(polls.len() + 3) {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            let mut length = 0usize;
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap() == 0 || header == "\r\n" {
+                    break;
+                }
+                if let Some(v) = header.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = v.trim().parse().unwrap_or(0);
+                }
+            }
+            if length > 0 {
+                let mut body = vec![0u8; length];
+                std::io::Read::read_exact(&mut reader, &mut body).ok();
+            }
+            let (status, body) = if request_line.contains("/v1/auth/device/start") {
+                (
+                    200,
+                    serde_json::json!({
+                        "device_code": "dc",
+                        "user_code": "WXYZ-WXYZ",
+                        "verification_uri": "http://127.0.0.1/device",
+                        "verification_uri_complete": "http://127.0.0.1/device?user_code=WXYZ-WXYZ",
+                        "expires_in": expires_in,
+                        "interval": interval,
+                    })
+                    .to_string(),
+                )
+            } else if request_line.contains("/v1/auth/device/poll") {
+                match script.next().expect("no poll beyond the script") {
+                    Some(error) => (400, serde_json::json!({ "error": error }).to_string()),
+                    None => (
+                        200,
+                        r#"{"session_token":"st","refresh_token":"rt","expires_in":3600}"#
+                            .to_string(),
+                    ),
+                }
+            } else if request_line.contains("/v1/me") {
+                (200, r#"{"account_id":"account-b"}"#.to_string())
+            } else {
+                (404, r#"{"error":"not_found"}"#.to_string())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).ok();
+        }
+    });
+    port
+}
+
+/// RFC 8628 `slow_down` adds 5 s to the poll interval, and the client clamps the
+/// sum to the time left before the code expires. The server sends `interval: 1`
+/// and a 10 s expiry, then answers two `slow_down`s before the tokens: the loop
+/// asks for the 1 s floor, then 1 + 5 = 6 s, then 6 + 5 = 11 s clamped to what
+/// is left of the 10 s, which is under 10 s once any time has passed.
+#[test]
+#[serial]
+fn slow_down_adds_five_seconds_to_the_poll_interval_clamped_to_the_expiry() {
+    let port = start_scripted_poll_issuer(1, 10, &[Some("slow_down"), Some("slow_down"), None]);
+    let home = tempfile::tempdir().unwrap();
+    let _svc = EnvGuard::set(
+        "CERULION_ACCOUNT_SERVICE",
+        &format!("http://127.0.0.1:{port}"),
+    );
+    let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
+
+    let waits = login_cmd::PollWaitLog::default();
+    let state = waits
+        .shorten_during(|| login_cmd::run_login(&mut SharedBuf::new()))
+        .expect("the third poll answers the tokens");
+    assert_eq!(state.account_id, "account-b");
+
+    let requested = waits.requested();
+    assert_eq!(
+        requested.len(),
+        3,
+        "one poll wait before each of the three polls: {requested:?}"
+    );
+    assert_eq!(
+        requested[..2],
+        [POLL_INTERVAL_FLOOR, Duration::from_secs(6)],
+        "the floor, then 5 s more after the first slow_down"
+    );
+    assert!(
+        requested[2] > Duration::from_secs(6) && requested[2] < Duration::from_secs(10),
+        "the second slow_down's 11 s is clamped to the time left of the 10 s expiry: {requested:?}"
+    );
+}
+
 #[test]
 #[serial]
 fn identity_only_login_drops_a_previous_account_device_cert() {
@@ -878,7 +1085,8 @@ fn identity_only_login_drops_a_previous_account_device_cert() {
     std::fs::write(home.path().join("device-chain.json"), "old-chain-cache").unwrap();
 
     let mut buf = SharedBuf::new();
-    let state = login_cmd::run_login(&mut buf).expect("the identity-only login succeeds");
+    let state = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect("the identity-only login succeeds");
 
     assert_eq!(state.account_id, "account-b");
     assert!(
@@ -910,7 +1118,8 @@ fn a_login_that_never_resolves_an_account_keeps_the_cached_cert() {
     std::fs::write(&cert_path, "cert-issued-to-account-a").unwrap();
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect_err("a 500 on /v1/me is a failed login");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect_err("a 500 on /v1/me is a failed login");
 
     assert!(
         cert_path.exists(),
@@ -937,7 +1146,8 @@ fn identity_only_login_drops_the_cert_netd_was_pointed_at() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let state = login_cmd::run_login(&mut buf).expect("the identity-only login succeeds");
+    let state = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect("the identity-only login succeeds");
 
     assert_eq!(state.account_id, "account-b");
     assert!(
@@ -1127,7 +1337,7 @@ fn a_cert_path_that_refuses_removal_names_itself_and_stops_the_login() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let msg = login_cmd::run_login(&mut buf)
+    let msg = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("a cert that outlives the switch fails the login")
         .to_string();
 
@@ -1187,7 +1397,7 @@ fn a_first_path_that_refuses_does_not_strand_the_paths_after_it() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("a cert that outlives the switch fails the login")
         .to_string();
 
@@ -1233,7 +1443,8 @@ fn a_rollback_puts_a_cert_symlink_back_as_a_symlink() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect_err("an unclearable cert fails the login");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect_err("an unclearable cert fails the login");
 
     let md = std::fs::symlink_metadata(&link).expect("the link is back");
     assert!(
@@ -1280,7 +1491,7 @@ fn a_rollback_puts_a_corrupt_store_back_rather_than_deleting_it() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("an unclearable cert fails the login")
         .to_string();
 
@@ -1333,8 +1544,8 @@ fn a_cert_that_cannot_be_read_is_cleared_anyway_because_the_clear_is_a_rename() 
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let state =
-        login_cmd::run_login(&mut buf).expect("an unreadable cert does not block the login");
+    let state = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect("an unreadable cert does not block the login");
     assert_eq!(state.account_id, "account-b");
 
     assert!(
@@ -1405,7 +1616,7 @@ fn a_login_that_refuses_puts_back_the_cert_it_could_not_read() {
     .unwrap();
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("a target that cannot take the cert stops the login")
         .to_string();
 
@@ -1479,7 +1690,7 @@ fn a_dangling_cert_symlink_is_unlinked_rather_than_read_as_absent() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("the switch itself succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf)).expect("the switch itself succeeds");
 
     assert!(
         std::fs::symlink_metadata(&link).is_err(),
@@ -1514,7 +1725,8 @@ fn a_login_that_cannot_publish_its_state_keeps_the_previous_cert() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect_err("an unpublishable store fails the login");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect_err("an unpublishable store fails the login");
 
     assert!(
         own_cert.exists(),
@@ -1645,7 +1857,7 @@ fn a_certifying_login_that_cannot_publish_its_state_caches_no_cert() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("an unpublishable store fails the login")
         .to_string();
 
@@ -1753,7 +1965,7 @@ fn a_certifying_switch_with_one_unusable_cert_target_publishes_nothing() {
     .unwrap();
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("a cert target that refuses the cert refuses the login")
         .to_string();
 
@@ -1800,7 +2012,7 @@ fn a_relative_netd_cert_path_refuses_the_login_by_name() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", "certs/desk.cert");
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("an unresolvable netd cert path refuses the login")
         .to_string();
 
@@ -1843,7 +2055,7 @@ fn a_certifying_switch_caches_the_new_cert_where_netd_reads_it() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("the certifying switch succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf)).expect("the certifying switch succeeds");
 
     assert_eq!(
         std::fs::read_to_string(&netd_cert).unwrap(),
@@ -1882,7 +2094,8 @@ fn a_certifying_login_replaces_the_previous_accounts_cert() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    let state = login_cmd::run_login(&mut buf).expect("the certifying login succeeds");
+    let state = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect("the certifying login succeeds");
 
     assert_eq!(state.account_id, "account-b");
     assert_eq!(
@@ -1924,7 +2137,8 @@ fn a_same_account_relogin_keeps_the_cache_netd_was_pointed_at() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("a same-account re-login succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect("a same-account re-login succeeds");
 
     assert_eq!(
         std::fs::read_to_string(&netd_cert).unwrap(),
@@ -1969,7 +2183,7 @@ fn the_cli_owned_cert_path_replaces_a_symlink_instead_of_writing_through_it() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("the re-login succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf)).expect("the re-login succeeds");
 
     assert!(
         !std::fs::symlink_metadata(&own_cert).unwrap().is_symlink(),
@@ -2017,7 +2231,7 @@ fn a_cert_target_that_refuses_the_rename_fails_the_login_with_no_cache_left() {
     std::fs::create_dir(home.path().join("device.cert")).unwrap();
 
     let mut buf = SharedBuf::new();
-    let failed = login_cmd::run_login(&mut buf)
+    let failed = with_one_floor_wait(|| login_cmd::run_login(&mut buf))
         .expect_err("a cert that cannot be published is not a successful login")
         .to_string();
 
@@ -2064,7 +2278,7 @@ fn an_unpublishable_chain_reports_failure_after_caching_the_current_leaf() {
     let chain = home.path().join("device-chain.json");
     std::fs::create_dir(&chain).unwrap();
 
-    let error = login_cmd::run_login(&mut SharedBuf::new())
+    let error = with_one_floor_wait(|| login_cmd::run_login(&mut SharedBuf::new()))
         .expect_err("a chain rename failure must not report a fully usable login")
         .to_string();
     assert!(error.contains("device-chain.json"), "{error}");
@@ -2126,7 +2340,8 @@ fn an_interrupted_clear_is_put_back_when_the_store_still_names_its_account() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("a same-account re-login succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect("a same-account re-login succeeds");
 
     assert_eq!(
         std::fs::read_to_string(&netd_cert).unwrap(),
@@ -2173,7 +2388,7 @@ fn an_interrupted_clear_is_dropped_when_the_store_has_moved_on() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("the re-login succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf)).expect("the re-login succeeds");
 
     assert!(
         !stale_aside.exists(),
@@ -2218,7 +2433,7 @@ fn a_cert_symlink_that_already_holds_this_cert_is_left_as_a_symlink() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("the re-login succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf)).expect("the re-login succeeds");
 
     assert!(
         std::fs::symlink_metadata(&own_cert)
@@ -2266,7 +2481,8 @@ fn a_consumer_left_empty_by_an_interrupted_login_is_cached_by_the_next_one() {
     let _cert = EnvGuard::set("CERULION_NETD_DEVICE_CERT", netd_cert.to_str().unwrap());
 
     let mut buf = SharedBuf::new();
-    login_cmd::run_login(&mut buf).expect("a same-account re-login succeeds");
+    with_one_floor_wait(|| login_cmd::run_login(&mut buf))
+        .expect("a same-account re-login succeeds");
 
     assert_eq!(
         std::fs::read_to_string(&netd_cert).unwrap(),
@@ -2379,7 +2595,7 @@ fn login_as(
     anon_id: Option<&'static str>,
 ) -> login_cmd::LoginOutcome {
     let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
+    let worker = spawn_login({
         let mut b = buf.clone();
         move || login_cmd::run_login_carrying(&mut b, || anon_id.map(str::to_owned))
     });
@@ -2438,7 +2654,7 @@ fn logout_revokes_the_session_and_the_gate_then_refuses() {
     let _home = EnvGuard::set("CERULION_HOME", home.path().to_str().unwrap());
 
     let buf = SharedBuf::new();
-    let worker = std::thread::spawn({
+    let worker = spawn_login({
         let mut b = buf.clone();
         move || login_cmd::run_login(&mut b)
     });
@@ -2542,7 +2758,7 @@ fn a_robot_that_logs_out_and_back_in_stays_a_robot() {
 
     let log_in = || {
         let buf = SharedBuf::new();
-        let worker = std::thread::spawn({
+        let worker = spawn_login({
             let mut b = buf.clone();
             move || login_cmd::run_login(&mut b)
         });
@@ -2790,7 +3006,7 @@ fn a_refresh_racing_a_logout_and_a_new_login_leaves_no_live_session_behind() {
 
     let log_in = || {
         let buf = SharedBuf::new();
-        let worker = std::thread::spawn({
+        let worker = spawn_login({
             let mut b = buf.clone();
             move || login_cmd::run_login(&mut b)
         });
@@ -2860,7 +3076,7 @@ fn hosted_certificate_login_retains_uuid_and_loads_its_mapped_owner_chain() {
         "CERULION_ACCOUNT_SERVICE",
         &format!("http://127.0.0.1:{port}"),
     );
-    let state = login_cmd::run_login(&mut SharedBuf::new()).unwrap();
+    let state = with_one_floor_wait(|| login_cmd::run_login(&mut SharedBuf::new())).unwrap();
     worker.join().unwrap();
     assert_eq!(state.account_id, HOSTED_UUID);
     assert_eq!(auth::load().state().unwrap().account_id, HOSTED_UUID);
@@ -2925,7 +3141,7 @@ fn inconsistent_hosted_certification_preserves_previous_auth_and_certificate_byt
         )
         .unwrap();
         assert!(
-            login_cmd::run_login(&mut SharedBuf::new()).is_err(),
+            with_one_floor_wait(|| login_cmd::run_login(&mut SharedBuf::new())).is_err(),
             "accepted {issue:?}"
         );
         worker.join().unwrap();

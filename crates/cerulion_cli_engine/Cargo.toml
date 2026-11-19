@@ -32,6 +32,10 @@ workspace = true
 # shrink the budget the three `VerifierDecline` budget causes are measured
 # against. Unlike `seed_logged_in_at`, these ARE reached from the integration
 # tests, which is what the dev-dependency self-reference below is for.
+#
+# `login_cmd::PollWaitLog` sits behind it too: it records the device-flow poll
+# waits of a thread that opts in and sleeps 5 ms in their place, so a shipped
+# login always sleeps the interval it computed.
 test-seams = []
 # Oracle MUTANTS: env-armed seams that restore a refused behaviour so a test can
 # show its oracle catches it, among them the private replay feed's

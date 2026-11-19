@@ -53,6 +53,10 @@ pub mod connect_cmd;
 // The `cerulion rcp` verb's PURE resolution: the same robot resolution as
 // `connect`, spawning `cerulion-connectd rcp` with inherited stdio.
 pub mod rcp_cmd;
+// `cerulion rcp --sim` and `cerulion rcp bench`: where the harness folder is
+// and the launcher command line both run. The launcher is spawned with
+// inherited stdio; nothing of the harness runs in this process.
+pub mod harness_cmd;
 // The value sources behind shell tab-completion — live topic / node /
 // graph / schema / robot names for a TAB press. Every source is an INSTANT
 // LOCAL read under a hard wall-clock budget: no process is ever spawned (netd

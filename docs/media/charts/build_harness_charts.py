@@ -16,7 +16,11 @@ solved start state"). Standard library only: the same package gives the same byt
 
 The form of both charts:
   - one row per model, ordered by the share of finished episodes solved WITHOUT Cerulion, lowest
-    first, ties by name; the same order in both charts; no model is marked;
+    first, ties by name; the same order in both charts; no model is marked for its results; a model
+    whose column was added after the grid's first rows had been seen (the package's ADDED_LATE)
+    carries a dagger, and a footnote says so;
+  - the first line under the title is the scope: new start states of task rows Cerulion was developed
+    on at other start states, one episode each, the same model in both arms;
   - linear scales; success rate in percent;
   - the cost scale ends at 30 USD, and a bar past it is drawn to the edge with a break and its value
     printed at its end;
@@ -25,7 +29,9 @@ The form of both charts:
     visible; from 1.1 to 10 to one decimal; from 10 as a whole number. A model that solved nothing
     without Cerulion reads "from 0%" on the success chart and "no figure" on the cost chart;
   - a model whose column had not finished at the package's read carries a star, and a footnote gives
-    its finished counts and the read time.
+    its finished counts and the read time;
+  - the cost chart's footer says what its figure leaves out (the episodes that ended without a score
+    and every attempt in no row) and that part of each factor is caching.
 """
 import decimal
 import html
@@ -43,7 +49,8 @@ WIDTH = 1000
 LEFT = 190          # x of the zero line
 LABEL_X = 178       # right edge of the model names
 RIGHT = 976         # right edge of the factor column
-TOP = 100           # y of the first row's band
+TOP = 100           # y of the first row's band under a two-line subtitle; each further line adds SUB_LINE
+SUB_LINE = 18       # one subtitle line
 ROW = 40            # one model
 BAR = 13            # one bar
 PCT_FULL = 850      # x of 100 percent
@@ -115,7 +122,8 @@ def rows_of(rc):
     out = []
     for c in cols:
         wo, wi = c.stats("without"), c.stats("with")
-        out.append({"model": c.model, "complete": c.complete, "without": wo, "with": wi})
+        out.append({"model": c.model, "complete": c.complete, "late": c.model in rc.ADDED_LATE, "without": wo,
+                    "with": wi})
     for r in out:
         if not r["without"]["finished"] or not r["with"]["finished"]:
             raise SystemExit(f"build_harness_charts: {r['model']} has an arm with no finished episode")
@@ -125,25 +133,26 @@ def rows_of(rc):
 
 def frame(title, subtitle, header, ticks, rows, footer):
     n = len(rows)
-    bottom = TOP + ROW * n + 4
+    shift = SUB_LINE * (len(subtitle) - 2)      # the legend and the rows move down under a longer subtitle
+    top = TOP + shift
+    bottom = top + ROW * n + 4
     height = bottom + 48 + 18 * len(footer)
     s = [f'<svg viewBox="0 0 {WIDTH} {height}" xmlns="http://www.w3.org/2000/svg" '
          f'font-family="system-ui,-apple-system,Segoe UI,sans-serif" role="img" aria-label="{esc(title)}">',
          f'<rect width="{WIDTH}" height="{height}" fill="#fff"/>',
-         text(24, 34, title, 19, INK, weight="650"),
-         text(24, 56, subtitle[0], 13, MUTED),
-         text(24, 74, subtitle[1], 13, MUTED),
-         f'<rect x="24" y="84" width="14" height="10" rx="2" fill="{WITHOUT}"/>',
-         text(44, 93, f"without {NAME}", 13, INK),
-         f'<rect x="170" y="84" width="14" height="10" rx="2" fill="{WITH}"/>',
-         text(190, 93, f"with {NAME}", 13, INK),
-         text(RIGHT, 93, header, 12.5, "#444", anchor="end", weight="600")]
+         text(24, 34, title, 19, INK, weight="650")]
+    s += [text(24, 56 + SUB_LINE * j, line, 13, MUTED) for j, line in enumerate(subtitle)]
+    s += [f'<rect x="24" y="{84 + shift}" width="14" height="10" rx="2" fill="{WITHOUT}"/>',
+          text(44, 93 + shift, f"without {NAME}", 13, INK),
+          f'<rect x="170" y="{84 + shift}" width="14" height="10" rx="2" fill="{WITH}"/>',
+          text(190, 93 + shift, f"with {NAME}", 13, INK),
+          text(RIGHT, 93 + shift, header, 12.5, "#444", anchor="end", weight="600")]
     for x, label in ticks:
-        s.append(f'<line x1="{x:.1f}" y1="{TOP}" x2="{x:.1f}" y2="{bottom}" stroke="{GRID}" stroke-width="1"/>')
+        s.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{bottom}" stroke="{GRID}" stroke-width="1"/>')
         s.append(text(f"{x:.1f}", bottom + 18, label, 12, SOFT, anchor="middle"))
-    s.append(f'<line x1="{LEFT:.1f}" y1="{TOP}" x2="{LEFT:.1f}" y2="{bottom}" stroke="{AXIS}" stroke-width="1"/>')
+    s.append(f'<line x1="{LEFT:.1f}" y1="{top}" x2="{LEFT:.1f}" y2="{bottom}" stroke="{AXIS}" stroke-width="1"/>')
     for i, parts in enumerate(rows):
-        y = TOP + ROW * i
+        y = top + ROW * i
         s.extend(parts(y))
     for j, line in enumerate(footer):
         s.append(text(24, bottom + 44 + 18 * j, line, 12, SOFT))
@@ -157,14 +166,24 @@ def star_footer(rows, when, cells):
         if not r["complete"]:
             out.append(f"* Still running at the read of {when}: {r['model']}, {r['without']['finished']} of {cells} "
                        f"start states finished without {NAME} and {r['with']['finished']} with.")
+    late = [r["model"] for r in rows if r["late"]]
+    if late:
+        out.append(f"\u2020 {', '.join(late)}: added to the grid after its first rows had been seen.")
     return out
 
 
+def scope(cells, task_rows):
+    """The fine print every chart of these rows carries, one sentence on two subtitle lines so it fits the
+    width: what the start states are."""
+    return [f"{cells} new start states of {task_rows} LIBERO-PRO task rows {NAME} was developed on at other start "
+            f"states,", "one episode each, the same model with and without."]
+
+
 def label(r):
-    return r["model"] + ("" if r["complete"] else "*")
+    return r["model"] + ("" if r["complete"] else "*") + ("\u2020" if r["late"] else "")
 
 
-def success_chart(rows, when, cells):
+def success_chart(rows, when, cells, task_rows):
     def rate(s):
         return s["solved"] / s["finished"]
 
@@ -192,14 +211,13 @@ def success_chart(rows, when, cells):
               + ([f"Below 1.0× the model did a little better without {NAME}."] if below else [])
               + star_footer(rows, when, cells))
     return frame(f"Success rate, without and with {NAME}",
-                 [f"Solved start states of LIBERO-PRO, {cells} new start states per model and arm, zero-shot, the "
-                  "same model in both arms.",
-                  f"Ordered by success rate without {NAME}, lowest first."
+                 scope(cells, task_rows)
+                 + [f"Ordered by success rate without {NAME}, lowest first."
                   + ("" if all(r["complete"] for r in rows) else " * still running.") + f" Read {when}."],
                  "with ÷ without", ticks, [parts_for(r) for r in rows], footer)
 
 
-def cost_chart(rows, when, cells, fnum):
+def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd):
     scale = (USD_CUT_X - LEFT) / USD_CUT
     broken = sum(1 for r in rows for a in ("without", "with")
                  if r[a]["usd_per_solved"] is not None and r[a]["usd_per_solved"] > USD_CUT)
@@ -239,12 +257,21 @@ def cost_chart(rows, when, cells, fnum):
     if broken:
         word = NUMBER_WORDS.get(broken, str(broken))
         tail = f" Linear scale; {word} bar{'' if broken == 1 else 's'} {'is' if broken == 1 else 'are'} broken."
-    footer = ["Model spend only; the simulator is not counted. Failed episodes are included: their cost is spread "
-              "over the successes.",
+    lower_cache = sum(1 for r in rows if r["without"]["cached_share"] is not None
+                      and r["with"]["cached_share"] is not None
+                      and r["without"]["cached_share"] < r["with"]["cached_share"])
+    footer = ["Model spend only; the simulator is not counted. Failed scored episodes are included: their cost is "
+              "spread over the successes.",
+              f"The {unscored} episodes that ended without a score and every attempt in no row are left "
+              f"out (${fnum(lost_usd, 2)} of spend in all; lost_attempts.csv).",
               f"The factor is the cost per success without {NAME} over the cost with it."
-              + (f" A broken bar runs past ${USD_CUT:.0f}." if broken else "")] + star_footer(rows, when, cells)
+              + (f" A broken bar runs past ${USD_CUT:.0f}." if broken else ""),
+              f"Part of each factor is caching: cached input costs less, and the arm without {NAME} had the lower "
+              f"cached share of input for {lower_cache} of the {len(rows)} models."] \
+        + star_footer(rows, when, cells)
     return frame(f"Model cost per successful episode, without and with {NAME}",
-                 ["Model spend of every scored episode divided by the episodes solved, at list prices." + tail,
+                 scope(cells, task_rows)
+                 + ["Model spend of every scored episode divided by the episodes solved, at list prices." + tail,
                   f"Ordered by success rate without {NAME}, lowest first."
                   + ("" if all(r["complete"] for r in rows) else " * still running.") + f" Read {when}."],
                  "times cheaper", ticks, [parts_for(r) for r in rows], footer)
@@ -255,8 +282,11 @@ def main(argv):
     rc = load_recompute()
     rows = rows_of(rc)
     when, cells = read_info()
-    outputs = {"harness-success-rate.svg": success_chart(rows, when, cells),
-               "harness-cost-per-success.svg": cost_chart(rows, when, cells, rc.fnum)}
+    listed, _cols, uns = rc.columns(PACKAGE)
+    task_rows = len({x["task_row"] for x in listed})
+    lost_usd = sum(float(x["usd_list"]) for x in rc.load(PACKAGE, "lost_attempts.csv"))
+    outputs = {"harness-success-rate.svg": success_chart(rows, when, cells, task_rows),
+               "harness-cost-per-success.svg": cost_chart(rows, when, cells, task_rows, rc.fnum, len(uns), lost_usd)}
     stale = []
     for name, svg in outputs.items():
         path = os.path.join(MEDIA, name)

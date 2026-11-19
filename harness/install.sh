@@ -7,7 +7,8 @@
 #   install.sh [--bench-from DIR] [--check]
 #
 # It builds, inside this folder:
-#   bx/libero-env              Python 3.10: the simulator (requirements/sim-py310.txt and CPU torch)
+#   bx/libero-env              Python 3.10: the simulator (requirements/sim-py310.txt and CPU torch), with
+#                              robosuite's file log turned off (requirements/sim-robosuite-macros.py)
 #   bx/LIBERO, bx/LIBERO-PRO   the benchmark at its pinned revisions (benchmarks/fetch.sh)
 #   venv                       Python 3.12: the episode server (requirements/server-py312.txt), with this
 #                              folder's src/ on its path, so venv/bin/python -m cerulion_harness runs
@@ -36,7 +37,7 @@ while [ $# -gt 0 ]; do
       [ -d "$2" ] || { echo "--bench-from: $2 is not a folder" >&2; exit 2; }
       FROM=$(cd "$2" && pwd -P); shift 2 ;;
     --check) CHECK=1; shift ;;
-    -h|--help) sed -n '3,23p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '3,24p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "$USAGE" >&2; exit 2 ;;
   esac
 done
@@ -62,7 +63,8 @@ sha256_of() {  # FILE...: one SHA-256 over the files' bytes in order
   cat "$@" | sha256_stdin
 }
 # Each step's stamp holds the SHA-256 of what the step was built from; a stamp that matches skips the step.
-SIM_IN=$(sha256_of "$HARNESS/requirements/sim-py310.txt" "$HARNESS/requirements/sim-torch-cpu.txt")
+SIM_IN=$(sha256_of "$HARNESS/requirements/sim-py310.txt" "$HARNESS/requirements/sim-torch-cpu.txt" \
+  "$HARNESS/requirements/sim-robosuite-macros.py")
 SCENES_IN=$(sha256_of "$HARNESS/benchmarks/fetch.sh" "$HARNESS/benchmarks/LIBERO-PRO-data.files.txt" \
   "$HARNESS/benchmarks/LIBERO-PRO-data.sha256")
 SERVER_IN=$(printf '%s\n' "$(sha256_of "$HARNESS/requirements/server-py312.txt")" "$HARNESS" "$OS" | sha256_stdin)
@@ -159,6 +161,11 @@ else
   if current scenes "$SCENES_IN" && scenes_here; then
     "$UV" pip install --python "$SIM_PY" --no-deps -e "$BX/LIBERO" --config-settings editable_mode=compat
   fi
+  # robosuite appends a log of every simulator start to /tmp/robosuite.log unless its private settings turn the
+  # file log off; with them in place it also no longer warns at each start that it has none.
+  SIM_SITE=$("$SIM_PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+  [ -d "$SIM_SITE/robosuite" ] || { echo "the simulator environment has no robosuite in $SIM_SITE" >&2; exit 1; }
+  cp "$HARNESS/requirements/sim-robosuite-macros.py" "$SIM_SITE/robosuite/macros_private.py"
   echo "$SIM_IN" > "$BX/.step-sim"
   took "$t"
 fi
@@ -204,7 +211,9 @@ fi
 
 echo "[4/4] this machine's body record for the default start state"
 t=$(date +%s)
-"$VENV_PY" -m cerulion_harness.body_record > "$BX/body_record.json" || {
+# It imports the measured code into its own process: PYTHONDONTWRITEBYTECODE keeps it from writing __pycache__
+# folders into this folder.
+PYTHONDONTWRITEBYTECODE=1 "$VENV_PY" -m cerulion_harness.body_record > "$BX/body_record.json" || {
   echo "the body record check failed; its report: $BX/body_record.json" >&2
   exit 1
 }

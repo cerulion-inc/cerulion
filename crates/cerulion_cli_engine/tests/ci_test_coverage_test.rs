@@ -159,6 +159,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod ci_test_line;
+use ci_test_line::{line_runs_tests_of, logical_lines};
+
 /// Packages that have tests and are deliberately NOT named in a CI test step.
 ///
 /// Each entry is `(package name, reason)`. Empty is the healthy state and is
@@ -1326,55 +1329,15 @@ fn pr_blocking_workflow_texts() -> BTreeMap<String, String> {
     out
 }
 
-/// Does ONE command line name `pkg` as a package it runs tests for?
-///
-/// Two forms, and EVERY package on the line counts in both:
-///
-///   * `cargo test … -p a -p b …` — the ordinary one. Reading
-///     only the package after the FIRST `-p` would leave the `b` of
-///     `cargo test -p a -p b` uncovered. Every
-///     `-p` / `--package` occurrence after `cargo test` is read, in every
-///     spelling cargo accepts (`-p x`, `-px`, `--package x`, `--package=x`).
-///   * `ci_test_shard.sh <pkg> …` — the sharded form
-///     (`tools/scripts/ci_test_shard.sh`, used by the `cerulion_core` legs of
-///     `test-linux` / `test-macos`): the script takes the package name as its
-///     first argument precisely so the name stays LITERALLY present in the
-///     workflow and this walk keeps working across the split.
-///
-/// Matching is by WHOLE WHITESPACE TOKEN, which is what keeps `cerulion_viz`
-/// and `cerulion_vizd` apart: a plain `contains` would report `cerulion_viz`
-/// covered by the `cerulion_vizd` step and vice versa.
-fn line_names_package(line: &str, pkg: &str) -> bool {
-    if let Some(pos) = line.find("ci_test_shard.sh ") {
-        let tail = &line[pos + "ci_test_shard.sh ".len()..];
-        if tail.split_whitespace().next() == Some(pkg) {
-            return true;
-        }
-    }
-    let Some(pos) = line.find("cargo test") else {
-        return false;
-    };
-    let mut it = line[pos..].split_whitespace();
-    while let Some(tok) = it.next() {
-        let named = match tok {
-            "-p" | "--package" => it.next() == Some(pkg),
-            _ => tok
-                .strip_prefix("--package=")
-                .or_else(|| tok.strip_prefix("-p"))
-                .is_some_and(|rest| rest == pkg),
-        };
-        if named {
-            return true;
-        }
-    }
-    false
-}
-
 /// The first PR-blocking workflow whose text names `pkg` in a test command.
 fn workflows_name(texts: &BTreeMap<String, String>, pkg: &str) -> Option<String> {
     texts
         .iter()
-        .find(|(_, text)| text.lines().any(|l| line_names_package(l, pkg)))
+        .find(|(_, text)| {
+            logical_lines(text.lines())
+                .iter()
+                .any(|l| line_runs_tests_of(l, pkg))
+        })
         .map(|(file, _)| file.clone())
 }
 
@@ -3079,6 +3042,169 @@ fn every_package_named_in_one_step_is_credited() {
     .into_iter()
     .collect();
     assert!(workflows_name(&build_only, "buildonly").is_none());
+}
+
+/// `cargo nextest run` credits its packages like `cargo test` does, and a
+/// command that runs none of a package's unit or integration tests credits
+/// nothing: `--doc` runs only doctests, `--no-run` runs no test, and `list` /
+/// `archive` are not runs. Each row is `(line, package, credited?)`, written by
+/// hand.
+#[test]
+fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
+    const ROWS: &[(&str, &str, bool)] = &[
+        // nextest, in every package spelling the cargo form takes.
+        (
+            "        run: cargo nextest run --profile ci -p alpha -E 'not kind(lib)'",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "beta",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "gamma",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "delta",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "epsilon",
+            true,
+        ),
+        // The whole-token rule holds for nextest too.
+        ("        run: cargo nextest run -p alphab", "alpha", false),
+        // nextest subcommands that run nothing.
+        ("        run: cargo nextest list -p alpha", "alpha", false),
+        (
+            "        run: cargo nextest archive -p alpha --archive-file a.tar.zst",
+            "alpha",
+            false,
+        ),
+        // A step's `name:` is a label, not an invocation.
+        ("      - name: cargo nextest run -p alpha", "alpha", false),
+        ("        name: cargo test -p alpha", "alpha", false),
+        // Steps that run none of the package's ordinary tests.
+        ("        run: cargo test -p alpha --doc", "alpha", false),
+        ("        run: cargo test --doc -p alpha", "alpha", false),
+        ("        run: cargo test -p alpha --no-run", "alpha", false),
+        ("        run: cargo nextest run -p alpha --no-run", "alpha", false),
+        // What follows a bare `--` goes to the test binaries, not to cargo.
+        (
+            "        run: cargo test -p alpha -- --exact -p beta",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha -- --test-threads=1",
+            "alpha",
+            true,
+        ),
+        ("        run: cargo test -p alpha -- --doc", "alpha", true),
+        // Each shell command is read on its own: a `--doc` command does not
+        // cancel the run beside it, and a `-p` of a build command is not a test.
+        (
+            "        run: cargo test -p alpha --lib && cargo test -p alpha --doc",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha --doc && cargo nextest run -p alpha",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha && cargo build -p beta",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cd examples/x && cargo test -p alpha --lib -- --test-threads=1",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p alpha || cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "beta",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "alpha",
+            false,
+        ),
+        // A `;` glued to a word still ends the command.
+        (
+            "        run: cargo build -p alpha; cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha; cargo build -p beta",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p x && ./tools/scripts/ci_test_shard.sh alpha 0 4",
+            "alpha",
+            true,
+        ),
+    ];
+    let wrong: Vec<String> = ROWS
+        .iter()
+        .filter(|(line, pkg, credited)| line_runs_tests_of(line, pkg) != *credited)
+        .map(|(line, pkg, credited)| format!("  `{line}` credits `{pkg}`: expected {credited}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the test-line reader disagrees with the hand oracle:\n{}",
+        wrong.join("\n")
+    );
+
+    // End to end through the gate's own lookup: a package whose ONLY step is a
+    // doctest run is uncovered.
+    let doc_only: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "      - run: cargo test -p doconly --doc\n".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(workflows_name(&doc_only, "doconly").is_none());
+
+    // A `\` continuation belongs to the command it continues, so a flag on
+    // the next line counts, and so does a package named there.
+    let continued: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "        run: |\n          cargo test -p norun \\\n            --no-run\n          \
+         cargo nextest run --profile ci \\\n            -p later\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(workflows_name(&continued, "norun").is_none());
+    assert!(workflows_name(&continued, "later").is_some());
+
+    // A `\` followed by a space escapes the space and continues nothing, and
+    // a comment is never continued.
+    assert_eq!(
+        logical_lines(["cargo test -p a \\ ", "--no-run"]),
+        vec!["cargo test -p a \\ ".to_string(), "--no-run".to_string()]
+    );
+    assert_eq!(
+        logical_lines(["# note \\", "cargo test -p a"]),
+        vec!["# note \\".to_string(), "cargo test -p a".to_string()]
+    );
 }
 
 /// The `shard:` matrix is read in BOTH YAML list forms, and per JOB.

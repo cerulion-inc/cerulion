@@ -293,6 +293,12 @@ pub(crate) static CASES: &[Case] = &[
         &["service", "call", "/reset", "std_srvs/srv/Trigger"],
     ),
     gated(&["viz"], &["viz", "/camera"]),
+    // ---- the simulated robot and the benchmark reach no robot and no
+    // Cerulion service, so the switch does not refuse them ----
+    gated(&["rcp"], &["rcp", "--sim"]),
+    gated(&["rcp"], &["rcp", "--sim", "--http", "127.0.0.1:8765"]),
+    gated(&["rcp", "bench"], &["rcp", "bench", "--model", "m"]),
+    gated(&["rcp", "bench"], &["rcp", "bench", "--verify"]),
     // ---- not refused under the switch, behind the login gate ----
     gated(&["workspace", "create"], &["workspace", "create", "demo"]),
     gated(&["workspace", "init"], &["workspace", "init"]),
