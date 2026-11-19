@@ -2931,6 +2931,63 @@ const DEAD_NODE_SWEEP_NICE: libc::c_int = 10;
 /// var overrides it (see `spin_budget`).
 const SPIN_HOP_US: u64 = 10;
 
+/// The live loop's liveliness-sweep cadence: the longest wait (matches the 25a
+/// heartbeat).
+const LIVE_WAIT_CAP_NS: u64 = 250_000_000;
+/// The poll floor of a wait for anything but a Period deadline still ahead: a
+/// node due now, a Period node past its deadline, a throttle window or a
+/// `block` release. A node due now that the next step does not fire is re-read
+/// at this cadence, never busy-spun.
+const LIVE_POLL_FLOOR_NS: u64 = 1_000_000;
+/// The floor of an exact Period-deadline wait. A deadline less than this far
+/// ahead (a wake that landed a few ns before the gating clock reached it) waits
+/// this long, so a Period node costs at most one extra wake per fire.
+const LIVE_DEADLINE_FLOOR_NS: u64 = 10_000;
+
+/// PURE: the live loop's next wait in ns. A Period deadline still ahead is
+/// waited for exactly (floored at [`LIVE_DEADLINE_FLOOR_NS`]), capped at a
+/// fixed-quantum boundary when one applies; every other pending fire, capped at
+/// the same boundary, keeps the [`LIVE_POLL_FLOOR_NS`] poll, so the boundary
+/// waits less than 1 ms only beside a deadline still ahead. Nothing pending, or
+/// a wait past it, is capped at [`LIVE_WAIT_CAP_NS`].
+///
+/// The exact class is what keeps a Period node on its grid: a wait floored at
+/// 1 ms for a deadline less than 1 ms ahead starts each fire's wait from a late
+/// wake, so every fire lands later than the last by the step and wake overshoot
+/// until a slot is skipped and caught up with a double fire.
+pub(crate) fn live_wait_ns(
+    next: crate::scheduler::NextFire,
+    quantum_boundary_ns: Option<u64>,
+) -> u64 {
+    let exact = next.deadline_ns.map(|deadline| {
+        quantum_boundary_ns
+            .map_or(deadline, |boundary| deadline.min(boundary))
+            .max(LIVE_DEADLINE_FLOOR_NS)
+    });
+    // The boundary caps the poll too. Beside a deadline ahead that never
+    // changes the wait: a boundary below the poll caps the exact half as well,
+    // whose 10 µs floor sits below the poll's 1 ms floor.
+    let polled = next.poll_ns.map(|poll| {
+        quantum_boundary_ns
+            .map_or(poll, |boundary| poll.min(boundary))
+            .max(LIVE_POLL_FLOOR_NS)
+    });
+    match (exact, polled) {
+        (Some(e), Some(p)) => e.min(p),
+        (e, p) => e.or(p).unwrap_or(LIVE_WAIT_CAP_NS),
+    }
+    .min(LIVE_WAIT_CAP_NS)
+}
+
+/// Test-only: the wait the live loop sizes from `scheduler`'s pending fires at
+/// `now_ns`, with no fixed-quantum boundary: [`live_wait_ns`] over the
+/// scheduler's split read, the decision `live_timeout` takes. For a test that
+/// drives a bare [`Scheduler`] the way the live loop would.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn live_wait_for_test(scheduler: &Scheduler, now_ns: u64) -> Duration {
+    Duration::from_nanos(live_wait_ns(scheduler.next_fire_split(now_ns), None))
+}
+
 /// The manual-ceiling clamp for `CERULION_LIVE_SPIN_US`
 /// (100 ms, in µs). A spin budget beyond this is never sensible — the spin is a
 /// pre-block latency optimization for an *imminent* wake, not a polling loop —
@@ -4342,6 +4399,11 @@ pub struct GraphRuntime {
     /// the `#[cfg(any(test, feature = "test-helpers"))]`
     /// [`Self::set_single_park_for_test`] (gate the SETTER, not the field).
     single_park_override: Option<bool>,
+    /// Test seam: a closure the Sync drain runs right after a node's align
+    /// pass; see [`Self::set_sync_align_hook_for_test`]. Test and test-helpers
+    /// builds only (`GraphRuntime` never crosses an FFI boundary).
+    #[cfg(any(test, feature = "test-helpers"))]
+    sync_align_hook: Option<Box<dyn FnMut() + Send>>,
     /// Wake sources collected from `external`-policy ingress (driver)
     /// nodes — one per node whose [`NodeEntry::external_source`] returned an
     /// [`ExternalSource::Fd`] / [`ExternalSource::Blocking`]. Populated ONCE at
@@ -10315,6 +10377,11 @@ impl GraphRuntime {
             .now_ns()
             .saturating_add(EXTERNAL_TOPIC_SILENCE_GRACE_MS.saturating_mul(1_000_000));
 
+        debug_assert!(
+            sync_bindings_contiguous(sync_input_bindings.iter().map(|b| b.node_id.as_ref())),
+            "every node's Sync bindings must sit in one contiguous run: the drain walks a \
+             node's bindings from its first one and stops at another node's"
+        );
         // Fail fast if the live-loop WaitSet would exceed the
         // FD-set attachment bound — the loop attaches one notification per
         // data-trigger input + per sync input. Past the cap, iceoryx2 silently
@@ -10524,6 +10591,8 @@ impl GraphRuntime {
             park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
             credit_baseline_full_override: None,
             single_park_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            sync_align_hook: None,
             // External ingress sources are collected lazily at run_live
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
@@ -14675,6 +14744,16 @@ impl GraphRuntime {
         self.single_park_override = forced;
     }
 
+    /// Test seam: run `hook` in the step's drain right after each per-set Sync
+    /// node's listeners are emptied and its align pass has read every one of
+    /// its inputs. A frame the hook publishes then lands after the pass that
+    /// read the node's queues, at a fixed point in the drain. `None` removes
+    /// it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_sync_align_hook_for_test(&mut self, hook: Option<Box<dyn FnMut() + Send>>) {
+        self.sync_align_hook = hook;
+    }
+
     /// Holistic-review L6 (test seam): is a WaitSet reactor currently
     /// built/parked? A monitor-wait-park run drives every inter-step idle via
     /// [`Self::monitor_wait_block`] and never calls `reactor.run_once`, so
@@ -15690,17 +15769,17 @@ impl GraphRuntime {
     /// (previously the `--sim-clock` flag). (The loop first landed
     /// as opt-in; a later change flipped the default.)
     ///
-    /// **Timeout (period-deadline precision):** each iteration's
-    /// WaitSet timeout is the MINIMUM of (a) the scheduler's
-    /// [`Scheduler::ns_until_next_fire`] — nanoseconds until the soonest
-    /// pending `Period` deadline — and (b) a 250 ms liveliness-sweep cadence
-    /// cap (matching the 25a heartbeat), clamped to a 1 ms floor. So a
-    /// `period_ms` node fires on time between data events instead of at coarse
-    /// heartbeat granularity, while the cadence cap still bounds non-data
-    /// liveliness sweeps and the 1 ms floor bounds CPU when a Period node is
-    /// past-due. A data wake returns immediately regardless of the timeout (the
-    /// WaitSet unblocks on the event), so the timeout only governs the
-    /// no-data-arriving case.
+    /// **Timeout (period-deadline precision):** each iteration's wait is
+    /// `live_wait_ns` over the scheduler's pending fires: a `Period` deadline
+    /// still ahead is waited for exactly (at least 10 µs), every other pending
+    /// fire (a node due now, a Period node past its deadline, a throttle
+    /// window, a `block` release) at no less than a 1 ms poll, and nothing
+    /// pending at the 250 ms liveliness-sweep cadence (matching the 25a
+    /// heartbeat). So a `period_ms` node fires on its deadline between data
+    /// events, the poll bounds CPU while a node is due but not firing, and the
+    /// cadence cap still bounds non-data liveliness sweeps. A data wake returns
+    /// immediately regardless of the timeout (the WaitSet unblocks on the
+    /// event), so the timeout only governs the no-data-arriving case.
     ///
     /// **Firewall:** `run_live` only changes WHEN `step()` runs, never its
     /// body. The reactor's fired-set is ignored; `step`/`drain_level`
@@ -16034,23 +16113,16 @@ impl GraphRuntime {
         Ok(())
     }
 
-    /// The live-loop WaitSet timeout for the NEXT iteration —
-    /// `min(`[`Scheduler::ns_until_next_fire`]`, 250 ms liveliness-sweep cap)`,
-    /// floored at 1 ms. Shared by [`Self::run_live`]'s loop and the test seam
-    /// [`Self::live_timeout_for_test`] so the period-deadline integration is
-    /// directly pinnable (a freshly-built `period_ms = N` graph yields ~`N` ms,
-    /// NOT the coarse 250 ms heartbeat). PURE READ — `now_ns` + the scheduler's
-    /// pending Period deadlines; no mutation, never on the firing path.
-    ///
-    /// The 250 ms cap is the liveliness-sweep cadence (matches the 25a
-    /// heartbeat); the 1 ms floor is the old poll cadence (= the minimum
-    /// `period_ms` granularity, so it never under-shoots a real period) and
-    /// bounds CPU when a Period node is past-due. A data wake returns
-    /// immediately regardless of this timeout, so it only governs the
-    /// no-data-arriving case.
+    /// The live-loop wait for the NEXT iteration: [`live_wait_ns`] over the
+    /// scheduler's [`Scheduler::next_fire_split`] and, under a fixed-quantum
+    /// gating clock, the distance to the next quantum boundary. Shared by
+    /// [`Self::run_live`]'s loop and the test seam [`Self::live_timeout_for_test`]
+    /// so the period-deadline integration is directly pinnable (a freshly-built
+    /// `period_ms = N` graph yields ~`N` ms, NOT the coarse 250 ms heartbeat).
+    /// PURE READ: `now_ns` + the scheduler's pending deadlines; no mutation,
+    /// never on the firing path. A data wake returns immediately regardless of
+    /// this timeout, so it only governs the no-data-arriving case.
     fn live_timeout(&self) -> Duration {
-        const LIVELINESS_SWEEP_NS: u64 = 250_000_000;
-        const MIN_TIMEOUT_NS: u64 = 1_000_000;
         let now_ns = self.live_deadline_now_ns();
         // Read BEFORE the wait is sized: a drain of a mapped edge that lands
         // between this read and the park entry must still wake the park
@@ -16059,34 +16131,32 @@ impl GraphRuntime {
             e.sized_full
                 .store(e.word.outstanding() >= e.threshold, Ordering::Release);
         }
-        let next_fire_ns = self.scheduler.ns_until_next_fire(now_ns);
-        let mut wake_ns = next_fire_ns.unwrap_or(LIVELINESS_SWEEP_NS);
+        let next = self.scheduler.next_fire_split(now_ns);
         // Under a FIXED-quantum gating clock a step advances gating by exactly
         // one handed quantum however long the wait was, so a wait longer than
         // the distance to the next quantum boundary would leave gating behind
         // wall by the excess (a 20 ms Period over a 5 ms quantum would then
         // take ≈ P²/2q of wall per fire). Cap the wait at that boundary so
         // gating tracks wall one quantum per step; with quantum == period this
-        // is exactly the Period deadline. Only while a Period deadline is
-        // pending: a purely data-driven rank has nothing gating-paced to wake
-        // for (its 1 ms fallback quantum would otherwise turn the sweep into a
-        // 1 kHz poll), and a gating-follows-wall (free-run) clock advances by
-        // the measured wait, so it never falls behind.
-        if let (Some(quantum), Some(_), false) = (
+        // is exactly the Period deadline. Only while a fire is pending: a
+        // purely data-driven rank has nothing gating-paced to wake for (its
+        // 1 ms fallback quantum would otherwise turn the sweep into a 1 kHz
+        // poll), and a gating-follows-wall (free-run) clock advances by the
+        // measured wait, so it never falls behind.
+        let quantum_boundary_ns = match (
             self.live_gating_quantum,
-            next_fire_ns,
+            next.soonest(),
             self.gating_follows_wall,
         ) {
-            let boundary_ns = self
-                .scheduler
-                .gating_now_ns()
-                .saturating_add(quantum.as_nanos() as u64)
-                .saturating_sub(now_ns);
-            wake_ns = wake_ns.min(boundary_ns);
-        }
-        // clamp(floor, cap): MIN_TIMEOUT_NS (1 ms) < LIVELINESS_SWEEP_NS (250 ms),
-        // so the floor ≤ cap invariant holds (clamp would panic if floor > cap).
-        Duration::from_nanos(wake_ns.clamp(MIN_TIMEOUT_NS, LIVELINESS_SWEEP_NS))
+            (Some(quantum), Some(_), false) => Some(
+                self.scheduler
+                    .gating_now_ns()
+                    .saturating_add(quantum.as_nanos() as u64)
+                    .saturating_sub(now_ns),
+            ),
+            _ => None,
+        };
+        Duration::from_nanos(live_wait_ns(next, quantum_boundary_ns))
     }
 
     /// Test-only: the next live-loop WaitSet timeout
@@ -19344,6 +19414,148 @@ fn shared_start_decision(
 }
 
 #[cfg(test)]
+mod live_wait_tests {
+    use super::{live_wait_ns, LIVE_DEADLINE_FLOOR_NS, LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS};
+    use crate::scheduler::NextFire;
+
+    const US: u64 = 1_000;
+    const MS: u64 = 1_000_000;
+
+    fn next(deadline: Option<u64>, poll: Option<u64>) -> NextFire {
+        NextFire {
+            deadline_ns: deadline,
+            poll_ns: poll,
+        }
+    }
+
+    /// The wait the live loop sized before the exact deadline: the soonest of
+    /// everything, capped at the boundary, clamped to [1 ms, 250 ms].
+    fn single_floor_oracle(n: NextFire, boundary: Option<u64>) -> u64 {
+        match n.soonest() {
+            None => LIVE_WAIT_CAP_NS,
+            Some(soonest) => boundary
+                .map_or(soonest, |b| soonest.min(b))
+                .clamp(LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS),
+        }
+    }
+
+    #[test]
+    fn a_period_deadline_below_a_millisecond_is_waited_for_exactly() {
+        assert_eq!(live_wait_ns(next(Some(300 * US), None), None), 300 * US);
+        assert_eq!(live_wait_ns(next(Some(999 * US), None), None), 999 * US);
+        assert_eq!(live_wait_ns(next(Some(4 * MS), None), None), 4 * MS);
+    }
+
+    #[test]
+    fn a_deadline_closer_than_the_deadline_floor_waits_the_floor() {
+        assert_eq!(LIVE_DEADLINE_FLOOR_NS, 10 * US);
+        assert_eq!(live_wait_ns(next(Some(1), None), None), 10 * US);
+        assert_eq!(live_wait_ns(next(Some(9_999), None), None), 10 * US);
+        assert_eq!(live_wait_ns(next(Some(10_001), None), None), 10_001);
+    }
+
+    #[test]
+    fn every_other_pending_fire_keeps_the_millisecond_poll() {
+        assert_eq!(LIVE_POLL_FLOOR_NS, MS);
+        assert_eq!(live_wait_ns(next(None, Some(0)), None), MS, "due now");
+        assert_eq!(
+            live_wait_ns(next(None, Some(300 * US)), None),
+            MS,
+            "a window below 1 ms"
+        );
+        assert_eq!(
+            live_wait_ns(next(None, Some(7 * MS)), None),
+            7 * MS,
+            "a later release"
+        );
+    }
+
+    #[test]
+    fn a_deadline_and_a_poll_take_the_sooner_of_their_floored_waits() {
+        assert_eq!(live_wait_ns(next(Some(300 * US), Some(0)), None), 300 * US);
+        assert_eq!(live_wait_ns(next(Some(5 * MS), Some(0)), None), MS);
+        assert_eq!(live_wait_ns(next(Some(2 * US), Some(0)), None), 10 * US);
+    }
+
+    #[test]
+    fn nothing_pending_or_a_far_wait_is_capped_at_the_liveliness_sweep() {
+        assert_eq!(LIVE_WAIT_CAP_NS, 250 * MS);
+        assert_eq!(live_wait_ns(next(None, None), None), 250 * MS);
+        assert_eq!(live_wait_ns(next(None, None), Some(3 * MS)), 250 * MS);
+        assert_eq!(live_wait_ns(next(Some(400 * MS), None), None), 250 * MS);
+        assert_eq!(live_wait_ns(next(None, Some(900 * MS)), None), 250 * MS);
+    }
+
+    #[test]
+    fn a_quantum_boundary_is_exact_only_beside_a_deadline_still_ahead() {
+        // Beside a deadline: the sooner of the two, exact.
+        assert_eq!(
+            live_wait_ns(next(Some(4 * MS), None), Some(2_500 * US)),
+            2_500 * US
+        );
+        assert_eq!(
+            live_wait_ns(next(Some(4 * MS), None), Some(3 * US)),
+            10 * US
+        );
+        assert_eq!(
+            live_wait_ns(next(Some(400 * US), None), Some(2 * MS)),
+            400 * US
+        );
+        // Without one: it caps the poll and keeps the poll floor.
+        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(2 * MS)), 2 * MS);
+        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(400 * US)), MS);
+        assert_eq!(live_wait_ns(next(None, Some(0)), Some(400 * US)), MS);
+    }
+
+    /// No case polls faster than a single 1 ms floor: wherever no Period
+    /// deadline is ahead, the wait is exactly the old one, and a deadline ahead
+    /// only ever brings the wait forward to that deadline (never below it, and
+    /// never below the deadline floor).
+    #[test]
+    fn only_a_deadline_still_ahead_waits_less_than_the_single_floor_did() {
+        let values = [
+            None,
+            Some(0),
+            Some(1),
+            Some(9 * US),
+            Some(10 * US),
+            Some(300 * US),
+            Some(MS - 1),
+            Some(MS),
+            Some(2 * MS),
+            Some(250 * MS),
+            Some(900 * MS),
+        ];
+        for deadline in values {
+            let deadline = deadline.filter(|&d| d > 0);
+            for poll in values {
+                for boundary in values {
+                    let n = next(deadline, poll);
+                    let new = live_wait_ns(n, boundary);
+                    let old = single_floor_oracle(n, boundary);
+                    let case = format!("deadline {deadline:?} poll {poll:?} boundary {boundary:?}");
+                    match deadline {
+                        None => assert_eq!(new, old, "{case}"),
+                        Some(d) => {
+                            assert!(new <= old, "{case}: {new} > {old}");
+                            assert!(new >= LIVE_DEADLINE_FLOOR_NS, "{case}: {new}");
+                            if new < LIVE_POLL_FLOOR_NS {
+                                let exact =
+                                    boundary.map_or(d, |b| d.min(b)).max(LIVE_DEADLINE_FLOOR_NS);
+                                assert_eq!(
+                                    new, exact,
+                                    "{case}: only the deadline waits under 1 ms"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod shared_start_decision_tests {
     use super::{shared_start_decision, SharedStart};
     use std::time::Duration;
@@ -19601,6 +19813,51 @@ fn log_tick_failure_recovery(node_id: &str, suppressed: u64) {
         suppressed,
         "node tick recovered after failures"
     );
+}
+
+/// PURE: whether, in list order, every node id's entries sit in one
+/// contiguous run. The Sync drain's per-set walk relies on it: it empties a
+/// node's listeners from the node's first binding and stops at the first
+/// binding of another node.
+// hot-path-alloc-ok-fn: cold: build-time check only (one debug_assert per graph build)
+fn sync_bindings_contiguous<'a>(node_ids: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen: Vec<&'a str> = Vec::new();
+    for id in node_ids {
+        if seen.last() == Some(&id) {
+            continue;
+        }
+        if seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+    }
+    true
+}
+
+#[cfg(test)]
+mod sync_binding_order_tests {
+    use super::sync_bindings_contiguous;
+
+    #[test]
+    fn a_node_whose_bindings_are_split_by_another_nodes_is_not_contiguous() {
+        // (node ids in binding order, contiguous)
+        let cases: [(&[&str], bool); 7] = [
+            (&[], true),
+            (&["a"], true),
+            (&["a", "a"], true),
+            (&["a", "a", "b", "b", "c"], true),
+            (&["a", "b", "a"], false),
+            (&["a", "a", "b", "c", "a"], false),
+            (&["a", "b", "b", "a", "b"], false),
+        ];
+        for (ids, want) in cases {
+            assert_eq!(
+                sync_bindings_contiguous(ids.iter().copied()),
+                want,
+                "{ids:?}"
+            );
+        }
+    }
 }
 
 fn log_drain_failure(
@@ -20094,44 +20351,62 @@ impl GraphRuntime {
                 continue;
             }
             // On the PER-SET path this binding's `trigger_subscribers`
-            // slot is a listener-only WAKE SOURCE, not a data receiver. Two
-            // things happen here instead of the legacy timestamp drain:
+            // slot is a listener-only WAKE SOURCE, not a data receiver. At the
+            // node's FIRST per-set binding, two things happen instead of the
+            // legacy timestamp drain, in this order:
             //
-            // 1. DRAIN ITS STALE NOTIFICATIONS. A publish onto a unified input
-            //    leaves its `SentSample` event in the standalone listener
-            //    forever if nothing on the step path takes it, and the live
-            //    loop's next idle poll reads the stale event as a data wake —
-            //    one spurious wake+step per publish, which under the multi-process
-            //    split is self-sustaining (the free-run class).
+            // 1. DRAIN THE STALE NOTIFICATIONS of every per-set binding of the
+            //    node. A publish onto a unified input leaves its `SentSample`
+            //    event in the standalone listener forever if nothing on the step
+            //    path takes it, and the live loop's next idle poll reads the
+            //    stale event as a data wake: one spurious wake+step per publish,
+            //    which under the multi-process split is self-sustaining (the
+            //    free-run class).
             // 2. RUN THE ALIGN PASS. It fills every unfilled head through the
             //    node lock and drives the matcher's verdicts, leaving a
-            //    complete in-window set for `decide_node` to fire — or not.
+            //    complete in-window set for `decide_node` to fire, or not.
+            //
+            // The order is the unified data-trigger drain's: empty, then read.
+            // A frame that lands after the align pass read its queue keeps its
+            // notification, so the next idle wait wakes on it. Emptying a later
+            // binding's listener after the pass would erase that notification
+            // while its sample stays queued, and the park or WaitSet would then
+            // sleep its full timeout. A frame that lands between the empty and
+            // the read is read by the pass if its head is empty, and leaves one
+            // stale wake either way: at most one spurious step, which needs a new
+            // publish in that window to recur.
             //
             // The align pass's own verdict is deliberately ignored here:
             // `decide_node` re-derives it from the heads, so there is ONE
             // authority for whether a node fires, and the burst loop is the
             // only other consumer of the outcome.
             if self.sync_input_bindings[i].per_set {
-                {
-                    let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    // iceoryx2 0.10: one `try_wait` empties the queue.
-                    let _ = wake_listener.try_wait(|_activation| {});
-                }
                 // ONCE PER NODE, not once per binding. The align pass is a
-                // WHOLE-NODE operation — it walks every declared trigger input —
+                // WHOLE-NODE operation (it walks every declared trigger input),
                 // so running it k times would re-probe every input k times, and
                 // each pass resets the per-input advance clamp, handing a k-input
                 // node k times the descent budget its own contract states.
                 //
                 // A node's bindings are pushed contiguously by the build loop
-                // (one per trigger input of one node), and the level filter above
-                // preserves that, so remembering the PREVIOUS node id is enough
-                // and costs no allocation on a path that runs every level of
-                // every step.
+                // (one per trigger input of one node; `sync_bindings_contiguous`
+                // checks it at build in debug builds), and the level filter above
+                // keeps or skips a node's bindings together, so remembering the
+                // PREVIOUS node id is enough, and the walk below stops at the
+                // first binding of another node. No allocation on a path that
+                // runs every level of every step.
                 if aligned_node.as_deref() == Some(node_id.as_ref()) {
                     continue;
                 }
                 aligned_node = Some(Arc::clone(&node_id));
+                for binding in self.sync_input_bindings[i..]
+                    .iter()
+                    .take_while(|b| b.node_id == node_id)
+                    .filter(|b| b.per_set)
+                {
+                    let wake_listener = self.trigger_subscribers[binding.subscriber_idx].listener();
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
+                }
                 if let Err(e) = self
                     .scheduler
                     .align_sync_heads(&node_id, crate::scheduler::SyncAlignSite::Boundary)
@@ -20141,6 +20416,10 @@ impl GraphRuntime {
                         error = %e,
                         "sync alignment skipped (node absent from the scheduler)"
                     );
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(hook) = self.sync_align_hook.as_mut() {
+                    hook();
                 }
                 continue;
             }
