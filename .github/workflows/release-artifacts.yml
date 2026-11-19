@@ -537,11 +537,22 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Download the Lyrical rmw libraries
+      # One download per target, by name, into a folder named for its
+      # artifact, which is where the packaging step below reads each library.
+      # A pattern download does not pin that folder: download-artifact v5 and
+      # later extract a pattern that matches one artifact straight into
+      # `path`, without the artifact-name folder.
+      - name: Download the Lyrical rmw library for x86_64
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: rmw-lyrical-*
-          path: rmw-lyrical
+          name: rmw-lyrical-x86_64-unknown-linux-gnu
+          path: rmw-lyrical/rmw-lyrical-x86_64-unknown-linux-gnu
+
+      - name: Download the Lyrical rmw library for aarch64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rmw-lyrical-aarch64-unknown-linux-gnu
+          path: rmw-lyrical/rmw-lyrical-aarch64-unknown-linux-gnu
 
       # The Lyrical rmw is a separate asset: the library bakes in the distro it
       # was built for and refuses a mismatched ROS_DISTRO, and the CLI looks for
