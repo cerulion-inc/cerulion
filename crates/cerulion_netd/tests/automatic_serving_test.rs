@@ -321,27 +321,28 @@ async fn read_catalog(
     (bytes, listed)
 }
 
-/// Requests the catalog until it lists `topic`, within `LIMIT`, and returns
-/// that reply's bytes. The remote daemon writes its beacon facts when its
-/// endpoint binds, and its catalog lists a topic only once its own transport
-/// lists that topic, so a read right after the facts appear can lack it.
+/// Requests the catalog until it lists `topic` and returns that reply's bytes;
+/// one `LIMIT` covers every request, reply and pause. The remote daemon writes
+/// its beacon facts when its endpoint binds, and its catalog lists a topic only
+/// once its own transport lists that topic, so a read right after the facts
+/// appear can lack it.
 async fn catalog_listing(
     send: &mut cerulion_link::SendStream,
     recv: &mut cerulion_link::RecvStream,
     topic: &str,
 ) -> Vec<u8> {
-    let deadline = Instant::now() + LIMIT;
-    loop {
-        let (bytes, listed) = read_catalog(send, recv, topic).await;
-        if listed {
-            return bytes;
+    let listing = async {
+        loop {
+            let (bytes, listed) = read_catalog(send, recv, topic).await;
+            if listed {
+                return bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            Instant::now() < deadline,
-            "the served catalog never listed {topic}"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    };
+    tokio::time::timeout(LIMIT, listing)
+        .await
+        .unwrap_or_else(|_| panic!("the served catalog never listed {topic} within {LIMIT:?}"))
 }
 
 #[test]
