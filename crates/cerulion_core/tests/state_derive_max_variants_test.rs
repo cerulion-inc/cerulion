@@ -17,7 +17,7 @@
 //!
 //! The file EARNS ITS KEEP as the standing evidence for both halves. It is a
 //! real compilation of the boundary — so if rustc ever stops suppressing the
-//! lint, the CI `lint` job says so instead of a user's build being the first
+//! lint, the CI `lint-clippy` job says so instead of a user's build being the first
 //! to find out — and it asserts the ENCODING at the boundary, which compiling
 //! proves nothing about: that the 256th variant really rides tag 255, that it
 //! round-trips, and that with every tag spoken for the remaining decode

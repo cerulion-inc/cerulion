@@ -49,6 +49,12 @@ This file records the licensing history of Cerulion.
   distributed library source; revisit if counsel wants the header (it requires
   regenerating the fixture via `cargo run -p cerulion_cli_engine --example
   dump_raw_ffi_emit`).
+  **Exclusion:** `crates/test_fixtures/test_node_start_order_prod_cdylib/src/lib.rs`
+  and `crates/test_fixtures/test_node_start_order_cons_cdylib/src/lib.rs` are
+  skipped for the same reason: each is byte for byte the `src/lib.rs` that
+  `cerulion node create` and `cerulion node modify` write, pinned by
+  `crates/cerulion_cli/tests/graph_start_order_e2e_test.rs`, and the scaffold
+  writes no SPDX header.
 - **Scope of per-file SPDX headers.** "First-party Rust source" means the
   source of the workspace-member crates (`cerulion_core`, `cerulion_cli`,
   `cerulion_cli_engine`, `cerulion_cli_tui`, `cerulion_macros`, `rmw_cerulion`,

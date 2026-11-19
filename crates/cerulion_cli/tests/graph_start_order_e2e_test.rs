@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Permanent regression pin — producer-graph-FIRST start order at the
-//! TRUE production surface (two `cerulion graph run` PROCESSES over real
-//! CLI-scaffolded cdylib nodes).
+//! TRUE production surface (two `cerulion graph run` PROCESSES over cdylib
+//! nodes whose source is the CLI scaffold's, byte for byte).
 //!
 //! # The contract
 //!
@@ -28,7 +28,11 @@
 //!     hold path) — staged into graph `cgraph` (prefix `soc`), its input
 //!     bound to the ABSOLUTE producer topic `/sop/prod/out`.
 //!
-//! Both node crates are compiled in-test via `cerulion node build`. Then it
+//! The node libraries are PREBUILT fixtures, `test_node_start_order_prod_cdylib`
+//! and `test_node_start_order_cons_cdylib`, compared against the scaffold before
+//! they are loaded (see "The fixture pin" below). The test copies each to
+//! `<ws>/target/debug/lib<node>.so`, where `graph run` resolves the node with
+//! `CARGO_TARGET_DIR` unset. Then it
 //! starts `graph run pgraph` FIRST (the load-bearing ordering — without the
 //! floor this creates `/sop/prod/out` at borrow 2), waits for the producer to go live
 //! (its owned service now exists — created at the borrow FLOOR), starts
@@ -43,6 +47,37 @@
 //! supervisor + worker, obscuring the two-process cross-graph scenario this pin
 //! is actually about (and changing the readiness/teardown shape).
 //!
+//! # The fixture pin
+//!
+//! After the scaffold and the staging, the scaffolded nodes must be exactly
+//! `prod` and `cons`, and each node crate and its fixture crate must hold
+//! exactly `Cargo.toml` and `src/lib.rs`. Each node's `src/lib.rs` must equal
+//! its fixture's byte for byte, and its `Cargo.toml` must equal its fixture's
+//! manifest once three edits a workspace member needs are applied: the package
+//! renamed to the fixture's name, `publish = false` under it, and the
+//! inherited `[lints]` table appended. A template change that adds a file, or
+//! adds, drops or rewrites a line of either file, fails here, naming both
+//! texts. The library must also be no older than the fixture's `src/lib.rs`,
+//! so a library built from an earlier fixture source is refused rather than
+//! loaded. A library file name carries no source hash, so a target directory
+//! shared by two checkouts can hold the other checkout's build of the same
+//! fixture; give each checkout its own. To follow an intended template change,
+//! copy the scaffolded files over the fixture's, reapply the three edits and
+//! rebuild the fixtures.
+//!
+//! What the fixtures do not exercise is the build of a generated workspace
+//! itself: the unlocked resolve, the iceoryx2 patch and the generated message
+//! crate. `read_identity_oracle_test` builds a generated workspace, a
+//! `node create` template node included, through the engine's `node_build` on
+//! every platform, and `node_build_notice_e2e_test` pins where `cerulion node
+//! build` puts the library for each `CARGO_TARGET_DIR` form. Loading and
+//! running a library built in a generated workspace is
+//! `crates/cerulion_py/tests/test_cli_pynode.py`'s, which builds a Rust node
+//! with `cerulion node build` and runs it in a graph.
+//!
+//! Build the fixtures first:
+//! `cargo build -p test_node_start_order_prod_cdylib -p test_node_start_order_cons_cdylib`.
+//!
 //! # Anti-tautology
 //!
 //! The negative control was run by hand on Linux x86_64: a binary built WITH
@@ -56,26 +91,17 @@
 //! fails LOUDLY if the CLI ever stops emitting a plain non-trigger `#[input]`
 //! for `cons` — a trigger input would drain-not-hold, provision NO borrow-3
 //! requirement, and make this whole test pass VACUOUSLY (green with or without
-//! the borrow floor).
+//! the borrow floor). The fixture pin carries that guard over to the loaded
+//! library: the `cons` fixture is the scaffold's source.
 //!
 //! # Qualified schema names
 //!
 //! Ports are added with the QUALIFIED schema name `geometry_msgs::Vector3`.
 //! Bare (`Vector3`) names generate broken node-crate imports, so the
-//! scaffold would fail to compile at the `node build` step.
+//! scaffold would not compile.
 //!
-//! # Runtime cost (why this test is heavyweight)
-//!
-//! Unlike the sibling e2e tests (which COPY prebuilt fixture cdylibs), this
-//! test compiles two node crates in-process via `cerulion node build`, because
-//! the point is the TRUE production surface — real CLI-scaffolded nodes, not a
-//! hand-copied fixture. The generated node crates path-dep the repo's
-//! `cerulion_core`, so the FIRST build cold-compiles the cerulion_core family
-//! (its dependencies come warm from `~/.cargo`); `mp_supervisor_box_test`
-//! measures ~8 min for three such crates cold. The second build reuses
-//! `<ws>/target` and is fast. Timeouts below are budgeted GENEROUSLY for a slow
-//! CI runner; every wait is bounded (no unbounded waits, no exact-timing asserts —
-//! liveness and the regression signature only).
+//! Every wait is bounded and generous for a slow CI runner; none asserts an
+//! exact timing (liveness and the regression signature only).
 //!
 //! Runs on the GLOBAL iceoryx2 namespace (no isolation seam at the binary
 //! layer, same as `node_run_e2e_test.rs` / `mp_record_e2e_test.rs`);
@@ -83,13 +109,15 @@
 //! it safe.
 
 #![cfg(not(target_os = "macos"))]
-// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. Every arm here
-// spawns a `cerulion` supervisor child that loads plugin nodes, and on macOS such a
-// process cannot create any further event resource. The mechanism, the derivation
+// WAIVED WHOLE on macOS: upstream iceoryx2 0.10.0 defect 2034. The start-order arm
+// spawns `cerulion graph run` children that load plugin nodes, and on macOS such a
+// process cannot create any further event resource; the two manifest unit tests
+// spawn nothing and share the file gate. The mechanism, the derivation
 // that selects this file, and the coverage this costs are stated once in
 // `cerulion_core/tests/upstream_waivers_test.rs`. Runs normally on Linux.
 #![cfg(unix)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -112,12 +140,6 @@ const READY_LINE: &str = "starting graph (live)";
 // Every wait is bounded and generous; none asserts an exact timing.
 /// Fast scaffold steps (workspace/node/graph file ops via the binary).
 const SCAFFOLD_TIMEOUT: Duration = Duration::from_secs(60);
-/// FIRST `node build` — cold-compiles the cerulion_core family into
-/// `<ws>/target` (deps warm from `~/.cargo`). `mp_supervisor_box_test` measures
-/// ~8 min for three such crates cold; ~2x headroom for a slow machine.
-const FIRST_BUILD_TIMEOUT: Duration = Duration::from_secs(900);
-/// SECOND `node build` — reuses `<ws>/target`, compiles only the node crate.
-const SECOND_BUILD_TIMEOUT: Duration = Duration::from_secs(300);
 /// Producer readiness (mirrors `node_run_e2e_test.rs`'s 30 s readiness wait).
 const PRODUCER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Consumer readiness — a touch more headroom than the producer (it opens the
@@ -183,13 +205,12 @@ fn wait_for_log_line(path: &Path, needle: &str, timeout: Duration) -> String {
     }
 }
 
-/// Run one scaffold/build step through the REAL binary to completion in `root`,
-/// asserting exit 0. Output is redirected to files so a build's flood of stdout
-/// never deadlocks a pipe; on timeout or failure both are dumped.
+/// Run one scaffold step through the REAL binary to completion in `root`,
+/// asserting exit 0. Output is redirected to files so a full pipe never blocks
+/// the child; on timeout or failure both are dumped.
 ///
-/// `CARGO_TARGET_DIR` is stripped so every build lands in `<ws>/target` and the
-/// later `graph run` resolves the cdylib from the same place (the
-/// `node_run_e2e_test.rs` convention). `NO_COLOR` keeps captured output plain.
+/// `CARGO_TARGET_DIR` is stripped, as for `graph run` below, so no step reads
+/// the caller's target directory. `NO_COLOR` keeps captured output plain.
 fn run_step(root: &Path, args: &[&str], timeout: Duration) {
     let out_path = root.join("step.stdout");
     let err_path = root.join("step.stderr");
@@ -241,6 +262,173 @@ fn spawn_graph_run(root: &Path, graph: &str) -> (ChildGuard, PathBuf, PathBuf) {
         .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn `cerulion graph run {graph}`: {e}"));
     (ChildGuard(child), stdout_path, stderr_path)
+}
+
+/// One prebuilt node library and the scaffolded node it stands in for.
+struct Fixture {
+    /// The node type the test scaffolds.
+    node: &'static str,
+    /// The fixture crate, from this package's directory. Its last segment is
+    /// the package name, which is also the library's crate name.
+    dir: &'static str,
+}
+
+impl Fixture {
+    fn package(&self) -> &'static str {
+        self.dir.rsplit_once('/').map_or(self.dir, |(_, last)| last)
+    }
+}
+
+const FIXTURES: [Fixture; 2] = [
+    Fixture {
+        node: "prod",
+        dir: "../test_fixtures/test_node_start_order_prod_cdylib",
+    },
+    Fixture {
+        node: "cons",
+        dir: "../test_fixtures/test_node_start_order_cons_cdylib",
+    },
+];
+
+/// Every file a scaffolded Rust node crate holds, and so every file its
+/// fixture may hold: a template that adds a file (a `build.rs`, a second
+/// source) fails the pin even though the two compared files still match.
+const CRATE_FILES: [&str; 2] = ["Cargo.toml", "src/lib.rs"];
+
+/// `scaffold`, a node manifest `node create` wrote for `node`, as the manifest
+/// of a member of this repository's workspace: the package renamed to
+/// `package`, `publish = false` under it, and the inherited `[lints]` table
+/// appended. A fixture manifest differs from its scaffold by these three edits
+/// and nothing else.
+fn as_fixture_manifest(scaffold: &str, node: &str, package: &str) -> String {
+    let name_line = format!("name = \"{node}\"\n");
+    assert_eq!(
+        scaffold.matches(&name_line).count(),
+        1,
+        "fixture pin: the scaffolded manifest must carry {name_line:?} exactly once:\n{scaffold}"
+    );
+    let renamed = scaffold.replacen(
+        &name_line,
+        &format!("name = \"{package}\"\npublish = false\n"),
+        1,
+    );
+    format!("{renamed}\n[lints]\nworkspace = true\n")
+}
+
+/// The whole file at `path`; a missing or unreadable file fails the test
+/// rather than reading as empty.
+fn read_required(path: &Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()))
+}
+
+/// Every file under `dir`, as `/`-separated paths relative to it.
+fn files_under(dir: &Path) -> BTreeSet<String> {
+    let mut files = BTreeSet::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        let entries =
+            std::fs::read_dir(&at).unwrap_or_else(|e| panic!("cannot list {}: {e}", at.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("cannot list {}: {e}", at.display()))
+                .path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(dir).expect("listed under dir");
+                let parts: Vec<_> = relative
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect();
+                files.insert(parts.join("/"));
+            }
+        }
+    }
+    files
+}
+
+fn modified(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| panic!("cannot read the mtime of {}: {e}", path.display()))
+}
+
+/// Compare the scaffolded `nodes/<node>/` crate in `root` with its fixture,
+/// then copy the fixture's prebuilt library to where `graph run` resolves
+/// `<node>`.
+fn install_pinned_fixture(root: &Path, fixture: &Fixture) {
+    let (node, package) = (fixture.node, fixture.package());
+    let scaffold_dir = root.join("nodes").join(node);
+    let fixture_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(fixture.dir);
+    let crate_files: BTreeSet<String> = CRATE_FILES.iter().map(|f| f.to_string()).collect();
+    for (side, dir) in [("scaffolded", &scaffold_dir), ("fixture", &fixture_dir)] {
+        assert_eq!(
+            files_under(dir),
+            crate_files,
+            "fixture pin: the {side} crate {} must hold exactly {CRATE_FILES:?}",
+            dir.display()
+        );
+    }
+
+    let fixture_lib_rs = fixture_dir.join("src").join("lib.rs");
+    assert_eq!(
+        read_required(&scaffold_dir.join("src").join("lib.rs")),
+        read_required(&fixture_lib_rs),
+        "fixture pin: the scaffolded nodes/{node}/src/lib.rs (left) differs from {} (right); \
+         copy the scaffold over the fixture and rebuild it",
+        fixture_lib_rs.display()
+    );
+    let fixture_manifest = fixture_dir.join("Cargo.toml");
+    assert_eq!(
+        as_fixture_manifest(
+            &read_required(&scaffold_dir.join("Cargo.toml")),
+            node,
+            package
+        ),
+        read_required(&fixture_manifest),
+        "fixture pin: the scaffolded nodes/{node}/Cargo.toml, with the three member edits \
+         applied (left), differs from {} (right)",
+        fixture_manifest.display()
+    );
+
+    // Cargo rebuilds a library whose source is newer than its last build, so
+    // an older library was built from some other source than the one above.
+    let lib = cerulion_core::testing::find_fixture_cdylib(package);
+    assert!(
+        modified(&lib) >= modified(&fixture_lib_rs),
+        "{} is older than {}, so it was not built from the source the pin just compared; \
+         run `cargo build -p {package}`",
+        lib.display(),
+        fixture_lib_rs.display()
+    );
+    let target_debug = root.join("target").join("debug");
+    std::fs::create_dir_all(&target_debug).expect("create <ws>/target/debug");
+    std::fs::copy(
+        &lib,
+        target_debug.join(cerulion_core::testing::cdylib_file_name(node)),
+    )
+    .unwrap_or_else(|e| panic!("copy {} into the workspace: {e}", lib.display()));
+}
+
+/// The manifest edits against hand-written text: the package renamed with
+/// `publish = false` under it, the lint table appended, nothing else moved.
+#[test]
+fn a_scaffold_manifest_becomes_its_fixture_manifest_by_the_three_edits() {
+    let scaffold = "[package]\nname = \"prod\"\nversion = \"0.1.0\"\n\n\
+                    [dependencies]\ncerulion_core = { workspace = true }\n";
+    assert_eq!(
+        as_fixture_manifest(scaffold, "prod", "pinned_prod"),
+        "[package]\nname = \"pinned_prod\"\npublish = false\nversion = \"0.1.0\"\n\n\
+         [dependencies]\ncerulion_core = { workspace = true }\n\n[lints]\nworkspace = true\n"
+    );
+}
+
+/// A manifest that does not name the scaffolded package exactly once is
+/// refused, rather than passed through with no rename.
+#[test]
+#[should_panic(expected = "exactly once")]
+fn a_scaffold_manifest_without_its_package_name_line_is_refused() {
+    as_fixture_manifest("[package]\nname = \"other\"\n", "prod", "pinned_prod");
 }
 
 /// THE pin: producer graph started FIRST, snapshot-hold consumer graph
@@ -349,11 +537,30 @@ fn producer_first_then_snapshot_consumer_starts_and_runs() {
         SCAFFOLD_TIMEOUT,
     );
 
-    // ── In-test node builds (the heavyweight step; see module doc) ───────────
-    // prod first cold-compiles the cerulion_core family into <ws>/target; cons
-    // then reuses it.
-    run_step(root, &["node", "build", "prod"], FIRST_BUILD_TIMEOUT);
-    run_step(root, &["node", "build", "cons"], SECOND_BUILD_TIMEOUT);
+    // ── The fixture pin, then the prebuilt libraries (see module doc) ───────
+    let fixture_nodes: BTreeSet<String> = FIXTURES.iter().map(|f| f.node.to_string()).collect();
+    let scaffolded_nodes: BTreeSet<String> = std::fs::read_dir(root.join("nodes"))
+        .expect("list nodes/")
+        .map(|entry| {
+            entry
+                .expect("list nodes/")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    assert_eq!(
+        fixture_nodes.len(),
+        FIXTURES.len(),
+        "fixture pin: FIXTURES names a node twice"
+    );
+    assert_eq!(
+        scaffolded_nodes, fixture_nodes,
+        "fixture pin: every scaffolded node needs exactly one fixture"
+    );
+    for fixture in &FIXTURES {
+        install_pinned_fixture(root, fixture);
+    }
 
     // ── Start the PRODUCER graph FIRST (the load-bearing ordering) ───────────
     let (mut producer, _prod_stdout, prod_stderr) = spawn_graph_run(root, "pgraph");
