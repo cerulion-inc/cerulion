@@ -423,9 +423,13 @@ package_dir_of() {
 #     package's own;
 #   * a doctest's possible source under `src/`: a fenced block (three
 #     backticks or tildes) or a line indented as code (five spaces or a tab
-#     past the marker) in a `//!` or `///` comment, any `#[doc`/`#![doc` attribute (a `#[doc = "..."]`
-#     string or an `include_str!` can hold a block too) or a `/**`/`/*!` block
-#     comment, because nextest runs no doctest;
+#     past the marker) in a `//!` or `///` comment. The indent rule is a
+#     heuristic: it counts from the marker, where rustdoc counts from the
+#     indent every line of the comment shares, so it refuses an indented list
+#     continuation and misses a block in a comment written with no space after
+#     the marker. Also refused: any `#[doc`/`#![doc` attribute (a `#[doc =
+#     "..."]` string or an `include_str!` can hold a block too) or a
+#     `/**`/`/*!` block comment. nextest runs no doctest;
 #   * a test target the depth-1 list does not name, or test code outside
 #     `src/`: a `[[test]]` table, a `tests/<dir>/main.rs`, a `[[bin]]` without
 #     `test = false`, an `[[example]]` or `[[bench]]` with `test = true`, or a
@@ -445,13 +449,15 @@ check_extra() {
         && die "--with $1: $2/Cargo.toml declares a [[test]] target, which the tests/*.rs list does not name"
     _nested=$(find "$2/tests" -mindepth 2 -maxdepth 2 -name main.rs -print 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
     [ -z "$_nested" ] || die "--with $1: $_nested is a test target the tests/*.rs list does not name"
-    # One pass over the manifest's target tables; the first offence decides.
+    # One pass over the manifest's target tables; the first offence decides. A
+    # table header may carry a trailing comment; a `path` may be quoted either
+    # way and start `./`. Inline tables (`lib = { ... }`) are not read.
     _target=$(awk '
         function close_table() { if (table == "[[bin]]" && !off && !why) why = "a [[bin]] lacks `test = false`, so its tests would run only under --bins" }
-        /^\[/ { close_table(); table = $0; off = 0; next }
-        table == "[[bin]]" && /^test[ \t]*=[ \t]*false/ { off = 1 }
-        (table == "[[example]]" || table == "[[bench]]") && /^test[ \t]*=[ \t]*true/ && !why { why = "a " table " has `test = true`, which the tests/*.rs list does not name" }
-        table == "[lib]" && /^path[ \t]*=/ && !/^path[ \t]*=[ \t]*"src\// && !why { why = "its [lib] path is outside src/, where the unit test scan does not look" }
+        /^[ \t]*\[/ { close_table(); table = $0; sub(/^[ \t]+/, "", table); sub(/[ \t]*#.*$/, "", table); sub(/[ \t]+$/, "", table); off = 0; next }
+        table == "[[bin]]" && /^[ \t]*test[ \t]*=[ \t]*false/ { off = 1 }
+        (table == "[[example]]" || table == "[[bench]]") && /^[ \t]*test[ \t]*=[ \t]*true/ && !why { why = "a " table " has `test = true`, which the tests/*.rs list does not name" }
+        table == "[lib]" && /^[ \t]*path[ \t]*=/ && !/^[ \t]*path[ \t]*=[ \t]*["\047](\.\/)?src\// && !why { why = "its [lib] path is outside src/, where the unit test scan does not look" }
         END { close_table(); print why }' "$2/Cargo.toml")
     [ -z "$_target" ] || die "--with $1: in $2/Cargo.toml, $_target"
     [ -d "$2/tests" ] || die "--with $1: $2/tests does not exist, so it would add nothing to the shard"

@@ -1420,7 +1420,8 @@ fn shard_script_package(line: &str) -> Option<String> {
 /// whose first argument after the script is the package; a `--list`,
 /// `--check` or `--selected` line runs nothing. The arguments end at the
 /// first `;`, `&&`, `||` or `|`, where the coverage walk's reader
-/// (`cerulion_cli_engine/tests/ci_test_line`) ends the command too.
+/// (`crates/cerulion_cli_engine/tests/ci_test_line/mod.rs`) ends the command
+/// too.
 fn shard_script_with_packages(line: &str) -> Vec<String> {
     let line = line.replace(';', " ; ");
     let toks: Vec<&str> = line.split_whitespace().collect();
@@ -1584,6 +1585,7 @@ fn the_workflow_reader_finds_packages_and_their_thread_policy() {
     for other_command in [
         "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4; echo --with alpha",
         "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4 && echo --with alpha",
+        "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4 || echo --with alpha",
         "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4 | tee --with alpha",
     ] {
         assert_eq!(
