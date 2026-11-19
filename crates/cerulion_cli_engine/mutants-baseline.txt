@@ -1,8 +1,9 @@
 # Mutation baseline for cerulion_cli_engine: the delivery flag token of
 # `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
-# resumed replay make about a node a checkpoint states as stopped, and the
+# resumed replay make about a node a checkpoint states as stopped, the
 # stand-downs a resumed replay applies to a node whose stop the recording
-# does not state.
+# does not state, and how a replay judges and re-executes a node that a
+# `block` input in its own rank holds.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -116,6 +117,45 @@
 # Result:  29 mutants: 28 caught, 1 unviable, 0 missed. The unviable one
 #          replaces `unfired_since_anchor` with `Default::default()`:
 #          `OwedFire` has no default.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Fourth scope: a FIFO node that a `block` input in its own rank holds.
+#
+# Scope: the pure decision functions on the lines the change added or
+# changed. In src/replay_rederive.rs: the held-by fact (`BlockHeldBy`), the
+# counted carry and the carry dispatcher (`fifo_step_backlog`,
+# `fifo_carry_out`), the deferral predicate (`fifo_carry_deferrable`), the
+# note a finding on a node whose drain the bag does not record carries
+# (`unrecorded_hold_note`), the rules that read them (`verify_fifo`,
+# `verify_latest`) and the pass entry that hands a node its drain (`verify`).
+# In src/replay_engine.rs: the trailing refill plan (`fifo_trailing_refills`)
+# and the drain a FIFO input's recording or declaration settles
+# (`node_trigger_decl`, `declared_latest_drain`, `never_unifies`). The pass
+# loop that appends the note to a finding, and the rank's topology read
+# (`local_block_producers`), read the bag or build a graph, which the mutation
+# rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re 'BlockHeldBy::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|unrecorded_hold_note|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies' \
+#            --cap-lints true --in-place --timeout 600 \
+#            -- --lib -- replay_engine:: replay_rederive::
+#          (in 3 shards; the unmutated baseline passed)
+# Result:  46 mutants: 43 caught, 2 unviable, 1 missed, killed since:
+#          `<` replaced with `<=` in `fifo_step_backlog`, which no test could
+#          catch: the arm before it had already taken `fires == supply`. The
+#          function now subtracts once (`checked_sub`) and matches on what is
+#          left, and its 5 mutants are caught (re-run with
+#          `--re 'fifo_step_backlog'`: 5 mutants, 5 caught). The 2 unviable
+#          replace `node_trigger_decl` and `declared_latest_drain` with
+#          `Default::default()`: neither return type has a default.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

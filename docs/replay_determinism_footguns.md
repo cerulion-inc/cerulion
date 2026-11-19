@@ -279,6 +279,16 @@ re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
 clock, `Sync` alignment, FIFO pop counts from the read log, and a
 `consume = latest` node's one fire per step from the read log's drains) are
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
+A node that produces a topic a `block` input in its own rank reads can have a
+fire held by that edge's pre-fire check after its trigger drain popped, with no
+record, and the FIFO rule judges such a node on what the hold leaves. Read
+through one subscriber, it may leave one popped frame unfired at a step, and the
+replay pops that frame after the step's last fire, as the live burst did, so the
+next fire serves it. Read through two subscribers (a `block` or `sample(N)`
+trigger input, or `CERULION_DRAIN_DISCIPLINE=separate`), it carries every signal
+a held or throttled burst left unfired, up to the scheduler's clamp. A bag that
+does not record how a FIFO input was read is judged as before the hold was
+allowed for, and a fire-schedule divergence on a held node there says so.
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
 node's last fire than that fire's read took, plus two per writer still
