@@ -2151,7 +2151,11 @@ class Router:
             if reasons:
                 selected[unit.id] = unit
                 reasons_for[unit.id] = reasons
-                built |= libs
+                # Cargo compiles every dev-dependency of the package for any
+                # of its test binaries, named or not, so the built set takes
+                # the full test closure; `libs` stays the narrower set the
+                # selection above reads.
+                built |= libs | self.full_test_closure(unit.package)
         foreign = self.select_foreign()
         return self.report(selected, reasons_for, built, foreign)
 
@@ -3161,6 +3165,15 @@ def self_test():
           FX_ALL | {'fx_alpha::ghost_test'}, 'not everything')
     check('metadata mismatch', any(i['reason'] == 'metadata-mismatch' for i in doc['global']),
           doc['global'])
+
+    # A test binary that names none of its package's dev-dependencies still
+    # has them compiled: the built set carries the full test closure.
+    cases += 1
+    doc = fx_route(['tools/scripts/other_lint.sh'], {}, {})
+    check('built closure', 'fx_alpha::alpha_test' in {i['binary'] for i in doc['selected']}
+          and 'fx_alpha::ui_test' not in {i['binary'] for i in doc['selected']},
+          [i['binary'] for i in doc['selected']])
+    check('built closure', 'fx_user' in doc['built_packages'], doc['built_packages'])
 
     # The member-test-only change leaves the foreign workspace skipped.
     cases += 1
