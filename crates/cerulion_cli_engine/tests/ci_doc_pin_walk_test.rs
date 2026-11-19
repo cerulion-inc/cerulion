@@ -1327,14 +1327,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 91 where the root manifest's `members` array lists 90: the extra one is the
+/// 93 where the root manifest's `members` array lists 92: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 91;
+const WORKSPACE_MEMBER_COUNT: usize = 93;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -3410,6 +3410,19 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     // ros2_graph_e2e_test names `librmw_cerulion.so`, the artifact rmw_cerulion
     // builds, under the sandbox library directory.
     ("cerulion_cli", "rmw_cerulion", "dlopen"),
+    // graph_start_order_e2e_test's FIXTURES table names each fixture crate's
+    // directory by a climb out of its own crate, and the test reads the
+    // fixture's `src/lib.rs` and `Cargo.toml` under it for the fixture pin.
+    (
+        "cerulion_cli",
+        "test_node_start_order_cons_cdylib",
+        "crate-path",
+    ),
+    (
+        "cerulion_cli",
+        "test_node_start_order_prod_cdylib",
+        "crate-path",
+    ),
     // block_colocation_adoption_test's `read_src` reads the manifest directory's
     // parent joined with a crate-relative path its callers choose.
     ("cerulion_cli_engine", "all", "whole-tree"),
