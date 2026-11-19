@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cerulion_core::clock::{Clock, VirtualClock};
-use cerulion_core::graph::config::{GraphConfig, InputDef, NodeDef, OutputDef};
+use cerulion_core::graph::config::{GraphConfig, InputBackpressure, InputDef, NodeDef, OutputDef};
 use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::{GraphRuntime, PeriodParkStats};
 use cerulion_core::prelude::*;
@@ -297,11 +297,17 @@ pub fn two_runtimes(
 
 /// One runtime with a 1 kHz node and a consumer of it, driven by the
 /// production live step for `fires` ticks with the period-park forced as asked.
+/// The node catches up every missed period in one step, and the consumer reads
+/// in the same step, after it. The consumer's input runs `reader_policy`: under
+/// `drop_oldest` a step that fires more frames than the queue holds overwrites
+/// the oldest unread ones; under `block` the catch-up stops at the queue's depth
+/// and resumes on the next step, so the consumer reads every frame written.
 /// Returns the tick times, the consumer's numbers and the period-park counters.
 pub fn ticker_run(
     tag: &str,
     period_park: bool,
     fires: usize,
+    reader_policy: InputBackpressure,
 ) -> (Vec<u64>, Vec<f64>, PeriodParkStats) {
     let mgr = transport(
         &format!("ppk_{tag}"),
@@ -333,7 +339,15 @@ pub fn ticker_run(
             &format!("ppk{tag}"),
             vec![
                 node("ticker", "ticker", vec![], vec![out(None)]),
-                node("reader", "reader", vec![input("ticker/out")], vec![]),
+                node(
+                    "reader",
+                    "reader",
+                    vec![InputDef {
+                        backpressure: Some(reader_policy),
+                        ..input("ticker/out")
+                    }],
+                    vec![],
+                ),
             ],
         ),
         factories,
