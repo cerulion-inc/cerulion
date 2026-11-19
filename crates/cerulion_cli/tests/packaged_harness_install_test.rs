@@ -2,8 +2,8 @@
 //! The harness a release package installs is the one `cerulion rcp` runs.
 //!
 //! `tools/scripts/install.sh` installs a release archive's `harness/` beside
-//! the programs, and `cerulion rcp` takes the folder beside its canonicalized
-//! binary only when no user but its owner can write that folder or the
+//! the programs, and `cerulion rcp` never takes the folder beside its
+//! canonicalized binary when every user can write that folder or the
 //! binary's own. This drives the real binary through the real installer:
 //! an archive holding this build's `cerulion` and a stand-in harness whose
 //! tree any user could write, installed under umask 000, must leave a tree
@@ -155,8 +155,8 @@ fn install_under_umask_000(target: &str) -> Installed {
     }
 }
 
-fn run_verify(installed: &Installed) -> std::process::Output {
-    Command::new(installed.install_dir.join("cerulion"))
+fn run_verify(installed: &Installed, program: &Path) -> std::process::Output {
+    Command::new(program)
         .args(["rcp", "bench", "--verify"])
         .current_dir(&installed.home)
         .env("HOME", &installed.home)
@@ -169,7 +169,8 @@ fn run_verify(installed: &Installed) -> std::process::Output {
 }
 
 #[test]
-fn the_installed_harness_runs_as_the_packaged_folder_after_an_install_under_umask_000() {
+fn the_installed_harness_runs_as_the_packaged_folder_and_not_from_a_directory_every_user_can_write()
+{
     let Some(target) = release_target() else {
         eprintln!("no release archive for this host; nothing to install");
         return;
@@ -188,7 +189,14 @@ fn the_installed_harness_runs_as_the_packaged_folder_after_an_install_under_umas
         );
     }
 
-    let out = run_verify(&installed);
+    // Run it the way a user does: through a link on the PATH, which the CLI
+    // resolves to the real binary before it looks beside it.
+    let link_dir = installed.home.join("bin");
+    fs::create_dir_all(&link_dir).expect("a link folder");
+    let link = link_dir.join("cerulion");
+    std::os::unix::fs::symlink(installed.install_dir.join("cerulion"), &link)
+        .expect("link cerulion");
+    let out = run_verify(&installed, &link);
     assert!(
         out.status.success(),
         "cerulion rcp bench --verify failed: {}\n{}",
@@ -233,19 +241,14 @@ fn the_installed_harness_runs_as_the_packaged_folder_after_an_install_under_umas
         "the folder was not run as the packaged one"
     );
     assert_eq!(words[4], "verify");
-}
 
-#[test]
-fn an_install_directory_others_can_write_is_not_taken_as_the_packaged_folder() {
-    let Some(target) = release_target() else {
-        eprintln!("no release archive for this host; nothing to install");
-        return;
-    };
-    let installed = install_under_umask_000(target);
+    // The control: the same install, with its directory open to every user,
+    // is not taken, and the launcher never starts.
+    fs::remove_file(&installed.record).expect("clear the launcher record");
     fs::set_permissions(&installed.install_dir, fs::Permissions::from_mode(0o777))
         .expect("open the install directory to others");
 
-    let out = run_verify(&installed);
+    let out = run_verify(&installed, &link);
     assert!(
         !out.status.success(),
         "cerulion rcp ran a harness beside a binary in a directory others can write"
