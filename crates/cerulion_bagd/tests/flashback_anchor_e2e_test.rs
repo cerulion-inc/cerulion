@@ -1000,14 +1000,15 @@ struct MultiRankRun {
 ///
 /// # The ORDER, and what each step of it buys
 ///
-/// * Ranks are drained ONE AT A TIME, in vector order, with the drain waited on
-///   as a CONDITION between them. The fold takes the LATEST member by
-///   `(taken_at_ns, step)`, and a rank whose records reach the recorder after its
-///   predecessor's have all left the ring is harvested on a later drive pass and
-///   therefore stamped later. So "the last plan in the vector is the latest
-///   member" is a fact the driver establishes rather than a race it hopes for,
-///   and where the arms also give the later rank the higher STEP, the tie-break
-///   agrees, so the two keys cannot disagree.
+/// * Pre-window ranks are published ONE AT A TIME, in vector order, with the
+///   drain waited on as a CONDITION between them. The recorder visits their
+///   rings in REVERSE order: when one ring empties, the next rank's still-empty
+///   ring has already been visited on that pass. Its records therefore wait for
+///   a later pass and a later `taken_at_ns`. Waiting for an empty ring alone
+///   would let the next rank join the SAME pass, which stamps every rank with
+///   one instant. The fold takes the LATEST member by `(taken_at_ns, step)`, so
+///   the last non-empty pre-window plan is the latest member; where the arms
+///   also give it the higher STEP, the tie-break agrees.
 /// * The pre-window ranks are then left alone for two post windows before the
 ///   trigger. The anchor deadline is `trigger − post_window`, so this is what
 ///   makes their members COVER the claimed window. It is a LOWER bound: load can
@@ -1056,6 +1057,11 @@ fn multi_rank_captures(tag: &str, plans: Vec<RankPlan>, captures_wanted: usize) 
         rings.push(owner.name().to_string());
         owners.push(owner);
     }
+    // Traverse opposite to publication order. Before rank i's drain becomes
+    // visible, every later plan's empty ring has already been visited, so its
+    // subsequent publication cannot join that same pass. Keep owners, producers
+    // and returned ring names in plan order for the driver and its assertions.
+    cfg.state_rings.reverse();
     // MINTED ONCE each and held: a state ring is SPSC, so a second `producer()`
     // answers `None`. Each is also its rank's rendezvous, being the only handle
     // in this process that can see that ring's consumer cursor.

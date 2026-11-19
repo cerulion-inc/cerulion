@@ -776,7 +776,7 @@ pub fn run_login_carrying(
 /// Only a link to a REGULAR file is read: following one to a FIFO with no writer
 /// would hang the login, so anything else answers `false` and takes the ordinary
 /// replace path (which unlinks the link rather than writing through it).
-fn symlink_already_holds(path: &Path, cert: &str) -> bool {
+pub(crate) fn symlink_already_holds(path: &Path, cert: &str) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(md) if md.file_type().is_symlink() => {}
         _ => return false,
@@ -874,7 +874,7 @@ fn poll_for_tokens(
                 "login timed out waiting for authorization — run `cerulion login` again".into(),
             ));
         }
-        std::thread::sleep(interval);
+        poll_wait(interval);
         let resp = client
             .post(format!("{base}/v1/auth/device/poll"))
             .json(&body)
@@ -916,6 +916,123 @@ fn poll_for_tokens(
                 return Err(CliError::Login(format!("login failed: {detail}")));
             }
         }
+    }
+}
+
+/// Wait `requested` before the next device-flow poll.
+///
+/// The `std::thread::sleep` below is the wait in every build. The statement
+/// above it is compiled only under `cfg(test)` or `test-seams`, and acts only on
+/// a thread inside `PollWaitLog::shorten_during`: it records `requested` in that
+/// log, blocks first if the test called `PollWaitLog::hold_next_wait`, and
+/// answers 5 ms as the duration to sleep. Every other thread, and every build
+/// without the gate, sleeps `requested`.
+fn poll_wait(requested: Duration) {
+    let slept = requested;
+    #[cfg(any(test, feature = "test-seams"))]
+    let slept = poll_wait_log::slept_for(slept);
+    std::thread::sleep(slept);
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use poll_wait_log::PollWaitLog;
+
+#[cfg(any(test, feature = "test-seams"))]
+mod poll_wait_log {
+    use std::cell::RefCell;
+    use std::sync::{mpsc, Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// What an opted-in thread sleeps per poll wait.
+    const SHORT_POLL_WAIT: Duration = Duration::from_millis(5);
+
+    /// **Test-only.** The intervals the device-flow poll loop asked to wait on
+    /// the threads that opted in, so a test pins the 1 s floor and the
+    /// `slow_down` back-off without sleeping them.
+    ///
+    /// The opt-in is per thread: [`PollWaitLog::shorten_during`] sets a
+    /// `thread_local!` slot for the length of its closure, so a login on any
+    /// other thread keeps the shipped wait. Clones share one record.
+    #[derive(Clone, Default)]
+    pub struct PollWaitLog {
+        shared: Arc<Shared>,
+    }
+
+    #[derive(Default)]
+    struct Shared {
+        requested: Mutex<Vec<Duration>>,
+        held: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    thread_local! {
+        static OPTED_IN: RefCell<Option<PollWaitLog>> = const { RefCell::new(None) };
+    }
+
+    impl PollWaitLog {
+        /// Run `f` on the calling thread with every poll wait it makes recorded
+        /// here and shortened to 5 ms. The thread's previous opt-in, if any, is
+        /// restored when `f` returns or unwinds.
+        pub fn shorten_during<T>(&self, f: impl FnOnce() -> T) -> T {
+            struct Restore(Option<PollWaitLog>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let previous = self.0.take();
+                    OPTED_IN.with(|slot| *slot.borrow_mut() = previous);
+                }
+            }
+            let previous = OPTED_IN.with(|slot| slot.replace(Some(self.clone())));
+            let _restore = Restore(previous);
+            f()
+        }
+
+        /// Block the next recorded poll wait until the returned sender sends or
+        /// is dropped. The wait records its interval before it blocks.
+        pub fn hold_next_wait(&self) -> mpsc::Sender<()> {
+            let (release, held) = mpsc::channel();
+            *self
+                .shared
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(held);
+            release
+        }
+
+        /// Every interval recorded so far, in the order the loop asked for them.
+        #[must_use]
+        pub fn requested(&self) -> Vec<Duration> {
+            self.shared
+                .requested
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    /// The duration `poll_wait` sleeps for `requested` on the calling thread:
+    /// `requested` itself on a thread that has not opted in. On an opted-in
+    /// thread it records `requested`, waits out a hold set by `hold_next_wait`,
+    /// and answers 5 ms.
+    pub(super) fn slept_for(requested: Duration) -> Duration {
+        let Some(log) = OPTED_IN.with(|slot| slot.borrow().clone()) else {
+            return requested;
+        };
+        log.shared
+            .requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(requested);
+        let held = log
+            .shared
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(held) = held {
+            // A send and a dropped sender both end the hold.
+            let _ = held.recv();
+        }
+        SHORT_POLL_WAIT
     }
 }
 
@@ -1284,7 +1401,47 @@ fn register_device_with_seed(
     session_token: &str,
     seed: [u8; 32],
 ) -> CliResult<Option<IssuedRegistration>> {
-    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    register_device_key(client, base, session_token, &seed, "human")
+}
+
+#[cfg(unix)]
+/// A certificate re-issued for a device key that is already registered: the
+/// leaf and the intermediate it was issued under, both base64url as served.
+pub(crate) struct ReissuedCert {
+    pub(crate) device_cert: String,
+    pub(crate) intermediate: String,
+}
+
+#[cfg(unix)]
+/// Register `seed`'s key again (`POST /v1/devices/challenge` + `POST
+/// /v1/devices`) and return the certificate the service mints from its stored
+/// row for that key. `None` when the service has no device surface (404).
+/// Never creates or reads any other key.
+pub(crate) fn reregister_device_key(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    session_token: &str,
+    seed: &[u8; 32],
+    principal_kind: &str,
+) -> CliResult<Option<ReissuedCert>> {
+    Ok(
+        register_device_key(client, base, session_token, seed, principal_kind)?.map(|issued| {
+            ReissuedCert {
+                device_cert: issued.response.device_cert,
+                intermediate: issued.response.intermediate,
+            }
+        }),
+    )
+}
+
+fn register_device_key(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    session_token: &str,
+    seed: &[u8; 32],
+    principal_kind: &str,
+) -> CliResult<Option<IssuedRegistration>> {
+    let signing = ed25519_dalek::SigningKey::from_bytes(seed);
     let public_key = signing.verifying_key().to_bytes();
     let Some((pop_challenge, pop_account)) = fetch_pop_challenge(client, base, session_token)?
     else {
@@ -1299,7 +1456,7 @@ fn register_device_with_seed(
     );
     let body = serde_json::json!({
         "public_key": URL_SAFE_NO_PAD.encode(public_key),
-        "principal_kind": "human",
+        "principal_kind": principal_kind,
         "pop_challenge": pop_challenge,
         "pop_signature": URL_SAFE_NO_PAD.encode(pop_signature.0),
     });
@@ -1476,6 +1633,13 @@ pub(crate) fn http_client() -> CliResult<reqwest::blocking::Client> {
 /// Keep account catalog and trust-root requests at their validated service origin.
 pub(crate) fn http_client_without_redirects() -> CliResult<reqwest::blocking::Client> {
     build_http_client(reqwest::redirect::Policy::none())
+}
+
+#[cfg(unix)]
+/// [`http_client_without_redirects`] with a per-request timeout of `timeout`, for
+/// callers that make several requests inside a fixed overall deadline.
+pub(crate) fn http_client_bounded(timeout: Duration) -> CliResult<reqwest::blocking::Client> {
+    build_http_client_with_timeout(reqwest::redirect::Policy::none(), timeout)
 }
 
 fn build_http_client(redirect: reqwest::redirect::Policy) -> CliResult<reqwest::blocking::Client> {

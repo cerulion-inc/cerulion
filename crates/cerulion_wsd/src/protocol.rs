@@ -733,7 +733,10 @@ fn engine_error(error: String) -> OperationError {
 
 fn file_version(path: &Path) -> Result<String, OperationError> {
     let bytes = std::fs::read(path).map_err(|error| engine_failure(error.into()))?;
-    Ok(format!("{:x}", Sha256::digest(bytes)))
+    Ok(Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn check_expected_version(path: &Path, expected: Option<&str>) -> Result<(), OperationError> {
@@ -1878,5 +1881,24 @@ mod tests {
         let error = response.error.expect("error");
         assert_eq!(error.code, "bad_request");
         assert_eq!(error.message, "invalid node type");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_file_version_is_the_lowercase_sha256_hex_of_the_file_bytes() {
+        let scratch = Scratch::new("file-version");
+        let empty = scratch.path().join("empty");
+        let abc = scratch.path().join("abc");
+        std::fs::write(&empty, b"").expect("write the empty file");
+        std::fs::write(&abc, b"abc").expect("write the abc file");
+        // The NIST SHA-256 vectors for the empty message and for "abc".
+        assert_eq!(
+            file_version(&empty).expect("version of the empty file"),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            file_version(&abc).expect("version of the abc file"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 }

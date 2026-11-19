@@ -121,7 +121,7 @@ pub enum CpuDmaLockMode {
 
 /// How the live-loop CPU monitor-wait park is selected. Auto-ON for a
 /// LIVE graph on every target: a real shallow CPU monitor-wait where the CPU
-/// has a primitive (Linux x86_64 WAITPKG / Linux aarch64 WFE), the degraded
+/// has a primitive (Linux x86_64 WAITPKG or MWAITX / Linux aarch64 WFE), the degraded
 /// sleep-recheck park elsewhere; `--no-monitor-wait` is the hard opt-out. Env
 /// overrides `CERULION_MONITOR_WAIT` / `CERULION_DOORBELL` (`"1"` force-on /
 /// `"0"` disable) resolve through `Auto`; an explicit `CERULION_MONITOR_WAIT=0`
@@ -536,7 +536,7 @@ struct MonitorWaitInputs<'a> {
     /// parks).
     is_live: bool,
     /// `cerulion_core::monitor_wait::monitor_wait_available()` — false off
-    /// Linux-WAITPKG / Linux-aarch64, where the real CPU monitor-wait park is
+    /// Linux x86_64 with WAITPKG or MWAITX / Linux aarch64, where the real CPU monitor-wait park is
     /// unavailable and arm 2 substitutes the degraded sleep-recheck park.
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
@@ -573,7 +573,7 @@ struct MonitorWaitInputs<'a> {
 ///    the flag won, because a request that cannot be honoured is never dropped in
 ///    silence.
 /// 2. `!primitive_available` (no real CPU monitor-wait on this target, e.g.
-///    macOS or x86 without WAITPKG) → the DEGRADED park tier (default-ON
+///    macOS or x86 with neither WAITPKG nor MWAITX) → the DEGRADED park tier (default-ON
 ///    after the wake-latency sweep: base epoll-block
 ///    p50 was unstable 15-54µs on macOS; the degraded park held a
 ///    stable ~8.5-11.5µs p50 / 16.4µs p99 with zero busy-spin).
@@ -7201,8 +7201,8 @@ pub fn graph_run(
             // building the runtime (the policy is threaded into the
             // policy-aware live builder). The env reads are bound to owned
             // locals first so the `.as_deref()` borrows outlive the struct
-            // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
-            // host (e.g. aarch64 macOS) `monitor_wait_available()` is
+            // (mirrors `env_lock`/`env_us` above). On a host with no CPU
+            // monitor-wait primitive (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
             // default-ON for live: monitor_wait per the arm-3 flag ladder, and
             // the doorbell where a consumer can kernel-block on one. The
@@ -17468,12 +17468,37 @@ fn resolve_recording_paths(record_dir: &Path, graph_name: &str, now: Duration) -
 /// file, which is never touched by recording. The round trip is pinned by
 /// `the_effective_graph_yaml_round_trips_through_the_replay_parser`.
 ///
-/// `pub(crate)` because `bag_migrate` re-renders the graph it strips
-/// through THIS renderer, so a migrated bag's `graph.yaml` is byte-for-byte the
-/// shape `graph run --record` writes rather than a second normalization that
-/// could drift from it.
+/// Public because an embedded host serves THIS render as its hosted run's
+/// `graph.yaml`, and `bag_migrate` re-renders the graph it strips through it
+/// too, so a hosted run, a migrated bag and `graph run --record` carry one
+/// normalization rather than several that could drift apart.
+///
+/// # Errors
+///
+/// [`CliError::Validation`] when `serde_yaml` cannot serialize the config.
+///
+/// # Examples
+///
+/// Render `graphs/lobby.yaml` of the workspace at `workspace_dir`, read by
+/// name the way every `cerulion graph` verb reads it:
+///
+/// ```
+/// use cerulion_cli_engine::graph_cmd::{graph_read, render_effective_graph_yaml};
+/// use cerulion_cli_engine::workspace::CerulionWorkspace;
+/// # use cerulion_cli_engine::{graph_cmd::graph_create, workspace::workspace_create};
+/// # let tmp = tempfile::tempdir()?;
+/// # let created = workspace_create(tmp.path(), "lobby_ws")?;
+/// # graph_create(&created.graphs_dir, "lobby", Some("lobby"))?;
+/// # let workspace_dir = created.root;
+///
+/// let workspace = CerulionWorkspace::discover(&workspace_dir)?;
+/// let config = graph_read(&workspace.graphs_dir, "lobby")?;
+/// let graph_yaml = render_effective_graph_yaml(&config)?;
+/// assert_eq!(graph_yaml, "prefix: lobby\nnodes: []\n");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[cfg(unix)]
-pub(crate) fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
+pub fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
     serde_yaml::to_string(config).map_err(|e| {
         CliError::Validation(format!(
             "recording: cannot render the effective graph config for the bag's `graph.yaml` \
@@ -30451,6 +30476,109 @@ process_groups:
             rendered,
             "the render must be idempotent"
         );
+    }
+
+    /// A hosted run serves this render as its `graph.yaml`, so a reader that
+    /// re-parses it with `parse_graph` gets the same graph: its `name:` (the
+    /// identity on a stemless parse), prefix and wiring come back, and a
+    /// second render is identical.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_graph_yaml_round_trips_parse_graph_with_its_name() {
+        let config = cerulion_core::graph::parse_graph(
+            "\
+name: lobby
+prefix: lobby
+nodes:
+  - id: logic
+    type: lobby_logic
+    inputs:
+      - {name: in, source: /lobby/in}
+    outputs:
+      - {name: edge, schema: std_msgs/String}
+      - {name: pulse, schema: std_msgs/String, topic: /lobby/logic/pulse}
+",
+        )
+        .expect("parse");
+        let rendered = render_effective_graph_yaml(&config).expect("render");
+        let back =
+            cerulion_core::graph::parse_graph(&rendered).expect("parse_graph reads the render");
+
+        assert_eq!(back.identity(), "lobby");
+        assert_eq!(back.name.as_deref(), Some("lobby"));
+        assert_eq!(back.prefix, "lobby");
+        assert_eq!(back.nodes.len(), 1);
+        assert_eq!(back.nodes[0].id, "logic");
+        assert_eq!(back.nodes[0].node_type, "lobby_logic");
+        assert_eq!(
+            back.nodes[0]
+                .inputs
+                .iter()
+                .map(|i| (i.name.as_str(), i.source.as_str()))
+                .collect::<Vec<_>>(),
+            [("in", "/lobby/in")]
+        );
+        assert_eq!(
+            back.nodes[0]
+                .outputs
+                .iter()
+                .map(|o| (o.name.as_str(), o.schema.as_str(), o.topic.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("edge", "std_msgs/String", None),
+                ("pulse", "std_msgs/String", Some("/lobby/logic/pulse")),
+            ]
+        );
+        assert_eq!(
+            render_effective_graph_yaml(&back).expect("render again"),
+            rendered
+        );
+    }
+
+    /// AGENTS.md: rustdoc shows a graph only as a workspace `graphs/*.yaml`
+    /// read by name; a graph built in code is for tests only. Rustdoc is
+    /// published, so a reader copies its examples into application code.
+    #[test]
+    fn rustdoc_examples_read_graphs_from_the_workspace_not_from_code() {
+        let mut fence: Option<bool> = None;
+        let mut example_lines = Vec::new();
+        for line in include_str!("graph_cmd.rs").lines() {
+            let trimmed = line.trim_start();
+            let Some(doc) = trimmed
+                .strip_prefix("///")
+                .or_else(|| trimmed.strip_prefix("//!"))
+            else {
+                continue;
+            };
+            let doc = doc.trim();
+            if let Some(info) = doc.strip_prefix("```") {
+                fence = match fence {
+                    Some(_) => None,
+                    None => Some(!matches!(info.trim(), "text" | "yaml" | "json" | "console")),
+                };
+                continue;
+            }
+            if fence == Some(true) {
+                example_lines.push(doc);
+            }
+        }
+
+        assert!(
+            example_lines
+                .iter()
+                .any(|l| l.contains("graph_read(") && !l.starts_with('#')),
+            "the public renderer's example must show reading `graphs/<name>.yaml` by name"
+        );
+        for banned in ["parse_graph", "GraphConfig {", "GraphRuntime"] {
+            let hits: Vec<&&str> = example_lines
+                .iter()
+                .filter(|l| l.contains(banned))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "a rustdoc example builds a graph in code with `{banned}`: {hits:?}"
+            );
+        }
     }
 
     /// The rendered attachment is SCRATCH: it must be cleaned up like every other
@@ -43904,12 +44032,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// facts, named so a table row reads as a host rather than two bools.
     #[derive(Clone, Copy, Debug)]
     enum MwHost {
-        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64): arm 3. The wake-word fact is run both ways for every row,
+        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// MWAITX, Linux aarch64): arm 3. The wake-word fact is run both ways for every row,
         /// because arm 3 must not read it.
         Primitive,
         /// No primitive, but a consumer can kernel-block on a doorbell wake
-        /// word (Linux without WAITPKG, macOS 14.4 and later): arm 2.
+        /// word (Linux with no CPU monitor-wait primitive, macOS 14.4 and
+        /// later): arm 2.
         WakeWord,
         /// Neither (macOS before 14.4, other targets): arm 2, doorbell inert.
         Neither,

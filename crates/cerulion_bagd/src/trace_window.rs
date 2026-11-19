@@ -2359,4 +2359,26 @@ mod tests {
         assert_eq!(all.named_frames[0], named(4, 0xA, 40));
         assert_eq!(all.named_frames.len(), 4);
     }
+
+    /// A drop marker that counts no dropped record lost no annotation, so the
+    /// site's writer still names the frame of the read after it.
+    #[test]
+    fn a_drop_marker_that_counts_nothing_keeps_its_sites_writer() {
+        use cerulion_core::flashback::resim::NamedFrame;
+        use cerulion_core::read_outcome::ReadSiteRole::Drain;
+        let records = vec![
+            boundary(5, 5_000),
+            note(5, 1, 0, 52, 0xB, Drain),
+            served(5, 1, 0, 52, Drain),
+            TraceRingRecord::read_outcome_truncated(5, 1, 0, 0, Drain),
+            served(5, 1, 0, 53, Drain),
+        ];
+        let named = |sequence| NamedFrame {
+            step: 5,
+            writer: 0xB,
+            sequence,
+        };
+        let all = keep_all(records.into_iter(), &nodes());
+        assert_eq!(all.named_frames, vec![named(52), named(53)]);
+    }
 }
