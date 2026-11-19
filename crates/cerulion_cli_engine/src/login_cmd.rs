@@ -1196,6 +1196,33 @@ pub fn refresh_session_if_stale_within(budget: Duration) -> CliResult<Option<Aut
     )
 }
 
+/// [`refresh_session_if_stale_within`] (unbounded with no `budget`, as
+/// [`refresh_session_if_stale`]) that spends no refresh token once `stopping`
+/// is set: it is read before the refresh lock is taken and again right before
+/// the exchange. A process told to stop (the robot's revocation worker, which
+/// netd stops within a grace sized for one exchange in flight) so never starts
+/// an exchange the stop can cut short.
+pub(crate) fn refresh_session_if_stale_unless_stopping(
+    budget: Option<Duration>,
+    stopping: &std::sync::atomic::AtomicBool,
+) -> CliResult<Option<AuthState>> {
+    refresh_session_with_settlement(
+        budget.map(|budget| std::time::Instant::now() + budget),
+        &std::time::Instant::now,
+        REFRESH_SETTLEMENT_BUDGET,
+        Some(&|| stopping.load(std::sync::atomic::Ordering::SeqCst)),
+    )
+}
+
+/// The refusal of a refresh that a stop kept from sending its exchange.
+const STOP_REFUSAL: &str = "the session was not refreshed: this process is stopping";
+
+/// Whether `error` is the refusal of a refresh a stop kept from sending its
+/// exchange ([`refresh_session_if_stale_unless_stopping`]).
+pub(crate) fn is_stop_refusal(error: &CliError) -> bool {
+    matches!(error, CliError::Login(message) if message == STOP_REFUSAL)
+}
+
 // A successful exchange has consumed the old refresh token. Publication (or
 // retirement after a concurrent sign-out) must not inherit an exhausted HTTP
 // budget and discard the only replacement pair before a briefly busy store clears.
@@ -1219,18 +1246,26 @@ fn refresh_session_until(
     deadline: Option<std::time::Instant>,
     now: &dyn Fn() -> std::time::Instant,
 ) -> CliResult<Option<AuthState>> {
-    refresh_session_with_settlement(deadline, now, REFRESH_SETTLEMENT_BUDGET)
+    refresh_session_with_settlement(deadline, now, REFRESH_SETTLEMENT_BUDGET, None)
 }
 
 /// Every budget is read off `now`. The store wait for publishing or retiring
 /// the rotated pair is `settlement`; for a bounded refresh it runs from the
 /// moment the exchange answered, and a revoke after a superseded publication
-/// spends what is left of it.
+/// spends what is left of it. Once `stopping` answers true, read before the
+/// refresh lock and again before the exchange, no exchange is sent.
 fn refresh_session_with_settlement(
     deadline: Option<std::time::Instant>,
     now: &dyn Fn() -> std::time::Instant,
     settlement: Duration,
+    stopping: Option<&dyn Fn() -> bool>,
 ) -> CliResult<Option<AuthState>> {
+    let stop_requested = || -> CliResult<()> {
+        match stopping {
+            Some(stopping) if stopping() => Err(CliError::Login(STOP_REFUSAL.into())),
+            _ => Ok(()),
+        }
+    };
     let loaded = auth::load();
     let Some(state) = loaded.state() else {
         // Never logged in (or corrupt) — nothing to refresh (the gate handles it).
@@ -1248,6 +1283,7 @@ fn refresh_session_with_settlement(
             "no home directory (set CERULION_HOME) to store ~/.cerulion/auth.json".to_string(),
         )
     })?;
+    stop_requested()?;
     let refresh_lock = match deadline {
         Some(_) => auth::hold_refresh_lock_within(
             &auth_path,
@@ -1264,6 +1300,7 @@ fn refresh_session_with_settlement(
     if state.session_is_valid(auth::now_unix_ns()) {
         return Ok(None);
     }
+    stop_requested()?;
     let base = account_service_base();
     let remaining = refresh_remaining(deadline, HTTP_TIMEOUT, now());
     if remaining < REFRESH_REQUEST_FLOOR {
@@ -2121,6 +2158,78 @@ mod tests {
     }
 
     #[test]
+    fn a_stopping_process_sends_no_refresh_and_keeps_the_single_use_token() {
+        use std::sync::atomic::AtomicBool;
+        let _environment = env_lock();
+        let directory = tempfile::tempdir().unwrap();
+        let _home = EnvGuard::set("CERULION_HOME", directory.path().to_str().unwrap());
+        auth::seed_logged_in_at(directory.path(), "account").unwrap();
+        let path = directory.path().join("auth.json");
+        let mut stale = auth::load_from(&path).state().unwrap().clone();
+        stale.expires_at_ns = 1;
+        auth::write_to(&path, &stale).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _service = EnvGuard::set(
+            ACCOUNT_SERVICE_ENV,
+            &format!("http://{}", listener.local_addr().unwrap()),
+        );
+        let stopping = AtomicBool::new(true);
+        for budget in [Some(Duration::from_secs(5)), None] {
+            let error = refresh_session_if_stale_unless_stopping(budget, &stopping).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "the session was not refreshed: this process is stopping"
+            );
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(auth::load_from(&path).state().unwrap(), &stale);
+        // A stop that lands while the refresh waits for its lock: the second
+        // read, right before the exchange, sends nothing either.
+        let reads = std::cell::Cell::new(0);
+        let lands_after_the_lock = || {
+            reads.set(reads.get() + 1);
+            if reads.get() == 2 {
+                // The second read runs with the refresh lock held.
+                let held = std::thread::scope(|s| {
+                    s.spawn(|| auth::hold_refresh_lock_within(&path, Duration::ZERO).is_err())
+                        .join()
+                        .unwrap()
+                });
+                assert!(held, "the second read runs under the refresh lock");
+            }
+            reads.get() > 1
+        };
+        let error = refresh_session_with_settlement(
+            Some(std::time::Instant::now() + Duration::from_secs(5)),
+            &std::time::Instant::now,
+            REFRESH_SETTLEMENT_BUDGET,
+            Some(&lands_after_the_lock),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "the session was not refreshed: this process is stopping"
+        );
+        assert_eq!(reads.get(), 2);
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert_eq!(auth::load_from(&path).state().unwrap(), &stale);
+        // A session that is still fresh needs no exchange, stopping or not.
+        let mut fresh = stale.clone();
+        fresh.expires_at_ns = u64::MAX;
+        auth::write_to(&path, &fresh).unwrap();
+        assert!(refresh_session_if_stale_unless_stopping(None, &stopping)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn bounded_refresh_does_not_wait_thirty_seconds_on_a_peer_exchange() {
         let _g = env_lock();
@@ -2414,7 +2523,7 @@ mod tests {
         let deadline = now() + FIXTURE_CEILING;
         let refreshed = match refresh {
             BusyRefresh::Settling(settlement) => {
-                refresh_session_with_settlement(Some(deadline), &now, settlement)
+                refresh_session_with_settlement(Some(deadline), &now, settlement, None)
             }
             BusyRefresh::Shipped => refresh_session_until(Some(deadline), &now),
             BusyRefresh::Unbounded => refresh_session_if_stale(),

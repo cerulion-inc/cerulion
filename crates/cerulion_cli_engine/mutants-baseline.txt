@@ -1,0 +1,26 @@
+# Mutation baseline for cerulion_cli_engine: the delivery flag token of `cerulion ros2 run` and `ros2 launch`.
+#
+# Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
+# argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
+# inline `=value`, matched on bytes so a value that is not UTF-8 is kept whole.
+# The rest of the file stages the child environment and execs `ros2`, which the
+# mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/ros2_cmd.rs \
+#            --re 'delivery_flag_token' --exclude-re 'tests::' \
+#            --timeout 300 --cap-lints true -- \
+#            --test ros2_delivery_flags_test --test ros2_cmd_test
+#          (run in place in a scratch checkout; the unmutated baseline passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  5 mutants: 5 caught, 0 unviable, 0 missed. Each replaces the
+#          body with None or a Some of an empty or made-up flag name, with and
+#          without a value. The tool generates no mutant inside the match on
+#          the bytes after the flag: it has no bare `_` arm to delete.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
