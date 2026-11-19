@@ -223,3 +223,42 @@
 # it with a test, or list it here with a reason.
 
 (none)
+
+# Fifth scope: a `period_ms` or Sync node that a `block` input in its own rank
+# holds.
+#
+# Scope: the pure decision functions on the lines the change added or
+# changed, all in src/replay_rederive.rs: the held Period burst
+# (`is_block_held_period_burst`), the two rules that read it and the
+# per-step hold bound (`verify_period`, `verify_sync`), the walk that bounds
+# it and the fires and clocks it folds (`PreFireDeferral`,
+# `step_fire_instants`, `next_clock_ns`) and the text of a stand down
+# (`StandDownReason`).
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            --in-diff <the change's diff of the file> \
+#            --re 'is_block_held_period_burst|verify_period|verify_sync|PreFireDeferral::|step_fire_instants|next_clock_ns|StandDownReason::' \
+#            --cap-lints true --in-place --timeout 600 \
+#            -- --lib -- replay_engine:: replay_rederive::
+#          (in 2 shards; the unmutated baseline passed)
+# Result:  first run, before the three rules shared one next-step clock:
+#          31 mutants: 30 caught, 0 unviable, 1 missed, killed since: `+`
+#          replaced with `*` in `verify_sync`'s next-step clock. A held Sync
+#          vector now fails with it: the node sends a frame its consumer takes
+#          in the same step, and counted a step late that frame fills the
+#          slot at the next step. The three rules now share that clock
+#          (`next_clock_ns`). Re-run with
+#          `--re 'next_clock_ns|verify_sync|verify_period'`: 14 mutants, 14
+#          caught. Re-run over the change once the count it reads stays at
+#          or below the slot's, in 2 shards, with the full `--re`: 32
+#          mutants, 32 caught. Re-run over the change once the rules take
+#          whether the pass resumed again and the held Period stand-down names
+#          the rank, with `--re 'verify_period|verify_sync|StandDownReason::label'`:
+#          11 mutants, 11 caught.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
