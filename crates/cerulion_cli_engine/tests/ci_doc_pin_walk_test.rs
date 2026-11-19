@@ -161,6 +161,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+mod ci_test_line;
+use ci_test_line::{line_runs_tests_of, logical_lines};
+
 /// The shared directory trees a test may read from outside its own crate.
 ///
 /// Spelled without a trailing separator because that is how a marker names them;
@@ -1317,14 +1320,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 87 where the root manifest's `members` array lists 86: the extra one is the
+/// 88 where the root manifest's `members` array lists 87: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 87;
+const WORKSPACE_MEMBER_COUNT: usize = 88;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
@@ -1616,37 +1619,19 @@ fn job_key(line: &str) -> Option<String> {
 
 /// Does ONE workflow line name `package` as a package it runs tests for?
 ///
-/// The two forms `ci.yml` uses, matched by WHOLE TOKEN so `cerulion_viz` and
-/// `cerulion_vizd` stay apart: `cargo test … -p <package>` in every spelling
-/// cargo accepts, and `ci_test_shard.sh <package> …`, which takes the name as
-/// its first argument precisely so the name stays literally in the workflow.
+/// The shared reader ([`line_runs_tests_of`]) decides, so this gate and
+/// `ci_test_coverage_test` credit exactly the same runner forms. A doc-pin
+/// marker line itself never vouches for the package it names.
 fn line_names_package(line: &str, package: &str) -> bool {
-    if line.trim().starts_with(MARKER_PREFIX) {
-        return false;
-    }
-    if let Some(pos) = line.find("ci_test_shard.sh ") {
-        let tail = &line[pos + "ci_test_shard.sh ".len()..];
-        if tail.split_whitespace().next() == Some(package) {
-            return true;
-        }
-    }
-    let Some(pos) = line.find("cargo test") else {
-        return false;
-    };
-    let mut it = line[pos..].split_whitespace();
-    while let Some(tok) = it.next() {
-        let named = match tok {
-            "-p" | "--package" => it.next() == Some(package),
-            _ => tok
-                .strip_prefix("--package=")
-                .or_else(|| tok.strip_prefix("-p"))
-                .is_some_and(|rest| rest == package),
-        };
-        if named {
-            return true;
-        }
-    }
-    false
+    !line.trim().starts_with(MARKER_PREFIX) && line_runs_tests_of(line, package)
+}
+
+/// Does any line of `lines`, read as the shell reads them (a `\` continuation
+/// joined to the line it continues), name `package`?
+fn lines_name_package<'a>(lines: impl IntoIterator<Item = &'a str>, package: &str) -> bool {
+    logical_lines(lines)
+        .iter()
+        .any(|l| line_names_package(l, package))
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,7 +1780,7 @@ fn every_doc_pin_marker_sits_in_the_job_that_runs_its_package() {
                 ));
                 continue;
             };
-            if !block.lines().any(|l| line_names_package(l, package)) {
+            if !lines_name_package(block.lines(), package) {
                 complaints.push(format!(
                     "  {job}: `{line}` but no step in this job runs \
                      `{package}`; move the marker beside the step that does"
@@ -2227,6 +2212,30 @@ fn a_two_space_comment_does_not_open_a_job_and_a_marker_never_names_its_own_pack
     assert!(line_names_package("      - run: cargo test -p pkg", "pkg"));
     assert!(line_names_package(
         "      - run: ./tools/scripts/ci_test_shard.sh pkg 0 4",
+        "pkg"
+    ));
+    assert!(line_names_package(
+        "      - run: cargo nextest run --profile ci -p pkg -E 'not kind(lib)'",
+        "pkg"
+    ));
+    // A doctest-only step runs none of the package's unit or integration
+    // test binaries.
+    assert!(!line_names_package(
+        "      - run: cargo test -p pkg --doc",
+        "pkg"
+    ));
+    // A step's lines are read as the shell reads them: a `-p` on a
+    // continuation line names the package, and a `--no-run` there means the
+    // command runs nothing.
+    assert!(lines_name_package(
+        [
+            "      - run: cargo nextest run --profile ci \\",
+            "          -p pkg",
+        ],
+        "pkg"
+    ));
+    assert!(!lines_name_package(
+        ["      - run: cargo test -p pkg \\", "          --no-run"],
         "pkg"
     ));
     // Whole-token matching, which is what keeps a name off its own prefix.
@@ -4009,7 +4018,7 @@ fn gated_doc_pin_markers(lines: &[&str]) -> Vec<(usize, String, String)> {
         };
         let gated = (0..step_at.len()).any(|k| {
             let body = &lines[step_at[k]..step_end(k)];
-            body.iter().any(|l| line_names_package(l, package))
+            lines_name_package(body.iter().copied(), package)
                 && body.iter().any(|l| line_gates_package(l, package))
         });
         if gated {
@@ -4053,9 +4062,7 @@ fn doc_pin_adjacency_complaints(job: &str, block: &str) -> Vec<String> {
                 .iter()
                 .position(|&s| s == j)
                 .expect("j is a step start");
-            lines[j..step_end(k)]
-                .iter()
-                .any(|l| line_names_package(l, &package))
+            lines_name_package(lines[j..step_end(k)].iter().copied(), &package)
         });
         if !names_it {
             out.push(format!(

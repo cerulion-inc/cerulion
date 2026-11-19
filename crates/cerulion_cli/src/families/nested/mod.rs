@@ -25,6 +25,7 @@ use clap::{ArgMatches, Command};
 use crate::cli::VerbLogClass;
 use crate::network_switch::{NetworkRefusal, SwitchEnv};
 
+mod rcp_bench;
 mod topic_introspect;
 pub(crate) mod topic_message;
 
@@ -60,6 +61,7 @@ pub(crate) trait NestedVerbs: Sync {
 pub(crate) static NESTED: &[&dyn NestedVerbs] = &[
     &topic_introspect::TopicIntrospect,
     &topic_message::TopicMessage,
+    &rcp_bench::RcpBench,
 ];
 
 /// Every verb a derived `Subcommand` enum `S` defines, for

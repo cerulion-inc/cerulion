@@ -32,7 +32,7 @@ below).
   milliseconds long (measured). SCHED_FIFO only pays off *after* isolation, and only with
   the RT throttle handled.
 - **The shallow-idle wake path is already Cerulion's job, not yours.**
-  Monitor-wait parks (UMWAIT/WFE) with SHM doorbell wakes, a graph-derived
+  Monitor-wait parks (UMWAIT/MWAITX/WFE) with SHM doorbell wakes, a graph-derived
   C-state cap, and the barrier-boundary spin are all in the framework. You
   do not tune C-states by hand.
 
@@ -67,7 +67,7 @@ You do **not** tune the shallow-idle wake path. The framework owns it:
 
 | Mechanism | What it does |
 |---|---|
-| Monitor-wait park (UMWAIT / WFE) + SHM doorbell wake | Shallow CPU park between messages; a peer's shared-memory doorbell wakes it in ns to µs. On by default for live runs (`CERULION_MONITOR_WAIT`). |
+| Monitor-wait park (UMWAIT / MWAITX / WFE) + SHM doorbell wake | Shallow CPU park between messages; a peer's shared-memory doorbell wakes it in ns to µs. On by default for live runs (`CERULION_MONITOR_WAIT`). |
 | Graph-derived C-state cap | Where no CPU park primitive exists, the runtime caps C-state exit latency from the graph's tightest timing so a core never enters a deep sleep it can't leave in time (`CERULION_CPU_DMA_LOCK`, Linux). |
 | Barrier-boundary spin-then-block (`CERULION_EXECUTION_MODE=lockstep` opt-out only, and deprecated with it; the free-run default creates no barrier) | Cross-process DAG-level boundaries spin for a bounded budget (default 20 µs on the kernel-wake tiers: Linux futex, macOS ≥ 14.4 os_sync; 150 µs on the macOS sleep-recheck fallback) before the blocking tier (futex on Linux; `os_sync_wait_on_address` on macOS ≥ 14.4, chunked sleep-recheck below), so lockstep peers don't pay a kernel round-trip per level (`CERULION_BARRIER_SPIN_US`; `CERULION_BARRIER_OS_SYNC=0` disables the macOS kernel-wake tier). |
 | macOS degraded park | On hosts without a CPU monitor-wait primitive, a bounded recheck-nap park (never a busy-spin). On macOS ≥ 14.4 each ~100 µs nap is an `os_sync_wait_on_address` timed wait, roughly half `nanosleep`'s timer-coalescing overshoot; `CERULION_PARK_OS_SYNC=0` disables that tier and restores the plain sleep-recheck nap (macOS < 14.4 and every other OS keep it unconditionally). |

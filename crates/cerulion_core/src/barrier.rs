@@ -1877,7 +1877,7 @@ impl BarrierShared {
 /// wake word RIGHT NOW" — the guard is scoped to the `!performed` kernel-block
 /// arm of `monitor_wait_block` (set immediately before the
 /// snapshot→re-derive→block sequence, dropped right after), NOT the whole
-/// park. A hardware CPU park (Linux UMWAIT/WFE — `performed == true`) never
+/// park. A hardware CPU park (Linux UMWAIT/MWAITX/WFE, `performed == true`) never
 /// reaches that arm, never sets the bit, and therefore never taxes arrivers
 /// with a futile wake syscall the hardware park cannot hear (the wake word is
 /// not the line the CPU monitor watches). The brief pre-block window where the
@@ -1933,7 +1933,7 @@ pub fn park_enter_call_count_for_test() -> u64 {
 /// **PRIMITIVE EXISTENCE ONLY — this does NOT imply the wake-word arm is
 /// taken** (the name deliberately avoids `barrier_park_wake_available`,
 /// which would read as a runtime routing promise): on a Linux machine with a
-/// hardware CPU park (WAITPKG/WFE), `monitor_wait_block`'s park is performed
+/// hardware CPU park (WAITPKG/MWAITX/WFE), `monitor_wait_block`'s park is performed
 /// by the CPU primitive and the `!performed` wake-word arm — the ONLY
 /// consumer of this predicate on the park path — never runs, even though this
 /// returns `true`. "Which path does THIS machine's park actually take" is
