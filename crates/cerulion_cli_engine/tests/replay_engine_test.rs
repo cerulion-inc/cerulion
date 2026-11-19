@@ -21358,7 +21358,7 @@ fn a_believed_role_divergence_is_reported_with_its_suffix_and_gated_by_the_forma
     // ── LEG 1: format 5 ⇒ the role is believed ⇒ two named sites that differ.
     let stamped = dir.path().join("role_divergence_format5.mcap");
     write_bag_with_recorder_json(&rec, &stamped, pre_stamp_recorder_json(lockstep));
-    // This bag is recorded BY THIS BINARY, so it stamps 10
+    // This bag is recorded BY THIS BINARY, so it stamps 11
     // (`SUPPORTED_TRACE_FORMAT`), past 7, the format that says every gated
     // consult wrote a kind-6 record. The reason is
     // stated once here and applies to every `recorded_trace_format` assertion
@@ -23638,14 +23638,16 @@ fn a_hostile_run_count_stands_the_edge_down_rather_than_expanding_it() {
 /// ZERO) and stamped `trace_format` 5 still replays, and reads
 /// occurrence-for-occurrence identically to the same run recorded at 6.
 ///
-/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 10 on every
+/// **Why this arm has to CRAFT its bag.** `stamp_trace_format` stamps 11 on every
 /// bag this binary writes (every gated consult, and every frame of each batch
-/// that fits its read stage's window, record, and every complete checkpoint
-/// part of a stopped node carries the stopped flag), so every "corpus" bag elsewhere in this file is a format-**10** bag, a PRECONDITION that roles are
+/// that fits its read stage's window, record, every complete checkpoint part
+/// of a stopped node carries the stopped flag, and every read site names its
+/// writer at every checkpoint window head), so every "corpus" bag elsewhere in
+/// this file is a format-**11** bag, a PRECONDITION that roles are
 /// on the wire, never evidence that an older bag is still readable (see
 /// `recorded_trace_format`). No switch makes this binary write a format-5 read
-/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 10, the stops,
-/// identity and consult terms outrank the fold term). Reading an archived bag is a compatibility claim
+/// log (`CERULION_READ_LOG_FOLD=off` leaves the stamp at 11, the window heads,
+/// stops, identity and consult terms outrank the fold term). Reading an archived bag is a compatibility claim
 /// about bytes this process will not emit, so the bytes are built here by hand,
 /// through the OLD packer itself rather than a transcribed constant, from a
 /// recording stripped of the records those formats never wrote
@@ -26312,7 +26314,8 @@ fn assert_ls_verify_refuses(bag: &std::path::Path, fails: SinkFailure) {
 /// A sink stopped at its third frame (step 2), the step before a resumed pass's
 /// anchor, fires nothing and reads nothing in the slice while its boundary
 /// drain counts one frame per step. The bag's checkpoint holds no part for the
-/// sink, so it does not state the stop, even at trace format 10.
+/// sink, so it does not state the stop, even at the trace format this build's
+/// recorder stamps, where a part would.
 ///
 /// `--verify` refuses the bag before its first step ([`assert_ls_verify_refuses`],
 /// exit 2), so it reaches no verdict on the sink and passes nothing. A neutral
@@ -26878,7 +26881,7 @@ fn a_fatal_unified_latest_sink_stopped_before_the_anchor_stays_stopped_in_a_resu
     );
     let part = part_with_section(&StoppingUnifiedSinkNode::default(), &section);
     for (name, recorder_json) in [
-        ("unified_stopped_10.mcap", ri_free_run_recorder_json()),
+        ("unified_stopped_10.mcap", ri_recorder_json_at(10)),
         ("unified_stopped_9.mcap", ri_recorder_json_at(9)),
     ] {
         let bag = write_stop_resumed_bag(&dir, name, &rec, &part, recorder_json);
@@ -27565,9 +27568,10 @@ fn a_stopped_fifo_co_consumer_does_not_cap_a_running_consumers_pre_anchor_band()
 
 /// A sink stopped before the anchor whose checkpoint holds a `CaptureFailed`
 /// skip for it rather than a part (what a node that saves no state records),
-/// on a format 10 bag: the checkpoint does not state its stop, so the resumed
-/// pass stands its unread-frame rule down by name, as on a bag with no part
-/// at all, and `stopped_at_anchor` is empty.
+/// on a bag this build's recorder stamps, a format that states every stop a
+/// part carries: the checkpoint holds no part, so it does not state the stop,
+/// the resumed pass stands its unread-frame rule down by name, as on a bag
+/// with no part at all, and `stopped_at_anchor` is empty.
 #[test]
 #[serial]
 fn a_stopped_node_with_no_anchor_part_is_unstated() {
@@ -27697,7 +27701,7 @@ fn a_part_without_the_stopped_flag_states_a_running_node_only_from_format_ten() 
         "unflagged_10.mcap",
         &rec,
         &unflagged,
-        ri_free_run_recorder_json(),
+        ri_recorder_json_at(10),
     );
     let (running, _) = ri_replay(&at_ten, make, replay_engine::ReplayPurpose::Resim);
     let running = running.expect("the resumed neutral resim runs");
@@ -28109,7 +28113,7 @@ fn assert_format_ten_states_the_sink_running(
         &format!("{stem}_10.mcap"),
         rec,
         parts,
-        ri_free_run_recorder_json(),
+        ri_recorder_json_at(10),
     );
     let (running, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
     let running = running.expect("the resumed neutral resim runs");
@@ -28352,7 +28356,7 @@ fn a_format_ten_bag_with_no_part_for_a_stopped_node_stands_it_down_by_name() {
         "fifo_skipped_10.mcap",
         &rec,
         &[(LS_SINK, 1, vec![skip.to_vec()])],
-        ri_free_run_recorder_json(),
+        ri_recorder_json_at(10),
     );
     let (outcome, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
     let outcome = outcome.expect("the resumed neutral resim runs");
