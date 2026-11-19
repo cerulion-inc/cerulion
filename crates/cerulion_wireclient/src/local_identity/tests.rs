@@ -85,3 +85,38 @@ fn explicit_lock_path_and_identity_changes_are_observed_without_creating_state()
     );
     assert!(!dir.path().join("auth.json").exists());
 }
+
+#[test]
+fn session_presence_distinguishes_empty_logout_from_expired_credentials() {
+    let dir = fixture();
+    let lock = dir.path().join("auth.lock");
+    let auth_path = dir.path().join("auth.json");
+    let open = |path: &Path| File::open(path);
+    let expired = load_identity(dir.path(), &lock, &open).unwrap();
+    assert!(expired.session_present(), "expiry is not logout");
+    let prior = load_with_proof(dir.path(), &lock, &open).unwrap();
+    assert!(prior.session_present());
+    let logout = br#"{"account_id":"00112233-4455-4677-8899-aabbccddeeff","session_token":"","refresh_token":"","expires_at_ns":0,"logged_in_ever":true}"#;
+    std::fs::write(&auth_path, logout).unwrap();
+    let signed_out = load_identity(dir.path(), &lock, &open).unwrap();
+    assert!(!signed_out.session_present());
+    assert_eq!(signed_out.account(), expired.account());
+    assert_eq!(signed_out.device_key(), expired.device_key());
+    assert_eq!(signed_out.seed(), expired.seed());
+    let full = load_with_proof(dir.path(), &lock, &open).unwrap();
+    assert!(!full.session_present());
+    // Netd's prior-login/stamp semantics do not acquire a new token prerequisite.
+    assert_eq!(decode_login_identity(logout).unwrap(), ACCOUNT);
+    assert_eq!(read_identity_at(&auth_path, &open).unwrap(), ACCOUNT);
+    assert!(full.stamp() == prior.stamp());
+    // Writers which remove credential fields at logout remain a typed refusal.
+    std::fs::write(
+        &auth_path,
+        br#"{"account_id":"00112233-4455-4677-8899-aabbccddeeff","logged_in_ever":true}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        load_identity(dir.path(), &lock, &open).err(),
+        Some(SnapshotError::Auth(LoginProblem::Malformed))
+    );
+}
