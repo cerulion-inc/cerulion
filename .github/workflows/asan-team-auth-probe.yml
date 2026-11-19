@@ -1,0 +1,111 @@
+# Runs one team authentication arm under AddressSanitizer on a hosted macOS
+# runner, the only place it has aborted with SIGSEGV or SIGBUS. It runs only
+# when this branch is pushed; no other event starts it.
+#
+# The tree under test is main just before the arm was rewritten, so the arm
+# streams its dropped puts right up to each session's teardown, as it did when
+# it faulted. The job fails if any run aborts or AddressSanitizer reports, and
+# uploads every run's log and any crash report either way.
+name: ASan probe, team auth ingress arm
+
+on:
+  push:
+    branches: [ci/asan-team-auth-probe]
+
+permissions:
+  contents: read
+
+env:
+  PINNED_NIGHTLY: nightly-2026-07-16
+  TREE_UNDER_TEST: 2e8226a1aa37fe8cdc9ca7c07f52b38cd1561284
+  ARM: a_robot_drops_a_viewer_put_on_ingress
+
+jobs:
+  asan:
+    name: ASan, team auth ingress arm (macOS, slot ${{ matrix.slot }})
+    runs-on: macos-latest
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [0, 1]
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: 1
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:halt_on_error=1:print_stacktrace=1
+      WORKERS: 4
+      RUNS_PER_WORKER: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TREE_UNDER_TEST }}
+
+      - name: Log the runner's OS, CPU and memory
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+
+      - name: Install the pinned nightly
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: ${{ env.PINNED_NIGHTLY }}
+
+      - name: Build the test binary under AddressSanitizer
+        env:
+          RUSTFLAGS: -Zsanitizer=address
+        run: |
+          set -euo pipefail
+          cargo build --version
+          cargo test --locked --target aarch64-apple-darwin -p cerulion_core \
+            --test network_team_auth_test --no-run --message-format=json \
+            > "$RUNNER_TEMP/build.json"
+          bin=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "network_team_auth_test" and .executable != null) | .executable' "$RUNNER_TEMP/build.json" | tail -1)
+          test -x "$bin"
+          echo "TEST_BIN=$bin" >> "$GITHUB_ENV"
+
+      - name: Run the arm in parallel workers
+        run: |
+          set -uo pipefail
+          logs="$RUNNER_TEMP/asan-logs"
+          mkdir -p "$logs"
+          worker() {
+            w=$1
+            for i in $(seq 1 "$RUNS_PER_WORKER"); do
+              log="$logs/w$w-run$i.log"
+              start=$(date +%s)
+              "$TEST_BIN" --exact "$ARM" --test-threads=1 > "$log" 2>&1
+              rc=$?
+              echo "worker=$w run=$i rc=$rc seconds=$(( $(date +%s) - start ))" >> "$logs/summary.txt"
+            done
+          }
+          for w in $(seq 1 "$WORKERS"); do worker "$w" & done
+          wait
+          sort "$logs/summary.txt"
+          total=$(wc -l < "$logs/summary.txt" | tr -d ' ')
+          bad=$(grep -vc ' rc=0 ' "$logs/summary.txt" || true)
+          reports=$(grep -l 'AddressSanitizer' "$logs"/w*.log 2>/dev/null | wc -l | tr -d ' ')
+          echo "runs=$total failed=$bad asan_reports=$reports"
+          grep -l -E 'AddressSanitizer|signal: 1[01]|SIGSEGV|SIGBUS' "$logs"/w*.log 2>/dev/null | while read -r f; do
+            echo "::group::$f"; cat "$f"; echo "::endgroup::"
+          done
+          if [ "$total" -ne $(( WORKERS * RUNS_PER_WORKER )) ] || [ "$bad" -ne 0 ] || [ "$reports" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Collect crash reports
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/asan-logs/crash-reports"
+          find "$HOME/Library/Logs/DiagnosticReports" -name 'network_team_auth_test*' -exec cp {} "$RUNNER_TEMP/asan-logs/crash-reports/" \; 2>/dev/null || true
+          ls -la "$RUNNER_TEMP/asan-logs/crash-reports"
+
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: asan-team-auth-slot-${{ matrix.slot }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/asan-logs
+          retention-days: 7
+          if-no-files-found: warn
