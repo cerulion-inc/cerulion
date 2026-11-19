@@ -292,3 +292,40 @@ fn failed_snapshot_releases_shared_lock_and_legacy_base64_preserves_account_byte
     writer.try_lock().unwrap();
     fixture.refuse(SnapshotError::Busy);
 }
+
+#[test]
+fn netd_wrapper_preserves_shared_snapshot_identity_proof_stamp_and_errors() {
+    let fixture = Fixture::new();
+    let shared = || {
+        local_identity::load_with_proof(
+            fixture.dir.path(),
+            &fixture.path(STORE_LOCK_FILE),
+            &serving_login::open_read_only,
+        )
+    };
+    let direct = shared().unwrap();
+    let wrapped = fixture.load();
+    assert_eq!(direct.seed(), &SEED);
+    assert_eq!(direct.auth_account_id(), UUID);
+    assert_eq!(direct.account(), AccountId(ACCOUNT));
+    assert_eq!(direct.device_key(), fixture.leaf.cert.device_key);
+    let decoded =
+        OwnerCertificatePresentationWire::from_postcard(direct.owner_chain_wire().unwrap())
+            .unwrap();
+    assert_eq!(decoded.device_cert, fixture.leaf);
+    assert_eq!(decoded.intermediate, fixture.issuer);
+    assert_eq!(wrapped.auth_account_id(), direct.auth_account_id());
+    assert_eq!(wrapped.account(), direct.account());
+    assert_eq!(wrapped.device_key(), direct.device_key());
+    assert_eq!(wrapped.owner_chain_wire(), direct.owner_chain_wire());
+    assert!(wrapped.stamp() == direct.stamp());
+    fixture.auth(UUID, "another-expired-token", 0);
+    assert!(shared().unwrap().stamp() == wrapped.stamp());
+    std::fs::write(fixture.path("device-chain.json"), b"{").unwrap();
+    assert_eq!(shared().err(), Some(SnapshotError::InvalidCertificate));
+    fixture.refuse(SnapshotError::InvalidCertificate);
+    let writer = File::open(fixture.path(STORE_LOCK_FILE)).unwrap();
+    writer.try_lock().unwrap();
+    assert_eq!(shared().err(), Some(SnapshotError::Busy));
+    fixture.refuse(SnapshotError::Busy);
+}
