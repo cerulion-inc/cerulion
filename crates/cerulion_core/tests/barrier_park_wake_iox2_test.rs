@@ -701,6 +701,88 @@ fn solo_context_park_reports_zero_barrier_wakes() {
     );
 }
 
+/// The period-park (`CERULION_PERIOD_PARK=1`) stays off for a barrier
+/// participant: a peer's arrival cannot end a kernel nap, so the park keeps
+/// running exactly as with the switch off. The same solo context without the
+/// barrier is the positive control: there the period-park plans its blocks
+/// wherever the CPU carries a monitor-wait primitive.
+#[test]
+#[serial]
+fn the_period_park_stays_off_for_a_barrier_participant() {
+    const ITERS: u64 = 10;
+    let run = |with_barrier: bool, tag: &str| {
+        let ix = cerulion_core::testing::iceoryx_test_config();
+        let fires = Arc::new(AtomicU64::new(0));
+        let mgr = manager(&format!("park_pp_{tag}"), ix);
+        let clock = Arc::new(VirtualClock::new());
+        let config = graph_config(
+            &format!("pp_{tag}"),
+            &format!("bpwpp{tag}"),
+            vec![NodeDef {
+                isolate: None,
+                params: Default::default(),
+                ros2: None,
+                id: "ticker".to_string(),
+                node_type: "ticker".to_string(),
+                inputs: vec![],
+                outputs: vec![out_def("out")],
+            }],
+        );
+        let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+        factories.insert(
+            "ticker".to_string(),
+            Box::new(C555TickerEntry::with_state(C555Ticker {
+                fires: Arc::clone(&fires),
+                ..Default::default()
+            })),
+        );
+        let mut rt = build_ctx(
+            config,
+            factories,
+            &mgr,
+            Arc::clone(&clock),
+            &format!("bpwpp{tag}"),
+            true,
+        );
+        rt.set_period_park_for_test(Some(true));
+        if with_barrier {
+            let ns = barrier_ns(&format!("pp{tag}"));
+            let owner =
+                Arc::new(MappedBarrier::create_owned(&ns, "g", 1).expect("solo barrier create"));
+            rt.set_barrier_participant_for_test(owner, vec![Some(0)], 0);
+        }
+        for _ in 0..ITERS {
+            clock.advance(ADVANCE.as_nanos() as u64);
+            rt.run_live_step_once_for_test(PARK_SHORT);
+        }
+        let stats = rt.period_park_stats_for_test();
+        let entries = rt.park_entry_count_for_test();
+        let fired = fires.load(Ordering::Relaxed);
+        rt.shutdown();
+        (stats, entries, fired)
+    };
+    let (stats, entries, fired) = run(true, "barrier");
+    assert!(
+        fired > 0 && entries > 0,
+        "apparatus: the context fired and parked"
+    );
+    assert_eq!(
+        stats,
+        cerulion_core::graph::PeriodParkStats::default(),
+        "the period-park planned no block for a barrier participant"
+    );
+    let (control, entries, _) = run(false, "control");
+    assert!(entries > 0, "apparatus: the control parked");
+    if cerulion_core::monitor_wait::monitor_wait_available() {
+        assert!(
+            control.blocks > 0,
+            "the control's period-park planned its blocks: {control:?}"
+        );
+    } else {
+        assert_eq!(control, cerulion_core::graph::PeriodParkStats::default());
+    }
+}
+
 // ===========================================================================
 // Pin 6 — the wake-word kernel block is LIVE in the park.
 // ===========================================================================

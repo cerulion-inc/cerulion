@@ -4317,6 +4317,10 @@ pub struct GraphRuntime {
     /// takes `&self`; only the live-loop thread takes it, so it is never
     /// contended.
     doorbell_baseline: std::sync::Mutex<Vec<u64>>,
+    /// The period-park's state (`CERULION_PERIOD_PARK=1`): the kernel lead, the
+    /// data-arrival learner and the record-only counters. A `Mutex` for the
+    /// same reason as `doorbell_baseline`: only the live-loop thread takes it.
+    period_park: std::sync::Mutex<super::period_park::State>,
     /// The registry's first topic when a kernel wake may arm on it, `None`
     /// otherwise. The registry spans data-trigger AND sync-input topics, so a
     /// sync input can hold the armed line. `None` covers a graph every one of
@@ -4328,6 +4332,11 @@ pub struct GraphRuntime {
     /// rather than guaranteeing one. Recorded once at build, on the open's
     /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
+    /// How many of this graph's data-trigger and sync input topics a writer
+    /// outside it can write, whatever the doorbell policy and whether its
+    /// registry opened: the armed line, when there is one, is among them.
+    /// Recorded once at build.
+    outside_input_topics: usize,
     /// How many of this graph's own publishers armed a doorbell, which under an
     /// active policy is every topic it publishes: a ring reaches whoever is
     /// blocked on the page, and this build cannot name those consumers. Recorded
@@ -4498,6 +4507,9 @@ pub struct GraphRuntime {
     /// the `#[cfg(any(test, feature = "test-helpers"))]`
     /// [`Self::set_single_park_for_test`] (gate the SETTER, not the field).
     single_park_override: Option<bool>,
+    /// Test seam over the `CERULION_PERIOD_PARK` env read (`None` = the env
+    /// decides); see [`Self::set_period_park_for_test`].
+    period_park_override: Option<bool>,
     /// Test seam: a closure the Sync drain runs right after a node's align
     /// pass; see [`Self::set_sync_align_hook_for_test`]. Test and test-helpers
     /// builds only (`GraphRuntime` never crosses an FFI boundary).
@@ -10513,6 +10525,34 @@ impl GraphRuntime {
             scheduler.external_policy_node_count(),
         )?;
 
+        // The data-trigger and sync inputs a publisher outside this graph can
+        // write, whatever the doorbell policy: the period-park refuses a
+        // runtime that has one with no doorbell wake word to end its naps.
+        let mut topics: Vec<String> = data_trigger_bindings
+            .iter()
+            .map(|b| b.topic.to_string())
+            .collect();
+        topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
+        // Which of them a publisher outside this graph can write, read
+        // off the provisioning this build already RESOLVED per topic rather
+        // than re-derived from the node list. `topic_is_writable_from_outside`
+        // is true for a topic in the graph's `multi_publisher_topics` opt-in,
+        // asked of the config directly whatever its provisioning, and for a
+        // topic whose provisioning is `External`, which is every topic absent
+        // from `owned_topic_configs` since that map holds exactly the topics
+        // with an in-graph producer.
+        let armable: std::collections::BTreeSet<String> = topics
+            .iter()
+            .filter(|t| {
+                let provisioning = owned_topic_configs
+                    .get(t.as_str())
+                    .map(|c| c.publisher_provisioning)
+                    .unwrap_or(PublisherProvisioning::External);
+                topic_is_writable_from_outside(&config, t, provisioning)
+            })
+            .cloned()
+            .collect();
+        let outside_input_topics = armable.len();
         // Under an active doorbell policy, build the CONSUMER-side
         // doorbell registry over this graph's data-trigger + sync input topics,
         // ordered by `rung_topics` so the armed slot holds a topic a publisher
@@ -10530,30 +10570,6 @@ impl GraphRuntime {
                 "an active doorbell policy must carry a non-empty ns (the CLI \
                  resolver sets default_namespace())"
             );
-            let mut topics: Vec<String> = data_trigger_bindings
-                .iter()
-                .map(|b| b.topic.to_string())
-                .collect();
-            topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            // Which of them a publisher outside this graph can write, read
-            // off the provisioning this build already RESOLVED per topic rather
-            // than re-derived from the node list. `topic_is_writable_from_outside`
-            // is true for a topic in the graph's `multi_publisher_topics` opt-in,
-            // asked of the config directly whatever its provisioning, and for a
-            // topic whose provisioning is `External`, which is every topic absent
-            // from `owned_topic_configs` since that map holds exactly the topics
-            // with an in-graph producer.
-            let armable: std::collections::BTreeSet<String> = topics
-                .iter()
-                .filter(|t| {
-                    let provisioning = owned_topic_configs
-                        .get(t.as_str())
-                        .map(|c| c.publisher_provisioning)
-                        .unwrap_or(PublisherProvisioning::External);
-                    topic_is_writable_from_outside(&config, t, provisioning)
-                })
-                .cloned()
-                .collect();
             let rung = rung_topics(&topics, &armable);
             if rung.armed.is_none() {
                 // No declared topic of this graph is writable from outside it, so
@@ -10668,11 +10684,13 @@ impl GraphRuntime {
             // The resolved monitor-wait/doorbell policy + the
             // consumer-side doorbell registry built from it above.
             monitor_wait_policy: policy,
+            period_park: std::sync::Mutex::new(super::period_park::State::default()),
             doorbell_baseline: std::sync::Mutex::new(Vec::with_capacity(
                 doorbell_registry.as_ref().map_or(0, |r| r.len()),
             )),
             doorbell_registry,
             doorbell_armed_topic,
+            outside_input_topics,
             producer_doorbells_armed,
             producer_doorbells_planned,
             // Park-entry routing counter (see field doc) — starts at 0.
@@ -10700,6 +10718,7 @@ impl GraphRuntime {
             park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
             credit_baseline_full_override: None,
             single_park_override: None,
+            period_park_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             sync_align_hook: None,
             // External ingress sources are collected lazily at run_live
@@ -14580,6 +14599,60 @@ impl GraphRuntime {
         )
     }
 
+    /// Is the period-park on for this runtime: the test seam, else
+    /// `CERULION_PERIOD_PARK=1`.
+    fn period_park_on(&self) -> bool {
+        self.period_park_override
+            .unwrap_or_else(|| super::period_park::env_mode().on())
+    }
+
+    /// Does the period-park apply to this park block? Only where every wake the
+    /// park waits for can end a kernel nap, or has none: the monitor-wait park
+    /// is active and real on this host, no barrier or credit word is waited on,
+    /// no external fd is polled, and a data input written from outside this
+    /// runtime has an armed line and the doorbell wake word. With no such input
+    /// every input is written by this runtime's own nodes inside its own step,
+    /// and the loop top sees it before any nap. Anywhere else the park runs as
+    /// it does with the switch off.
+    fn period_park_applies(&self, sources: &[(waitset::WaitSource<'_>, Arc<str>)]) -> bool {
+        super::period_park::admits(
+            self.period_park_gate(
+                sources
+                    .iter()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            ),
+        )
+    }
+
+    /// This runtime's period-park gate, given whether the park polls an
+    /// external fd source.
+    fn period_park_gate(&self, fd_sources: bool) -> super::period_park::Gate {
+        super::period_park::Gate {
+            on: self.period_park_on(),
+            park_active: self.park_active(),
+            primitive: crate::monitor_wait::monitor_wait_available(),
+            barrier: self.barrier_participant.is_some(),
+            credit_edges: !self.credit_park_edges.is_empty(),
+            fd_sources,
+            outside_inputs: self.outside_input_topics > 0,
+            armed_line: self.has_armed_line(),
+            data_wake: self.data_wake_rung(),
+        }
+    }
+
+    /// Test seam: the reason a requested period-park would not engage on this
+    /// runtime's wiring (the `reason` field of its warning), or `None` where it
+    /// would, with the host's CPU monitor-wait primitive taken as held, so the
+    /// wiring is judged on every host.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn period_park_wiring_refusal_for_test(&self) -> Option<&'static str> {
+        super::period_park::refusal(super::period_park::Gate {
+            primitive: true,
+            ..self.period_park_gate(false)
+        })
+        .map(|r| r.as_str())
+    }
+
     /// Test seam over [`Self::data_wake_rung`], the decision the wait policy
     /// line reports.
     #[cfg(any(test, feature = "test-helpers"))]
@@ -14852,6 +14925,23 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_single_park_for_test(&mut self, forced: Option<bool>) {
         self.single_park_override = forced;
+    }
+
+    /// Test seam: force the period-park on (`Some(true)`) or off
+    /// (`Some(false)`) for this runtime, over the process-wide
+    /// `CERULION_PERIOD_PARK` read; `None` lets the env decide.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_period_park_for_test(&mut self, forced: Option<bool>) {
+        self.period_park_override = forced;
+    }
+
+    /// Test seam: the period-park's record-only counters.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn period_park_stats_for_test(&self) -> super::period_park::PeriodParkStats {
+        self.period_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats
     }
 
     /// Test seam: run `hook` in the step's drain right after each per-set Sync
@@ -15271,6 +15361,23 @@ impl GraphRuntime {
         let wake_word_eligible =
             !self.barrier_failed && crate::barrier::wake_word_block_primitive_available();
 
+        // The period-park (`CERULION_PERIOD_PARK=1`, see `period_park`). The plan
+        // is fixed at entry: nap in the kernel until one lead before the predicted
+        // data window or the deadline, then run the park below for what remains.
+        // `None` keeps this block exactly as it is with the switch off. Data
+        // wakes teach the arrival learner only where data can come from outside
+        // this runtime (an armed line); in-process data arrives inside the step.
+        let period_park_learns = self.has_armed_line();
+        let mut period_park = self.period_park_applies(sources).then(|| {
+            let mut st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let plan = st.plan(std::time::Instant::now(), deadline);
+            (st, plan)
+        });
+        let mut period_park_last = super::period_park::LastWait::None;
+
         loop {
             // RECORD-ONLY poll — notification queue only (mirrors `spin_sources`
             // and the reactor callback in `waitset.rs`). NEVER the SHM message
@@ -15427,6 +15534,12 @@ impl GraphRuntime {
                     self.park_wakes_credit
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Record-only: a data wake teaches the period-park's learner.
+                if let Some((st, _)) = period_park.as_mut() {
+                    if period_park_learns && (listener_got || doorbell_got) {
+                        st.note_data_wake(std::time::Instant::now(), period_park_last);
+                    }
+                }
                 return true;
             }
             if std::time::Instant::now() >= park_deadline {
@@ -15441,7 +15554,70 @@ impl GraphRuntime {
                 // Record-only TIMEOUT wake attribution (Relaxed).
                 self.park_wakes_timeout
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some((st, plan)) = period_park.as_mut() {
+                    st.note_timer_wake(plan.deadline, std::time::Instant::now());
+                }
                 return true;
+            }
+            // The period-park: outside the plan's window, nap in the kernel
+            // instead of parking. A ring on the armed doorbell ends the nap
+            // through the doorbell wake word (snapshot, re-derive, block: the
+            // rung's own lost-wake protocol); a runtime with no armed line has
+            // nothing outside it to ring and takes a plain timed nap. Either way
+            // the loop top re-polls every source after the nap, so a ring on
+            // another input topic is seen within one nap.
+            if let Some((st, plan)) = period_park.as_mut() {
+                use super::period_park::{LastWait, Phase, NAP};
+                let now = std::time::Instant::now();
+                match plan.phase(now) {
+                    Phase::Kernel {
+                        until,
+                        before_window,
+                    } => {
+                        let cap = until.saturating_duration_since(now).min(NAP);
+                        let target = now + cap;
+                        #[cfg(any(
+                            target_os = "macos",
+                            target_os = "linux",
+                            target_os = "android"
+                        ))]
+                        let outcome = self.doorbell_wake_word_block(baseline, cap);
+                        #[cfg(not(any(
+                            target_os = "macos",
+                            target_os = "linux",
+                            target_os = "android"
+                        )))]
+                        let outcome = crate::monitor_wait::AddrParkOutcome::Unavailable;
+                        let napped = match outcome {
+                            crate::monitor_wait::AddrParkOutcome::RingPending => false,
+                            crate::monitor_wait::AddrParkOutcome::Parked => true,
+                            crate::monitor_wait::AddrParkOutcome::Unavailable => {
+                                let _ = crate::monitor_wait::park_nap(cap);
+                                true
+                            }
+                        };
+                        if napped {
+                            // A signal ends the kernel wait early too, so an
+                            // early return is a data cut only if the armed
+                            // line rang.
+                            let rang = primary_expected.is_some_and(|expected| {
+                                self.armed_primary_topic()
+                                    .and_then(|t| self.doorbell_registry.as_ref()?.bell(t))
+                                    .is_some_and(|bell| bell.seq() != expected)
+                            });
+                            st.note_kernel_sleep(target, std::time::Instant::now(), rang);
+                            self.park_slices
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            period_park_last = if before_window {
+                                LastWait::KernelBeforeWindow
+                            } else {
+                                LastWait::KernelOther
+                            };
+                        }
+                        continue;
+                    }
+                    Phase::Hot => period_park_last = LastWait::Hot,
+                }
             }
             // Shallow-park until the next recheck (or, with `single_park`, the
             // WHOLE remaining time) or the park deadline. With a doorbell, arm
@@ -16017,6 +16193,36 @@ impl GraphRuntime {
             primary_topic = tracing::field::display(self.armed_primary_topic().unwrap_or("none")),
             "live loop wait policy"
         );
+        // The period-park, as THIS process resolved it, at each live-loop entry,
+        // so a run's log shows whether it engages and, once, why not.
+        let period_park_at_entry = self
+            .period_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats;
+        if self.period_park_override.is_none()
+            && super::period_park::env_mode() == super::period_park::Mode::Unrecognized
+        {
+            tracing::warn!(
+                graph = %self.config.identity(),
+                value = %std::env::var("CERULION_PERIOD_PARK").unwrap_or_default(),
+                "CERULION_PERIOD_PARK is set to a value other than 1 or 0; the period park stays off"
+            );
+        }
+        // Requested: either the `on` line, or one WARN per runtime naming the
+        // first term that refuses it. Only an engaged period-park reports exit
+        // telemetry.
+        let period_park_engaged = {
+            let gate = self.period_park_gate(
+                self.external_wake_sources()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            );
+            let mut st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            super::period_park::announce(gate, &mut st.warned, self.config.identity())
+        };
 
         // Entry snapshot of the (lifetime-cumulative) park counters so
         // the exit line reports THIS run's deltas — a resumed `run_live` must
@@ -16177,6 +16383,28 @@ impl GraphRuntime {
             park_core_yields = core_yields_now - core_yields_at_entry,
             "live loop park telemetry"
         );
+        if period_park_engaged {
+            let st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let s = st.stats.since(period_park_at_entry);
+            tracing::info!(
+                graph = %self.config.identity(),
+                blocks = s.blocks,
+                predicted_blocks = s.predicted_blocks,
+                kernel_sleeps = s.kernel_sleeps,
+                kernel_sleeps_cut_by_data = s.kernel_sleeps_cut_by_data,
+                timer_wakes = s.timer_wakes,
+                timer_late = s.timer_late,
+                data_wakes = s.data_wakes,
+                data_caught_hot = s.data_caught_hot,
+                data_before_window = s.data_before_window,
+                lead_us = st.lead.lead_ns() / 1_000,
+                data_regular = st.arrivals.regular(),
+                "live loop period park telemetry"
+            );
+        }
 
         // Delivery-accounting twin of the park telemetry (once at
         // loop exit): per data-trigger-bound input — fires + the input's

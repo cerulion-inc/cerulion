@@ -1,13 +1,13 @@
 # Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
-# the live loop's wait sizing, the framework-section codec and the capture
-# judge's frame check.
+# the live loop's wait sizing, its period-park decisions, the framework-section
+# codec and the capture judge's frame check.
 #
-# Scope: the two pure parser files, the three pure wait-sizing functions named
-# below, the framework-section codec in state_restore.rs (its changed lines),
-# the three frame-check functions in flashback/resim.rs named below, and the
-# oracle mutants listed below, each on one pure decision function. The
-# rest of the crate holds transport and scheduler paths that the mutation rule
-# does not cover.
+# Scope: the two pure parser files, the pure wait-sizing and period-park
+# functions named below, the framework-section codec in state_restore.rs (its
+# changed lines), the three frame-check functions in flashback/resim.rs named
+# below, and the oracle mutants listed below, each on one pure decision
+# function. The rest of the crate holds transport and scheduler paths that the
+# mutation rule does not cover.
 #
 # Run:     cargo mutants -p cerulion_core \
 #            -f crates/cerulion_core/src/codegen/rosmsg_parser.rs \
@@ -44,6 +44,24 @@
 #            -f crates/cerulion_core/src/state_restore.rs \
 #            --in-diff <the change's diff of that file> -- --test state_restore_test
 # Result:  46 mutants: 43 caught, 3 unviable (do not compile), 0 missed.
+#
+# Live-loop period-park (`graph/period_park.rs`, `CERULION_PERIOD_PARK=1`):
+# `refusal` and `admits` (where it applies), `NotEngaged::as_str` (the
+# warning's reason), `announce` (the start line or the one warning),
+# `classify` (the switch), `Plan::phase` (nap or park), `KernelLead` (how late
+# a nap returns) and `ArrivalLearner` (a data input's period and phase).
+#
+# Run:     cargo mutants -p cerulion_core --in-place -C --lib \
+#            -f crates/cerulion_core/src/graph/period_park.rs \
+#            --re "admits|refusal|NotEngaged::as_str|announce|classify|Plan::phase|KernelLead::|ArrivalLearner::" \
+#            -- -- period_park
+# Result:  93 mutants: 61 caught, 18 unviable, 14 missed. Eleven missed
+#          mutants were boundaries no test held (the learner's shortest and
+#          longest gap, its tolerance, the instant a window closes), now
+#          pinned. Three were in code that changed nothing (two checks in
+#          `Plan::phase`, a cap in `ArrivalLearner::half_width_ns`), now gone.
+#          Re-run over `ArrivalLearner::` and `Plan::phase` after both fixes:
+#          60 mutants, 52 caught, 8 unviable, 0 missed.
 #
 # Capture judge's frame check: `HeldFrames::new` (a writer's held sequences,
 # sorted and distinct), `first_frame_gap` (the first frame a kept read names
