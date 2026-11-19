@@ -534,10 +534,11 @@ packages that way rebuilds every crate they share (`cerulion_core` and the third
 under it, up to a dozen times per leg). The runner builds a group of packages in ONE cargo
 invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 
-* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run` over the group's
-  packages, then `cargo test` over the same packages with the script as cargo's target
-  runner. That recording run compiles nothing; for each test binary it records the
-  environment and working directory cargo gives it, in cargo's run order. Cargo then runs
+* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run --timings` over the
+  group's packages, so the job's timing report covers the grouped compile, then
+  `cargo test` over the same packages with the script as cargo's target runner. That
+  recording run compiles nothing; for each test binary it records the environment and
+  working directory cargo gives it, in cargo's run order. Cargo then runs
   the group's doctests against the libraries the build compiled; rustdoc hands each doctest
   it runs to the same runner, which runs any binary outside the target directory. They run
   without a step's `-- --test-threads=1` or env. A package builds
