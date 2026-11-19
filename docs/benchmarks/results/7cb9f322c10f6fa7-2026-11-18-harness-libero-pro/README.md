@@ -34,8 +34,9 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 
 - [SUMMARY.md](SUMMARY.md): the main test as it was declared before the first episode, the two secondary tests,
   every model and arm with intervals, the paired counts and exact tests, cost and time per episode. It states
-  at its top when the rows were read, and names every model whose start states had not all ended then, with its
-  counts.
+  at its top when the rows were read and names every model whose start states had not all ended then, with its
+  counts; once every column is complete it opens with what must be read before any of its numbers, and prints
+  each declared test's verdict with the counts that qualify it.
 - [extension_list2/SUMMARY.md](extension_list2/SUMMARY.md) and
   [extension_libero10/SUMMARY.md](extension_libero10/SUMMARY.md): the two further lists of the two models, read
   as one family of twelve tests by the extension's rule, with the lines that must be read before any of their
@@ -127,15 +128,17 @@ is in cells.csv, and the success predicate was false at reset on every one.
 
 ## Things to know before quoting a number
 
-- Models whose 100 start states had not all ended when the rows were read are marked incomplete, with their n
-  and the read time. Start states that end first are the short episodes, so an incomplete row is not a fair
-  sample.
+- At this package's read every model had finished all 100 start states in both arms. A model whose start
+  states had not all ended at a read is marked incomplete, with its n and the read time: start states that end
+  first are the short episodes, so an incomplete row is not a fair sample.
 - GPT-6.1 Terra was added to the grid after its first rows had been seen. Its column is marked so.
 - One further model, Gemini Robotics-ER 2 (preview), was tried and left out before any grid row: its endpoint
   failed the arm with Cerulion on 5 of 5 trial attempts. It has no column.
-- The four Claude models share one endpoint. No new episode of theirs started from 2026-11-18T01:31:31Z to
-  07:21:16Z, to lower the load on that endpoint, so their later start states ran hours after the other models'
-  did, in the list's order and both arms alike.
+- The four Claude models share one endpoint. To lower the load on it, no episode of theirs started between
+  2026-11-18T01:30:07Z and 07:21:18Z (5 h 51 min), so their later start states ran hours after the other
+  models' did, in the list's order and both arms alike. For 13 start states of a Claude model (Claude Opus 5.5
+  7, Claude Sonnet 5.5 3, Claude Haiku 5.5 2, Claude Fable 5.2 1) the two arms ran on either side of that
+  pause.
 - Five start states of GPT-6 Astra's `without` arm were started again from attempt 1 because the harness
   refused to start them before any model call; the refused attempts the records still hold are in
   lost_attempts.csv with 0 replies.
@@ -146,7 +149,8 @@ is in cells.csv, and the success predicate was false at reset on every one.
 - A network outage of 22 minutes cut the model endpoint off from three of the machines. It ended one episode
   without a score after its 3 attempts (Claude Sonnet 5.5, `without`, pro_goal_task_t00_i06). That episode was
   started again from attempt 1 under RULES.md section 5 (5); its outage attempts are in lost_attempts.csv with
-  `before_rerun` 1.
+  `before_rerun` 1. A first restart of it was refused by the harness twice before any model call; those two
+  attempts left empty folders and are in no file.
 - Providers gave no version string beyond the model's name.
 - Wall clock seconds include time an endpoint stalled or refused requests.
 - On the LIBERO-10 list the provider's image filter refused GPT-6 Astra's `without` arm, and only that arm, on

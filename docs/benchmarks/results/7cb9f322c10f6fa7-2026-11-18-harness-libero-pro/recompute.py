@@ -277,6 +277,213 @@ def paired_rows(cols, fam, list_name, settled=True):
     return rows
 
 
+EARLIER = {"with": (0.615, 0.819), "without": (0.101, 0.276)}   # RULES.md section 3: the main test's statement
+CLEAN_NEED = 63                          # RULES.md section 3: GPT-6 Astra CLEAN stands on at least 63 start states
+
+
+def times(x):
+    """A factor as the charts print it: two decimals under 1.1, one under 10, a whole number from 10."""
+    return f"{x:.2f}" if x < 1.1 else f"{x:.1f}" if x < 10 else f"{x:.0f}"
+
+
+def task_rows(c, measure, cells):
+    """The task row as the unit: the start states of each task row counted together in each arm; the rows where the
+    arm with the harness has more, fewer and the same; the exact sign test on more against fewer. Descriptive."""
+    by = {}
+    for x in cells:
+        k = by.setdefault(x["task_row"], [0, 0])
+        k[0] += c.val("with", x["cell"], measure)
+        k[1] += c.val("without", x["cell"], measure)
+    more = sum(1 for w, o in by.values() if w > o)
+    fewer = sum(1 for w, o in by.values() if w < o)
+    return {"rows": len(by), "more": more, "fewer": fewer, "tied": len(by) - more - fewer, "p": sign_p(more, fewer)}
+
+
+def rows_txt(tr):
+    return f"{tr['more']} task rows more, {tr['fewer']} fewer, {tr['tied']} the same, p = {fp(tr['p'])}"
+
+
+def per_unsolved(s):
+    return None if not s["unsolved"] else s["false_claims"] / s["unsolved"]
+
+
+def clean_tally(done, name):
+    ahead = sum(1 for c in done if c.stats("with")["clean"] > c.stats("without")["clean"])
+    behind = [c for c in done if c.stats("with")["clean"] < c.stats("without")["clean"]]
+    return (f" On CLEAN, with {name} more in {ahead}, fewer in {len(behind)}, the same number in "
+            f"{len(done) - ahead - len(behind)}."
+            + (" Fewer: " + "; ".join(f"{c.model} ({c.stats('with')['clean']} against {c.stats('without')['clean']}, "
+                                      f"p = {fp(c.paired('clean')['p'])})" for c in behind) + "." if behind else ""))
+
+
+def grid_first(cols, name, fam, N, cells, uns):
+    """What must be read before any number of the grid, each line computed from the CSV files. RULES.md section 5
+    (1): a column against the harness is named with its counts in the first paragraph."""
+    M = len(cols)
+    L = ["## Read these first", ""]
+    st = {(c.model, arm): c.stats(arm) for c in cols for arm in ("without", "with")}
+    # fewer with the harness, SOLVED and CLEAN, and the tally printed whole
+    tally = []
+    for key, word in MEASURES[:2]:
+        behind = sorted((c for c in cols if st[c.model, "with"][key] < st[c.model, "without"][key]),
+                        key=lambda c: (-st[c.model, "without"][key], c.model))
+        ahead = sum(1 for c in cols if st[c.model, "with"][key] > st[c.model, "without"][key])
+        tally.append(f"on {word} in {ahead} of {M}" + (f" (level in {M - ahead - len(behind)})"
+                                                         if M - ahead - len(behind) else ""))
+        if not behind:
+            continue
+        top = sorted(cols, key=lambda c: -st[c.model, "without"][key])
+        highest = (len(top) > len(behind) and {c.model for c in top[:len(behind)]} == {c.model for c in behind}
+                   and st[top[len(behind) - 1].model, "without"][key] > st[top[len(behind)].model, "without"][key])
+        items, words = [], set()
+        for c in behind:
+            pr = c.paired(key)
+            words.add(verdict(pr, fam[key].get(c.model), key))
+            items.append(f"{c.model} ({st[c.model, 'with'][key]} against {st[c.model, 'without'][key]} of {N}; "
+                         f"with only {pr['with_only']}, without only {pr['without_only']}; p = {fp(pr['p'])})")
+        n = len(behind)
+        lead = (f"With {name}, {n} of the {M} models solved fewer start states than without it"
+                + (f", the {n} with the highest rates without it" if highest and n > 1 else "") if key == "solved"
+                else f"On CLEAN, {n} of the {M} models had fewer with {name}")
+        tail = ((" None of them is significant at 0.05, so each reads" if n > 1 else
+                 " It is not significant at 0.05, so it reads") + " \"no difference shown\" (RULES.md section 5 (3))."
+                if words == {"no difference shown"} else
+                " Their readings: " + "; ".join(f"{c.model} {verdict(c.paired(key), fam[key].get(c.model), key)}"
+                                               for c in behind) + ".")
+        L.append(f"- {lead}: {'; '.join(items)}.{tail}")
+    L.append(f"- With {name} ahead, printed whole: " + ", and ".join(tally) + " models.")
+    # false claims: the pooled test beside the rate per unsolved episode
+    fw = sum(st[c.model, "with"]["false_claims"] for c in cols)
+    fo = sum(st[c.model, "without"]["false_claims"] for c in cols)
+    uw = sum(st[c.model, "with"]["unsolved"] for c in cols)
+    uo = sum(st[c.model, "without"]["unsolved"] for c in cols)
+    a = sum(c.paired("false_claim")["without_only"] for c in cols)
+    b = sum(c.paired("false_claim")["with_only"] for c in cols)
+    pooled = sign_p(a, b)
+    hi = [c for c in cols if per_unsolved(st[c.model, "with"]) is not None
+          and per_unsolved(st[c.model, "without"]) is not None
+          and per_unsolved(st[c.model, "with"]) >= per_unsolved(st[c.model, "without"])]
+    passes = pooled is not None and pooled <= ALPHA and a > b
+    rw, ro = (fw / uw if uw else 0.0), (fo / uo if uo else 0.0)
+    L.append(f"- The pooled false-claim test (the second secondary test below) "
+             + ("passes: fewer episodes ended with the model wrongly saying it had succeeded. " if passes else
+                "does not pass. ")
+             + f"Per unsolved episode the rate is {'higher' if rw > ro else 'not higher'} with {name}: {fw} false "
+             f"claims in {uw} unsolved episodes ({rw:.3f}) against {fo} in {uo} ({ro:.3f}) without it, over all {M} "
+             f"models; as high or higher with {name} for {len(hi)} of the {M}"
+             + (" (with against without): " + "; ".join(f"{c.model} {per_unsolved(st[c.model, 'with']):.3f} against "
+                                 f"{per_unsolved(st[c.model, 'without']):.3f}" for c in hi) if hi else "") + ".")
+    more = sorted((c for c in cols if st[c.model, "with"]["false_claims"] > st[c.model, "without"]["false_claims"]),
+                  key=lambda c: (st[c.model, "without"]["false_claims"] - st[c.model, "with"]["false_claims"],
+                                 c.model))
+    if more:
+        L.append(f"- With {name} the model made more false claims in all for {len(more)} of the {M} models: "
+                 + "; ".join(f"{c.model} ({st[c.model, 'with']['false_claims']} against "
+                             f"{st[c.model, 'without']['false_claims']}; "
+                             f"with only {c.paired('false_claim')['with_only']}, "
+                             f"without only {c.paired('false_claim')['without_only']}; "
+                             f"p = {fp(c.paired('false_claim')['p'])})" for c in more)
+                 + ". Each per-model count is descriptive; the declared test is the pooled one.")
+    # episodes in which the model stopped acting, and episodes that ran no control step
+    for c in cols:
+        for arm in ("without", "with"):
+            sc = list(c.arm[arm]["scored"].values())
+            stop = [e for e in sc if e["ended_by"] == "stopped_calling_tools"]
+            if 10 * len(stop) <= N:
+                continue
+            zero = sum(1 for e in stop if int(e["steps"]) == 0)
+            unsolved = st[c.model, arm]["unsolved"]
+            stop_un = sum(1 for e in stop if not int(e["solved"]))
+            line = (f"- {c.model} {arm} {name} ended {len(stop)} of its {N} episodes with the model no longer "
+                    f"calling tools (a reply with no tool call ends the episode), {zero} of them before any control "
+                    f"step.")
+            if arm == "without" and 2 * stop_un > unsolved:
+                line += (f" {stop_un} of the {unsolved} start states it did not solve without {name} ended that way, "
+                         f"so its gain on SOLVED ({st[c.model, 'without']['solved']} against "
+                         f"{st[c.model, 'with']['solved']}) is mostly against an arm that stopped acting.")
+            L.append(line)
+    zero = {}
+    flagged = zero_ok = 0
+    for c in cols:
+        for arm in ("without", "with"):
+            for e in c.arm[arm]["scored"].values():
+                z, p = int(e["steps"]) == 0, int(e["problems"]) > 0
+                flagged += p
+                if z:
+                    zero[c.model, arm] = zero.get((c.model, arm), 0) + 1
+                    zero_ok += p and not int(e["solved"]) and not int(e["false_claim"])
+    nz = sum(zero.values())
+    if nz:
+        L.append(f"- {nz} scored episodes ran no control step: "
+                 + ", ".join(f"{m} {arm} {name} {k}" for (m, arm), k in zero.items()) + "."
+                 + (" Each carries a problem row and none was solved or is a false claim, so no count of solved, "
+                    "clean or false claims changes with them." if zero_ok == nz == flagged else
+                    f" {flagged} scored episodes carry a problem row."))
+    # requests, steps, cost and time
+    notless = [c for c in cols if st[c.model, "with"]["requests"] >= st[c.model, "without"]["requests"]
+               or st[c.model, "with"]["steps"] >= st[c.model, "without"]["steps"]]
+    if notless:
+        L.append(f"- With {name}, {len(notless)} of the {M} models did not use fewer model replies and control steps "
+                 f"per scored episode than without it: "
+                 + "; ".join(f"{c.model} ({st[c.model, 'with']['requests']:.1f} against "
+                             f"{st[c.model, 'without']['requests']:.1f} replies, {st[c.model, 'with']['steps']:.1f} "
+                             f"against {st[c.model, 'without']['steps']:.1f} control steps)" for c in notless) + ".")
+    for c in cols:
+        w, o = st[c.model, "with"], st[c.model, "without"]
+        if w["usd"] > o["usd"] or w["wall_s"] > o["wall_s"]:
+            parts = []
+            if w["usd"] > o["usd"]:
+                parts.append(f"cost more at list price ({w['usd']:.2f} against {o['usd']:.2f} USD an episode)")
+            if w["wall_s"] > o["wall_s"]:
+                parts.append(f"took longer ({w['wall_s']:.1f} against {o['wall_s']:.1f} wall seconds)")
+            per = ""
+            if w["usd_per_solved"] is not None and o["usd_per_solved"] is not None:
+                per = (f"; a success cost {'less' if w['usd_per_solved'] < o['usd_per_solved'] else 'more'} "
+                       f"({w['usd_per_solved']:.2f} against {o['usd_per_solved']:.2f} USD)")
+            L.append(f"- With {c.model}, an episode with {name} " + " and ".join(parts) + per + ".")
+    # the column added late, and the passes that do not hold with the task row as the unit
+    for m in ADDED_LATE:
+        c = next((x for x in cols if x.model == m), None)
+        t = fam["solved"].get(m)
+        if c and t:
+            L.append(f"- {m} was added to the grid after its first rows had been seen. It "
+                     f"{'passes' if t[1] else 'does not pass'} SOLVED at p = {fp(c.paired('solved')['p'])} against its "
+                     f"Holm threshold {fp(t[0])}.")
+    weak = []
+    for key, word in MEASURES[:2]:
+        for c in cols:
+            t = fam[key].get(c.model)
+            tr = task_rows(c, key, cells)
+            if t and t[1] and (tr["p"] is None or tr["p"] > ALPHA):
+                weak.append(f"{c.model} {word} ({rows_txt(tr)})")
+    if weak:
+        R = len({x["task_row"] for x in cells})
+        L.append(f"- With the task row as the unit (the start states of each of the {R} task rows counted together "
+                 f"in each arm; descriptive, no test is declared on it), {len(weak)} of the passes below do not reach "
+                 f"0.05: " + "; ".join(weak) + ".")
+    # unscored episodes, and the families on scored pairs only
+    if uns:
+        why = {}
+        for u in uns:
+            why[u["reason"]] = why.get(u["reason"], 0) + 1
+        nw = sum(1 for u in uns if u["arm"] == "without")
+        famsc = {key: holm({c.model: c.paired(key, scored_only=True)["p"] for c in cols})
+                 for key in ("solved", "clean")}
+        moved = [f"{c.model} {word}" for key, word in MEASURES[:2] for c in cols
+                 if bool((fam[key].get(c.model) or (0, False))[1]) != bool((famsc[key].get(c.model) or (0, False))[1])]
+        L.append(f"- {len(uns)} episodes ended without a score ({nw} without {name}, {len(uns) - nw} with), each "
+                 f"counted as a failure for its arm: " + "; ".join(f"{k} because {r}" for r, k in why.items()) + ". "
+                 + ("On scored pairs only (start states scored in both arms) the same models pass Holm on SOLVED and "
+                    "on CLEAN." if not moved else
+                    "On scored pairs only (start states scored in both arms) these readings change: "
+                    + "; ".join(moved) + "."))
+    L += ["- Each start state ran once in each arm. How much the outcome of one start state varies from run to run "
+          "was not measured.",
+          "- How the run went, and where it differed from the protocol (the pause of the Claude models, two machines "
+          "that stopped, a network outage), is in README.md under \"Things to know before quoting a number\".", ""]
+    return L
+
+
 def grid(name, check, changed):
     cells, cols, uns = columns(HERE)
     if not cols:
@@ -292,8 +499,9 @@ def grid(name, check, changed):
          f"Computed by recompute.py from episodes.csv, unscored.csv and not_finished.csv as read at {info['read']}. "
          f"recompute.py computes this file again from the CSV files; with --check it writes nothing and says "
          f"whether this file still matches them.", ""]
-    if len(done) == len(cols):
-        L += [f"Every model has finished all {N} start states in both arms.", ""]
+    final = len(done) == len(cols)
+    if final:
+        L += [f"Every model has finished all {N} start states in both arms, so every verdict below is settled.", ""]
     else:
         L += [f"THE GRID WAS STILL RUNNING AT THIS READ. {len(done)} of {len(cols)} models had finished all {N} "
               f"start states in both arms. A model marked * is incomplete: its counts are of the start states that "
@@ -307,6 +515,8 @@ def grid(name, check, changed):
           f"{name}'s tools. Same start states, same budgets (80 replies, one tool call a reply, 900 control steps), "
           f"one episode a start state an arm. An episode that ended without a score counts as a failure for its arm "
           f"and stays in the count.", ""]
+    if final:
+        L += grid_first(cols, name, fam, N, cells, uns)
     # the main test
     L += ["## The main test, as declared before the first episode", "",
           f"Declared: {MAIN_MODEL}, SOLVED within the 900-step budget, with {name} against without, paired by start "
@@ -324,6 +534,16 @@ def grid(name, check, changed):
               ("The test passes at 0.05." if pr["p"] is not None and pr["p"] <= ALPHA and
                pr["with_only"] > pr["without_only"] else "The test does not pass at 0.05.")
               if mc.complete else "No verdict before the column is complete.", ""]
+        if final and so["solved"]:
+            sw_iv, so_iv = sw["solved_wilson"], so["solved_wilson"]
+            over = lambda iv, e: iv[0] <= e[1] and e[0] <= iv[1]
+            ok = over(sw_iv, EARLIER["with"]) and over(so_iv, EARLIER["without"])
+            L += [f"Read with it: the statement it carries (RULES.md section 3) also needs the rate with {name} to "
+                  f"overlap the earlier 61.5 to 81.9 percent and the rate without to overlap 10.1 to 27.6 percent: "
+                  f"{pct(sw_iv)} and {pct(so_iv)} {'do' if ok else 'do not'}, so the statement "
+                  f"{'stands' if ok else 'does not stand as written'}, with these counts: {sw['solved']} against "
+                  f"{so['solved']} of {N}, {times(sw['solved'] / so['solved'])} times as many. With the task row as "
+                  f"the unit (descriptive): {rows_txt(task_rows(mc, 'solved', cells))}.", ""]
     # the two declared secondary tests
     L += ["## The two secondary tests, declared with it (alpha 0.05 each, apart from the per-model family)", ""]
     ac = next((c for c in cols if c.model == CLEAN_MODEL), None)
@@ -337,12 +557,42 @@ def grid(name, check, changed):
               f"{pr['without_only']}, p = {fp(pr['p'])}. Its SOLVED counts, to be read with it: {sw['solved']} "
               f"against {so['solved']} (with only {ps['with_only']}, without only {ps['without_only']}, "
               f"p = {fp(ps['p'])}).", ""]
+        if final:
+            cpass = pr["p"] is not None and pr["p"] <= ALPHA and pr["with_only"] > pr["without_only"]
+            L += [f"   {'The test passes at 0.05' if cpass else 'The test does not pass at 0.05'}, on {N} start "
+                  f"states (the rule asks for at least {CLEAN_NEED})."
+                  + (f" What it supports: with {CLEAN_MODEL}, {name} did "
+                     f"{'not ' if sw['solved'] <= so['solved'] else ''}solve more start states ({sw['solved']} against "
+                     f"{so['solved']} of {N}); more of its solves came inside the published step limit ({sw['clean']} "
+                     f"against {so['clean']}, p = {fp(pr['p'])})." if cpass and N >= CLEAN_NEED else "")
+                  + f" With the task row as the unit (descriptive): {rows_txt(task_rows(ac, 'clean', cells))}.", ""]
     a = sum(c.paired("false_claim")["without_only"] for c in cols)
     b = sum(c.paired("false_claim")["with_only"] for c in cols)
     L += [f"2. Fewer false claims, pooled over every model that ran both arms, one sign test over all discordant "
           f"pairs of (model, start state){'' if len(done) == len(cols) else ' (INCOMPLETE: it pools the pairs ended so far)'}: "
           f"a false claim without {name} only on {a} pairs, with {name} only on {b} pairs, p = {fp(sign_p(a, b))}. "
           f"The rate per unsolved episode is in the table below for each model and arm.", ""]
+    if final:
+        fpass = sign_p(a, b) is not None and sign_p(a, b) <= ALPHA and a > b
+        a2 = sum(c.paired("false_claim", scored_only=True)["without_only"] for c in cols)
+        b2 = sum(c.paired("false_claim", scored_only=True)["with_only"] for c in cols)
+        tot = {arm: sum(c.stats(arm)["false_claims"] for c in cols) for arm in ("without", "with")}
+        eps = {arm: sum(c.stats(arm)["finished"] for c in cols) for arm in ("without", "with")}
+        hi = sum(1 for c in cols if per_unsolved(c.stats("with")) is not None
+                 and per_unsolved(c.stats("without")) is not None
+                 and per_unsolved(c.stats("with")) >= per_unsolved(c.stats("without")))
+        most = 2 * hi > len(cols)
+        L += [f"   {'The test passes at 0.05' if fpass else 'The test does not pass at 0.05'}. False claims in all: "
+              f"{tot['without']} of {eps['without']} episodes without {name}, {tot['with']} of {eps['with']} with it. "
+              f"On scored pairs only: without only {a2}, with only {b2}, p = {fp(sign_p(a2, b2))}."
+              + ((" What it supports: " + ("fewer episodes ended with the model wrongly saying it had succeeded"
+                                           if not most else "fewer false claims because it solves more")
+                  + f"; not that {name} stops false claims. The rule narrows the statement to \"fewer because it "
+                  f"solves more\" if, per unsolved episode, the arm with {name} claims falsely as often or more for "
+                  f"most models: it does for {hi} of the {len(cols)}, "
+                  + ("which is not most, so the statement stands as written." if not most else
+                     "which is most, so the statement narrows.")
+                  + " The rates are under \"Read these first\" and in the table below.") if fpass else ""), ""]
     # per model
     L += ["## Every model, both arms", ""] + arm_table(cols, name, N) + [""]
     L += ["Wilson intervals are over the finished start states of the arm (scored plus unscored). A false claim is "
@@ -351,9 +601,10 @@ def grid(name, check, changed):
     L += [f"## Paired by start state, and the per-model family ({len(cols)} models, Holm's step-down at 0.05)", "",
           "The family is every model that ran, the main test's model included, however each came out; the main "
           "test above is read alone at 0.05 and does not depend on this table. Thresholds are computed from the "
-          "p values of all the models as they stand, so they can move until the last column completes."
-          + ("" if len(done) == len(cols) else " Until then the verdict printed for a complete column can change "
-             "with them."), ""]
+          "p values of all the models"
+          + ("; every column is complete, so they are final." if final else
+             " as they stand, so they can move until the last column completes. Until then the verdict printed for "
+             "a complete column can change with them."), ""]
     for key, word in MEASURES[:2]:
         L += [f"### {word}", "",
               "| model | paired start states | with only | without only | both | neither | difference, points "
@@ -374,7 +625,8 @@ def grid(name, check, changed):
     L += [f"Tally over the {len(done)} complete columns, printed whole: with {name} solved more start states in "
           f"{ahead}, fewer in {len(behind)}, the same number in {tied}."
           + (" Fewer: " + "; ".join(f"{c.model} ({c.stats('with')['solved']} against {c.stats('without')['solved']}, "
-                                    f"p = {fp(c.paired('solved')['p'])})" for c in behind) + "." if behind else ""), ""]
+                                    f"p = {fp(c.paired('solved')['p'])})" for c in behind) + "." if behind else "")
+          + clean_tally(done, name), ""]
     L += ["### FALSE CLAIM (descriptive for each model; the declared test is the pooled one above)", "",
           "| model | paired start states | false claim without only | with only | exact p |", "|---|---|---|---|---|"]
     for c in cols:
