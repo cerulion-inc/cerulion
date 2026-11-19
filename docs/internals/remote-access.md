@@ -192,6 +192,16 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
+  process enumeration, readiness and signal syscalls before spawn. Native pidfds
+  bind each signal to its captured process. Only an unavailable pidfd syscall permits the
+  ordinary fallback; its last SID/birth-time check cannot be atomic with the
+  numeric-PID signal. The caller retains the unreaped session leader until cleanup
+  returns, pinning its SID. Repeated scans include ordinary job-control groups;
+  unreadable session state is an error, not an empty-session success. The blocking
+  scan has a 250 ms deadline and requires two empty scans. It is lifecycle cleanup,
+  not containment of a process that escapes the session or continually forks.
+
 - **The AGPL/closed boundary for the connect worker is a PROCESS boundary**: the closed Studio spawns
   the AGPL `cerulion-connectd` binary exactly as it spawns the gateway/vizd
   (`crates/cerulion_connectd/src/lib.rs`; the CLI side is pure argv resolution in
