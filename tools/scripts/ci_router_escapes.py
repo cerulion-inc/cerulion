@@ -38,7 +38,10 @@ passed, failed, seconds`). From a log it reads:
     build, is UNPLACED;
   * libtest blocks (`Running tests/x.rs (target/debug/deps/x-<hash>)` up to
     its `test result:` line, and `Doc-tests <crate>`), and cargo's own
-    `error: test failed, to rerun pass `-p pkg --test x`` line;
+    `error: test failed, to rerun pass `-p pkg --test x`` line, which also
+    marks the open block of the unit it names as failed (narrowing a block two
+    same-named binaries share to that one), so a passing result that follows
+    closes a later block;
   * `error: could not compile `pkg` (test "x")` and its `lib test`, `bin`,
     `example` and `lib` forms. A LIBRARY that failed to compile is an escape
     only when the selection compiles no binary that links it
@@ -73,12 +76,14 @@ TIMESTAMP = re.compile(r'^\d{4}-\d\d-\d\dT[\d:.]+Z ?')
 # nextest: `STATUS [ secs] (n/m) binary-id test-name`, optionally `TRY n`.
 NEXTEST = re.compile(r'^\s*(?:TRY\s+\d+\s+)?([A-Z][A-Z-]*(?:\s+\d+/\d+)?)\s+\[\s*[\d.]+s\]\s+'
                      r'(?:\(\s*\d+/\s*\d+\)\s+)?(\S+)\s+(\S+)\s*$')
-# A test's LAST status decides it. `SLOW` never replaces a status: mid-run it
-# says the test is still going, and in the closing list after `Summary` it is a
-# slow PASS (the CI profile prints no `PASS` lines, so that is the only line a
-# slow pass gets). A `SLOW` test whose step printed a `Summary` passed; one
-# whose step never did has no verdict, and the step is UNPLACED. Every status
-# word outside these lists counts as failing.
+# A test's LAST status decides it. `SLOW` never replaces a status. The CI
+# profile streams no `PASS` or `SLOW` lines while the run goes (`status-level =
+# "retry"`); its closing list after `Summary` (`final-status-level = "pass"`)
+# names every test once with its final status, and a test that passed slowly is
+# named `SLOW` there in place of `PASS` (the Summary reads "N passed (1 slow)").
+# A `SLOW` test whose step printed a `Summary` therefore passed; one whose step
+# never did has no verdict, and the step is UNPLACED. Every status word outside
+# these lists counts as failing.
 NEXTEST_PASSING = ('PASS', 'FLAKY', 'LEAK', 'SKIP')
 NEXTEST_RUNNING = ('SLOW',)
 NEXTEST_STARTING = re.compile(r'^\s*Starting \d+ tests? across \d+ binar')
@@ -225,10 +230,15 @@ def read_log(text, universe, verdicts, where):
     `test result:` line. Cargo writes the first to stderr and the test binary
     writes the second to stdout, and the log interleaves the two streams, so
     a `Running` line can land before the result of the binary ahead of it.
-    The blocks are therefore paired in ORDER: each result closes the oldest
-    open block. A block still open when its step ends, or at the end of the
-    log, had no result at all: the binary died, hung until the job's limit,
-    or was cancelled, and that is a failure of it.
+    The blocks are therefore paired in ORDER: a failing result closes the
+    oldest open block, and a passing one closes the oldest block no rerun line
+    has named as failed. A rerun line marks the first unmarked open block that
+    holds the unit it names and narrows that block to the unit. A block two
+    same-named binaries share that closes FAILED is held until a rerun line in
+    its step names one of them; if the step ends first, both are charged. A
+    block still open when its step ends, or at the end of the log, had no
+    result at all: the binary died, hung until the job's limit, or was
+    cancelled, and that is a failure of it.
 
     A STEP that failed with no failure placed on a binary (a nextest run that
     never printed its `Summary`, a test list nextest could not build, a
@@ -238,13 +248,23 @@ def read_log(text, universe, verdicts, where):
     """
     nextest_final = {}
     pending = collections.deque()
+    # FAILED results of blocks two same-named binaries share, waiting for the
+    # rerun line that names one of them: `(units, evidence, test names)`.
+    held = []
+    # A block: [units, unplaced, opened, marked by a rerun line, names held
+    # while two units share it].
     step = {'packages': set(), 'header': False, 'started': None, 'summary': False,
             'placed': False, 'failed': None, 'index': 0}
     summarized = set()
 
     def flush(at):
+        while held:
+            units, evidence, _ = held.pop(0)
+            for unit_id in units:
+                verdicts.fail(unit_id, '%s, and no rerun line named one of %s (%s)'
+                              % (evidence, ', '.join(units), at))
         while pending:
-            units, unplaced, opened, identified = pending.popleft()
+            units, unplaced, opened, identified, _ = pending.popleft()
             step['placed'] = True
             if identified:
                 # Already failed by the rerun line that named it.
@@ -324,17 +344,24 @@ def read_log(text, universe, verdicts, where):
             # The fourth field is set once cargo's rerun line names this
             # block's unit while the block is still open: that unit FAILED, so
             # a passing result that follows belongs to a later block.
-            pending.append([narrowed or units, unplaced, '%s: %s' % (at, line.strip()), False])
+            pending.append([narrowed or units, unplaced, '%s: %s' % (at, line.strip()),
+                            False, set()])
             continue
         match = LIBTEST_FAILED.match(line)
-        unnamed = [block for block in pending if not block[3]]
-        if match and len(unnamed) == 1 and len(unnamed[0][0]) == 1:
-            # Only when ONE block not yet named by a rerun line is open is it
-            # the binary whose output this is: a block that crashed without a
-            # result stays open while the next binary prints, and naming that
-            # one's tests after it would let another binary's known flake
-            # excuse a crash.
-            verdicts.tests.setdefault(unnamed[0][0][0], set()).add(match.group(1))
+        # One open block owns these names even when a rerun line already named
+        # it (its own stdout can land after cargo's line). Among several, only
+        # a single block no rerun line has named can: a block that crashed
+        # without a result stays open while the next binary prints, and naming
+        # that one's tests after it would let another binary's known flake
+        # excuse a crash.
+        candidates = list(pending) if len(pending) == 1 else [b for b in pending if not b[3]]
+        if match and len(candidates) == 1:
+            if len(candidates[0][0]) == 1:
+                verdicts.tests.setdefault(candidates[0][0][0], set()).add(match.group(1))
+            else:
+                # A block two same-named binaries share keeps its names until
+                # a rerun line says which binary they belong to.
+                candidates[0][4].add(match.group(1))
             continue
         match = RESULT.match(line)
         if match and pending:
@@ -348,16 +375,22 @@ def read_log(text, universe, verdicts, where):
                 del pending[index]
             else:
                 block = pending.popleft()
-            units, unplaced, _, _ = block
+            units, unplaced, _, _, names = block
             if match.group(1) == 'FAILED':
                 placed()
             # A block no unit claims matters only when it FAILED: a passing
             # binary of another workspace is no verdict this score needs.
             if not units and match.group(1) == 'FAILED':
                 verdicts.unplaced.append(unplaced)
+            if len(units) > 1 and match.group(1) == 'FAILED':
+                # Two same-named binaries: the rerun line that follows names
+                # the one that failed; if the step ends without one, both are
+                # charged, with no test names (`flush`).
+                held.append((units, '%s: test result: FAILED' % at, names))
+                continue
             for unit_id in units:
                 # A block that could be either of two units is a verdict on
-                # neither when it passed: only a failure is charged to both.
+                # neither when it passed; a failure of one waits in `held`.
                 if len(units) == 1:
                     verdicts.observed.add(unit_id)
                 if match.group(1) == 'FAILED':
@@ -372,8 +405,18 @@ def read_log(text, universe, verdicts, where):
             else:
                 verdicts.fail(unit_id, '%s:%d: %s' % (where, number, line.strip()))
                 for block in pending:
-                    if not block[3] and block[0] == [unit_id]:
+                    if not block[3] and unit_id in block[0]:
                         block[3] = True
+                        block[0] = [unit_id]
+                        if block[4]:
+                            verdicts.tests.setdefault(unit_id, set()).update(block[4])
+                            block[4] = set()
+                        break
+                for entry in held:
+                    if unit_id in entry[0]:
+                        held.remove(entry)
+                        if entry[2]:
+                            verdicts.tests.setdefault(unit_id, set()).update(entry[2])
                         break
             continue
         match = BUILD_SCRIPT.search(line)
@@ -426,17 +469,27 @@ PER_BINARY_COLUMNS = ('run', 'source', 'binary', 'result')
 def read_tsv(path, columns):
     try:
         with open(path, encoding='utf-8', newline='') as handle:
-            rows = list(csv.DictReader(handle, delimiter='\t'))
+            reader = csv.DictReader(handle, delimiter='\t')
+            # The reader's own line count, since it skips blank lines.
+            rows = [(reader.line_num, row) for row in reader]
     except OSError as err:
         raise ScoreError('cannot read %s: %s' % (path, err))
-    if rows and not set(columns) <= set(rows[0]):
-        raise ScoreError('%s lacks the columns %s' % (path, ', '.join(columns)))
+    if rows:
+        missing = [column for column in columns if column not in rows[0][1]]
+        if missing:
+            raise ScoreError('%s lacks the columns %s' % (path, ', '.join(missing)))
+    for number, row in rows:
+        # DictReader fills a short row with None values and puts a long row's
+        # extra fields under a None key.
+        if None in row or None in row.values():
+            raise ScoreError('%s:%d: the row has %s fields than the header'
+                             % (path, number, 'more' if None in row else 'fewer'))
     return rows
 
 
 def read_per_test(path, universe, verdicts, run):
     final = {}
-    for number, row in enumerate(read_tsv(path, PER_TEST_COLUMNS), 2):
+    for number, row in read_tsv(path, PER_TEST_COLUMNS):
         if run and row['run'] != run:
             continue
         key = (row['run'], row['job_id'], row['binary'], row['test'])
@@ -460,7 +513,7 @@ def read_per_test(path, universe, verdicts, run):
 
 
 def read_per_binary(path, universe, verdicts, run):
-    for number, row in enumerate(read_tsv(path, PER_BINARY_COLUMNS), 2):
+    for number, row in read_tsv(path, PER_BINARY_COLUMNS):
         if run and row['run'] != run:
             continue
         units = universe.by_running(row['source'], row['binary'])
@@ -903,6 +956,104 @@ def self_test():
           [e['binary'] for e in result['escapes']], ['netd::client_test'])
     check('crash then a passing binary observes the pass',
           'core::slow_test' in result['unverified_skips'], False)
+    check('crash then a passing binary charges no failure to the pass',
+          'core::slow_test' in [e['binary'] for e in result['escapes'] + result['flakes']], False)
+
+    # A rerun line that lands before its binary's own FAILED lines: one open
+    # block, so the names are still that binary's, and a flake issue on them
+    # excuses it.
+    cases += 1
+    early_rerun = '\n'.join([
+        '2026-11-17T22:20:00.0000000Z      Running tests/client_test.rs '
+        '(target/debug/deps/client_test-00000000000000aa)',
+        '2026-11-17T22:20:01.0000000Z error: test failed, to rerun pass '
+        '`-p netd --test client_test`',
+        '2026-11-17T22:20:02.0000000Z test reconnect::after_reset ... FAILED',
+        '2026-11-17T22:20:03.0000000Z test result: FAILED. 20 passed; 1 failed',
+    ])
+    result = run_score(ST_SELECTION, logs=[('early.log', early_rerun)],
+                       issues={'netd::client_test reconnect::after_reset': [949]})
+    check('rerun before the names: no escape', [e['binary'] for e in result['escapes']], [])
+    check('rerun before the names: a flake with its names',
+          [(e['binary'], e['tests'], e['issues']) for e in result['flakes']],
+          [('netd::client_test', ['reconnect::after_reset'], [949])])
+
+    # A crashed block named by its rerun line, then a neighbour whose failing
+    # test a flake issue names: the names go to the one unmarked block, so the
+    # neighbour is that flake and the crash stays an escape with no names.
+    cases += 1
+    crash_flake = '\n'.join([
+        '2026-11-17T22:30:00.0000000Z      Running tests/client_test.rs '
+        '(target/debug/deps/client_test-00000000000000aa)',
+        '2026-11-17T22:30:01.0000000Z error: test failed, to rerun pass '
+        '`-p netd --test client_test`',
+        '2026-11-17T22:30:02.0000000Z      Running tests/slow_test.rs '
+        '(target/debug/deps/slow_test-00000000000000bb)',
+        '2026-11-17T22:30:03.0000000Z test waits ... FAILED',
+        '2026-11-17T22:30:04.0000000Z test result: FAILED. 0 passed; 1 failed',
+        '2026-11-17T22:30:05.0000000Z error: test failed, to rerun pass '
+        '`-p core --test slow_test`',
+    ])
+    result = run_score(ST_SELECTION, logs=[('crash.log', crash_flake)],
+                       issues={'core::slow_test waits': [9]})
+    check('crash then a flaky neighbour: the crash escapes',
+          [(e['binary'], e['tests']) for e in result['escapes']], [('netd::client_test', [])])
+    check('crash then a flaky neighbour: the neighbour is the flake',
+          [(e['binary'], e['tests'], e['issues']) for e in result['flakes']],
+          [('core::slow_test', ['waits'], [9])])
+
+    # Two same-named binaries in one step (`core` and `tf` both hold
+    # tests/wire_test.rs): the rerun line names the one that failed, and only
+    # it is charged; with no rerun line, both are.
+    cases += 1
+    def shared(lines):
+        return '\n'.join(['2026-11-17T22:40:00.0000000Z ##[group]Run cargo build -p tf',
+                           'cargo test -p core --no-fail-fast',
+                           '2026-11-17T22:40:00.1000000Z ##[endgroup]'] + lines)
+    running_wire = ('2026-11-17T22:40:01.0000000Z      Running tests/wire_test.rs '
+                    '(target/debug/deps/wire_test-00000000000000cc)')
+    rerun_core = ('2026-11-17T22:40:04.0000000Z error: test failed, to rerun pass '
+                  '`-p core --test wire_test`')
+    failed_result = '2026-11-17T22:40:03.0000000Z test result: FAILED. 3 passed; 1 failed'
+    for label, lines, want_escapes, want_caught in (
+            ('a failure named by its rerun line', [running_wire, failed_result, rerun_core],
+             [], ['core::wire_test']),
+            ('a crash named by its rerun line, then a pass',
+             [running_wire, rerun_core,
+              '2026-11-17T22:40:05.0000000Z      Running tests/slow_test.rs '
+              '(target/debug/deps/slow_test-00000000000000bb)',
+              '2026-11-17T22:40:06.0000000Z test result: ok. 1 passed; 0 failed'],
+             [], ['core::wire_test']),
+            ('a failure no rerun line names', [running_wire, failed_result],
+             ['tf::wire_test'], ['core::wire_test'])):
+        result = run_score(ST_SELECTION, logs=[('shared.log', shared(lines))])
+        check('shared name, %s: escapes' % label,
+              [e['binary'] for e in result['escapes']], want_escapes)
+        check('shared name, %s: caught' % label, result['caught'], want_caught)
+    # The skipped one of the two fails, with a flake issue on its test: its
+    # names wait with the shared block and go to the binary the rerun line
+    # names, whether that line comes after the names or before them.
+    cases += 1
+    def shared_tf(lines):
+        return '\n'.join(['2026-11-17T22:50:00.0000000Z ##[group]Run cargo build -p core',
+                           'cargo test -p tf --no-fail-fast',
+                           '2026-11-17T22:50:00.1000000Z ##[endgroup]'] + lines)
+    names_line = '2026-11-17T22:50:02.0000000Z test decodes ... FAILED'
+    rerun_tf = ('2026-11-17T22:50:04.0000000Z error: test failed, to rerun pass '
+                '`-p tf --test wire_test`')
+    for label, lines in (('the rerun line last',
+                          [running_wire, names_line, failed_result, rerun_tf]),
+                         ('the rerun line first', [running_wire, rerun_tf, names_line,
+                                                   failed_result]),
+                         ('the rerun line before a late result',
+                          [running_wire, names_line, rerun_tf, failed_result])):
+        result = run_score(ST_SELECTION, logs=[('shared.log', shared_tf(lines))],
+                           issues={'tf::wire_test decodes': [5]})
+        check('shared name, %s: no escape' % label, result['escapes'], [])
+        check('shared name, %s: the flake keeps its names' % label,
+              [(e['binary'], e['tests'], e['issues']) for e in result['flakes']],
+              [('tf::wire_test', ['decodes'], [5])])
+        check('shared name, %s: the selected twin is not charged' % label, result['caught'], [])
 
     # A test nextest lists as SLOW after its run finished is the pass it had,
     # from a log and from the per-test table, whatever order the rows come in;
@@ -943,7 +1094,23 @@ def self_test():
             run_score(ST_SELECTION, per_test=slow_tsv)
             fails.append('a per-test table without job_id was accepted')
         except ScoreError as err:
-            check('a per-test table without job_id names it', 'job_id' in str(err), True)
+            check('a per-test table without job_id names it, and only it',
+                  ('job_id' in str(err), 'run' in str(err).split('lacks the columns')[-1]),
+                  (True, False))
+        # A row cut short, or one with a field too many, is refused with its
+        # line, not read as missing values.
+        for label, row, line in (
+                ('fewer', '1\t10\tTest\tFAIL\t0.2\tcore::slow_test\n', 3),
+                ('more', '1\t10\tTest\tFAIL\t0.2\tcore::slow_test\twaits\textra\n', 3),
+                ('fewer', '\n1\t10\tTest\tFAIL\t0.2\tcore::slow_test\n', 4)):
+            with open(slow_tsv, 'w', encoding='utf-8') as handle:
+                handle.write(head + '1\t10\tTest\tPASS\t0.1\tcore::slow_test\twaits\n' + row)
+            try:
+                run_score(ST_SELECTION, per_test=slow_tsv)
+                fails.append('a row with %s fields was accepted' % label)
+            except ScoreError as err:
+                check('a row with %s fields names its line %d' % (label, line),
+                      ('%s:%d:' % (slow_tsv, line) in str(err), label in str(err)), (True, True))
     finally:
         if os.path.exists(slow_tsv):
             os.remove(slow_tsv)
