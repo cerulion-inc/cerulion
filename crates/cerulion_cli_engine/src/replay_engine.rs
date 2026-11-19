@@ -10917,16 +10917,17 @@ fn derive_trailing_refills(
 /// The FIFO `Data` nodes whose recorded burst at `step` ended on a TRAILING
 /// REFILL (`replay_rederive::fifo_step_carry`): the read log holds one pop more
 /// than fires, the burst fired at least once, and the cap or the node's
-/// throttle left the last popped frame unfired for the next step's first
-/// fire. Derived only from the recording: each node's drain-site pops on its
+/// pre-fire check (its throttle, or a `block` input in its rank that holds it:
+/// [`replay_rederive::fifo_carry_deferrable`]) left the last popped frame
+/// unfired for the next step's first fire. Derived only from the recording: each node's drain-site pops on its
 /// trigger inputs this step, its recorded fires, and the carry the previous
 /// step left, which `carried` threads across steps (and `seen`, so a resumed
 /// pass's first step can take a carry its recording does not show).
 ///
 /// Only a node with a refill hook (`has_refill`, a unified `Data` binding)
-/// can carry: its burst is the one that refills before the cap and throttle
-/// checks. A node whose reads a pop count cannot be taken over (a
-/// `block`-gated node, a truncated or decimated stream, a declined
+/// can carry: its burst is the one that refills before the cap and pre-fire
+/// checks. A node whose reads a pop count cannot be taken over (a node a
+/// cross-rank `block` edge gates, a truncated or decimated stream, a declined
 /// verification) is skipped and carries nothing. A step no carry explains (a
 /// stopped node, a fire on a re-offered head that no pop recorded, a signal
 /// clamp) carries nothing and is left to the re-derivation verdict.
@@ -10950,7 +10951,7 @@ fn fifo_trailing_refills(
     let no_reads = Vec::new();
     let reads = verification.reads_by_step.get(&step).unwrap_or(&no_reads);
     for decl in &verification.decls {
-        let replay_rederive::TriggerDecl::Data { trigger_inputs } = &decl.trigger else {
+        let replay_rederive::TriggerDecl::Data { trigger_inputs, .. } = &decl.trigger else {
             continue;
         };
         if !has_refill(&decl.node_id) {
@@ -10978,7 +10979,7 @@ fn fifo_trailing_refills(
             carried_in,
             popped,
             fired,
-            decl.throttle_ns.is_some(),
+            replay_rederive::fifo_carry_deferrable(decl),
         ) {
             Ok(true) => {
                 carried.insert(decl.node_id.clone(), true);
@@ -12856,8 +12857,19 @@ fn node_trigger_decl(
                     identity,
                 }
             } else {
+                // The same two sources the latest drain reads, in the same
+                // order.
+                let drain = match recorded_separate(&input_name) {
+                    Some(true) => replay_rederive::FifoDrain::Separate,
+                    Some(false) => replay_rederive::FifoDrain::Unified,
+                    None if never_unifies(info, &input_name) => {
+                        replay_rederive::FifoDrain::Separate
+                    }
+                    None => replay_rederive::FifoDrain::Unrecorded,
+                };
                 replay_rederive::TriggerDecl::Data {
                     trigger_inputs: vec![input_name],
+                    drain,
                 }
             }
         }
@@ -13064,19 +13076,27 @@ fn declared_latest_drain(
     info: &cerulion_core::graph::NodeInfo,
     input: &str,
 ) -> replay_rederive::LatestDrain {
+    if never_unifies(info, input) {
+        replay_rederive::LatestDrain::Separate
+    } else {
+        replay_rederive::LatestDrain::Unrecorded
+    }
+}
+
+/// Does `input`'s declaration settle that it reads through two subscribers?
+/// `block` and `sample(N)` never unify (`NodeInfo::unifies_data_trigger`
+/// refuses them on policy); every other input's drain is the node library's
+/// and the run's choice, which a bag that states no per-input stage set does
+/// not record.
+fn never_unifies(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
     use cerulion_core::graph::node::BackpressurePolicy;
-    let never_unifies = info.input_meta().iter().any(|m| {
+    info.input_meta().iter().any(|m| {
         m.name == input
             && matches!(
                 m.backpressure,
                 BackpressurePolicy::Block | BackpressurePolicy::Sample(_)
             )
-    });
-    if never_unifies {
-        replay_rederive::LatestDrain::Separate
-    } else {
-        replay_rederive::LatestDrain::Unrecorded
-    }
+    })
 }
 
 /// The writer a kind-6 record names, for
@@ -17198,6 +17218,18 @@ fn run_rank_pass(
                     replayed: None,
                     context: Vec::new(),
                 });
+                // A FIFO node the bag records no drain for is judged without
+                // allowing for a `block` hold, so its finding says that.
+                let note = verification
+                    .decls
+                    .iter()
+                    .filter(|_| finding.decider == replay_rederive::Decider::FifoPop)
+                    .find(|d| d.node_id == finding.node_id)
+                    .and_then(replay_rederive::unrecorded_hold_note);
+                if let (Some(report), Some(note)) = (rederive_divergence.as_mut(), note) {
+                    report.detail.push_str("; ");
+                    report.detail.push_str(note);
+                }
             }
         }
     }
@@ -21047,7 +21079,7 @@ impl InjectionWindow {
 mod node_trigger_decl_tests {
     use super::{
         node_trigger_decl,
-        replay_rederive::{BlockHeldBy, LatestDrain, TriggerDecl},
+        replay_rederive::{BlockHeldBy, FifoDrain, LatestDrain, TriggerDecl},
     };
     use cerulion_core::graph::config::InputDef;
     use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
@@ -21246,12 +21278,38 @@ mod node_trigger_decl_tests {
             ),
             latest_on(LatestDrain::Unified, None)
         );
+        // A FIFO input's drain comes from the same two sources: the stage set
+        // the bag states, then a declaration that settles it, else neither.
+        let fifo_on = |drain| TriggerDecl::Data {
+            trigger_inputs: cam.clone(),
+            drain,
+        };
         assert_eq!(
             node_trigger_decl(&fifo, &wired, None, &|_| None, &|_| None, EVERY_EDGE),
-            TriggerDecl::Data {
-                trigger_inputs: cam
-            }
+            fifo_on(FifoDrain::Unrecorded)
         );
+        assert_eq!(
+            node_trigger_decl(&fifo, &wired, None, &|_| Some(true), &|_| None, EVERY_EDGE),
+            fifo_on(FifoDrain::Separate)
+        );
+        assert_eq!(
+            node_trigger_decl(&fifo, &wired, None, &|_| Some(false), &|_| None, EVERY_EDGE),
+            fifo_on(FifoDrain::Unified)
+        );
+        for backpressure in [BackpressurePolicy::Block, BackpressurePolicy::Sample(5)] {
+            assert_eq!(
+                node_trigger_decl(
+                    &data_with(InputConsume::Fifo, backpressure),
+                    &wired,
+                    None,
+                    &|_| None,
+                    &|_| None,
+                    EVERY_EDGE
+                ),
+                fifo_on(FifoDrain::Separate),
+                "{backpressure:?}"
+            );
+        }
         assert_eq!(input_consume_mode(&latest, "cam"), ConsumeMode::Latest);
         assert_eq!(input_consume_mode(&fifo, "cam"), ConsumeMode::EachFifo);
     }
@@ -39327,6 +39385,7 @@ mod trailing_refill_tests {
             node_id: id.to_string(),
             trigger: replay_rederive::TriggerDecl::Data {
                 trigger_inputs: vec!["inp".to_string()],
+                drain: replay_rederive::FifoDrain::Unified,
             },
             throttle_ns: throttled.then_some(1_000_000),
             held_by: replay_rederive::BlockHeldBy::NONE,
@@ -39462,6 +39521,66 @@ mod trailing_refill_tests {
                 (2, vec![]),
                 (3, vec![])
             ]
+        );
+    }
+
+    /// `(step, pops, fires)` rows of the relay of one real recording of `src`
+    /// (5 ms) -> `relay` (FIFO) -> `sink` (`block`, depth 2, `throttle_ms =
+    /// 50`) in one rank, hand-counted: the hold engages at step 4 (one pop, no
+    /// fire), and each later fire (12, 24, 36) serves the held frame while its
+    /// refill pops the next one, which the hold freezes.
+    fn block_held_relay_rows() -> Vec<(u64, usize, usize)> {
+        let mut rows = vec![(1, 1, 1), (2, 1, 1), (3, 1, 1), (4, 1, 0)];
+        rows.extend((5..=11).map(|n| (n, 0, 0)));
+        rows.push((12, 1, 1));
+        rows.extend((13..=23).map(|n| (n, 0, 0)));
+        rows.push((24, 1, 1));
+        rows.extend((25..=35).map(|n| (n, 0, 0)));
+        rows.push((36, 1, 1));
+        rows
+    }
+
+    /// The steps of `rows` that mark a trailing refill, for a node `held_by`
+    /// holds.
+    fn marked_steps(
+        rows: &[(u64, usize, usize)],
+        held_by: replay_rederive::BlockHeldBy,
+    ) -> Vec<u64> {
+        let pops: Vec<(u64, usize)> = rows.iter().map(|&(n, p, _)| (n, p)).collect();
+        let fired: Vec<(u64, usize)> = rows.iter().map(|&(n, _, f)| (n, f)).collect();
+        let mut v = verification(&pops, false);
+        v.decls[0].held_by = held_by;
+        derive(&v, &fired, false, true)
+            .into_iter()
+            .filter(|(_, ids)| !ids.is_empty())
+            .map(|(step, _)| step)
+            .collect()
+    }
+
+    /// A node a `block` input in its rank holds marks a trailing refill at
+    /// every step whose last fire's refill the hold froze, the pops the live
+    /// burst made after its fire at steps 12, 24 and 36, and at no other step.
+    /// The same steps of a node nothing holds mark none: the onset is a step
+    /// no carry explains, so its carry is cleared.
+    #[test]
+    fn a_block_held_node_marks_each_refill_its_hold_froze() {
+        let rows = block_held_relay_rows();
+        assert_eq!(
+            marked_steps(&rows, replay_rederive::BlockHeldBy::IN_RANK),
+            vec![12, 24, 36]
+        );
+        assert!(marked_steps(&rows, replay_rederive::BlockHeldBy::NONE).is_empty());
+    }
+
+    /// A step no carry explains on a held node (two frames popped and none
+    /// fired) clears its carry, so the next fire step marks nothing; a hold
+    /// that engages again after it marks its refill again.
+    #[test]
+    fn a_block_held_node_step_no_carry_explains_clears_its_carry() {
+        let rows = [(0, 1, 1), (1, 2, 0), (2, 1, 1), (3, 1, 0), (4, 1, 1)];
+        assert_eq!(
+            marked_steps(&rows, replay_rederive::BlockHeldBy::IN_RANK),
+            vec![4]
         );
     }
 
