@@ -8,8 +8,27 @@ The benchmark: simulated robot manipulation tasks from LIBERO-PRO, each run twic
 harness's tools. Same simulator, same start state, same budget, same scorer. Fifteen models, 100 start states
 each, one episode a start state an arm.
 
-The LIBERO-PRO start states are new start states of 25 task rows that the Cerulion harness was developed on at
-other start states; the tasks themselves are not new to it.
+Said before any number (RULES.md section 2):
+
+1. They are new start states of 25 task rows that the Cerulion harness was developed on at other start states.
+   The tasks themselves are not new to it. Task rows that the Cerulion harness never met exist in the benchmark
+   and are on no list here.
+2. The result is on one benchmark family, the one the Cerulion harness was built and checked on.
+3. The arm with Cerulion reads a record of the robot's own calibration that the other arm does not have. The
+   comparison is the whole package against the published interface; it cannot be split into tools, record and
+   documents.
+4. One episode a start state at temperature 1.0. Provider model versions are known only by the model's name.
+5. Other groups publish higher rates on this benchmark under their own protocols. Nothing here supports a
+   ranking against any of them.
+
+With them: the arm without Cerulion is the benchmark's published minimal interface, not the best harness there
+is. The calibration records were made by the robot's own calibration episodes on development start states of
+LIBERO-10 and LIBERO-PRO, and which record each episode read is not recorded. The arm without Cerulion reads the
+gripper in one of the two ways the published paper allows, the one that scored lower when both ran in an
+earlier check on LIBERO-10 (not in this package); the other way was not run here, so a small gain over this arm
+is not shown to hold against it. CLEAN was defined before the first episode with Cerulion on the earlier lists,
+and became a claim only after the first of those lists had shown a gain on it; for this grid it was declared
+before the first episode.
 
 Two of the models, Gemini 3.8 Flash and GPT-6 Astra, also ran further start states the same way. The 400-cell
 lists were added after the first rows of the 100-cell grid had been scored and seen. The 100-cell test declared
@@ -33,9 +52,11 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 ## Start here
 
 - [SUMMARY.md](SUMMARY.md): the main test as it was declared before the first episode, the two secondary tests,
-  every model and arm with intervals, the paired counts and exact tests, cost and time per episode. It states
-  at its top when the rows were read, and names every model whose start states had not all ended then, with its
-  counts.
+  every model and arm with intervals, the paired counts and exact tests, the two cross-model pairs named before
+  the grid, cost and time per episode with each arm's failed requests and cached share. It opens with the lines
+  above, states when the rows were read and names every model whose start states had not all ended then, with
+  its counts; once every column is complete it goes on with what must be read before any of its numbers, and
+  prints each declared test's verdict with the counts that qualify it.
 - [extension_list2/SUMMARY.md](extension_list2/SUMMARY.md) and
   [extension_libero10/SUMMARY.md](extension_libero10/SUMMARY.md): the two further lists of the two models, read
   as one family of twelve tests by the extension's rule, with the lines that must be read before any of their
@@ -45,7 +66,7 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 - [RULES.md](RULES.md): the reading rules, each frozen before the rows of its own lists.
 - recompute.py: computes every SUMMARY.md, summary.csv, paired.csv and task_rows.csv again from the CSV files,
   with Python 3 and its standard library only. With `--check` it writes nothing and says whether the files still
-  match.
+  match. Either way it fails if a row of a cells.csv no longer matches its content hash.
 
 ## Files
 
@@ -57,8 +78,8 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 | not_finished.csv | every episode not yet ended when the rows were read (empty once the grid is complete) |
 | lost_attempts.csv | every attempt that is in no scored row, priced; `before_rerun` is 1 for an attempt of an episode that was started again from attempt 1 (see below) |
 | prices.csv | the list prices used, per million tokens, with the page and the date each row was read |
-| summary.csv | per model and arm: counts, Wilson intervals, means per scored episode, and the model's paired counts and exact test on SOLVED |
-| paired.csv | per model and measure (solved, clean, false claim): the paired counts, the difference with its interval, the exact p, the Holm threshold and the verdict |
+| summary.csv | per model and arm: counts, Wilson intervals, means per scored episode, the cached share of input tokens, the failed requests in all, and the model's paired counts and exact test on SOLVED |
+| paired.csv | per model and measure (solved, clean, false claim): the paired counts, the difference with its interval, the exact p, the Holm threshold and the verdict; the grid declares no per-model false-claim test, so its false-claim rows read `descriptive, no test declared` |
 | SUMMARY.md | the same as text |
 | list_info.json | when the rows were read, the list's hashes and its freeze time |
 | transcripts/ | six whole episodes as text: the model's messages, the tool calls and their answers, and the names of the camera frames the model received (the images are not in this package) |
@@ -127,28 +148,45 @@ is in cells.csv, and the success predicate was false at reset on every one.
 
 ## Things to know before quoting a number
 
-- Models whose 100 start states had not all ended when the rows were read are marked incomplete, with their n
-  and the read time. Start states that end first are the short episodes, so an incomplete row is not a fair
-  sample.
-- GPT-6.1 Terra was added to the grid after its first rows had been seen. Its column is marked so.
+- At this package's read every model had finished all 100 start states in both arms. A model whose start
+  states had not all ended at a read is marked incomplete, with its n and the read time: start states that end
+  first are the short episodes, so an incomplete row is not a fair sample.
+- GPT-6.1 Terra was added to the grid after its first rows had been seen. Its column is marked so in SUMMARY.md
+  and on both charts.
 - One further model, Gemini Robotics-ER 2 (preview), was tried and left out before any grid row: its endpoint
   failed the arm with Cerulion on 5 of 5 trial attempts. It has no column.
-- The four Claude models share one endpoint. No new episode of theirs started from 2026-11-18T01:31:31Z to
-  07:21:16Z, to lower the load on that endpoint, so their later start states ran hours after the other models'
-  did, in the list's order and both arms alike.
+- The four Claude models share one endpoint. To lower the load on it, no episode of theirs started between
+  2026-11-18T01:30:07Z and 07:21:18Z (5 h 51 min), so their later start states ran hours after the other
+  models' did, in the list's order and both arms alike. For 13 start states of a Claude model (Claude Opus 5.5
+  7, Claude Sonnet 5.5 3, Claude Haiku 5.5 2, Claude Fable 5.2 1) the two arms ran on either side of that
+  pause.
+- Beyond that pause, the two arms of a start state did not always start in the same hour. Start states whose two
+  arms started more than 1 h apart, per model: Claude Opus 5.5 8 (up to 7.7 h), Gemini 4 Argon 10 (up to
+  1.5 h), Grok 4.7 4, Claude Sonnet 5.5 3, Claude Haiku 5.5 2, Claude Fable 5.2 2, GPT-6 Luna 2, GPT-6.1 Sol 1.
+  The Claude counts include the 13 start states across the pause, and Claude Opus 5.5's also one of the two
+  start states moved off a stopped machine (below). episodes.csv holds no start times.
 - Five start states of GPT-6 Astra's `without` arm were started again from attempt 1 because the harness
   refused to start them before any model call; the refused attempts the records still hold are in
   lost_attempts.csv with 0 replies.
 - Two of the machines stopped during the run. Their scored rows are kept. Every episode they had not ended ran
   from attempt 1 on another machine; for two start states of Claude Opus 5.5 this put the `without` arm on a
   different machine from the `with` arm, one of them hours later. The two attempts that were running when their machine
-  stopped left no token count, so they are in no file and their cost is in no total.
+  stopped left no token count, so they are in no file and their cost is in no total. Before a third machine was
+  removed, the 94 Claude episodes waiting on it that had not started were moved to other machines (12 of them
+  twice) and ran there.
 - A network outage of 22 minutes cut the model endpoint off from three of the machines. It ended one episode
   without a score after its 3 attempts (Claude Sonnet 5.5, `without`, pro_goal_task_t00_i06). That episode was
   started again from attempt 1 under RULES.md section 5 (5); its outage attempts are in lost_attempts.csv with
-  `before_rerun` 1.
-- Providers gave no version string beyond the model's name.
-- Wall clock seconds include time an endpoint stalled or refused requests.
+  `before_rerun` 1. A first restart of it was refused by the harness twice before any model call; those two
+  attempts left empty folders and are in no file.
+- Providers gave no version string beyond the model's name. Grok 4.7 answered from two provider deployments,
+  alternating through the whole run. The grid cannot show that no provider changed a model behind its name.
+- Wall clock seconds include time an endpoint stalled or refused requests, and other workloads shared the
+  machines: one machine ran up to 9 grid episodes at once. SUMMARY.md prints each arm's failed requests beside
+  its seconds; the episodes the 90 minute clock ended are in no mean.
+- Cost per success counts the scored episodes only. Part of the gap in USD between the arms is caching:
+  SUMMARY.md prints each arm's cached share of input tokens, and the arm without Cerulion had the lower share
+  for every model.
 - On the LIBERO-10 list the provider's image filter refused GPT-6 Astra's `without` arm, and only that arm, on
   tasks 4 and 6 (HTTP 400, "Image processing blocked due to content policy violation"). No start state was run
   again for it: the requests reached the provider and were answered. GPT-6 Astra's LIBERO-10 SOLVED and FALSE

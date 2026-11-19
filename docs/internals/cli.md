@@ -1099,7 +1099,7 @@ own binary.
 
 | Test file | What it pins | Serial? | Prereq fixtures |
 |---|---|---|---|
-| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the byte-mismatch line naming the field and both values, per writer and under a tolerance; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
+| `replay_engine_test.rs` | Replay engine e2e: every test crafts a bag from a reference run, replays with injected node factories, asserts against hand oracles (byte-identity via recorded-clock re-advance; violation taxonomy; the byte-mismatch line naming the field and both values, per writer and under a tolerance; the `--duration` bag-time bound; `--report` JSON; an rmw borrow-window gap-frame recording byte-diffs clean; a resim in a re-executed child whose environment holds a value that is not valid UTF-8 matches its recorded hash, and a two-pass resim beside such variables prints the node-environment line once) | whole binary `#[serial]` (env mutation + empirically racy transport) | none |
 | `replay_gates_test.rs` | Exit-4 pre-flight loudness (opaque-field tolerance refusal) | no | none |
 | `replay_driver_stamp_cdylib_test.rs` | A crafted bag's `node_external` stamp reaches the engine through `run_replay`: a workspace build that runs a recorded driver as an ordinary node is refused with `DriverSetDrift` (exit 2) | one test (moves the working directory, mints the resim transport) | `test_node_macro_period_cdylib` |
 | `integration_test.rs` | Engine integration incl. `pinned_hashes_match_generated_constants` (the hash-regen seam) | no | none |
@@ -1357,7 +1357,11 @@ from the engine function the verb's own path refuses with, so its text and exit 
 are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot` and
 `service call`, and `rcp` (exit 2), and `viz --robot` (exit 1). The `rcp`
 family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connect`
-does. The hidden `pair` stub never reaches this check: `dispatch` answers it
+does. `rcp --sim` and the nested `rcp bench` (`families/nested/rcp_bench.rs`) are not
+refused, because they reach no robot and no Cerulion service, and they need an
+identity like every other `rcp` form; both run the harness launcher that
+`harness_cmd::find_harness_dir` finds and `harness_cmd::plan` spells, through
+`connect_cmd::spawn_child_and_wait`. The hidden `pair` stub never reaches this check: `dispatch` answers it
 beside the removed `ros` family, above the switch and the gate, with
 `PAIR_UNAVAILABLE_MSG` and exit 2 for every spelling, because no robot-side verb
 arms a pairing code (`SharedCodePairSessions::arm` has no caller outside tests);

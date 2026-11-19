@@ -882,6 +882,132 @@ SAVE_ALLOWED = ("cache-hit",) + PRUNE_ALLOWED + ("prune-proceed", "namespace")
 TOOL_CACHE_ALLOWED = ("cache-hit", "merge-group")
 
 
+# The cargo timing reports (`--timings`, the "CARGO TIMING REPORTS" comment in
+# ci.yml). Cargo writes them into `<target dir>/cargo-timings/`, inside the
+# directories the cache steps archive, so a job that passes the flag must move
+# them out before its cache save (R3 and R7 put the prune directly before the
+# save and the save last), or the save carries them and every later restore
+# uploads them again as that run's own.
+TIMINGS_FLAG_RE = re.compile(r"(?<![\w-])--timings(?![\w-])")
+TIMINGS_COLLECT_NAME = "Collect the cargo timing reports"
+TIMINGS_UPLOAD_NAME = "Upload the cargo timing reports"
+TIMINGS_UPLOAD_USES_PREFIX = "actions/upload-artifact@"
+TIMINGS_UPLOAD_PATH = "${{ runner.temp }}/cargo-timings"
+CACHE_STEP_PREFIXES = ("actions/cache/restore@", SAVE_USES_PREFIX, COMBINED_USES_PREFIX)
+TIMINGS_COLLECT_FOR_RE = re.compile(r"^for dir in (?P<dirs>[^;\n]+); do\n")
+# The collect step's whole script, `%s` being its target directory list. Held
+# exactly so the copies in every job cannot drift: a report it cannot move it
+# deletes, and only a report it can neither move nor delete fails the step.
+# The list is checked against the target directories the job's cache steps
+# name; one nested inside them (a `CARGO_TARGET_DIR` under a cached `target`)
+# is not derived here and is listed by hand.
+TIMINGS_COLLECT_RUN = (
+    'for dir in %s; do\n'
+    '  if [ -d "$dir/cargo-timings" ]; then rm -f "$dir/cargo-timings/cargo-timing.html" || true; '
+    'if ! { mkdir -p "$RUNNER_TEMP/cargo-timings/$dir" && mv "$dir/cargo-timings" '
+    '"$RUNNER_TEMP/cargo-timings/$dir/"; }; then echo "::warning::$dir/cargo-timings could not be '
+    'moved, so it is deleted"; rm -rf "$dir/cargo-timings"; fi; fi\n'
+    'done\n'
+)
+
+
+def _env_passes_timings(env, what):
+    if env is None:
+        return False
+    return any(TIMINGS_FLAG_RE.search(_get_str(env, name, what) or "") for name in env.keys())
+
+
+def _step_passes_timings(step):
+    if step.run and TIMINGS_FLAG_RE.search(step.run):
+        return True
+    return _env_passes_timings(step.env, "step %r env" % step.label())
+
+
+def _check_timings(add, job):
+    """TIMINGS_REPORTS for one job."""
+    code = "TIMINGS_REPORTS"
+    steps = job.steps
+    if _env_passes_timings(job.env, "job %s env" % job.job_id):
+        add(job.env_line, code,
+            "job %s passes `--timings` through its job-level `env`, which reaches every step, "
+            "the collect step's successors included; set it on the steps that build" % job.job_id)
+    timed = [step for step in steps if _step_passes_timings(step)]
+    collects = [step for step in steps if norm(step.name) == TIMINGS_COLLECT_NAME]
+    uploads = [step for step in steps if norm(step.name) == TIMINGS_UPLOAD_NAME]
+    if not timed:
+        for step in collects + uploads:
+            add(step.line, code,
+                "step %r is in job %s, which passes no `--timings`; nothing writes a report for "
+                "it to carry" % (step.label(), job.job_id))
+        return
+    if len(collects) != 1 or len(uploads) != 1:
+        add(timed[0].line, code,
+            "job %s passes `--timings` (step %r) and carries %d %r and %d %r steps; it needs "
+            "exactly one of each, or its reports stay in the target directory for the next "
+            "cache save" % (job.job_id, timed[0].label(), len(collects), TIMINGS_COLLECT_NAME,
+                            len(uploads), TIMINGS_UPLOAD_NAME))
+        return
+    collect, upload = collects[0], uploads[0]
+    if upload.index != collect.index + 1:
+        add(upload.line, code,
+            "step %r must directly follow %r" % (upload.label(), collect.label()))
+    for step in timed:
+        if step.index > collect.index:
+            add(step.line, code,
+                "step %r passes `--timings` after %r, so its report stays in the target "
+                "directory" % (step.label(), collect.label()))
+    for step in steps[:collect.index]:
+        if step.is_save or step.is_combined_cache:
+            add(step.line, code,
+                "step %r saves a cache before %r runs, so the archive carries the reports"
+                % (step.label(), collect.label()))
+    for step, want in ((collect, "always()"), (upload, "always()")):
+        if norm(step.cond) != want:
+            add(step.cond_line, code,
+                "step %r runs under %r; expected `if: %s`, so a red or timed-out job still "
+                "reports" % (step.label(), norm(step.cond) or None, want))
+    if collect.node.has("continue-on-error"):
+        add(collect.line, code,
+            "step %r carries `continue-on-error`; a collect step that fails must fail the job, "
+            "which skips the cache save it did not clear" % collect.label())
+    if norm(_get_str(upload.node, "continue-on-error", "step %r" % upload.label())) != "true":
+        add(upload.line, code,
+            "step %r needs `continue-on-error: true`, so a failed upload never fails the job"
+            % upload.label())
+    if not (upload.uses or "").startswith(TIMINGS_UPLOAD_USES_PREFIX) \
+            or norm(upload.path) != TIMINGS_UPLOAD_PATH:
+        add(upload.line, code,
+            "step %r must use %s with `path: %s`, where the collect step moves the reports"
+            % (upload.label(), TIMINGS_UPLOAD_USES_PREFIX, TIMINGS_UPLOAD_PATH))
+    defaults = _get_map(job.node, "defaults", "job %s" % job.job_id)
+    run_defaults = _get_map(defaults, "run", "job %s defaults" % job.job_id) if defaults else None
+    if run_defaults is not None and run_defaults.has("working-directory") and \
+            norm(_get_str(collect.node, "working-directory", "step %r" % collect.label())) \
+            != "${{ github.workspace }}":
+        add(collect.line, code,
+            "job %s sets `defaults.run.working-directory`, so step %r needs `working-directory: "
+            "${{ github.workspace }}` for its target directory list to resolve"
+            % (job.job_id, collect.label()))
+    mo = TIMINGS_COLLECT_FOR_RE.match(collect.run or "")
+    if mo is None or norm(collect.run) != norm(TIMINGS_COLLECT_RUN % mo.group("dirs")):
+        add(collect.line, code,
+            "step %r does not run the collect script `TIMINGS_COLLECT_RUN` holds, with its own "
+            "target directory list" % collect.label())
+        return
+    listed = mo.group("dirs").split()
+    for step in steps:
+        if not (step.uses or "").startswith(CACHE_STEP_PREFIXES):
+            continue
+        for entry in (step.path or "").split("\n"):
+            entry = entry.strip()
+            if not entry or entry.startswith("~"):
+                continue
+            if entry not in listed:
+                add(step.line, code,
+                    "step %r caches %r, which %r does not list (%s)"
+                    % (step.label(), entry, collect.label(), " ".join(listed)))
+
+
 def check_text(path, text):
     """Return (violations, stats). Raises ParseError for a file outside the subset."""
     doc = Parser(text).parse()
@@ -901,6 +1027,7 @@ def check_text(path, text):
     # ---- rules that apply to EVERY workflow in the directory ---------------
     for job in jobs:
         _check_local_policy_env(add, job)
+        _check_timings(add, job)
         for step in job.steps:
             if step.is_combined_cache:
                 add(
@@ -912,6 +1039,10 @@ def check_text(path, text):
                 )
 
     wf_env = _get_map(doc, "env", "workflow")
+    if _env_passes_timings(wf_env, "workflow env"):
+        add(doc.line_of("env"), "TIMINGS_REPORTS",
+            "the workflow-level `env` passes `--timings`, which reaches every step of every job; "
+            "set it on the steps that build")
     bears_policy = save_count > 0 or (
         wf_env is not None and any(wf_env.has(name) for name in POLICY_ENV_NAMES)
     )
@@ -1384,8 +1515,25 @@ jobs:
 
       - name: Build and test
         run: |
-          cargo build --locked
-          cargo test --locked
+          cargo build --timings --locked
+          cargo test --timings --locked
+
+      - name: Collect the cargo timing reports
+        if: always()
+        timeout-minutes: 2
+        run: |
+<COLLECT_TARGET>
+      - name: Upload the cargo timing reports
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-test-linux-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/cargo-timings
+
+      - name: Trim the units this run did not use
+        run: bash tools/scripts/ci_cache_trim_target.sh trim target
 
       - name: Prune the cache namespace, Linux shard
         id: cache-prune
@@ -1652,7 +1800,10 @@ jobs:
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
-""".replace("<MAIN>", MAIN_ONLY_CLAUSE)
+""".replace("<MAIN>", MAIN_ONLY_CLAUSE).replace(
+    "<COLLECT_TARGET>\n",
+    "".join("          " + line + "\n" for line in (TIMINGS_COLLECT_RUN % "target").splitlines()),
+)
 
 # A workflow that restores and never saves costs the store nothing, so it
 # carries no policy `env`, no `actions: write` and no prune step -- and the
@@ -2161,6 +2312,91 @@ def _mutants():
         _mut(clean, "    runs-on: ubuntu-latest\n", "    runs-on: &ru ubuntu-latest\n",
              total=8, occurrence=1),
         None,
+    ))
+    # TIMINGS_REPORTS: the reports must leave the target directory before any
+    # trim, prune or save, through the one collect script, and no build after.
+    trim = (
+        "      - name: Trim the units this run did not use\n"
+        "        run: bash tools/scripts/ci_cache_trim_target.sh trim target\n\n"
+    )
+    collect_head = "      - name: Collect the cargo timing reports\n"
+    collect_block = clean[clean.index(collect_head):clean.index(trim)]
+    linux_save_tail = (
+        "            target\n"
+        "          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}"
+        "-${{ hashFiles('**/Cargo.lock') }}\n\n  lint:\n"
+    )
+    out.append((
+        "TIMINGS the collect and upload steps after the save",
+        _mut(_mut(clean, collect_block, ""), linux_save_tail,
+             linux_save_tail[:-len("  lint:\n")] + collect_block + "  lint:\n"),
+        {"TIMINGS_REPORTS", "R7_SAVE_IS_LAST"},
+    ))
+    out.append((
+        "TIMINGS a build passing --timings after the collect step",
+        _mut(clean, trim, "      - name: Late build\n        run: cargo test --timings --locked\n\n" + trim),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS a cached target directory missing from the collect list",
+        _mut(clean, "for dir in target; do", "for dir in examples/*/target; do"),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS the collect script keeps a report it could not move",
+        _mut(clean, ' rm -rf "$dir/cargo-timings"; fi; fi', " fi; fi"),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS a job passing --timings with no collect and upload steps",
+        _mut(clean, collect_block, ""),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS the collect and upload steps in a job passing no --timings",
+        _mut(clean, "          cargo build --timings --locked\n          cargo test --timings --locked\n",
+             "          cargo build --locked\n          cargo test --locked\n"),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS an upload that can fail the job",
+        _mut(clean, "        continue-on-error: true\n        timeout-minutes: 5\n",
+             "        timeout-minutes: 5\n"),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS a collect step that cannot fail the job",
+        _mut(clean, "        timeout-minutes: 2\n",
+             "        timeout-minutes: 2\n        continue-on-error: true\n"),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS a collect step that runs only on success",
+        _mut(clean, collect_head + "        if: always()\n", collect_head),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS --timings through the job env",
+        _mut(clean, "        shard: [0, 1, 2, 3]\n    steps:\n",
+             "        shard: [0, 1, 2, 3]\n    env:\n      CI_TEST_SHARD_EXTRA: --timings\n    steps:\n"),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS a default working directory the collect step does not override",
+        _mut(clean, "        shard: [0, 1, 2, 3]\n    steps:\n",
+             "        shard: [0, 1, 2, 3]\n    defaults:\n      run:\n        working-directory: crates/x\n"
+             "    steps:\n"),
+        {"TIMINGS_REPORTS"},
+    ))
+    # The near miss: the flag through a step `env` counts as passing it, so the
+    # job stays clean with its steps in place.
+    out.append((
+        "TIMINGS --timings through a step env passes",
+        _mut(clean, "      - name: Build and test\n        run: |\n"
+                    "          cargo build --timings --locked\n          cargo test --timings --locked\n",
+             "      - name: Build and test\n        env:\n          CI_TEST_SHARD_EXTRA: --timings\n"
+             "        run: |\n          ./tools/scripts/ci_test_shard.sh cerulion_core 0 4\n"),
+        set(),
     ))
     # The restore-only workflow and its two structural failures.
     out.append(("restore-only workflow passes", RESTORE_ONLY_WORKFLOW, set()))

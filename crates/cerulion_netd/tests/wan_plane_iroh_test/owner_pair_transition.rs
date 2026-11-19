@@ -642,6 +642,7 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
     struct StalledPlane {
         controller: Arc<AccountWanController>,
         started: std::sync::mpsc::SyncSender<()>,
+        released: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
         healthy_attempts: std::sync::atomic::AtomicUsize,
         healthy_ensure_attempts: std::sync::atomic::AtomicUsize,
     }
@@ -669,7 +670,9 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
             }
             if key.topic == "/wan/stall" {
                 self.started.send(()).unwrap();
-                std::thread::sleep(Duration::from_secs(6));
+                // The daemon holds its registry lock across this call. The stall
+                // ends on the test's release, or when the test drops the sender.
+                let _ = self.released.lock().unwrap().recv();
                 Err(MirrorError::Iroh {
                     key: key.clone(),
                     reason: "stalled fixture refuses the new demand".into(),
@@ -693,14 +696,19 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
     desk.install(login.snapshot(&[(ROBOT, &robot)]));
     let socket = desk._directory.path().join("stall.sock");
     let (started, ready) = std::sync::mpsc::sync_channel(1);
+    let (stall_sender, released) = std::sync::mpsc::channel();
     let plane = Arc::new(StalledPlane {
         controller: desk.controller.clone(),
         started,
+        released: std::sync::Mutex::new(released),
         healthy_attempts: std::sync::atomic::AtomicUsize::new(0),
         healthy_ensure_attempts: std::sync::atomic::AtomicUsize::new(0),
     });
     let mut daemon =
         cerulion_netd::start(socket.clone(), plane.clone(), NetdConfig::default()).unwrap();
+    // Bound after the daemon, so a failing assertion drops the sender first: that
+    // ends the stall before the daemon's drop joins the stalled handler.
+    let release_stall = stall_sender;
     let mut holding = NetdClient::connect_existing_at(socket.clone()).unwrap();
     let route = robot_route(&ROBOT.0);
     let channel = holding
@@ -718,9 +726,14 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
             .unwrap_err()
     });
     ready.recv_timeout(Duration::from_secs(2)).unwrap();
-    let deadline = Instant::now() + Duration::from_millis(6200);
+    // The registry stays locked until the release below. Every pass of a connection
+    // handler's read loop bumps this counter without that lock, and the observer's
+    // handler is the only one that can loop: the worker's handler is inside the
+    // stalled call, and each probe's handler waits on the lock to register.
+    let passes_at_stall = daemon.conn_read_loop_iterations();
+    let deadline = Instant::now() + Duration::from_secs(3);
     let mut busy = 0;
-    while Instant::now() < deadline {
+    loop {
         holding.poll_pushed_losses().unwrap();
         assert!(holding.take_mirror_losses().is_empty());
         if holding
@@ -730,13 +743,30 @@ fn stalled_first_demand_cannot_poison_a_healthy_observer_heartbeat() {
             busy += 1;
         }
         sequence = read_after(&mut tap, Some(sequence)).0;
+        // Two passes counted from inside the stall: the observer's handler finished
+        // at least one whole pass, its loss drain included, while the lock was held.
+        let passes = daemon.conn_read_loop_iterations() - passes_at_stall;
+        if busy > 0 && passes >= 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the observer's heartbeat did not complete under the stalled registry \
+             (busy probes: {busy}, observer handler passes: {passes})"
+        );
         std::thread::sleep(Duration::from_millis(100));
     }
+    release_stall.send(()).unwrap();
+    drop(release_stall);
+    let refusal = worker.join().unwrap();
     assert!(
-        busy > 0,
-        "the observer never encountered the stalled registry"
+        matches!(&refusal, cerulion_netd::ClientError::Netd { error, .. }
+            if error.contains("stalled fixture refuses the new demand")),
+        "the released demand must end in the stalled plane's refusal: {refusal}"
     );
-    worker.join().unwrap();
+    holding.poll_pushed_losses().unwrap();
+    assert!(holding.take_mirror_losses().is_empty());
+    read_after(&mut tap, Some(sequence));
     let rows = holding.status().unwrap().demands;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].robot, route);

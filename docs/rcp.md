@@ -1,6 +1,8 @@
 # Robot Context Protocol (`cerulion-rcpd`)
 
-Experimental: not in any release; build from source.
+Experimental: `cerulion-rcpd` is not in any release; build it from source. The simulated robot of
+[Try it in simulation](#try-it-in-simulation) needs no source build: the release's `cerulion` runs it from the
+`harness/` folder of a checkout of this repository.
 
 `cerulion-rcpd` is an MCP server that lets an agent read the live state of a
 robot running Cerulion and call the tools its manifest declares. It identifies
@@ -15,6 +17,34 @@ script expects an [ASPIRE](https://github.com/NVlabs/ASPIRE) embodiment that is
 not yet published; the plant and the replay run from this repository alone.
 
 Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep their graph, state and tool journal local. Remote requests are refused before reaching those topics; configured external eye requests also respect this scope. Cached private state stays local after its producer exits. Remote graph topic diagnostics require an eligible live producer; local observations retain history. Local tool calls remain available. Emergency-stop operations remain available independently of network scope.
+
+## Try it in simulation
+
+`cerulion rcp --sim` serves the tools of the [Cerulion harness](harness.md) with a simulated robot on your
+machine, to any MCP client. It needs no robot and no source build. The release packages install `cerulion`
+without the harness folder, so clone this repository once and name its `harness/` folder in
+`CERULION_HARNESS_DIR`. Then sign in once, start it, and add it to your client:
+
+```bash
+git clone --depth 1 https://github.com/cerulion-inc/cerulion   # the harness folder, once
+export CERULION_HARNESS_DIR="$PWD/cerulion/harness"
+cerulion login                                   # once, on this machine
+cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
+claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
+```
+
+Then ask your model for a task, for example "Put the bowl on the plate." Each MCP connection gets its own
+episode of the simulated robot. Without `--http` the server speaks MCP over stdio, the way `cerulion rcp <robot>`
+does. `--task NAME` sets the robot up for another task: `bowl-on-plate` (the default), `open-drawer` or
+`soup-in-basket`. The first run installs the simulator and the benchmark scenes once, which takes minutes, with
+its progress on stderr.
+
+`cerulion rcp bench --model YOUR_MODEL` reruns a task of the published benchmark twice against your own model
+endpoint, once with the harness and once without, and prints the benchmark's verdict for each;
+`cerulion rcp bench --verify` checks that the harness code on disk is the code the benchmark measured. See
+[the harness guide](harness.md) for both, and `docs/user-api.md` for every flag.
+
+The harness's tools on real robots through `cerulion rcp` come in the next release.
 
 ## Run it
 
