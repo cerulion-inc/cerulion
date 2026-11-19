@@ -235,6 +235,12 @@ members = [
     # gateway that demands one topic without reading a catalog first, so the
     # e2e can show a paired app refuses a LAN data demand and sends no frame.
     "crates/test_fixtures/android_e2e_demand_probe",
+    # A node crate as `node create` writes it, and an app library that depends
+    # on it with `default-features = false`. Built and inspected by
+    # `crates/cerulion_cli_engine/tests/node_links_as_library_test.rs`, which
+    # also checks the node against `node create`'s output.
+    "crates/test_fixtures/test_node_links_timer",
+    "crates/test_fixtures/test_node_links_host_app",
     # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
     #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
