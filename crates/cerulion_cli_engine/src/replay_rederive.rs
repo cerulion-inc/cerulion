@@ -673,6 +673,34 @@ pub enum LatestDrain {
     Unrecorded,
 }
 
+/// Which `block` edges can hold a node's fire after its trigger drain popped,
+/// with no record of the hold in the bag.
+///
+/// A rank's runtime installs a pre-fire check on every producer of a topic
+/// that a `block` input in the rank reads, whatever the topic's other
+/// consumers declare (`graph/runtime.rs`, the producer block edges, by
+/// `TopicFlow::holds_its_producers`). The check holds the node's fire while
+/// that consumer's queue is at its declared depth. It runs after the step's
+/// trigger drain has popped, and the recording keeps no record of its answer,
+/// so a step can pop a trigger frame and record no fire with nothing in the
+/// bag to say why. Every rule asks the one predicate [`Self::can_hold`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlockHeldBy {
+    in_rank: bool,
+}
+
+impl BlockHeldBy {
+    /// No `block` input in the node's rank reads a topic the node produces.
+    pub const NONE: Self = Self { in_rank: false };
+    /// A `block` input in the node's own rank reads a topic the node produces.
+    pub const IN_RANK: Self = Self { in_rank: true };
+
+    /// Can a `block` edge hold this node's fire with no record in the bag?
+    pub fn can_hold(self) -> bool {
+        self.in_rank
+    }
+}
+
 /// One node's declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodeDecl {
@@ -685,22 +713,13 @@ pub struct NodeDecl {
     /// time), so a `Period` node carrying one is a declaration this module
     /// judges on the Period rule alone.
     pub throttle_ns: Option<u64>,
-    /// Does this node produce a topic that a `block` input in its rank reads,
-    /// whatever the topic's other consumers declare?
-    ///
-    /// The rank's runtime installs a pre-fire check on every producer of such
-    /// a topic (`graph/runtime.rs`, the producer block edges, by
-    /// `TopicFlow::holds_its_producers`), and the check
-    /// holds the node's fire while a consumer's queue is at its declared
-    /// depth. It runs after the step's trigger drain has popped, and the
-    /// recording keeps no record of its answer, so a step can pop a trigger
-    /// frame and record no fire with nothing in the bag to say why. A `block`
-    /// edge across ranks reaches this module as a [`BlockEdgeObservation`];
-    /// one inside the rank reaches it only as this flag. The
-    /// `consume = latest` rule holds such a node to no fire it did not
-    /// record: the first step that would owe one stands the rule down
+    /// Which `block` edges can hold this node's fire with no record in the
+    /// bag ([`BlockHeldBy`]). A `block` edge across ranks reaches this module
+    /// as a [`BlockEdgeObservation`]; one inside the rank reaches it only as
+    /// this field. The `consume = latest` rule holds such a node to no fire it
+    /// did not record: the first step that would owe one stands the rule down
     /// ([`StandDownReason::LatestBlockHeld`]).
-    pub feeds_local_block_edge: bool,
+    pub held_by: BlockHeldBy,
     /// Does this node wire any input that is NOT
     /// `#[input(trigger)]`-marked?
     ///
@@ -1308,7 +1327,7 @@ pub enum StandDownReason {
     /// is named is judged again and can be a finding.
     LatestWritersUnnamed,
     /// A `consume = latest` node produces a topic a `block` input in its own
-    /// rank reads ([`NodeDecl::feeds_local_block_edge`]), and a step owed it a
+    /// rank reads ([`NodeDecl::held_by`]), and a step owed it a
     /// fire it did not record: a step whose drain popped a frame on one
     /// subscriber, or a step whose counted frames outran the reads and the
     /// frames in delivery on two. The pre-fire check that holds such a node's
@@ -3608,7 +3627,7 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
 /// ([`StandDownReason::LatestDrainUnrecorded`]).
 ///
 /// A node that produces a topic a `block` input in its own rank reads
-/// ([`NodeDecl::feeds_local_block_edge`]) can have a fire held by that edge's
+/// ([`NodeDecl::held_by`]) can have a fire held by that edge's
 /// pre-fire check after its drain popped, with no record. The first step that
 /// would owe it a fire it did not record, on either drain, stands the owing
 /// rule down by name ([`StandDownReason::LatestBlockHeld`]); until then both
@@ -3730,7 +3749,7 @@ fn verify_latest(
         let pop_owes_fire = popped > 0
             && node.throttle_ns.is_none()
             && drain == LatestDrain::Unified
-            && !node.feeds_local_block_edge
+            && !node.held_by.can_hold()
             && !at_stop;
         // A node the pass never ran can be one stopped before the anchor,
         // which owes no fire for a pop.
@@ -3765,7 +3784,7 @@ fn verify_latest(
             unrecorded_noted = true;
         }
         if drain == LatestDrain::Unified
-            && node.feeds_local_block_edge
+            && node.held_by.can_hold()
             && popped > 0
             && recorded.count == 0
             && node.throttle_ns.is_none()
@@ -3814,7 +3833,7 @@ fn verify_latest(
                         named: named.count(),
                     },
                     depth,
-                    node.feeds_local_block_edge,
+                    node.held_by.can_hold(),
                 ) {
                     LatestUnreadVerdict::Explained => {}
                     // The rule judged the step on the allowance: a judged
@@ -4229,7 +4248,7 @@ impl LatestUnread {
     /// the node at this step; `writers` holds `TriggerDecl::DataLatest`'s
     /// cap and the writers the read log names, and `depth` is
     /// `TriggerDecl::DataLatest`'s; `block_held` is
-    /// [`NodeDecl::feeds_local_block_edge`].
+    /// [`BlockHeldBy::can_hold`] of [`NodeDecl::held_by`].
     ///
     /// A count is checked against the reads first. Past them it needs the
     /// writer count: with no cap the frames in delivery have no bound, and the
@@ -4669,7 +4688,7 @@ mod tests {
             // mean what they always meant.
             has_non_trigger_inputs: false,
             trigger_input_capacities: BTreeMap::new(),
-            feeds_local_block_edge: false,
+            held_by: BlockHeldBy::NONE,
         }
     }
 
@@ -8494,7 +8513,7 @@ mod tests {
     /// its own rank reads.
     fn block_producing_latest_node(drain: LatestDrain) -> Vec<NodeDecl> {
         let mut nodes = latest_node_on(drain, Some(1));
-        nodes[0].feeds_local_block_edge = true;
+        nodes[0].held_by = BlockHeldBy::IN_RANK;
         nodes
     }
 
@@ -8844,7 +8863,7 @@ mod tests {
         );
 
         let mut block_producing = deep.clone();
-        block_producing[0].feeds_local_block_edge = true;
+        block_producing[0].held_by = BlockHeldBy::IN_RANK;
         let held = verify_unrestored(&block_producing, &past_one_queue, &[], BELIEVED);
         assert!(held.is_clean(), "{:?}", held.findings);
         assert_eq!(
@@ -12426,7 +12445,7 @@ mod tests {
                 trigger_inputs: inputs(&["cam", "lidar"]),
             },
             throttle_ns: None,
-            feeds_local_block_edge: false,
+            held_by: BlockHeldBy::NONE,
             has_non_trigger_inputs: true,
             trigger_input_capacities: [("cam".to_string(), DEPTH)].into_iter().collect(),
         };

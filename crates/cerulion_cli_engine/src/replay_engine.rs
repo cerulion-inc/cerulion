@@ -12973,7 +12973,7 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
 }
 
 /// The rank's nodes whose fire a `block` input in the same rank can hold, for
-/// [`replay_rederive::NodeDecl::feeds_local_block_edge`].
+/// [`replay_rederive::NodeDecl::held_by`].
 ///
 /// The rank's runtime builds a `GraphTopology` from the same subgraph and node
 /// infos, and installs a block pre-fire check on every in-graph producer of a
@@ -14976,7 +14976,11 @@ fn prepare_pass_verification(
                 node_id: id.clone(),
                 trigger,
                 throttle_ns: info.throttle_ms().map(|ms| ms.saturating_mul(1_000_000)),
-                feeds_local_block_edge: block_producers.contains(id.as_str()),
+                held_by: if block_producers.contains(id.as_str()) {
+                    replay_rederive::BlockHeldBy::IN_RANK
+                } else {
+                    replay_rederive::BlockHeldBy::NONE
+                },
                 has_non_trigger_inputs: node_has_non_trigger_inputs(info, wired),
                 trigger_input_capacities: trigger_input_capacities(
                     info,
@@ -21043,7 +21047,7 @@ impl InjectionWindow {
 mod node_trigger_decl_tests {
     use super::{
         node_trigger_decl,
-        replay_rederive::{LatestDrain, TriggerDecl},
+        replay_rederive::{BlockHeldBy, LatestDrain, TriggerDecl},
     };
     use cerulion_core::graph::config::InputDef;
     use cerulion_core::graph::node::{BackpressurePolicy, InputMeta, MacroPolicy, NodeInfo};
@@ -21293,7 +21297,7 @@ mod node_trigger_decl_tests {
             node_id: "sink".to_string(),
             trigger,
             throttle_ns: None,
-            feeds_local_block_edge: false,
+            held_by: BlockHeldBy::NONE,
             has_non_trigger_inputs: false,
             trigger_input_capacities: Default::default(),
         };
@@ -21445,7 +21449,7 @@ mod node_trigger_decl_tests {
                 EVERY_EDGE,
             ),
             throttle_ns: None,
-            feeds_local_block_edge: false,
+            held_by: BlockHeldBy::NONE,
             has_non_trigger_inputs: false,
             trigger_input_capacities: Default::default(),
         };
@@ -39325,7 +39329,7 @@ mod trailing_refill_tests {
                 trigger_inputs: vec!["inp".to_string()],
             },
             throttle_ns: throttled.then_some(1_000_000),
-            feeds_local_block_edge: false,
+            held_by: replay_rederive::BlockHeldBy::NONE,
             has_non_trigger_inputs: false,
             trigger_input_capacities: BTreeMap::new(),
         }
