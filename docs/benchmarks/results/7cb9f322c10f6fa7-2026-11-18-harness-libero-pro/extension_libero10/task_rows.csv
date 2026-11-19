@@ -1,0 +1,21 @@
+model,task_row,start_states,solved_with,clean_with,false_claim_with,solved_without,clean_without,false_claim_without
+Gemini 3.8 Flash,libero_10 task 1,40,39,38,1,21,18,5
+Gemini 3.8 Flash,libero_10 task 2,40,19,16,16,15,9,4
+Gemini 3.8 Flash,libero_10 task 3,39,1,1,4,0,0,15
+Gemini 3.8 Flash,libero_10 task 4,40,39,39,1,0,0,9
+Gemini 3.8 Flash,libero_10 task 6,40,32,32,8,0,0,8
+Gemini 3.8 Flash,libero_10 task 7,40,34,33,6,4,4,1
+Gemini 3.8 Flash,libero_10 task 8,40,10,8,21,0,0,8
+Gemini 3.8 Flash,libero_10 task 9,39,1,0,2,0,0,5
+Gemini 3.8 Flash,libero_10 task 0,38,36,36,2,8,5,2
+Gemini 3.8 Flash,libero_10 task 5,39,38,38,1,2,2,5
+GPT-6 Astra,libero_10 task 1,40,34,34,6,38,31,0
+GPT-6 Astra,libero_10 task 2,40,28,22,0,30,23,0
+GPT-6 Astra,libero_10 task 3,39,15,8,10,9,2,6
+GPT-6 Astra,libero_10 task 4,40,39,39,1,0,0,30
+GPT-6 Astra,libero_10 task 6,40,36,36,4,0,0,33
+GPT-6 Astra,libero_10 task 7,40,27,27,13,38,31,2
+GPT-6 Astra,libero_10 task 8,40,36,35,2,23,19,6
+GPT-6 Astra,libero_10 task 9,39,0,0,0,4,0,0
+GPT-6 Astra,libero_10 task 0,38,27,26,10,31,16,7
+GPT-6 Astra,libero_10 task 5,39,1,1,37,0,0,34

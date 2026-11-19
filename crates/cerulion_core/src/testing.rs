@@ -1199,6 +1199,68 @@ pub fn trace_level_compiled_in() -> bool {
     tracing::Level::TRACE <= tracing::level_filters::STATIC_MAX_LEVEL
 }
 
+/// The environment variable cargo-nextest sets in every test process it
+/// spawns, naming how it runs tests.
+pub const NEXTEST_EXECUTION_MODE_ENV: &str = "NEXTEST_EXECUTION_MODE";
+
+/// The [`NEXTEST_EXECUTION_MODE_ENV`] value of a process that runs exactly one
+/// test.
+pub const NEXTEST_PROCESS_PER_TEST: &str = "process-per-test";
+
+/// What [`install_nextest_trace_sink`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraceSinkOutcome {
+    /// [`NEXTEST_EXECUTION_MODE_ENV`] is not [`NEXTEST_PROCESS_PER_TEST`], so
+    /// this process may run other tests, and nothing was installed.
+    SharedProcess,
+    /// A TRACE-level subscriber that writes to [`std::io::sink`] is now the
+    /// process-global default.
+    Installed,
+    /// The process already had a global subscriber (a `#[traced_test]`
+    /// capture, or an earlier call). It is kept unchanged.
+    AlreadySet,
+}
+
+/// Installs a process-global TRACE-level subscriber that writes every event
+/// to [`std::io::sink`], when cargo-nextest runs this test in a process of its
+/// own.
+///
+/// With a subscriber installed, every enabled `tracing` call site evaluates
+/// its field expressions and formats its event, so a field that panics, or
+/// indexes out of range, fails the test that reaches it. Under `cargo test`
+/// the first `#[traced_test]` in a binary installs such a subscriber for every
+/// later test in that process. nextest runs each test in its own process,
+/// where a test without `#[traced_test]` has no subscriber and its log fields
+/// are never evaluated. A shared fixture calls this to put the subscriber
+/// back.
+///
+/// Nothing is installed in any other process: there, tests can share the
+/// process, and a global subscriber set by one test makes a later
+/// `#[traced_test]` panic when it sets its own. A process the test spawns
+/// inherits [`NEXTEST_EXECUTION_MODE_ENV`], so a child that runs several tests
+/// in one process removes it first. An existing global subscriber is never
+/// replaced, so a `#[traced_test]` test that calls a fixture calling this
+/// keeps its capture.
+///
+/// The subscriber allocates and formats on every event, so allocation-counting
+/// and wall-clock timing binaries do not call it.
+pub fn install_nextest_trace_sink() -> TraceSinkOutcome {
+    if std::env::var_os(NEXTEST_EXECUTION_MODE_ENV).as_deref()
+        != Some(std::ffi::OsStr::new(NEXTEST_PROCESS_PER_TEST))
+    {
+        return TraceSinkOutcome::SharedProcess;
+    }
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(std::io::sink)
+        .finish();
+    match tracing::subscriber::set_global_default(subscriber) {
+        Ok(()) => TraceSinkOutcome::Installed,
+        Err(_already_set) => TraceSinkOutcome::AlreadySet,
+    }
+}
+
 /// How many DEBUG-level lines a test may demand: `n` where `debug!` is
 /// compiled in, `0` where it is not.
 ///
@@ -2298,5 +2360,238 @@ mod robust_ratio_tests {
             }
             Ok(())
         });
+    }
+
+    /// [`install_nextest_trace_sink`], each arm in a fresh child process of this
+    /// test binary. The subscriber it installs is process-global, so an arm run
+    /// in the parent's process would leak into every later test there, and a
+    /// fresh process is the only way to start from "no subscriber" under either
+    /// runner.
+    mod nextest_trace_sink {
+        use super::super::{
+            install_nextest_trace_sink, trace_level_compiled_in, TraceSinkOutcome,
+            NEXTEST_EXECUTION_MODE_ENV, NEXTEST_PROCESS_PER_TEST,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        /// Set by [`run_child`]: an arm run without it (`--ignored`, or nextest
+        /// `--run-ignored`) returns at once instead of judging an environment
+        /// it was not given.
+        const CHILD_ENV: &str = "CERULION_TRACE_SINK_CHILD";
+
+        /// The line a child arm prints as its last act, so the parent can
+        /// tell an arm that ran to the end from one that returned early.
+        const CHILD_DONE: &str = "trace sink child arm done";
+
+        /// How long a child arm may take before the parent kills it.
+        const CHILD_DEADLINE: Duration = Duration::from_secs(60);
+
+        /// `true` when this arm was launched by [`run_child`].
+        fn launched_by_parent() -> bool {
+            std::env::var_os(CHILD_ENV).is_some()
+        }
+
+        /// A TRACE subscriber that writes nowhere, for the arms that set one
+        /// themselves.
+        fn sink_subscriber() -> impl tracing::Subscriber + Send + Sync {
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish()
+        }
+
+        /// How many times a [`Probe`] field was formatted in this process.
+        static FORMATTED: AtomicUsize = AtomicUsize::new(0);
+
+        /// A log field that counts its own formatting.
+        struct Probe;
+
+        impl std::fmt::Display for Probe {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                FORMATTED.fetch_add(1, Ordering::SeqCst);
+                f.write_str("probe")
+            }
+        }
+
+        fn formatted() -> usize {
+            FORMATTED.load(Ordering::SeqCst)
+        }
+
+        /// Runs the `#[ignore]`d child arm `name` alone in a fresh process of
+        /// this test binary, with [`NEXTEST_EXECUTION_MODE_ENV`] set to `mode`,
+        /// or removed for `None`, and returns what the child printed.
+        fn run_child(name: &str, mode: Option<&str>) -> String {
+            let module = module_path!()
+                .strip_prefix("cerulion_core::")
+                .expect("a crate-rooted module path");
+            let test = format!("{module}::{name}");
+            let exe = std::env::current_exe().expect("the running test binary");
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args([
+                "--exact",
+                &test,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+            match mode {
+                Some(mode) => cmd.env(NEXTEST_EXECUTION_MODE_ENV, mode),
+                None => cmd.env_remove(NEXTEST_EXECUTION_MODE_ENV),
+            };
+            let mut child = cmd
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn the child arm `{test}`: {e}"));
+            // Both pipes drain on their own threads while this one polls, so
+            // a child that prints more than a pipe holds cannot stall.
+            fn drain<R: std::io::Read + Send + 'static>(
+                pipe: Option<R>,
+            ) -> std::thread::JoinHandle<String> {
+                std::thread::spawn(move || {
+                    let mut text = String::new();
+                    if let Some(mut pipe) = pipe {
+                        let _ = pipe.read_to_string(&mut text);
+                    }
+                    text
+                })
+            }
+            let stdout = drain(child.stdout.take());
+            let stderr = drain(child.stderr.take());
+            let started = Instant::now();
+            let status = loop {
+                if let Some(status) = child.try_wait().expect("poll the child arm") {
+                    break status;
+                }
+                if started.elapsed() > CHILD_DEADLINE {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "child arm `{test}` ran past {CHILD_DEADLINE:?}:\n{}\n{}",
+                        stdout.join().unwrap_or_default(),
+                        stderr.join().unwrap_or_default()
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = stdout.join().expect("the stdout drain");
+            let stderr = stderr.join().expect("the stderr drain");
+            assert!(
+                status.success(),
+                "child arm `{test}` failed ({status}):\n{stdout}\n{stderr}"
+            );
+            // libtest exits 0 when `--exact` matches no test, and an arm that
+            // returned early also passes, so neither a zero exit nor the
+            // pass count alone proves the arm ran to its end.
+            assert!(
+                stdout.contains("test result: ok. 1 passed"),
+                "child arm `{test}` did not run exactly one test:\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains(CHILD_DONE),
+                "child arm `{test}` did not reach its end:\n{stdout}\n{stderr}"
+            );
+            format!("{stdout}{stderr}")
+        }
+
+        /// Twice, in two fresh processes: the outcome depends on the
+        /// environment only, never on the run.
+        #[test]
+        fn one_test_per_process_installs_the_sink_and_formats_every_enabled_event() {
+            for _ in 0..2 {
+                let printed = run_child(
+                    "child_installs_the_sink_and_formats",
+                    Some(NEXTEST_PROCESS_PER_TEST),
+                );
+                // The sink formats every event and writes none of them out.
+                assert!(
+                    !printed.contains("trace sink probe"),
+                    "the sink wrote an event to the child's output:\n{printed}"
+                );
+            }
+        }
+
+        /// Unset (libtest), and set to a mode that is not one test per
+        /// process.
+        #[test]
+        fn a_process_that_may_run_other_tests_gets_nothing() {
+            run_child("child_installs_nothing_in_a_shared_process", None);
+            run_child(
+                "child_installs_nothing_in_a_shared_process",
+                Some("process-per-binary"),
+            );
+        }
+
+        #[test]
+        fn an_existing_traced_test_capture_is_kept() {
+            run_child(
+                "child_keeps_the_traced_test_capture",
+                Some(NEXTEST_PROCESS_PER_TEST),
+            );
+        }
+
+        #[test]
+        #[ignore = "self-re-exec child of one_test_per_process_installs_the_sink_and_formats_every_enabled_event"]
+        fn child_installs_the_sink_and_formats() {
+            if !launched_by_parent() {
+                return;
+            }
+            assert_eq!(install_nextest_trace_sink(), TraceSinkOutcome::Installed);
+
+            tracing::info!(probe = %Probe, "trace sink probe at info");
+            assert_eq!(formatted(), 1, "the sink did not format an INFO field");
+
+            // TRACE is compiled out of a release build, so the field is
+            // formatted exactly when the level exists.
+            tracing::trace!(probe = %Probe, "trace sink probe at trace");
+            let after_trace = 1 + usize::from(trace_level_compiled_in());
+            assert_eq!(
+                formatted(),
+                after_trace,
+                "the sink did not format a TRACE field"
+            );
+
+            // A second fixture in the same test keeps the first subscriber.
+            assert_eq!(install_nextest_trace_sink(), TraceSinkOutcome::AlreadySet);
+            tracing::info!(probe = %Probe, "trace sink probe after a second install");
+            assert_eq!(formatted(), after_trace + 1);
+            println!("{CHILD_DONE}");
+        }
+
+        #[test]
+        #[ignore = "self-re-exec child of a_process_that_may_run_other_tests_gets_nothing"]
+        fn child_installs_nothing_in_a_shared_process() {
+            if !launched_by_parent() {
+                return;
+            }
+            assert_eq!(
+                install_nextest_trace_sink(),
+                TraceSinkOutcome::SharedProcess
+            );
+            tracing::info!(probe = %Probe, "trace sink probe with no subscriber");
+            assert_eq!(formatted(), 0, "a field was formatted with no subscriber");
+            // Nothing global was set, so a later `#[traced_test]` in this
+            // process can still set its own subscriber.
+            assert!(tracing::subscriber::set_global_default(sink_subscriber()).is_ok());
+            println!("{CHILD_DONE}");
+        }
+
+        #[test]
+        #[ignore = "self-re-exec child of an_existing_traced_test_capture_is_kept"]
+        #[tracing_test::traced_test]
+        fn child_keeps_the_traced_test_capture() {
+            if !launched_by_parent() {
+                return;
+            }
+            assert_eq!(install_nextest_trace_sink(), TraceSinkOutcome::AlreadySet);
+            tracing::info!(probe = %Probe, "trace sink probe beside a capture");
+            assert!(
+                logs_contain("trace sink probe beside a capture"),
+                "the capture lost an event after the sink was asked to install"
+            );
+            println!("{CHILD_DONE}");
+        }
     }
 }
