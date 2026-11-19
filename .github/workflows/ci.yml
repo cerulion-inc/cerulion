@@ -2931,7 +2931,8 @@ jobs:
       # doc-pin: cerulion_core::cerulion_core reads docs
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
-      # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks
+      # NOT gated on the selection, deliberately (only a leg selector splits
+      # shard 2 into its own step). `cerulion_core`'s whole-tree walks
       # (`serial_discipline_test` among them) read every `.rs` file in the source
       # tree, and `tools/ci/observation_edges.tsv` records the package
       # as observing `all`, so it rides every selection that names a package; only
@@ -3020,19 +3021,25 @@ jobs:
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
-        # On shard 2 the `#[cerulion_node]` diagnostics suite (`node_macro_ui`)
-        # rides the same nextest invocation (`--with`), so its trybuild test
-        # runs beside the core tests and builds in the same cargo invocation.
-        # The script reads the selection for each package on its own and
-        # prints a `selection:` line for each one it leaves out.
+        # Shard 2 runs the step below instead.
+        if: matrix.shard != 2
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
-        run: |
-          case "${{ matrix.shard }}" in
-            2) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with node_macro_ui ;;
-            *) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 ;;
-          esac
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
+      - name: cerulion_core tests and the diagnostics suite (shard ${{ matrix.shard }} of 4, nextest)
+        # The same shard step, with the `#[cerulion_node]` diagnostics suite
+        # (`node_macro_ui`) in the same nextest invocation (`--with`): its
+        # trybuild test runs beside the core tests and builds in the same cargo
+        # invocation. The script reads the selection for each package on its
+        # own and prints a `selection:` line for each one it leaves out. A leg
+        # selector of its own, so the coverage walk sees which leg credits the
+        # suite.
+        if: matrix.shard == 2
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+          CI_TEST_SHARD_EXTRA: --timings
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with node_macro_ui
 
       # The modified raw node fixture once more, built ALONE, the way a user's node
       # builds: `-p` with no sibling package resolves the node's dependency tree
@@ -3224,8 +3231,9 @@ jobs:
       # (The tail is now the `node_macro_ui` package, whose tests ride this
       # shard's core nextest invocation (`--with node_macro_ui`): its
       # compile-pass programs build as binaries of that package, so trybuild
-      # checks the compile-fail set alone, in one dependency pass, and an
-      # override in `.config/nextest.toml` starts that test first. The emptied
+      # checks the compile-fail set alone, in one dependency pass, and
+      # `.config/nextest.toml` starts that test right after the timing tests
+      # that claim every slot. The emptied
       # core binary stays PINNED, which keeps every other file on its shard; see
       # `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. The suite does
       # NOT get its own job: a new job is not in branch protection's required
@@ -4223,7 +4231,7 @@ jobs:
         if: matrix.shard == 0
         run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli --test credit_death_e2e_test c7_
 
-      # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
+      # NOT gated on the selection: see the twin step in `test-linux`. `cerulion_core`
       # observes the whole tree, so the shard runner does the intersection.
       # The waiver gate asks OTHER test binaries what libtest will do with the
       # arms it declares waived. A shard builds only its own files, so on the
@@ -4304,16 +4312,19 @@ jobs:
           echo "built $total waived test binaries for the gate"
 
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
-        # Shard 2 runs the `#[cerulion_node]` diagnostics suite in the same
-        # nextest invocation, as in `test-linux`.
+        if: matrix.shard != 2
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
-        run: |
-          case "${{ matrix.shard }}" in
-            2) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 --with node_macro_ui ;;
-            *) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 ;;
-          esac
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
+      - name: cerulion_core tests and the diagnostics suite (shard ${{ matrix.shard }} of 3, nextest)
+        # Shard 2's shard step, with the `#[cerulion_node]` diagnostics suite in
+        # the same nextest invocation, as in `test-linux`.
+        if: matrix.shard == 2
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+          CI_TEST_SHARD_EXTRA: --timings
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 --with node_macro_ui
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).

@@ -521,14 +521,20 @@ policy below names their namespaces, which the default does not. Each sharded jo
 `ci_test_coverage_test.rs`.
 
 `--with <package>` adds another package's integration tests to the same nextest
-invocation: `-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. On shard 2
-of both lanes the step passes `--with node_macro_ui`, so the `#[cerulion_node]`
+invocation: `-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. Shard 2
+of both lanes runs its shard in a step of its own (`if: matrix.shard == 2`, so the coverage
+walk sees the leg) that passes `--with node_macro_ui`, so the `#[cerulion_node]`
 diagnostics suite builds in the shard's cargo invocation and its trybuild test runs beside
-the core tests; an override in `.config/nextest.toml` gives that test a priority of 100,
-which starts it first (at the default priority it sorts after every `cerulion_core`
-binary and would start last). Cargo applies `--lib` and each `--test` to every package one
-command selects, so the script refuses an extra package that holds a unit test or a
-doctest under `src/`, or a `tests/*.rs` named like one of `cerulion_core`'s; the suite's
+the core tests. nextest starts tests by priority, then in binary order, and its queue does
+not start a test past the one at its head, where a test that claims every slot waits for
+every running test to end; so `.config/nextest.toml` gives the timing tests that claim
+every slot priority 100 and the trybuild test 99 (at the default priority it sorts after
+every `cerulion_core` binary and would start last). On the other shards the timing tests
+then run first, each alone, which costs no slot they would not have waited for anyway.
+Cargo applies `--lib` and each `--test` to every package one command selects, so the
+script refuses `--with` on shard 0, which carries `--lib`, and an extra package that holds
+a test attribute, a doctest source or a test target outside `tests/*.rs` (see `check_extra`
+in the script), or a `tests/*.rs` named like one of `cerulion_core`'s; the suite's
 compile-pass programs are binaries of that package, which cargo builds for an integration
 test even when targets are named. Its dev-dependencies ask for `test-helpers` on
 `cerulion_core` and `native_ros2_messages`, which `cerulion_core`'s own test build already

@@ -55,7 +55,7 @@ members = [
     "crates/test_fixtures/test_node_stable_abi_cross_compiler",
     "crates/test_fixtures/test_node_macro_cdylib",
     # The #[cerulion_node] diagnostics suite: trybuild compile-fail cases and
-    # the compile-pass programs as examples.
+    # the compile-pass programs as binaries.
     "crates/test_fixtures/node_macro_ui",
     "crates/test_fixtures/test_node_failing_cdylib",
     # Returns one chosen NodeError arm (env-selected) from init, a chosen
