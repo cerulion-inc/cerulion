@@ -391,6 +391,76 @@ jobs:
             echo "pkgs=$pkgs"
           } >> "$GITHUB_OUTPUT"
 
+  # THE PER-BINARY TEST ROUTER, IN SHADOW MODE. It computes which test binaries
+  # a change can affect (`tools/scripts/ci_test_router.py`: the rules and their
+  # hand-written table live there), prints the answer and uploads it as a JSON
+  # artifact. NOTHING READS IT: no job needs this one, no step is gated on it,
+  # and it is not a required context, so it changes what no job runs on any
+  # event. Run by hand on the artifact and the run's job logs,
+  # `tools/scripts/ci_router_escapes.py` scores it against the verdicts of the
+  # same run, which still runs every test it runs today.
+  #
+  # The base is the one the `changes` job resolves on a pull request (the
+  # merge commit's first parent when `base.sha` is its ancestor, else
+  # `base.sha`), and `merge_group.base_sha` in the merge queue, so a queue
+  # entry is scored on everything the queue run built on top of main.
+  router-shadow:
+    name: Test router (shadow)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: ${{ !cancelled() && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
+    steps:
+      # `fetch-depth: 0` because the router diffs against the base and reads
+      # files at both commits.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      # `cargo` is preinstalled on `ubuntu-latest`; the router runs
+      # `cargo metadata --no-deps`, which resolves nothing off the network.
+      # The live check pins shapes the real tree keeps (the vizd binary is
+      # reached through `viz_client.rs`, the empty change selects nothing, a
+      # head other than the checkout is refused); it runs here so that a
+      # change to the tree reds this unrequired job and never `Lint`.
+      - name: Check the router over this checkout
+        run: python3 -B tools/scripts/ci_test_router.py --live-check
+
+      # Computed even when the live check failed, so a red check still leaves
+      # the run's selection to score: a run with no artifact is a hole in the
+      # shadow data.
+      - name: Compute the shadow selection
+        if: ${{ !cancelled() }}
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          QUEUE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            if PARENT=$(git rev-parse --verify -q HEAD^2 >/dev/null 2>&1 \
+                        && git rev-parse --verify HEAD^1) \
+               && git merge-base --is-ancestor "$PR_BASE_SHA" "$PARENT"; then
+              BASE="$PARENT"
+            else
+              BASE="$PR_BASE_SHA"
+            fi
+          else
+            BASE="$QUEUE_BASE_SHA"
+          fi
+          git rev-parse --verify -q "$BASE^{commit}" > /dev/null \
+            || { echo "router-shadow: base '$BASE' does not name a commit"; exit 1; }
+          echo "router-shadow: base=$BASE head=$(git rev-parse HEAD)"
+          python3 -B tools/scripts/ci_test_router.py --base "$BASE" --head HEAD \
+            --json "$RUNNER_TEMP/router-shadow.json"
+
+      - name: Upload the shadow selection
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: router-shadow-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/router-shadow.json
+          if-no-files-found: error
+          retention-days: 30
+
   deb-smoke:
     name: Debian and APT package smoke
     runs-on: ubuntu-22.04
@@ -1190,10 +1260,11 @@ jobs:
       - name: Changed-path classifier self-test
         run: ./tools/scripts/ci_changed_paths.sh --self-test
 
-      # The per-binary test router, and the scorer that judges its answer
-      # against a full run. Both tables are hand-built fixtures with every
-      # answer written out beside them; neither reads this checkout, so a
-      # change to the real tree cannot red this step.
+      # The per-binary router the `router-shadow` job runs, and the scorer that
+      # judges its answer against a full run. Both tables are hand-built
+      # fixtures with every answer written out beside them; neither reads this
+      # checkout, so a change to the real tree cannot red this step (the
+      # router's check over the real tree runs in `router-shadow`).
       - name: Test router self-test (shadow mode)
         run: python3 -B tools/scripts/ci_test_router.py --self-test
 
@@ -3416,6 +3487,7 @@ jobs:
       # doc-pin: cerulion_cli_engine::ci_test_coverage_test reads .github, tools
       # doc-pin: cerulion_cli_engine::dependency_door_test reads examples, tools
       # doc-pin: cerulion_cli_engine::library_print_ban_test reads examples
+      # doc-pin: cerulion_cli_engine::node_links_as_library_test reads tools
       # doc-pin: cerulion_cli_engine::ros_attach_test reads examples
       # doc-pin: cerulion_cli_engine::user_api_attach_dry_run_doc_test reads docs
       # doc-pin: cerulion_cli_engine::user_api_inspector_doc_test reads docs

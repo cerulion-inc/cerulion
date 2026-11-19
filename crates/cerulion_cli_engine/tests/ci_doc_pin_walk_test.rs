@@ -273,6 +273,13 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["examples"],
         &[],
     ),
+    // The build-once runner script, run to declare the fixture builds to it.
+    (
+        "cerulion_cli_engine",
+        "node_links_as_library_test",
+        &["tools"],
+        &[],
+    ),
     // The bridge node's sources, reached from the crate manifest directory.
     ("cerulion_cli_engine", "ros_attach_test", &["examples"], &[]),
     // The `ros2 attach` row, reached from the manifest directory.
@@ -1320,14 +1327,14 @@ fn path_dependency_dirs(dir: &Path) -> Vec<PathBuf> {
 ///
 /// Measured by running that command and counting `workspace_members`. It is the
 /// only reader that resolves a path dependency into a member, and it reported
-/// 88 where the root manifest's `members` array lists 87: the extra one is the
+/// 91 where the root manifest's `members` array lists 90: the extra one is the
 /// example node crate a viz library reaches through a path dev-dependency.
 ///
 /// The walk below follows those edges ITSELF rather than shelling out to cargo,
 /// and this number is what holds it to the same answer. A member cargo resolves
 /// and the walk does not reach leaves that crate's test sources unscanned and
 /// every pin they owe missing.
-const WORKSPACE_MEMBER_COUNT: usize = 89;
+const WORKSPACE_MEMBER_COUNT: usize = 91;
 
 /// Every workspace member directory: the root manifest's `members = [ ... ]`
 /// array with globs expanded, then closed over in-workspace path dependencies.
