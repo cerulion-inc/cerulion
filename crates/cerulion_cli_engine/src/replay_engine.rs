@@ -5633,6 +5633,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 stages_batch_frames,
                 identity: edge_identity,
                 kind_width,
+                trace_format: recorder.as_ref().map(|r| r.trace_format),
                 catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
@@ -10092,6 +10093,10 @@ struct PassInputs<'a> {
     /// because they answer different questions and disagree on exactly the bag
     /// that has no recorder attachment — see [`KindFieldWidth`].
     kind_width: KindFieldWidth,
+    /// The bag's stamped `trace_format`, `None` with no recorder attachment.
+    /// Named on the warnings a resumed pass's stand-downs print, since the
+    /// format decides whether the checkpoint can state a node's stop.
+    trace_format: Option<u32>,
     /// The armed capture plane the recording ran under, if any: the
     /// SAME onset `attach_replay_catchup_arm` hands this pass's scheduler, so
     /// the re-derivation verifier runs the one clamp the replay runs.
@@ -16966,16 +16971,22 @@ fn run_rank_pass(
                 }),
                 &rederive_stops,
             );
+            // The checkpoint step a resumed pass began from, named on the
+            // unfired-since-anchor warnings, which only a resumed pass raises.
+            let anchor_step = resume.map(|r| r.anchor.step);
             for sd in &report.stand_downs {
-                // Two arms here are `warn!`, so they survive the default
+                // Four arms here are `warn!`, so they survive the default
                 // filter an operator actually runs under. The corrupt-recording
                 // stand-down is not "we declined to judge" but "this bag cannot
-                // have been written by any recorder". The unfired-since-anchor
-                // one leaves a whole node's unread-frame rule unjudged with no
-                // change to the verdict or the exit code, and a node the
-                // scheduler never fired records the same resumed slice as a
-                // stopped one; it is raised at most once per node per pass, and
-                // only on a resumed pass, which has one rank. The generic loop
+                // have been written by any recorder". Each unfired-since-anchor
+                // one leaves a rule that owed a node a fire unjudged with no
+                // change to the exit code, and a node the scheduler never fired
+                // records the same resumed slice as a stopped one; each is
+                // raised at most once per node per pass, and only on a resumed
+                // pass, which has one rank. A `--report` needs `--verify`, and
+                // a fed `--verify` can refuse such a bag before its first step,
+                // so their text says the note lands where a `--verify` replay
+                // reaches the rule. The generic loop
                 // stays `debug!` because a healthy multi-rank replay
                 // legitimately declines several deciders per rank and a warn
                 // per decline is the flood class.
@@ -16989,15 +17000,47 @@ fn run_rank_pass(
                          (corrupt recording — re-record the bag; report-only, the verdict is \
                          unchanged. See `detail`)"
                     );
+                } else if sd.reason == replay_rederive::StandDownReason::FifoUnfiredSinceAnchor {
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        node_id = %sd.node_id,
+                        code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
+                        detail = %sd,
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its FIFO pop rule was not verified. The exit code is \
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
+                    );
                 } else if sd.reason == replay_rederive::StandDownReason::LatestUnfiredSinceAnchor {
                     tracing::warn!(
                         rank = plan.rank(),
                         node_id = %sd.node_id,
                         code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
                         detail = %sd,
-                        "replay: the resumed pass holds no fire and no body read of this \
-                         consume = latest node, so its unread-frame rule was not verified \
-                         (report-only, the verdict is unchanged. See `detail`)"
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its consume = latest fire rule was not verified. The exit \
+                         code is unchanged; where a --verify replay reaches this rule, its \
+                         --report carries a stand_down note (see `code` and `detail`)"
+                    );
+                } else if sd.reason == replay_rederive::StandDownReason::SyncUnfiredSinceAnchor {
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        node_id = %sd.node_id,
+                        code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
+                        detail = %sd,
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its Sync owed-fire rule was not verified. The exit code is \
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
                     );
                 } else {
                     tracing::debug!(

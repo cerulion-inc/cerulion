@@ -1,6 +1,8 @@
 # Mutation baseline for cerulion_cli_engine: the delivery flag token of
-# `cerulion ros2 run` and `ros2 launch`, and the decisions the recorder and a
-# resumed replay make about a node a checkpoint states as stopped.
+# `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
+# resumed replay make about a node a checkpoint states as stopped, and the
+# stand-downs a resumed replay applies to a node whose stop the recording
+# does not state.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -83,6 +85,37 @@
 #          (the unmutated baseline passed)
 # Result:  1 mutant: 1 caught (the body replaced with
 #          `Ok(Default::default())`).
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Third scope: the stand-downs a resumed replay applies to a node whose stop
+# the recording does not state.
+#
+# Scope: the pure decision functions on the lines the unstated-stop change
+# added or changed. In src/replay_rederive.rs: the predicate that a node
+# neither fired nor read in its body in the pass (`unfired_since_anchor`,
+# `OwedFire`, `node_ran_in_pass`), the three rules that stand down on it
+# (`verify_fifo`, `verify_latest`, `verify_sync`), the pass entry that hands it
+# to them (`verify`) and the text of a stand down (`StandDownReason`). Every
+# other line of the two files is outside the change's diff, or, in
+# src/replay_engine.rs, reads the bag or drives the scheduler, which the
+# mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re 'unfired_since_anchor|node_ran_in_pass|verify_fifo|verify_latest|verify_sync|\bverify\b|StandDownReason::|OwedFire::' \
+#            --cap-lints true --in-place --timeout 600 \
+#            -- --lib -- replay_engine:: replay_rederive::
+#          (in 4 shards; the unmutated baseline passed)
+# Result:  29 mutants: 28 caught, 1 unviable, 0 missed. The unviable one
+#          replaces `unfired_since_anchor` with `Default::default()`:
+#          `OwedFire` has no default.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
