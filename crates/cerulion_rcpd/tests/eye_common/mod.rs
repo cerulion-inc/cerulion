@@ -356,15 +356,27 @@ pub fn key_file(dir: &Path) -> PathBuf {
     path
 }
 
-/// Wait until `topic` has at least `n` subscribers, failing after 5 s. The
-/// eye subscribes to an ask or frame topic only once it exists.
+/// The budget [`wait_for_subscribers`] and the eye host test give the eye to
+/// open a topic, or to answer or drop an ask, before they fail. The eye's
+/// thread syncs each answer's receipt to disk before it publishes the answer,
+/// and a loaded machine can hold one synced write, or leave the eye's thread
+/// or the test's thread unscheduled, for seconds. Each wait returns once its
+/// state is reached, so a passing run never waits this out.
+pub const EYE_WAIT: Duration = Duration::from_secs(30);
+
+/// Wait until `topic` has at least `n` subscribers, failing after
+/// [`EYE_WAIT`]. The eye subscribes to an ask or frame topic only once it
+/// exists. The count is read once more after the deadline has passed, so a
+/// thread that was not scheduled until after it still sees a subscriber that
+/// arrived meanwhile.
 pub fn wait_for_subscribers(mgr: &cerulion_core::TransportManager, topic: &str, n: usize) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while mgr.topic_subscriber_count(topic) < n {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "{topic} has fewer than {n} subscribers"
-        );
+    let deadline = std::time::Instant::now() + EYE_WAIT;
+    loop {
+        let last = std::time::Instant::now() >= deadline;
+        if mgr.topic_subscriber_count(topic) >= n {
+            return;
+        }
+        assert!(!last, "{topic} has fewer than {n} subscribers");
         std::thread::sleep(Duration::from_millis(1));
     }
 }
