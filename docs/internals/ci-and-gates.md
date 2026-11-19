@@ -467,7 +467,8 @@ against the type it has to parse as by a unit test in
 `Lint`'s parts run: `cargo fmt --all --check` plus a workspace-root WALK (`lint-fmt`)
 that fmt-checks the workspaces outside the root (`examples/go2`, every `benches/*`, every
 `examples/*`, the fuzz workspace); `cargo clippy --workspace --all-targets -- -D warnings`
-(`lint-clippy`); and in `lint-gates`, the hot-path alloc lint and its self-test; the advisory issue bookkeeping self-test;
+(`lint-clippy`); and in `lint-gates`, the hot-path alloc lint and its self-test; the advisory
+issue and nightly full run bookkeeping self-tests;
 the agent-docs gate; the leak guard's self-test and generic-class tree scan; the three
 crates.io script self-tests (the index wait, the publish retry, and the post-publish
 archive reader `release.yml` runs after an upload); the nextest, actionlint and cargo-deny
@@ -485,19 +486,17 @@ EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_reques
 and no stub job standing in for a skipped required check.
 
 `lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
-`cli-e2e-latency`), which no pull request and no queued batch runs; a red `lint` saves their
-runner minutes, and none of the four reports a required context. It gates none of the four
-dependants that DO report one (`docs`, `netd-wan`, `crate-tests`, `viz-tests`): each carries
-the `!cancelled()` guard, which replaces the implicit `success()` over the whole `needs:` set;
-GitHub offers no per-dependency form, so all four run and report through a red `lint`, and the
-dependency buys the ordering alone. A skipped required context counts as satisfied, which is
-what the guard is there to stop. It does NOT gate the two that set the wall: `test-linux` and
-`test-macos`. Both list `changes` and nothing else in `needs:`, so both start after the
-classifier, which is a checkout and a path classification, about a minute, and no build. No
-REBUILD waits on it: each shard builds the `cerulion_core` test binaries it runs, so nothing
-in front of either job is a data dependency for compilation. A `lint` verdict was never one
-either, and while it gated them the wall was `lint` plus the longest test job instead of the
-longest test job.
+`cli-e2e-latency`), which no pull request and no queued batch runs: their `if:` carries no
+status function, so a red `lint` skips them and saves their runner minutes. `python-client`
+also lists it, but carries `!cancelled()` because it needs `changes`, so it runs through a red
+`lint` and the dependency only orders it; it reports no required context. No job that reports
+a required context waits for `lint`. `docs` and `netd-wan` list no `needs:` at all and start at once;
+`test-linux`, `test-macos`, `crate-tests` and `viz-tests` list `changes` and nothing else, so
+they start after the classifier, which is a checkout and a path classification, about a
+minute, and no build. No REBUILD waits on `lint`: each job builds what it runs, so nothing in
+front of any of them is a data dependency for compilation. A `lint` verdict was never one
+either, and while it gated a job that job started a whole `lint` run late. `Lint` is its own
+required context, so a red one still blocks the pull request.
 
 `test-linux` is 4-way SHARDED (`strategy.matrix.shard: [0,1,2,3]`) and `test-macos` is
 3-way (`[0,1,2]`); both `fail-fast: false`. The macOS count is set from per-step
@@ -526,14 +525,68 @@ shards (one per shard on Linux; a hand-balanced 3-way tilt on macOS), with the i
 packages kept together so that large tree compiles once. On macOS, shard 2 also carries the
 six viz steps (`cerulion_viz`, `go2_tf`, the serial `cerulion-vizd` suite and the three
 OpenH264 steps) beside the trybuild tail, which is why it takes the lightest package set;
-there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
-shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, for the same
-reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by
+there is NO macOS `viz-tests` leg. Every shard of both jobs has a cache key of its own: shard 0
+`cargo-<os>-<scope>-<lock hash>`, shard k above 0 `cargo-<os>-shard<k>-<scope>-<lock hash>`,
+starting from shard 0's archive until it has one. Shards above 0 save only when the cache save
+policy below names their namespaces, which the default does not. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
 Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
 what it built. There is no shared archive of test binaries and no job that builds one.
+
+`netd-owner-pair-transition-repeat` runs `cerulion_netd`'s owner pair serving transition
+test 20 times in a row on one runner, on every event but a merge-queue batch, with every
+step past the checkout gated on `cerulion_netd`'s selection; it reports no required context,
+and the `cerulion_netd` step of `test-linux` shard 3 is the one a merge waits for.
+
+### Build once per shard (`tools/scripts/ci_built_tests.py`)
+
+A `cargo test -p X` per package resolves features for X alone, so a leg that runs several
+packages that way rebuilds every crate they share (`cerulion_core` and the third-party tree
+under it, up to a dozen times per leg). The runner builds a group of packages in ONE cargo
+invocation and runs the prebuilt test binaries the way `cargo test` runs them.
+
+* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run` over the group's
+  packages, then `cargo test` over the same packages with the script as cargo's target
+  runner. That recording run compiles nothing; for each test binary it records the
+  environment and working directory cargo gives it, in cargo's run order. Cargo then runs
+  the group's doctests against the libraries the build compiled; rustdoc hands each doctest
+  it runs to the same runner, which runs any binary outside the target directory. They run
+  without a step's `-- --test-threads=1` or env. A package builds
+  when `CI_SELECTED_PACKAGES` names it, the same rule as a step's
+  `contains(fromJSON(...))` condition; a `+` package builds on every change, for a step with
+  no selection condition.
+* **Run.** A package step keeps its command and prefixes it:
+  `python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p X [--lib] [--bins]
+  [--test T] [--features F] [--no-fail-fast] [FILTER] [-- ARGS]` (`--locked` and `--package`
+  are accepted too); any other flag is refused.
+  The script runs the prebuilt binaries that command selects, each as one libtest process as
+  under cargo, with `FILTER ARGS` as their arguments, the recorded environment (on macOS a
+  system interpreter cannot see `DYLD_FALLBACK_LIBRARY_PATH`, so the script sets it as cargo
+  does), cargo's order and cargo's fail-fast rule. A serial package keeps
+  `-- --test-threads=1`, so its tests still run one at a time inside that one process, which
+  the tests that read process state rely on (a leaked global subscriber, a leftover-manager
+  check). Because the line still carries `cargo test -p X`, the coverage walk and
+  `serial_discipline_test` read it as before.
+* **Audit.** `audit` fails when a built binary had no whole run (one with no test name
+  filter and no libtest argument but `--test-threads=N`, `--nocapture`, `--show-output`,
+  `--include-ignored` or `--quiet`), unless `--not-run` names it; when `--not-run` names a
+  binary the leg does not build; when a leg that kept every package builds fewer than its
+  floor of test binaries; or when cargo compiled a unit or ran a build script outside a
+  declared build step. Every compiling step is wrapped in `ci_built_tests.py phase NAME --
+  CMD`, and an `invoked.timestamp` under `target/debug/.fingerprint` or `target/debug/build`
+  dates each compile and build-script run, so a package step that went back to plain
+  `cargo test -p` is a red audit. It prints the units each build step compiled and the
+  crates built more than once.
+* **Wiring.** `check-workflow FILE` refuses a job whose legs do not build exactly the
+  packages their steps run, a `+` anywhere but on a package whose step carries no selection
+  condition, a run whose features the build lacks, a run before the build, a job with no
+  unconditioned audit step after its last run, and a `cargo test`, `build`, `nextest` or
+  `check` command outside `run` or `phase`.
+* **Reclaim.** `reclaim` deletes the executables in `target/debug/deps` except the prebuilt
+  binaries a later step still runs, libraries (`.so`, `.so.N`, `.dylib`, `.dll`, `.rlib`, `.a`)
+  and cargo's `.rmeta` and `.d` files.
 
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
@@ -545,6 +598,13 @@ only there (`miri` is a blocking job; it has no `continue-on-error`). Also: `exa
 `demos-go2`, `netd-wan`, `docs`, `deps` (cargo-deny,
 blocking), and the release-mode latency jobs (push to main + `workflow_dispatch` only, never
 on PRs).
+
+The repeat legs run one test binary or module 20 times in a row on one runner, on every event
+but a merge-queue batch, so a change that makes that test fail now and then shows as a red even when a single
+run passes: `rcpd-eye-host-repeat` runs `cerulion_rcpd`'s `eye_host_test`, and `remoted-rcp-repeat`
+runs `cerulion_remoted`'s `rcp::tests::` module and fails a run that passed no test. Every step past
+the checkout is gated on the package's selection, and none reports a required context; the
+package's own step in its test job is the one a merge waits for.
 
 `examples` opens with a lockfile WALK: `cargo metadata --locked` over every tracked
 `Cargo.lock` outside the root (the benches, the examples, the Python wheel, the Android sample
@@ -593,6 +653,22 @@ entries of that namespace; the namespace token `msrv-1.95` is absent from the
 scratch on every run. It lists no `needs:`, so a pull request starts it beside `lint` rather
 than after it.
 
+`core-repeat` (`Repeat runs (cerulion_core, macOS)`) runs three `cerulion_core` test binaries,
+`gateway_egress_congestion_iox2_test`, `liveliness_sweep_iox2_test` and
+`free_run_ctor_iox2_test`, 20 times each on
+`macos-latest`, where thread scheduling varies most. Their tests wait on counters the product
+exposes, so a failed run here is a wait that still depends on how a loaded host schedules
+threads. Each run is the whole binary under `--test-threads=1`; it passes only when cargo exits
+0 AND libtest reports at least one passed test and none failed. Every run goes ahead whatever an
+earlier one did, and the step fails at the end on any failed run, with the count printed per
+binary. The job carries `if: ${{ !cancelled() && github.event_name != 'merge_group' &&
+github.event_name != 'pull_request' }}`: pushes to `main` and `workflow_dispatch` runs run it, pull
+requests and merge-queue batches do not, since it would hold one more macOS runner that a pull
+request's own macOS test shards wait for, and the coverage walk drops it from the PR-blocking
+view. It is not a required status context,
+so a red reports a flake and blocks no merge. Its cache is restore-only (the macOS test shards'
+archive).
+
 The `changes` job classifies a pull request's changed paths (rules and a
 `--self-test` table in `tools/scripts/ci_changed_paths.sh`, executed by `lint-gates`) into four
 outputs. `packaging` only ever makes a job RUN that would otherwise skip: a pull request
@@ -612,16 +688,28 @@ selects nothing, so the probe refuses it and fails the job;
 probe, its refusal and their order ahead of the diff in the script text.
 
 `code`, `docs` and `pkgs` are the test-impact selection, and they run in the other
-direction: they SKIP test steps. Four rules bound them.
+direction: they SKIP test steps. Five rules bound them.
 
-* PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` every package is
-  selected. The queue run is the last gate before `main` and the one place a miss has no
-  later catch.
+* PULL REQUESTS, AND HARNESS-ONLY MERGE GROUPS. On `push` and `workflow_dispatch` every
+  package is selected. A `merge_group` run diffs the group against the commit where it leaves
+  its target branch, so every group queued ahead of it that has not merged is in the diff,
+  and selects every package unless every changed path is under `harness/`. The queue run is
+  the last gate before `main` and the one place a miss has no later catch.
+* THE HARNESS TREE. A change whose every path is under `harness/` selects only the packages
+  whose doc-pin markers read `harness` (none today), on a pull request and on a merge group:
+  the folder is Python, shell and data that no Rust package builds. A `harness/` path beside
+  any other path selects every package. The folder's own checks are the `harness` job
+  ("Harness (Linux)"), which no classifier output reaches: no `needs:`, no job or step
+  condition, so it runs on every event. It shellchecks every tracked `harness/**/*.sh` and
+  runs every tracked `harness/**/test_*.py`, one module per file, fetching nothing. With no
+  tracked file under `harness/` it passes saying so; a tracked test file holding no test, and
+  a run that judged no script and no test, fail it.
 * ONE OFF SWITCH. The repository variable `CI_SELECTION` reaches the classifier through
   the workflow-level `env:` block; `off`, and any value the classifier does not know,
   selects every package. Nothing else may read it: a step is gated on the classifier's
   OUTPUT, never on the variable, and `ci_test_coverage_test` refuses any other shape.
-* STEPS, NEVER JOBS. Every job still runs and still reports its own required context. A
+* STEPS, NEVER A REQUIRED JOB. Every job that reports a required context still runs and
+  still reports it; `android-check`, which reports none, is the one job gated whole. A
   gated step carries the one condition the coverage walk credits,
   `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')`, and a companion step
   under the exact negation of that condition prints one line beginning `selection:`, so
@@ -640,13 +728,20 @@ direction: they SKIP test steps. Four rules bound them.
   selection itself and prints the `selection:` line when it skips.
 
 The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
-requests. It does NOT narrow the workspace build, it does not gate a job, it does not apply
-to any event but `pull_request`, and it never removes a required status context.
+requests and on harness-only merge groups. It does NOT narrow the workspace build, it gates
+one job whole and no other, `android-check`, which reports no required status context, it
+does not apply to `push` or `workflow_dispatch`, and it never removes a required status
+context.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
 `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` is the walk that holds it, counting only
-steps and jobs that can actually fail a pull request, and it drives
+steps and jobs that can actually fail a pull request. A step credits the packages a
+`cargo test` or `cargo nextest run` command names with `-p`, or the one `ci_test_shard.sh` takes;
+a command whose cargo flags (those before a bare `--`) carry `--doc` or `--no-run` credits none,
+because it runs none of the package's unit or integration tests. Each shell command of a line is
+read on its own, a `\` continuation joins the line it continues, and a step's `name:` never
+counts. `ci_doc_pin_walk_test` reads workflow lines through the same reader. The walk drives
 `tools/scripts/ci_test_shard.sh --check` to prove the shard partition is TOTAL and DISJOINT, so a
 broken split is a local red rather than a silent gap.
 
@@ -660,21 +755,75 @@ future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
 
+## Cargo timing reports and runner hardware
+
+Every `ci.yml` job that compiles with cargo commands written in the workflow passes
+`--timings` to each cargo build, check, clippy, doc and test command (the `cerulion_core`
+shards through `CI_TEST_SHARD_EXTRA`), prints the runner's architecture, CPU model, core
+count and memory right after checkout, and uploads one artifact per job and matrix leg named
+`cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7 days. It holds
+`runner.txt` (the hardware lines, present even when the path selection skipped every cargo
+step) and one `cargo-timing-<timestamp>-<hash>.html` report per cargo command, under the path
+of the target directory it came from (`target/cargo-timings/`,
+`examples/go2/target/cargo-timings/`). Download it from the run's summary page or with
+`gh run download <run id> --pattern 'cargo-timings-*'`. The collect and upload steps run
+under `always()`, so a red or timed-out job still uploads. The collect step moves the reports
+out of the job's target directories before any cache save and deletes one it cannot move; it
+fails the job only when it can neither move nor delete a report, or passes its 2 minute step
+timeout, and a failed job saves no cache, so no cache archive carries a report. Only the upload
+carries `continue-on-error: true` (with a 5 minute step timeout). Artifact names spell a shard
+leg as `shard-<n>`, for example `cargo-timings-test-linux-shard-0-attempt-1`.
+`ci_cache_policy_check.py` holds the steps in place (TIMINGS_REPORTS, below).
+`deb-smoke` and `stable-node-compiler-skew` build inside scripts and `fuzz` and `miri` through
+cargo plugins, so those four carry none of these steps, and a `cargo install` tool build
+writes no report.
+
 ## Scheduled workflows
 
-Five workflows run on a clock, and none of them reports a required status context.
-Three of the five run on nothing but the clock and a manual dispatch:
-`.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy MoveIt image
-and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC runs the
-dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC labels and
-closes `needs-info` items. The fourth, `.github/workflows/examples-replay.yml`, runs
+Seven workflows run on a clock, and none of them reports a required status context.
+Five of the seven run on nothing but the clock and a manual dispatch:
+`.github/workflows/nightly.yml` at 03:30 UTC runs the nightly full run (below),
+`.github/workflows/nightly-alarm.yml` every six hours at minute 47 checks that it
+still runs, `.github/workflows/moveit-hero.yml` at 03:43 UTC builds the ROS 2 Jazzy
+MoveIt image and runs the hero demo, `.github/workflows/advisories.yml` at 04:37 UTC
+runs the dependency advisory check, and `.github/workflows/stale.yml` at 07:17 UTC
+labels and closes `needs-info` items. The sixth, `.github/workflows/examples-replay.yml`, runs
 the replay-tolerance demo at 07:30 UTC and ALSO on a push to `main` and on a pull
 request, both path-filtered to `examples/perception/**` and its own file, so for that
 one the clock is the second trigger rather than the only one: it is what notices a
 change outside the filter breaking the demo. Every minute is off the hour, where
-GitHub queues the world's hourly crons at once. The fifth,
+GitHub queues the world's hourly crons at once. The seventh,
 `.github/workflows/android-e2e.yml`, runs at 06:13 UTC and also on
 Android-affecting pushes and pull requests.
+
+`nightly.yml` dispatches `ci.yml` and `rmw-distros.yml` on `main` with the job's own token,
+so every job a push runs also runs once a day, and so does every distro lane, which a push
+outside `rmw-distros.yml`'s paths never starts. The clock is not in `ci.yml` itself because a
+workflow that reports a required context may trigger only on a pull request, a merge-queue
+batch, a push or a dispatch (`ci_test_coverage_test`). `tools/scripts/nightly_full_run.sh run`
+takes each run's id from the dispatch's answer, or, when the answer carries none, finds the one
+new dispatch run whose actor or triggering actor is the token's bot account; a dispatch that
+errors is sent again only when four reads of the listing show no new run. It waits for both
+runs, reading each attempt by its number so that a rerun someone else starts never stands in for
+it, reruns the failed jobs (as the attempt after the newest, which it then waits on) of a red run once (a failed step skips every later step of its
+job, and the rerun shows whether the failure repeats), and records the result on ONE issue
+labelled `bug`, found by the exact title `Nightly full run of main failed or did not run`. A
+red run, or one not finished after 330 minutes, opens that issue or comments on it, naming the
+failed jobs of each attempt; every run green on its first attempt comments on an open one and
+closes it. A job that passed only on the rerun is reported as failed on the first attempt, and
+no rerun is requested past the deadline. The script exits 0 once the result is recorded, red
+or green, or every run passed with no issue open to close, so a successful run of
+`nightly.yml` means a result was reached.
+
+`nightly-alarm.yml` runs `nightly_full_run.sh alarm` every six hours. It writes to the same
+issue when `nightly.yml` is not active, or when no run of it is in progress and none reached a
+result on `main` in the last 26 hours (counted from the workflow's creation until one has),
+naming the newest run when it did not succeed; it writes at most once a day. It lives in a
+file of its own, with a concurrency group of its own, so that a disabled or broken
+`nightly.yml` does not take the alarm with it and a queued alarm never replaces a queued
+nightly. Two open issues carrying the title hold both modes at exit 2 until one is closed. The
+script's oracle is `tools/scripts/test_nightly_full_run.sh`, cases over a `gh` shim with answer
+files per call, run as a step of `lint-gates`.
 
 `advisories.yml` runs `cargo deny --format json --config tools/release/deny.toml
 check advisories` and nothing else. Licences, bans and sources are decided by
@@ -745,6 +894,58 @@ actionlint, the cache save policy checker and the script self-test; the first ru
 the clock is on `main`. GitHub also disables scheduled workflows on a repository
 after 60 days with no commit.
 
+## The queue run watchdog
+
+`.github/workflows/queue-watchdog.yml` runs on every merge-queue batch, beside the `ci.yml` run
+of the same queue commit, and cancels that run at its first failed required job, or once the
+batch has left the queue without merging. A failed required context fails the batch by itself,
+so the rest of the run changes no verdict; what it holds is its runner minutes and its
+concurrency group, which `ci.yml` keys on the queue branch, and a pull request queued again on
+the same `main` gets the same branch, so its new run waits in that group until the failed one
+ends. `tools/scripts/ci_queue_watchdog.sh` finds the run as the one `ci.yml` run with event
+`merge_group` and the batch's head commit, then once a minute reads its jobs and cancels it
+when a job named in `tools/ci/required_contexts.txt` ends `failure`, `timed_out` or
+`cancelled`. Once no job is left running it reads the run as well, and stops when the run has
+completed: one jobs read a minute while jobs run, from the job token's hourly budget that every
+job of the repository shares. A failed job that is not required, and a skipped required one,
+cancel nothing; the three Leak guard contexts are reported by `leak-guard.yml`, so their
+failures cancel nothing through the jobs read; such a failure takes the batch out of the queue,
+and the dead batch check below cancels the run two polls later. The cost is that a failed batch
+shows only the failures that ended before the cancel: a pull request run, which the watchdog
+never touches, shows them all.
+
+GitHub does not cancel a merge-queue run when its batch leaves the queue: a pull request
+removed or queued again, or a failure ahead of it, invalidates the batch, and its run fails
+nothing and holds its runners to its end, while the live batches wait for those runners. So
+each poll that reads again also reads the merge queue of the base branch
+(`github.event.merge_group.base_ref`), every page of `repository.mergeQueue(branch:).entries`
+over GraphQL: the batch is live while its commit is the `headCommit` of an entry. When it is no
+entry's head commit, `compare/<base>...<commit>` says whether it merged (`identical` or
+`behind`: the queue is not read again) or is dead (`ahead` or `diverged`). Dead on two polls in
+a row cancels the run with the same cancel and refusal handling as a failed job. One dead poll
+alone cancels nothing, because the queue pages and the compare are separate reads that a batch
+moving or merging can fall between. A read that fails three times, or an answer missing a field
+the decision reads, decides nothing for that poll and starts the count again, so failed reads
+never add up to a cancel. An answer refusing the job token (`Resource not accessible`, or a
+GraphQL error of type `FORBIDDEN` or `INSUFFICIENT_SCOPES`) is not retried: the watchdog says
+so once and stops reading the queue for that run, cancelling nothing for it, while a failed
+required job still cancels. The first read that finds the commit in the queue says so once, so
+a batch's log shows whether the job token may read the queue. The workflow grants
+`contents: read` for the queue read and the compare; no GitHub page names the permission the
+job token needs for `repository.mergeQueue`, and a refusal turns only the dead batch check off.
+The queue reads come out of the job token's hourly GraphQL budget, per repository like its REST
+one; until the batch merges or a read is refused a poll reads one page per 100 entries, and the
+compare (REST) runs only while the commit is no entry's head commit.
+
+It lives in a file of its own because no `ci.yml` job takes `actions: write` except to prune
+its cache (`ci_cache_policy_check.py` R4), and cancelling needs it; a job inside `ci.yml` would
+also sit in the run it cancels. It reports no required context, so a watchdog that cannot find
+the run, cannot read it or has its cancel refused exits nonzero, cancels nothing, and leaves
+the batch to finish as it would have; a cancel refused because the run completed first exits 0.
+Its permissions are `contents: read` (granted for the merge queue and the compare) and
+`actions: write` (the jobs and the cancel). Its oracle,
+`tools/scripts/test_ci_queue_watchdog.sh`, runs as a step of `lint-gates`.
+
 ## The cache save policy (`CACHE_SAVE_*` in `ci.yml`)
 
 The Actions cache store has a 10 GB free allowance; storage above it is billed, and while the
@@ -763,7 +964,8 @@ The policy is two workflow-level `env` values, each defaulting from a repository
 * `CACHE_SAVE_NAMESPACES` (`${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}`): the
   space-separated namespace tokens that may save, or `all`. A token is the key text between
   `cargo-` and the scope segment, with any `${{ steps.*.outputs.* }}` segment removed: `macOS`,
-  `Linux`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  `Linux` (shard 0 of each test job), `macOS-shard1`, `macOS-shard2` and `Linux-shard1` to
+  `Linux-shard3` (the other shards, which the default does not name), `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
   `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lockhash>`, whose
   header hash is a cache generation rather than part of the namespace. The default is the
   expression's literal, so a repository with no variable saves the measured frontier and a
@@ -817,7 +1019,8 @@ Python and Android lockfiles describe other workspaces and do not change that tr
 `android-check`, the example jobs and `python-client` keep their wider hashes. A save happens only on a key miss, whose
 run restored the previous generation through `restore-keys`, and cargo writes the units whose
 hash changed next to the old ones without deleting those. So in `test-linux` and `test-macos`
-shard 0 runs `tools/scripts/ci_cache_trim_target.sh` twice around its build: `age` right after
+each shard whose namespace may save runs `tools/scripts/ci_cache_trim_target.sh` twice around
+its build: `age` right after
 the restore sets the access time of every restored `.fingerprint` file to 2000-01-01, and `trim`
 before the prune deletes from every profile directory under `target/` (the scaffold target dirs
 under `target/tmp/` included) each `deps/`, `build/`, `examples/` and `.fingerprint/` entry whose
@@ -825,17 +1028,18 @@ unit hash no cargo command in the job read, plus `incremental/`. Cargo reads the
 every unit in a build graph, fresh or not, so a unit the job used stays. The trim deletes nothing
 when a read leaves an aged access time unchanged, when `target/debug` holds no unit read during
 the run, or (per profile) when no `deps/` entry carries a live unit hash, and it prints the
-target size before and after. It runs on `main` only, under the save's namespace gate. Shard 0's
-archive then holds only the units its own cargo commands read, so a unit that only shards 1 to 3
-or a fall-through job (`lint-clippy`, `docs`, `netd-wan`) builds is compiled by that run every time.
+target size before and after. It runs on `main` only, under the save's namespace gate. Each
+shard's archive then holds only the units its own cargo commands read, so a unit that only a
+fall-through job (`lint-clippy`, `docs`, `netd-wan`) builds is compiled by that job every time, and so
+is a unit only shards 1 to 3 build while the policy does not name their namespaces.
 
 `lint-clippy`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
 shards' `cargo-Linux-` key, so whichever finished first saved it: on 2026-09-28 the entry under
 the shards' key was a 0.63 GB archive saved by one of the smaller jobs, not the shards' 3.18 GB
 one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-`,
 `cargo-Linux-netd-wan-`). Under the default all three are restore-only and fall through their
-`restore-keys` to `cargo-Linux-main-`, the shards' archive;
-`test-linux` shard 0 restores and saves its own key; the shards 1 to 3 restore it.
+`restore-keys` to `cargo-Linux-main-`, shard 0's archive; every `test-linux` shard restores its
+own key and saves it when the policy names its namespace.
 
 Two exemptions, both narrow. The TOOL caches carry no lockfile generation for the prune to
 work from, so they carry no namespace gate and no prune step, only the cache-hit test and the
@@ -869,8 +1073,17 @@ prune, under the prune's own condition (R9); nothing shadows the policy in a job
 `env` (R10); a prune whose keep key carries no `-main-`/`-pr-` scope segment -- one the scope rule
 cannot narrow, so it clears the whole namespace -- lives only in a job whose `if:` can never be
 true on a pull request, either a `github.event_name != 'pull_request'` conjunct or an allowlist of
-events naming none (R11); a key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
-the
+events naming none (R11); a lockfile-keyed save in a job whose matrix declares `shard` (as a
+key or in an `include` entry) runs on shard 0 alone or carries the shard in its key in one of
+two forms, `${{ matrix.shard }}` or nothing on shard 0 and `-shard<k>` on shard k, so shards
+never race for one archive; any other key expression naming `matrix.shard` is refused (R12); a
+key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
+a job that passes `--timings` in a step carries `Collect the cargo timing reports` under
+`if: always()` with no `continue-on-error`, running the one script the checker holds, directly
+followed by `Upload the cargo timing reports` under `if: always()` with `continue-on-error: true`,
+both after its last `--timings` step and before its save, the collect list naming every target
+directory its cache steps archive, and a job with neither the flag nor the steps carries neither;
+no job- or workflow-level `env` passes the flag (TIMINGS_REPORTS); the
 combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and a job whose
 steps the reader cannot enumerate -- a reusable-workflow call, or one carrying no `steps:` -- is
 refused rather than passed in silence. The `Lint` step "Cache save policy" runs the prune
@@ -884,17 +1097,20 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` (or, as the `Lint` aggregator does, `always()`) whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. Every job a required job needs, transitively, is held to the same rules; the `Lint` aggregator's check is run over every result its parts can carry; and a job-level `always()` sits only on a job that checks out nothing, runs no cargo and carries `timeout-minutes` of at most 5. The required names are read from `tools/ci/required_contexts.txt` | no |
-| `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches` or `examples`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` (or, as the `Lint` aggregator does, `always()`) whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. Every job a required job needs, transitively, is held to the same rules; the `Lint` aggregator's check is run over every result its parts can carry; and a job-level `always()` sits only on a job that checks out nothing, runs no cargo and carries `timeout-minutes` of at most 5. The required names are read from `tools/ci/required_contexts.txt`. The classifier itself, run on hand-written rows per path and per event, answers the harness rule: a harness-only change selects no package on a pull request and on a merge group, and a harness path beside any other selects every package; the `harness` job carries no `needs:`, no job or step condition and no matrix | no |
+| `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches`, `examples` or `harness`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |
 | `tools/scripts/check_hot_path_allocs.sh --self-test` | the annotation grammar and scope rules | n/a |
 | `tools/scripts/ci_cache_trim_target.sh --self-test` | a synthetic target with a read and an unread generation: the unread units' artifacts, build dirs and fingerprints go, the read ones and unhashed files stay, an unread scaffold target and scratch files under `tmp/` go; nothing is deleted when nothing was read, when `age` never ran, or when no `deps/` entry carries a live hash; fails when the filesystem does not update access times | n/a |
 | `tools/scripts/check_pr_title.sh --self-test` | the title/branch oracle table | n/a |
 | `tools/scripts/check_agents_md.sh` | context-file budgets, shims, banned tokens | n/a |
+| `tools/scripts/ci_built_tests.py --self-test` | the build-once runner: the selection rule against the classifier's list (a longer name never matches a shorter one), the `cargo test` command line it accepts and the ones it refuses, which prebuilt binaries a selection runs and in what order, the environment replay (a cargo `[env]` key without `force` yields to the step's own value), the macOS library path in cargo's order, the attribution of compiled units to declared build steps, the wiring check over a hand-written job and nine broken ones, and the modes end to end over a fake cargo: the recording runs no test and a doctest that reaches the runner runs (and fails the build when it fails), a run gets cargo's env and working directory, fail-fast, a missing feature refused, the reclaim keep set (shared libraries kept whatever their mode), a selection naming no package auditing clean, comma feature lists compared as sets, and the audit's refusals (an unrun binary, a binary run only under a filter or `--ignored`, a floor, an unknown `--not-run`, a unit compiled after every step, a floor that is no number) | n/a |
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
+| `tools/scripts/test_nightly_full_run.sh` | the oracle table for `tools/scripts/nightly_full_run.sh`: every issue write of both modes (none, open, comment, comment and close) with its exact text; the run id taken from the dispatch's answer, and found by listing when the answer has none, late, by either actor field, and never a person's dispatch; a dispatch that errors after starting a run is not sent again, one that starts nothing is, and three that start nothing are refused; attempt 1 read by number when someone reran the run by hand, and the nightly's own rerun read at the attempt it started after a rerun by hand; a rerun's attempt answering 404 until it exists; a rerun that reads `completed` on the old attempt for a moment, a refused rerun, a rerun unfinished at the 330-minute deadline and none requested past it; a neutral job and a jobs page cut at 100; the alarm's findings, its silence while a nightly is in progress or in the workflow's first 26 hours, and its once-a-day limit; every refusal; and the same fixtures giving the same calls and text twice. The run ends on a case-count floor | n/a |
+| `tools/scripts/test_ci_queue_watchdog.sh` | the oracle table for `tools/scripts/ci_queue_watchdog.sh`: a failed, timed-out or cancelled required job cancels the run once under its rendered matrix name, read through the committed required list too; a failed job that is not required and a skipped required job cancel nothing; the first of two failed required jobs is the one named; the run itself is read only once no job is left running, and the watch ends when it has completed, with jobs or without any, and keeps going while jobs are still to be listed; the run is found by its commit, after a listing that holds only a run of another commit, and two runs or none are refused; a jobs read, a run read and a run listing each failing three times; a cancel retried, refused while the run runs, and refused because it had completed; a jobs page cut at 100; every argument and environment refusal, a missing `jq` and a base ref naming no branch among them, before any call; the exact waits between reads; the same answers giving the same calls twice. The batch liveness read, over a stubbed merge queue and compare: a live queue entry keeps the watch to the run's end and is never compared; dead on one poll then live cancels nothing; dead on two polls in a row (`ahead`, then `diverged`) cancels once, naming the commit, and a cancel refused because the run completed exits 0; off the queue once and then `behind` main, and `identical` with main on the first poll, never cancel and stop the queue reads; dead, live, dead cancels nothing; a queue read failing on every poll (a timeout), a failed read between two dead polls, a compare failing on every poll, a queue answer missing its entry list, an entry's head commit field or oid, its page flag or its next cursor, an oid that is not a string, a queue or compare body that is not JSON, and an unknown compare status each cancel nothing; a queue read or compare refused to the job token (`Resource not accessible`, a `FORBIDDEN` or an `INSUFFICIENT_SCOPES` error body) is read once, said, and turns only the dead check off, a failed required job still cancelling after either, while a rate-limit error body is retried; the first live read said once; the entry found on the second page through the first page's cursor, and a commit on no page read as dead; pages that never end read ten deep; the base branch read off the event for both the queue and the compare; the exact calls of each, the query's fields, and the same dead answers giving the same calls and output twice. The run ends on a case-count floor | n/a |
 | `tools/scripts/test_android_e2e_probe_verdict.sh` | the oracle table for `tools/scripts/android_e2e_probe_verdict.sh`, the verdict the Android emulator e2e applies to each run of the direct data demand probe: a passing report and every failing rule for each of the four expectations (`paired`, `open`, `schema-mismatch`, where every frame on the wire must die on the schema, and `connect`, the open rules over a link the app dialed), the `dialer=` field (missing or not `probe` or `app` is refused; `connect` needs `dialer=app`, every other expectation `dialer=probe`), every rule that holds for all four (every counted ack from the app's robot identity and none named without an ack, no ack from a peer the probe did not name because its peer set was full or the name too long, no more acks than demand passes, no more frames delivered or dropped on the schema than crossed the wire, no wire-header refusal, no decode, re-injection or LAN-posture drop), a report line that is absent, repeated, missing a field, carrying a field twice or a non-number or an `ack_peers=` that is not a list of robot names, `wire_frames=` never read as `frames=`, the three usage refusals (an unknown expectation, a missing argument, an app identity that is not a robot name), and the same report giving the same bytes twice. The run ends on a case-count floor | n/a |
 | `tools/scripts/test_android_release_docs.py` | the Android app copy step in `docs/android.md` against the root `Cargo.toml`: the app runtime example plus the root table's `iceoryx2*` entries parse as one `[patch.crates-io]` table, the same entries pasted under a second header do not parse, the root table holds entries beyond the `iceoryx2*` family (`re_grpc_server`), the family `cerulion workspace create` writes is the root table's family, and the step text says entries under the existing header and not a complete block; and the `CHANGELOG.md` entry for the empty trust-store MAC key, which appears once and names no key length | n/a |
 | `tools/scripts/test_package_android_java.py` | the oracle table for `tools/scripts/package_android_java.py`, which builds the `cerulion-android-java-<version>.tar.gz` release asset in the `android-java` job of `release-artifacts.yml`: the asset from this checkout carries exactly `CerulionRuntime.java` and the crate's `LICENSE` under its versioned directory, byte for byte; over a hand-written crate, the member order, owner, mode and time, the `sha256sum` line, a gzip header with no time and no name, and two runs byte-identical after the source times change; a prerelease identifier with a hyphen accepted; refusals for a version that is not `X.Y.Z` or `X.Y.Z-<pre>`, a crate with no `java/` tree, a tree with no `.java` file, a missing `LICENSE`, a `java/` directory or `LICENSE` that is a symbolic link, a symbolic link or a special file in the tree and missing arguments, each writing nothing | n/a |
@@ -924,6 +1140,6 @@ package at run time (`dlopen`). The closure sees none of those.
 
 The doc-pin walk covers one of those classes: every test binary that opens the
 shared documentation and tool trees (`docs`, `tools`, `.github`, `benches`,
-`examples`) or a root markdown file is pinned, both ways, against the markers in
+`examples`, `harness`) or a root markdown file is pinned, both ways, against the markers in
 `ci.yml`. Cross-crate source literals and dlopen fixtures are an open class. They
 have to be pinned before any CI test step is gated on the selection.

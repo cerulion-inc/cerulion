@@ -4595,7 +4595,8 @@ mod tests {
                 vec!["original", "first", "second"]
             );
             let source = std::fs::read_to_string(node.join("src/lib.rs")).unwrap();
-            let fixture = include_str!("../../test_fixtures/test_node_raw_ffi_template_cdylib/tests/fixtures/modified_raw.rs");
+            let fixture =
+                include_str!("../../test_fixtures/test_node_modified_raw_cdylib/src/lib.rs");
             let block = |text: &str| {
                 text.split_once("// CERULION:INFO_START")
                     .unwrap()

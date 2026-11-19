@@ -1108,7 +1108,12 @@ const WRITER_PUBLIC_SURFACE: &[(&str, &str)] = &[
     ("write_attachment", "Guarded"),
     ("write_schema_catalog", "Guarded"),
     ("finalize", "Guarded"),
-    // --- Cannot reach the sink (4) ------------------------------------------
+    // --- Cannot reach the sink (5) ------------------------------------------
+    (
+        "abandon",
+        "sets one flag and drops the writer, so nothing is appended or written; \
+         a poisoned writer is abandoned the same way",
+    ),
     (
         "discard_pending_chunk",
         "clears pending state only — never appends, never writes; ChunkScope's \

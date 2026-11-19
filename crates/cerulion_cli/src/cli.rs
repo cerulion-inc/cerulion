@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Clap CLI definitions.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use cerulion_cli_engine::graph_cmd::PeerLossPolicy as EnginePeerLossPolicy;
@@ -676,7 +677,9 @@ impl Commands {
                 | GraphAction::Plan { .. }
                 | GraphAction::Partition { .. }
                 | GraphAction::Pause { .. }
-                | GraphAction::Resume { .. } => OneShot,
+                | GraphAction::Resume { .. }
+                | GraphAction::Live { .. }
+                | GraphAction::Fires { .. } => OneShot,
             },
             // `node run` is a runtime loop; every other node verb runs-and-exits.
             Commands::Node { action } => match action {
@@ -881,7 +884,7 @@ pub enum Ros2Action {
             allow_hyphen_values = true,
             value_name = "ARGS"
         )]
-        args: Vec<String>,
+        args: Vec<OsString>,
     },
     /// Launch a ROS 2 launch file on Cerulion transport. Arguments go to
     /// `ros2 launch` verbatim, except a leading `--adopt-take`, refused here for
@@ -915,7 +918,7 @@ pub enum Ros2Action {
             allow_hyphen_values = true,
             value_name = "ARGS"
         )]
-        args: Vec<String>,
+        args: Vec<OsString>,
     },
     /// Migrate a colcon workspace's C++ publish sites to the loaned-message API.
     ///
@@ -1302,8 +1305,8 @@ pub enum NodeAction {
         /// Hard opt-out from the live-loop monitor-wait park, on every target;
         /// no environment variable can re-enable it. Without this flag the park
         /// is on by default everywhere.
-        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
-        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// AMD MWAITX, Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost; elsewhere it is a bounded
         /// park that never busy-spins. This flag restores the blocking wait on
@@ -1441,8 +1444,8 @@ pub enum GraphAction {
         /// Hard opt-out from the live-loop monitor-wait park, on every target;
         /// no environment variable can re-enable it. Without this flag, on the
         /// live (real or external) clock the park is on by default everywhere.
-        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
-        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// AMD MWAITX, Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost; elsewhere it is a bounded
         /// park that never busy-spins. This flag restores the blocking wait on
@@ -1811,6 +1814,70 @@ pub enum GraphAction {
         /// The run to resume: a run id (`0x` and 32 hex digits) or a graph name
         /// that matches exactly one live run
         run_id: String,
+    },
+    /// Show what a remote robot is running: each run's nodes, their triggers
+    /// and topics, and the run's endpoints.
+    ///
+    /// Asks each robot's runs query once. A node row reads `<id>  <type>
+    /// <trigger>  → <output topics>`; an endpoint row names the topics the code
+    /// around an embedded graph publishes and subscribes. The last line of a
+    /// run says whether it serves fire telemetry, which `graph fires` reads.
+    /// Without `--connect`, the question goes through this machine's
+    /// `cerulion-netd`; with it, through a session of this command's own that
+    /// reaches only the locators given.
+    Live {
+        /// Zenoh locator of a robot's gateway to ask directly (repeatable),
+        /// for example `tcp/127.0.0.1:7683`. No discovery runs beside it.
+        #[arg(long, value_name = "LOCATOR")]
+        connect: Vec<String>,
+        /// The robot to ask, by its network name. Without it, every robot that
+        /// announces itself answers.
+        #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
+        /// Print one JSON object per line: one per run (ids, names, topics
+        /// and numbers), and one per robot that gave no readable run.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show each node fire of a remote run as it happens.
+    ///
+    /// Reads the run's nodes from one runs query, then asks the run for its
+    /// fires every 250 ms. Each row is one node tick: how long ago it started,
+    /// the node, what triggered it, how long it ran, and which output topics it
+    /// wrote. No message content is read. The robot records fires only while a
+    /// desk asks and stops 5 s after the last ask. The reading ends with the
+    /// number of fires read and the number the robot lost before this desk
+    /// read them. Without `--follow` or `--for`, it reads for 5 s. Without
+    /// `--connect`, it reads through this machine's `cerulion-netd`, which
+    /// needs protocol 12 or newer; with it, through a session of this
+    /// command's own that reaches only the locators given.
+    Fires {
+        /// Zenoh locator of a robot's gateway to ask directly (repeatable),
+        /// for example `tcp/127.0.0.1:7683`. No discovery runs beside it.
+        #[arg(long, value_name = "LOCATOR")]
+        connect: Vec<String>,
+        /// The robot to ask, by its network name. Without it, every robot that
+        /// announces itself is asked for its runs.
+        #[arg(long, value_name = "NAME", add = ArgValueCandidates::new(completion::robot_names))]
+        robot: Option<String>,
+        /// The run to read: its run id or its graph name. Without it, the one
+        /// run that serves fire telemetry. Only a run id chooses while a robot
+        /// asked may host a run its answer does not name.
+        #[arg(long, value_name = "RUN")]
+        run: Option<String>,
+        /// Read until Ctrl+C.
+        #[arg(long, conflicts_with = "for_secs")]
+        follow: bool,
+        /// Read for SECS seconds. The last ask is made when they end, and full
+        /// pages are read on for up to 3 s more, so the totals cover at least
+        /// the whole window. A robot that is not answering when they end gets
+        /// up to 3 s more to answer.
+        #[arg(long = "for", value_name = "SECS", value_parser = clap::value_parser!(u64).range(1..))]
+        for_secs: Option<u64>,
+        /// Print one JSON object per fire (ids, names, topics and numbers),
+        /// then one summary object.
+        #[arg(long)]
+        json: bool,
     },
     /// HIDDEN: run ONE worker process of a multi-process deployment.
     ///
@@ -2366,6 +2433,148 @@ mod graph_pause_dispatch_tests {
     fn graph_pause_and_resume_are_one_shot_verbs() {
         for verb in ["pause", "resume"] {
             let cli = Cli::try_parse_from(["cerulion", "graph", verb, "x"]).expect("parse");
+            assert_eq!(
+                cli.command.log_verb_class(),
+                VerbLogClass::OneShot,
+                "{verb}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod graph_live_dispatch_tests {
+    use super::*;
+
+    /// `graph live` takes repeatable locators, a robot and `--json`, all optional.
+    #[test]
+    fn graph_live_parses_its_flags() {
+        let cli = Cli::try_parse_from([
+            "cerulion",
+            "graph",
+            "live",
+            "--connect",
+            "tcp/127.0.0.1:17683",
+            "--connect",
+            "tcp/192.0.2.10:7683",
+            "--robot",
+            "temi",
+            "--json",
+        ])
+        .expect("all `graph live` flags must parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Live {
+                        connect,
+                        robot,
+                        json,
+                    },
+            } => {
+                assert_eq!(connect, ["tcp/127.0.0.1:17683", "tcp/192.0.2.10:7683"]);
+                assert_eq!(robot.as_deref(), Some("temi"));
+                assert!(json);
+            }
+            _ => panic!("expected Graph::Live"),
+        }
+        let cli = Cli::try_parse_from(["cerulion", "graph", "live"]).expect("bare parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Live {
+                        connect,
+                        robot,
+                        json,
+                    },
+            } => assert!(connect.is_empty() && robot.is_none() && !json),
+            _ => panic!("expected Graph::Live"),
+        }
+    }
+
+    /// `graph fires` takes `--run`, and either `--follow` or `--for SECS`.
+    #[test]
+    fn graph_fires_parses_its_flags() {
+        let cli = Cli::try_parse_from([
+            "cerulion",
+            "graph",
+            "fires",
+            "--connect",
+            "tcp/127.0.0.1:17683",
+            "--robot",
+            "temi",
+            "--run",
+            "0x5d1c",
+            "--for",
+            "3",
+            "--json",
+        ])
+        .expect("all `graph fires` flags must parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Fires {
+                        connect,
+                        robot,
+                        run,
+                        follow,
+                        for_secs,
+                        json,
+                    },
+            } => {
+                assert_eq!(connect, ["tcp/127.0.0.1:17683"]);
+                assert_eq!(robot.as_deref(), Some("temi"));
+                assert_eq!(run.as_deref(), Some("0x5d1c"));
+                assert!(!follow);
+                assert_eq!(for_secs, Some(3));
+                assert!(json);
+            }
+            _ => panic!("expected Graph::Fires"),
+        }
+        let cli = Cli::try_parse_from(["cerulion", "graph", "fires", "--follow"]).expect("parse");
+        match cli.command {
+            Commands::Graph {
+                action:
+                    GraphAction::Fires {
+                        follow, for_secs, ..
+                    },
+            } => assert!(follow && for_secs.is_none()),
+            _ => panic!("expected Graph::Fires"),
+        }
+    }
+
+    /// `--follow` with `--for`, a zero or negative window and a word are usage
+    /// errors before anything runs.
+    #[test]
+    fn graph_fires_refuses_contradictory_or_empty_windows() {
+        for (args, kind) in [
+            (
+                &["--follow", "--for", "3"][..],
+                clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (&["--for", "0"][..], clap::error::ErrorKind::ValueValidation),
+            (
+                &["--for", "-1"][..],
+                clap::error::ErrorKind::UnknownArgument,
+            ),
+            (
+                &["--for", "soon"][..],
+                clap::error::ErrorKind::ValueValidation,
+            ),
+        ] {
+            let mut argv = vec!["cerulion", "graph", "fires"];
+            argv.extend_from_slice(args);
+            let err = Cli::try_parse_from(&argv)
+                .err()
+                .unwrap_or_else(|| panic!("{args:?} must be a parse error"));
+            assert_eq!(err.kind(), kind, "{args:?}");
+        }
+    }
+
+    /// Both print their answer and exit or stream rows: quiet by default.
+    #[test]
+    fn graph_live_and_fires_are_one_shot_verbs() {
+        for verb in ["live", "fires"] {
+            let cli = Cli::try_parse_from(["cerulion", "graph", verb]).expect("parse");
             assert_eq!(
                 cli.command.log_verb_class(),
                 VerbLogClass::OneShot,
@@ -5073,7 +5282,11 @@ mod ros2_run_dispatch_tests {
     /// This pins the clap FALLBACK path only — the primary dispatch is
     /// `main`'s raw-argv intercept, which never parses at all (that is what
     /// makes a LEADING hyphenated token forwardable; the e2e pins it).
-    fn parse_ros2(argv: &[&str]) -> (bool, Vec<String>) {
+    fn parse_ros2(argv: &[&str]) -> (bool, Vec<OsString>) {
+        parse_ros2_os(&argv.iter().map(OsString::from).collect::<Vec<_>>())
+    }
+
+    fn parse_ros2_os(argv: &[OsString]) -> (bool, Vec<OsString>) {
         let cli = Cli::try_parse_from(argv).expect("argv must parse");
         match cli.command {
             Commands::Ros2 {
@@ -5143,6 +5356,31 @@ mod ros2_run_dispatch_tests {
             "--show-args",
         ]);
         assert_eq!(args, ["demo.launch.py", "--show-args"]);
+    }
+
+    /// The clap path (a global `-v` after `ros2` skips `main`'s raw-argv
+    /// intercept) forwards an argument that is not valid UTF-8 with its bytes
+    /// as given, as the intercept does.
+    #[cfg(unix)]
+    #[test]
+    fn ros2_run_collects_an_argument_that_is_not_utf8_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = std::ffi::OsStr::from_bytes(b"caf\xE9.yaml");
+        let argv: Vec<OsString> = ["cerulion", "ros2", "-v", "run", "pkg", "exe"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([raw.to_os_string()])
+            .collect();
+        let (is_launch, args) = parse_ros2_os(&argv);
+        assert!(!is_launch);
+        assert_eq!(
+            args,
+            [
+                OsString::from("pkg"),
+                OsString::from("exe"),
+                raw.to_os_string()
+            ]
+        );
     }
 
     /// Bare `cerulion ros2` requires a subcommand (clap's exit-2 usage error

@@ -6,6 +6,7 @@ mod completion;
 mod families;
 mod install_marker;
 mod network_switch;
+mod not_utf8_args;
 mod telemetry;
 mod telemetry_events;
 // Pins for the shell-facing WIRING (which arg carries
@@ -26,6 +27,7 @@ mod cfg_symmetry_tests;
 #[cfg(test)]
 mod clean_diagnostic_tests;
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,8 +41,8 @@ use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
-    account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, partition_emit, ros_cmd, schema_cmd,
-    topic_cmd, viz_client, workspace,
+    account_cmd, connect_cmd, graph_cmd, graph_live, login_cmd, node_cmd, partition_emit, ros_cmd,
+    schema_cmd, topic_cmd, viz_client, workspace,
 };
 use cli::{
     AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
@@ -109,23 +111,31 @@ fn main() -> ExitCode {
         return code;
     }
 
-    let matches = families::cli_command().get_matches();
+    let matches = match families::cli_command().try_get_matches() {
+        Ok(matches) => matches,
+        Err(e) => return exit_on_parse_error(e),
+    };
     // The internal workers `cerulion-netd` starts on a robot (first-serve
-    // registration, the revocation sync): dispatched before telemetry,
-    // logging and the login gate, so they never start a browser login, record
-    // no event, and their JSON stdout carries nothing else. The engine
-    // requires an existing login.
+    // registration, the revocation sync): dispatched before telemetry and the
+    // login gate, so they never start a browser login, record no event, and
+    // their JSON stdout carries nothing else. The engine requires an existing
+    // login. The revocation sync logs to stderr, which netd passes through, at
+    // its verb class's default level and in colour only on a terminal;
+    // first-serve registration's stderr is netd's error text and carries only
+    // its error.
     #[cfg(unix)]
     if matches!(
         matches.subcommand_name(),
         Some("bootstrap-robot" | "robot-sync-epoch")
     ) {
-        let worker = match Cli::from_arg_matches(&matches)
-            .unwrap_or_else(|e| e.exit())
-            .command
-        {
+        let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+        let quiet_default = cli.command.log_verb_class().is_quiet_default();
+        let worker = match cli.command {
             Commands::BootstrapRobot { state_root } => bootstrap_robot(&state_root),
-            Commands::RobotSyncEpoch { state_root } => robot_sync_epoch(&state_root),
+            Commands::RobotSyncEpoch { state_root } => {
+                cerulion_core::init_worker_logging(cli.verbose, quiet_default);
+                robot_sync_epoch(&state_root)
+            }
             _ => unreachable!("the subcommand name selected an internal worker"),
         };
         return match worker {
@@ -986,6 +996,25 @@ fn connect_exit_code(command: Commands) -> ExitCode {
     }
 }
 
+/// A clap parse error (a usage error, or `--help` / `--version` output),
+/// printed and exited as clap does it, except a usage error that refused an
+/// argument that is not valid UTF-8 (in a text field, in the place of a verb
+/// or a flag name, past the last argument a verb takes, or as a value given to
+/// a flag that takes none): clap's text for that names no position, so the
+/// refusal prints in its place, with clap's usage-error code, 2.
+/// [`not_utf8_args::refusal_for_parse_error`] decides, and while another
+/// argument holds a typed U+FFFD it replaces only the text-field error.
+fn exit_on_parse_error(e: clap::Error) -> ExitCode {
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    match not_utf8_args::refusal_for_parse_error(&e, &args) {
+        Some(refusal) => {
+            eprint!("{refusal}");
+            ExitCode::from(2)
+        }
+        None => e.exit(),
+    }
+}
+
 /// The raw-argv half of the `cerulion ros2` pass-through: recognize
 /// `cerulion [-v|--verbose]... ros2 run|launch [anything...]` and dispatch it
 /// WITHOUT clap, so every forwarded token — hyphenated or not — reaches the
@@ -996,17 +1025,18 @@ fn connect_exit_code(command: Commands) -> ExitCode {
 /// `tracing`); a runtime verb, so the `info` default applies.
 #[cfg(unix)]
 fn ros2_passthrough_intercept() -> Option<ExitCode> {
-    let argv: Vec<String> = std::env::args().collect();
+    // `args_os`: a forwarded argument keeps its bytes, UTF-8 or not.
+    let argv: Vec<OsString> = std::env::args_os().collect();
     let mut i = 1;
     let mut verbose = false;
     while i < argv.len() && (argv[i] == "-v" || argv[i] == "--verbose") {
         verbose = true;
         i += 1;
     }
-    if argv.get(i).map(String::as_str) != Some("ros2") {
+    if argv.get(i).is_none_or(|a| a != "ros2") {
         return None;
     }
-    let verb = match argv.get(i + 1).map(String::as_str) {
+    let verb = match argv.get(i + 1).and_then(|a| a.to_str()) {
         Some("run") => cerulion_cli_engine::ros2_cmd::Ros2NativeVerb::Run,
         Some("launch") => cerulion_cli_engine::ros2_cmd::Ros2NativeVerb::Launch,
         _ => return None,
@@ -1028,7 +1058,7 @@ fn ros2_passthrough_intercept() -> Option<ExitCode> {
 #[cfg(unix)]
 fn ros2_exit_code(
     verb: cerulion_cli_engine::ros2_cmd::Ros2NativeVerb,
-    args: Vec<String>,
+    args: Vec<OsString>,
 ) -> ExitCode {
     use cerulion_cli_engine::ros2_cmd;
     // ONE engine call: the ordering (refuse BEFORE staging) is the engine's
@@ -1063,7 +1093,7 @@ fn ros2_exit_code(
 #[cfg(not(unix))]
 fn ros2_exit_code(
     _verb: cerulion_cli_engine::ros2_cmd::Ros2NativeVerb,
-    _args: Vec<String>,
+    _args: Vec<OsString>,
 ) -> ExitCode {
     eprintln!(
         "Error: `cerulion ros2` is only supported on Unix platforms (LD_PRELOAD + rmw_cerulion \
@@ -1164,9 +1194,28 @@ fn bootstrap_robot(state_root: &std::path::Path) -> CliResult<()> {
     cerulion_cli_engine::robot_bootstrap::run(state_root, &mut std::io::stdout().lock())
 }
 
+/// The revocation sync netd runs for a registered robot. netd's stop sends it
+/// SIGTERM: the handler only sets `stopping`, after which the sync starts no
+/// session refresh or certificate renewal, and an exchange in flight finishes
+/// inside netd's stop grace.
 #[cfg(unix)]
 fn robot_sync_epoch(state_root: &std::path::Path) -> CliResult<()> {
-    cerulion_cli_engine::robot_bootstrap::sync_epoch(state_root, &mut std::io::stdout().lock())
+    let stopping = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stopping);
+    if let Err(e) = ctrlc::set_handler(move || flag.store(true, Ordering::SeqCst)) {
+        // Without the handler, netd's stop signal would end the sync in the
+        // middle of an exchange, so this run spends no refresh token at all.
+        stopping.store(true, Ordering::SeqCst);
+        eprintln!(
+            "warning: the revocation sync cannot watch for netd's stop signal, so it refreshes \
+             no session and renews no certificate this run: {e}"
+        );
+    }
+    cerulion_cli_engine::robot_bootstrap::sync_epoch(
+        state_root,
+        &mut std::io::stdout().lock(),
+        &stopping,
+    )
 }
 
 fn run(cli: Cli) -> CliResult<()> {
@@ -1787,6 +1836,39 @@ fn run(cli: Cli) -> CliResult<()> {
             }
         }
         Commands::Graph { action } => {
+            // `graph live` and `graph fires` ask a remote robot, not a workspace,
+            // so they run from anywhere.
+            let action = match action {
+                GraphAction::Live {
+                    connect,
+                    robot,
+                    json,
+                } => {
+                    return graph_live::graph_live(
+                        &graph_live::RemoteTarget { connect, robot },
+                        json,
+                    );
+                }
+                GraphAction::Fires {
+                    connect,
+                    robot,
+                    run,
+                    follow,
+                    for_secs,
+                    json,
+                } => {
+                    let running = setup_ctrlc_handler()?;
+                    return graph_live::graph_fires(
+                        &graph_live::RemoteTarget { connect, robot },
+                        run.as_deref(),
+                        follow,
+                        for_secs,
+                        json,
+                        running,
+                    );
+                }
+                other => other,
+            };
             let ws = discover_workspace()?;
             match action {
                 GraphAction::Create { name, prefix } => {
@@ -2093,6 +2175,12 @@ fn run(cli: Cli) -> CliResult<()> {
                     unreachable!(
                         "`graph pause|resume` are dispatched in `main` before the workspace \
                          lookup, because they address a live run"
+                    )
+                }
+                GraphAction::Live { .. } | GraphAction::Fires { .. } => {
+                    unreachable!(
+                        "`graph live|fires` are dispatched above, before the workspace lookup, \
+                         because they address a remote robot"
                     )
                 }
                 GraphAction::RunWorker { plan } => {
@@ -3840,14 +3928,15 @@ fn command_needs_identity(command: &Commands) -> bool {
 /// The network kill-switch refusal of a `Commands` verb under `switch`, which
 /// `dispatch` gives before the login gate. Each verb's refusal is the one its
 /// own path gives further down, with the same text and exit code:
-/// `viz --robot` (exit 1) under the run and query parse of
-/// `CERULION_NETWORK`, and under `CERULION_NETD_NETWORK` or
-/// `CERULION_VIZD_NETWORK` at `off` too; `connect` (a warning, exit 0) when
-/// `--network` or `CERULION_NETWORK` is exactly `off`, the value its helper
-/// reads. Every other verb is not refused here: it runs as without the
-/// switch, or does not run through `dispatch`. The match names every
-/// top-level verb, so a new one is decided here before it compiles; a new
-/// subverb of a verb below needs its row in `network_switch/cases.rs`.
+/// `viz --robot`, `graph live` and `graph fires` (exit 1) under the run and
+/// query parse of `CERULION_NETWORK` and under `CERULION_NETD_NETWORK` at
+/// `off`, and `viz --robot` under `CERULION_VIZD_NETWORK` at `off` too;
+/// `connect` (a warning, exit 0) when `--network` or `CERULION_NETWORK` is
+/// exactly `off`, the value its helper reads. Every other verb is not refused
+/// here: it runs as without the switch, or does not run through `dispatch`.
+/// The match names every top-level verb, so a new one is decided here before
+/// it compiles; a new subverb of a verb below needs its row in
+/// `network_switch/cases.rs`.
 fn command_network_refusal(
     command: &Commands,
     switch: &network_switch::SwitchEnv,
@@ -3866,6 +3955,21 @@ fn command_network_refusal(
         Commands::Connect { network, .. } => {
             connect_cmd::network_refusal(network.as_deref(), switch.network.as_deref())
                 .map(|refusal| NetworkRefusal::warning(refusal, 0))
+        }
+        // `graph live` and `graph fires` ask robots with or without `--robot`
+        // and `--connect`, so the query-side switches refuse every form.
+        Commands::Graph { action } => {
+            let verb = match action {
+                GraphAction::Live { .. } => "graph live",
+                GraphAction::Fires { .. } => "graph fires",
+                _ => return None,
+            };
+            let kill = cerulion_cli_engine::graph_cmd::query_network_kill_from(
+                switch.network.clone(),
+                switch.netd.as_deref(),
+            );
+            cerulion_cli_engine::graph_live::network_refusal(verb, &kill)
+                .map(|refusal| NetworkRefusal::error(refusal, 1))
         }
         Commands::Topic { action } => match action {
             TopicAction::Info { robot, .. } => {
@@ -3888,7 +3992,6 @@ fn command_network_refusal(
         Commands::BootstrapRobot { .. } | Commands::RobotSyncEpoch { .. } => None,
         Commands::Workspace { .. }
         | Commands::Node { .. }
-        | Commands::Graph { .. }
         | Commands::Ros { .. }
         | Commands::Pair { .. }
         | Commands::Ros2 { .. }

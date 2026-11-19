@@ -735,8 +735,8 @@ fn f5_orphan_reuse_resets_generation() {
 // ---- Parking `wait` (monitor-wait park) ----
 //
 // The parking `wait` replaces the deleted placeholder busy-spin. On a
-// WAITPKG/WFE machine it exercises the REAL shallow CPU park-wake; on
-// macOS / non-WAITPKG x86 the `Unavailable` backend no-ops so `wait` falls back to
+// WAITPKG/MWAITX/WFE machine it exercises the REAL shallow CPU park-wake; on
+// macOS / x86 with neither WAITPKG nor MWAITX the `Unavailable` backend no-ops so `wait` falls back to
 // a sleep-recheck (NEVER a busy-spin). Both paths must return the same outcome,
 // so these tests assert OUTCOME (Opened / TimedOut), which is invariant across
 // the backend.
@@ -784,8 +784,8 @@ fn wait_times_out_when_generation_never_opens() {
 /// arrival-gate guarantees the waiter has arrived (and is heading into `wait`)
 /// before main becomes the 2nd arriver, so there is no flake.
 ///
-/// On a WAITPKG/WFE machine this exercises the REAL CPU park-wake; on macOS /
-/// non-WAITPKG it exercises the sleep-recheck fallback. Both must return `Opened`.
+/// On a WAITPKG/MWAITX/WFE machine this exercises the REAL CPU park-wake; on macOS /
+/// no-primitive x86 it exercises the sleep-recheck fallback. Both must return `Opened`.
 #[test]
 fn wait_wakes_a_parked_waiter() {
     let b = Arc::new(BarrierShared::new(2));
@@ -1938,7 +1938,7 @@ mod box_harness {
     /// CPU monitor-wait. Separate page tables prove cross-address-space sharing.
     /// `#[ignore]`'d (needs multiple processes and a real CPU park; any Unix); run with
     /// `cargo test -p cerulion_core --test barrier_test -- --ignored --nocapture`
-    /// on a machine with x86 WAITPKG or aarch64 WFE.
+    /// on a machine with x86 WAITPKG or MWAITX, or aarch64 WFE.
     #[test]
     #[ignore = "box-only: real cross-process MAP_SHARED rendezvous + CPU park (multi-process box run; any Unix)"]
     fn box_wide_cross_process_rendezvous() {
