@@ -273,6 +273,13 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["examples"],
         &[],
     ),
+    // The build-once runner script, run to declare the fixture builds to it.
+    (
+        "cerulion_cli_engine",
+        "node_links_as_library_test",
+        &["tools"],
+        &[],
+    ),
     // The bridge node's sources, reached from the crate manifest directory.
     ("cerulion_cli_engine", "ros_attach_test", &["examples"], &[]),
     // The `ros2 attach` row, reached from the manifest directory.

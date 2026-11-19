@@ -39,24 +39,37 @@
 //! share a target directory share these cdylib file names, which carry no
 //! hash, so the build never reads an ambient `CARGO_TARGET_DIR`: the child
 //! cargo gets one pointing at an empty directory, which must still be empty
-//! after every build. The test holds an exclusive lock on a file in the target
-//! directory and runs `cargo clean -p` on both crates first, so every library
-//! it inspects was built by this run.
+//! after every build. The test holds an exclusive lock on a file named after
+//! that target directory and runs `cargo clean -p` on both crates first, so
+//! every library it inspects was built by this run.
 //!
 //! Each build is `cargo build --workspace` with one of the two crates
 //! excluded. The other crates then resolve with the features of a plain
-//! `cargo build --workspace`, which CI runs before this test, so only the two
-//! fixtures compile, besides relinking any workspace binary CI's Linux test job
-//! has deleted from `target/debug/deps` to reclaim disk. A `-p` build of the
-//! app alone resolves its dependencies' features differently and compiles over
-//! a hundred of them again, and a `--lib` build gives the workspace's cdylib
+//! `cargo build --workspace`, which CI runs before this test, so only
+//! workspace crates compile: the two fixtures, any workspace binary CI's Linux
+//! test job has deleted from `target/debug/deps` to reclaim disk, and any
+//! workspace cdylib an earlier step rebuilt under the same file name with other
+//! features. A `-p` build of the app alone resolves its dependencies' features
+//! differently and compiles over a hundred of them again, and a `--lib` build gives the workspace's cdylib
 //! members a different profile and compiles those again. Excluding the node
 //! leaves it built only as the app's dependency, without its default features;
 //! excluding the app builds the node with them.
 //!
+//! CI runs this test through the build-once runner
+//! (`tools/scripts/ci_built_tests.py`), whose audit fails the job on any unit
+//! that compiles outside a step declared to it. Where the runner keeps CI
+//! state for the job (`$RUNNER_TEMP/ci-built-tests/groups.json`), each fixture
+//! build here runs as a runner `phase`, so the audit counts its compiles as
+//! this test's, and cargo reports what each build compiled as JSON. The test
+//! then requires the fixture it cleaned among those compiles, so the report is
+//! known to have arrived, and fails if any crate from outside the workspace
+//! compiled, since the leg's workspace build had built them all. Elsewhere
+//! cargo runs directly.
+//!
 //! Host only. Without a workspace build in `target/`, the first run builds the
 //! workspace.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -97,6 +110,40 @@ fn repo_root() -> PathBuf {
         .join("../..")
         .canonicalize()
         .expect("the checkout root")
+}
+
+/// The build-once runner to declare a build to, given `$RUNNER_TEMP`: its
+/// script, when the runner keeps state for this job there (a
+/// `ci-built-tests/groups.json` its build step wrote), and `None` otherwise,
+/// an empty value included, which the runner reads as unset. Only
+/// `$RUNNER_TEMP` counts: without it the runner keeps state in
+/// `$CARGO_TARGET_DIR`, which for this test's builds is the decoy directory.
+fn build_once_runner(runner_temp: Option<&OsStr>) -> Option<PathBuf> {
+    let groups = Path::new(runner_temp.filter(|t| !t.is_empty())?)
+        .join("ci-built-tests")
+        .join("groups.json");
+    groups
+        .is_file()
+        .then(|| repo_root().join("tools/scripts/ci_built_tests.py"))
+}
+
+/// The file every run of this test that builds into `target` locks while it
+/// builds and inspects the fixtures: in the system temporary directory, named
+/// by an FNV-1a hash of the resolved target path, so two checkouts whose
+/// `target/` resolves to one directory, run with the same temporary
+/// directory, share the lock and no others do.
+fn fixture_build_lock(target: &Path) -> PathBuf {
+    let target = target
+        .canonicalize()
+        .unwrap_or_else(|_| target.to_path_buf());
+    let hash = target
+        .as_os_str()
+        .as_encoded_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3)
+        });
+    std::env::temp_dir().join(format!("node_links_as_library_test-{hash:016x}.lock"))
 }
 
 /// The shared-library file name the platform's linker writes for `name`.
@@ -260,21 +307,141 @@ fn the_fixture_node_is_what_node_create_writes() {
     }
 }
 
+/// The package id of every artifact a cargo run with `--message-format=json`
+/// compiled: each `compiler-artifact` message cargo did not find fresh.
+fn compiled_package_ids(messages: &str) -> Vec<String> {
+    messages
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|m| m["reason"] == "compiler-artifact" && m["fresh"] == false)
+        .filter_map(|m| m["package_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// The package a cargo package id names: the `name` of `<source>#name@version`,
+/// or the last path segment of `<source>` for `<source>#version`.
+fn package_name(id: &str) -> Option<&str> {
+    let (source, fragment) = id.rsplit_once('#')?;
+    match fragment.split_once('@') {
+        Some((name, _)) => Some(name),
+        None => source.rsplit('/').next(),
+    }
+}
+
+/// Every compiled artifact is reported, a fresh one and any other message
+/// are not, and a package id's name reads from either form cargo writes.
+#[test]
+fn compiled_artifacts_are_read_from_cargo_messages() {
+    let messages = concat!(
+        r#"{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14","fresh":false}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#libc@0.2.177","fresh":true}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///w/crates/test_fixtures/test_node_links_timer#0.1.0","fresh":false}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","package_id":"path+file:///w/fixtures/app#test_node_links_host_app@0.1.0","fresh":false}"#,
+        "\n",
+        r#"{"reason":"compiler-artifact","package_id":"git+https://example.invalid/iceoryx2?rev=1#iceoryx2@0.7.0","fresh":false}"#,
+        "\n",
+        r#"{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14"}"#,
+        "\n",
+        "a proc macro's own output line\n",
+        r#"{"reason":"build-finished","success":true}"#,
+        "\n",
+    );
+    let compiled = compiled_package_ids(messages);
+    assert_eq!(
+        compiled,
+        vec![
+            "registry+https://github.com/rust-lang/crates.io-index#ring@0.17.14",
+            "path+file:///w/crates/test_fixtures/test_node_links_timer#0.1.0",
+            "path+file:///w/fixtures/app#test_node_links_host_app@0.1.0",
+            "git+https://example.invalid/iceoryx2?rev=1#iceoryx2@0.7.0",
+        ]
+    );
+    let names: Vec<Option<&str>> = compiled.iter().map(|id| package_name(id)).collect();
+    assert_eq!(
+        names,
+        vec![
+            Some("ring"),
+            Some("test_node_links_timer"),
+            Some("test_node_links_host_app"),
+            Some("iceoryx2"),
+        ]
+    );
+    assert!(compiled_package_ids("").is_empty());
+    assert_eq!(package_name("no fragment"), None);
+}
+
+/// A build is declared to the runner only when its state exists in the
+/// directory `$RUNNER_TEMP` names.
+#[test]
+fn a_build_is_declared_only_where_the_build_once_runner_keeps_state() {
+    assert_eq!(build_once_runner(None), None, "no RUNNER_TEMP");
+    assert_eq!(
+        build_once_runner(Some(OsStr::new(""))),
+        None,
+        "an empty RUNNER_TEMP"
+    );
+    let temp = tempfile::tempdir().expect("temp dir");
+    assert_eq!(
+        build_once_runner(Some(temp.path().as_os_str())),
+        None,
+        "a RUNNER_TEMP the runner wrote nothing to"
+    );
+    let state = temp.path().join("ci-built-tests");
+    std::fs::create_dir_all(state.join("groups.json")).expect("a directory named groups.json");
+    assert_eq!(
+        build_once_runner(Some(temp.path().as_os_str())),
+        None,
+        "groups.json that is not a file"
+    );
+    std::fs::remove_dir(state.join("groups.json")).expect("remove it");
+    std::fs::write(state.join("groups.json"), "{}").expect("write groups.json");
+    let script = build_once_runner(Some(temp.path().as_os_str())).expect("the runner's state");
+    assert_eq!(script, repo_root().join("tools/scripts/ci_built_tests.py"));
+    assert!(script.is_file(), "{} exists", script.display());
+}
+
 #[test]
 fn a_generated_node_links_into_an_app_library_without_its_c_exports() {
     let root = repo_root();
     let target = root.join("target");
-    std::fs::create_dir_all(&target).expect("create the target directory");
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(target.join("node_links_as_library_test.lock"))
-        .expect("open the fixture build lock");
+    // The lock lives outside `target/`: cargo refuses to clean a target
+    // directory it did not create, so this test must not create it first. An
+    // existing lock file opens read only, which is all `flock` needs.
+    let lock_path = fixture_build_lock(&target);
+    let lock = std::fs::File::open(&lock_path)
+        .or_else(|_| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+        })
+        .unwrap_or_else(|e| panic!("open the fixture build lock {}: {e}", lock_path.display()));
     lock.lock().expect("take the fixture build lock");
     let decoy = tempfile::tempdir().expect("decoy target dir");
-    let cargo = |args: &[&str]| {
-        let mut cmd = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string()));
+    let runner = build_once_runner(std::env::var_os("RUNNER_TEMP").as_deref());
+    // `phase` names a build to declare to the build-once runner.
+    let cargo = |phase: Option<&str>, args: &[&str]| {
+        let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+        let mut cmd = match (phase, &runner) {
+            (Some(phase), Some(script)) => {
+                let mut cmd = Command::new("python3");
+                cmd.arg("-B")
+                    .arg(script)
+                    .args(["phase", phase, "--", cargo_bin.as_str()])
+                    .args(args)
+                    .args(["--timings", "--message-format=json-render-diagnostics"]);
+                cmd
+            }
+            _ => {
+                let mut cmd = Command::new(&cargo_bin);
+                cmd.args(args);
+                cmd
+            }
+        };
         for (name, _) in std::env::vars_os() {
             if name
                 .to_str()
@@ -286,7 +453,6 @@ fn a_generated_node_links_into_an_app_library_without_its_c_exports() {
         cmd.current_dir(&root)
             .env("CARGO_TARGET_DIR", decoy.path())
             .env_remove("CARGO_BUILD_TARGET_DIR")
-            .args(args)
             .arg("--target-dir")
             .arg(&target);
         cmd
@@ -299,13 +465,36 @@ fn a_generated_node_links_into_an_app_library_without_its_c_exports() {
              --target-dir: {leaked:?}"
         );
     };
+    // Under the runner, the build `what` must report compiling `fixture`, which
+    // `cargo clean -p` removed, and nothing from outside the workspace.
+    let check_compiled = |built: &str, fixture: &str, what: &str| {
+        if runner.is_none() {
+            return;
+        }
+        let compiled = compiled_package_ids(built);
+        assert!(
+            compiled.iter().any(|id| package_name(id) == Some(fixture)),
+            "{what} reported no compile of {fixture}, which `cargo clean -p` removed, \
+             so cargo's JSON did not reach this test: {compiled:?}"
+        );
+        let outside: Vec<&String> = compiled
+            .iter()
+            .filter(|id| !id.starts_with("path+file://"))
+            .collect();
+        assert!(
+            outside.is_empty(),
+            "{what} compiled crates from outside the workspace, which the leg's \
+             workspace build had built: its features or environment differ from \
+             that build's: {outside:?}"
+        );
+    };
     let debug = target.join("debug");
     let host_lib = debug.join(cdylib_file(APP));
     let host_exe = debug.join(format!("{APP}{}", std::env::consts::EXE_SUFFIX));
     let node_lib = debug.join(cdylib_file(NODE));
 
     run_ok(
-        cargo(&["clean", "--locked", "-p", APP, "-p", NODE]),
+        cargo(None, &["clean", "--locked", "-p", APP, "-p", NODE]),
         "cargo clean the fixtures",
     );
     for path in [&host_lib, &host_exe, &node_lib] {
@@ -317,11 +506,15 @@ fn a_generated_node_links_into_an_app_library_without_its_c_exports() {
     }
 
     // The app side: the node as a library, its exports compiled out.
-    run_ok(
-        cargo(&["build", "--locked", "--workspace", "--exclude", NODE]),
+    let built = run_ok(
+        cargo(
+            Some("node-links app"),
+            &["build", "--locked", "--workspace", "--exclude", NODE],
+        ),
         "cargo build the app fixture",
     );
     assert_no_leak("cargo build the app fixture");
+    check_compiled(&built, APP, "cargo build the app fixture");
     let stdout = run_ok(Command::new(&host_exe), "run the app fixture");
     assert_eq!(
         stdout.trim(),
@@ -343,11 +536,15 @@ fn a_generated_node_links_into_an_app_library_without_its_c_exports() {
 
     // The control: the node built as a member, with its default features,
     // keeps the export `dlopen` resolves.
-    run_ok(
-        cargo(&["build", "--locked", "--workspace", "--exclude", APP]),
+    let built = run_ok(
+        cargo(
+            Some("node-links node"),
+            &["build", "--locked", "--workspace", "--exclude", APP],
+        ),
         "cargo build the node fixture",
     );
     assert_no_leak("cargo build the node fixture");
+    check_compiled(&built, NODE, "cargo build the node fixture");
     assert!(
         exports_symbol(&node_lib, "cerulion_node_info"),
         "{} must export `cerulion_node_info` for `cerulion graph run`",

@@ -568,12 +568,17 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
   CMD`, and an `invoked.timestamp` under `target/debug/.fingerprint` or `target/debug/build`
   dates each compile and build-script run, so a package step that went back to plain
   `cargo test -p` is a red audit. It prints the units each build step compiled and the
-  crates built more than once.
+  crates built more than once. A test that builds into the job's target directory declares
+  each of its builds itself, as a `phase` run from inside its `run` step, when
+  `$RUNNER_TEMP/ci-built-tests/groups.json` exists: `node_links_as_library_test` declares
+  `node-links app` and `node-links node`, and fails if either compiled a crate from
+  outside the workspace.
 * **Wiring.** `check-workflow FILE` refuses a job whose legs do not build exactly the
   packages their steps run, a `+` anywhere but on a package whose step carries no selection
   condition, a run whose features the build lacks, a run before the build, a job with no
   unconditioned audit step after its last run, and a `cargo test`, `build`, `nextest` or
-  `check` command outside `run` or `phase`.
+  `check` command outside `run` or `phase`. It reads the workflow only, so the phases a
+  test declares from inside a `run` step are not in its view.
 * **Reclaim.** `reclaim` deletes the executables in `target/debug/deps` except the prebuilt
   binaries a later step still runs, libraries (`.so`, `.so.N`, `.dylib`, `.dll`, `.rlib`, `.a`)
   and cargo's `.rmeta` and `.d` files.
