@@ -527,6 +527,54 @@ test 20 times in a row on one runner, on every event but a merge-queue batch, wi
 step past the checkout gated on `cerulion_netd`'s selection; it reports no required context,
 and the `cerulion_netd` step of `test-linux` shard 3 is the one a merge waits for.
 
+### Build once per shard (`tools/scripts/ci_built_tests.py`)
+
+A `cargo test -p X` per package resolves features for X alone, so a leg that runs several
+packages that way rebuilds every crate they share (`cerulion_core` and the third-party tree
+under it, up to a dozen times per leg). The runner builds a group of packages in ONE cargo
+invocation and runs the prebuilt test binaries the way `cargo test` runs them.
+
+* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run` over the group's
+  packages, then `cargo test` over the same packages with the script as cargo's target
+  runner. That recording run compiles nothing; for each test binary it records the
+  environment and working directory cargo gives it, in cargo's run order. Cargo then runs
+  the group's doctests against the libraries the build compiled; rustdoc hands each doctest
+  it runs to the same runner, which runs any binary outside the target directory. They run
+  without a step's `-- --test-threads=1` or env. A package builds
+  when `CI_SELECTED_PACKAGES` names it, the same rule as a step's
+  `contains(fromJSON(...))` condition; a `+` package builds on every change, for a step with
+  no selection condition.
+* **Run.** A package step keeps its command and prefixes it:
+  `python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p X [--lib] [--bins]
+  [--test T] [--features F] [--no-fail-fast] [FILTER] [-- ARGS]` (`--locked` and `--package`
+  are accepted too); any other flag is refused.
+  The script runs the prebuilt binaries that command selects, each as one libtest process as
+  under cargo, with `FILTER ARGS` as their arguments, the recorded environment (on macOS a
+  system interpreter cannot see `DYLD_FALLBACK_LIBRARY_PATH`, so the script sets it as cargo
+  does), cargo's order and cargo's fail-fast rule. A serial package keeps
+  `-- --test-threads=1`, so its tests still run one at a time inside that one process, which
+  the tests that read process state rely on (a leaked global subscriber, a leftover-manager
+  check). Because the line still carries `cargo test -p X`, the coverage walk and
+  `serial_discipline_test` read it as before.
+* **Audit.** `audit` fails when a built binary had no whole run (one with no test name
+  filter and no libtest argument but `--test-threads=N`, `--nocapture`, `--show-output`,
+  `--include-ignored` or `--quiet`), unless `--not-run` names it; when `--not-run` names a
+  binary the leg does not build; when a leg that kept every package builds fewer than its
+  floor of test binaries; or when cargo compiled a unit or ran a build script outside a
+  declared build step. Every compiling step is wrapped in `ci_built_tests.py phase NAME --
+  CMD`, and an `invoked.timestamp` under `target/debug/.fingerprint` or `target/debug/build`
+  dates each compile and build-script run, so a package step that went back to plain
+  `cargo test -p` is a red audit. It prints the units each build step compiled and the
+  crates built more than once.
+* **Wiring.** `check-workflow FILE` refuses a job whose legs do not build exactly the
+  packages their steps run, a `+` anywhere but on a package whose step carries no selection
+  condition, a run whose features the build lacks, a run before the build, a job with no
+  unconditioned audit step after its last run, and a `cargo test`, `build`, `nextest` or
+  `check` command outside `run` or `phase`.
+* **Reclaim.** `reclaim` deletes the executables in `target/debug/deps` except the prebuilt
+  binaries a later step still runs, libraries (`.so`, `.so.N`, `.dylib`, `.dll`, `.rlib`, `.a`)
+  and cargo's `.rmeta` and `.d` files.
+
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
 runs the visualization tree in two lanes, Linux only: the library lane PARALLEL (every
@@ -1006,6 +1054,7 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/ci_cache_trim_target.sh --self-test` | a synthetic target with a read and an unread generation: the unread units' artifacts, build dirs and fingerprints go, the read ones and unhashed files stay, an unread scaffold target and scratch files under `tmp/` go; nothing is deleted when nothing was read, when `age` never ran, or when no `deps/` entry carries a live hash; fails when the filesystem does not update access times | n/a |
 | `tools/scripts/check_pr_title.sh --self-test` | the title/branch oracle table | n/a |
 | `tools/scripts/check_agents_md.sh` | context-file budgets, shims, banned tokens | n/a |
+| `tools/scripts/ci_built_tests.py --self-test` | the build-once runner: the selection rule against the classifier's list (a longer name never matches a shorter one), the `cargo test` command line it accepts and the ones it refuses, which prebuilt binaries a selection runs and in what order, the environment replay (a cargo `[env]` key without `force` yields to the step's own value), the macOS library path in cargo's order, the attribution of compiled units to declared build steps, the wiring check over a hand-written job and nine broken ones, and the modes end to end over a fake cargo: the recording runs no test and a doctest that reaches the runner runs (and fails the build when it fails), a run gets cargo's env and working directory, fail-fast, a missing feature refused, the reclaim keep set (shared libraries kept whatever their mode), a selection naming no package auditing clean, comma feature lists compared as sets, and the audit's refusals (an unrun binary, a binary run only under a filter or `--ignored`, a floor, an unknown `--not-run`, a unit compiled after every step, a floor that is no number) | n/a |
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
