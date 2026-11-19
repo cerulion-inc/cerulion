@@ -192,6 +192,16 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
+  process enumeration, readiness and signal syscalls before spawn. Native pidfds
+  bind each signal to its captured process. Only an unavailable pidfd syscall permits the
+  ordinary fallback; its last SID/birth-time check cannot be atomic with the
+  numeric-PID signal. The caller retains the unreaped session leader until cleanup
+  returns, pinning its SID. Repeated scans include ordinary job-control groups;
+  unreadable session state is an error, not an empty-session success. The blocking
+  scan has a 250 ms deadline and requires two empty scans. It is lifecycle cleanup,
+  not containment of a process that escapes the session or continually forks.
+
 - **The AGPL/closed boundary for the connect worker is a PROCESS boundary**: the closed Studio spawns
   the AGPL `cerulion-connectd` binary exactly as it spawns the gateway/vizd
   (`crates/cerulion_connectd/src/lib.rs`; the CLI side is pure argv resolution in
@@ -232,6 +242,19 @@ Load-bearing boundary contracts:
   add `session: SessionKind::Ops` or use `Hello::current()`; the re-export from
   `cerud::protocol` has the same field. A version-1 ordinary client still
   negotiates version 1 and receives the same request/response envelopes.
+- **Exec transport stays with the caller**: `ExecClient` builds an argv-only
+  Hello, validates the handshake and session order, and collects stdout/stderr
+  within explicit byte limits. It sends no network traffic and opens no files.
+  The caller authenticates the transport, sends the returned `StdinEof`, applies
+  its deadline, and persists checkpoint events outside the robot. Reaching a
+  capture limit discards further captured bytes while continuing to consume
+  frames; the result combines local and robot truncation flags. Only a valid
+  final Exit produces a complete result. Timeout or connection loss leaves a
+  partial result and must never trigger automatic command replay. OPS uses
+  big-endian framing; the link crate's wire-plane framing is little-endian.
+  `exec_client_test.rs` also pins direct typed-frame refusals, duplicate
+  checkpoints, final status/truncation combinations and independent partial
+  snapshots.
 - **Session audit commitments** use a domain-separated SHA-256 chain over the
   canonical event JSON documented in `cerulion_ops_proto::recording`. The builder
   requires exactly one initial Started event, monotonic timestamps and no event

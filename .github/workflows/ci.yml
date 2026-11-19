@@ -61,7 +61,8 @@ permissions:
 #     run's verdict to decide whether to merge, so a cancelled required
 #     context reads as "not passed" forever and the batch stalls. The one
 #     cancel a queue run takes is `queue-watchdog.yml`'s, once a required job
-#     has already failed the batch.
+#     has already failed the batch or the batch has left the queue without
+#     merging.
 #   * push / workflow_dispatch / schedule ⇒ group = `github.run_id`, which is
 #     unique per run, so every main commit keeps its own run, nothing is
 #     ever queued behind a sibling, and nothing is ever cancelled.
@@ -1165,6 +1166,13 @@ jobs:
       - name: Selected-packages closure self-test
         run: python3 -B tools/scripts/ci_selected_packages.py --self-test
 
+      # The runner the test shards build their package tests with and then run
+      # them through: command-line reading, selection rule, environment replay,
+      # attribution of compiled units, the workflow wiring rules, and the
+      # modes end to end over a fake cargo.
+      - name: Built-test runner self-test
+        run: python3 -B tools/scripts/ci_built_tests.py --self-test
+
       # The path classifier the `changes` job runs. Its table is what decides
       # which test steps a pull request pays for and whether it pays for the
       # 22-minute packaging smoke, so it is executed here rather than only read
@@ -1173,6 +1181,12 @@ jobs:
       # resolves the workspace with `cargo metadata`.
       - name: Changed-path classifier self-test
         run: ./tools/scripts/ci_changed_paths.sh --self-test
+
+      # The per-binary test router. Its table is a hand-built workspace with
+      # every selection written out beside it; it reads no file of this
+      # checkout, so a change to the real tree cannot red this step.
+      - name: Test router self-test (shadow mode)
+        run: python3 -B tools/scripts/ci_test_router.py --self-test
 
       # THE SHARD PARTITION AND ITS SELECTION READER. `--check` proves the
       # partition of `cerulion_core`'s test files is total and disjoint, that
@@ -1970,8 +1984,9 @@ jobs:
   # nowhere else.
   #
   # TWO LEGS, one per architecture, because the code differs between them: the
-  # park's monitor wait is `WFE` on aarch64 and `UMWAIT` on x86_64 (when the
-  # CPU has WAITPKG; the stock wait otherwise), and `c_char` is `u8` on Linux
+  # park's monitor wait is `WFE` on aarch64 and on x86_64 `UMWAIT` (when the
+  # CPU has WAITPKG), `MWAITX` (when it has MWAITX and no WAITPKG) or the stock
+  # wait otherwise, and `c_char` is `u8` on Linux
   # aarch64 and `i8` on x86_64, so a cast between it and `u8` lints on aarch64
   # only. `lint` and the test shards run on x86_64 alone.
   #
@@ -5285,8 +5300,9 @@ jobs:
   # THIS JOB IS THE LATENCY REGRESSION GATE, and the only one. There is no
   # separate benchmark workflow running the same two tests, because this job
   # would be a strict superset of it on both axes —
-  #   - TESTS: it runs `latency_threshold_test`, `graph_latency_test` and
-  #     `exact_deadline_grid_latency_test`, and additionally the release-mode `--lib` tests
+  #   - TESTS: it runs `latency_threshold_test`, `graph_latency_test`,
+  #     `exact_deadline_grid_latency_test` and `period_park_latency_test`, and
+  #     additionally the release-mode `--lib` tests
   #     (cfg(not(debug_assertions))-gated) and a
   #     `cargo check --tests --release`;
   #   - TRIGGERS: this workflow is push-to-main with NO path filter, so a
@@ -5756,6 +5772,16 @@ jobs:
       # controlled clock. A green run prints the double-fire share and median gap.
       - name: Exact-deadline grid test (release mode)
         run: cargo test --timings -p cerulion_core --test exact_deadline_grid_latency_test --release -- --nocapture --test-threads=1
+
+      # The period-park's wall-clock bounds: a frame from another runtime read
+      # within 2 ms across a kernel nap, one on a second input within about one
+      # nap, and a 1 kHz node on its grid under the park. A loaded PR runner
+      # stretches each, so they run here; the shards pin the same runs' counts
+      # and order. The bounds are judged only where the period-park engages (a
+      # CPU monitor-wait primitive: WAITPKG on x86); elsewhere each arm prints
+      # that its bounds were not judged. A green run prints its figures.
+      - name: Period-park latency test (release mode)
+        run: cargo test -p cerulion_core --test period_park_latency_test --release -- --nocapture --test-threads=1
 
       # Release-mode counterpart: `record_below_wire_header_size_silent_fallback_in_release`
       # in `cerulion_core::transport::adaptive_sizer::tests` is `cfg(not(debug_assertions))`-gated

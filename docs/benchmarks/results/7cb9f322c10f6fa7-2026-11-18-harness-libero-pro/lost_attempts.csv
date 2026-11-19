@@ -50,6 +50,11 @@ grid,pro_goal_swap_t05_i06,with,Claude Haiku 5.5,1,33,0.200462,2026-11-17,1,0
 grid,pro_goal_swap_t09_i06,without,Claude Haiku 5.5,1,8,0.007675,2026-11-17,1,0
 grid,pro_object_swap_t01_i03,with,Claude Haiku 5.5,1,9,0.020997,2026-11-17,1,0
 grid,pro_goal_swap_t03_i07,with,Claude Haiku 5.5,1,34,0.205908,2026-11-17,1,0
+grid,pro_goal_swap_t01_i09,without,Claude Haiku 5.5,1,28,0.057499,2026-11-17,1,0
+grid,pro_goal_swap_t04_i09,with,Claude Haiku 5.5,1,12,0.030525,2026-11-17,1,0
+grid,pro_spatial_swap_t00_i06,without,Claude Haiku 5.5,1,49,0.156201,2026-11-17,1,0
+grid,pro_spatial_swap_t00_i06,without,Claude Haiku 5.5,2,0,0.000000,2026-11-17,1,0
+grid,pro_spatial_task_t01_i06,without,Claude Haiku 5.5,1,69,0.267683,2026-11-17,1,0
 grid,pro_goal_task_t00_i04,with,Claude Fable 5.2,1,50,35.528882,2026-11-17,0,0
 grid,pro_goal_task_t00_i05,with,Claude Fable 5.2,1,43,29.146153,2026-11-17,0,0
 grid,pro_goal_swap_t03_i06,without,Gemini 4 Carbon,1,27,7.142726,2026-11-17,0,0
