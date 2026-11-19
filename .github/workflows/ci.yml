@@ -3382,16 +3382,6 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
-      - name: node context helper compile tests
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: cargo test --timings -p test_node_macro_cdylib
-      - name: selection marker, test_node_macro_cdylib
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
-
       # The #[cerulion_node] diagnostics suite: one trybuild check of every
       # compile-fail fixture against its .stderr, then the compile-pass
       # programs, each an example cargo builds with no cfg(test) and no
@@ -3407,6 +3397,18 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped node_macro_ui (selected: $SELECTED)"
+
+      # After the diagnostics suite, so this package's trybuild check reuses the
+      # dependency build that suite leaves in target/tests/trybuild.
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test --timings -p test_node_macro_cdylib
+      - name: selection marker, test_node_macro_cdylib
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
 
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
@@ -4422,16 +4424,6 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
-      - name: node context helper compile tests
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: cargo test --timings -p test_node_macro_cdylib
-      - name: selection marker, test_node_macro_cdylib
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
-
       # The #[cerulion_node] diagnostics suite: one trybuild check of every
       # compile-fail fixture against its .stderr, then the compile-pass
       # programs, each an example cargo builds with no cfg(test) and no
@@ -4447,6 +4439,18 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped node_macro_ui (selected: $SELECTED)"
+
+      # After the diagnostics suite, so this package's trybuild check reuses the
+      # dependency build that suite leaves in target/tests/trybuild.
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test --timings -p test_node_macro_cdylib
+      - name: selection marker, test_node_macro_cdylib
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
 
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite
