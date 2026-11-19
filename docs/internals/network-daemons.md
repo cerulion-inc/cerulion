@@ -165,6 +165,12 @@ remove them before committing.
   `serving_ready` to restore retained WAN pins once the owned socket admits work,
   and `end_serving` after child and fetch reap, also on transfer or spawn failure.
   Controllers preserve holders and schema pins or notify holders of failed restores.
+  `serving_ready` waits up to 250 ms for a controller state another operation holds,
+  then cancels every live WAN pin, names the first in its error, and leaves each
+  holder's loss to registry retirement. `AccountWanController` counts the
+  serving starts that met a held state (`restoration_contentions`) and the ones that
+  cancelled pins (`restoration_busy_cancellations`). The identity watch reads the
+  identity files with that state unlocked.
   Incoming TLS handshakes run in at most 32 concurrent workers for at most 10 s.
   Arrivals other than paired relay keys fill at most 24: unvalidated addresses
   retry at half capacity, validated IPs hold at most four, unpaired relay arrivals
@@ -455,7 +461,7 @@ rung itself.
 | Test file | What it pins (1 line) | Serial? | Prereq fixtures |
 |---|---|---|---|
 | `crates/cerulion_netd/tests/daemon_e2e_test.rs` | Refcount→mirror wiring over the real UDS with a spy plane: shared mirror, idempotent re-demand, conflict refusal, ensure-failure rollback, close-releases-all, flock singleton, discovery marker on both query verbs | no | none |
-| `crates/cerulion_netd/tests/daemon_idle_exit_e2e_test.rs` | Idle self-exit over the REAL binary: socket unlinked first, no half-dead zombie, client retry binds the respawn | no | daemon binary (built by cargo test) |
+| `crates/cerulion_netd/tests/daemon_idle_exit_e2e_test.rs` | Idle self-exit over the REAL binary: boot observed from the stderr lifecycle line, socket unlinked first, no half-dead zombie, client retry binds the respawn | no | daemon binary (built by cargo test) |
 | `crates/cerulion_netd/tests/cli_version_test.rs` | `--version`/`-V` over the REAL binary: the exact `cerulion-netd <version>` line on stdout, empty stderr, exit 0, with no daemon boot | no | daemon binary (built by cargo test) |
 | `crates/cerulion_netd/tests/client_e2e_test.rs` | `NetdClient` demand/release pairing, spawn-readiness wait (first-use line at `INFO`, one stall `WARN` past two seconds, none on a prompt boot), died-vs-booting discriminator, an auto-started daemon holding none of the consumer's pipes (a re-executed consumer process) and a failed start quoting its startup log, version trust downgrade at the call sites | no (env arms use a file-local mutex) | daemon binary via `CARGO_BIN_EXE` |
 | `crates/cerulion_netd/tests/client_egress_e2e_test.rs` | `register_egress` composed through client + daemon + production egress plane really egresses (no inert shipping) | no | none |

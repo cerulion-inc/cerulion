@@ -4,7 +4,7 @@
 //! subtle. Nothing here is public API.
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
@@ -39,8 +39,8 @@ pub(crate) fn ed25519_sign(key: &SigningKey, msg: &[u8]) -> Signature {
 
 /// HMAC-SHA256 over `data` with `mac_key`.
 pub(crate) fn hmac_sha256(mac_key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac =
-        <Hmac<Sha256> as Mac>::new_from_slice(mac_key).expect("HMAC accepts a key of any length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(mac_key)
+        .expect("HMAC accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
@@ -72,4 +72,29 @@ pub(crate) fn to_hex(bytes: &[u8]) -> String {
         s.push(HEX[(b & 0x0f) as usize] as char);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hmac_sha256, sha256_domain, to_hex};
+
+    #[test]
+    fn hmac_sha256_matches_rfc_4231_test_case_2() {
+        let tag = hmac_sha256(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            to_hex(&tag),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    #[test]
+    fn sha256_domain_matches_the_fips_180_abc_vector() {
+        // The domain and the data are hashed as one message, so splitting
+        // "abc" across them must give the published digest of "abc".
+        let digest = sha256_domain(b"a", b"bc");
+        assert_eq!(
+            to_hex(&digest),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

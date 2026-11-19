@@ -53,6 +53,10 @@ pub mod connect_cmd;
 // The `cerulion rcp` verb's PURE resolution: the same robot resolution as
 // `connect`, spawning `cerulion-connectd rcp` with inherited stdio.
 pub mod rcp_cmd;
+// `cerulion rcp --sim` and `cerulion rcp bench`: where the harness folder is
+// and the launcher command line both run. The launcher is spawned with
+// inherited stdio; nothing of the harness runs in this process.
+pub mod harness_cmd;
 // The value sources behind shell tab-completion — live topic / node /
 // graph / schema / robot names for a TAB press. Every source is an INSTANT
 // LOCAL read under a hard wall-clock budget: no process is ever spawned (netd
@@ -115,6 +119,9 @@ pub mod robot_cmd;
 // cloud AccountId (asserting the cert attests THIS machine's device key). The
 // desk half of the binding the robot side enforces via `device_index`.
 pub mod device_binding;
+// Re-registers this machine's device key before its cached certificate expires.
+#[cfg(unix)]
+pub mod device_cert_renewal;
 /// Consistent local certificate chains for automatic owner access.
 pub mod owner_certificate;
 // The peer-cache discovery rung + best-effort persist to

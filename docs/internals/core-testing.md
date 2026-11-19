@@ -539,3 +539,11 @@ above.
 - `#[traced_test]` requires the `no-env-filter` feature (already on the dev-dep) or
   production-crate events are silently dropped; assert suppression-latch lines with the
   LEVEL TOKEN, not message text alone.
+- Log fields are evaluated only while a subscriber is installed. Under `cargo test` the
+  first `#[traced_test]` of a binary installs one for every later test in the process;
+  under nextest a test without `#[traced_test]` has none. A binary that moves to nextest
+  calls `cerulion_core::testing::install_nextest_trace_sink()` from its shared fixtures: a
+  TRACE subscriber writing to `io::sink`, installed only when
+  `NEXTEST_EXECUTION_MODE=process-per-test`, never replacing an existing one
+  (`TraceSinkOutcome` says which). Allocation-counting and wall-clock timing binaries do
+  not call it: the subscriber allocates and formats on every event.

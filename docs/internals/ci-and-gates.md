@@ -523,6 +523,11 @@ Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the sh
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
 what it built. There is no shared archive of test binaries and no job that builds one.
 
+`netd-owner-pair-transition-repeat` runs `cerulion_netd`'s owner pair serving transition
+test 20 times in a row on one runner, on every event but a merge-queue batch, with every
+step past the checkout gated on `cerulion_netd`'s selection; it reports no required context,
+and the `cerulion_netd` step of `test-linux` shard 3 is the one a merge waits for.
+
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
 runs the visualization tree in two lanes, Linux only: the library lane PARALLEL (every
@@ -671,7 +676,12 @@ context.
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
 `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` is the walk that holds it, counting only
-steps and jobs that can actually fail a pull request, and it drives
+steps and jobs that can actually fail a pull request. A step credits the packages a
+`cargo test` or `cargo nextest run` command names with `-p`, or the one `ci_test_shard.sh` takes;
+a command whose cargo flags (those before a bare `--`) carry `--doc` or `--no-run` credits none,
+because it runs none of the package's unit or integration tests. Each shell command of a line is
+read on its own, a `\` continuation joins the line it continues, and a step's `name:` never
+counts. `ci_doc_pin_walk_test` reads workflow lines through the same reader. The walk drives
 `tools/scripts/ci_test_shard.sh --check` to prove the shard partition is TOTAL and DISJOINT, so a
 broken split is a local red rather than a silent gap.
 
@@ -684,6 +694,29 @@ The release workflows reject missing, malformed, impossible-calendar, pre-tag, a
 future dates before publishing artifacts. The shared implementation is
 `tools/scripts/check_citation_release.sh`, which is also exercised by the release-gate
 regression script.
+
+## Cargo timing reports and runner hardware
+
+Every `ci.yml` job that compiles with cargo commands written in the workflow passes
+`--timings` to each cargo build, check, clippy, doc and test command (the `cerulion_core`
+shards through `CI_TEST_SHARD_EXTRA`), prints the runner's architecture, CPU model, core
+count and memory right after checkout, and uploads one artifact per job and matrix leg named
+`cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7 days. It holds
+`runner.txt` (the hardware lines, present even when the path selection skipped every cargo
+step) and one `cargo-timing-<timestamp>-<hash>.html` report per cargo command, under the path
+of the target directory it came from (`target/cargo-timings/`,
+`examples/go2/target/cargo-timings/`). Download it from the run's summary page or with
+`gh run download <run id> --pattern 'cargo-timings-*'`. The collect and upload steps run
+under `always()`, so a red or timed-out job still uploads. The collect step moves the reports
+out of the job's target directories before any cache save and deletes one it cannot move; it
+fails the job only when it can neither move nor delete a report, or passes its 2 minute step
+timeout, and a failed job saves no cache, so no cache archive carries a report. Only the upload
+carries `continue-on-error: true` (with a 5 minute step timeout). Artifact names spell a shard
+leg as `shard-<n>`, for example `cargo-timings-test-linux-shard-0-attempt-1`.
+`ci_cache_policy_check.py` holds the steps in place (TIMINGS_REPORTS, below).
+`deb-smoke` and `stable-node-compiler-skew` build inside scripts and `fuzz` and `miri` through
+cargo plugins, so those four carry none of these steps, and a `cargo install` tool build
+writes no report.
 
 ## Scheduled workflows
 
@@ -927,7 +960,12 @@ key or in an `include` entry) runs on shard 0 alone or carries the shard in its 
 two forms, `${{ matrix.shard }}` or nothing on shard 0 and `-shard<k>` on shard k, so shards
 never race for one archive; any other key expression naming `matrix.shard` is refused (R12); a
 key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
-the
+a job that passes `--timings` in a step carries `Collect the cargo timing reports` under
+`if: always()` with no `continue-on-error`, running the one script the checker holds, directly
+followed by `Upload the cargo timing reports` under `if: always()` with `continue-on-error: true`,
+both after its last `--timings` step and before its save, the collect list naming every target
+directory its cache steps archive, and a job with neither the flag nor the steps carries neither;
+no job- or workflow-level `env` passes the flag (TIMINGS_REPORTS); the
 combined `actions/cache` action appears nowhere (NO_COMBINED_CACHE_ACTION); and a job whose
 steps the reader cannot enumerate -- a reusable-workflow call, or one carrying no `steps:` -- is
 refused rather than passed in silence. The `Lint` step "Cache save policy" runs the prune
