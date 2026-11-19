@@ -529,6 +529,36 @@ impl TopicStat {
         })
     }
 
+    /// Move this observation `by` into the past: when it began, when a frame last
+    /// arrived, and every Hz-window sample. A later [`Self::liveness`] or
+    /// [`Self::hz`] then reads the observation `by` older.
+    ///
+    /// `false`, changing nothing, when the entry is not observing or the monotonic
+    /// clock cannot represent one of the earlier instants.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn age_by(&mut self, by: Duration) -> bool {
+        let earlier = move |at: Instant| at.checked_sub(by);
+        let Some(since) = self.observed_since.and_then(earlier) else {
+            return false;
+        };
+        let last_frame_at = match self.last_frame_at.map(earlier) {
+            Some(None) => return false,
+            aged => aged.flatten(),
+        };
+        let Some(samples) = self
+            .samples
+            .iter()
+            .map(|&(seq, at)| earlier(at).map(|at| (seq, at)))
+            .collect::<Option<VecDeque<_>>>()
+        else {
+            return false;
+        };
+        self.observed_since = Some(since);
+        self.last_frame_at = last_frame_at;
+        self.samples = samples;
+        true
+    }
+
     /// Record the newest frame's wire sequence at `now`, pruning the window to
     /// [`HZ_WINDOW`].
     ///
@@ -9228,10 +9258,12 @@ pub struct RunningDaemon {
     /// See [`Self::fail_next_provenance_gathers_for_test`].
     #[cfg(any(test, feature = "test-helpers"))]
     provenance_gather_faults: Arc<AtomicU64>,
-    /// See [`Self::age_provenance_snapshot_for_test`]. WEAK, so the seam never keeps
+    /// The daemon state [`Self::age_provenance_snapshot_for_test`],
+    /// [`Self::skew_monitor_clock_for_test`] and
+    /// [`Self::age_tap_observation_for_test`] lock. WEAK, so the seams never keep
     /// the taps and stats alive past [`Self::shutdown`].
     #[cfg(any(test, feature = "test-helpers"))]
-    provenance_state: std::sync::Weak<Mutex<DaemonState>>,
+    state_for_test: std::sync::Weak<Mutex<DaemonState>>,
 }
 
 impl RunningDaemon {
@@ -9579,11 +9611,43 @@ impl RunningDaemon {
     /// the monotonic clock cannot represent the earlier instant.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn age_provenance_snapshot_for_test(&self, by: Duration) -> bool {
-        let Some(state) = self.provenance_state.upgrade() else {
+        let Some(state) = self.state_for_test.upgrade() else {
             return false;
         };
         let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
         st.mirror_provenance.age_by(by)
+    }
+
+    /// Move the monitor plane's clock origin `by` into the past, so every later
+    /// sample and read is dated `by` further along and each watched row reads as
+    /// first seen `by` earlier, without a sleep. The tap observations the samples
+    /// are built from stay on the real clock.
+    ///
+    /// Returns `false`, and changes nothing, when the daemon state is gone or the
+    /// monotonic clock cannot represent the earlier origin.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn skew_monitor_clock_for_test(&self, by: Duration) -> bool {
+        let Some(state) = self.state_for_test.upgrade() else {
+            return false;
+        };
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.monitors.skew_by(by)
+    }
+
+    /// Move `topic`'s tap observation `by` into the past (when it began, its last
+    /// frame arrival and its Hz window), so its liveness verdict and its rate read
+    /// `by` older without a sleep.
+    ///
+    /// Returns `false`, and changes nothing, when the daemon state is gone, the
+    /// topic has no observing stats entry, or the monotonic clock cannot represent
+    /// the earlier instants.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn age_tap_observation_for_test(&self, topic: &str, by: Duration) -> bool {
+        let Some(state) = self.state_for_test.upgrade() else {
+            return false;
+        };
+        let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+        st.stats.get_mut(topic).is_some_and(|stat| stat.age_by(by))
     }
 
     /// Fail the next `n` mirror-provenance gathers with
@@ -10003,7 +10067,7 @@ pub fn start_on_socket(
         #[cfg(any(test, feature = "test-helpers"))]
         provenance_gather_faults: Arc::clone(&ctx.provenance_gather_faults),
         #[cfg(any(test, feature = "test-helpers"))]
-        provenance_state: Arc::downgrade(&ctx.state),
+        state_for_test: Arc::downgrade(&ctx.state),
         conns,
         worker_control,
         guard: Some(guard),
@@ -15226,6 +15290,60 @@ mod tests {
             stopped.rate_estimate, None,
             "a stopped stream claims no rate"
         );
+    }
+
+    /// `age_by` moves the start, the last arrival and the Hz window together, so one
+    /// read instant gives the verdict and the rate of an observation that much
+    /// older; an entry that is not observing, or an instant the clock cannot
+    /// represent, changes nothing.
+    #[test]
+    fn an_aged_tap_observation_reads_older_by_exactly_the_age() {
+        let base = Instant::now();
+        let mut stat = TopicStat::default();
+        stat.begin_observation(base);
+        stat.observe_frames(1, base);
+        observe_seq_gap_free(&mut stat, 100, base);
+        let arrival = base + Duration::from_secs(2);
+        stat.observe_frames(2, arrival);
+        observe_seq_gap_free(&mut stat, 200, arrival);
+        let read = arrival + Duration::from_millis(250);
+        let fresh = stat.liveness(read).expect("observing");
+        assert_eq!(
+            (fresh.last_frame_age_ms, fresh.observed_for_ms),
+            (Some(250), 2_250)
+        );
+        assert_eq!(fresh.state(), LivenessState::Streaming);
+        assert_eq!(stat.hz(read), Some(100.0 / 2.25), "100 frames over 2.25 s");
+
+        assert!(stat.age_by(Duration::from_millis(4_800)));
+        let aged = stat.liveness(read).expect("observing");
+        assert_eq!(
+            (aged.last_frame_age_ms, aged.observed_for_ms),
+            (Some(5_050), 7_050)
+        );
+        assert_eq!(aged.state(), LivenessState::Idle);
+        assert_eq!(aged.frames_observed, 3, "the frame count does not move");
+        assert_eq!(
+            stat.hz(read),
+            None,
+            "the newest Hz sample is 5.05 s old, past the streaming window"
+        );
+
+        assert!(
+            !stat.age_by(Duration::MAX),
+            "an instant before the clock's own start is refused"
+        );
+        assert_eq!(
+            stat.liveness(read).expect("observing"),
+            aged,
+            "a refused age moves nothing"
+        );
+        let mut not_observing = TopicStat::default();
+        assert!(
+            !not_observing.age_by(Duration::from_secs(1)),
+            "an entry that is not observing has nothing to age"
+        );
+        assert_eq!(not_observing.liveness(read), None);
     }
 
     #[test]
