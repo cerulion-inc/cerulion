@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""The model key reaches no address but the one given, through run-cell and the episode it starts. Standard
-library only, no simulator: the model endpoint is a server on the loopback address that answers every request
-with a redirect to a second server, and the episode driver is a stand-in in a folder made here. Like the episode
-driver, it starts the model client as a new Python process with its own environment; the client builds its
-urllib opener as the episode's model client does, so what is tested is what that process sends, not how."""
+"""The model key reaches no address but the one given, through run-cell, its relay and the episode it starts.
+Standard library only, no simulator: the model endpoint is a server on the loopback address that answers every
+request with a redirect to a second server, and the episode driver is a stand-in in a folder made here. Like the
+episode driver, it starts the model client as a new Python process with its own environment; the client builds
+its urllib opener as the episode's model client does, so what is tested is what that process sends, not how."""
 import contextlib
 import http.server
 import io
@@ -36,11 +36,13 @@ req = urllib.request.Request(sys.argv[1].rstrip("/") + "/chat/completions", data
                              headers={"Content-Type": "application/json",
                                       "Authorization": "Bearer " + os.environ[sys.argv[2]]})
 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# Whether this process's urllib follows a redirect at all, whatever the relay in front of the endpoint does.
+guard = urllib.request.HTTPRedirectHandler().redirect_request(req, None, 302, "", {}, "http://127.0.0.1:9/") is None
 try:
     with opener.open(req, timeout=30) as reply:
-        print(json.dumps({"status": reply.status}))
+        print(json.dumps({"status": reply.status, "guard": guard}))
 except urllib.error.HTTPError as exc:
-    print(json.dumps({"status": exc.code}))
+    print(json.dumps({"status": exc.code, "guard": guard, "location": exc.headers.get("Location")}))
 """
 done = subprocess.run([sys.executable, "-c", CLIENT, ns.base_url, ns.key_env], env=dict(os.environ),
                       stdin=subprocess.DEVNULL, capture_output=True, text=True)
@@ -112,9 +114,9 @@ class RedirectGuard(unittest.TestCase):
     def run_cell(self, *extra):
         err, out = io.StringIO(), io.StringIO()
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(out):
+            # No --work: the default scratch folder under /tmp, short enough for the episode's socket paths.
             code = cli.main(["run-cell", "--model", "m", "--base-url", self.url, "--key-env", "TEST_KEY",
-                             "--arm", "plain", "--out", self.out, "--work", os.path.join(self.tmp.name, "w"),
-                             *extra])
+                             "--arm", "plain", "--out", self.out, *extra])
         return code, err.getvalue()
 
     def test_with_the_endpoint_check_the_redirect_is_named_and_no_episode_starts(self):
@@ -127,9 +129,11 @@ class RedirectGuard(unittest.TestCase):
         self.assertFalse(os.path.exists(self.client))
 
     def test_without_the_endpoint_check_the_episode_client_follows_no_redirect(self):
+        # The client reaches the endpoint through run-cell's relay, which follows no redirect and passes no
+        # Location back; the client's own urllib follows none either.
         code, err = self.run_cell("--no-endpoint-check")
         with open(self.client, encoding="utf-8") as f:
-            self.assertEqual(json.load(f), {"status": 302})
+            self.assertEqual(json.load(f), {"status": 302, "guard": True, "location": None})
         self.assertEqual(code, 1, err)   # the stand-in driver scores nothing
         self.assertEqual(self.endpoint_saw, ["Bearer " + KEY])
         self.assertEqual(self.elsewhere_saw, [])
@@ -147,7 +151,8 @@ class RedirectGuard(unittest.TestCase):
         probe = ("import urllib.request\n"
                  "print(urllib.request.HTTPRedirectHandler().redirect_request(None, None, 302, '', {}, "
                  "'http://127.0.0.1:9/'))\n")
-        env = dict(os.environ, PYTHONPATH=os.pathsep.join((link, redirects.SITE, hidden)))
+        # PYTHONDONTWRITEBYTECODE as the episode has it (cli.THREADS): no bytecode written into the source folder.
+        env = dict(os.environ, PYTHONPATH=os.pathsep.join((link, redirects.SITE, hidden)), PYTHONDONTWRITEBYTECODE="1")
         done = subprocess.run([sys.executable, "-c", probe], env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=60)
         self.assertEqual((done.returncode, done.stdout.strip(), done.stderr), (0, "None", ""))
