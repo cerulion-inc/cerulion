@@ -23,7 +23,7 @@ Both run under the free Cerulion account, as the other `cerulion` commands do: r
 Every release package installs the harness folder beside `cerulion`: the install script, the release archives,
 the Debian package (`/usr/bin/harness`) and the Homebrew formula. A release's `cerulion` finds it there with no
 clone and no setting, and a `cerulion` built in a checkout of this repository finds that checkout's own
-([Where the harness lives](#where-the-harness-lives)). A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder.
+([Where the harness lives](#where-the-harness-lives)). A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`.
 
 ```bash
 cerulion login                                   # once, on this machine
@@ -50,7 +50,8 @@ Without `--http`, `cerulion rcp --sim` serves MCP over stdio, so a client can st
 claude mcp add cerulion-sim -- cerulion rcp --sim
 ```
 
-For a `cerulion` installed with `cargo install`, pass the variable to the server the client starts:
+For a `cerulion` installed with `cargo install`, pass the variable to the server the client starts. Give it an
+absolute path: the value is captured when the server is added, and the client starts it from its own directory.
 
 ```bash
 claude mcp add cerulion-sim -e CERULION_HARNESS_DIR="$CERULION_HARNESS_DIR" -- cerulion rcp --sim

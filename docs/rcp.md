@@ -1,8 +1,8 @@
 # Robot Context Protocol (`cerulion-rcpd`)
 
 Experimental: `cerulion-rcpd` is not in any release; build it from source. The simulated robot of
-[Try it in simulation](#try-it-in-simulation) needs no source build: the release packages install the harness
-beside `cerulion`, and the release's `cerulion` runs it from there.
+[Try it in simulation](#try-it-in-simulation) needs no source build when `cerulion` comes from a release package,
+which installs the harness beside it; the release's `cerulion` runs it from there.
 
 `cerulion-rcpd` is an MCP server that lets an agent read the live state of a
 robot running Cerulion and call the tools its manifest declares. It identifies
@@ -21,8 +21,8 @@ Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep thei
 ## Try it in simulation
 
 `cerulion rcp --sim` serves the tools of the [Cerulion harness](harness.md) with a simulated robot on your
-machine, to any MCP client. It needs no robot and no source build: every release package installs the harness
-folder beside `cerulion`, which finds it there with no clone and no setting. A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder. Sign in once, start it,
+machine, to any MCP client. It needs no robot, and with a release package no source build: every release package
+installs the harness folder beside `cerulion`, which finds it there with no clone and no setting. A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`. Sign in once, start it,
 and add it to your client:
 
 ```bash

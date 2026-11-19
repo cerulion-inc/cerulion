@@ -190,7 +190,10 @@ fn the_installed_harness_runs_as_the_packaged_folder_and_not_from_a_directory_ev
     }
 
     // Run it the way a user does: through a link on the PATH, which the CLI
-    // resolves to the real binary before it looks beside it.
+    // resolves to the real binary before it looks beside it. On macOS that is
+    // the CLI's own canonicalization at work; on Linux the kernel has already
+    // resolved the link in `/proc/self/exe`, so this run proves the layout
+    // there and the macOS job proves the resolution.
     let link_dir = installed.home.join("bin");
     fs::create_dir_all(&link_dir).expect("a link folder");
     let link = link_dir.join("cerulion");

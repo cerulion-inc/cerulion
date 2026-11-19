@@ -19,7 +19,7 @@ config directory and runs from the copy. A `cerulion` built in this checkout (`c
 `cerulion` at it; both run it in place while your user can write to it.
 The current directory is never searched for a harness. `CERULION_HARNESS_DIR` is taken as given; this folder
 beside the binary, or in a checkout, is never taken from a folder that every user can write to, such as `/tmp`.
-A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder.
+A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`.
 
 ## What is in it
 

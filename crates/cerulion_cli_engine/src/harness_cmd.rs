@@ -27,8 +27,8 @@
 //!
 //! A folder holds a harness when both [`LAUNCHER`] and [`INSTALL_SCRIPT`] are
 //! files in it. Rungs 2 and 3 take a folder only when no folder on the way to
-//! it from the binary's directory, both ends included, can be written by users
-//! other than its owner ([`others_can_write`]). The walk of rung 3 stops at the
+//! it from the binary's directory, both ends included, can be written by
+//! every user (o+w, [`others_can_write`]); group write is not read. The walk of rung 3 stops at the
 //! first such folder, so a `harness/` and a marker planted in a shared folder
 //! such as `/tmp` are never run.
 //!
@@ -149,7 +149,7 @@ fn holds_harness(dir: &Path) -> bool {
     dir.join(LAUNCHER).is_file() && dir.join(INSTALL_SCRIPT).is_file()
 }
 
-/// Whether users other than its owner can write to `dir`: its mode has the
+/// Whether every user can write to `dir` (o+w): its mode has the
 /// write bit for others, as `/tmp` and every folder of mode 1777 have, so any
 /// user of the machine can add files there. `false` for a folder whose mode
 /// cannot be read, such as one that does not exist, and on a platform without
@@ -160,7 +160,7 @@ pub fn others_can_write(dir: &Path) -> bool {
     std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o002 != 0)
 }
 
-/// Whether users other than its owner can write to `dir`: never, on a platform
+/// Whether every user can write to `dir` (o+w): never, on a platform
 /// without unix modes.
 #[cfg(not(unix))]
 pub fn others_can_write(_dir: &Path) -> bool {
@@ -171,10 +171,10 @@ pub fn others_can_write(_dir: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckoutRoot<'a> {
     /// The nearest folder that holds [`CHECKOUT_MARKER`]. Neither it nor any
-    /// folder below it on the way up can be written by other users.
+    /// folder below it on the way up can be written by every user (o+w).
     Found(&'a Path),
-    /// The walk stopped at this folder, which other users can write to
-    /// ([`others_can_write`]), whether or not it holds the marker; no folder
+    /// The walk stopped at this folder, which every user can write to
+    /// (o+w, [`others_can_write`]), whether or not it holds the marker; no folder
     /// below it on the way up does.
     StoppedAt(&'a Path),
     /// No folder up to the file system root holds the marker.
@@ -183,7 +183,7 @@ pub enum CheckoutRoot<'a> {
 
 /// The root of the Cerulion source checkout `exe_dir` sits in: the nearest of
 /// `exe_dir` and the folders above it that holds [`CHECKOUT_MARKER`]. The walk
-/// stops at the first folder other users can write to, whether or not it
+/// stops at the first folder every user can write to (o+w), whether or not it
 /// holds the marker, so a marker planted there, or in any folder above it, is
 /// never taken.
 pub fn checkout_root(exe_dir: &Path) -> CheckoutRoot<'_> {
@@ -247,7 +247,7 @@ pub fn find_harness_dir(
         return Ok(FoundHarness { dir, source });
     }
     // Rung 2: the folder beside the binary, when neither the binary's
-    // directory nor the folder itself is one other users can write to.
+    // directory nor the folder itself is one every user can write to (o+w).
     let beside_shared = exe_dir
         .zip(beside.as_deref())
         .and_then(|(exe_dir, beside)| {
@@ -264,8 +264,8 @@ pub fn find_harness_dir(
             source: HarnessSource::Packaged,
         });
     }
-    // Rung 3: the harness folder of the checkout root, when other users
-    // cannot write to it.
+    // Rung 3: the harness folder of the checkout root, when not every user
+    // can write to it (o+w).
     let root = exe_dir.map(checkout_root);
     let checkout_harness = match root {
         Some(CheckoutRoot::Found(root)) => Some(root.join(HARNESS_FOLDER)),

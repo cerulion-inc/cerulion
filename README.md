@@ -64,7 +64,7 @@ Each step runs only if the one before it succeeded, and the [APT distribution pa
 cargo install --locked cerulion_cli cerulion_netd
 ```
 
-The release installer places `cerulion-connectd` (the desk side of a remote connection) and `cerulion-remoted` (the robot side) beside the CLI. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
+The release installer places `cerulion-connectd` (the desk side of a remote connection), `cerulion-remoted` (the robot side) and the agent harness beside the CLI; a `cerulion` built this way has no harness beside it, so [Try the harness](#try-the-harness) says how to point it at one. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
 
 </details>
 
@@ -83,7 +83,7 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 
 ## Try the harness
 
-Give your own model the Cerulion harness's tools on a simulated robot, through Cerulion's MCP server. Experimental. Every release package installs the harness folder beside `cerulion`, so there is nothing to clone or set. Only a `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder. Then:
+Give your own model the Cerulion harness's tools on a simulated robot, through Cerulion's MCP server. Experimental. With a release package there is nothing to clone or set: every release package installs the harness folder beside `cerulion`. A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`. Then:
 
 ```bash
 cerulion login                                   # once, on this machine
