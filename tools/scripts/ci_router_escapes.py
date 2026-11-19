@@ -244,8 +244,11 @@ def read_log(text, universe, verdicts, where):
 
     def flush(at):
         while pending:
-            units, unplaced, opened = pending.popleft()
+            units, unplaced, opened, identified = pending.popleft()
             step['placed'] = True
+            if identified:
+                # Already failed by the rerun line that named it.
+                continue
             if units:
                 for unit_id in units:
                     verdicts.fail(unit_id, '%s, and no test result followed (%s)'
@@ -318,19 +321,34 @@ def read_log(text, universe, verdicts, where):
             # the step's own `-p` list says which one this block is.
             narrowed = [unit_id for unit_id in units
                         if universe.units[unit_id]['package'] in step['packages']]
-            pending.append((narrowed or units, unplaced, '%s: %s' % (at, line.strip())))
+            # The fourth field is set once cargo's rerun line names this
+            # block's unit while the block is still open: that unit FAILED, so
+            # a passing result that follows belongs to a later block.
+            pending.append([narrowed or units, unplaced, '%s: %s' % (at, line.strip()), False])
             continue
         match = LIBTEST_FAILED.match(line)
-        if match and len(pending) == 1 and len(pending[0][0]) == 1:
-            # Only when ONE block is open is it the binary whose output this
-            # is: a block that crashed without a result stays open while the
-            # next binary prints, and naming that one's tests after it would
-            # let another binary's known flake excuse a crash.
-            verdicts.tests.setdefault(pending[0][0][0], set()).add(match.group(1))
+        unnamed = [block for block in pending if not block[3]]
+        if match and len(unnamed) == 1 and len(unnamed[0][0]) == 1:
+            # Only when ONE block not yet named by a rerun line is open is it
+            # the binary whose output this is: a block that crashed without a
+            # result stays open while the next binary prints, and naming that
+            # one's tests after it would let another binary's known flake
+            # excuse a crash.
+            verdicts.tests.setdefault(unnamed[0][0][0], set()).add(match.group(1))
             continue
         match = RESULT.match(line)
         if match and pending:
-            units, unplaced, _ = pending.popleft()
+            if match.group(1) == 'ok':
+                # A passing result never closes a block whose unit a rerun line
+                # already named as failed.
+                index = next((i for i, block in enumerate(pending) if not block[3]), None)
+                if index is None:
+                    continue
+                block = pending[index]
+                del pending[index]
+            else:
+                block = pending.popleft()
+            units, unplaced, _, _ = block
             if match.group(1) == 'FAILED':
                 placed()
             # A block no unit claims matters only when it FAILED: a passing
@@ -353,6 +371,10 @@ def read_log(text, universe, verdicts, where):
                 verdicts.unplaced.append('%s:%d: %s' % (where, number, line.strip()))
             else:
                 verdicts.fail(unit_id, '%s:%d: %s' % (where, number, line.strip()))
+                for block in pending:
+                    if not block[3] and block[0] == [unit_id]:
+                        block[3] = True
+                        break
             continue
         match = BUILD_SCRIPT.search(line)
         if match:
@@ -395,6 +417,12 @@ def read_log(text, universe, verdicts, where):
             verdicts.fail(binary, '%s: %s %s %s' % (evidence, status, binary, test), test)
 
 
+# Every column the two TSV readers read, so a file that lacks one is refused
+# with a message rather than failing on a missing key.
+PER_TEST_COLUMNS = ('run', 'job_id', 'status', 'binary', 'test')
+PER_BINARY_COLUMNS = ('run', 'source', 'binary', 'result')
+
+
 def read_tsv(path, columns):
     try:
         with open(path, encoding='utf-8', newline='') as handle:
@@ -408,12 +436,20 @@ def read_tsv(path, columns):
 
 def read_per_test(path, universe, verdicts, run):
     final = {}
-    for number, row in enumerate(read_tsv(path, ('run', 'status', 'binary', 'test')), 2):
+    for number, row in enumerate(read_tsv(path, PER_TEST_COLUMNS), 2):
         if run and row['run'] != run:
             continue
-        final[(row['run'], row['job_id'], row['binary'], row['test'])] = (
-            row['status'], '%s:%d' % (path, number))
+        key = (row['run'], row['job_id'], row['binary'], row['test'])
+        # `SLOW` says a test was still running when nextest printed the line,
+        # and a finished run lists slow tests again after its Summary: it
+        # never replaces a finished status, and a test with no finished
+        # status has no verdict, as in `read_log` without a Summary.
+        if row['status'] in NEXTEST_RUNNING and key in final:
+            continue
+        final[key] = (row['status'], '%s:%d' % (path, number))
     for (_, _, binary, test), (status, evidence) in sorted(final.items()):
+        if status in NEXTEST_RUNNING:
+            continue
         if binary not in universe.units:
             if status not in NEXTEST_PASSING:
                 verdicts.unplaced.append('%s: nextest binary %s is no unit' % (evidence, binary))
@@ -424,7 +460,7 @@ def read_per_test(path, universe, verdicts, run):
 
 
 def read_per_binary(path, universe, verdicts, run):
-    for number, row in enumerate(read_tsv(path, ('run', 'source', 'binary', 'result')), 2):
+    for number, row in enumerate(read_tsv(path, PER_BINARY_COLUMNS), 2):
         if run and row['run'] != run:
             continue
         units = universe.by_running(row['source'], row['binary'])
@@ -849,6 +885,68 @@ def self_test():
           ['core::slow_test', 'netd::client_test'])
     check('crash then a failing neighbour names nothing',
           [e['tests'] for e in result['escapes']], [[], []])
+    # A binary that died without a result, named by cargo's rerun line, then a
+    # binary that passed: the pass closes its own block, not the crashed one.
+    cases += 1
+    crash_pass = '\n'.join([
+        '2026-11-17T22:00:00.0000000Z      Running tests/client_test.rs '
+        '(target/debug/deps/client_test-00000000000000aa)',
+        '2026-11-17T22:00:01.0000000Z error: test failed, to rerun pass '
+        '`-p netd --test client_test`',
+        '2026-11-17T22:00:02.0000000Z      Running tests/slow_test.rs '
+        '(target/debug/deps/slow_test-00000000000000bb)',
+        '2026-11-17T22:00:03.0000000Z test waits ... ok',
+        '2026-11-17T22:00:04.0000000Z test result: ok. 1 passed; 0 failed',
+    ])
+    result = run_score(ST_SELECTION, logs=[('crash.log', crash_pass)])
+    check('crash then a passing binary escapes',
+          [e['binary'] for e in result['escapes']], ['netd::client_test'])
+    check('crash then a passing binary observes the pass',
+          'core::slow_test' in result['unverified_skips'], False)
+
+    # A test nextest lists as SLOW after its run finished is the pass it had,
+    # from a log and from the per-test table, whatever order the rows come in;
+    # a test with SLOW alone has no verdict.
+    cases += 1
+    slow_log = '\n'.join([
+        '2026-11-17T22:10:00.0000000Z         PASS [  61.000s] core::slow_test waits',
+        '2026-11-17T22:10:01.0000000Z      Summary [  61.100s] 1 test run: 1 passed',
+        '2026-11-17T22:10:02.0000000Z         SLOW [> 60.000s] core::slow_test waits',
+    ])
+    result = run_score(ST_SELECTION, logs=[('slow.log', slow_log)])
+    check('slow pass from a log', [e['binary'] for e in result['escapes']], [])
+    check('slow pass from a log is observed', 'core::slow_test' in result['unverified_skips'],
+          False)
+    tmp = os.environ.get('TMPDIR', '/tmp')
+    slow_tsv = os.path.join(tmp, 'ci_router_escapes_selftest_%d_slow.tsv' % os.getpid())
+    head = 'run\tjob_id\tjob\tstatus\tseconds\tbinary\ttest\n'
+    try:
+        for label, rows, want_escapes, want_observed in (
+                ('pass then slow', ['PASS', 'SLOW'], [], True),
+                ('slow then pass', ['SLOW', 'PASS'], [], True),
+                ('slow alone', ['SLOW'], [], False),
+                ('slow then fail', ['SLOW', 'FAIL'], ['core::slow_test'], True)):
+            with open(slow_tsv, 'w', encoding='utf-8') as handle:
+                handle.write(head + ''.join('1\t10\tTest\t%s\t61.0\tcore::slow_test\twaits\n'
+                                            % status for status in rows))
+            result = run_score(ST_SELECTION, per_test=slow_tsv)
+            check('slow from the table, %s' % label,
+                  [e['binary'] for e in result['escapes']], want_escapes)
+            check('slow from the table, %s, observed' % label,
+                  'core::slow_test' not in result['unverified_skips'], want_observed)
+        # A per-test table without a column the reader reads is refused with a
+        # message, not a missing key.
+        with open(slow_tsv, 'w', encoding='utf-8') as handle:
+            handle.write('run\tjob\tstatus\tseconds\tbinary\ttest\n'
+                         '1\tTest\tPASS\t0.1\tcore::wire_test\tencodes\n')
+        try:
+            run_score(ST_SELECTION, per_test=slow_tsv)
+            fails.append('a per-test table without job_id was accepted')
+        except ScoreError as err:
+            check('a per-test table without job_id names it', 'job_id' in str(err), True)
+    finally:
+        if os.path.exists(slow_tsv):
+            os.remove(slow_tsv)
 
     # The two maps are refused when they are not the shape they claim.
     cases += 1
