@@ -45,8 +45,13 @@
 //! # Failure
 //!
 //! The file is created with `create_new`, so an existing file is never
-//! overwritten. A run that does not finish (an aborted pass, a write error) removes the
-//! partial file instead of leaving an unfinalized bag behind.
+//! overwritten. The engine creates it only after the bag's whole-run checks,
+//! so a bag those checks refuse leaves no file. A run that does not finish (a
+//! refused or aborted pass, a write error) removes the partial file instead of
+//! leaving an unfinalized bag behind. A run that stops before the sink's
+//! `finalize` abandons the writer first, so it logs no warning about a bag
+//! that is being deleted. A removal that fails logs one warning
+//! that the file is left at the `--record-out` path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
@@ -167,7 +172,8 @@ struct Inner {
 pub(crate) struct RecordOut {
     path: PathBuf,
     inner: Mutex<Inner>,
-    /// Set by [`Self::finalize`]; an unfinalized sink removes its file on drop.
+    /// Set by [`Self::finalize`]; an unfinalized sink abandons the writer it
+    /// still holds and removes its file on drop.
     finalized: AtomicBool,
 }
 
@@ -369,10 +375,26 @@ impl RecordOut {
 
 impl Drop for RecordOut {
     fn drop(&mut self) {
-        if !self.finalized.load(Ordering::Acquire) {
-            // Best effort: an unfinalized bag is worse than none, and the run
-            // that was writing it already reports its own failure.
-            let _ = std::fs::remove_file(&self.path);
+        if self.finalized.load(Ordering::Acquire) {
+            return;
+        }
+        // An unfinalized bag is worse than none, and the run that was writing
+        // it already reports its own failure. The writer is abandoned first:
+        // it closes the file without the writer's warning that the bag is
+        // unfinished, which would describe a file about to be removed.
+        let inner = self.inner.get_mut().unwrap_or_else(|p| p.into_inner());
+        if let Some(writer) = inner.writer.take() {
+            writer.abandon();
+        }
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => {}
+            // Already gone: nothing is left behind.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                "resim: the unfinished --record-out bag could not be removed, so a partial \
+                 file is left at the --record-out path; delete it by hand"
+            ),
         }
     }
 }
@@ -704,5 +726,117 @@ mod tests {
         let (out, path) = open(dir.path(), false);
         out.finalize().unwrap();
         assert!(BagReader::open(&path).unwrap().schema_catalog().is_none());
+    }
+
+    /// The warning a `BagWriter` dropped without `finalize` logs.
+    const UNFINALIZED_WARNING: &str = "BagWriter dropped without finalize()";
+
+    /// The warning a sink logs when it cannot remove its unfinished file.
+    const NOT_REMOVED_WARNING: &str = "the unfinished --record-out bag could not be removed";
+
+    /// The captured lines that contain `needle`.
+    fn lines_with<'a>(lines: &[&'a str], needle: &str) -> Vec<&'a str> {
+        lines
+            .iter()
+            .copied()
+            .filter(|l| l.contains(needle))
+            .collect()
+    }
+
+    /// A sink dropped before `finalize`, as a refused or aborted run drops it,
+    /// removes its file and logs nothing: its writer is abandoned, not dropped
+    /// unfinished. CONTROLS in the same body: a finalized sink keeps its file
+    /// when it drops, and a bare writer dropped unfinished under the same
+    /// capture logs the warning the first arm must not.
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_unfinished_output_bag_is_removed_without_a_writer_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, path) = open(dir.path(), true);
+        out.write_frame("/state", &frame(1, 5)).unwrap();
+        assert!(
+            path.exists(),
+            "PREMISE: the bag is on disk while it is written"
+        );
+        drop(out);
+        assert!(!path.exists(), "the unfinished bag is removed");
+        logs_assert(|lines| match lines_with(lines, "WARN").as_slice() {
+            [] => Ok(()),
+            warned => Err(format!("an abandoned sink logs no warning: {warned:?}")),
+        });
+
+        let finished = tempfile::tempdir().unwrap();
+        let (out, kept) = open(finished.path(), false);
+        out.write_frame("/state", &frame(1, 5)).unwrap();
+        out.finalize().unwrap();
+        drop(out);
+        assert!(
+            kept.exists(),
+            "a finalized sink keeps its file when it drops"
+        );
+
+        let bare = dir.path().join("bare.mcap");
+        drop(BagWriter::create(&bare, BagWriterConfig::default(), &[]).unwrap());
+        logs_assert(|lines| match lines_with(lines, "WARN").as_slice() {
+            [line] if line.contains(UNFINALIZED_WARNING) => Ok(()),
+            warned => Err(format!(
+                "the capture sees the writer's warning, once, from the bare writer: {warned:?}"
+            )),
+        });
+    }
+
+    /// A removal that fails leaves the file behind and says so once, as a WARN
+    /// carrying the error. It names the `--record-out` path and prints no
+    /// machine path. The writer is still abandoned, so its own warning stays
+    /// silent.
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_unfinished_output_bag_that_cannot_be_removed_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, path) = open(dir.path(), false);
+        out.write_frame("/state", &frame(1, 5)).unwrap();
+        // A directory where the file was: `remove_file` refuses a directory.
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        drop(out);
+        assert!(path.is_dir(), "what could not be removed is still there");
+        let machine_path = dir.path().display().to_string();
+        logs_assert(|lines| {
+            match lines_with(lines, NOT_REMOVED_WARNING).as_slice() {
+                [line]
+                    if line.contains("WARN")
+                        && line.contains("error=")
+                        && line.contains("delete it by hand")
+                        && !line.contains(&machine_path) => {}
+                other => {
+                    return Err(format!(
+                        "one WARN with the error and no machine path: {other:?}"
+                    ))
+                }
+            }
+            match lines_with(lines, UNFINALIZED_WARNING).as_slice() {
+                [] => Ok(()),
+                warned => Err(format!("the writer was abandoned, not dropped: {warned:?}")),
+            }
+        });
+    }
+
+    /// A file already gone when the sink drops leaves nothing behind, so the
+    /// drop reports nothing.
+    #[test]
+    #[tracing_test::traced_test]
+    fn an_unfinished_output_bag_already_gone_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, path) = open(dir.path(), false);
+        out.write_frame("/state", &frame(1, 5)).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        drop(out);
+        assert!(!path.exists());
+        logs_assert(|lines| match lines_with(lines, "WARN").as_slice() {
+            [] => Ok(()),
+            warned => Err(format!(
+                "nothing is left, so nothing is reported: {warned:?}"
+            )),
+        });
     }
 }

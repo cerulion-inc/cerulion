@@ -1,0 +1,6 @@
+list,cell,arm,model,attempt,refused_requests,scored_attempt,before_rerun
+libero10_development,l10_t04_i02,without,GPT-6 Astra,1,5,0,0
+libero10_development,l10_t06_i00,without,GPT-6 Astra,1,5,0,0
+libero10_development,l10_t06_i02,without,GPT-6 Astra,1,5,0,0
+libero10_development,l10_t06_i02,without,GPT-6 Astra,2,5,0,0
+libero10_development,l10_t06_i02,without,GPT-6 Astra,3,5,0,0

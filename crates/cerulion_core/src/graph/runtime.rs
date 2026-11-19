@@ -19,6 +19,7 @@
 //! capable). It requires a caller-owned `TransportManager`.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -3070,8 +3071,9 @@ struct LivelinessWatch {
 /// outlier sat on the 250 ms comb). The [`crate::transport::LivelinessCleaner`]
 /// holds only a `Config` clone and the reclaim is an associated fn keyed by it,
 /// so nothing of the live loop's transport crosses to this thread. Stopped and
-/// JOINED on drop (bounded by one in-flight pass). The cadence is an atomic so
-/// the test seam can shorten or park it without restarting the thread.
+/// JOINED on drop (bounded by one in-flight pass). The cadence lives in the
+/// shared schedule so the test seam can shorten or park it without restarting
+/// the thread.
 struct DeadNodeCleanupThread {
     shared: Arc<DeadNodeCleanupShared>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -3083,59 +3085,164 @@ struct DeadNodeCleanupThread {
 
 /// What the owner and the reclaim thread share.
 struct DeadNodeCleanupShared {
-    /// `true` once the owner asked the thread to exit; under the mutex so the
-    /// condvar wait cannot miss the flip.
-    stop: Mutex<bool>,
+    /// The thread's schedule, under one mutex so neither condvar wait can miss
+    /// a change.
+    gate: Mutex<CleanupGate>,
+    /// Wakes the thread: a stop, or a cadence change.
     wake: std::sync::Condvar,
+    /// Signalled when a pass ends (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pass_done: std::sync::Condvar,
+}
+
+/// The reclaim thread's schedule.
+struct CleanupGate {
+    /// `true` once the owner asked the thread to exit.
+    stopped: bool,
     /// Cadence (ms); re-read after every wake so a change applies at once.
-    period_ms: AtomicU64,
+    period_ms: u64,
+    /// Bumped by every cadence change. A wait that sees it move re-arms with
+    /// the new period, also when the old period ran out before the wait took
+    /// the lock back. Only the test seam changes the cadence.
+    #[cfg(any(test, feature = "test-helpers"))]
+    period_changes: u64,
+    /// `true` from the moment the thread decides to run a pass until that
+    /// pass returns (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_pass: bool,
+    /// `true` from the lock hold that enters a timed wait until the thread
+    /// takes the lock back, so a reader that holds the lock and sees it set
+    /// holds it while the thread is inside `wait_timeout` (a unit test reads
+    /// it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_wait: bool,
+}
+
+/// Ends the pass [`DeadNodeCleanupShared::wait_period`] started when dropped,
+/// so a pass that panics still ends. Only `wait_period` makes one, in the same
+/// lock hold that marks the pass as under way.
+#[cfg(any(test, feature = "test-helpers"))]
+struct PassEnd<'a>(&'a DeadNodeCleanupShared);
+
+/// The pass [`DeadNodeCleanupShared::wait_period`] decided to run. Under the
+/// test seam it is the [`PassEnd`] that ends it; otherwise it carries nothing.
+#[cfg(any(test, feature = "test-helpers"))]
+type PassToken<'a> = PassEnd<'a>;
+#[cfg(not(any(test, feature = "test-helpers")))]
+type PassToken<'a> = std::marker::PhantomData<&'a DeadNodeCleanupShared>;
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PassEnd<'_> {
+    fn drop(&mut self) {
+        self.0.lock_gate().in_pass = false;
+        self.0.pass_done.notify_all();
+    }
 }
 
 impl DeadNodeCleanupShared {
-    /// Wait one period. `true` when the period elapsed (run a pass), `false`
-    /// when the owner asked the thread to stop. A wake that is neither (the
-    /// period was changed) re-arms with the new value.
-    fn wait_period(&self) -> bool {
-        let mut stopped = self
-            .stop
+    fn new(period_ms: u64) -> Self {
+        Self {
+            gate: Mutex::new(CleanupGate {
+                stopped: false,
+                period_ms,
+                #[cfg(any(test, feature = "test-helpers"))]
+                period_changes: 0,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_pass: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_wait: false,
+            }),
+            wake: std::sync::Condvar::new(),
+            #[cfg(any(test, feature = "test-helpers"))]
+            pass_done: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock_gate(&self) -> std::sync::MutexGuard<'_, CleanupGate> {
+        // Every update under this lock is a plain assignment or increment, so
+        // a poisoned lock still holds a consistent schedule.
+        self.gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `pass` once per period until the owner stops the thread.
+    fn run_passes(&self, mut pass: impl FnMut()) {
+        while let Some(_end) = self.wait_period() {
+            pass();
+        }
+    }
+
+    /// Wait one period. `Some` when the period elapsed (run a pass; the pass
+    /// ends when the token drops), `None` when the owner asked the thread to
+    /// stop. A cadence change re-arms the wait with the new value, also when
+    /// it landed after the old period ran out but before this thread took the
+    /// lock back: the condvar reports that wake as a timeout.
+    fn wait_period(&self) -> Option<PassToken<'_>> {
+        let mut gate = self.lock_gate();
         loop {
-            if *stopped {
-                return false;
+            if gate.stopped {
+                return None;
             }
-            let period = Duration::from_millis(self.period_ms.load(Ordering::Relaxed));
+            #[cfg(any(test, feature = "test-helpers"))]
+            let changes = gate.period_changes;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = true;
+            }
+            let period = Duration::from_millis(gate.period_ms);
             let (guard, timeout) = self
                 .wake
-                .wait_timeout(stopped, period)
+                .wait_timeout(gate, period)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            stopped = guard;
-            if *stopped {
-                return false;
+            gate = guard;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = false;
             }
-            if timeout.timed_out() {
-                return true;
+            if gate.stopped {
+                return None;
+            }
+            #[cfg(any(test, feature = "test-helpers"))]
+            let unchanged = gate.period_changes == changes;
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            let unchanged = true;
+            if timeout.timed_out() && unchanged {
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    gate.in_pass = true;
+                    return Some(PassEnd(self));
+                }
+                #[cfg(not(any(test, feature = "test-helpers")))]
+                return Some(std::marker::PhantomData);
             }
         }
     }
 
-    /// Test seam only (the production cadence never changes).
+    /// Test seam only (the production cadence never changes). Returns once
+    /// the change is in force: a pass already under way has ended, and the
+    /// next one starts only after the new period elapses.
     #[cfg(any(test, feature = "test-helpers"))]
     fn set_period_ms(&self, ms: u64) {
-        self.period_ms.store(ms, Ordering::Relaxed);
-        // Take the lock so the store is ordered before the thread's next wait.
-        let _guard = self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.change_period(self.lock_gate(), ms);
+    }
+
+    /// [`Self::set_period_ms`] with the schedule lock already held.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn change_period(&self, mut gate: std::sync::MutexGuard<'_, CleanupGate>, ms: u64) {
+        gate.period_ms = ms;
+        gate.period_changes = gate.period_changes.wrapping_add(1);
         self.wake.notify_all();
+        while gate.in_pass {
+            gate = self
+                .pass_done
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     fn stop(&self) {
-        *self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.lock_gate().stopped = true;
         self.wake.notify_all();
     }
 }
@@ -3145,11 +3252,7 @@ impl DeadNodeCleanupThread {
     /// the thread: the graph still runs, but a CRASHED publisher's port is then
     /// not reclaimed by this runtime (graceful disconnects are unaffected).
     fn spawn(cleaner: crate::transport::LivelinessCleaner) -> Option<Self> {
-        let shared = Arc::new(DeadNodeCleanupShared {
-            stop: Mutex::new(false),
-            wake: std::sync::Condvar::new(),
-            period_ms: AtomicU64::new(LIVELINESS_CLEANUP_PERIOD_MS),
-        });
+        let shared = Arc::new(DeadNodeCleanupShared::new(LIVELINESS_CLEANUP_PERIOD_MS));
         #[cfg(any(test, feature = "test-helpers"))]
         let call_count = cleaner.call_count_handle();
         let worker = Arc::clone(&shared);
@@ -3177,13 +3280,9 @@ impl DeadNodeCleanupThread {
 
     fn run(shared: &DeadNodeCleanupShared, cleaner: &crate::transport::LivelinessCleaner) {
         Self::lower_own_priority();
-        tracing::debug!(
-            period_ms = shared.period_ms.load(Ordering::Relaxed),
-            "liveliness: dead-node reclaim thread started"
-        );
-        while shared.wait_period() {
-            cleaner.cleanup_dead_nodes();
-        }
+        let period_ms = shared.lock_gate().period_ms;
+        tracing::debug!(period_ms, "liveliness: dead-node reclaim thread started");
+        shared.run_passes(|| cleaner.cleanup_dead_nodes());
     }
 
     /// Renice THIS thread to [`DEAD_NODE_SWEEP_NICE`]. Linux and Android:
@@ -4355,7 +4454,7 @@ pub struct GraphRuntime {
     /// moved after the loop-top poll, so no wait happened) yields but does
     /// NOT count, else doorbell-driven runs inflate slice telemetry. The
     /// yield is what
-    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`WFE`-parked thread
+    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`MWAITX`/`WFE`-parked thread
     /// is RUNNING to the OS scheduler, so without it a co-located runnable
     /// peer got the core only at CFS wakeup granularity (measured p50
     /// 6.997 ms RTT on a same-core pinned ping-pong). The sleeping tiers
@@ -4399,6 +4498,11 @@ pub struct GraphRuntime {
     /// the `#[cfg(any(test, feature = "test-helpers"))]`
     /// [`Self::set_single_park_for_test`] (gate the SETTER, not the field).
     single_park_override: Option<bool>,
+    /// Test seam: a closure the Sync drain runs right after a node's align
+    /// pass; see [`Self::set_sync_align_hook_for_test`]. Test and test-helpers
+    /// builds only (`GraphRuntime` never crosses an FFI boundary).
+    #[cfg(any(test, feature = "test-helpers"))]
+    sync_align_hook: Option<Box<dyn FnMut() + Send>>,
     /// Wake sources collected from `external`-policy ingress (driver)
     /// nodes — one per node whose [`NodeEntry::external_source`] returned an
     /// [`ExternalSource::Fd`] / [`ExternalSource::Blocking`]. Populated ONCE at
@@ -4425,6 +4529,9 @@ pub struct GraphRuntime {
     /// Every native node's params as this build resolved them, keyed by node
     /// id: what [`Self::param_differences`] compares a recording against.
     params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce>,
+    /// The variables this build left out of its nodes' environment snapshot:
+    /// what [`Self::node_env_left_out`] returns.
+    node_env_left_out: NodeEnvLeftOut,
     /// Sticky inert-at-launch refusal.
     /// Once [`Self::collect_external_sources`] refuses the live run because one
     /// or more external nodes are provably inert (host-driven / no-source /
@@ -6021,8 +6128,15 @@ impl GraphRuntime {
         // Capture live env once at
         // build time so per-tick `ctx.env(...)` is replay-deterministic
         // (Principle #7). Wrapped in Arc so all NodeContexts in the
-        // graph share one allocation.
-        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
+        // graph share one allocation. A variable whose name or value is not
+        // valid UTF-8 is left out of the snapshot and its name is kept on the
+        // runtime (`node_env_left_out`). The build logs nothing about it: the
+        // process that owns the run reports it once.
+        let NodeEnvCapture {
+            snapshot,
+            left_out: node_env_left_out,
+        } = capture_node_env(std::env::vars_os());
+        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(snapshot);
         let mut handles = IndexMap::new();
         let mut topology_nodes = Vec::with_capacity(config.nodes.len());
         let fire_tap: Arc<OnceLock<FireInstall>> = Arc::new(OnceLock::new());
@@ -10372,6 +10486,11 @@ impl GraphRuntime {
             .now_ns()
             .saturating_add(EXTERNAL_TOPIC_SILENCE_GRACE_MS.saturating_mul(1_000_000));
 
+        debug_assert!(
+            sync_bindings_contiguous(sync_input_bindings.iter().map(|b| b.node_id.as_ref())),
+            "every node's Sync bindings must sit in one contiguous run: the drain walks a \
+             node's bindings from its first one and stops at another node's"
+        );
         // Fail fast if the live-loop WaitSet would exceed the
         // FD-set attachment bound — the loop attaches one notification per
         // data-trigger input + per sync input. Past the cap, iceoryx2 silently
@@ -10581,11 +10700,14 @@ impl GraphRuntime {
             park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
             credit_baseline_full_override: None,
             single_park_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            sync_align_hook: None,
             // External ingress sources are collected lazily at run_live
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
             external_sources_collected: false,
             params_in_force,
+            node_env_left_out,
             // No refusal yet; set the first time
             // `collect_external_sources` rejects a self-source-less external node.
             external_refusal: None,
@@ -13345,7 +13467,7 @@ impl GraphRuntime {
         // recheck loop now POLLS every external fd/doorbell source each recheck
         // (`monitor_wait_block` → `park_poll_fd_ready`) and drains Notified
         // listeners inline — so external readiness wakes the park at the recheck
-        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / degraded
+        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / MWAITX / degraded
         // sleep-recheck), NOT at the ≤250ms `live_timeout` sweep cadence the
         // earlier fd-skip left it at. Correctness always held (the sweep is
         // level-triggered / rings-delta'd and runs every live_step); the park's fd watch
@@ -14074,7 +14196,7 @@ impl GraphRuntime {
                 || self.has_credit_edges()
             {
                 // A shallow monitor-wait park replaces the blocking
-                // WaitSet wait, so the core stays in a SHALLOW C0.1/WFE state (no
+                // WaitSet wait, so the core stays in a SHALLOW C0.1/C0/WFE state (no
                 // deep cpuidle C-state) during the inter-step idle — removing the
                 // ~18µs C-state cold-wake the epoll-block suffers.
                 // Under the doorbell policy it ALSO arms on the
@@ -14350,7 +14472,7 @@ impl GraphRuntime {
     /// [`Self::monitor_wait_block`]'s recheck loop `poll(2)` every external
     /// fd/doorbell source each recheck (≤~100 µs, record-only via
     /// [`park_poll_fd_ready`]), so the park now wakes promptly on an fd on ALL
-    /// tiers (WFE / WAITPKG / degraded sleep-recheck) and the exclusion is GONE.
+    /// tiers (WFE / WAITPKG / MWAITX / degraded sleep-recheck) and the exclusion is GONE.
     /// This is still the ONE choke point every park-vs-reactor decision reads
     /// (reactor build in `run_live` + the test seam, the `live_step` park branch,
     /// the wait-policy telemetry line); external graphs now park uniformly. The
@@ -14645,7 +14767,7 @@ impl GraphRuntime {
     /// chunks [`Self::monitor_wait_block`] has performed, whichever mechanism
     /// paced each (see the `park_recheck_naps` field doc; the os_sync-paced
     /// subset is [`Self::park_os_sync_nap_count_for_test`]). 0 on primitive
-    /// targets — the real UMWAIT/WFE park never takes the `!performed` arm.
+    /// targets; the real UMWAIT/MWAITX/WFE park never takes the `!performed` arm.
     /// (Renamed from `park_recheck_sleep_count_for_test` with the field.)
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_recheck_nap_count_for_test(&self) -> u64 {
@@ -14671,7 +14793,7 @@ impl GraphRuntime {
     /// a context whose rung applies reports `> 0` here after
     /// parking; reverting the swap zeroes it while the pins stay green
     /// (the wake word is additive latency, not new semantics). 0 whenever that
-    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
+    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park host (Linux WAITPKG/MWAITX/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_wake_word_block_count_for_test(&self) -> u64 {
         self.park_wake_word_blocks
@@ -14730,6 +14852,16 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_single_park_for_test(&mut self, forced: Option<bool>) {
         self.single_park_override = forced;
+    }
+
+    /// Test seam: run `hook` in the step's drain right after each per-set Sync
+    /// node's listeners are emptied and its align pass has read every one of
+    /// its inputs. A frame the hook publishes then lands after the pass that
+    /// read the node's queues, at a fixed point in the drain. `None` removes
+    /// it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_sync_align_hook_for_test(&mut self, hook: Option<Box<dyn FnMut() + Send>>) {
+        self.sync_align_hook = hook;
     }
 
     /// Holistic-review L6 (test seam): is a WaitSet reactor currently
@@ -14878,7 +15010,7 @@ impl GraphRuntime {
     /// os_sync) the predicate above is no longer merely POLLED at the
     /// recheck cadence: the `!performed` arm sets the rank's `parked` bit
     /// (RAII `ParkedRankGuard`, scoped to the block: a
-    /// hardware CPU park never sets it, so arrivers on WAITPKG/WFE machines pay
+    /// hardware CPU park never sets it, so arrivers on WAITPKG/MWAITX/WFE machines pay
     /// no futile wake syscall) and kernel-blocks on the barrier's
     /// `wake_seq` epoch instead of the pacing sleep — every arrive/open/drop
     /// bumps the epoch (arrivers gate only the SYSCALL on the parked mask), so
@@ -14889,11 +15021,11 @@ impl GraphRuntime {
     /// kernel wake only gets us there sooner, so `park_wakes_barrier`
     /// semantics and the pins are untouched; the block itself is
     /// counted by `park_wake_word_blocks`, the mutation seam). The Linux
-    /// park-ON hardware arm (UMWAIT/WFE on the doorbell line) is untouched —
+    /// park-ON hardware arm (UMWAIT/MWAITX/WFE on the doorbell line) is untouched:
     /// the futex arm is not promoted into the scratch-word
     /// park.
     ///
-    /// **OS-cooperative hardware park:** a `UMWAIT`/`WFE`-parked
+    /// **OS-cooperative hardware park:** a `UMWAIT`/`MWAITX`/`WFE`-parked
     /// thread is RUNNING to the OS scheduler, so a park that sliced without
     /// yielding held its core for the whole idle and a co-located runnable
     /// peer (graph processes > cores under the multi-process default,
@@ -14905,7 +15037,7 @@ impl GraphRuntime {
     /// pacing chunk) and every hardware slice ends with
     /// `std::thread::yield_now()` (counted in `park_core_yields`, record-only):
     /// a co-located peer runs within one slice, the core still never enters a
-    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`WFE`
+    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`MWAITX`/`WFE`
     /// still wake instantly on the doorbell inside a slice. Cost: one ~0.5 µs
     /// `sched_yield` per slice, idle path only. The degraded sleep and
     /// wake-word arms keep their measured 100 µs pacing (a sleeping thread
@@ -14936,10 +15068,10 @@ impl GraphRuntime {
     /// a wakeup optimization, not part of the deterministic timeline.
     ///
     /// **No busy-spin:** on a target WITHOUT a real CPU monitor-wait primitive
-    /// (this macOS box, x86 without WAITPKG, or a forced-policy test seam) the
+    /// (macOS, x86 with neither WAITPKG nor MWAITX, or a forced-policy test seam) the
     /// park primitive returns `false` (a no-op); this method then
     /// `std::thread::sleep`s the recheck instead of re-looping immediately, so it
-    /// can never busy-spin at 100% CPU. On a real WAITPKG/WFE box the primitive
+    /// can never busy-spin at 100% CPU. On a real WAITPKG/MWAITX/WFE host the primitive
     /// parks for real and returns `true`. On the DEGRADED tier (the
     /// default-ON shape on no-primitive targets) the degraded sleep is ALWAYS
     /// the chunked ~100µs sleep-recheck. The single-sleep alternative was
@@ -14975,7 +15107,7 @@ impl GraphRuntime {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Loud over silent: name the DEGRADED tier once, at the FIRST
         // park of the runtime's life (`prior_entries == 0` — the counter is
-        // monotonic, never reset). Primitive (UMWAIT/WFE) targets skip this.
+        // monotonic, never reset). Primitive (UMWAIT/MWAITX/WFE) targets skip this.
         // The tier line names the NAP MECHANISM the degraded arm
         // resolved on THIS host — the os_sync timed wait (macOS ≥ 14.4, tier
         // active) or the plain chunked sleep — so an operator reading the log
@@ -15002,7 +15134,7 @@ impl GraphRuntime {
         let recheck = Duration::from_micros(100);
         // HARDWARE park slice: the shared 20µs
         // `monitor_wait::PARK_RECHECK` (the same constant rmw's `park_block`
-        // slices at). A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS
+        // slices at). A `UMWAIT`/`MWAITX`/`WFE`-parked thread is RUNNING to the OS
         // scheduler, so the hardware arm keeps its slices short and the loop
         // bottom YIELDS after every hardware slice (`park_core_yields`), so a co-located
         // runnable peer gets the core within one slice instead of at CFS
@@ -15117,7 +15249,7 @@ impl GraphRuntime {
         // eligibility — computed ONCE per park; the `parked` bit itself is now
         // set ONLY inside the `!performed` arm, scoped tightly around the
         // kernel block (its semantic: "a waiter is blocked on the wake word
-        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/WFE — `performed ==
+        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/MWAITX/WFE, `performed ==
         // true`) never reaches that arm and therefore NEVER sets the bit, so
         // arrivers on hardware-park machines pay no futile wake syscall for a
         // waiter the CPU monitor cannot hear on that line (the earlier
@@ -15173,7 +15305,7 @@ impl GraphRuntime {
                     }
                     // Poll external/doorbell raw fds (DeviceFd +
                     // DoorbellFd) each recheck. Earlier the park SKIPPED Fd
-                    // sources, so on a primitive target (WFE/WAITPKG) an external
+                    // sources, so on a primitive target (WFE/WAITPKG/MWAITX) an external
                     // node's only wake was the pre-step sweep at the ≤250ms
                     // `live_timeout` — ~1.9Hz per hop. `park_poll_fd_ready` is a
                     // non-blocking level-triggered readiness probe (record-only —
@@ -15313,7 +15445,7 @@ impl GraphRuntime {
             }
             // Shallow-park until the next recheck (or, with `single_park`, the
             // WHOLE remaining time) or the park deadline. With a doorbell, arm
-            // `UMONITOR`/`WFE` on the PRIMARY line against the pre-park snapshot so
+            // `UMONITOR`/`MONITORX`/`WFE` on the PRIMARY line against the pre-park snapshot so
             // a producer store wakes it early (the primitive's own arm-time
             // re-check closes the arm-window race); without one, park on a scratch
             // word (timer only). `single_park` passes `timeout` as the recheck cap
@@ -15657,10 +15789,12 @@ impl GraphRuntime {
     /// PARTICIPANT ignores this knob — the hardware monitor never arms on the
     /// barrier's `remaining` word, so a whole-window park (or single sleep)
     /// would blind the `peers_waiting` step-start wake until the park deadline.
-    /// Caveat: on x86 (`UMWAIT` honors the recheck cap) a single park
+    /// Caveat: under `MWAITX` (no OS limit on its timer) a single park
     /// covers the WHOLE window in one slice with no yield boundary, so a
     /// co-located runnable peer waits out the window — the exact same-core
-    /// starvation the default chunked-and-yielding shape fixes. Measurement
+    /// starvation the default chunked-and-yielding shape fixes. Under `UMWAIT`
+    /// Linux's time limit (`umwait_control/max_time`, 100000 TSC cycles by
+    /// default) ends each wait early, so the loop still yields. Measurement
     /// knob only; never set it on an oversubscribed box. (aarch64 `WFE` still
     /// returns at the ~100µs event stream regardless, so the loop — and its
     /// per-slice yield — keeps running there.)
@@ -17233,10 +17367,13 @@ impl GraphRuntime {
 
     /// Test-only: change the dead-node reclaim thread's cadence (production:
     /// [`LIVELINESS_CLEANUP_PERIOD_MS`]). Applies at once, including to a wait
-    /// already in progress. A huge value PARKS the walk (the zero-alloc gates
-    /// use this to keep it out of their measured windows); a small one lets a
-    /// test observe a pass without waiting the production 2 s. No-op when the
-    /// runtime has no liveliness watches (no thread).
+    /// already in progress, and returns only after a pass already under way
+    /// has ended, so [`Self::liveliness_cleanup_call_count`] read after it
+    /// moves only when the new period elapses. A huge value PARKS the walk
+    /// (the zero-alloc gates use this to keep it out of their measured
+    /// windows); a small one lets a test observe a pass without waiting the
+    /// production 2 s. No-op when the runtime has no liveliness watches (no
+    /// thread).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_liveliness_cleanup_period_for_test(&mut self, ms: u64) {
         if let Some(c) = &self.liveliness_cleanup {
@@ -17308,6 +17445,16 @@ impl GraphRuntime {
         // hot-path-alloc-ok: not a heap allocation: the clone is one `Arc`
         // refcount bump, taken before the run, never on a fire
         self.tick_panic_records.clone()
+    }
+
+    /// The variables this build left out of the environment snapshot its
+    /// nodes read (`ctx.env`, `ctx.env_str`, `ctx.env_opt`), because a name
+    /// or a value is not valid UTF-8.
+    ///
+    /// The build logs nothing about them. The process that owns the run
+    /// reports them once with [`NodeEnvLeftOut::warn`].
+    pub fn node_env_left_out(&self) -> &NodeEnvLeftOut {
+        &self.node_env_left_out
     }
 
     /// Every node stopped by a `NodeError::Fatal` from its tick during this
@@ -19793,6 +19940,51 @@ fn log_tick_failure_recovery(node_id: &str, suppressed: u64) {
     );
 }
 
+/// PURE: whether, in list order, every node id's entries sit in one
+/// contiguous run. The Sync drain's per-set walk relies on it: it empties a
+/// node's listeners from the node's first binding and stops at the first
+/// binding of another node.
+// hot-path-alloc-ok-fn: cold: build-time check only (one debug_assert per graph build)
+fn sync_bindings_contiguous<'a>(node_ids: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen: Vec<&'a str> = Vec::new();
+    for id in node_ids {
+        if seen.last() == Some(&id) {
+            continue;
+        }
+        if seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+    }
+    true
+}
+
+#[cfg(test)]
+mod sync_binding_order_tests {
+    use super::sync_bindings_contiguous;
+
+    #[test]
+    fn a_node_whose_bindings_are_split_by_another_nodes_is_not_contiguous() {
+        // (node ids in binding order, contiguous)
+        let cases: [(&[&str], bool); 7] = [
+            (&[], true),
+            (&["a"], true),
+            (&["a", "a"], true),
+            (&["a", "a", "b", "b", "c"], true),
+            (&["a", "b", "a"], false),
+            (&["a", "a", "b", "c", "a"], false),
+            (&["a", "b", "b", "a", "b"], false),
+        ];
+        for (ids, want) in cases {
+            assert_eq!(
+                sync_bindings_contiguous(ids.iter().copied()),
+                want,
+                "{ids:?}"
+            );
+        }
+    }
+}
+
 fn log_drain_failure(
     already_suppressed: bool,
     node_id: &str,
@@ -20284,44 +20476,62 @@ impl GraphRuntime {
                 continue;
             }
             // On the PER-SET path this binding's `trigger_subscribers`
-            // slot is a listener-only WAKE SOURCE, not a data receiver. Two
-            // things happen here instead of the legacy timestamp drain:
+            // slot is a listener-only WAKE SOURCE, not a data receiver. At the
+            // node's FIRST per-set binding, two things happen instead of the
+            // legacy timestamp drain, in this order:
             //
-            // 1. DRAIN ITS STALE NOTIFICATIONS. A publish onto a unified input
-            //    leaves its `SentSample` event in the standalone listener
-            //    forever if nothing on the step path takes it, and the live
-            //    loop's next idle poll reads the stale event as a data wake —
-            //    one spurious wake+step per publish, which under the multi-process
-            //    split is self-sustaining (the free-run class).
+            // 1. DRAIN THE STALE NOTIFICATIONS of every per-set binding of the
+            //    node. A publish onto a unified input leaves its `SentSample`
+            //    event in the standalone listener forever if nothing on the step
+            //    path takes it, and the live loop's next idle poll reads the
+            //    stale event as a data wake: one spurious wake+step per publish,
+            //    which under the multi-process split is self-sustaining (the
+            //    free-run class).
             // 2. RUN THE ALIGN PASS. It fills every unfilled head through the
             //    node lock and drives the matcher's verdicts, leaving a
-            //    complete in-window set for `decide_node` to fire — or not.
+            //    complete in-window set for `decide_node` to fire, or not.
+            //
+            // The order is the unified data-trigger drain's: empty, then read.
+            // A frame that lands after the align pass read its queue keeps its
+            // notification, so the next idle wait wakes on it. Emptying a later
+            // binding's listener after the pass would erase that notification
+            // while its sample stays queued, and the park or WaitSet would then
+            // sleep its full timeout. A frame that lands between the empty and
+            // the read is read by the pass if its head is empty, and leaves one
+            // stale wake either way: at most one spurious step, which needs a new
+            // publish in that window to recur.
             //
             // The align pass's own verdict is deliberately ignored here:
             // `decide_node` re-derives it from the heads, so there is ONE
             // authority for whether a node fires, and the burst loop is the
             // only other consumer of the outcome.
             if self.sync_input_bindings[i].per_set {
-                {
-                    let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    // iceoryx2 0.10: one `try_wait` empties the queue.
-                    let _ = wake_listener.try_wait(|_activation| {});
-                }
                 // ONCE PER NODE, not once per binding. The align pass is a
-                // WHOLE-NODE operation — it walks every declared trigger input —
+                // WHOLE-NODE operation (it walks every declared trigger input),
                 // so running it k times would re-probe every input k times, and
                 // each pass resets the per-input advance clamp, handing a k-input
                 // node k times the descent budget its own contract states.
                 //
                 // A node's bindings are pushed contiguously by the build loop
-                // (one per trigger input of one node), and the level filter above
-                // preserves that, so remembering the PREVIOUS node id is enough
-                // and costs no allocation on a path that runs every level of
-                // every step.
+                // (one per trigger input of one node; `sync_bindings_contiguous`
+                // checks it at build in debug builds), and the level filter above
+                // keeps or skips a node's bindings together, so remembering the
+                // PREVIOUS node id is enough, and the walk below stops at the
+                // first binding of another node. No allocation on a path that
+                // runs every level of every step.
                 if aligned_node.as_deref() == Some(node_id.as_ref()) {
                     continue;
                 }
                 aligned_node = Some(Arc::clone(&node_id));
+                for binding in self.sync_input_bindings[i..]
+                    .iter()
+                    .take_while(|b| b.node_id == node_id)
+                    .filter(|b| b.per_set)
+                {
+                    let wake_listener = self.trigger_subscribers[binding.subscriber_idx].listener();
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
+                }
                 if let Err(e) = self
                     .scheduler
                     .align_sync_heads(&node_id, crate::scheduler::SyncAlignSite::Boundary)
@@ -20331,6 +20541,10 @@ impl GraphRuntime {
                         error = %e,
                         "sync alignment skipped (node absent from the scheduler)"
                     );
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(hook) = self.sync_align_hook.as_mut() {
+                    hook();
                 }
                 continue;
             }
@@ -21154,6 +21368,256 @@ fn validate_no_silent_data_trigger(
             trigger_inputs.join(", ")
         ),
     })
+}
+
+/// The process environment as the nodes of one graph read it, split by
+/// [`capture_node_env`].
+struct NodeEnvCapture {
+    /// Every variable whose name and value are both valid UTF-8: the map that
+    /// `ctx.env`, `ctx.env_str` and `ctx.env_opt` read for the whole run.
+    snapshot: HashMap<String, String>,
+    /// Every variable left out of `snapshot` because its name or its value is
+    /// not valid UTF-8.
+    left_out: NodeEnvLeftOut,
+}
+
+/// The variables a graph build left out of the environment snapshot its nodes
+/// read, because a name or a value is not valid UTF-8. A node reads the
+/// default for each of them.
+///
+/// Each build records one ([`GraphRuntime::node_env_left_out`]) and logs
+/// nothing. The process that owns the run calls [`Self::warn`] once, for one
+/// of its builds: a single-process run for its build, the supervisor of a
+/// multi-process run for its planning build, a resim for its first pass. The
+/// workers and the other passes read the same environment and report nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEnvLeftOut {
+    /// Sorted by bytes, each name once.
+    names: Vec<OsString>,
+}
+
+impl NodeEnvLeftOut {
+    /// The name of each variable left out, sorted by bytes, each once.
+    pub fn names(&self) -> &[OsString] {
+        &self.names
+    }
+
+    /// Warn once, naming each variable left out, or do nothing when none was.
+    ///
+    /// The message is constant. The names ride the `names` field, where each
+    /// byte that is not valid UTF-8 prints escaped (`CER_\xFF`). No value is
+    /// printed, because a value may be a secret.
+    pub fn warn(&self) {
+        if self.names.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            names = ?self.names,
+            "node environment: variables whose name or value is not valid UTF-8 are left out, \
+             so ctx.env and ctx.env_str return the default for them"
+        );
+    }
+}
+
+/// Split `vars` into the snapshot the nodes read and the names left out of it.
+///
+/// A variable is kept only when both its name and its value are valid UTF-8,
+/// the case in which `std::env::var` returns its value, so a node reads the
+/// default for any other variable. The split is infallible: no name or value
+/// can fail the build, where `std::env::vars()` panics on the first variable
+/// that is not valid UTF-8.
+// hot-path-alloc-ok-fn: cold: graph BUILD, once per GraphRuntime, before the first step
+fn capture_node_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> NodeEnvCapture {
+    let mut snapshot = HashMap::new();
+    let mut left_out = Vec::new();
+    for (name, value) in vars {
+        match (name.into_string(), value.into_string()) {
+            (Ok(name), Ok(value)) => {
+                snapshot.insert(name, value);
+            }
+            (Ok(name), Err(_)) => left_out.push(OsString::from(name)),
+            (Err(name), _) => left_out.push(name),
+        }
+    }
+    left_out.sort();
+    left_out.dedup();
+    NodeEnvCapture {
+        snapshot,
+        left_out: NodeEnvLeftOut { names: left_out },
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod node_env_capture_tests {
+    //! Hand-written oracles for [`capture_node_env`] and
+    //! [`NodeEnvLeftOut::warn`]. Each input is the `(name, value)` list an
+    //! environment yields, built from raw bytes, so a name or value that is not
+    //! valid UTF-8 never enters this process's own environment. The build-level
+    //! arms, which run a real graph build in a child process, are in
+    //! `tests/env_snapshot_isolation_test.rs`.
+    use super::{capture_node_env, NodeEnvCapture};
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use tracing_test::traced_test;
+
+    fn os(bytes: &[u8]) -> OsString {
+        OsStr::from_bytes(bytes).to_os_string()
+    }
+
+    fn var(name: &[u8], value: &[u8]) -> (OsString, OsString) {
+        (os(name), os(value))
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The warning text, typed out by hand rather than shared with the code.
+    const WARNING: &str = "node environment: variables whose name or value is not valid UTF-8 \
+                           are left out, so ctx.env and ctx.env_str return the default for them";
+
+    #[test]
+    fn node_env_capture_of_a_utf8_environment_keeps_every_pair_and_leaves_nothing_out() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_A", b"1"),
+            var(b"CER_B", b"two"),
+            var(b"PATH", b"/usr/bin:/bin"),
+        ]);
+        assert_eq!(
+            snapshot,
+            map(&[("CER_A", "1"), ("CER_B", "two"), ("PATH", "/usr/bin:/bin")])
+        );
+        assert!(
+            left_out.names().is_empty(),
+            "nothing is left out: {left_out:?}"
+        );
+    }
+
+    #[test]
+    fn node_env_capture_of_an_empty_environment_is_empty() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `caf\xc3\xa9` is "café" in UTF-8, a two-byte sequence the split must
+    /// not mistake for invalid bytes; an empty value is still a value.
+    #[test]
+    fn node_env_capture_keeps_a_multibyte_utf8_value_and_an_empty_value() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_LAYOUT", b"caf\xc3\xa9"), var(b"CER_EMPTY", b"")]);
+        assert_eq!(snapshot, map(&[("CER_LAYOUT", "café"), ("CER_EMPTY", "")]));
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `\xff\xfe` is never UTF-8, and `caf\xe9` is "café" in Latin-1, where
+    /// `\xe9` starts a three-byte UTF-8 sequence that never finishes. Each is
+    /// left out by name; the UTF-8 neighbour is kept.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_value_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_LATIN1", b"caf\xe9"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_LATIN1"), os(b"CER_X")]);
+    }
+
+    /// A name that is not valid UTF-8 is left out whole: no lossy key such as
+    /// `CER_\u{FFFD}` appears in the snapshot.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_name_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_\xff", b"v"), var(b"CER_KEPT", b"kept")]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_\xff")]);
+    }
+
+    /// The left-out names come back in byte order, each once, whatever order
+    /// and however often the environment yields them.
+    #[test]
+    fn node_env_capture_names_each_left_out_variable_once_in_byte_order() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_Z", b"\xff"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_A", b"\xfe"),
+            var(b"CER_Z", b"\xff"),
+        ]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert_eq!(
+            left_out.names(),
+            [os(b"CER_A"), os(b"CER_Z"), os(b"CER_\xff")]
+        );
+    }
+
+    /// Two splits of one environment, in opposite orders, both equal the same
+    /// hand-written oracle.
+    #[test]
+    fn node_env_capture_is_identical_for_reversed_input() {
+        let vars = vec![
+            var(b"CER_KEPT", b"kept"),
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_LAYOUT", b"caf\xc3\xa9"),
+        ];
+        let reversed: Vec<_> = vars.iter().rev().cloned().collect();
+        for input in [vars, reversed] {
+            let NodeEnvCapture { snapshot, left_out } = capture_node_env(input);
+            assert_eq!(
+                snapshot,
+                map(&[("CER_KEPT", "kept"), ("CER_LAYOUT", "café")])
+            );
+            assert_eq!(left_out.names(), [os(b"CER_X"), os(b"CER_\xff")]);
+        }
+    }
+
+    /// The warning names every left-out variable, with its invalid byte
+    /// escaped, and carries no value: neither the secret-named one that is not
+    /// UTF-8 nor the plain value of a name that is not.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_names_every_left_out_variable_and_no_value() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([
+            var(b"CER_TOKEN", b"\xffhunter2"),
+            var(b"CER_\xff", b"plainvalue"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        left_out.warn();
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains(WARNING))
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [line]
+                    if line.contains(" WARN ")
+                        && line.contains(r#"names=["CER_TOKEN", "CER_\xFF"]"#) =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("one WARN line naming both variables: {other:#?}")),
+            }
+        });
+        for absent in ["hunter2", "plainvalue", "CER_KEPT"] {
+            assert!(!logs_contain(absent), "the warning never carries {absent}");
+        }
+    }
+
+    /// The control: nothing left out, nothing printed.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_is_silent_when_nothing_is_left_out() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([var(b"CER_KEPT", b"kept")]);
+        left_out.warn();
+        assert!(!logs_contain("node environment"));
+    }
 }
 
 #[cfg(test)]
@@ -22908,5 +23372,174 @@ mod fire_site_tests {
             ),
             (7, 10, 2, FireCause::Period, FireFlags::TICK_ERROR, 0b101)
         );
+    }
+}
+
+#[cfg(test)]
+mod dead_node_cleanup_schedule_tests {
+    use super::*;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    /// How long a negative check watches for a pass that must not start. A
+    /// broken schedule shows within it; a correct one can never fail it, since
+    /// the parked period is an hour.
+    const QUIET_WINDOW: Duration = Duration::from_millis(200);
+
+    /// Guards a hang only: every wait below ends as soon as its condition holds.
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+
+    const PARKED_MS: u64 = 3_600_000;
+
+    /// The reclaim loop on its own thread, counting passes.
+    fn start_counting(
+        period_ms: u64,
+    ) -> (
+        Arc<DeadNodeCleanupShared>,
+        Arc<AtomicU64>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let shared = Arc::new(DeadNodeCleanupShared::new(period_ms));
+        let passes = Arc::new(AtomicU64::new(0));
+        let worker = {
+            let (shared, passes) = (Arc::clone(&shared), Arc::clone(&passes));
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    passes.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        (shared, passes, worker)
+    }
+
+    fn wait_for_passes(passes: &AtomicU64, at_least: u64) {
+        let deadline = Instant::now() + HANG_GUARD;
+        while passes.load(Ordering::Relaxed) < at_least {
+            assert!(
+                Instant::now() < deadline,
+                "no pass ran within {HANG_GUARD:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn passes_keep_running_at_a_short_period() {
+        let (shared, passes, worker) = start_counting(5);
+        wait_for_passes(&passes, 3);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// The test keeps the schedule lock only once it sees the thread inside
+    /// its 20 ms wait after a pass, then holds it for 100 ms, so that wait
+    /// runs out before the thread takes the lock back and the park lands
+    /// first: the condvar reports a timeout, and the park must still win.
+    #[test]
+    fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
+        let (shared, passes, worker) = start_counting(20);
+        wait_for_passes(&passes, 1);
+        let deadline = Instant::now() + HANG_GUARD;
+        let gate = loop {
+            let gate = shared.lock_gate();
+            // A pass already ran, so the wait the thread sits in follows a
+            // pass, and the thread released the lock only inside it.
+            if gate.in_wait {
+                break gate;
+            }
+            drop(gate);
+            assert!(
+                Instant::now() < deadline,
+                "the thread never re-entered its wait after a pass"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        // The lock is held and no pass is under way, so none can start or
+        // count until the park below releases the lock: this is the count the
+        // park must keep.
+        let parked = passes.load(Ordering::Relaxed);
+        shared.change_period(gate, PARKED_MS);
+        std::thread::sleep(QUIET_WINDOW);
+        assert_eq!(
+            passes.load(Ordering::Relaxed),
+            parked,
+            "a pass started under the old period after the park returned"
+        );
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A park issued while a pass runs returns only once that pass has ended,
+    /// so a count read after the park already holds it.
+    #[test]
+    fn a_park_returns_only_after_the_pass_under_way_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                })
+            })
+        };
+        started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the first pass starts");
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let parker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.set_period_ms(PARKED_MS);
+                parked_tx.send(()).expect("test thread listening");
+            })
+        };
+        // The park has stored the new period and now waits on the pass.
+        let deadline = Instant::now() + HANG_GUARD;
+        while shared.lock_gate().period_changes == 0 {
+            assert!(Instant::now() < deadline, "the park never took the lock");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            parked_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "the park returned while a pass was still running"
+        );
+        release_tx.send(()).expect("pass waiting for release");
+        parked_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the park returns once the pass ends");
+        parker.join().expect("parker");
+        assert_eq!(
+            started_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "another pass started after the park"
+        );
+        drop(release_tx);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A pass that panics still ends, so a later park does not wait for it.
+    #[test]
+    fn a_pass_that_panics_still_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.run_passes(|| panic!("reclaim pass panicked")))
+        };
+        assert!(worker.join().is_err(), "the pass panicked");
+        assert!(!shared.lock_gate().in_pass, "the panicked pass ended");
+        shared.set_period_ms(PARKED_MS);
+    }
+
+    #[test]
+    fn a_stop_ends_a_parked_wait() {
+        let (shared, passes, worker) = start_counting(PARKED_MS);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+        assert_eq!(passes.load(Ordering::Relaxed), 0);
     }
 }
