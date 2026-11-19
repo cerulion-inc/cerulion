@@ -513,9 +513,10 @@ shards (one per shard on Linux; a hand-balanced 3-way tilt on macOS), with the i
 packages kept together so that large tree compiles once. On macOS, shard 2 also carries the
 six viz steps (`cerulion_viz`, `go2_tf`, the serial `cerulion-vizd` suite and the three
 OpenH264 steps) beside the trybuild tail, which is why it takes the lightest package set;
-there is NO macOS `viz-tests` leg. Linux shard 0 is the cache SAVER and
-shards 1-3 restore only; the macOS job's shard 0 saves and shards 1-2 restore, for the same
-reason. Each sharded job's `shard:` matrix is held to the count its shard step passes by
+there is NO macOS `viz-tests` leg. Every shard of both jobs has a cache key of its own: shard 0
+`cargo-<os>-<scope>-<lock hash>`, shard k above 0 `cargo-<os>-shard<k>-<scope>-<lock hash>`,
+starting from shard 0's archive until it has one. Shards above 0 save only when the cache save
+policy below names their namespaces, which the default does not. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
 Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
@@ -920,7 +921,8 @@ The policy is two workflow-level `env` values, each defaulting from a repository
 * `CACHE_SAVE_NAMESPACES` (`${{ vars.CACHE_SAVE_NAMESPACES || 'macOS Linux' }}`): the
   space-separated namespace tokens that may save, or `all`. A token is the key text between
   `cargo-` and the scope segment, with any `${{ steps.*.outputs.* }}` segment removed: `macOS`,
-  `Linux`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
+  `Linux` (shard 0 of each test job), `macOS-shard1`, `macOS-shard2` and `Linux-shard1` to
+  `Linux-shard3` (the other shards, which the default does not name), `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `examples-replay-Linux`, and
   `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lockhash>`, whose
   header hash is a cache generation rather than part of the namespace. The default is the
   expression's literal, so a repository with no variable saves the measured frontier and a
@@ -974,7 +976,8 @@ Python and Android lockfiles describe other workspaces and do not change that tr
 `android-check`, the example jobs and `python-client` keep their wider hashes. A save happens only on a key miss, whose
 run restored the previous generation through `restore-keys`, and cargo writes the units whose
 hash changed next to the old ones without deleting those. So in `test-linux` and `test-macos`
-shard 0 runs `tools/scripts/ci_cache_trim_target.sh` twice around its build: `age` right after
+each shard whose namespace may save runs `tools/scripts/ci_cache_trim_target.sh` twice around
+its build: `age` right after
 the restore sets the access time of every restored `.fingerprint` file to 2000-01-01, and `trim`
 before the prune deletes from every profile directory under `target/` (the scaffold target dirs
 under `target/tmp/` included) each `deps/`, `build/`, `examples/` and `.fingerprint/` entry whose
@@ -982,17 +985,18 @@ unit hash no cargo command in the job read, plus `incremental/`. Cargo reads the
 every unit in a build graph, fresh or not, so a unit the job used stays. The trim deletes nothing
 when a read leaves an aged access time unchanged, when `target/debug` holds no unit read during
 the run, or (per profile) when no `deps/` entry carries a live unit hash, and it prints the
-target size before and after. It runs on `main` only, under the save's namespace gate. Shard 0's
-archive then holds only the units its own cargo commands read, so a unit that only shards 1 to 3
-or a fall-through job (`lint`, `docs`, `netd-wan`) builds is compiled by that run every time.
+target size before and after. It runs on `main` only, under the save's namespace gate. Each
+shard's archive then holds only the units its own cargo commands read, so a unit that only a
+fall-through job (`lint`, `docs`, `netd-wan`) builds is compiled by that job every time, and so
+is a unit only shards 1 to 3 build while the policy does not name their namespaces.
 
 `lint`, `docs` and `netd-wan` build far smaller targets than the shards and used to share the
 shards' `cargo-Linux-` key, so whichever finished first saved it: on 2026-09-28 the entry under
 the shards' key was a 0.63 GB archive saved by one of the smaller jobs, not the shards' 3.18 GB
 one. They now have their own namespaces (`cargo-Linux-lint-`, `cargo-Linux-docs-`,
 `cargo-Linux-netd-wan-`). Under the default all three are restore-only and fall through their
-`restore-keys` to `cargo-Linux-main-`, the shards' archive;
-`test-linux` shard 0 restores and saves its own key; the shards 1 to 3 restore it.
+`restore-keys` to `cargo-Linux-main-`, shard 0's archive; every `test-linux` shard restores its
+own key and saves it when the policy names its namespace.
 
 Two exemptions, both narrow. The TOOL caches carry no lockfile generation for the prune to
 work from, so they carry no namespace gate and no prune step, only the cache-hit test and the
@@ -1026,7 +1030,11 @@ prune, under the prune's own condition (R9); nothing shadows the policy in a job
 `env` (R10); a prune whose keep key carries no `-main-`/`-pr-` scope segment -- one the scope rule
 cannot narrow, so it clears the whole namespace -- lives only in a job whose `if:` can never be
 true on a pull request, either a `github.event_name != 'pull_request'` conjunct or an allowlist of
-events naming none (R11); a key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
+events naming none (R11); a lockfile-keyed save in a job whose matrix declares `shard` (as a
+key or in an `include` entry) runs on shard 0 alone or carries the shard in its key in one of
+two forms, `${{ matrix.shard }}` or nothing on shard 0 and `-shard<k>` on shard k, so shards
+never race for one archive; any other key expression naming `matrix.shard` is refused (R12); a
+key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
 a job that passes `--timings` in a step carries `Collect the cargo timing reports` under
 `if: always()` with no `continue-on-error`, running the one script the checker holds, directly
 followed by `Upload the cargo timing reports` under `if: always()` with `continue-on-error: true`,
