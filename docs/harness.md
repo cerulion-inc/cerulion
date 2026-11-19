@@ -144,6 +144,11 @@ A Claude model (a model name that holds `claude`, in any case) runs `append` wit
 model without the harness, runs `swap`. The start line names each setup's mode, and `summary.json` records it
 with the operator flags it adds.
 
+The mark covers only the opening. Whether the older pictures are read from the cache depends on the endpoint: one
+that caches the growing conversation by itself bills them at its cached rate (on the endpoint the results package
+ran through, 97.4 to 97.9 percent of each Claude model's input with the harness was read from the cache), and one
+that caches only marked blocks bills them at its full input price on every request.
+
 `cerulion rcp bench` runs these defaults. To name one mode for both setups, run the program behind it from the
 harness folder with `--image-mode swap` or `--image-mode append`, once a first `cerulion rcp bench` has installed
 the harness:
