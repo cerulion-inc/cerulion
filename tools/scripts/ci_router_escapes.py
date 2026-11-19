@@ -26,7 +26,11 @@ WHERE THE VERDICTS COME FROM. Job logs as GitHub serves them (timestamps and
 colour codes are stripped here), or the tab-separated extracts
 `per_test.tsv` (nextest: `run, job_id, job, status, seconds, binary, test`)
 and `per_binary.tsv` (libtest: `run, job_id, job, source, binary, result,
-passed, failed, seconds`). From a log it reads:
+passed, failed, seconds`). The per-test table carries one `SUMMARY` row (status
+`SUMMARY`, binary and test `-`) for each job whose nextest run printed its
+`Summary`: in such a job a test whose last row is `SLOW` passed slowly, and a
+job with rows and no `SUMMARY` row is UNPLACED, as a log without a `Summary`
+is. From a log it reads:
 
   * nextest status lines (`FAIL [ 0.4s] (12/300) pkg::binary test`). A test's
     LAST status decides it: `PASS`, `FLAKY`, `LEAK` and `SKIP` pass, `SLOW`
@@ -463,6 +467,8 @@ def read_log(text, universe, verdicts, where):
 # Every column the two TSV readers read, so a file that lacks one is refused
 # with a message rather than failing on a missing key.
 PER_TEST_COLUMNS = ('run', 'job_id', 'status', 'binary', 'test')
+# The per-test table's row for a job whose nextest run printed its `Summary`.
+TABLE_SUMMARY = 'SUMMARY'
 PER_BINARY_COLUMNS = ('run', 'source', 'binary', 'result')
 
 
@@ -489,20 +495,36 @@ def read_tsv(path, columns):
 
 def read_per_test(path, universe, verdicts, run):
     final = {}
+    jobs = {}
+    summarized = set()
     for number, row in read_tsv(path, PER_TEST_COLUMNS):
         if run and row['run'] != run:
             continue
+        job = (row['run'], row['job_id'])
+        jobs.setdefault(job, '%s:%d' % (path, number))
+        if row['status'] == TABLE_SUMMARY:
+            summarized.add(job)
+            continue
         key = (row['run'], row['job_id'], row['binary'], row['test'])
-        # `SLOW` says a test was still running when nextest printed the line,
-        # and a finished run lists slow tests again after its Summary: it
-        # never replaces a finished status, and a test with no finished
-        # status has no verdict, as in `read_log` without a Summary.
+        # `SLOW` never replaces a finished status. A test whose last status
+        # is `SLOW` passed slowly when its job has a `SUMMARY` row (the closing
+        # list names a slow pass `SLOW`); in a job without one it has no
+        # verdict, and the job is UNPLACED below.
         if row['status'] in NEXTEST_RUNNING and key in final:
             continue
         final[key] = (row['status'], '%s:%d' % (path, number))
-    for (_, _, binary, test), (status, evidence) in sorted(final.items()):
+    for (run_id, job_id), evidence in sorted(jobs.items()):
+        if (run_id, job_id) not in summarized:
+            # The job never printed its Summary: it was cut short, so its
+            # missing rows are no passes, and another job's pass of the same
+            # binary cannot stand in for it.
+            verdicts.unplaced.append('%s: run %s job %s has no %s row, so its nextest run did '
+                                     'not finish' % (evidence, run_id, job_id, TABLE_SUMMARY))
+    for (run_id, job_id, binary, test), (status, evidence) in sorted(final.items()):
         if status in NEXTEST_RUNNING:
-            continue
+            if (run_id, job_id) not in summarized:
+                continue
+            status = 'PASS'
         if binary not in universe.units:
             if status not in NEXTEST_PASSING:
                 verdicts.unplaced.append('%s: nextest binary %s is no unit' % (evidence, binary))
@@ -814,7 +836,9 @@ ST_NEXTEST_BROKEN_LOG = '\n'.join([
 ST_PER_TEST = ('run\tjob_id\tjob\tstatus\tseconds\tbinary\ttest\n'
                '1\t10\tTest\tPASS\t0.1\tcore::wire_test\tencodes\n'
                '1\t10\tTest\tFAIL\t0.2\tcore::slow_test\twaits\n'
-               '2\t20\tTest\tFAIL\t0.2\tnetd::client_test\tother_run\n')
+               '2\t20\tTest\tFAIL\t0.2\tnetd::client_test\tother_run\n'
+               '1\t10\tTest\tSUMMARY\t0.3\t-\t-\n'
+               '2\t20\tTest\tSUMMARY\t0.2\t-\t-\n')
 ST_PER_BINARY = ('run\tjob_id\tjob\tsource\tbinary\tresult\tpassed\tfailed\tseconds\n'
                  '1\t11\tCrates\tsrc/lib.rs\ttf\tok\t3\t0\t0.01\n'
                  '1\t11\tCrates\tsrc/lib.rs\tnetd\tFAILED\t1\t1\t0.02\n')
@@ -1072,19 +1096,33 @@ def self_test():
     slow_tsv = os.path.join(tmp, 'ci_router_escapes_selftest_%d_slow.tsv' % os.getpid())
     head = 'run\tjob_id\tjob\tstatus\tseconds\tbinary\ttest\n'
     try:
-        for label, rows, want_escapes, want_observed in (
-                ('pass then slow', ['PASS', 'SLOW'], [], True),
-                ('slow then pass', ['SLOW', 'PASS'], [], True),
-                ('slow alone', ['SLOW'], [], False),
-                ('slow then fail', ['SLOW', 'FAIL'], ['core::slow_test'], True)):
+        summary = '1\t10\tTest\tSUMMARY\t61.1\t-\t-\n'
+        for label, rows, ended, want_escapes, want_observed, want_unplaced in (
+                ('pass then slow', ['PASS', 'SLOW'], True, [], True, 0),
+                ('slow then pass', ['SLOW', 'PASS'], True, [], True, 0),
+                ('slow alone, the run finished', ['SLOW'], True, [], True, 0),
+                ('slow alone, the run cut short', ['SLOW'], False, [], False, 1),
+                ('slow then fail', ['SLOW', 'FAIL'], True, ['core::slow_test'], True, 0)):
             with open(slow_tsv, 'w', encoding='utf-8') as handle:
                 handle.write(head + ''.join('1\t10\tTest\t%s\t61.0\tcore::slow_test\twaits\n'
-                                            % status for status in rows))
+                                            % status for status in rows)
+                             + (summary if ended else ''))
             result = run_score(ST_SELECTION, per_test=slow_tsv)
             check('slow from the table, %s' % label,
                   [e['binary'] for e in result['escapes']], want_escapes)
             check('slow from the table, %s, observed' % label,
                   'core::slow_test' not in result['unverified_skips'], want_observed)
+            check('slow from the table, %s, unplaced' % label, len(result['unplaced']),
+                  want_unplaced)
+        # A job cut short before its Summary is UNPLACED even when another job
+        # of the same run passed that binary, so the pass cannot cover a hang.
+        with open(slow_tsv, 'w', encoding='utf-8') as handle:
+            handle.write(head + '1\t10\tTest\tPASS\t61.0\tcore::slow_test\twaits\n' + summary
+                         + '1\t11\tTest\tFAIL\t1.0\tcore::wire_test\tdecodes\n')
+        result = run_score(ST_SELECTION, per_test=slow_tsv)
+        check('a job cut short beside a finished one is unplaced',
+              [line.split(': ', 1)[-1] for line in result['unplaced']],
+              ['run 1 job 11 has no SUMMARY row, so its nextest run did not finish'])
         # A per-test table without a column the reader reads is refused with a
         # message, not a missing key.
         with open(slow_tsv, 'w', encoding='utf-8') as handle:
