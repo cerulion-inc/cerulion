@@ -17,7 +17,8 @@ document; when a row and the file's own header disagree, the header wins; fix th
   joins a shard with nothing to edit, with ONE named exception: the script PINS
   `macro_compile_fail_test` to shard `PINNED_SHARD % count` (2 of 4 on Linux, 2 of 3 on
   macOS) and holds it out of the rotation. The blocking trybuild suite it held is now the
-  `node_macro_ui` package, run by its own step on that same shard; the pin keeps every
+  `node_macro_ui` package, whose tests run in that same shard's nextest invocation
+  (`--with node_macro_ui`); the pin keeps every
   other file on the shard the package map was balanced against. `PINNED_TEST` in that
   script is where the bar for adding a second pinned name lives. `--check` proves the
   pin landed where declared, and that the partition is total and disjoint. The script execs

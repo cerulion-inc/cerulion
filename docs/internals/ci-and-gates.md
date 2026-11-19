@@ -520,6 +520,26 @@ starting from shard 0's archive until it has one. Shards above 0 save only when 
 policy below names their namespaces, which the default does not. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
+`--with <package>` adds another package's integration tests to the same nextest
+invocation: `-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. On shard 2
+of both lanes the step passes `--with node_macro_ui`, so the `#[cerulion_node]`
+diagnostics suite builds in the shard's cargo invocation and its trybuild test runs beside
+the core tests; an override in `.config/nextest.toml` gives that test a priority of 100,
+which starts it first (at the default priority it sorts after every `cerulion_core`
+binary and would start last). Cargo applies `--lib` and each `--test` to every package one
+command selects, so the script refuses an extra package that holds a unit test or a
+doctest under `src/`, or a `tests/*.rs` named like one of `cerulion_core`'s; the suite's
+compile-pass programs are binaries of that package, which cargo builds for an integration
+test even when targets are named. Its dev-dependencies ask for `test-helpers` on
+`cerulion_core` and `native_ros2_messages`, which `cerulion_core`'s own test build already
+turns on, so every unit the shard compiles for the core tests keeps its features. The selection is read for each package on its own: a
+change that selects only `node_macro_ui` builds and runs its tests and none of the core
+files, a change that selects only `cerulion_core` runs no extra, and the script prints a
+`selection:` line for each package it leaves out. `--list` applies the same selection and
+prints the argument list the run would hand nextest, which is how to check a change to the
+step without running it. The coverage walk credits each `--with` package on the line; the
+package has no step or selection marker of its own in either job.
+
 Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
 what it built. There is no shared archive of test binaries and no job that builds one.
@@ -581,7 +601,9 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 Every `test-linux` and `test-macos` leg uses it: the step `Build this shard's package tests
 once and run their doctests` builds the leg's packages, every package step runs through
 `run`, and the leg ends with the audit. `cerulion_core` keeps its own build in its shard step,
-unchanged. A Lint step runs `check-workflow .github/workflows/ci.yml`.
+unchanged, and the `--with` packages build there too: they are in no group and have no
+`run` step, so the audit, which dates every compile, attributes theirs to
+`phase cerulion_core`. A Lint step runs `check-workflow .github/workflows/ci.yml`.
 
 * **Groups.** One unified build changes some packages' features: a package's tests link a
   shared crate with the union of what every package of the group enables. The unions in

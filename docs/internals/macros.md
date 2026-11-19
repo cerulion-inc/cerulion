@@ -241,8 +241,9 @@ Compile-fail coverage lives in two places:
   around it), checked by trybuild in
   `tests/compile_fail.rs`. The compile-pass programs in `tests/ui/pass/` are binary
   targets of that package: cargo builds each one for `tests/pass_programs.rs` as
-  `cargo build` builds a package that uses the macros, and that test runs it. CI runs
-  the package alone, `cargo test -p node_macro_ui`.
+  `cargo build` builds a package that uses the macros, and that test runs it. Locally,
+  `cargo test -p node_macro_ui`; CI runs its tests in the `cerulion_core` nextest shard
+  step on shard 2 (`ci_test_shard.sh ... --with node_macro_ui`).
 - **`#[ignore]`d** (toolchain-fragile rustc renderings):
   `crates/cerulion_core/tests/macro_compile_fail_test.rs` over
   `crates/cerulion_core/tests/ui/const_eval/` (const-eval panics) and
