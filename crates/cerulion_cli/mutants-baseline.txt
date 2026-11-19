@@ -1,0 +1,28 @@
+# Mutation baseline for cerulion_cli: the refusal of a command-line argument that is not valid UTF-8.
+#
+# Scope: `refusal` and `refusal_for_parse_error` in src/not_utf8_args.rs, the
+# text of the refusal and which clap parse errors it replaces. The rest of the
+# crate parses arguments and dispatches verbs over live paths the mutation
+# rule does not cover; the real-binary tests in
+# tests/argv_not_utf8_cli_test.rs gate the parse-error exit that calls them.
+#
+# Run:     cargo mutants -p cerulion_cli \
+#            -f crates/cerulion_cli/src/not_utf8_args.rs \
+#            --re 'refusal' --exclude-re 'tests::' \
+#            --timeout 300 --cap-lints true -- --bin cerulion not_utf8
+#          (`--exclude-re 'tests::'` leaves out the test module's own helper,
+#          which sits under `#[cfg(all(test, unix))]`; run in place in a
+#          scratch checkout; the unmutated baseline passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  14 mutants: 14 caught, 0 unviable, 0 missed. The two functions'
+#          bodies replaced with None, Some(String::new()) and
+#          Some("xyzzy".into()), the position's `+` replaced with `-` and `*`,
+#          and every `!`, `&&` and `!=` of the decision changed, each fail a
+#          test in not_utf8_args::tests.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)

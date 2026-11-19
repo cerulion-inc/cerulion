@@ -1,0 +1,6 @@
+list,cell,arm,model,attempts,reason,usd_attempts,price_date,replies_tool_calls,replies_stop,replies_length,replies_content_filter,replies_other,requests_no_reply
+libero10,l10_t06_i21,without,GPT-6 Astra,3,"the model endpoint refused every attempt: HTTP 400, Image processing blocked due to content policy violation",6.072735,2026-11-17,57,0,0,0,0,18
+libero10,l10_t06_i26,without,GPT-6 Astra,3,"the model endpoint refused every attempt: HTTP 400, Image processing blocked due to content policy violation",0.275508,2026-11-17,11,0,0,0,0,16
+libero10,l10_t06_i31,without,GPT-6 Astra,3,"the model endpoint refused every attempt: HTTP 400, Image processing blocked due to content policy violation",0.881825,2026-11-17,20,0,0,0,0,15
+libero10,l10_t06_i42,without,GPT-6 Astra,3,"the model endpoint refused every attempt: HTTP 400, Image processing blocked due to content policy violation",12.241631,2026-11-17,97,0,0,0,0,18
+libero10,l10_t04_i45,without,GPT-6 Astra,3,"the model endpoint refused every attempt: HTTP 400, Image processing blocked due to content policy violation",9.888646,2026-11-17,81,0,0,0,0,15

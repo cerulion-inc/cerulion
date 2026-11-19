@@ -83,6 +83,8 @@ members = [
     "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",
     # Oracle-vector fixture for raw-FFI template emit.
     "crates/test_fixtures/test_node_raw_ffi_template_cdylib",
+    # The raw template created with one output, after two `node modify` calls.
+    "crates/test_fixtures/test_node_modified_raw_cdylib",
     "crates/test_fixtures/test_node_unknown_schema_cdylib",
     # Variable-schema spill round-trip across FFI.
     "crates/test_fixtures/test_node_macro_overflow_cdylib",
@@ -399,9 +401,9 @@ default-members = [
     "crates/cerulion_ops_proto",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
-    # The RCP daemon adds only rmcp, sse-stream, a second base64, a second
-    # sha2 (with its digest 0.11 stack) and `h2` to the default build: its
-    # HTTP server and its Jev client run on hyper, already here.
+    # The RCP daemon adds only rmcp, sse-stream, a second base64 and `h2` to
+    # the default build: its HTTP server and its Jev client run on hyper,
+    # already here.
     "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a

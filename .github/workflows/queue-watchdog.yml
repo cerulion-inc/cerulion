@@ -1,0 +1,54 @@
+name: Queue run watchdog
+
+# Cancels a merge-queue run of `ci.yml` at its first failed required job, or
+# once its batch has left the queue without merging.
+#
+# A failed required context fails the queue batch by itself, so the rest of
+# that run changes no verdict. What it holds is its runner minutes, and the
+# concurrency group `ci.yml` keys a queue run on: a pull request queued again
+# on the same `main` gets the same queue branch, so its new run waits in that
+# group until the failed run ends. GitHub does not cancel a run whose batch
+# leaves the queue (a pull request removed or queued again, a failure ahead of
+# it): that run fails nothing and holds the same minutes to its end.
+# `tools/scripts/ci_queue_watchdog.sh` finds the `ci.yml` run of this event's
+# queue commit and once a minute reads its jobs against
+# `tools/ci/required_contexts.txt` and the merge queue of the base branch. It
+# cancels the run at the first failed required job, or when the commit is no
+# entry's head commit and not in the base branch on two polls in a row, and
+# stops once the run has completed; the Lint job runs its oracle.
+#
+# A file of its own, not a job of `ci.yml`: no job there takes `actions: write`
+# except to prune its cache, and this one needs it to cancel. It reports no
+# required context, so a watchdog that cannot read or cancel leaves the run to
+# finish as it would have and never blocks the batch. Pull request runs are
+# not watched: they keep every failure on show.
+on:
+  merge_group:
+
+# `actions: write` lists the run's jobs and cancels the run. `contents: read`
+# is granted for the merge queue read and the compare; no GitHub page names
+# the permission the job token needs for `repository.mergeQueue`, so a batch's
+# log shows whether it is enough. A refused queue read or compare is said once
+# and turns only the dead batch check off.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  watch:
+    name: Cancel the queue run once its batch fails or leaves the queue
+    runs-on: ubuntu-latest
+    # Above the longest chain of `ci.yml` jobs (`python-client` after `lint`,
+    # 45 + 90 minutes) plus the wait for a macOS runner, so a slow run that
+    # passes is still watched to its end.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Watch the ci.yml run of this queue commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          WATCH_SHA: ${{ github.event.merge_group.head_sha }}
+          WATCH_BASE_REF: ${{ github.event.merge_group.base_ref }}
+        run: tools/scripts/ci_queue_watchdog.sh tools/ci/required_contexts.txt

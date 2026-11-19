@@ -390,8 +390,12 @@ fn serve(
         &provisioned.endpoint_id,
         &refresh_facts,
     );
-    // Gracefully reap the child, then finish the revocation fetch before
-    // returning the shared endpoint and restoring outgoing reader pins.
+    // Tell a running revocation fetch the stop began, gracefully reap the
+    // child, then finish the fetch before returning the shared endpoint and
+    // restoring outgoing reader pins.
+    if let Some(sync) = epoch_sync.as_mut() {
+        sync.signal_stop();
+    }
     drop(child);
     if let Some(sync) = epoch_sync.as_mut() {
         sync.stop();
@@ -477,13 +481,16 @@ fn epoch_sync_period_from_env() -> Duration {
     resolve_epoch_sync_period(std::env::var(EPOCH_SYNC_PERIOD_ENV).ok().as_deref())
 }
 
-/// The environment variable setting how long a netd shutdown waits for a
-/// running revocation fetch to finish before stopping it, in whole seconds from
-/// 5 to 120. A longer wait lets a session refresh in flight publish its
-/// rotated token pair; it also lengthens a shutdown that lands during a fetch.
-/// A shutdown with no fetch running, or with one that ends sooner, does not
-/// wait. The robot server is stopped before this wait, and netd's hard-exit
-/// deadline (`CERULION_NETD_HARD_EXIT_MS`) is extended by this grace.
+/// The environment variable setting how long a netd shutdown (or the teardown
+/// before a robot server restart) waits for a running revocation fetch to finish
+/// before stopping it, in whole seconds from 5 to 120, counted from the SIGTERM
+/// the teardown sends the fetch as it begins, after which the fetch starts no
+/// session refresh or certificate renewal. A longer wait lets a session refresh
+/// in flight publish its rotated token pair; it also lengthens a shutdown that
+/// lands during a fetch. A shutdown with no fetch running, or with one that ends
+/// sooner, does not wait. The wait overlaps the robot server's own stop; a fetch
+/// still running once both have ended is stopped. netd's hard-exit deadline
+/// (`CERULION_NETD_HARD_EXIT_MS`) is extended by this grace.
 pub const EPOCH_SYNC_STOP_GRACE_ENV: &str = "CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S";
 /// What the stop grace adds to one account HTTP exchange: the worker's local
 /// publication of the refreshed pair and its own exit after the exchange.
@@ -529,9 +536,12 @@ pub fn resolve_epoch_sync_stop_grace(env_value: Option<&str>) -> Duration {
 fn epoch_sync_stop_grace_from_env() -> Duration {
     resolve_epoch_sync_stop_grace(std::env::var(EPOCH_SYNC_STOP_GRACE_ENV).ok().as_deref())
 }
-/// The bound on one revocation fetch: above the worker's own worst case (a
-/// 30 s wait for the session refresh lock, a 30 s refresh request, a 30 s
-/// access request), so the deadline never cuts a refresh in flight.
+/// The bound on one revocation fetch: above the worker's own bound (a robot-proof
+/// fetch bounded at 24 s, then a 30 s wait for the session refresh lock, a
+/// 30 s refresh request and its 1 s save, and a 30 s access request: 115 s), so
+/// the deadline never cuts a refresh in flight. The worker starts a
+/// device-certificate renewal only in its first 15 s, and a renewal takes at most
+/// 62 s.
 const EPOCH_SYNC_DEADLINE: Duration = Duration::from_secs(120);
 /// The shortest gap between two fetches started by connection requests: caps
 /// the account-service load connecting keys can cause at 12 requests a minute.
@@ -569,6 +579,8 @@ struct EpochSync {
     next: Instant,
     last_start: Option<Instant>,
     failures: u32,
+    /// When [`EpochSync::signal_stop`] signalled the running fetch.
+    stop_signalled: Option<Instant>,
 }
 
 impl EpochSync {
@@ -588,6 +600,7 @@ impl EpochSync {
             next: now,
             last_start: None,
             failures: 0,
+            stop_signalled: None,
         }
     }
 
@@ -645,14 +658,39 @@ impl EpochSync {
         }
     }
 
-    /// Shutdown: wait for a running fetch to exit, for at most the stop grace,
-    /// then stop it (dropping the child kills and reaps it). Returns as soon as
-    /// the worker exits, and at once when none is running.
+    /// The start of shutdown: send a running fetch SIGTERM, once, after which it
+    /// starts no session refresh or certificate renewal; requests already sent,
+    /// and requests that spend no token, may still run. The stop grace runs from
+    /// here.
+    fn signal_stop(&mut self) {
+        if self.stop_signalled.is_some() {
+            return;
+        }
+        let Some((child, _)) = self.child.as_mut() else {
+            return;
+        };
+        if !matches!(child.0.try_wait(), Ok(None)) {
+            return;
+        }
+        self.stop_signalled = Some(Instant::now());
+        if let Err(error) = send_sigterm(child.0.id()) {
+            tracing::warn!(
+                error = %error,
+                "could not tell the robot revocation sync that netd is stopping; waiting within its stop grace"
+            );
+        }
+    }
+
+    /// Shutdown: signal a running fetch ([`EpochSync::signal_stop`]) unless that
+    /// was done, wait for it to exit until the stop grace after the signal, then
+    /// stop it (dropping the child kills and reaps it). Returns as soon as the
+    /// worker exits, and at once when none is running.
     fn stop(&mut self) {
+        self.signal_stop();
         let Some((mut child, _)) = self.child.take() else {
             return;
         };
-        let until = Instant::now() + self.stop_grace;
+        let until = self.stop_signalled.take().unwrap_or_else(Instant::now) + self.stop_grace;
         while Instant::now() < until {
             if !matches!(child.0.try_wait(), Ok(None)) {
                 return;

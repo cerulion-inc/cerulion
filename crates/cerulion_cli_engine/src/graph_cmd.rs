@@ -121,7 +121,7 @@ pub enum CpuDmaLockMode {
 
 /// How the live-loop CPU monitor-wait park is selected. Auto-ON for a
 /// LIVE graph on every target: a real shallow CPU monitor-wait where the CPU
-/// has a primitive (Linux x86_64 WAITPKG / Linux aarch64 WFE), the degraded
+/// has a primitive (Linux x86_64 WAITPKG or MWAITX / Linux aarch64 WFE), the degraded
 /// sleep-recheck park elsewhere; `--no-monitor-wait` is the hard opt-out. Env
 /// overrides `CERULION_MONITOR_WAIT` / `CERULION_DOORBELL` (`"1"` force-on /
 /// `"0"` disable) resolve through `Auto`; an explicit `CERULION_MONITOR_WAIT=0`
@@ -536,7 +536,7 @@ struct MonitorWaitInputs<'a> {
     /// parks).
     is_live: bool,
     /// `cerulion_core::monitor_wait::monitor_wait_available()` — false off
-    /// Linux-WAITPKG / Linux-aarch64, where the real CPU monitor-wait park is
+    /// Linux x86_64 with WAITPKG or MWAITX / Linux aarch64, where the real CPU monitor-wait park is
     /// unavailable and arm 2 substitutes the degraded sleep-recheck park.
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
@@ -573,7 +573,7 @@ struct MonitorWaitInputs<'a> {
 ///    the flag won, because a request that cannot be honoured is never dropped in
 ///    silence.
 /// 2. `!primitive_available` (no real CPU monitor-wait on this target, e.g.
-///    macOS or x86 without WAITPKG) → the DEGRADED park tier (default-ON
+///    macOS or x86 with neither WAITPKG nor MWAITX) → the DEGRADED park tier (default-ON
 ///    after the wake-latency sweep: base epoll-block
 ///    p50 was unstable 15-54µs on macOS; the degraded park held a
 ///    stable ~8.5-11.5µs p50 / 16.4µs p99 with zero busy-spin).
@@ -7096,6 +7096,9 @@ pub fn graph_run(
                 clock.clone(),
                 Some(&schema_hashes),
             )?;
+            // This single process owns the run: it reports what its one build
+            // left out of the nodes' environment.
+            runtime.node_env_left_out().warn();
             // Production trace cap — `--trace-limit` (defaults to
             // PRODUCTION_TRACE_LIMIT; 0 rejected at the CLI parse).
             runtime.set_trace_limit(trace_limit);
@@ -7201,8 +7204,8 @@ pub fn graph_run(
             // building the runtime (the policy is threaded into the
             // policy-aware live builder). The env reads are bound to owned
             // locals first so the `.as_deref()` borrows outlive the struct
-            // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
-            // host (e.g. aarch64 macOS) `monitor_wait_available()` is
+            // (mirrors `env_lock`/`env_us` above). On a host with no CPU
+            // monitor-wait primitive (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
             // default-ON for live: monitor_wait per the arm-3 flag ladder, and
             // the doorbell where a consumer can kernel-block on one. The
@@ -7243,6 +7246,9 @@ pub fn graph_run(
                     Some(&schema_hashes),
                     mw_policy,
                 )?;
+            // This single process owns the run: it reports what its one build
+            // left out of the nodes' environment.
+            runtime.node_env_left_out().warn();
             let gateway_child = establish_network_egress(
                 gateway_launch.as_ref(),
                 graph_name,
@@ -11592,6 +11598,10 @@ fn graph_run_supervisor(
         // the top of every recorded run read as the run's result.
         cerulion_core::graph::BuildPurpose::PlanningOnly,
     )?;
+    // The supervisor owns the run: it reports what the planning build left out
+    // of the nodes' environment, once, before any worker spawns. Each worker
+    // builds its subgraph from the same environment and reports nothing.
+    runtime.node_env_left_out().warn();
     // Snapshot the impure planner inputs, then tear the planning runtime down
     // (releases its ports). `Levels` is `Clone`. `shutdown` consumes the runtime.
     let levels = runtime.levels().clone();
@@ -15503,6 +15513,9 @@ pub fn graph_profile(
         Some(&schema_hashes),
         mw_policy,
     )?;
+    // This single process owns the profiling run: it reports what its one
+    // build left out of the nodes' environment.
+    runtime.node_env_left_out().warn();
     runtime.set_live_transport(transport.clone());
 
     // Size the trace ring for the profiling window: per-node target × nodes
@@ -17468,12 +17481,37 @@ fn resolve_recording_paths(record_dir: &Path, graph_name: &str, now: Duration) -
 /// file, which is never touched by recording. The round trip is pinned by
 /// `the_effective_graph_yaml_round_trips_through_the_replay_parser`.
 ///
-/// `pub(crate)` because `bag_migrate` re-renders the graph it strips
-/// through THIS renderer, so a migrated bag's `graph.yaml` is byte-for-byte the
-/// shape `graph run --record` writes rather than a second normalization that
-/// could drift from it.
+/// Public because an embedded host serves THIS render as its hosted run's
+/// `graph.yaml`, and `bag_migrate` re-renders the graph it strips through it
+/// too, so a hosted run, a migrated bag and `graph run --record` carry one
+/// normalization rather than several that could drift apart.
+///
+/// # Errors
+///
+/// [`CliError::Validation`] when `serde_yaml` cannot serialize the config.
+///
+/// # Examples
+///
+/// Render `graphs/lobby.yaml` of the workspace at `workspace_dir`, read by
+/// name the way every `cerulion graph` verb reads it:
+///
+/// ```
+/// use cerulion_cli_engine::graph_cmd::{graph_read, render_effective_graph_yaml};
+/// use cerulion_cli_engine::workspace::CerulionWorkspace;
+/// # use cerulion_cli_engine::{graph_cmd::graph_create, workspace::workspace_create};
+/// # let tmp = tempfile::tempdir()?;
+/// # let created = workspace_create(tmp.path(), "lobby_ws")?;
+/// # graph_create(&created.graphs_dir, "lobby", Some("lobby"))?;
+/// # let workspace_dir = created.root;
+///
+/// let workspace = CerulionWorkspace::discover(&workspace_dir)?;
+/// let config = graph_read(&workspace.graphs_dir, "lobby")?;
+/// let graph_yaml = render_effective_graph_yaml(&config)?;
+/// assert_eq!(graph_yaml, "prefix: lobby\nnodes: []\n");
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[cfg(unix)]
-pub(crate) fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
+pub fn render_effective_graph_yaml(config: &GraphConfig) -> CliResult<String> {
     serde_yaml::to_string(config).map_err(|e| {
         CliError::Validation(format!(
             "recording: cannot render the effective graph config for the bag's `graph.yaml` \
@@ -17581,9 +17619,11 @@ pub fn render_recorder_json(
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
         // binary writes; v8 marks a stream in which every edge names its frames'
-        // writers by run, and v9 one in which every multi-frame read whose batch
-        // fits its read stage's window names each frame it consumed, both also
-        // every bag this binary writes.
+        // writers by run, v9 one in which every multi-frame read whose batch
+        // fits its read stage's window names each frame it consumed, and v10
+        // one in which every complete checkpoint part of a stopped node
+        // carries the stopped flag, all three also every bag this binary
+        // writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17593,9 +17633,10 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stream_needs_v4(),
             crate::replay_engine::recorder_stamps_read_site_roles(),
             // Whether THIS run folds identical runs, read from the one switch.
-            // `stamp_trace_format` tests the consult term first, so the stamp
-            // is 7 with folding on or off; this term decides the stamp on the
-            // ladder below 7, which is the arm an older recorder's bag took.
+            // `stamp_trace_format` tests the stops, identity and consult terms
+            // first, so the stamp is 10 with folding on or off; this term
+            // decides the stamp on the ladder below 7, which is the arm an
+            // older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
             // Whether THIS binary records every gated consult a replay also
             // makes: it does, at every consult that found its queue empty but
@@ -17605,9 +17646,12 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stamps_consult_records(),
             // Whether every edge carries its frames' writers, one annotation per
             // writer run, and every multi-frame read whose batch fits its read
-            // stage's window names each frame it consumed: it does, so every bag
-            // this binary writes stamps 9.
+            // stage's window names each frame it consumed: it does.
             crate::replay_engine::recorder_records_read_identity(),
+            // Whether every complete checkpoint part of a stopped node carries
+            // the stopped flag: it does, so every bag this binary writes
+            // stamps 10.
+            crate::replay_engine::recorder_states_anchor_stops(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -22596,6 +22640,9 @@ fn run_graph_recording(run: RecordingRun) -> CliResult<()> {
             mw_policy,
             Some(&recorded_set),
         )?;
+    // This single process owns the recorded run: it reports what its one build
+    // left out of the nodes' environment.
+    runtime.node_env_left_out().warn();
     configure_recording_runtime(&mut runtime, trace_limit)?;
 
     // CREATE and ARM this run's capture plane HERE,
@@ -29677,6 +29724,73 @@ process_groups:
         }
     }
 
+    /// The process that owns a run reports what its graph build left out of
+    /// the nodes' environment, once, and a worker never does.
+    ///
+    /// A build logs nothing about it (`cerulion_core`'s
+    /// `env_snapshot_isolation_test` pins that over real builds), so how often
+    /// the line prints is decided here, by which code path calls
+    /// `NodeEnvLeftOut::warn`: each single-process build of `graph_run` (the
+    /// virtual and the live arm), the single-process recording, `graph
+    /// profile`, and the supervisor after its planning build and before it
+    /// spawns any worker. Hand-written counts over the comment- and
+    /// literal-stripped source: the worker builds and reports nothing, so a
+    /// 3-worker run prints the line once, not four times.
+    #[test]
+    fn the_run_owner_reports_the_node_environment_once_and_a_worker_never_does() {
+        const REPORT: &str = ".node_env_left_out().warn()";
+        fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+            fn_body(src, sig).unwrap_or_else(|| panic!("`{sig}` must still exist"))
+        }
+        let src = code_only(include_str!("graph_cmd.rs"));
+        let recording = body(
+            &src,
+            "fn run_graph_recording(run: RecordingRun) -> CliResult<()> {\n    let \
+             RecordingRun {\n        workspace_root,",
+        );
+        for (owner, builds, reports) in [
+            (body(&src, "pub fn graph_run("), 2, 2),
+            (recording, 1, 1),
+            (body(&src, "pub fn graph_profile("), 1, 1),
+            (body(&src, "fn graph_run_supervisor("), 1, 1),
+        ] {
+            assert_eq!(owner.matches("GraphRuntime::build").count(), builds);
+            assert_eq!(
+                owner.matches(REPORT).count(),
+                reports,
+                "one report per build of a process that owns its run"
+            );
+        }
+        let supervisor = body(&src, "fn graph_run_supervisor(");
+        let planning = supervisor
+            .find("BuildPurpose::PlanningOnly")
+            .expect("the supervisor's planning build");
+        let report = supervisor.find(REPORT).expect("the supervisor's report");
+        let spawn = supervisor
+            .find("spawn_order(&plan)")
+            .expect("the supervisor spawns workers in plan order");
+        assert!(
+            planning < report && report < spawn,
+            "the supervisor reports after its planning build and before any worker spawns"
+        );
+        let worker = body(&src, "fn graph_run_worker(");
+        assert_eq!(
+            worker.matches("GraphRuntime::build").count(),
+            3,
+            "the worker's three build paths"
+        );
+        assert_eq!(
+            worker.matches(REPORT).count(),
+            0,
+            "a worker reports nothing"
+        );
+        assert_eq!(
+            src.matches(REPORT).count(),
+            5,
+            "no other path in this file reports"
+        );
+    }
+
     /// The checked rank → ring-header-rank conversion.
     /// In-range ranks pass through; `u32::MAX` (the departure-ring
     /// sentinel reservation) and above are rejected LOUDLY, never silently
@@ -30461,6 +30575,109 @@ process_groups:
         );
     }
 
+    /// A hosted run serves this render as its `graph.yaml`, so a reader that
+    /// re-parses it with `parse_graph` gets the same graph: its `name:` (the
+    /// identity on a stemless parse), prefix and wiring come back, and a
+    /// second render is identical.
+    #[cfg(unix)]
+    #[test]
+    fn the_effective_graph_yaml_round_trips_parse_graph_with_its_name() {
+        let config = cerulion_core::graph::parse_graph(
+            "\
+name: lobby
+prefix: lobby
+nodes:
+  - id: logic
+    type: lobby_logic
+    inputs:
+      - {name: in, source: /lobby/in}
+    outputs:
+      - {name: edge, schema: std_msgs/String}
+      - {name: pulse, schema: std_msgs/String, topic: /lobby/logic/pulse}
+",
+        )
+        .expect("parse");
+        let rendered = render_effective_graph_yaml(&config).expect("render");
+        let back =
+            cerulion_core::graph::parse_graph(&rendered).expect("parse_graph reads the render");
+
+        assert_eq!(back.identity(), "lobby");
+        assert_eq!(back.name.as_deref(), Some("lobby"));
+        assert_eq!(back.prefix, "lobby");
+        assert_eq!(back.nodes.len(), 1);
+        assert_eq!(back.nodes[0].id, "logic");
+        assert_eq!(back.nodes[0].node_type, "lobby_logic");
+        assert_eq!(
+            back.nodes[0]
+                .inputs
+                .iter()
+                .map(|i| (i.name.as_str(), i.source.as_str()))
+                .collect::<Vec<_>>(),
+            [("in", "/lobby/in")]
+        );
+        assert_eq!(
+            back.nodes[0]
+                .outputs
+                .iter()
+                .map(|o| (o.name.as_str(), o.schema.as_str(), o.topic.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                ("edge", "std_msgs/String", None),
+                ("pulse", "std_msgs/String", Some("/lobby/logic/pulse")),
+            ]
+        );
+        assert_eq!(
+            render_effective_graph_yaml(&back).expect("render again"),
+            rendered
+        );
+    }
+
+    /// AGENTS.md: rustdoc shows a graph only as a workspace `graphs/*.yaml`
+    /// read by name; a graph built in code is for tests only. Rustdoc is
+    /// published, so a reader copies its examples into application code.
+    #[test]
+    fn rustdoc_examples_read_graphs_from_the_workspace_not_from_code() {
+        let mut fence: Option<bool> = None;
+        let mut example_lines = Vec::new();
+        for line in include_str!("graph_cmd.rs").lines() {
+            let trimmed = line.trim_start();
+            let Some(doc) = trimmed
+                .strip_prefix("///")
+                .or_else(|| trimmed.strip_prefix("//!"))
+            else {
+                continue;
+            };
+            let doc = doc.trim();
+            if let Some(info) = doc.strip_prefix("```") {
+                fence = match fence {
+                    Some(_) => None,
+                    None => Some(!matches!(info.trim(), "text" | "yaml" | "json" | "console")),
+                };
+                continue;
+            }
+            if fence == Some(true) {
+                example_lines.push(doc);
+            }
+        }
+
+        assert!(
+            example_lines
+                .iter()
+                .any(|l| l.contains("graph_read(") && !l.starts_with('#')),
+            "the public renderer's example must show reading `graphs/<name>.yaml` by name"
+        );
+        for banned in ["parse_graph", "GraphConfig {", "GraphRuntime"] {
+            let hits: Vec<&&str> = example_lines
+                .iter()
+                .filter(|l| l.contains(banned))
+                .collect();
+            assert!(
+                hits.is_empty(),
+                "a rustdoc example builds a graph in code with `{banned}`: {hits:?}"
+            );
+        }
+    }
+
     /// The rendered attachment is SCRATCH: it must be cleaned up like every other
     /// bagd input, never left beside the bag as a stray artifact.
     #[cfg(unix)]
@@ -30609,16 +30826,18 @@ process_groups:
                 crate::replay_engine::recorder_stamps_read_site_roles(),
                 cerulion_core::read_outcome::fold_enabled(),
                 crate::replay_engine::recorder_stamps_consult_records(),
-                crate::replay_engine::recorder_records_read_identity()
+                crate::replay_engine::recorder_records_read_identity(),
+                crate::replay_engine::recorder_states_anchor_stops()
             )
         );
         assert_eq!(
-            v["trace_format"], 9,
+            v["trace_format"], 10,
             "every bag this binary writes carries read-site roles, folds runs, \
-             records an empty consult a replay also makes AND names the writer and \
+             records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
-             read stage's window: a reader below 9 does not know the per-frame \
-             record, so the stamp makes it refuse the bag"
+             read stage's window AND flags every complete checkpoint part of a stopped node: \
+             a reader below 10 reads past the stopped flag, so the stamp makes it \
+             refuse the bag"
         );
     }
 
@@ -30628,13 +30847,14 @@ process_groups:
     /// contract to a stream built to violate it).
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
-    /// it to 5, folding to 6, the consult record to 7, read identity to 8 and
-    /// per-frame batch identity to the 9 asserted here.
+    /// it to 5, folding to 6, the consult record to 7, read identity to 8,
+    /// per-frame batch identity to 9 and checkpoint stops to the 10 asserted
+    /// here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_ten() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
@@ -30647,9 +30867,10 @@ process_groups:
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
         // folding overrides both. 7, not 6: the consult record overrides
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
-        // every consumed frame of a batch is named (`stamp_trace_format`'s
-        // hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 9);
+        // every consumed frame of a batch is named. 10, not 9: every complete
+        // checkpoint part of a stopped node carries the stopped flag
+        // (`stamp_trace_format`'s hand table pins the whole matrix).
+        assert_eq!(v["trace_format"], 10);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -30678,7 +30899,7 @@ process_groups:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":10}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
@@ -43908,12 +44129,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// facts, named so a table row reads as a host rather than two bools.
     #[derive(Clone, Copy, Debug)]
     enum MwHost {
-        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64): arm 3. The wake-word fact is run both ways for every row,
+        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// MWAITX, Linux aarch64): arm 3. The wake-word fact is run both ways for every row,
         /// because arm 3 must not read it.
         Primitive,
         /// No primitive, but a consumer can kernel-block on a doorbell wake
-        /// word (Linux without WAITPKG, macOS 14.4 and later): arm 2.
+        /// word (Linux with no CPU monitor-wait primitive, macOS 14.4 and
+        /// later): arm 2.
         WakeWord,
         /// Neither (macOS before 14.4, other targets): arm 2, doorbell inert.
         Neither,

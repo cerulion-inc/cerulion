@@ -1217,6 +1217,58 @@ fn park_policy_fd_source_watches_fd_and_fires() {
     );
 }
 
+/// The period-park (`CERULION_PERIOD_PARK=1`) stays off for a park that polls
+/// an external fd: an fd's readiness cannot end a kernel nap, so the park keeps
+/// running exactly as with the switch off, and the fd still wakes it promptly.
+#[test]
+#[serial]
+fn the_period_park_stays_off_for_a_park_that_polls_an_external_fd() {
+    let pipe = Pipe::new();
+    let p_fires = Arc::new(AtomicU64::new(0));
+    let c_last = Arc::new(AtomicU64::new(0));
+    let c_fires = Arc::new(AtomicU64::new(0));
+    let producer = ExtProducer::new(
+        ExternalSource::Fd(pipe.read),
+        Arc::clone(&p_fires),
+        Some(pipe.read),
+    );
+    let mut runtime = producer_consumer_graph_with_policy(
+        producer,
+        Arc::clone(&c_last),
+        Arc::clone(&c_fires),
+        MonitorWaitPolicy::new(true, false, "extpp".into()),
+    );
+    runtime.set_period_park_for_test(Some(true));
+    runtime.collect_external_sources_for_test();
+    assert_eq!(runtime.external_binding_count(), 1);
+    runtime.run_live_step_once_for_test(Duration::from_millis(20));
+    pipe.write_byte();
+    runtime.run_live_step_once_for_test(Duration::from_millis(500));
+    assert!(
+        runtime.park_entry_count_for_test() > 0,
+        "apparatus: the idle went through the park"
+    );
+    assert_eq!(
+        runtime.period_park_stats_for_test(),
+        cerulion_core::graph::PeriodParkStats::default(),
+        "the period-park planned no block for a park that polls an fd"
+    );
+    assert!(
+        runtime.park_wakes_external_fd_count_for_test() > 0,
+        "the fd woke the park"
+    );
+    assert_eq!(
+        p_fires.load(Ordering::Relaxed),
+        1,
+        "the readable fd fired the node"
+    );
+    assert_eq!(
+        c_last.load(Ordering::Relaxed),
+        1,
+        "and the consumer received it"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 10b. The HEADLINE lost-wakeup pin: an external fd wakes the park
 // promptly (attribution `park_wakes_external_fd > 0`, `wakes_timeout == 0` for

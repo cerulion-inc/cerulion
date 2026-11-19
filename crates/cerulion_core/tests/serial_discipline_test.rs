@@ -605,6 +605,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point reporting the probe's env-resolved settings to its parent",
     ),
     (
+        "env_snapshot_isolation_test.rs",
+        "subprocess_child_builds_a_graph_and_prints_what_its_node_reads",
+        "child",
+        "self-re-exec entry point; a name or value that is not valid UTF-8 is set only in the child's environment, and the parent reads what its node read, what its builds left out and what it logged",
+    ),
+    (
         "reg_channel_iox2_test.rs",
         "subprocess_child_pump_panic_storm_probe",
         "child",
@@ -648,8 +654,8 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
 /// assumed. A grep for the cfg ANYWHERE in the file would call
 /// `cross_thread_rtt_test` and `flat_latency_test` release-only; both are
 /// deliberately DEBUG-OK (their metric is a RATIO, which is build-mode
-/// invariant) and gate every pull request. That makes those two the members
-/// this fence matters most for — the release-only five run on push-to-main lanes
+/// invariant) and gate every pull request. The DEBUG-OK members are the ones
+/// this fence matters most for; the release-only seven run on push-to-main lanes
 /// where little else is competing for the machine.
 const TIMING_INVENTORY: &[(&str, &str)] = &[
     (
@@ -660,6 +666,11 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
         "cross_thread_rtt_test",
         "cross-thread RTT flatness — DEBUG-OK, so it gates every PR, and a \
          loaded runner inflates the per-size floors it compares",
+    ),
+    (
+        "exact_deadline_grid_latency_test",
+        "release-only: a 1 kHz node's fire gaps and the wait after a slow step against \
+         wall time",
     ),
     (
         "flat_latency_test",
@@ -686,8 +697,24 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
         "release-only latency regression gate — the ci.yml test-latency headline",
     ),
     (
+        "live_exact_deadline_iox2_test",
+        "runs a 1 kHz node live for a second; DEBUG-OK, so it gates every PR, and \
+         on Linux it requires every frame delivered, which a runner that stalls \
+         the ticker past its consumer's queue depth would break",
+    ),
+    (
         "period_decompose_bench_test",
         "release-only per-hop decomposition bench",
+    ),
+    (
+        "period_park_iox2_test",
+        "runs live consumers and a 1 kHz ticker for counts and order only; \
+         DEBUG-OK, so it gates every PR, and a loaded runner slows its live runs",
+    ),
+    (
+        "period_park_latency_test",
+        "release-only: the period-park's frame delays and its 1 kHz grid against \
+         wall time",
     ),
     (
         "streaming_latency_bench_test",
