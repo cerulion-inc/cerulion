@@ -83,7 +83,7 @@ thiserror = "2"
 tracing = { version = "0.1.44" }
 # The config directory rule of the machine identity (`identity`): the home
 # directory when `CERULION_HOME` is unset. Already in the lockfile.
-dirs = "6"
+dirs = "7"
 # OS entropy for a fresh machine key (`identity`). Already in the lockfile.
 getrandom = "0.4"
 

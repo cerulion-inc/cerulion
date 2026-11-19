@@ -72,7 +72,7 @@ cerulion_pairing = { workspace = true }
 # The cached device cert is `base64url(postcard(SignedDeviceCert))` — the exact shape
 # `cerulion login` / `cerulion_cli_engine::device_binding` write + read. Match their
 # versions so the resolver decodes the identical bytes.
-base64 = "0.22"
+base64 = "0.23"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [dev-dependencies]
