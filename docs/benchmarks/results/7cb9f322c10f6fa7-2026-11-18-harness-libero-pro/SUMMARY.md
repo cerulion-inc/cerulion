@@ -1,6 +1,6 @@
 # Summary of the grid: 100 start states, 15 models, both arms
 
-Computed by recompute.py from episodes.csv, unscored.csv and not_finished.csv as read at 2026-11-19T02:31:28Z. recompute.py computes this file again from the CSV files; with --check it writes nothing and says whether this file still matches them.
+Computed by recompute.py from episodes.csv, unscored.csv and not_finished.csv as read at 2026-11-19T08:39:55Z. recompute.py computes this file again from the CSV files; with --check it writes nothing and says whether this file still matches them.
 
 Said before any number (RULES.md section 2):
 
@@ -22,9 +22,12 @@ Arms: `without` is the same model on a published three-tool interface; `with` is
 - On CLEAN, 1 of the 15 models had fewer with Cerulion: Gemini 4 Carbon (58 against 71 of 100; with only 17, without only 30; p = 0.0789). It is not significant at 0.05, so it reads "no difference shown" (RULES.md section 5 (3)).
 - With Cerulion ahead, printed whole: on SOLVED in 12 of 15, and on CLEAN in 14 of 15 models.
 - Established after Holm's correction over the 15 models (RULES.md section 3): on SOLVED for 10 of 15, and on CLEAN for 13 of 15. Ahead with Cerulion but not established: GPT-6.2 Sol SOLVED (73 against 59 of 100; with only 26, without only 12; p = 0.0336 against its Holm threshold 0.0100): points up, not established; GPT-6.1 Sol SOLVED (68 against 59 of 100; with only 22, without only 13; p = 0.175 against its Holm threshold 0.0125): no difference shown; GPT-6.2 Astra CLEAN (58 against 54 of 100; with only 15, without only 11; p = 0.557 against its Holm threshold 0.0500): no difference shown. Only a model established on SOLVED may be read as "Cerulion lifts" it.
+- The provider's content filter stopped replies (finish reason content_filter) in 4 of the 30 arms: Claude Fable 5.2 without Cerulion (337 of its 1,101 replies in scored episodes, in 94 of its 100 scored episodes, 86 of which ended on filtered replies); Gemini 4 Argon without Cerulion (1 of the 155 replies of its 3 unscored episodes, in 1 of them); Gemini 4 Argon with Cerulion (1 of its 1,647 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it); Gemini 4 Hydrogen without Cerulion (1 of its 5,990 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it). No other arm had one. Every arm's replies by finish reason are in the table under "How the replies ended".
 - The pooled false-claim test (the second secondary test below) passes: fewer episodes ended with the model wrongly saying it had succeeded. Per unsolved episode the rate is higher with Cerulion: 180 false claims in 497 unsolved episodes (0.362) against 248 in 898 (0.276) without it, over all 15 models; as high or higher with Cerulion for 6 of the 15 (with against without): Gemini 3.8 Flash 0.593 against 0.400; Claude Sonnet 5.5 0.431 against 0.190; Claude Haiku 5.5 0.373 against 0.042; Claude Fable 5.2 0.500 against 0.044; GPT-6 Luna 0.197 against 0.120; Grok 4.7 0.319 against 0.062.
 - With Cerulion the model made more false claims in all for 5 of the 15 models: Claude Haiku 5.5 (22 against 4; with only 22, without only 4; p = 5.34e-04); Grok 4.7 (15 against 6; with only 15, without only 6; p = 0.0784); Claude Sonnet 5.5 (22 against 16; with only 18, without only 12; p = 0.362); Claude Fable 5.2 (9 against 4; with only 9, without only 4; p = 0.267); GPT-6 Luna (14 against 12; with only 14, without only 12; p = 0.845). Each per-model count is descriptive; the declared test is the pooled one.
-- Claude Fable 5.2 without Cerulion ended 86 of its 100 episodes with the model no longer calling tools (a reply with no tool call ends the episode), 44 of them before any control step. 86 of the 90 start states it did not solve without Cerulion ended that way, so its gain on SOLVED (10 against 82) is mostly against an arm that stopped acting.
+- Read with the content filter: Claude Fable 5.2 without Cerulion ended 86 of its 90 unsolved episodes on filtered replies, and in those the model made no claim, true or false. Its false claims per unsolved episode: 4 of 90 (0.044) with them counted, 4 of the 4 that did not end that way (1.000); with Cerulion, 9 of 18 (0.500). Its 9 against 4 false claims in all, and 0.500 against 0.044 per unsolved episode, therefore cannot be read as Cerulion raising them.
+- The pooled rate per unsolved episode, over all 15 models: 180 in 497 (0.362) with Cerulion against 248 in 898 (0.276) without; with Claude Fable 5.2 left out (both arms, so each pool holds the same 14 models): 171 in 479 (0.357) with Cerulion against 244 in 808 (0.302) without. With each arm's unsolved episodes that ended on filtered replies left out of its count, the arm with Cerulion claims falsely as often or more for 5 of the 15 models, against 6 with them counted; not most, either way.
+- Claude Fable 5.2 without Cerulion ended 86 of its 100 episodes on 3 replies in a row with no tool call, which end an episode (ended_by stopped_calling_tools), 44 of them before any control step. All 86 ended on content_filter replies: in every one, the 3 replies with no tool call that ended it were all ones the provider's content filter stopped. 86 of the 90 start states it did not solve without Cerulion ended that way, so its gain on SOLVED (82 against 10) is mostly against an arm that the content filter stopped.
 - 74 scored episodes ran no control step: Claude Fable 5.2 without Cerulion 44, GPT-6 Luna with Cerulion 28, Grok 4.7 without Cerulion 1, Grok 4.7 with Cerulion 1. Each carries a problem row and none was solved or is a false claim, so no count of solved, clean or false claims changes with them.
 - With Cerulion, 2 of the 15 models did not use fewer model replies and control steps per scored episode than without it: Claude Fable 5.2 (14.7 against 11.0 replies, 246.3 against 76.2 control steps); Gemini 4 Carbon (18.3 against 16.0 replies, 247.7 against 200.4 control steps).
 - With Claude Fable 5.2, an episode with Cerulion cost more at list price (5.50 against 1.50 USD an episode) and took longer (414.4 against 250.4 wall seconds); a success cost less (6.57 against 15.03 USD). These means are over scored episodes, and 2 of its episodes with Cerulion and 0 without ended without a score. Counted too (an episode the 90 minute clock ended at its 5400 seconds), with every attempt in no row at its cost (lost_attempts.csv): 514.2 against 250.4 wall seconds, 6.04 against 1.50 USD an episode and 7.36 against 15.03 USD a success.
@@ -207,6 +210,45 @@ RULES.md section 3 names these two pairs, and only these, before the grid was re
 Wall seconds are wall clock from the episode's start to its end, tool execution and failed requests included. A failed request was sent again inside its episode after a 20 second wait, and a request could wait up to 600 seconds before it timed out, so an arm's seconds carry its endpoint's stalls: read them with the arm's failed requests, printed beside them. Other workloads shared the machines. The 21 episodes that the 90 minute clock ended (5400 seconds each) are in no mean here; leaving them out lowers the mean wall seconds of Gemini 4 Carbon, Gemini 4 Argon and Grok 4.7 without Cerulion, and of Claude Fable 5.2 and Gemini 4 Carbon with it. A statement about speed in wall seconds is read with all of this in mind (RULES.md section 6).
 
 USD is the model's reported token counts of the scored attempt at the list prices of prices.csv on the date in that file; cached input is priced at the cached rate; simulator compute is not included; nothing here is a billed amount. USD per solved start state is the spend of the arm's scored episodes over the start states it solved: the 31 episodes that ended without a score and every attempt in no row are not in it (278.08 USD in all, lost_attempts.csv), and no figure counts the robot's calibration episodes or the two attempts lost with the stopped machines. Part of the gap in USD between the arms is caching, not only fewer requests: cached input is priced lower, and the arm without Cerulion had the lower cached share of input tokens for 15 of the 15 models. Where an arm's prompt changes near its start from turn to turn, as the published interface's does when its oldest images drop out, less of it can be read from a cache. Tokens in counts every prompt token, cached ones included; tokens out counts reasoning tokens.
+
+## How the replies ended (finish reason), scored episodes
+
+| model | arm | replies | tool_calls | stop | length | content_filter | other | requests with no reply | scored episodes with a content_filter reply | ended on content_filter replies |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Gemini 3.8 Flash | without Cerulion | 5,587 | 5,582 | 5 | 0 | 0 | 0 | 366 | 0 | 0 |
+| Gemini 3.8 Flash | with Cerulion | 2,555 | 2,536 | 19 | 0 | 0 | 0 | 126 | 0 | 0 |
+| GPT-6 Astra | without Cerulion | 2,991 | 2,991 | 0 | 0 | 0 | 0 | 648 | 0 | 0 |
+| GPT-6 Astra | with Cerulion | 1,635 | 1,635 | 0 | 0 | 0 | 0 | 310 | 0 | 0 |
+| Claude Opus 5.5 | without Cerulion | 5,510 | 5,510 | 0 | 0 | 0 | 0 | 466 | 0 | 0 |
+| Claude Opus 5.5 | with Cerulion | 1,520 | 1,519 | 1 | 0 | 0 | 0 | 293 | 0 | 0 |
+| Claude Sonnet 5.5 | without Cerulion | 5,625 | 5,625 | 0 | 0 | 0 | 0 | 344 | 0 | 0 |
+| Claude Sonnet 5.5 | with Cerulion | 1,963 | 1,962 | 1 | 0 | 0 | 0 | 259 | 0 | 0 |
+| Claude Haiku 5.5 | without Cerulion | 6,536 | 6,536 | 0 | 0 | 0 | 0 | 2,364 | 0 | 0 |
+| Claude Haiku 5.5 | with Cerulion | 2,021 | 2,021 | 0 | 0 | 0 | 0 | 800 | 0 | 0 |
+| Claude Fable 5.2 | without Cerulion | 1,101 | 764 | 0 | 0 | 337 | 0 | 260 | 94 | 86 |
+| Claude Fable 5.2 | with Cerulion | 1,445 | 1,445 | 0 | 0 | 0 | 0 | 241 | 0 | 0 |
+| Gemini 4 Carbon | without Cerulion | 1,444 | 1,439 | 3 | 2 | 0 | 0 | 114 | 0 | 0 |
+| Gemini 4 Carbon | with Cerulion | 1,743 | 1,740 | 1 | 2 | 0 | 0 | 130 | 0 | 0 |
+| Gemini 4 Argon | without Cerulion | 3,605 | 3,603 | 0 | 2 | 0 | 0 | 189 | 0 | 0 |
+| Gemini 4 Argon | with Cerulion | 1,647 | 1,644 | 0 | 2 | 1 | 0 | 81 | 1 | 0 |
+| Gemini 4 Hydrogen | without Cerulion | 5,990 | 5,989 | 0 | 0 | 1 | 0 | 337 | 1 | 0 |
+| Gemini 4 Hydrogen | with Cerulion | 2,261 | 2,261 | 0 | 0 | 0 | 0 | 125 | 0 | 0 |
+| GPT-6.2 Astra | without Cerulion | 2,981 | 2,981 | 0 | 0 | 0 | 0 | 578 | 0 | 0 |
+| GPT-6.2 Astra | with Cerulion | 2,051 | 2,051 | 0 | 0 | 0 | 0 | 369 | 0 | 0 |
+| GPT-6.2 Sol | without Cerulion | 5,116 | 5,116 | 0 | 0 | 0 | 0 | 1,013 | 0 | 0 |
+| GPT-6.2 Sol | with Cerulion | 2,876 | 2,876 | 0 | 0 | 0 | 0 | 533 | 0 | 0 |
+| GPT-6.1 Sol | without Cerulion | 3,994 | 3,994 | 0 | 0 | 0 | 0 | 852 | 0 | 0 |
+| GPT-6.1 Sol | with Cerulion | 1,538 | 1,538 | 0 | 0 | 0 | 0 | 326 | 0 | 0 |
+| GPT-6 Luna | without Cerulion | 6,772 | 6,772 | 0 | 0 | 0 | 0 | 1,204 | 0 | 0 |
+| GPT-6 Luna | with Cerulion | 1,739 | 1,738 | 1 | 0 | 0 | 0 | 313 | 0 | 0 |
+| Grok 4.7 | without Cerulion | 7,383 | 7,305 | 78 | 0 | 0 | 0 | 1,033 | 0 | 0 |
+| Grok 4.7 | with Cerulion | 2,985 | 2,985 | 0 | 0 | 0 | 0 | 384 | 0 | 0 |
+| GPT-6.1 Terra | without Cerulion | 4,979 | 4,979 | 0 | 0 | 0 | 0 | 743 | 0 | 0 |
+| GPT-6.1 Terra | with Cerulion | 1,761 | 1,761 | 0 | 0 | 0 | 0 | 275 | 0 | 0 |
+
+A reply's finish reason is the one its model endpoint returned: `tool_calls` a reply with a tool call, `stop` and `length` one that ended on its own or at the output limit, `content_filter` one the provider's content filter stopped, `other` any other. Every reply of each scored attempt is counted, so the five reasons add up to the replies. A request with no reply is a failed request (sent again) or one the endpoint refused for a request field it does not take (sent again without the field).
+
+4 of the 30 arms had a content_filter reply: Claude Fable 5.2 without Cerulion (337 of its 1,101 replies in scored episodes, in 94 of its 100 scored episodes, 86 of which ended on filtered replies); Gemini 4 Argon without Cerulion (1 of the 155 replies of its 3 unscored episodes, in 1 of them); Gemini 4 Argon with Cerulion (1 of its 1,647 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it); Gemini 4 Hydrogen without Cerulion (1 of its 5,990 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it). The unscored episodes' replies are in unscored.csv, per episode.
 
 ## Episodes that ended without a score
 
