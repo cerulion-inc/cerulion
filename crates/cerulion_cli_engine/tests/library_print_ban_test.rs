@@ -327,6 +327,7 @@ fn the_repo_clippy_config_declares_the_banned_paths_with_reasons() {
     for (key, wanted) in [
         ("disallowed-macros", "std::dbg"),
         ("disallowed-methods", "std::process::exit"),
+        ("disallowed-methods", "std::env::args"),
     ] {
         let entries = config
             .get(key)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Build test_node_raw_ffi_template_cdylib first. Tests the actual compiled raw
 //! template's checked interface, allocator ownership and diagnostic protocol.
-//! Build its modified_raw cdylib example too; run this binary with --test-threads=1.
+//! Build test_node_modified_raw_cdylib too; run this binary with --test-threads=1.
 
 use cerulion_core::clock::VirtualClock;
 use cerulion_core::graph::node::{DylibNodeEntry, NodeContext, NodeEntry};
@@ -72,18 +72,7 @@ fn modified_raw_node_delivers_both_added_ports_with_preserved_typed_facts() {
             environment,
         );
         context.set_transport(manager.clone());
-        let profile = cerulion_core::testing::test_target_profile_dir();
-        let filename = cerulion_core::testing::cdylib_file_name("modified_raw");
-        let primary = profile.join("examples").join(&filename);
-        let path = if primary.exists() {
-            primary
-        } else {
-            profile
-                .parent()
-                .unwrap()
-                .join("debug/examples")
-                .join(filename)
-        };
+        let path = cerulion_core::testing::find_fixture_cdylib("test_node_modified_raw_cdylib");
         let mut entry = DylibNodeEntry::load(&path).expect("built modified raw cdylib");
         let info = entry.info().unwrap();
         assert_eq!(info.output_names(), vec!["original", "first", "second"]);

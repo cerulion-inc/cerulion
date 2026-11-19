@@ -26877,14 +26877,26 @@ fn write_stop_bag_with(
     parts: &[(&str, u32, Vec<Vec<u8>>)],
     recorder_json: Vec<u8>,
 ) -> std::path::PathBuf {
-    let mid = make_mid_run(rec, LS_FIRST_STEP);
+    write_stop_bag_at(dir, name, rec, LS_FIRST_STEP, parts, recorder_json)
+}
+
+/// [`write_stop_bag_with`] for a bag that begins at `first_step`.
+fn write_stop_bag_at(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    first_step: u64,
+    parts: &[(&str, u32, Vec<Vec<u8>>)],
+    recorder_json: Vec<u8>,
+) -> std::path::PathBuf {
+    let mid = make_mid_run(rec, first_step);
     let bag = dir.path().join(name);
-    // The counter published `0..LS_FIRST_STEP` up to the anchor step.
+    // The counter published `0..first_step` up to the anchor step.
     let mut records = state_records(
         CHECKPOINT_RUN,
-        LS_FIRST_STEP - 1,
+        first_step - 1,
         0,
-        &anchor_blob(CHECKPOINT_SHAPE, LS_FIRST_STEP),
+        &anchor_blob(CHECKPOINT_SHAPE, first_step),
     );
     let mut named: Vec<(&str, u32)> = vec![(CP_NODE, 0)];
     for (node, idx, node_records) in parts {
@@ -27427,6 +27439,623 @@ fn a_malformed_stopped_section_refuses_the_resume_before_step_one() {
         assert_eq!(err.exit_code(), 2, "{name}");
         assert!(tapped.is_empty(), "{name}: no step ran: {tapped:?}");
     }
+}
+
+// ===========================================================================
+// A per-message FIFO node stopped before a resumed pass's anchor, fed by read
+// identity
+//
+// A `#[cerulion_node]` FIFO sink and a running FIFO co-consumer read a topic no
+// node writes, so every read carries its writer and a `--verify` replay of a
+// bag that begins mid-run feeds each read by its recorded identity. After the
+// fire that stops the sink, its trigger drain pops one more frame, holds it,
+// and from then on re-offers it and records nothing. The checkpoint states that
+// held frame as the sink's one unconsumed arrival, and the resumed replay keeps
+// the frame held.
+// ===========================================================================
+
+/// The held-frame fixture's external topic: `frames[k]` before step `k`.
+const HH_EXT: &str = "/hh/ext";
+/// The running co-consumer of [`HH_EXT`], at ring index 2. Its reads in the
+/// replayed steps are what give the topic's read log its coverage there.
+const HH_RUNNING: &str = "running";
+/// The step a held-frame bag begins at; its anchor is step 2.
+const HH_FIRST_STEP: u64 = 3;
+/// The steps every held-frame recording runs.
+const HH_STEPS: usize = 8;
+
+/// A per-message FIFO sink: its trigger input is drained through its own
+/// subscriber, one frame per read in arrival order. Each fire publishes the
+/// served frame plus 100, except a fire whose frame the build's
+/// [`SinkFailure`] fails on.
+#[cerulion_node]
+#[derive(Default)]
+struct StoppingFifoSinkNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    /// How this build fails, if at all; a restore leaves it as built.
+    #[cerulion(reconstruct)]
+    fails: Option<SinkFailure>,
+}
+
+#[cerulion_node_impl]
+impl StoppingFifoSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        if let Some(SinkFailure::Fatal(at)) = self.fails {
+            if self.inp.x >= at {
+                return Err(NodeError::Fatal("the sink stops at this frame".to_string()));
+            }
+        }
+        self.out.x = self.inp.x + 100.0;
+        Ok(())
+    }
+}
+
+/// The counter, a sink of `sink_type` and the running co-consumer, the last two
+/// reading [`HH_EXT`].
+fn hh_yaml(sink_type: &str) -> String {
+    format!(
+        "name: hh\nprefix: hh\nnodes:\n\
+         \x20 - id: counter\n    type: counter\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: {sink_type}\n    inputs:\n      - name: inp\n        source: {HH_EXT}\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: running\n    type: stopping_fifo_sink_node\n    inputs:\n      - name: inp\n        source: {HH_EXT}\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+    )
+}
+
+/// The counter, `sink`, and the running co-consumer, which never fails.
+fn hh_factories(sink: Box<dyn NodeEntry>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (CP_NODE, Box::new(CounterEntry::new()) as Box<dyn NodeEntry>),
+        (LS_SINK, sink),
+        (
+            HH_RUNNING,
+            Box::new(StoppingFifoSinkNodeEntry::new()) as Box<dyn NodeEntry>,
+        ),
+    ])
+}
+
+fn hh_fifo_factories(fails: SinkFailure) -> IndexMap<String, Box<dyn NodeEntry>> {
+    hh_factories(Box::new(StoppingFifoSinkNodeEntry::with_state(
+        StoppingFifoSinkNode {
+            fails: Some(fails),
+            ..Default::default()
+        },
+    )))
+}
+
+/// One frame per step on [`HH_EXT`], `x` = the step.
+fn hh_every_step() -> Vec<Vec<f64>> {
+    (0..HH_STEPS).map(|k| vec![k as f64]).collect()
+}
+
+/// A trigger-drain read of the sink: `(step, outcome kind, served sequence)`.
+type HhRead = (u64, u16, Option<u64>);
+
+/// A drained batch of one frame at `step` that served `seq`.
+fn hh_batch(step: u64, seq: u64) -> HhRead {
+    (step, READ_OUTCOME_DRAINED_BATCH, Some(seq))
+}
+
+/// A drain at `step` that found no frame.
+fn hh_none(step: u64) -> HhRead {
+    (step, READ_OUTCOME_NONE, None)
+}
+
+/// The steps at which `rec` holds a fire of `node`.
+fn hh_fires(rec: &Recording, node: &str) -> Vec<u64> {
+    let idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == node)
+        .unwrap_or_else(|| panic!("{node} is in the manifest")) as u32;
+    rec.trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == idx)
+        .map(|r| r.step)
+        .collect()
+}
+
+/// The sink's trigger-drain reads in `rec`, in record order, producer
+/// annotations left out.
+fn hh_drain_reads(rec: &Recording) -> Vec<HhRead> {
+    let sink = rec
+        .node_ids
+        .iter()
+        .position(|id| id == LS_SINK)
+        .expect("the sink is in the manifest") as u32;
+    rec.trace
+        .iter()
+        .filter(|r| is_read_record(r) && r.node_idx == sink)
+        .filter(|r| read_site_role(r.global_level) == ReadSiteRole::Drain)
+        .map(|r| {
+            let (_, kind) = unpack_read_outcome_meta(r.global_level);
+            let served = (r.fire_time_ns != READ_OUTCOME_NO_FRAME).then_some(r.fire_time_ns);
+            (r.step, kind, served)
+        })
+        .collect()
+}
+
+/// Record the held-frame graph with a sink of `sink_type` and its read log,
+/// and check it against the hand oracle: the sink fires at `fires` and its
+/// trigger drain reads `drain`, and the running co-consumer fires once at every
+/// step that carries a frame.
+fn hh_reference(
+    sink_type: &str,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    frames: Vec<Vec<f64>>,
+    fires: &[u64],
+    drain: &[HhRead],
+) -> Recording {
+    let running: Vec<u64> = (0..HH_STEPS as u64)
+        .filter(|&k| !frames[k as usize].is_empty())
+        .collect();
+    let rec = record_uniform_with_read_log(
+        &hh_yaml(sink_type),
+        make,
+        &[ExternalDrive {
+            topic: HH_EXT.to_string(),
+            per_step: frames,
+        }],
+        HH_STEPS,
+    );
+    assert_eq!(hh_fires(&rec, LS_SINK), fires, "the sink's fires");
+    assert_eq!(
+        hh_drain_reads(&rec),
+        drain,
+        "the sink's trigger-drain reads"
+    );
+    assert_eq!(
+        hh_fires(&rec, HH_RUNNING),
+        running,
+        "the co-consumer's fires"
+    );
+    rec
+}
+
+/// The section a recorder writes for the stopped sink at the anchor: the
+/// service cursor of a per-message FIFO input (`served`, the frame its
+/// stopping fire read; `None` for a `consume = latest` input, which has none)
+/// and the recording's own pending count there, which must be `pending`.
+fn hh_section(rec: &Recording, served: Option<u32>, pending: u64) -> NodeFrameworkState {
+    let recorded = rec.pending_after[LS_SINK][(HH_FIRST_STEP - 1) as usize];
+    assert_eq!(
+        recorded, pending,
+        "PRECONDITION: the stopped sink's pending count at the anchor"
+    );
+    NodeFrameworkState {
+        pending_data_count: recorded,
+        input_service: served.map(|seq| [("inp".to_string(), Some(seq))].into_iter().collect()),
+        stopped: true,
+        ..Default::default()
+    }
+}
+
+/// A one-rank bag of `rec` that begins at [`HH_FIRST_STEP`], stamped by
+/// `recorder_json`, with the counter's anchor, the sink's `sink_part`, and the
+/// running co-consumer's part stating `running_served`, the last frame its tick
+/// read by the anchor.
+fn hh_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    sink_part: &[u8],
+    running_served: u32,
+    recorder_json: Vec<u8>,
+) -> std::path::PathBuf {
+    let running = part_with_section(
+        &StoppingFifoSinkNode::default(),
+        &NodeFrameworkState {
+            input_service: Some(
+                [("inp".to_string(), Some(running_served))]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        },
+    );
+    write_stop_bag_at(
+        dir,
+        name,
+        rec,
+        HH_FIRST_STEP,
+        &[
+            (
+                LS_SINK,
+                1,
+                state_records(CHECKPOINT_RUN, HH_FIRST_STEP - 1, 1, sink_part),
+            ),
+            (
+                HH_RUNNING,
+                2,
+                state_records(CHECKPOINT_RUN, HH_FIRST_STEP - 1, 2, &running),
+            ),
+        ],
+        recorder_json,
+    )
+}
+
+/// [`hh_bag`] with the FIFO sink's part carrying `section`.
+fn hh_fifo_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    section: &NodeFrameworkState,
+    running_served: u32,
+    recorder_json: Vec<u8>,
+) -> std::path::PathBuf {
+    let part = part_with_section(&StoppingFifoSinkNode::default(), section);
+    hh_bag(dir, name, rec, &part, running_served, recorder_json)
+}
+
+/// A `--verify` replay of `bag` that passes with every read fed by identity, a
+/// clean read log, no violation, exit 0 and the sink listed as stopped.
+fn hh_assert_verify_passes(
+    tag: &str,
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+) {
+    let (outcome, _) = ri_replay(bag, make, replay_engine::ReplayPurpose::Verify);
+    let outcome = outcome.unwrap_or_else(|e| panic!("{tag}: the resumed verify runs: {e}"));
+    assert!(
+        matches!(
+            outcome.read_identity,
+            replay_engine::ReadIdentityReport::Fed { .. }
+        ),
+        "{tag}: every read is fed by identity: {:?}",
+        outcome.read_identity
+    );
+    assert!(
+        matches!(
+            outcome.read_log,
+            replay_engine::ReadLogStatus::VerifiedClean { .. }
+        ),
+        "{tag}: {:?}",
+        outcome.read_log
+    );
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "{tag}: {:?}",
+        outcome.read_log_divergence
+    );
+    assert!(
+        outcome.violations.is_empty(),
+        "{tag}: {:?}",
+        outcome.violations
+    );
+    assert!(outcome.passed, "{tag}: {outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0, "{tag}: exit 0");
+    let resume = outcome
+        .resume
+        .as_ref()
+        .unwrap_or_else(|| panic!("{tag}: a mid-run bag reports its resume"));
+    assert_eq!(resume.stopped_at_anchor, vec![LS_SINK.to_string()], "{tag}");
+}
+
+/// A FIFO sink stopped before the anchor at step 2, at step 0 and at step 1,
+/// with one frame per step. Hand oracle: the stopping fire serves frame `s`
+/// (sequence `s`), the next step's drain pops frame `s + 1` and holds it, and
+/// the drain records nothing after that, so the recording holds no read of the
+/// sink in the replayed steps 3 to 7. The held frame is the sink's one
+/// unconsumed arrival at the anchor (pending count 1), the checkpoint states
+/// it, and the resumed replay keeps it held: a `--verify` replay fed by read
+/// identity passes with a clean read log and exit 0, and the resume line names
+/// the sink with `holds_trigger_head=true`. Two `--report` runs of each bag are
+/// byte-identical.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_fifo_sink_stopped_before_the_anchor_keeps_its_held_frame_in_a_fed_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    for (stop, drain) in [
+        (0u64, vec![hh_batch(0, 0), hh_batch(1, 1)]),
+        (1, vec![hh_batch(0, 0), hh_batch(1, 1), hh_batch(2, 2)]),
+    ] {
+        let make = move || hh_fifo_factories(SinkFailure::Fatal(stop as f64));
+        let fires: Vec<u64> = (0..=stop).collect();
+        let rec = hh_reference(
+            "stopping_fifo_sink_node",
+            make,
+            hh_every_step(),
+            &fires,
+            &drain,
+        );
+        let section = hh_section(&rec, Some(stop as u32), 1);
+        let bag = hh_fifo_bag(
+            &dir,
+            &format!("held_stop_{stop}.mcap"),
+            &rec,
+            &section,
+            2,
+            ri_free_run_recorder_json(),
+        );
+        hh_assert_verify_passes(&format!("stop {stop}"), &bag, make);
+        let report = |leg: &str| {
+            let path = dir.path().join(format!("held_stop_{stop}_{leg}.json"));
+            let (outcome, _) = ri_replay_reporting(
+                &bag,
+                make,
+                replay_engine::ReplayPurpose::Verify,
+                None,
+                None,
+                Some(path.clone()),
+            );
+            outcome.expect("the verify runs");
+            std::fs::read(&path).expect("the report is written")
+        };
+        assert_eq!(report("a"), report("b"), "stop {stop}: one report");
+    }
+    logs_assert(|lines: &[&str]| {
+        let held = lines
+            .iter()
+            .filter(|l| {
+                l.contains("keeps it stopped and releases its block slots")
+                    && l.contains("node_id=sink")
+                    && l.contains("holds_trigger_head=true")
+            })
+            .count();
+        // Two bags, three resumed runs each.
+        match held {
+            6 => Ok(()),
+            n => Err(format!("expected six held-head resume lines, got {n}")),
+        }
+    });
+}
+
+/// The control: the sink stops AT the anchor step (step 2). Its stopping fire
+/// served frame 2 and consumed its one arrival, so the anchor states none
+/// (pending count 0), and the drain pops and holds frame 3 at step 3, inside
+/// the replayed steps. The resumed replay restores no held frame and its drain
+/// pops frame 3 at step 3 as the recording did: passes, exit 0, and the resume
+/// line says `holds_trigger_head=false`.
+///
+/// The second leg: the sink stops at step 0 and the writer is silent until
+/// step 4. The drain finds no frame at steps 1 to 3, so it holds nothing at the
+/// anchor (pending count 0) and keeps consulting; it pops and holds frame 1
+/// (sequence 1) at step 4 and records nothing after. The replay consults at
+/// step 3 and pops at step 4 as the recording did: passes, exit 0.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_fifo_sink_that_holds_no_frame_at_the_anchor_keeps_consulting_in_a_fed_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let make = || hh_fifo_factories(SinkFailure::Fatal(2.0));
+    let rec = hh_reference(
+        "stopping_fifo_sink_node",
+        make,
+        hh_every_step(),
+        &[0, 1, 2],
+        &[
+            hh_batch(0, 0),
+            hh_batch(1, 1),
+            hh_batch(2, 2),
+            hh_batch(3, 3),
+        ],
+    );
+    let bag = hh_fifo_bag(
+        &dir,
+        "held_stop_at_anchor.mcap",
+        &rec,
+        &hh_section(&rec, Some(2), 0),
+        2,
+        ri_free_run_recorder_json(),
+    );
+    hh_assert_verify_passes("stop at the anchor", &bag, make);
+
+    let make = || hh_fifo_factories(SinkFailure::Fatal(0.0));
+    let mut frames = vec![vec![0.0], vec![], vec![], vec![]];
+    frames.extend((1..=4).map(|x| vec![f64::from(x)]));
+    let rec = hh_reference(
+        "stopping_fifo_sink_node",
+        make,
+        frames,
+        &[0],
+        &[
+            hh_batch(0, 0),
+            hh_none(1),
+            hh_none(2),
+            hh_none(3),
+            hh_batch(4, 1),
+        ],
+    );
+    let bag = hh_fifo_bag(
+        &dir,
+        "held_silent_writer.mcap",
+        &rec,
+        &hh_section(&rec, Some(0), 0),
+        0,
+        ri_free_run_recorder_json(),
+    );
+    hh_assert_verify_passes("silent writer", &bag, make);
+    logs_assert(|lines: &[&str]| {
+        let kept: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("keeps it stopped and releases its block slots"))
+            .collect();
+        match (
+            kept.len(),
+            kept.iter().all(|l| l.contains("holds_trigger_head=false")),
+        ) {
+            (2, true) => Ok(()),
+            _ => Err(format!(
+                "expected two resume lines holding no frame, got {kept:?}"
+            )),
+        }
+    });
+}
+
+/// A `consume = latest` sink on the same edge, stopped at step 1: its drain
+/// pops the whole queue at every step whether or not it holds a frame, so the
+/// recording holds a drained batch at every step, the steps after the stop
+/// included. Its pending count at the anchor is 1, the arrival the post-stop
+/// drain minted, and on this input that count is not a held frame: the resumed
+/// replay restores none and its drain consults at every step as the
+/// recording's did. Passes, exit 0, `holds_trigger_head=false`.
+#[test]
+#[serial]
+#[tracing_test::traced_test]
+fn a_latest_sink_stopped_before_the_anchor_holds_no_frame_in_a_fed_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let make = || {
+        hh_factories(Box::new(StoppingUnifiedSinkNodeEntry::with_state(
+            StoppingUnifiedSinkNode {
+                fails: Some(SinkFailure::Fatal(1.0)),
+                ..Default::default()
+            },
+        )))
+    };
+    let drain: Vec<HhRead> = (0..HH_STEPS as u64).map(|k| hh_batch(k, k)).collect();
+    let rec = hh_reference(
+        "stopping_unified_sink_node",
+        make,
+        hh_every_step(),
+        &[0, 1],
+        &drain,
+    );
+    let section = hh_section(&rec, None, 1);
+    let part = part_with_section(&StoppingUnifiedSinkNode::default(), &section);
+    let bag = hh_bag(
+        &dir,
+        "latest_stopped.mcap",
+        &rec,
+        &part,
+        2,
+        ri_free_run_recorder_json(),
+    );
+    hh_assert_verify_passes("latest", &bag, make);
+    logs_assert(|lines: &[&str]| {
+        let kept: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("keeps it stopped and releases its block slots"))
+            .collect();
+        match (
+            kept.len(),
+            kept.iter().all(|l| l.contains("holds_trigger_head=false")),
+        ) {
+            (1, true) => Ok(()),
+            _ => Err(format!(
+                "expected one resume line holding no frame, got {kept:?}"
+            )),
+        }
+    });
+}
+
+/// The held frame comes from the checkpoint, never from the read log.
+///
+/// The stop-at-the-anchor recording, whose drain pops frame 3 at step 3, in a
+/// bag whose sink section is crafted to state one unconsumed arrival: the
+/// replay holds a frame and its drain reads nothing at step 3, which the read
+/// log reports at that step (recorded a drained batch of sequence 3, replayed
+/// nothing), and the verify fails.
+///
+/// The stop-at-step-1 recording, whose drain holds frame 2 from step 2, in a
+/// bag whose section is crafted to state no unconsumed arrival (the shape of a
+/// fire that stopped without reading its trigger input): the replay holds
+/// nothing and its drain consults at step 3, which the read log reports there.
+#[test]
+#[serial]
+fn a_checkpoint_that_contradicts_the_recordings_drain_is_reported_at_the_first_replayed_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let make = || hh_fifo_factories(SinkFailure::Fatal(2.0));
+    let rec = hh_reference(
+        "stopping_fifo_sink_node",
+        make,
+        hh_every_step(),
+        &[0, 1, 2],
+        &[
+            hh_batch(0, 0),
+            hh_batch(1, 1),
+            hh_batch(2, 2),
+            hh_batch(3, 3),
+        ],
+    );
+    let crafted = NodeFrameworkState {
+        pending_data_count: 1,
+        ..hh_section(&rec, Some(2), 0)
+    };
+    let bag = hh_fifo_bag(
+        &dir,
+        "claims_a_held_frame.mcap",
+        &rec,
+        &crafted,
+        2,
+        ri_free_run_recorder_json(),
+    );
+    let (outcome, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let outcome = outcome.expect("the verify runs");
+    let divergence = outcome
+        .read_log_divergence
+        .as_ref()
+        .expect("the read log diverges");
+    assert_eq!(divergence.edges.len(), 1, "{divergence:?}");
+    let edge = &divergence.edges[0];
+    assert_eq!(
+        (edge.node_id.as_str(), edge.input.as_str(), edge.step),
+        ("sink", "inp", 3),
+        "{edge:?}"
+    );
+    let recorded = edge
+        .recorded
+        .as_ref()
+        .expect("the recording read at step 3");
+    assert!(
+        recorded.kind.starts_with("drained_batch")
+            && recorded.served_seq == Some(3)
+            && recorded.popped == 1,
+        "{edge:?}"
+    );
+    assert!(edge.replayed.is_none(), "{edge:?}");
+    assert!(!outcome.passed);
+
+    let make = || hh_fifo_factories(SinkFailure::Fatal(1.0));
+    let rec = hh_reference(
+        "stopping_fifo_sink_node",
+        make,
+        hh_every_step(),
+        &[0, 1],
+        &[hh_batch(0, 0), hh_batch(1, 1), hh_batch(2, 2)],
+    );
+    let crafted = NodeFrameworkState {
+        pending_data_count: 0,
+        ..hh_section(&rec, Some(1), 1)
+    };
+    let bag = hh_fifo_bag(
+        &dir,
+        "claims_no_held_frame.mcap",
+        &rec,
+        &crafted,
+        2,
+        ri_free_run_recorder_json(),
+    );
+    let (outcome, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Verify);
+    let outcome = outcome.expect("the verify runs");
+    let divergence = outcome
+        .read_log_divergence
+        .as_ref()
+        .expect("the read log diverges");
+    let edges: Vec<(&str, &str, u64, &str)> = divergence
+        .edges
+        .iter()
+        .map(|e| {
+            (
+                e.node_id.as_str(),
+                e.input.as_str(),
+                e.step,
+                e.detail.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        edges,
+        vec![(
+            "sink",
+            "inp",
+            3,
+            "step 3, read 0 on this edge: recorded <none> vs replayed none(drain)(no frame, popped 0)"
+        )]
+    );
+    assert!(!outcome.passed);
 }
 
 /// A `Period` node that publishes its tick count and stops itself

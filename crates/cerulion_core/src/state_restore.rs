@@ -573,6 +573,40 @@ pub enum InputServiceCursor {
     Served(u32),
 }
 
+/// What a checkpoint states about ONE node it states as stopped, as a resume
+/// restores it (`GraphRuntime::restore_stopped_nodes`).
+///
+/// A value per stopped node, so a restore cannot be handed a fact about a
+/// node's queue without the stop it belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StoppedAtAnchor {
+    /// The section states at least one arrival signalled into the node's
+    /// `Data` trigger that no fire consumed (`pending_data_count > 0`).
+    ///
+    /// On a per-message FIFO trigger input drained through the node's own
+    /// subscriber, the arrival is a frame that drain holds and no tick took:
+    /// the drain mints a signal only for a pop, or a
+    /// re-offer of a held head, while the count is 0, the fire that stopped
+    /// the node consumed the one it was due, and a stopped node consumes no
+    /// other. The restore reads it that way on that input alone. On any other
+    /// input the count is an arrival tally and says nothing about a held frame.
+    ///
+    /// A frame the stopping fire itself left unread is held with a count of 0
+    /// at a checkpoint taken in that fire's step, so this does not state it.
+    pub unconsumed_arrival: bool,
+}
+
+impl StoppedAtAnchor {
+    /// What `state` states about its node's stop: `None` for a node it does
+    /// not state as stopped.
+    #[must_use]
+    pub fn from_section(state: &NodeFrameworkState) -> Option<Self> {
+        state.stopped.then_some(Self {
+            unconsumed_arrival: state.pending_data_count > 0,
+        })
+    }
+}
+
 impl NodeFrameworkState {
     /// Whether this section states anything at all.
     ///

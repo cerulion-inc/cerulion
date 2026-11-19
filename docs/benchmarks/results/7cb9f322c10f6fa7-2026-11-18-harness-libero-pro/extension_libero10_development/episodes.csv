@@ -1,160 +1,160 @@
-list,cell,arm,model,attempt,solved,clean,claimed_success,false_claim,first_success_step,step_limit,requests,steps,wall_s,usd_list,price_date,tokens_in,tokens_cached,tokens_cache_write,tokens_out,failed_requests,ended_by,problems
-libero10_development,l10_t00_i00,with,Gemini 3.8 Flash,1,1,1,0,0,346,520,13,346,157.1,0.155849,2026-11-17,428225,300507,0,10006,0,episode_ended,0
-libero10_development,l10_t00_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,49,609,592.4,0.702824,2026-11-17,2283703,1817333,0,57799,0,claim,0
-libero10_development,l10_t00_i01,with,Gemini 3.8 Flash,1,1,1,0,0,334,520,26,334,248.3,0.303728,2026-11-17,992223,765042,0,20257,0,episode_ended,0
-libero10_development,l10_t00_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,79,851,661.2,1.089108,2026-11-17,5133460,4445957,0,64009,0,claim,0
-libero10_development,l10_t00_i02,with,Gemini 3.8 Flash,1,1,1,0,0,327,520,19,327,170.2,0.573643,2026-11-17,698373,0,0,13297,0,episode_ended,0
-libero10_development,l10_t00_i02,without,Gemini 3.8 Flash,1,1,1,0,0,440,520,42,440,592.9,0.623309,2026-11-17,2225428,1830727,0,50661,0,episode_ended,0
-libero10_development,l10_t00_i03,with,Gemini 3.8 Flash,1,1,1,0,0,493,520,19,493,158.5,0.194940,2026-11-17,670875,518534,0,11145,0,episode_ended,0
-libero10_development,l10_t00_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,73,714,786.8,1.112400,2026-11-17,5090956,4435379,0,76817,0,claim,0
-libero10_development,l10_t01_i00,with,Gemini 3.8 Flash,1,1,1,0,0,429,520,21,429,138.5,0.201589,2026-11-17,755168,583242,0,7707,0,episode_ended,0
-libero10_development,l10_t01_i00,without,Gemini 3.8 Flash,1,1,1,0,0,347,520,27,347,369.7,0.773069,2026-11-17,912621,36236,0,30150,0,episode_ended,0
-libero10_development,l10_t01_i01,with,Gemini 3.8 Flash,1,1,1,0,0,297,520,14,297,120.2,0.168915,2026-11-17,496411,341451,0,7223,0,episode_ended,0
-libero10_development,l10_t01_i01,without,Gemini 3.8 Flash,1,1,1,0,0,376,520,29,376,382.1,0.972017,2026-11-17,1155646,37842,0,34887,0,episode_ended,0
-libero10_development,l10_t01_i02,with,Gemini 3.8 Flash,1,1,1,0,0,283,520,8,283,122.4,0.124145,2026-11-17,286666,203994,0,12491,0,episode_ended,0
-libero10_development,l10_t01_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,78,787,724.2,1.081137,2026-11-17,4807252,4115562,0,67654,0,claim,0
-libero10_development,l10_t01_i03,with,Gemini 3.8 Flash,1,1,1,0,0,298,520,22,298,189.6,0.246603,2026-11-17,804737,585036,0,10120,0,episode_ended,0
-libero10_development,l10_t01_i03,without,Gemini 3.8 Flash,1,1,1,0,0,388,520,31,388,416.0,0.480054,2026-11-17,1445962,1134683,0,43065,0,episode_ended,0
-libero10_development,l10_t02_i00,with,Gemini 3.8 Flash,1,0,0,1,1,,520,60,497,667.9,0.938953,2026-11-17,4216081,3510826,0,39120,0,claim,0
-libero10_development,l10_t02_i00,without,Gemini 3.8 Flash,1,0,0,1,1,,520,63,583,912.0,1.011131,2026-11-17,4433364,3835982,0,73439,0,claim,0
-libero10_development,l10_t02_i01,with,Gemini 3.8 Flash,1,1,1,0,0,334,520,33,334,432.1,0.567529,2026-11-17,1713678,1200264,0,24653,0,episode_ended,0
-libero10_development,l10_t02_i01,without,Gemini 3.8 Flash,1,1,0,0,0,588,520,50,588,552.4,0.711122,2026-11-17,2636664,2176930,0,54147,0,episode_ended,0
-libero10_development,l10_t02_i02,with,Gemini 3.8 Flash,1,0,0,1,1,,520,52,866,486.0,1.461883,2026-11-17,3578949,2009613,0,35776,0,claim,0
-libero10_development,l10_t02_i02,without,Gemini 3.8 Flash,1,1,0,0,0,539,520,48,539,907.8,0.898487,2026-11-17,3353442,2845721,0,81138,0,episode_ended,0
-libero10_development,l10_t02_i03,with,Gemini 3.8 Flash,1,1,1,0,0,349,520,35,349,291.2,0.604343,2026-11-17,1720762,1126657,0,19804,0,episode_ended,0
-libero10_development,l10_t02_i03,without,Gemini 3.8 Flash,1,1,1,0,0,494,520,49,494,757.3,0.813616,2026-11-17,2998595,2505771,0,68284,0,episode_ended,0
-libero10_development,l10_t03_i00,with,Gemini 3.8 Flash,1,0,0,0,0,,520,40,292,304.3,0.475370,2026-11-17,2016281,1657038,0,21776,0,budget_spent_no_claim,0
-libero10_development,l10_t03_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,58,528,869.3,1.142251,2026-11-17,4503491,3814799,0,90566,0,claim,0
-libero10_development,l10_t03_i01,with,Gemini 3.8 Flash,1,0,0,0,0,,520,34,250,328.6,0.536160,2026-11-17,1551030,1052611,0,22240,0,claim,0
-libero10_development,l10_t03_i01,without,Gemini 3.8 Flash,1,1,1,0,0,243,520,30,243,569.5,1.218021,2026-11-17,1403117,39416,0,51277,0,episode_ended,0
-libero10_development,l10_t03_i02,with,Gemini 3.8 Flash,1,0,0,0,0,,520,40,255,319.1,0.520915,2026-11-17,2108727,1719954,0,26757,0,claim,0
-libero10_development,l10_t03_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,79,697,933.6,1.258726,2026-11-17,6145070,5410538,0,80543,0,claim,0
-libero10_development,l10_t03_i03,with,Gemini 3.8 Flash,1,0,0,0,0,,520,34,261,231.2,0.348612,2026-11-17,1444109,1169248,0,14606,0,claim,0
-libero10_development,l10_t03_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,79,587,873.0,1.179416,2026-11-17,5795131,5097362,0,73010,0,claim,0
-libero10_development,l10_t04_i00,with,Gemini 3.8 Flash,1,1,1,0,0,271,520,14,271,103.7,0.138763,2026-11-17,514932,394055,0,4947,0,episode_ended,0
-libero10_development,l10_t04_i00,without,Gemini 3.8 Flash,1,0,0,1,1,,520,54,777,803.6,2.711893,2026-11-17,3376733,75612,0,61435,0,claim,0
-libero10_development,l10_t04_i01,with,Gemini 3.8 Flash,1,0,0,1,1,,520,19,328,129.5,0.175373,2026-11-17,662005,514149,0,6912,0,claim,0
-libero10_development,l10_t04_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,66,748,905.0,1.041332,2026-11-17,4583131,3965815,0,74909,0,claim,0
-libero10_development,l10_t04_i02,with,Gemini 3.8 Flash,1,1,1,0,0,281,520,25,281,206.9,0.388604,2026-11-17,1019051,603502,0,8448,0,episode_ended,0
-libero10_development,l10_t04_i02,without,Gemini 3.8 Flash,1,0,0,1,1,,520,66,598,637.6,0.958279,2026-11-17,4269363,3664698,0,61314,0,claim,0
-libero10_development,l10_t04_i03,with,Gemini 3.8 Flash,1,1,1,0,0,260,520,21,260,156.1,0.234113,2026-11-17,746331,531973,0,8919,0,episode_ended,0
-libero10_development,l10_t04_i03,without,Gemini 3.8 Flash,1,0,0,1,1,,520,64,831,881.8,1.094016,2026-11-17,4961543,4341544,0,80907,0,claim,0
-libero10_development,l10_t05_i00,with,Gemini 3.8 Flash,1,1,1,0,0,200,520,23,200,408.7,0.326997,2026-11-17,1004211,779055,0,26587,0,episode_ended,0
-libero10_development,l10_t05_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,72,574,973.1,4.071442,2026-11-17,5129694,102383,0,78208,0,claim,0
-libero10_development,l10_t05_i01,with,Gemini 3.8 Flash,1,1,1,0,0,202,520,22,202,307.7,0.260388,2026-11-17,916964,728744,0,17218,0,episode_ended,0
-libero10_development,l10_t05_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,70,806,1032.1,1.352140,2026-11-17,6255464,5539390,0,106568,0,claim,0
-libero10_development,l10_t05_i02,with,Gemini 3.8 Flash,1,1,1,0,0,160,520,19,160,151.9,0.181584,2026-11-17,685225,538053,0,8227,0,episode_ended,0
-libero10_development,l10_t05_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,62,748,919.6,1.262754,2026-11-17,5580416,4925799,0,107295,0,claim,0
-libero10_development,l10_t05_i03,with,Gemini 3.8 Flash,1,1,1,0,0,160,520,27,160,332.4,0.353577,2026-11-17,1211341,993584,0,30864,0,episode_ended,0
-libero10_development,l10_t05_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,20,202,567.4,0.967798,2026-11-17,1004582,25894,0,61824,0,claim,0
-libero10_development,l10_t06_i00,with,Gemini 3.8 Flash,1,0,0,1,1,,520,19,361,247.6,0.273503,2026-11-17,792965,598244,0,22025,0,claim,0
-libero10_development,l10_t06_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,49,559,617.0,0.700248,2026-11-17,2456112,2005153,0,56438,0,claim,0
-libero10_development,l10_t06_i01,with,Gemini 3.8 Flash,1,1,1,0,0,373,520,28,373,266.3,0.356052,2026-11-17,1395180,1147954,0,22543,0,episode_ended,0
-libero10_development,l10_t06_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,75,900,869.7,1.259844,2026-11-17,5736127,5016505,0,91704,0,episode_ended,0
-libero10_development,l10_t06_i02,with,Gemini 3.8 Flash,1,1,1,0,0,374,520,17,374,184.2,0.223797,2026-11-17,677886,504178,0,14854,0,episode_ended,0
-libero10_development,l10_t06_i02,without,Gemini 3.8 Flash,1,0,0,1,1,,520,36,434,423.6,0.529150,2026-11-17,1605662,1219377,0,39462,0,claim,0
-libero10_development,l10_t06_i03,with,Gemini 3.8 Flash,1,1,1,0,0,355,520,19,355,307.6,0.313088,2026-11-17,904994,707631,0,29865,0,episode_ended,0
-libero10_development,l10_t06_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,71,759,901.4,3.494873,2026-11-17,4512398,195731,0,64718,1,claim,0
-libero10_development,l10_t07_i00,with,Gemini 3.8 Flash,1,0,0,1,1,,520,20,318,199.8,0.201979,2026-11-17,732762,578297,0,11402,0,claim,0
-libero10_development,l10_t07_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,71,659,610.6,0.926568,2026-11-17,3988895,3370795,0,56049,0,claim,0
-libero10_development,l10_t07_i01,with,Gemini 3.8 Flash,1,1,1,0,0,301,520,22,301,146.5,0.223669,2026-11-17,847968,663825,0,9540,0,episode_ended,0
-libero10_development,l10_t07_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,67,773,544.0,0.812446,2026-11-17,3156373,2575263,0,48925,0,claim,0
-libero10_development,l10_t07_i02,with,Gemini 3.8 Flash,1,1,1,0,0,307,520,18,307,239.4,0.249576,2026-11-17,695885,521069,0,21169,0,episode_ended,0
-libero10_development,l10_t07_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,72,859,922.7,1.258440,2026-11-17,6080211,5390057,0,89752,0,claim,0
-libero10_development,l10_t07_i03,with,Gemini 3.8 Flash,1,1,1,0,0,302,520,16,302,139.8,0.193223,2026-11-17,530953,362480,0,10582,0,episode_ended,0
-libero10_development,l10_t07_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,68,615,653.5,0.940344,2026-11-17,4042556,3438043,0,61095,0,claim,0
-libero10_development,l10_t08_i00,with,Gemini 3.8 Flash,1,1,1,0,0,341,520,14,341,187.7,0.170927,2026-11-17,497815,359420,0,10713,0,episode_ended,0
-libero10_development,l10_t08_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,14,172,376.0,0.272123,2026-11-17,437510,278599,0,35212,0,claim,0
-libero10_development,l10_t08_i01,with,Gemini 3.8 Flash,1,0,0,1,1,,520,47,524,602.8,0.630730,2026-11-17,2673429,2219084,0,32944,0,claim,0
-libero10_development,l10_t08_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,78,900,1100.3,1.351295,2026-11-17,6410723,5615524,0,88995,0,episode_ended,0
-libero10_development,l10_t08_i02,with,Gemini 3.8 Flash,1,0,0,0,0,,520,56,784,577.2,0.852682,2026-11-17,4053759,3501544,0,46908,0,claim,0
-libero10_development,l10_t08_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,39,459,723.9,1.970283,2026-11-17,2349074,54589,0,65420,0,claim,0
-libero10_development,l10_t08_i03,with,Gemini 3.8 Flash,1,0,0,1,1,,520,51,688,560.7,0.821643,2026-11-17,3799918,3285044,0,50429,0,claim,0
-libero10_development,l10_t08_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,65,884,1000.6,1.236508,2026-11-17,5700598,5040240,0,96859,0,claim,0
-libero10_development,l10_t09_i00,with,Gemini 3.8 Flash,1,0,0,0,0,,520,33,236,271.8,1.219291,2026-11-17,1516072,0,0,21930,0,claim,0
-libero10_development,l10_t09_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,77,758,863.9,3.878947,2026-11-17,4882871,51768,0,67130,0,claim,0
-libero10_development,l10_t09_i01,with,Gemini 3.8 Flash,1,0,0,0,0,,520,80,426,834.3,2.572763,2026-11-17,6329504,3484854,0,47443,0,reply_budget,0
-libero10_development,l10_t09_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,59,523,902.8,1.145794,2026-11-17,4783031,4164306,0,98514,0,claim,0
-libero10_development,l10_t09_i02,with,Gemini 3.8 Flash,1,0,0,0,0,,520,67,453,640.9,0.941568,2026-11-17,4592645,3954601,0,44384,0,claim,0
-libero10_development,l10_t09_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,64,761,979.8,1.159261,2026-11-17,4557618,3809607,0,83342,0,claim,0
-libero10_development,l10_t09_i03,with,Gemini 3.8 Flash,1,0,0,0,0,,520,79,577,676.7,1.141820,2026-11-17,6757632,6127523,0,55913,0,claim,0
-libero10_development,l10_t09_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,74,517,956.0,1.209978,2026-11-17,5816652,5120315,0,80987,0,claim,0
-libero10_development,l10_t00_i00,with,GPT-6 Astra,1,0,0,1,1,,520,12,320,65.1,1.233735,2026-11-17,380817,289865,0,687,0,claim,0
-libero10_development,l10_t00_i00,without,GPT-6 Astra,1,1,0,0,0,712,520,60,712,1264.9,11.884387,2026-11-17,1219809,117517,0,14879,1,episode_ended,0
-libero10_development,l10_t00_i01,with,GPT-6 Astra,1,0,0,1,1,,520,17,322,107.2,1.837374,2026-11-17,595801,465904,0,1450,0,claim,0
-libero10_development,l10_t00_i01,without,GPT-6 Astra,1,0,0,1,1,,520,50,662,534.8,8.689009,2026-11-17,869312,69329,0,12397,0,claim,0
-libero10_development,l10_t00_i02,with,GPT-6 Astra,1,0,0,1,1,,520,13,305,706.6,1.232374,2026-11-17,419892,333494,0,698,1,claim,0
-libero10_development,l10_t00_i02,without,GPT-6 Astra,1,1,1,0,0,464,520,33,464,2229.6,3.668473,2026-11-17,391993,70623,0,7683,3,episode_ended,0
-libero10_development,l10_t00_i03,with,GPT-6 Astra,1,1,1,0,0,314,520,8,314,45.4,0.611063,2026-11-17,222953,181663,0,330,0,episode_ended,0
-libero10_development,l10_t00_i03,without,GPT-6 Astra,1,1,0,0,0,609,520,49,609,491.9,7.913889,2026-11-17,800585,69329,0,10640,0,episode_ended,0
-libero10_development,l10_t01_i00,with,GPT-6 Astra,1,1,1,0,0,274,520,9,274,56.9,0.731401,2026-11-17,256900,206461,0,411,0,episode_ended,0
-libero10_development,l10_t01_i00,without,GPT-6 Astra,1,1,1,0,0,406,520,31,406,882.3,3.224494,2026-11-17,346940,61884,0,6241,1,episode_ended,0
-libero10_development,l10_t01_i01,with,GPT-6 Astra,1,1,1,0,0,495,520,15,495,98.3,1.575596,2026-11-17,506708,395326,0,1329,0,episode_ended,0
-libero10_development,l10_t01_i01,without,GPT-6 Astra,1,1,1,0,0,325,520,23,325,202.9,1.944042,2026-11-17,200394,32772,0,4701,0,episode_ended,0
-libero10_development,l10_t01_i02,with,GPT-6 Astra,1,1,1,0,0,281,520,6,281,37.4,0.461163,2026-11-17,156969,124753,0,285,0,episode_ended,0
-libero10_development,l10_t01_i02,without,GPT-6 Astra,1,1,1,0,0,512,520,46,512,709.6,7.000101,2026-11-17,716623,73981,0,9994,1,episode_ended,0
-libero10_development,l10_t01_i03,with,GPT-6 Astra,1,1,1,0,0,297,520,8,297,40.4,0.611502,2026-11-17,223382,182002,0,314,0,episode_ended,0
-libero10_development,l10_t01_i03,without,GPT-6 Astra,1,1,1,0,0,419,520,29,419,250.6,2.994887,2026-11-17,308235,41207,0,5668,0,episode_ended,0
-libero10_development,l10_t02_i00,with,GPT-6 Astra,1,1,1,0,0,468,520,46,468,310.1,7.575364,2026-11-17,1986390,1388254,0,4115,0,episode_ended,0
-libero10_development,l10_t02_i00,without,GPT-6 Astra,1,1,1,0,0,347,520,30,347,277.5,3.262893,2026-11-17,331926,42613,0,6543,0,episode_ended,0
-libero10_development,l10_t02_i01,with,GPT-6 Astra,1,1,1,0,0,277,520,33,277,306.0,4.342434,2026-11-17,1263785,937424,0,2828,0,episode_ended,0
-libero10_development,l10_t02_i01,without,GPT-6 Astra,1,1,0,0,0,614,520,53,614,1743.6,9.263582,2026-11-17,985861,132442,0,11939,2,episode_ended,0
-libero10_development,l10_t02_i02,with,GPT-6 Astra,1,1,1,0,0,283,520,28,283,167.1,3.130482,2026-11-17,1016176,797192,0,2869,0,episode_ended,0
-libero10_development,l10_t02_i02,without,GPT-6 Astra,1,1,0,0,0,521,520,38,521,408.0,5.403181,2026-11-17,539578,53861,0,9843,0,episode_ended,0
-libero10_development,l10_t02_i03,with,GPT-6 Astra,1,1,1,0,0,262,520,25,262,155.4,2.621779,2026-11-17,877144,694179,0,1959,0,episode_ended,0
-libero10_development,l10_t02_i03,without,GPT-6 Astra,1,1,1,0,0,336,520,27,336,241.4,2.537895,2026-11-17,262175,38395,0,5234,0,episode_ended,0
-libero10_development,l10_t03_i00,with,GPT-6 Astra,1,1,0,0,0,762,520,56,762,684.6,14.795269,2026-11-17,2867756,1576999,0,6214,1,episode_ended,0
-libero10_development,l10_t03_i00,without,GPT-6 Astra,1,0,0,0,0,,520,80,896,1528.0,22.209460,2026-11-17,2259742,162840,0,21552,1,claim,0
-libero10_development,l10_t03_i01,with,GPT-6 Astra,1,0,0,0,0,,520,56,775,1057.5,11.242604,2026-11-17,2773054,1867554,0,6401,1,claim,0
-libero10_development,l10_t03_i01,without,GPT-6 Astra,1,0,0,0,0,,520,79,793,2651.6,20.517497,2026-11-17,2124716,183207,0,18384,3,claim,0
-libero10_development,l10_t03_i02,with,GPT-6 Astra,1,0,0,0,0,,520,74,864,694.6,19.326021,2026-11-17,4394319,2790541,0,9954,1,claim,0
-libero10_development,l10_t03_i02,without,GPT-6 Astra,1,0,0,0,0,,520,73,859,646.8,16.566677,2026-11-17,1677972,103077,0,14293,0,claim,0
-libero10_development,l10_t03_i03,with,GPT-6 Astra,1,0,0,0,0,,520,61,865,463.2,14.053048,2026-11-17,3239847,2076458,0,6854,0,claim,0
-libero10_development,l10_t03_i03,without,GPT-6 Astra,1,0,0,0,0,,520,76,876,1457.6,19.335233,2026-11-17,1997569,178773,0,19370,1,claim,0
-libero10_development,l10_t04_i00,with,GPT-6 Astra,1,1,1,0,0,274,520,5,274,31.3,0.427028,2026-11-17,130502,98788,0,222,0,episode_ended,0
-libero10_development,l10_t04_i00,without,GPT-6 Astra,1,0,0,1,1,,520,53,582,1160.8,9.430035,2026-11-17,984263,109955,0,11540,2,claim,0
-libero10_development,l10_t04_i01,with,GPT-6 Astra,1,1,1,0,0,281,520,7,281,42.8,0.508355,2026-11-17,196020,163005,0,304,0,episode_ended,0
-libero10_development,l10_t04_i01,without,GPT-6 Astra,1,0,0,1,1,,520,47,487,389.3,7.161821,2026-11-17,734170,66531,0,8378,0,claim,0
-libero10_development,l10_t04_i02,with,GPT-6 Astra,1,1,1,0,0,279,520,5,279,34.8,0.426623,2026-11-17,130456,98793,0,224,0,episode_ended,0
-libero10_development,l10_t04_i02,without,GPT-6 Astra,2,0,0,1,1,,520,52,602,1081.7,9.129479,2026-11-17,941638,94939,0,11351,1,claim,0
-libero10_development,l10_t04_i03,with,GPT-6 Astra,1,1,1,0,0,271,520,4,271,31.4,0.339194,2026-11-17,98805,73284,0,214,0,episode_ended,0
-libero10_development,l10_t04_i03,without,GPT-6 Astra,1,0,0,1,1,,520,45,497,1049.8,6.791456,2026-11-17,710336,90056,0,9972,1,claim,0
-libero10_development,l10_t05_i00,with,GPT-6 Astra,1,0,0,1,1,,520,14,199,85.1,1.266845,2026-11-17,441191,357485,0,1446,0,claim,0
-libero10_development,l10_t05_i00,without,GPT-6 Astra,1,0,0,0,0,,520,72,873,2238.3,20.233554,2026-11-17,2056612,167474,0,23494,2,claim,0
-libero10_development,l10_t05_i01,with,GPT-6 Astra,1,0,0,1,1,,520,14,192,138.8,1.336523,2026-11-17,431419,337013,0,1109,0,claim,0
-libero10_development,l10_t05_i01,without,GPT-6 Astra,1,0,0,1,1,,520,30,332,361.1,3.854765,2026-11-17,372830,41215,0,9948,0,claim,0
-libero10_development,l10_t05_i02,with,GPT-6 Astra,1,0,0,1,1,,520,18,203,711.2,1.726757,2026-11-17,619358,504047,0,1392,1,claim,0
-libero10_development,l10_t05_i02,without,GPT-6 Astra,1,0,0,1,1,,520,37,430,1030.3,5.143881,2026-11-17,524336,71881,0,10949,1,claim,0
-libero10_development,l10_t05_i03,with,GPT-6 Astra,1,0,0,1,1,,520,17,293,100.7,1.700020,2026-11-17,571915,455070,0,1530,0,claim,0
-libero10_development,l10_t05_i03,without,GPT-6 Astra,1,0,0,1,1,,520,20,235,226.5,1.773448,2026-11-17,174352,28558,0,5739,0,claim,0
-libero10_development,l10_t06_i00,with,GPT-6 Astra,1,1,1,0,0,339,520,7,339,36.2,0.508423,2026-11-17,196020,163003,0,305,0,episode_ended,0
-libero10_development,l10_t06_i00,without,GPT-6 Astra,2,0,0,1,1,,520,31,356,376.3,3.356783,2026-11-17,350352,51943,0,6415,1,claim,0
-libero10_development,l10_t06_i01,with,GPT-6 Astra,1,1,1,0,0,345,520,7,345,35.9,0.504768,2026-11-17,195478,162568,0,262,0,episode_ended,0
-libero10_development,l10_t06_i01,without,GPT-6 Astra,1,0,0,1,1,,520,62,617,1133.0,12.090351,2026-11-17,1237870,93861,0,11128,1,claim,0
-libero10_development,l10_t06_i02,with,GPT-6 Astra,1,0,0,1,1,,520,9,393,49.4,0.664465,2026-11-17,262675,220215,0,393,0,claim,0
-libero10_development,l10_t06_i03,with,GPT-6 Astra,1,1,1,0,0,340,520,7,340,38.2,0.505979,2026-11-17,195518,162589,0,282,0,episode_ended,0
-libero10_development,l10_t06_i03,without,GPT-6 Astra,1,0,0,1,1,,520,54,538,1094.9,9.793435,2026-11-17,998486,81575,0,10855,1,claim,0
-libero10_development,l10_t07_i00,with,GPT-6 Astra,1,1,1,0,0,300,520,8,300,46.9,0.607983,2026-11-17,222643,181533,0,307,0,episode_ended,0
-libero10_development,l10_t07_i00,without,GPT-6 Astra,1,1,1,0,0,444,520,36,444,501.9,4.642424,2026-11-17,462974,51674,0,9555,1,episode_ended,0
-libero10_development,l10_t07_i01,with,GPT-6 Astra,1,1,1,0,0,302,520,8,302,61.9,0.511856,2026-11-17,206280,174316,0,358,0,episode_ended,0
-libero10_development,l10_t07_i01,without,GPT-6 Astra,1,1,1,0,0,359,520,33,359,327.3,3.358147,2026-11-17,365375,64217,0,5647,1,episode_ended,0
-libero10_development,l10_t07_i02,with,GPT-6 Astra,1,0,0,1,1,,520,10,327,68.3,0.780449,2026-11-17,292074,240349,0,457,0,claim,0
-libero10_development,l10_t07_i02,without,GPT-6 Astra,1,1,1,0,0,444,520,40,444,964.1,5.092596,2026-11-17,529339,66916,0,8029,1,episode_ended,0
-libero10_development,l10_t07_i03,with,GPT-6 Astra,1,0,0,1,1,,520,9,370,270.5,0.458959,2026-11-17,243391,222539,0,558,0,claim,0
-libero10_development,l10_t07_i03,without,GPT-6 Astra,1,1,1,0,0,395,520,32,395,270.7,3.496089,2026-11-17,358955,45429,0,6308,0,episode_ended,0
-libero10_development,l10_t08_i00,with,GPT-6 Astra,1,1,1,0,0,310,520,13,310,82.7,1.058944,2026-11-17,403815,336334,0,956,0,episode_ended,0
-libero10_development,l10_t08_i00,without,GPT-6 Astra,1,1,0,0,0,562,520,49,562,1158.5,8.089993,2026-11-17,822488,80843,0,11854,1,episode_ended,0
-libero10_development,l10_t08_i01,with,GPT-6 Astra,1,1,1,0,0,321,520,7,321,52.8,0.514765,2026-11-17,196007,162945,0,424,0,episode_ended,0
-libero10_development,l10_t08_i01,without,GPT-6 Astra,1,1,1,0,0,451,520,33,451,353.7,4.145912,2026-11-17,409641,46822,0,9418,0,episode_ended,0
-libero10_development,l10_t08_i02,with,GPT-6 Astra,1,1,1,0,0,342,520,8,342,47.2,0.543416,2026-11-17,227256,194266,0,385,0,episode_ended,0
-libero10_development,l10_t08_i02,without,GPT-6 Astra,1,0,0,0,0,,520,77,881,712.0,18.896257,2026-11-17,1904164,108687,0,16656,0,claim,0
-libero10_development,l10_t08_i03,with,GPT-6 Astra,1,0,0,1,1,,520,40,861,326.8,4.707628,2026-11-17,1765606,1462948,0,4362,0,claim,0
-libero10_development,l10_t08_i03,without,GPT-6 Astra,1,1,1,0,0,439,520,35,439,934.9,4.261988,2026-11-17,441890,61868,0,7998,1,episode_ended,0
-libero10_development,l10_t09_i00,with,GPT-6 Astra,1,0,0,0,0,,520,43,693,1517.6,8.578577,2026-11-17,2057901,1355737,0,4024,2,claim,0
-libero10_development,l10_t09_i00,without,GPT-6 Astra,1,0,0,0,0,,520,72,846,1521.7,16.140794,2026-11-17,1667768,141504,0,14733,2,claim,0
-libero10_development,l10_t09_i01,with,GPT-6 Astra,1,0,0,0,0,,520,28,836,187.5,3.320666,2026-11-17,1109110,876576,0,2375,0,claim,0
-libero10_development,l10_t09_i01,without,GPT-6 Astra,1,0,0,0,0,,520,80,777,1460.4,21.176731,2026-11-17,2130335,114891,0,18148,1,claim,0
-libero10_development,l10_t09_i02,with,GPT-6 Astra,1,0,0,0,0,,520,51,799,977.6,10.615150,2026-11-17,2456054,1580010,0,5494,1,claim,0
-libero10_development,l10_t09_i02,without,GPT-6 Astra,1,1,0,0,0,675,520,56,675,1217.1,10.734193,2026-11-17,1080054,84883,0,13952,1,episode_ended,0
-libero10_development,l10_t09_i03,with,GPT-6 Astra,1,0,0,0,0,,520,29,672,372.9,4.005253,2026-11-17,1140717,837163,0,2651,1,claim,0
-libero10_development,l10_t09_i03,without,GPT-6 Astra,1,0,0,0,0,,520,39,615,382.6,5.302979,2026-11-17,532815,55269,0,9445,0,claim,0
+list,cell,arm,model,attempt,solved,clean,claimed_success,false_claim,first_success_step,step_limit,requests,steps,wall_s,usd_list,price_date,tokens_in,tokens_cached,tokens_cache_write,tokens_out,failed_requests,ended_by,problems,replies_tool_calls,replies_stop,replies_length,replies_content_filter,replies_other,requests_no_reply,content_filter_at_end
+libero10_development,l10_t00_i00,with,Gemini 3.8 Flash,1,1,1,0,0,346,520,13,346,157.1,0.155849,2026-11-17,428225,300507,0,10006,0,episode_ended,0,13,0,0,0,0,0,0
+libero10_development,l10_t00_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,49,609,592.4,0.702824,2026-11-17,2283703,1817333,0,57799,0,claim,0,49,0,0,0,0,0,0
+libero10_development,l10_t00_i01,with,Gemini 3.8 Flash,1,1,1,0,0,334,520,26,334,248.3,0.303728,2026-11-17,992223,765042,0,20257,0,episode_ended,0,26,0,0,0,0,0,0
+libero10_development,l10_t00_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,79,851,661.2,1.089108,2026-11-17,5133460,4445957,0,64009,0,claim,0,79,0,0,0,0,0,0
+libero10_development,l10_t00_i02,with,Gemini 3.8 Flash,1,1,1,0,0,327,520,19,327,170.2,0.573643,2026-11-17,698373,0,0,13297,0,episode_ended,0,19,0,0,0,0,0,0
+libero10_development,l10_t00_i02,without,Gemini 3.8 Flash,1,1,1,0,0,440,520,42,440,592.9,0.623309,2026-11-17,2225428,1830727,0,50661,0,episode_ended,0,42,0,0,0,0,0,0
+libero10_development,l10_t00_i03,with,Gemini 3.8 Flash,1,1,1,0,0,493,520,19,493,158.5,0.194940,2026-11-17,670875,518534,0,11145,0,episode_ended,0,19,0,0,0,0,0,0
+libero10_development,l10_t00_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,73,714,786.8,1.112400,2026-11-17,5090956,4435379,0,76817,0,claim,0,73,0,0,0,0,0,0
+libero10_development,l10_t01_i00,with,Gemini 3.8 Flash,1,1,1,0,0,429,520,21,429,138.5,0.201589,2026-11-17,755168,583242,0,7707,0,episode_ended,0,21,0,0,0,0,0,0
+libero10_development,l10_t01_i00,without,Gemini 3.8 Flash,1,1,1,0,0,347,520,27,347,369.7,0.773069,2026-11-17,912621,36236,0,30150,0,episode_ended,0,27,0,0,0,0,0,0
+libero10_development,l10_t01_i01,with,Gemini 3.8 Flash,1,1,1,0,0,297,520,14,297,120.2,0.168915,2026-11-17,496411,341451,0,7223,0,episode_ended,0,14,0,0,0,0,0,0
+libero10_development,l10_t01_i01,without,Gemini 3.8 Flash,1,1,1,0,0,376,520,29,376,382.1,0.972017,2026-11-17,1155646,37842,0,34887,0,episode_ended,0,29,0,0,0,0,0,0
+libero10_development,l10_t01_i02,with,Gemini 3.8 Flash,1,1,1,0,0,283,520,8,283,122.4,0.124145,2026-11-17,286666,203994,0,12491,0,episode_ended,0,8,0,0,0,0,0,0
+libero10_development,l10_t01_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,78,787,724.2,1.081137,2026-11-17,4807252,4115562,0,67654,0,claim,0,78,0,0,0,0,0,0
+libero10_development,l10_t01_i03,with,Gemini 3.8 Flash,1,1,1,0,0,298,520,22,298,189.6,0.246603,2026-11-17,804737,585036,0,10120,0,episode_ended,0,22,0,0,0,0,0,0
+libero10_development,l10_t01_i03,without,Gemini 3.8 Flash,1,1,1,0,0,388,520,31,388,416.0,0.480054,2026-11-17,1445962,1134683,0,43065,0,episode_ended,0,31,0,0,0,0,0,0
+libero10_development,l10_t02_i00,with,Gemini 3.8 Flash,1,0,0,1,1,,520,60,497,667.9,0.938953,2026-11-17,4216081,3510826,0,39120,0,claim,0,60,0,0,0,0,0,0
+libero10_development,l10_t02_i00,without,Gemini 3.8 Flash,1,0,0,1,1,,520,63,583,912.0,1.011131,2026-11-17,4433364,3835982,0,73439,0,claim,0,63,0,0,0,0,0,0
+libero10_development,l10_t02_i01,with,Gemini 3.8 Flash,1,1,1,0,0,334,520,33,334,432.1,0.567529,2026-11-17,1713678,1200264,0,24653,0,episode_ended,0,33,0,0,0,0,0,0
+libero10_development,l10_t02_i01,without,Gemini 3.8 Flash,1,1,0,0,0,588,520,50,588,552.4,0.711122,2026-11-17,2636664,2176930,0,54147,0,episode_ended,0,50,0,0,0,0,0,0
+libero10_development,l10_t02_i02,with,Gemini 3.8 Flash,1,0,0,1,1,,520,52,866,486.0,1.461883,2026-11-17,3578949,2009613,0,35776,0,claim,0,52,0,0,0,0,0,0
+libero10_development,l10_t02_i02,without,Gemini 3.8 Flash,1,1,0,0,0,539,520,48,539,907.8,0.898487,2026-11-17,3353442,2845721,0,81138,0,episode_ended,0,47,1,0,0,0,0,0
+libero10_development,l10_t02_i03,with,Gemini 3.8 Flash,1,1,1,0,0,349,520,35,349,291.2,0.604343,2026-11-17,1720762,1126657,0,19804,0,episode_ended,0,35,0,0,0,0,0,0
+libero10_development,l10_t02_i03,without,Gemini 3.8 Flash,1,1,1,0,0,494,520,49,494,757.3,0.813616,2026-11-17,2998595,2505771,0,68284,0,episode_ended,0,49,0,0,0,0,0,0
+libero10_development,l10_t03_i00,with,Gemini 3.8 Flash,1,0,0,0,0,,520,40,292,304.3,0.475370,2026-11-17,2016281,1657038,0,21776,0,budget_spent_no_claim,0,40,0,0,0,0,0,0
+libero10_development,l10_t03_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,58,528,869.3,1.142251,2026-11-17,4503491,3814799,0,90566,0,claim,0,58,0,0,0,0,0,0
+libero10_development,l10_t03_i01,with,Gemini 3.8 Flash,1,0,0,0,0,,520,34,250,328.6,0.536160,2026-11-17,1551030,1052611,0,22240,0,claim,0,33,1,0,0,0,0,0
+libero10_development,l10_t03_i01,without,Gemini 3.8 Flash,1,1,1,0,0,243,520,30,243,569.5,1.218021,2026-11-17,1403117,39416,0,51277,0,episode_ended,0,30,0,0,0,0,0,0
+libero10_development,l10_t03_i02,with,Gemini 3.8 Flash,1,0,0,0,0,,520,40,255,319.1,0.520915,2026-11-17,2108727,1719954,0,26757,0,claim,0,40,0,0,0,0,0,0
+libero10_development,l10_t03_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,79,697,933.6,1.258726,2026-11-17,6145070,5410538,0,80543,0,claim,0,79,0,0,0,0,0,0
+libero10_development,l10_t03_i03,with,Gemini 3.8 Flash,1,0,0,0,0,,520,34,261,231.2,0.348612,2026-11-17,1444109,1169248,0,14606,0,claim,0,34,0,0,0,0,0,0
+libero10_development,l10_t03_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,79,587,873.0,1.179416,2026-11-17,5795131,5097362,0,73010,0,claim,0,79,0,0,0,0,0,0
+libero10_development,l10_t04_i00,with,Gemini 3.8 Flash,1,1,1,0,0,271,520,14,271,103.7,0.138763,2026-11-17,514932,394055,0,4947,0,episode_ended,0,14,0,0,0,0,0,0
+libero10_development,l10_t04_i00,without,Gemini 3.8 Flash,1,0,0,1,1,,520,54,777,803.6,2.711893,2026-11-17,3376733,75612,0,61435,0,claim,0,54,0,0,0,0,0,0
+libero10_development,l10_t04_i01,with,Gemini 3.8 Flash,1,0,0,1,1,,520,19,328,129.5,0.175373,2026-11-17,662005,514149,0,6912,0,claim,0,19,0,0,0,0,0,0
+libero10_development,l10_t04_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,66,748,905.0,1.041332,2026-11-17,4583131,3965815,0,74909,0,claim,0,66,0,0,0,0,0,0
+libero10_development,l10_t04_i02,with,Gemini 3.8 Flash,1,1,1,0,0,281,520,25,281,206.9,0.388604,2026-11-17,1019051,603502,0,8448,0,episode_ended,0,25,0,0,0,0,0,0
+libero10_development,l10_t04_i02,without,Gemini 3.8 Flash,1,0,0,1,1,,520,66,598,637.6,0.958279,2026-11-17,4269363,3664698,0,61314,0,claim,0,66,0,0,0,0,0,0
+libero10_development,l10_t04_i03,with,Gemini 3.8 Flash,1,1,1,0,0,260,520,21,260,156.1,0.234113,2026-11-17,746331,531973,0,8919,0,episode_ended,0,21,0,0,0,0,0,0
+libero10_development,l10_t04_i03,without,Gemini 3.8 Flash,1,0,0,1,1,,520,64,831,881.8,1.094016,2026-11-17,4961543,4341544,0,80907,0,claim,0,64,0,0,0,0,0,0
+libero10_development,l10_t05_i00,with,Gemini 3.8 Flash,1,1,1,0,0,200,520,23,200,408.7,0.326997,2026-11-17,1004211,779055,0,26587,0,episode_ended,0,23,0,0,0,0,0,0
+libero10_development,l10_t05_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,72,574,973.1,4.071442,2026-11-17,5129694,102383,0,78208,0,claim,0,72,0,0,0,0,0,0
+libero10_development,l10_t05_i01,with,Gemini 3.8 Flash,1,1,1,0,0,202,520,22,202,307.7,0.260388,2026-11-17,916964,728744,0,17218,0,episode_ended,0,22,0,0,0,0,0,0
+libero10_development,l10_t05_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,70,806,1032.1,1.352140,2026-11-17,6255464,5539390,0,106568,0,claim,0,70,0,0,0,0,0,0
+libero10_development,l10_t05_i02,with,Gemini 3.8 Flash,1,1,1,0,0,160,520,19,160,151.9,0.181584,2026-11-17,685225,538053,0,8227,0,episode_ended,0,17,2,0,0,0,0,0
+libero10_development,l10_t05_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,62,748,919.6,1.262754,2026-11-17,5580416,4925799,0,107295,0,claim,0,62,0,0,0,0,0,0
+libero10_development,l10_t05_i03,with,Gemini 3.8 Flash,1,1,1,0,0,160,520,27,160,332.4,0.353577,2026-11-17,1211341,993584,0,30864,0,episode_ended,0,27,0,0,0,0,0,0
+libero10_development,l10_t05_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,20,202,567.4,0.967798,2026-11-17,1004582,25894,0,61824,0,claim,0,20,0,0,0,0,0,0
+libero10_development,l10_t06_i00,with,Gemini 3.8 Flash,1,0,0,1,1,,520,19,361,247.6,0.273503,2026-11-17,792965,598244,0,22025,0,claim,0,19,0,0,0,0,0,0
+libero10_development,l10_t06_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,49,559,617.0,0.700248,2026-11-17,2456112,2005153,0,56438,0,claim,0,48,1,0,0,0,0,0
+libero10_development,l10_t06_i01,with,Gemini 3.8 Flash,1,1,1,0,0,373,520,28,373,266.3,0.356052,2026-11-17,1395180,1147954,0,22543,0,episode_ended,0,28,0,0,0,0,0,0
+libero10_development,l10_t06_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,75,900,869.7,1.259844,2026-11-17,5736127,5016505,0,91704,0,episode_ended,0,75,0,0,0,0,0,0
+libero10_development,l10_t06_i02,with,Gemini 3.8 Flash,1,1,1,0,0,374,520,17,374,184.2,0.223797,2026-11-17,677886,504178,0,14854,0,episode_ended,0,17,0,0,0,0,0,0
+libero10_development,l10_t06_i02,without,Gemini 3.8 Flash,1,0,0,1,1,,520,36,434,423.6,0.529150,2026-11-17,1605662,1219377,0,39462,0,claim,0,36,0,0,0,0,0,0
+libero10_development,l10_t06_i03,with,Gemini 3.8 Flash,1,1,1,0,0,355,520,19,355,307.6,0.313088,2026-11-17,904994,707631,0,29865,0,episode_ended,0,19,0,0,0,0,0,0
+libero10_development,l10_t06_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,71,759,901.4,3.494873,2026-11-17,4512398,195731,0,64718,1,claim,0,71,0,0,0,0,1,0
+libero10_development,l10_t07_i00,with,Gemini 3.8 Flash,1,0,0,1,1,,520,20,318,199.8,0.201979,2026-11-17,732762,578297,0,11402,0,claim,0,20,0,0,0,0,0,0
+libero10_development,l10_t07_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,71,659,610.6,0.926568,2026-11-17,3988895,3370795,0,56049,0,claim,0,71,0,0,0,0,0,0
+libero10_development,l10_t07_i01,with,Gemini 3.8 Flash,1,1,1,0,0,301,520,22,301,146.5,0.223669,2026-11-17,847968,663825,0,9540,0,episode_ended,0,22,0,0,0,0,0,0
+libero10_development,l10_t07_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,67,773,544.0,0.812446,2026-11-17,3156373,2575263,0,48925,0,claim,0,67,0,0,0,0,0,0
+libero10_development,l10_t07_i02,with,Gemini 3.8 Flash,1,1,1,0,0,307,520,18,307,239.4,0.249576,2026-11-17,695885,521069,0,21169,0,episode_ended,0,18,0,0,0,0,0,0
+libero10_development,l10_t07_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,72,859,922.7,1.258440,2026-11-17,6080211,5390057,0,89752,0,claim,0,72,0,0,0,0,0,0
+libero10_development,l10_t07_i03,with,Gemini 3.8 Flash,1,1,1,0,0,302,520,16,302,139.8,0.193223,2026-11-17,530953,362480,0,10582,0,episode_ended,0,16,0,0,0,0,0,0
+libero10_development,l10_t07_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,68,615,653.5,0.940344,2026-11-17,4042556,3438043,0,61095,0,claim,0,68,0,0,0,0,0,0
+libero10_development,l10_t08_i00,with,Gemini 3.8 Flash,1,1,1,0,0,341,520,14,341,187.7,0.170927,2026-11-17,497815,359420,0,10713,0,episode_ended,0,14,0,0,0,0,0,0
+libero10_development,l10_t08_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,14,172,376.0,0.272123,2026-11-17,437510,278599,0,35212,0,claim,0,14,0,0,0,0,0,0
+libero10_development,l10_t08_i01,with,Gemini 3.8 Flash,1,0,0,1,1,,520,47,524,602.8,0.630730,2026-11-17,2673429,2219084,0,32944,0,claim,0,47,0,0,0,0,0,0
+libero10_development,l10_t08_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,78,900,1100.3,1.351295,2026-11-17,6410723,5615524,0,88995,0,episode_ended,0,78,0,0,0,0,0,0
+libero10_development,l10_t08_i02,with,Gemini 3.8 Flash,1,0,0,0,0,,520,56,784,577.2,0.852682,2026-11-17,4053759,3501544,0,46908,0,claim,0,56,0,0,0,0,0,0
+libero10_development,l10_t08_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,39,459,723.9,1.970283,2026-11-17,2349074,54589,0,65420,0,claim,0,39,0,0,0,0,0,0
+libero10_development,l10_t08_i03,with,Gemini 3.8 Flash,1,0,0,1,1,,520,51,688,560.7,0.821643,2026-11-17,3799918,3285044,0,50429,0,claim,0,51,0,0,0,0,0,0
+libero10_development,l10_t08_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,65,884,1000.6,1.236508,2026-11-17,5700598,5040240,0,96859,0,claim,0,65,0,0,0,0,0,0
+libero10_development,l10_t09_i00,with,Gemini 3.8 Flash,1,0,0,0,0,,520,33,236,271.8,1.219291,2026-11-17,1516072,0,0,21930,0,claim,0,33,0,0,0,0,0,0
+libero10_development,l10_t09_i00,without,Gemini 3.8 Flash,1,0,0,0,0,,520,77,758,863.9,3.878947,2026-11-17,4882871,51768,0,67130,0,claim,0,77,0,0,0,0,0,0
+libero10_development,l10_t09_i01,with,Gemini 3.8 Flash,1,0,0,0,0,,520,80,426,834.3,2.572763,2026-11-17,6329504,3484854,0,47443,0,reply_budget,0,79,1,0,0,0,0,0
+libero10_development,l10_t09_i01,without,Gemini 3.8 Flash,1,0,0,0,0,,520,59,523,902.8,1.145794,2026-11-17,4783031,4164306,0,98514,0,claim,0,59,0,0,0,0,0,0
+libero10_development,l10_t09_i02,with,Gemini 3.8 Flash,1,0,0,0,0,,520,67,453,640.9,0.941568,2026-11-17,4592645,3954601,0,44384,0,claim,0,67,0,0,0,0,0,0
+libero10_development,l10_t09_i02,without,Gemini 3.8 Flash,1,0,0,0,0,,520,64,761,979.8,1.159261,2026-11-17,4557618,3809607,0,83342,0,claim,0,64,0,0,0,0,0,0
+libero10_development,l10_t09_i03,with,Gemini 3.8 Flash,1,0,0,0,0,,520,79,577,676.7,1.141820,2026-11-17,6757632,6127523,0,55913,0,claim,0,79,0,0,0,0,0,0
+libero10_development,l10_t09_i03,without,Gemini 3.8 Flash,1,0,0,0,0,,520,74,517,956.0,1.209978,2026-11-17,5816652,5120315,0,80987,0,claim,0,74,0,0,0,0,0,0
+libero10_development,l10_t00_i00,with,GPT-6 Astra,1,0,0,1,1,,520,12,320,65.1,1.233735,2026-11-17,380817,289865,0,687,0,claim,0,12,0,0,0,0,0,0
+libero10_development,l10_t00_i00,without,GPT-6 Astra,1,1,0,0,0,712,520,60,712,1264.9,11.884387,2026-11-17,1219809,117517,0,14879,1,episode_ended,0,60,0,0,0,0,1,0
+libero10_development,l10_t00_i01,with,GPT-6 Astra,1,0,0,1,1,,520,17,322,107.2,1.837374,2026-11-17,595801,465904,0,1450,0,claim,0,17,0,0,0,0,0,0
+libero10_development,l10_t00_i01,without,GPT-6 Astra,1,0,0,1,1,,520,50,662,534.8,8.689009,2026-11-17,869312,69329,0,12397,0,claim,0,50,0,0,0,0,0,0
+libero10_development,l10_t00_i02,with,GPT-6 Astra,1,0,0,1,1,,520,13,305,706.6,1.232374,2026-11-17,419892,333494,0,698,1,claim,0,13,0,0,0,0,1,0
+libero10_development,l10_t00_i02,without,GPT-6 Astra,1,1,1,0,0,464,520,33,464,2229.6,3.668473,2026-11-17,391993,70623,0,7683,3,episode_ended,0,33,0,0,0,0,3,0
+libero10_development,l10_t00_i03,with,GPT-6 Astra,1,1,1,0,0,314,520,8,314,45.4,0.611063,2026-11-17,222953,181663,0,330,0,episode_ended,0,8,0,0,0,0,0,0
+libero10_development,l10_t00_i03,without,GPT-6 Astra,1,1,0,0,0,609,520,49,609,491.9,7.913889,2026-11-17,800585,69329,0,10640,0,episode_ended,0,49,0,0,0,0,0,0
+libero10_development,l10_t01_i00,with,GPT-6 Astra,1,1,1,0,0,274,520,9,274,56.9,0.731401,2026-11-17,256900,206461,0,411,0,episode_ended,0,9,0,0,0,0,0,0
+libero10_development,l10_t01_i00,without,GPT-6 Astra,1,1,1,0,0,406,520,31,406,882.3,3.224494,2026-11-17,346940,61884,0,6241,1,episode_ended,0,31,0,0,0,0,1,0
+libero10_development,l10_t01_i01,with,GPT-6 Astra,1,1,1,0,0,495,520,15,495,98.3,1.575596,2026-11-17,506708,395326,0,1329,0,episode_ended,0,15,0,0,0,0,0,0
+libero10_development,l10_t01_i01,without,GPT-6 Astra,1,1,1,0,0,325,520,23,325,202.9,1.944042,2026-11-17,200394,32772,0,4701,0,episode_ended,0,23,0,0,0,0,0,0
+libero10_development,l10_t01_i02,with,GPT-6 Astra,1,1,1,0,0,281,520,6,281,37.4,0.461163,2026-11-17,156969,124753,0,285,0,episode_ended,0,6,0,0,0,0,0,0
+libero10_development,l10_t01_i02,without,GPT-6 Astra,1,1,1,0,0,512,520,46,512,709.6,7.000101,2026-11-17,716623,73981,0,9994,1,episode_ended,0,46,0,0,0,0,1,0
+libero10_development,l10_t01_i03,with,GPT-6 Astra,1,1,1,0,0,297,520,8,297,40.4,0.611502,2026-11-17,223382,182002,0,314,0,episode_ended,0,8,0,0,0,0,0,0
+libero10_development,l10_t01_i03,without,GPT-6 Astra,1,1,1,0,0,419,520,29,419,250.6,2.994887,2026-11-17,308235,41207,0,5668,0,episode_ended,0,29,0,0,0,0,0,0
+libero10_development,l10_t02_i00,with,GPT-6 Astra,1,1,1,0,0,468,520,46,468,310.1,7.575364,2026-11-17,1986390,1388254,0,4115,0,episode_ended,0,46,0,0,0,0,0,0
+libero10_development,l10_t02_i00,without,GPT-6 Astra,1,1,1,0,0,347,520,30,347,277.5,3.262893,2026-11-17,331926,42613,0,6543,0,episode_ended,0,30,0,0,0,0,0,0
+libero10_development,l10_t02_i01,with,GPT-6 Astra,1,1,1,0,0,277,520,33,277,306.0,4.342434,2026-11-17,1263785,937424,0,2828,0,episode_ended,0,33,0,0,0,0,0,0
+libero10_development,l10_t02_i01,without,GPT-6 Astra,1,1,0,0,0,614,520,53,614,1743.6,9.263582,2026-11-17,985861,132442,0,11939,2,episode_ended,0,53,0,0,0,0,2,0
+libero10_development,l10_t02_i02,with,GPT-6 Astra,1,1,1,0,0,283,520,28,283,167.1,3.130482,2026-11-17,1016176,797192,0,2869,0,episode_ended,0,28,0,0,0,0,0,0
+libero10_development,l10_t02_i02,without,GPT-6 Astra,1,1,0,0,0,521,520,38,521,408.0,5.403181,2026-11-17,539578,53861,0,9843,0,episode_ended,0,38,0,0,0,0,0,0
+libero10_development,l10_t02_i03,with,GPT-6 Astra,1,1,1,0,0,262,520,25,262,155.4,2.621779,2026-11-17,877144,694179,0,1959,0,episode_ended,0,25,0,0,0,0,0,0
+libero10_development,l10_t02_i03,without,GPT-6 Astra,1,1,1,0,0,336,520,27,336,241.4,2.537895,2026-11-17,262175,38395,0,5234,0,episode_ended,0,27,0,0,0,0,0,0
+libero10_development,l10_t03_i00,with,GPT-6 Astra,1,1,0,0,0,762,520,56,762,684.6,14.795269,2026-11-17,2867756,1576999,0,6214,1,episode_ended,0,56,0,0,0,0,1,0
+libero10_development,l10_t03_i00,without,GPT-6 Astra,1,0,0,0,0,,520,80,896,1528.0,22.209460,2026-11-17,2259742,162840,0,21552,1,claim,0,80,0,0,0,0,1,0
+libero10_development,l10_t03_i01,with,GPT-6 Astra,1,0,0,0,0,,520,56,775,1057.5,11.242604,2026-11-17,2773054,1867554,0,6401,1,claim,0,56,0,0,0,0,1,0
+libero10_development,l10_t03_i01,without,GPT-6 Astra,1,0,0,0,0,,520,79,793,2651.6,20.517497,2026-11-17,2124716,183207,0,18384,3,claim,0,79,0,0,0,0,3,0
+libero10_development,l10_t03_i02,with,GPT-6 Astra,1,0,0,0,0,,520,74,864,694.6,19.326021,2026-11-17,4394319,2790541,0,9954,1,claim,0,74,0,0,0,0,1,0
+libero10_development,l10_t03_i02,without,GPT-6 Astra,1,0,0,0,0,,520,73,859,646.8,16.566677,2026-11-17,1677972,103077,0,14293,0,claim,0,73,0,0,0,0,0,0
+libero10_development,l10_t03_i03,with,GPT-6 Astra,1,0,0,0,0,,520,61,865,463.2,14.053048,2026-11-17,3239847,2076458,0,6854,0,claim,0,61,0,0,0,0,0,0
+libero10_development,l10_t03_i03,without,GPT-6 Astra,1,0,0,0,0,,520,76,876,1457.6,19.335233,2026-11-17,1997569,178773,0,19370,1,claim,0,76,0,0,0,0,1,0
+libero10_development,l10_t04_i00,with,GPT-6 Astra,1,1,1,0,0,274,520,5,274,31.3,0.427028,2026-11-17,130502,98788,0,222,0,episode_ended,0,5,0,0,0,0,0,0
+libero10_development,l10_t04_i00,without,GPT-6 Astra,1,0,0,1,1,,520,53,582,1160.8,9.430035,2026-11-17,984263,109955,0,11540,2,claim,0,53,0,0,0,0,2,0
+libero10_development,l10_t04_i01,with,GPT-6 Astra,1,1,1,0,0,281,520,7,281,42.8,0.508355,2026-11-17,196020,163005,0,304,0,episode_ended,0,7,0,0,0,0,0,0
+libero10_development,l10_t04_i01,without,GPT-6 Astra,1,0,0,1,1,,520,47,487,389.3,7.161821,2026-11-17,734170,66531,0,8378,0,claim,0,47,0,0,0,0,0,0
+libero10_development,l10_t04_i02,with,GPT-6 Astra,1,1,1,0,0,279,520,5,279,34.8,0.426623,2026-11-17,130456,98793,0,224,0,episode_ended,0,5,0,0,0,0,0,0
+libero10_development,l10_t04_i02,without,GPT-6 Astra,2,0,0,1,1,,520,52,602,1081.7,9.129479,2026-11-17,941638,94939,0,11351,1,claim,0,52,0,0,0,0,1,0
+libero10_development,l10_t04_i03,with,GPT-6 Astra,1,1,1,0,0,271,520,4,271,31.4,0.339194,2026-11-17,98805,73284,0,214,0,episode_ended,0,4,0,0,0,0,0,0
+libero10_development,l10_t04_i03,without,GPT-6 Astra,1,0,0,1,1,,520,45,497,1049.8,6.791456,2026-11-17,710336,90056,0,9972,1,claim,0,45,0,0,0,0,1,0
+libero10_development,l10_t05_i00,with,GPT-6 Astra,1,0,0,1,1,,520,14,199,85.1,1.266845,2026-11-17,441191,357485,0,1446,0,claim,0,14,0,0,0,0,0,0
+libero10_development,l10_t05_i00,without,GPT-6 Astra,1,0,0,0,0,,520,72,873,2238.3,20.233554,2026-11-17,2056612,167474,0,23494,2,claim,0,72,0,0,0,0,2,0
+libero10_development,l10_t05_i01,with,GPT-6 Astra,1,0,0,1,1,,520,14,192,138.8,1.336523,2026-11-17,431419,337013,0,1109,0,claim,0,14,0,0,0,0,0,0
+libero10_development,l10_t05_i01,without,GPT-6 Astra,1,0,0,1,1,,520,30,332,361.1,3.854765,2026-11-17,372830,41215,0,9948,0,claim,0,30,0,0,0,0,0,0
+libero10_development,l10_t05_i02,with,GPT-6 Astra,1,0,0,1,1,,520,18,203,711.2,1.726757,2026-11-17,619358,504047,0,1392,1,claim,0,18,0,0,0,0,1,0
+libero10_development,l10_t05_i02,without,GPT-6 Astra,1,0,0,1,1,,520,37,430,1030.3,5.143881,2026-11-17,524336,71881,0,10949,1,claim,0,37,0,0,0,0,1,0
+libero10_development,l10_t05_i03,with,GPT-6 Astra,1,0,0,1,1,,520,17,293,100.7,1.700020,2026-11-17,571915,455070,0,1530,0,claim,0,17,0,0,0,0,0,0
+libero10_development,l10_t05_i03,without,GPT-6 Astra,1,0,0,1,1,,520,20,235,226.5,1.773448,2026-11-17,174352,28558,0,5739,0,claim,0,20,0,0,0,0,0,0
+libero10_development,l10_t06_i00,with,GPT-6 Astra,1,1,1,0,0,339,520,7,339,36.2,0.508423,2026-11-17,196020,163003,0,305,0,episode_ended,0,7,0,0,0,0,0,0
+libero10_development,l10_t06_i00,without,GPT-6 Astra,2,0,0,1,1,,520,31,356,376.3,3.356783,2026-11-17,350352,51943,0,6415,1,claim,0,31,0,0,0,0,1,0
+libero10_development,l10_t06_i01,with,GPT-6 Astra,1,1,1,0,0,345,520,7,345,35.9,0.504768,2026-11-17,195478,162568,0,262,0,episode_ended,0,7,0,0,0,0,0,0
+libero10_development,l10_t06_i01,without,GPT-6 Astra,1,0,0,1,1,,520,62,617,1133.0,12.090351,2026-11-17,1237870,93861,0,11128,1,claim,0,62,0,0,0,0,1,0
+libero10_development,l10_t06_i02,with,GPT-6 Astra,1,0,0,1,1,,520,9,393,49.4,0.664465,2026-11-17,262675,220215,0,393,0,claim,0,9,0,0,0,0,0,0
+libero10_development,l10_t06_i03,with,GPT-6 Astra,1,1,1,0,0,340,520,7,340,38.2,0.505979,2026-11-17,195518,162589,0,282,0,episode_ended,0,7,0,0,0,0,0,0
+libero10_development,l10_t06_i03,without,GPT-6 Astra,1,0,0,1,1,,520,54,538,1094.9,9.793435,2026-11-17,998486,81575,0,10855,1,claim,0,54,0,0,0,0,1,0
+libero10_development,l10_t07_i00,with,GPT-6 Astra,1,1,1,0,0,300,520,8,300,46.9,0.607983,2026-11-17,222643,181533,0,307,0,episode_ended,0,8,0,0,0,0,0,0
+libero10_development,l10_t07_i00,without,GPT-6 Astra,1,1,1,0,0,444,520,36,444,501.9,4.642424,2026-11-17,462974,51674,0,9555,1,episode_ended,0,36,0,0,0,0,1,0
+libero10_development,l10_t07_i01,with,GPT-6 Astra,1,1,1,0,0,302,520,8,302,61.9,0.511856,2026-11-17,206280,174316,0,358,0,episode_ended,0,8,0,0,0,0,0,0
+libero10_development,l10_t07_i01,without,GPT-6 Astra,1,1,1,0,0,359,520,33,359,327.3,3.358147,2026-11-17,365375,64217,0,5647,1,episode_ended,0,33,0,0,0,0,1,0
+libero10_development,l10_t07_i02,with,GPT-6 Astra,1,0,0,1,1,,520,10,327,68.3,0.780449,2026-11-17,292074,240349,0,457,0,claim,0,10,0,0,0,0,0,0
+libero10_development,l10_t07_i02,without,GPT-6 Astra,1,1,1,0,0,444,520,40,444,964.1,5.092596,2026-11-17,529339,66916,0,8029,1,episode_ended,0,40,0,0,0,0,1,0
+libero10_development,l10_t07_i03,with,GPT-6 Astra,1,0,0,1,1,,520,9,370,270.5,0.458959,2026-11-17,243391,222539,0,558,0,claim,0,9,0,0,0,0,0,0
+libero10_development,l10_t07_i03,without,GPT-6 Astra,1,1,1,0,0,395,520,32,395,270.7,3.496089,2026-11-17,358955,45429,0,6308,0,episode_ended,0,32,0,0,0,0,0,0
+libero10_development,l10_t08_i00,with,GPT-6 Astra,1,1,1,0,0,310,520,13,310,82.7,1.058944,2026-11-17,403815,336334,0,956,0,episode_ended,0,13,0,0,0,0,0,0
+libero10_development,l10_t08_i00,without,GPT-6 Astra,1,1,0,0,0,562,520,49,562,1158.5,8.089993,2026-11-17,822488,80843,0,11854,1,episode_ended,0,49,0,0,0,0,1,0
+libero10_development,l10_t08_i01,with,GPT-6 Astra,1,1,1,0,0,321,520,7,321,52.8,0.514765,2026-11-17,196007,162945,0,424,0,episode_ended,0,7,0,0,0,0,0,0
+libero10_development,l10_t08_i01,without,GPT-6 Astra,1,1,1,0,0,451,520,33,451,353.7,4.145912,2026-11-17,409641,46822,0,9418,0,episode_ended,0,33,0,0,0,0,0,0
+libero10_development,l10_t08_i02,with,GPT-6 Astra,1,1,1,0,0,342,520,8,342,47.2,0.543416,2026-11-17,227256,194266,0,385,0,episode_ended,0,8,0,0,0,0,0,0
+libero10_development,l10_t08_i02,without,GPT-6 Astra,1,0,0,0,0,,520,77,881,712.0,18.896257,2026-11-17,1904164,108687,0,16656,0,claim,0,77,0,0,0,0,0,0
+libero10_development,l10_t08_i03,with,GPT-6 Astra,1,0,0,1,1,,520,40,861,326.8,4.707628,2026-11-17,1765606,1462948,0,4362,0,claim,0,40,0,0,0,0,0,0
+libero10_development,l10_t08_i03,without,GPT-6 Astra,1,1,1,0,0,439,520,35,439,934.9,4.261988,2026-11-17,441890,61868,0,7998,1,episode_ended,0,35,0,0,0,0,1,0
+libero10_development,l10_t09_i00,with,GPT-6 Astra,1,0,0,0,0,,520,43,693,1517.6,8.578577,2026-11-17,2057901,1355737,0,4024,2,claim,0,43,0,0,0,0,2,0
+libero10_development,l10_t09_i00,without,GPT-6 Astra,1,0,0,0,0,,520,72,846,1521.7,16.140794,2026-11-17,1667768,141504,0,14733,2,claim,0,72,0,0,0,0,2,0
+libero10_development,l10_t09_i01,with,GPT-6 Astra,1,0,0,0,0,,520,28,836,187.5,3.320666,2026-11-17,1109110,876576,0,2375,0,claim,0,28,0,0,0,0,0,0
+libero10_development,l10_t09_i01,without,GPT-6 Astra,1,0,0,0,0,,520,80,777,1460.4,21.176731,2026-11-17,2130335,114891,0,18148,1,claim,0,80,0,0,0,0,1,0
+libero10_development,l10_t09_i02,with,GPT-6 Astra,1,0,0,0,0,,520,51,799,977.6,10.615150,2026-11-17,2456054,1580010,0,5494,1,claim,0,51,0,0,0,0,1,0
+libero10_development,l10_t09_i02,without,GPT-6 Astra,1,1,0,0,0,675,520,56,675,1217.1,10.734193,2026-11-17,1080054,84883,0,13952,1,episode_ended,0,56,0,0,0,0,1,0
+libero10_development,l10_t09_i03,with,GPT-6 Astra,1,0,0,0,0,,520,29,672,372.9,4.005253,2026-11-17,1140717,837163,0,2651,1,claim,0,29,0,0,0,0,1,0
+libero10_development,l10_t09_i03,without,GPT-6 Astra,1,0,0,0,0,,520,39,615,382.6,5.302979,2026-11-17,532815,55269,0,9445,0,claim,0,39,0,0,0,0,0,0

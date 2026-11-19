@@ -1,6 +1,6 @@
 # Summary of the LIBERO-10 list: 395 start states, 2 models, both arms
 
-Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-19T02:31:46Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
+Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-19T08:40:08Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
 
 Read these lines before any number here:
 
@@ -114,6 +114,19 @@ Every task, both models (with / without, of the start states in it; printed whol
 USD a start state and USD a solved start state count the scored rows and the attempts in no row (lost_attempts.csv) over all start states of the arm, or over its solved ones. USD is list price only, not a billed amount; part of the gap between the arms is caching (the cached share of input tokens), not only fewer requests. Seconds are wall clock from the episode's start to its end and include the time an endpoint stalled or refused requests; a failed request was sent again inside its episode.
 
 8 attempts were running when their machine stopped and left no token count on any copy (stopped_attempts.csv, with the longest each can have run). They are in no row and in no total above, and each start state ran again from attempt 1 on another machine (8 of the 8 were then scored, all on that attempt 1). Priced at the mean spend a second of their model and arm on this list (the USD of its scored rows over their seconds), they come to about 23 USD; at the highest spend a second of any scored row of their model and arm, about 65 USD. No row bounds them.
+
+## How the replies ended (finish reason), scored episodes
+
+| model | arm | replies | tool_calls | stop | length | content_filter | other | requests with no reply | scored episodes with a content_filter reply | ended on content_filter replies |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Gemini 3.8 Flash | without Cerulion | 23,180 | 23,174 | 6 | 0 | 0 | 0 | 1 | 0 | 0 |
+| Gemini 3.8 Flash | with Cerulion | 12,694 | 12,618 | 76 | 0 | 0 | 0 | 3 | 0 | 0 |
+| GPT-6 Astra | without Cerulion | 19,470 | 19,470 | 0 | 0 | 0 | 0 | 357 | 0 | 0 |
+| GPT-6 Astra | with Cerulion | 7,517 | 7,517 | 0 | 0 | 0 | 0 | 67 | 0 | 0 |
+
+A reply's finish reason is the one its model endpoint returned: `tool_calls` a reply with a tool call, `stop` and `length` one that ended on its own or at the output limit, `content_filter` one the provider's content filter stopped, `other` any other. Every reply of each scored attempt is counted, so the five reasons add up to the replies. A request with no reply is a failed request (sent again) or one the endpoint refused for a request field it does not take (sent again without the field).
+
+No reply came back content_filter in any arm. The provider's image filter answered 209 requests in 39 attempts with HTTP 400 (refusals.csv). A refused request got no reply, so none is a content_filter reply: 8 requests in 2 scored attempts are in the table's requests with no reply; 76 requests in 15 attempts of 5 unscored episodes are in their requests_no_reply in unscored.csv; 125 requests in 22 other attempts of episodes scored on a later attempt are counted nowhere as requests with no reply (lost_attempts.csv lists those attempts).
 
 ## Episodes that ended without a score
 

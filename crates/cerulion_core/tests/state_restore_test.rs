@@ -37,9 +37,9 @@ use cerulion_core::state_restore::{
     plan_backlog_admission, plan_restore, refuse_lossy_reexecuted_topics, seed_publisher_sequence,
     AnchorBlob, AnchorFact, AnchorOutcome, BacklogClaim, InputServiceCursor, NodeAnchorProblem,
     NodeFrameworkState, RestorePlan, RestoreRefusal, RestoreRequest, SeedEvidence, SeedRung,
-    TopicFrameCount, TopicLoss, TopicWriters, ANCHOR_BLOB_HEADER_SIZE, ANCHOR_BLOB_MAGIC,
-    ANCHOR_BLOB_MAGIC_V2, ANCHOR_BLOB_V2_HEADER_SIZE, FRAMEWORK_SECTION_MIN_READABLE,
-    FRAMEWORK_SECTION_WRITE_VERSION, NODE_FLAG_STOPPED,
+    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters, ANCHOR_BLOB_HEADER_SIZE,
+    ANCHOR_BLOB_MAGIC, ANCHOR_BLOB_MAGIC_V2, ANCHOR_BLOB_V2_HEADER_SIZE,
+    FRAMEWORK_SECTION_MIN_READABLE, FRAMEWORK_SECTION_WRITE_VERSION, NODE_FLAG_STOPPED,
 };
 
 // ---------------------------------------------------------------------------
@@ -618,6 +618,66 @@ fn a_stopped_section_round_trips_exactly() {
     let mut again = VecSink::new();
     read.encode(&mut again).expect("fits");
     assert_eq!(again.into_inner(), only);
+}
+
+#[test]
+fn a_stopped_section_states_an_unconsumed_arrival_exactly_when_its_pending_count_is_above_zero() {
+    // `(stopped, pending_data_count)` to what a stop restore is handed: no
+    // value for a running node whatever its count, and for a stopped node
+    // `unconsumed_arrival` is the count read as `> 0`.
+    for (stopped, pending, expected) in [
+        (false, 0u64, None),
+        (false, 1, None),
+        (true, 0, Some(false)),
+        (true, 1, Some(true)),
+        (true, 2, Some(true)),
+        (true, 64, Some(true)),
+        (true, u64::MAX, Some(true)),
+    ] {
+        let section = NodeFrameworkState {
+            stopped,
+            pending_data_count: pending,
+            ..Default::default()
+        };
+        assert_eq!(
+            StoppedAtAnchor::from_section(&section).map(|stop| stop.unconsumed_arrival),
+            expected,
+            "stopped {stopped}, pending {pending}"
+        );
+    }
+
+    // Read off a section's bytes: the stopped FIFO consumer's 55 bytes (served
+    // sequence 7 on `inp`) with one pending arrival in bytes 13 to 20, after
+    // the version word, the next-fire flag and the next-fire instant.
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[0x05, 0x00, 0x00, 0x00]); // version 5
+    bytes.push(0x00); // no next fire
+    bytes.extend_from_slice(&[0x00; 8]);
+    bytes.extend_from_slice(&[0x01, 0, 0, 0, 0, 0, 0, 0]); // one pending arrival
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // no sync heads
+    bytes.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // one service cursor
+    bytes.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]); // name length 3
+    bytes.extend_from_slice(b"inp");
+    bytes.push(0x01); // served
+    bytes.extend_from_slice(&[0x07, 0x00, 0x00, 0x00]); // sequence 7
+    bytes.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty high-water table
+    bytes.push(0x00); // no epoch floor
+    bytes.extend_from_slice(&[0x00; 8]);
+    bytes.push(0x01); // flags: stopped
+    assert_eq!(bytes.len(), 55);
+    let read = NodeFrameworkState::decode("sink", &bytes).expect("well-formed");
+    assert_eq!(read.pending_data_count, 1);
+    assert_eq!(
+        StoppedAtAnchor::from_section(&read),
+        Some(StoppedAtAnchor {
+            unconsumed_arrival: true
+        })
+    );
+    // The same bytes with the flags byte cleared state a running node.
+    let mut running = bytes.clone();
+    *running.last_mut().expect("the flags byte") = 0x00;
+    let read = NodeFrameworkState::decode("sink", &running).expect("well-formed");
+    assert_eq!(StoppedAtAnchor::from_section(&read), None);
 }
 
 #[test]
