@@ -33,17 +33,24 @@ use serde_json::{json, Value};
 /// How long a test waits for each event: the stand-in graph to start, the
 /// held line to be written, a frame to reach the graph, and the second
 /// `estop`'s answer. The journal publishes an urgent frame within one loop
-/// pass (about 1 ms), and 5 s leaves room for a loaded host.
-const OBSERVE: Duration = Duration::from_secs(5);
+/// pass (about 1 ms), but each `estop` writes its latch file when it is
+/// absent and its `intent` receipt, synced writes, before its frame, and each
+/// held call writes a synced receipt before its held line. A loaded machine
+/// can hold one synced write, or leave a thread unscheduled, for seconds.
+/// Each wait returns once its event arrives, so a passing run never waits
+/// this out.
+const OBSERVE: Duration = Duration::from_secs(30);
 
 /// How long the writer holds its line if the test never releases it: longer
 /// than the at most three [`OBSERVE`] waits made while it is held.
-const HOLD_BOUND: Duration = Duration::from_secs(60);
+const HOLD_BOUND: Duration = Duration::from_secs(120);
 
 /// How long the held call, and a second `estop` that did not answer while
 /// the line was held, get to answer after the release: the graph answers at
-/// once, and `estop` and `estop_clear` wait at most 2 s for it.
-const ANSWER: Duration = Duration::from_secs(10);
+/// once, and `estop` and `estop_clear` wait at most 2 s for it and then write
+/// a synced receipt, which a loaded machine can hold as long as [`OBSERVE`]
+/// allows.
+const ANSWER: Duration = Duration::from_secs(30);
 
 /// The `reason` every call passes.
 const REASON: &str = "held";

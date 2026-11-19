@@ -5544,6 +5544,41 @@ mod tests {
         );
     }
 
+    /// Below trace format 10 a checkpoint states only the nodes the scheduler
+    /// had stopped, so one that states `ticker` stopped leaves `sink`'s stop
+    /// unstated: on two subscribers the unread-frame rule stands down by name
+    /// for `sink`, exactly as on a checkpoint that states no stop. The stopped
+    /// `ticker` adds nothing to the report.
+    #[test]
+    fn stating_another_nodes_stop_leaves_a_latest_nodes_stop_unstated() {
+        let steps: Vec<RecordedStep> = (ANCHOR_STEP + 1..ANCHOR_STEP + 21)
+            .map(|n| latest_step(n, false, vec![counted(n as u32)]))
+            .collect();
+        let mut nodes = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        nodes.push(node("ticker", period(MS, None)));
+        let report = judge_resumed(
+            &nodes,
+            &steps,
+            &[],
+            BELIEVED,
+            resumed_unstated(),
+            Some("ticker"),
+        );
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(
+            report,
+            RederivationReport {
+                stand_downs: vec![StandDown {
+                    node_id: "sink".to_string(),
+                    decider: Decider::LatestFire,
+                    reason: StandDownReason::LatestUnfiredSinceAnchor,
+                }],
+                before_first_fire: excused_before_first_fire(),
+                ..RederivationReport::default()
+            }
+        );
+    }
+
     /// A Sync node the checkpoint states as stopped owes no fire when its
     /// restored head and a fresh arrival align, and a recorded fire of it is
     /// a finding expecting none. Where the checkpoint states the node
