@@ -41,7 +41,7 @@ cerulion_cli	rmw_cerulion	dlopen	crates/cerulion_cli/tests/doctor_cli_test.rs
 cerulion_cli	test_node_start_order_cons_cdylib	crate-path	crates/cerulion_cli/tests/graph_start_order_e2e_test.rs
 cerulion_cli	test_node_start_order_prod_cdylib	crate-path	crates/cerulion_cli/tests/graph_start_order_e2e_test.rs
 cerulion_cli_engine	all	whole-tree	crates/cerulion_cli_engine/tests/block_colocation_adoption_test.rs
-cerulion_cli_engine	cerulion_cli	crate-path	crates/cerulion_cli_engine/src/shm_state.rs
+cerulion_cli_engine	cerulion_cli	crate-path	crates/cerulion_cli_engine/src/harness_cmd.rs
 cerulion_cli_engine	cerulion_core	crate-path	crates/cerulion_cli_engine/src/replay_engine.rs
 cerulion_cli_engine	cerulion_heaphook	dlopen	crates/cerulion_cli_engine/src/ros2_cmd.rs
 cerulion_cli_engine	cerulion_wsd	crate-path	crates/cerulion_cli_engine/tests/workspace_lock_verb_adoption_test.rs

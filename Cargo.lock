@@ -1738,6 +1738,7 @@ dependencies = [
  "libc",
  "native_ros2_messages",
  "postcard",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "serial_test",
@@ -9477,6 +9478,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_links_host_app"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "test_node_links_timer",
+]
+
+[[package]]
+name = "test_node_links_timer"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_macro_accumulate_cdylib"
 version = "0.1.0"
 dependencies = [
@@ -9718,6 +9735,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_modified_raw_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_nondeterministic_cdylib"
 version = "0.1.0"
 dependencies = [
@@ -9737,7 +9762,6 @@ name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
- "native_ros2_messages",
 ]
 
 [[package]]

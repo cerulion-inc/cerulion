@@ -19,6 +19,7 @@
 //! capable). It requires a caller-owned `TransportManager`.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -1430,6 +1431,13 @@ struct DataTriggerBinding {
     /// delivers to one subscriber queue at a time, and the publisher notifies
     /// after the last one).
     unconfirmed_arrival: bool,
+    /// A resume restored this binding's node as stopped while its trigger
+    /// drain held a frame it had popped and no tick took
+    /// ([`GraphRuntime::restore_stopped_nodes`]). From then on
+    /// `drain_data_binding` answers this binding as the drain answers a held
+    /// head: one arrival, no pop, no read-gate consult and no read-outcome
+    /// record. `false` on every binding a build makes.
+    trigger_head_held: bool,
 }
 
 /// Per-input drain binding for a `Sync`/`UnboundedSync` node — the
@@ -4316,6 +4324,10 @@ pub struct GraphRuntime {
     /// takes `&self`; only the live-loop thread takes it, so it is never
     /// contended.
     doorbell_baseline: std::sync::Mutex<Vec<u64>>,
+    /// The period-park's state (`CERULION_PERIOD_PARK=1`): the kernel lead, the
+    /// data-arrival learner and the record-only counters. A `Mutex` for the
+    /// same reason as `doorbell_baseline`: only the live-loop thread takes it.
+    period_park: std::sync::Mutex<super::period_park::State>,
     /// The registry's first topic when a kernel wake may arm on it, `None`
     /// otherwise. The registry spans data-trigger AND sync-input topics, so a
     /// sync input can hold the armed line. `None` covers a graph every one of
@@ -4327,6 +4339,11 @@ pub struct GraphRuntime {
     /// rather than guaranteeing one. Recorded once at build, on the open's
     /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
+    /// How many of this graph's data-trigger and sync input topics a writer
+    /// outside it can write, whatever the doorbell policy and whether its
+    /// registry opened: the armed line, when there is one, is among them.
+    /// Recorded once at build.
+    outside_input_topics: usize,
     /// How many of this graph's own publishers armed a doorbell, which under an
     /// active policy is every topic it publishes: a ring reaches whoever is
     /// blocked on the page, and this build cannot name those consumers. Recorded
@@ -4453,7 +4470,7 @@ pub struct GraphRuntime {
     /// moved after the loop-top poll, so no wait happened) yields but does
     /// NOT count, else doorbell-driven runs inflate slice telemetry. The
     /// yield is what
-    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`WFE`-parked thread
+    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`MWAITX`/`WFE`-parked thread
     /// is RUNNING to the OS scheduler, so without it a co-located runnable
     /// peer got the core only at CFS wakeup granularity (measured p50
     /// 6.997 ms RTT on a same-core pinned ping-pong). The sleeping tiers
@@ -4497,6 +4514,9 @@ pub struct GraphRuntime {
     /// the `#[cfg(any(test, feature = "test-helpers"))]`
     /// [`Self::set_single_park_for_test`] (gate the SETTER, not the field).
     single_park_override: Option<bool>,
+    /// Test seam over the `CERULION_PERIOD_PARK` env read (`None` = the env
+    /// decides); see [`Self::set_period_park_for_test`].
+    period_park_override: Option<bool>,
     /// Test seam: a closure the Sync drain runs right after a node's align
     /// pass; see [`Self::set_sync_align_hook_for_test`]. Test and test-helpers
     /// builds only (`GraphRuntime` never crosses an FFI boundary).
@@ -4528,6 +4548,9 @@ pub struct GraphRuntime {
     /// Every native node's params as this build resolved them, keyed by node
     /// id: what [`Self::param_differences`] compares a recording against.
     params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce>,
+    /// The variables this build left out of its nodes' environment snapshot:
+    /// what [`Self::node_env_left_out`] returns.
+    node_env_left_out: NodeEnvLeftOut,
     /// Sticky inert-at-launch refusal.
     /// Once [`Self::collect_external_sources`] refuses the live run because one
     /// or more external nodes are provably inert (host-driven / no-source /
@@ -6124,8 +6147,15 @@ impl GraphRuntime {
         // Capture live env once at
         // build time so per-tick `ctx.env(...)` is replay-deterministic
         // (Principle #7). Wrapped in Arc so all NodeContexts in the
-        // graph share one allocation.
-        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
+        // graph share one allocation. A variable whose name or value is not
+        // valid UTF-8 is left out of the snapshot and its name is kept on the
+        // runtime (`node_env_left_out`). The build logs nothing about it: the
+        // process that owns the run reports it once.
+        let NodeEnvCapture {
+            snapshot,
+            left_out: node_env_left_out,
+        } = capture_node_env(std::env::vars_os());
+        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(snapshot);
         let mut handles = IndexMap::new();
         let mut topology_nodes = Vec::with_capacity(config.nodes.len());
         let fire_tap: Arc<OnceLock<FireInstall>> = Arc::new(OnceLock::new());
@@ -8877,6 +8907,7 @@ impl GraphRuntime {
                         consume_latest,
                         probes_body: false,
                         unconfirmed_arrival: false,
+                        trigger_head_held: false,
                     });
                     // Mark the BODY
                     // subscriber this Unified binding drains through, arming
@@ -9123,6 +9154,7 @@ impl GraphRuntime {
                         probes_body: consume_latest
                             && probes_trigger_input.get(&node_def.id) == Some(&true),
                         unconfirmed_arrival: false,
+                        trigger_head_held: false,
                     });
                 }
             }
@@ -10502,6 +10534,34 @@ impl GraphRuntime {
             scheduler.external_policy_node_count(),
         )?;
 
+        // The data-trigger and sync inputs a publisher outside this graph can
+        // write, whatever the doorbell policy: the period-park refuses a
+        // runtime that has one with no doorbell wake word to end its naps.
+        let mut topics: Vec<String> = data_trigger_bindings
+            .iter()
+            .map(|b| b.topic.to_string())
+            .collect();
+        topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
+        // Which of them a publisher outside this graph can write, read
+        // off the provisioning this build already RESOLVED per topic rather
+        // than re-derived from the node list. `topic_is_writable_from_outside`
+        // is true for a topic in the graph's `multi_publisher_topics` opt-in,
+        // asked of the config directly whatever its provisioning, and for a
+        // topic whose provisioning is `External`, which is every topic absent
+        // from `owned_topic_configs` since that map holds exactly the topics
+        // with an in-graph producer.
+        let armable: std::collections::BTreeSet<String> = topics
+            .iter()
+            .filter(|t| {
+                let provisioning = owned_topic_configs
+                    .get(t.as_str())
+                    .map(|c| c.publisher_provisioning)
+                    .unwrap_or(PublisherProvisioning::External);
+                topic_is_writable_from_outside(&config, t, provisioning)
+            })
+            .cloned()
+            .collect();
+        let outside_input_topics = armable.len();
         // Under an active doorbell policy, build the CONSUMER-side
         // doorbell registry over this graph's data-trigger + sync input topics,
         // ordered by `rung_topics` so the armed slot holds a topic a publisher
@@ -10519,30 +10579,6 @@ impl GraphRuntime {
                 "an active doorbell policy must carry a non-empty ns (the CLI \
                  resolver sets default_namespace())"
             );
-            let mut topics: Vec<String> = data_trigger_bindings
-                .iter()
-                .map(|b| b.topic.to_string())
-                .collect();
-            topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            // Which of them a publisher outside this graph can write, read
-            // off the provisioning this build already RESOLVED per topic rather
-            // than re-derived from the node list. `topic_is_writable_from_outside`
-            // is true for a topic in the graph's `multi_publisher_topics` opt-in,
-            // asked of the config directly whatever its provisioning, and for a
-            // topic whose provisioning is `External`, which is every topic absent
-            // from `owned_topic_configs` since that map holds exactly the topics
-            // with an in-graph producer.
-            let armable: std::collections::BTreeSet<String> = topics
-                .iter()
-                .filter(|t| {
-                    let provisioning = owned_topic_configs
-                        .get(t.as_str())
-                        .map(|c| c.publisher_provisioning)
-                        .unwrap_or(PublisherProvisioning::External);
-                    topic_is_writable_from_outside(&config, t, provisioning)
-                })
-                .cloned()
-                .collect();
             let rung = rung_topics(&topics, &armable);
             if rung.armed.is_none() {
                 // No declared topic of this graph is writable from outside it, so
@@ -10657,11 +10693,13 @@ impl GraphRuntime {
             // The resolved monitor-wait/doorbell policy + the
             // consumer-side doorbell registry built from it above.
             monitor_wait_policy: policy,
+            period_park: std::sync::Mutex::new(super::period_park::State::default()),
             doorbell_baseline: std::sync::Mutex::new(Vec::with_capacity(
                 doorbell_registry.as_ref().map_or(0, |r| r.len()),
             )),
             doorbell_registry,
             doorbell_armed_topic,
+            outside_input_topics,
             producer_doorbells_armed,
             producer_doorbells_planned,
             // Park-entry routing counter (see field doc) — starts at 0.
@@ -10689,6 +10727,7 @@ impl GraphRuntime {
             park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
             credit_baseline_full_override: None,
             single_park_override: None,
+            period_park_override: None,
             #[cfg(any(test, feature = "test-helpers"))]
             sync_align_hook: None,
             // External ingress sources are collected lazily at run_live
@@ -10696,6 +10735,7 @@ impl GraphRuntime {
             external_bindings: Vec::new(),
             external_sources_collected: false,
             params_in_force,
+            node_env_left_out,
             // No refusal yet; set the first time
             // `collect_external_sources` rejects a self-source-less external node.
             external_refusal: None,
@@ -13455,7 +13495,7 @@ impl GraphRuntime {
         // recheck loop now POLLS every external fd/doorbell source each recheck
         // (`monitor_wait_block` → `park_poll_fd_ready`) and drains Notified
         // listeners inline — so external readiness wakes the park at the recheck
-        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / degraded
+        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / MWAITX / degraded
         // sleep-recheck), NOT at the ≤250ms `live_timeout` sweep cadence the
         // earlier fd-skip left it at. Correctness always held (the sweep is
         // level-triggered / rings-delta'd and runs every live_step); the park's fd watch
@@ -14184,7 +14224,7 @@ impl GraphRuntime {
                 || self.has_credit_edges()
             {
                 // A shallow monitor-wait park replaces the blocking
-                // WaitSet wait, so the core stays in a SHALLOW C0.1/WFE state (no
+                // WaitSet wait, so the core stays in a SHALLOW C0.1/C0/WFE state (no
                 // deep cpuidle C-state) during the inter-step idle — removing the
                 // ~18µs C-state cold-wake the epoll-block suffers.
                 // Under the doorbell policy it ALSO arms on the
@@ -14460,7 +14500,7 @@ impl GraphRuntime {
     /// [`Self::monitor_wait_block`]'s recheck loop `poll(2)` every external
     /// fd/doorbell source each recheck (≤~100 µs, record-only via
     /// [`park_poll_fd_ready`]), so the park now wakes promptly on an fd on ALL
-    /// tiers (WFE / WAITPKG / degraded sleep-recheck) and the exclusion is GONE.
+    /// tiers (WFE / WAITPKG / MWAITX / degraded sleep-recheck) and the exclusion is GONE.
     /// This is still the ONE choke point every park-vs-reactor decision reads
     /// (reactor build in `run_live` + the test seam, the `live_step` park branch,
     /// the wait-policy telemetry line); external graphs now park uniformly. The
@@ -14566,6 +14606,60 @@ impl GraphRuntime {
             true,
             self.has_armed_line(),
         )
+    }
+
+    /// Is the period-park on for this runtime: the test seam, else
+    /// `CERULION_PERIOD_PARK=1`.
+    fn period_park_on(&self) -> bool {
+        self.period_park_override
+            .unwrap_or_else(|| super::period_park::env_mode().on())
+    }
+
+    /// Does the period-park apply to this park block? Only where every wake the
+    /// park waits for can end a kernel nap, or has none: the monitor-wait park
+    /// is active and real on this host, no barrier or credit word is waited on,
+    /// no external fd is polled, and a data input written from outside this
+    /// runtime has an armed line and the doorbell wake word. With no such input
+    /// every input is written by this runtime's own nodes inside its own step,
+    /// and the loop top sees it before any nap. Anywhere else the park runs as
+    /// it does with the switch off.
+    fn period_park_applies(&self, sources: &[(waitset::WaitSource<'_>, Arc<str>)]) -> bool {
+        super::period_park::admits(
+            self.period_park_gate(
+                sources
+                    .iter()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            ),
+        )
+    }
+
+    /// This runtime's period-park gate, given whether the park polls an
+    /// external fd source.
+    fn period_park_gate(&self, fd_sources: bool) -> super::period_park::Gate {
+        super::period_park::Gate {
+            on: self.period_park_on(),
+            park_active: self.park_active(),
+            primitive: crate::monitor_wait::monitor_wait_available(),
+            barrier: self.barrier_participant.is_some(),
+            credit_edges: !self.credit_park_edges.is_empty(),
+            fd_sources,
+            outside_inputs: self.outside_input_topics > 0,
+            armed_line: self.has_armed_line(),
+            data_wake: self.data_wake_rung(),
+        }
+    }
+
+    /// Test seam: the reason a requested period-park would not engage on this
+    /// runtime's wiring (the `reason` field of its warning), or `None` where it
+    /// would, with the host's CPU monitor-wait primitive taken as held, so the
+    /// wiring is judged on every host.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn period_park_wiring_refusal_for_test(&self) -> Option<&'static str> {
+        super::period_park::refusal(super::period_park::Gate {
+            primitive: true,
+            ..self.period_park_gate(false)
+        })
+        .map(|r| r.as_str())
     }
 
     /// Test seam over [`Self::data_wake_rung`], the decision the wait policy
@@ -14755,7 +14849,7 @@ impl GraphRuntime {
     /// chunks [`Self::monitor_wait_block`] has performed, whichever mechanism
     /// paced each (see the `park_recheck_naps` field doc; the os_sync-paced
     /// subset is [`Self::park_os_sync_nap_count_for_test`]). 0 on primitive
-    /// targets — the real UMWAIT/WFE park never takes the `!performed` arm.
+    /// targets; the real UMWAIT/MWAITX/WFE park never takes the `!performed` arm.
     /// (Renamed from `park_recheck_sleep_count_for_test` with the field.)
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_recheck_nap_count_for_test(&self) -> u64 {
@@ -14781,7 +14875,7 @@ impl GraphRuntime {
     /// a context whose rung applies reports `> 0` here after
     /// parking; reverting the swap zeroes it while the pins stay green
     /// (the wake word is additive latency, not new semantics). 0 whenever that
-    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
+    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park host (Linux WAITPKG/MWAITX/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_wake_word_block_count_for_test(&self) -> u64 {
         self.park_wake_word_blocks
@@ -14840,6 +14934,23 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_single_park_for_test(&mut self, forced: Option<bool>) {
         self.single_park_override = forced;
+    }
+
+    /// Test seam: force the period-park on (`Some(true)`) or off
+    /// (`Some(false)`) for this runtime, over the process-wide
+    /// `CERULION_PERIOD_PARK` read; `None` lets the env decide.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_period_park_for_test(&mut self, forced: Option<bool>) {
+        self.period_park_override = forced;
+    }
+
+    /// Test seam: the period-park's record-only counters.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn period_park_stats_for_test(&self) -> super::period_park::PeriodParkStats {
+        self.period_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats
     }
 
     /// Test seam: run `hook` in the step's drain right after each per-set Sync
@@ -14998,7 +15109,7 @@ impl GraphRuntime {
     /// os_sync) the predicate above is no longer merely POLLED at the
     /// recheck cadence: the `!performed` arm sets the rank's `parked` bit
     /// (RAII `ParkedRankGuard`, scoped to the block: a
-    /// hardware CPU park never sets it, so arrivers on WAITPKG/WFE machines pay
+    /// hardware CPU park never sets it, so arrivers on WAITPKG/MWAITX/WFE machines pay
     /// no futile wake syscall) and kernel-blocks on the barrier's
     /// `wake_seq` epoch instead of the pacing sleep — every arrive/open/drop
     /// bumps the epoch (arrivers gate only the SYSCALL on the parked mask), so
@@ -15009,11 +15120,11 @@ impl GraphRuntime {
     /// kernel wake only gets us there sooner, so `park_wakes_barrier`
     /// semantics and the pins are untouched; the block itself is
     /// counted by `park_wake_word_blocks`, the mutation seam). The Linux
-    /// park-ON hardware arm (UMWAIT/WFE on the doorbell line) is untouched —
+    /// park-ON hardware arm (UMWAIT/MWAITX/WFE on the doorbell line) is untouched:
     /// the futex arm is not promoted into the scratch-word
     /// park.
     ///
-    /// **OS-cooperative hardware park:** a `UMWAIT`/`WFE`-parked
+    /// **OS-cooperative hardware park:** a `UMWAIT`/`MWAITX`/`WFE`-parked
     /// thread is RUNNING to the OS scheduler, so a park that sliced without
     /// yielding held its core for the whole idle and a co-located runnable
     /// peer (graph processes > cores under the multi-process default,
@@ -15025,7 +15136,7 @@ impl GraphRuntime {
     /// pacing chunk) and every hardware slice ends with
     /// `std::thread::yield_now()` (counted in `park_core_yields`, record-only):
     /// a co-located peer runs within one slice, the core still never enters a
-    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`WFE`
+    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`MWAITX`/`WFE`
     /// still wake instantly on the doorbell inside a slice. Cost: one ~0.5 µs
     /// `sched_yield` per slice, idle path only. The degraded sleep and
     /// wake-word arms keep their measured 100 µs pacing (a sleeping thread
@@ -15056,10 +15167,10 @@ impl GraphRuntime {
     /// a wakeup optimization, not part of the deterministic timeline.
     ///
     /// **No busy-spin:** on a target WITHOUT a real CPU monitor-wait primitive
-    /// (this macOS box, x86 without WAITPKG, or a forced-policy test seam) the
+    /// (macOS, x86 with neither WAITPKG nor MWAITX, or a forced-policy test seam) the
     /// park primitive returns `false` (a no-op); this method then
     /// `std::thread::sleep`s the recheck instead of re-looping immediately, so it
-    /// can never busy-spin at 100% CPU. On a real WAITPKG/WFE box the primitive
+    /// can never busy-spin at 100% CPU. On a real WAITPKG/MWAITX/WFE host the primitive
     /// parks for real and returns `true`. On the DEGRADED tier (the
     /// default-ON shape on no-primitive targets) the degraded sleep is ALWAYS
     /// the chunked ~100µs sleep-recheck. The single-sleep alternative was
@@ -15095,7 +15206,7 @@ impl GraphRuntime {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Loud over silent: name the DEGRADED tier once, at the FIRST
         // park of the runtime's life (`prior_entries == 0` — the counter is
-        // monotonic, never reset). Primitive (UMWAIT/WFE) targets skip this.
+        // monotonic, never reset). Primitive (UMWAIT/MWAITX/WFE) targets skip this.
         // The tier line names the NAP MECHANISM the degraded arm
         // resolved on THIS host — the os_sync timed wait (macOS ≥ 14.4, tier
         // active) or the plain chunked sleep — so an operator reading the log
@@ -15122,7 +15233,7 @@ impl GraphRuntime {
         let recheck = Duration::from_micros(100);
         // HARDWARE park slice: the shared 20µs
         // `monitor_wait::PARK_RECHECK` (the same constant rmw's `park_block`
-        // slices at). A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS
+        // slices at). A `UMWAIT`/`MWAITX`/`WFE`-parked thread is RUNNING to the OS
         // scheduler, so the hardware arm keeps its slices short and the loop
         // bottom YIELDS after every hardware slice (`park_core_yields`), so a co-located
         // runnable peer gets the core within one slice instead of at CFS
@@ -15237,7 +15348,7 @@ impl GraphRuntime {
         // eligibility — computed ONCE per park; the `parked` bit itself is now
         // set ONLY inside the `!performed` arm, scoped tightly around the
         // kernel block (its semantic: "a waiter is blocked on the wake word
-        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/WFE — `performed ==
+        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/MWAITX/WFE, `performed ==
         // true`) never reaches that arm and therefore NEVER sets the bit, so
         // arrivers on hardware-park machines pay no futile wake syscall for a
         // waiter the CPU monitor cannot hear on that line (the earlier
@@ -15258,6 +15369,23 @@ impl GraphRuntime {
         // change only WHEN this park returns, never what fires.
         let wake_word_eligible =
             !self.barrier_failed && crate::barrier::wake_word_block_primitive_available();
+
+        // The period-park (`CERULION_PERIOD_PARK=1`, see `period_park`). The plan
+        // is fixed at entry: nap in the kernel until one lead before the predicted
+        // data window or the deadline, then run the park below for what remains.
+        // `None` keeps this block exactly as it is with the switch off. Data
+        // wakes teach the arrival learner only where data can come from outside
+        // this runtime (an armed line); in-process data arrives inside the step.
+        let period_park_learns = self.has_armed_line();
+        let mut period_park = self.period_park_applies(sources).then(|| {
+            let mut st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let plan = st.plan(std::time::Instant::now(), deadline);
+            (st, plan)
+        });
+        let mut period_park_last = super::period_park::LastWait::None;
 
         loop {
             // RECORD-ONLY poll — notification queue only (mirrors `spin_sources`
@@ -15293,7 +15421,7 @@ impl GraphRuntime {
                     }
                     // Poll external/doorbell raw fds (DeviceFd +
                     // DoorbellFd) each recheck. Earlier the park SKIPPED Fd
-                    // sources, so on a primitive target (WFE/WAITPKG) an external
+                    // sources, so on a primitive target (WFE/WAITPKG/MWAITX) an external
                     // node's only wake was the pre-step sweep at the ≤250ms
                     // `live_timeout` — ~1.9Hz per hop. `park_poll_fd_ready` is a
                     // non-blocking level-triggered readiness probe (record-only —
@@ -15415,6 +15543,12 @@ impl GraphRuntime {
                     self.park_wakes_credit
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Record-only: a data wake teaches the period-park's learner.
+                if let Some((st, _)) = period_park.as_mut() {
+                    if period_park_learns && (listener_got || doorbell_got) {
+                        st.note_data_wake(std::time::Instant::now(), period_park_last);
+                    }
+                }
                 return true;
             }
             if std::time::Instant::now() >= park_deadline {
@@ -15429,11 +15563,74 @@ impl GraphRuntime {
                 // Record-only TIMEOUT wake attribution (Relaxed).
                 self.park_wakes_timeout
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some((st, plan)) = period_park.as_mut() {
+                    st.note_timer_wake(plan.deadline, std::time::Instant::now());
+                }
                 return true;
+            }
+            // The period-park: outside the plan's window, nap in the kernel
+            // instead of parking. A ring on the armed doorbell ends the nap
+            // through the doorbell wake word (snapshot, re-derive, block: the
+            // rung's own lost-wake protocol); a runtime with no armed line has
+            // nothing outside it to ring and takes a plain timed nap. Either way
+            // the loop top re-polls every source after the nap, so a ring on
+            // another input topic is seen within one nap.
+            if let Some((st, plan)) = period_park.as_mut() {
+                use super::period_park::{LastWait, Phase, NAP};
+                let now = std::time::Instant::now();
+                match plan.phase(now) {
+                    Phase::Kernel {
+                        until,
+                        before_window,
+                    } => {
+                        let cap = until.saturating_duration_since(now).min(NAP);
+                        let target = now + cap;
+                        #[cfg(any(
+                            target_os = "macos",
+                            target_os = "linux",
+                            target_os = "android"
+                        ))]
+                        let outcome = self.doorbell_wake_word_block(baseline, cap);
+                        #[cfg(not(any(
+                            target_os = "macos",
+                            target_os = "linux",
+                            target_os = "android"
+                        )))]
+                        let outcome = crate::monitor_wait::AddrParkOutcome::Unavailable;
+                        let napped = match outcome {
+                            crate::monitor_wait::AddrParkOutcome::RingPending => false,
+                            crate::monitor_wait::AddrParkOutcome::Parked => true,
+                            crate::monitor_wait::AddrParkOutcome::Unavailable => {
+                                let _ = crate::monitor_wait::park_nap(cap);
+                                true
+                            }
+                        };
+                        if napped {
+                            // A signal ends the kernel wait early too, so an
+                            // early return is a data cut only if the armed
+                            // line rang.
+                            let rang = primary_expected.is_some_and(|expected| {
+                                self.armed_primary_topic()
+                                    .and_then(|t| self.doorbell_registry.as_ref()?.bell(t))
+                                    .is_some_and(|bell| bell.seq() != expected)
+                            });
+                            st.note_kernel_sleep(target, std::time::Instant::now(), rang);
+                            self.park_slices
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            period_park_last = if before_window {
+                                LastWait::KernelBeforeWindow
+                            } else {
+                                LastWait::KernelOther
+                            };
+                        }
+                        continue;
+                    }
+                    Phase::Hot => period_park_last = LastWait::Hot,
+                }
             }
             // Shallow-park until the next recheck (or, with `single_park`, the
             // WHOLE remaining time) or the park deadline. With a doorbell, arm
-            // `UMONITOR`/`WFE` on the PRIMARY line against the pre-park snapshot so
+            // `UMONITOR`/`MONITORX`/`WFE` on the PRIMARY line against the pre-park snapshot so
             // a producer store wakes it early (the primitive's own arm-time
             // re-check closes the arm-window race); without one, park on a scratch
             // word (timer only). `single_park` passes `timeout` as the recheck cap
@@ -15777,10 +15974,12 @@ impl GraphRuntime {
     /// PARTICIPANT ignores this knob — the hardware monitor never arms on the
     /// barrier's `remaining` word, so a whole-window park (or single sleep)
     /// would blind the `peers_waiting` step-start wake until the park deadline.
-    /// Caveat: on x86 (`UMWAIT` honors the recheck cap) a single park
+    /// Caveat: under `MWAITX` (no OS limit on its timer) a single park
     /// covers the WHOLE window in one slice with no yield boundary, so a
     /// co-located runnable peer waits out the window — the exact same-core
-    /// starvation the default chunked-and-yielding shape fixes. Measurement
+    /// starvation the default chunked-and-yielding shape fixes. Under `UMWAIT`
+    /// Linux's time limit (`umwait_control/max_time`, 100000 TSC cycles by
+    /// default) ends each wait early, so the loop still yields. Measurement
     /// knob only; never set it on an oversubscribed box. (aarch64 `WFE` still
     /// returns at the ~100µs event stream regardless, so the loop — and its
     /// per-slice yield — keeps running there.)
@@ -16003,6 +16202,36 @@ impl GraphRuntime {
             primary_topic = tracing::field::display(self.armed_primary_topic().unwrap_or("none")),
             "live loop wait policy"
         );
+        // The period-park, as THIS process resolved it, at each live-loop entry,
+        // so a run's log shows whether it engages and, once, why not.
+        let period_park_at_entry = self
+            .period_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats;
+        if self.period_park_override.is_none()
+            && super::period_park::env_mode() == super::period_park::Mode::Unrecognized
+        {
+            tracing::warn!(
+                graph = %self.config.identity(),
+                value = %std::env::var("CERULION_PERIOD_PARK").unwrap_or_default(),
+                "CERULION_PERIOD_PARK is set to a value other than 1 or 0; the period park stays off"
+            );
+        }
+        // Requested: either the `on` line, or one WARN per runtime naming the
+        // first term that refuses it. Only an engaged period-park reports exit
+        // telemetry.
+        let period_park_engaged = {
+            let gate = self.period_park_gate(
+                self.external_wake_sources()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            );
+            let mut st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            super::period_park::announce(gate, &mut st.warned, self.config.identity())
+        };
 
         // Entry snapshot of the (lifetime-cumulative) park counters so
         // the exit line reports THIS run's deltas — a resumed `run_live` must
@@ -16163,6 +16392,28 @@ impl GraphRuntime {
             park_core_yields = core_yields_now - core_yields_at_entry,
             "live loop park telemetry"
         );
+        if period_park_engaged {
+            let st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let s = st.stats.since(period_park_at_entry);
+            tracing::info!(
+                graph = %self.config.identity(),
+                blocks = s.blocks,
+                predicted_blocks = s.predicted_blocks,
+                kernel_sleeps = s.kernel_sleeps,
+                kernel_sleeps_cut_by_data = s.kernel_sleeps_cut_by_data,
+                timer_wakes = s.timer_wakes,
+                timer_late = s.timer_late,
+                data_wakes = s.data_wakes,
+                data_caught_hot = s.data_caught_hot,
+                data_before_window = s.data_before_window,
+                lead_us = st.lead.lead_ns() / 1_000,
+                data_regular = st.arrivals.regular(),
+                "live loop period park telemetry"
+            );
+        }
 
         // Delivery-accounting twin of the park telemetry (once at
         // loop exit): per data-trigger-bound input — fires + the input's
@@ -17431,6 +17682,16 @@ impl GraphRuntime {
         // hot-path-alloc-ok: not a heap allocation: the clone is one `Arc`
         // refcount bump, taken before the run, never on a fire
         self.tick_panic_records.clone()
+    }
+
+    /// The variables this build left out of the environment snapshot its
+    /// nodes read (`ctx.env`, `ctx.env_str`, `ctx.env_opt`), because a name
+    /// or a value is not valid UTF-8.
+    ///
+    /// The build logs nothing about them. The process that owns the run
+    /// reports them once with [`NodeEnvLeftOut::warn`].
+    pub fn node_env_left_out(&self) -> &NodeEnvLeftOut {
+        &self.node_env_left_out
     }
 
     /// Every node stopped by a `NodeError::Fatal` from its tick during this
@@ -18991,11 +19252,10 @@ impl GraphRuntime {
         }
     }
 
-    /// Keep each node in `ids` stopped on a runtime about to resume, as a
+    /// Keep each node in `stops` stopped on a runtime about to resume, as a
     /// recording's framework sections state it
-    /// ([`crate::state_restore::NodeFrameworkState::stopped`]). Called after
-    /// the build and before the first [`Self::step`], like every other
-    /// restore seam.
+    /// ([`crate::state_restore::StoppedAtAnchor`]). Called after the build and
+    /// before the first [`Self::step`], like every other restore seam.
     ///
     /// The node fires no more and this run records no failure for it
     /// ([`Self::node_fatal_errors`] does not name it); see
@@ -19008,6 +19268,20 @@ impl GraphRuntime {
     /// recorded run counted and announced that release when the node stopped,
     /// and this run restores the stop rather than performing it again.
     ///
+    /// A node whose entry states an unconsumed arrival
+    /// ([`crate::state_restore::StoppedAtAnchor::unconsumed_arrival`]) and
+    /// whose trigger input is per-message FIFO, drained through the node's own
+    /// subscriber, resumes with that input holding a frame. The recorded drain
+    /// had popped a frame no tick took, and every later boundary re-offered it,
+    /// popping nothing, consulting no read gate and recording nothing; the
+    /// restored binding answers each boundary the same way. The frame itself is
+    /// not restored: a stopped node never reads it. Every other trigger input
+    /// reads past the arrival: a `consume = latest` drain and a separate drain
+    /// subscriber consult their queue at every boundary, a frame held or not.
+    ///
+    /// Returns the nodes whose trigger input it restored holding a frame, in id
+    /// order.
+    ///
     /// # Errors
     ///
     /// Nothing changes on either refusal.
@@ -19019,8 +19293,8 @@ impl GraphRuntime {
     // hot-path-alloc-ok-fn: cold: a resume edit before step 1
     pub fn restore_stopped_nodes(
         &mut self,
-        ids: &std::collections::BTreeSet<String>,
-    ) -> TransportResult<()> {
+        stops: &std::collections::BTreeMap<String, crate::state_restore::StoppedAtAnchor>,
+    ) -> TransportResult<std::collections::BTreeSet<String>> {
         if self.external_sources_collected {
             return Err(TransportError::GraphError {
                 reason: format!(
@@ -19033,9 +19307,36 @@ impl GraphRuntime {
                 ),
             });
         }
-        self.scheduler.restore_stopped_nodes(ids)?;
-        self.release_block_slots_held_by(ids);
-        Ok(())
+        let ids: std::collections::BTreeSet<String> = stops.keys().cloned().collect();
+        self.scheduler.restore_stopped_nodes(&ids)?;
+        self.release_block_slots_held_by(&ids);
+        Ok(self.hold_restored_trigger_heads(stops))
+    }
+
+    /// Mark the trigger binding of each node in `stops` that states an
+    /// unconsumed arrival as holding a frame, when that binding is a
+    /// per-message FIFO input drained through the node's own subscriber, and
+    /// return those nodes. Called only after `Scheduler::restore_stopped_nodes`
+    /// has accepted `stops`.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    fn hold_restored_trigger_heads(
+        &mut self,
+        stops: &std::collections::BTreeMap<String, crate::state_restore::StoppedAtAnchor>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut held = std::collections::BTreeSet::new();
+        for binding in &mut self.data_trigger_bindings {
+            let unconsumed = stops
+                .get(binding.node_id.as_ref())
+                .is_some_and(|stop| stop.unconsumed_arrival);
+            if unconsumed
+                && matches!(binding.drain, DrainSource::Unified { .. })
+                && !binding.consume_latest
+            {
+                binding.trigger_head_held = true;
+                held.insert(binding.node_id.to_string());
+            }
+        }
+        held
     }
 
     /// Release every `block` slot a node in `ids` holds as a consumer, with no
@@ -20223,7 +20524,21 @@ impl GraphRuntime {
                 // `&self.nodes` borrow and the `&mut self.scheduler` borrows
                 // are sequential (no aliasing).
                 let input = input_name.as_deref(); // Some for any DataTrigger binding.
+                let held = self.data_trigger_bindings[i].trigger_head_held;
+                // `GraphRuntime` exposes no way to re-enable a node, so a node
+                // restored holding a frame stays disabled for the whole run.
+                debug_assert!(
+                    !held || self.scheduler.is_node_disabled(&node_id),
+                    "a held trigger binding's node '{node_id}' is enabled"
+                );
                 let (popped, latest_ts) = match input {
+                    // A stopped node restored holding a frame
+                    // (`restore_stopped_nodes`). The recorded drain re-offered
+                    // its held head here: no pop, no read-gate consult, no
+                    // read-outcome record, and one arrival with the head's
+                    // stamp. The stamp is not in the anchor, so this answers
+                    // the arrival with none.
+                    _ if held => (1, None),
                     Some(name) => match self.nodes.get(node_id.as_ref()) {
                         Some(arc) => match arc.lock() {
                             Ok(mut g) => g.drain_trigger_input(name),
@@ -21346,6 +21661,256 @@ fn validate_no_silent_data_trigger(
     })
 }
 
+/// The process environment as the nodes of one graph read it, split by
+/// [`capture_node_env`].
+struct NodeEnvCapture {
+    /// Every variable whose name and value are both valid UTF-8: the map that
+    /// `ctx.env`, `ctx.env_str` and `ctx.env_opt` read for the whole run.
+    snapshot: HashMap<String, String>,
+    /// Every variable left out of `snapshot` because its name or its value is
+    /// not valid UTF-8.
+    left_out: NodeEnvLeftOut,
+}
+
+/// The variables a graph build left out of the environment snapshot its nodes
+/// read, because a name or a value is not valid UTF-8. A node reads the
+/// default for each of them.
+///
+/// Each build records one ([`GraphRuntime::node_env_left_out`]) and logs
+/// nothing. The process that owns the run calls [`Self::warn`] once, for one
+/// of its builds: a single-process run for its build, the supervisor of a
+/// multi-process run for its planning build, a resim for its first pass. The
+/// workers and the other passes read the same environment and report nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEnvLeftOut {
+    /// Sorted by bytes, each name once.
+    names: Vec<OsString>,
+}
+
+impl NodeEnvLeftOut {
+    /// The name of each variable left out, sorted by bytes, each once.
+    pub fn names(&self) -> &[OsString] {
+        &self.names
+    }
+
+    /// Warn once, naming each variable left out, or do nothing when none was.
+    ///
+    /// The message is constant. The names ride the `names` field, where each
+    /// byte that is not valid UTF-8 prints escaped (`CER_\xFF`). No value is
+    /// printed, because a value may be a secret.
+    pub fn warn(&self) {
+        if self.names.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            names = ?self.names,
+            "node environment: variables whose name or value is not valid UTF-8 are left out, \
+             so ctx.env and ctx.env_str return the default for them"
+        );
+    }
+}
+
+/// Split `vars` into the snapshot the nodes read and the names left out of it.
+///
+/// A variable is kept only when both its name and its value are valid UTF-8,
+/// the case in which `std::env::var` returns its value, so a node reads the
+/// default for any other variable. The split is infallible: no name or value
+/// can fail the build, where `std::env::vars()` panics on the first variable
+/// that is not valid UTF-8.
+// hot-path-alloc-ok-fn: cold: graph BUILD, once per GraphRuntime, before the first step
+fn capture_node_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> NodeEnvCapture {
+    let mut snapshot = HashMap::new();
+    let mut left_out = Vec::new();
+    for (name, value) in vars {
+        match (name.into_string(), value.into_string()) {
+            (Ok(name), Ok(value)) => {
+                snapshot.insert(name, value);
+            }
+            (Ok(name), Err(_)) => left_out.push(OsString::from(name)),
+            (Err(name), _) => left_out.push(name),
+        }
+    }
+    left_out.sort();
+    left_out.dedup();
+    NodeEnvCapture {
+        snapshot,
+        left_out: NodeEnvLeftOut { names: left_out },
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod node_env_capture_tests {
+    //! Hand-written oracles for [`capture_node_env`] and
+    //! [`NodeEnvLeftOut::warn`]. Each input is the `(name, value)` list an
+    //! environment yields, built from raw bytes, so a name or value that is not
+    //! valid UTF-8 never enters this process's own environment. The build-level
+    //! arms, which run a real graph build in a child process, are in
+    //! `tests/env_snapshot_isolation_test.rs`.
+    use super::{capture_node_env, NodeEnvCapture};
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use tracing_test::traced_test;
+
+    fn os(bytes: &[u8]) -> OsString {
+        OsStr::from_bytes(bytes).to_os_string()
+    }
+
+    fn var(name: &[u8], value: &[u8]) -> (OsString, OsString) {
+        (os(name), os(value))
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The warning text, typed out by hand rather than shared with the code.
+    const WARNING: &str = "node environment: variables whose name or value is not valid UTF-8 \
+                           are left out, so ctx.env and ctx.env_str return the default for them";
+
+    #[test]
+    fn node_env_capture_of_a_utf8_environment_keeps_every_pair_and_leaves_nothing_out() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_A", b"1"),
+            var(b"CER_B", b"two"),
+            var(b"PATH", b"/usr/bin:/bin"),
+        ]);
+        assert_eq!(
+            snapshot,
+            map(&[("CER_A", "1"), ("CER_B", "two"), ("PATH", "/usr/bin:/bin")])
+        );
+        assert!(
+            left_out.names().is_empty(),
+            "nothing is left out: {left_out:?}"
+        );
+    }
+
+    #[test]
+    fn node_env_capture_of_an_empty_environment_is_empty() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `caf\xc3\xa9` is "café" in UTF-8, a two-byte sequence the split must
+    /// not mistake for invalid bytes; an empty value is still a value.
+    #[test]
+    fn node_env_capture_keeps_a_multibyte_utf8_value_and_an_empty_value() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_LAYOUT", b"caf\xc3\xa9"), var(b"CER_EMPTY", b"")]);
+        assert_eq!(snapshot, map(&[("CER_LAYOUT", "café"), ("CER_EMPTY", "")]));
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `\xff\xfe` is never UTF-8, and `caf\xe9` is "café" in Latin-1, where
+    /// `\xe9` starts a three-byte UTF-8 sequence that never finishes. Each is
+    /// left out by name; the UTF-8 neighbour is kept.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_value_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_LATIN1", b"caf\xe9"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_LATIN1"), os(b"CER_X")]);
+    }
+
+    /// A name that is not valid UTF-8 is left out whole: no lossy key such as
+    /// `CER_\u{FFFD}` appears in the snapshot.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_name_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_\xff", b"v"), var(b"CER_KEPT", b"kept")]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_\xff")]);
+    }
+
+    /// The left-out names come back in byte order, each once, whatever order
+    /// and however often the environment yields them.
+    #[test]
+    fn node_env_capture_names_each_left_out_variable_once_in_byte_order() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_Z", b"\xff"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_A", b"\xfe"),
+            var(b"CER_Z", b"\xff"),
+        ]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert_eq!(
+            left_out.names(),
+            [os(b"CER_A"), os(b"CER_Z"), os(b"CER_\xff")]
+        );
+    }
+
+    /// Two splits of one environment, in opposite orders, both equal the same
+    /// hand-written oracle.
+    #[test]
+    fn node_env_capture_is_identical_for_reversed_input() {
+        let vars = vec![
+            var(b"CER_KEPT", b"kept"),
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_LAYOUT", b"caf\xc3\xa9"),
+        ];
+        let reversed: Vec<_> = vars.iter().rev().cloned().collect();
+        for input in [vars, reversed] {
+            let NodeEnvCapture { snapshot, left_out } = capture_node_env(input);
+            assert_eq!(
+                snapshot,
+                map(&[("CER_KEPT", "kept"), ("CER_LAYOUT", "café")])
+            );
+            assert_eq!(left_out.names(), [os(b"CER_X"), os(b"CER_\xff")]);
+        }
+    }
+
+    /// The warning names every left-out variable, with its invalid byte
+    /// escaped, and carries no value: neither the secret-named one that is not
+    /// UTF-8 nor the plain value of a name that is not.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_names_every_left_out_variable_and_no_value() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([
+            var(b"CER_TOKEN", b"\xffhunter2"),
+            var(b"CER_\xff", b"plainvalue"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        left_out.warn();
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains(WARNING))
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [line]
+                    if line.contains(" WARN ")
+                        && line.contains(r#"names=["CER_TOKEN", "CER_\xFF"]"#) =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("one WARN line naming both variables: {other:#?}")),
+            }
+        });
+        for absent in ["hunter2", "plainvalue", "CER_KEPT"] {
+            assert!(!logs_contain(absent), "the warning never carries {absent}");
+        }
+    }
+
+    /// The control: nothing left out, nothing printed.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_is_silent_when_nothing_is_left_out() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([var(b"CER_KEPT", b"kept")]);
+        left_out.warn();
+        assert!(!logs_contain("node environment"));
+    }
+}
+
 #[cfg(test)]
 mod chain_call_cut_tests {
     use super::{build_trigger_edges, ChainCalls, DataTriggerBinding, DrainSource, LevelPlan};
@@ -21427,6 +21992,7 @@ mod chain_call_cut_tests {
             consume_latest: false,
             probes_body: false,
             unconfirmed_arrival: false,
+            trigger_head_held: false,
         }
     }
 

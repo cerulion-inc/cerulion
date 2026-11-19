@@ -31,7 +31,7 @@
 //! `if !cfg!(unix) { return; }` (the guard is Unix, not Linux:
 //! `MappedBarrier` is real POSIX `shm_open` + `MAP_SHARED` on every Unix,
 //! so a re-exec'd worker rendezvouses on macOS too). Run on Linux
-//! (x86 with WAITPKG / aarch64 with WFE) or on macOS:
+//! (x86 with WAITPKG or MWAITX / aarch64 with WFE) or on macOS:
 //!
 //! ```bash
 //! cargo test -p cerulion_cli_engine --test mp_worker_box_test -- --ignored --nocapture
