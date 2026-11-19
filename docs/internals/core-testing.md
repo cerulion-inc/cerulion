@@ -71,9 +71,10 @@ cargo test -p cerulion_core --test <name> -- --test-threads=1
 cargo test -p cerulion_core --test latency_threshold_test --release -- --test-threads=1
 cargo test -p cerulion_core --test graph_latency_test --release -- --test-threads=1
 
-# Trybuild: the blocking suite is its own package; re-bless after diagnostic edits:
-cargo test -p node_macro_ui
+# Trybuild: the blocking suites are their own packages; re-bless after diagnostic edits:
+cargo test -p node_macro_ui -p test_node_macro_cdylib
 TRYBUILD=overwrite cargo test -p node_macro_ui --test compile_fail
+TRYBUILD=overwrite cargo test -p test_node_macro_cdylib --test context_helpers
 # The ignored toolchain-fragile groups stay in cerulion_core:
 cargo test -p cerulion_core --test macro_compile_fail_test -- --ignored
 

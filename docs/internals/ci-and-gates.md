@@ -545,9 +545,9 @@ test even when targets are named. `node_macro_ui`'s dev-dependencies ask for
 for `trybuild` alone, all of which `cerulion_core`'s own test build already turns on, so
 every unit the shard compiles for the core tests keeps its features (the shard-2 unit
 graphs at both counts, with and without the two packages, agree on every unit they share).
-`test_node_macro_cdylib`'s programs build in every build of that package too, so a build
-without dev-dependencies, the workspace build among them, compiles them without
-`cerulion_core`'s `test-helpers`. Cargo copies a cdylib into
+`test_node_macro_cdylib`'s programs build in every build of that package that does not
+filter its targets too, so a build without dev-dependencies, the workspace build among
+them, compiles them without `cerulion_core`'s `test-helpers`. Cargo copies a cdylib into
 `target/debug` only when the command asks for its library, as `cargo build -p` and
 `--workspace` do, not when it builds the library as a dependency of a test; so during a
 shard run the fixture the core tests load from there is the one the leg's workspace build
