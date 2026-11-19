@@ -18,6 +18,7 @@
 //! (native `rerun` app OR Studio's WASM viewer) connects to — advertised in the
 //! Hello banner.
 
+use std::ffi::OsString;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -62,8 +63,9 @@ ENVIRONMENT:
 fn main() -> ExitCode {
     // Arg handling BEFORE tracing/transport: `--help`/`-h` prints usage and exits
     // 0 without starting the daemon (previously any arg was silently ignored and
-    // the daemon started serving). An unknown flag is a loud usage error (exit 2).
-    match parse_args(std::env::args().skip(1)) {
+    // the daemon started serving). An unknown flag or an argument that is not
+    // valid UTF-8 is a loud usage error (exit 2).
+    match parse_args(std::env::args_os().skip(1)) {
         ArgAction::Run => {}
         ArgAction::Help => {
             print!("{USAGE}");
@@ -71,6 +73,11 @@ fn main() -> ExitCode {
         }
         ArgAction::Unknown(arg) => {
             eprintln!("cerulion-vizd: unrecognized argument `{arg}`\n");
+            eprint!("{USAGE}");
+            return ExitCode::from(2);
+        }
+        ArgAction::NotUtf8 { position, arg } => {
+            eprintln!("cerulion-vizd: argument {position} is not valid UTF-8: {arg:?}\n");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
@@ -98,23 +105,30 @@ enum ArgAction {
     Help,
     /// An unrecognized argument — print usage to stderr and exit nonzero.
     Unknown(String),
+    /// An argument that is not valid UTF-8, at `position` (counted from 1
+    /// after the program name): print usage to stderr and exit nonzero.
+    NotUtf8 { position: usize, arg: OsString },
 }
 
 /// Parse `cerulion-vizd`'s argv (already past argv[0]). `--help`/`-h` wins over
-/// everything; any other argument is [`ArgAction::Unknown`]. Pure — oracle-tested.
-fn parse_args(args: impl IntoIterator<Item = String>) -> ArgAction {
-    let mut unknown: Option<String> = None;
-    for arg in args {
-        match arg.as_str() {
-            "--help" | "-h" => return ArgAction::Help,
-            other if unknown.is_none() => unknown = Some(other.to_string()),
-            _ => {}
+/// everything; the first other argument is [`ArgAction::Unknown`], or
+/// [`ArgAction::NotUtf8`] when it is not valid UTF-8. Pure, and oracle-tested.
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> ArgAction {
+    let mut refused: Option<ArgAction> = None;
+    for (index, arg) in args.into_iter().enumerate() {
+        match arg.to_str() {
+            Some("--help" | "-h") => return ArgAction::Help,
+            _ if refused.is_some() => {}
+            Some(other) => refused = Some(ArgAction::Unknown(other.to_string())),
+            None => {
+                refused = Some(ArgAction::NotUtf8 {
+                    position: index + 1,
+                    arg,
+                })
+            }
         }
     }
-    match unknown {
-        Some(arg) => ArgAction::Unknown(arg),
-        None => ArgAction::Run,
-    }
+    refused.unwrap_or(ArgAction::Run)
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -228,7 +242,12 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> ArgAction {
-        parse_args(args.iter().map(|s| s.to_string()))
+        parse_args(args.iter().map(OsString::from))
+    }
+
+    fn raw(bytes: &[u8]) -> OsString {
+        use std::os::unix::ffi::OsStringExt as _;
+        OsString::from_vec(bytes.to_vec())
     }
 
     #[test]
@@ -255,6 +274,25 @@ mod tests {
             parse(&["--one", "--two"]),
             ArgAction::Unknown("--one".to_string())
         );
+    }
+
+    /// An argument that is not valid UTF-8 is refused with its position and
+    /// its bytes; it shares the unknown argument's tier, so the first refused
+    /// argument is the one named and `--help` still wins.
+    #[test]
+    fn an_arg_that_is_not_utf8_is_refused_with_its_position() {
+        assert_eq!(
+            parse_args([raw(b"--bogus"), raw(b"\xFF")]),
+            ArgAction::Unknown("--bogus".to_string())
+        );
+        assert_eq!(
+            parse_args([raw(b"-\xE9"), raw(b"--bogus")]),
+            ArgAction::NotUtf8 {
+                position: 1,
+                arg: raw(b"-\xE9")
+            }
+        );
+        assert_eq!(parse_args([raw(b"\xFF"), raw(b"-h")]), ArgAction::Help);
     }
 
     #[test]
