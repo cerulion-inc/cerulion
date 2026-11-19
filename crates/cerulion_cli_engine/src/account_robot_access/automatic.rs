@@ -98,6 +98,15 @@ impl RemoteCatalogs {
     }
 }
 
+/// Renew a device certificate inside its renewal window, once per process,
+/// waiting at most `budget` for it.
+fn renew_device_cert_within(budget: std::time::Duration) {
+    #[cfg(unix)]
+    crate::device_cert_renewal::renew_once_within(budget);
+    #[cfg(not(unix))]
+    let _ = budget;
+}
+
 /// Fetch only when remote traffic is permitted; an unsigned desk with no pairings
 /// opens no account request or daemon. Directory failures preserve paired access.
 pub fn discover() -> CliResult<RemoteCatalogs> {
@@ -136,6 +145,7 @@ pub fn discover() -> CliResult<RemoteCatalogs> {
                             .diagnostics
                             .push(crate::login_cmd::DEVICE_ENROLLMENT_REQUIRED.into());
                     }
+                    renew_device_cert_within(account_robots::LISTING_FETCH_BUDGET);
                     account_robots::fetch_within(account_robots::LISTING_FETCH_BUDGET)
                 });
         match fetched {

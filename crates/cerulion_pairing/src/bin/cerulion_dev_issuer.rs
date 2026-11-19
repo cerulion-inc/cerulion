@@ -182,14 +182,28 @@ fn status(args: &[String]) -> Result<String, Failure> {
     }
 }
 
+/// The arguments after the program name, or the usage failure naming the
+/// first one that is not valid UTF-8 by its position.
+fn utf8_args() -> Result<Vec<String>, Failure> {
+    std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                let position = index + 1;
+                Failure::Usage(format!("argument {position} is not valid UTF-8: {arg:?}"))
+            })
+        })
+        .collect()
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let result = match args.first().map(String::as_str) {
+    let result = utf8_args().and_then(|args| match args.first().map(String::as_str) {
         Some("init") => init(&args[1..]),
         Some("status") => status(&args[1..]),
         Some(other) => Err(Failure::Usage(format!("unknown command '{other}'"))),
         None => Err(Failure::Usage("no command".into())),
-    };
+    });
     match result {
         Ok(line) => {
             println!("{line}");

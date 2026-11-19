@@ -62,6 +62,16 @@ not create one.
 
 `cerulion --help` prints the full tree. Every subcommand also responds to `--help`.
 
+An argument that is not valid UTF-8, such as a file name in a non-UTF-8 locale,
+is taken as given where a verb takes a path, and `ros2 run` / `ros2 launch`
+forward it to `ros2` unchanged. Anywhere else, such as where a verb takes text
+or in the place of a verb or flag name, `cerulion` refuses the command line with
+exit 2 and one `Error: argument N is not valid UTF-8: "caf\xE9"` line per such
+argument, `N` counted from 1 after `cerulion`, then a line saying what to do.
+The parser does not say which argument it refused, so a path argument that is
+not valid UTF-8 is named too. A usage error about another argument, such as an
+unknown flag, keeps the parser's own message.
+
 ### `cerulion workspace`
 
 | Command | Effect |
@@ -3802,6 +3812,7 @@ Read by `graph run`, `node run`, `ros2 attach` and the topic verbs. See
 | `CERULION_MULTICAST_SCOUTING` | `on` (trimmed, ASCII case-insensitive) turns zenoh multicast scouting back on: periodic scout packets to UDP `224.0.0.224:7446`. Default off. The explicit open LAN compatibility path finds peers through the `_cerulion._tcp` mDNS browse, peer cache and hostname rung. Paired robots use authenticated account or saved pairing discovery instead. Set it on a network where mDNS does not cross but multicast does, on every machine that should find or be found that way: a session with it off neither sends nor answers scouts. `off` or empty keeps the default; any other value keeps it off and logs a warning. Read by `cerulion-netd` and `cerulion-vizd` at daemon start, by `graph run` for a permissive gateway process it spawns itself, and by the `topic list` discovery session. A running daemon picks a change up only when it restarts, and a permissive `graph run` whose egress rides a running `cerulion-netd` gets that daemon's value. |
 | `CERULION_PEERS` | Comma-separated `host[:port]` list feeding the discovery ladder's hostname rung, the scripted / CI escape hatch for a robot mDNS and multicast cannot reach. The same list can live in `~/.cerulion/config.toml` under `peers`. Prefer `--connect tcp/<host>:7683` for a one-off. |
 | `CERULION_HOME` | The Cerulion config directory, used verbatim instead of `~/.cerulion` (`auth.json`, the machine key `identity/device.key` and its legacy name `desk.key`, `device.cert`, `robots.toml`, `peers.json`, `config.toml`, `epochs/`, `runs/`, `ros2/`). Empty counts as unset. The isolation knob for a test rig or a second identity on one machine. |
+| `CERULION_DEVICE_CERT_RENEW_WINDOW_S` | How long before the cached device certificate expires it is renewed, in whole seconds (60 to 2592000). Unset: half the certificate's lifetime, 3.5 days for the hosted issuer's 7-day certificate. The same device key is registered again (`POST /v1/devices/challenge` + `POST /v1/devices`) and the cached copies are replaced when the certificate is that close to expiry: by a command that uses the account session with a session that is valid or refreshable, by the automatic account step of remote robot discovery (`topic list`, for example), which waits at most 2 s for it once per process, and by the robot's revocation sync. Local commands never renew it. A machine on which such a command succeeds in renewing at least once in any 3.5 days keeps a valid certificate. It never creates a key. A failure is one warning while the cached certificate stays in use, and the next attempt waits an hour. A value out of range is named in a warning and the default applies. |
 | `DDS_BRIDGE_CONFIG` | Path to the bridge mapping file a `cerulion ros2 attach` graph's `dds_bridge` node loads. `ros2 attach` sets it absolute when it runs the graph for you; a hand-written `graph run` of an attach graph inherits whatever your shell exported, so export it there. |
 
 ### ROS 2 on Cerulion transport

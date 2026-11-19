@@ -192,6 +192,15 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Local identity**: `cerulion_wireclient::local_identity` holds the existing
+  never-renamed auth-store lock while reading the account and actual machine key.
+  A busy writer refuses immediately. Identity-only reads never open certificate
+  files; full snapshots also bind the leaf and chain, refusing malformed present
+  proof. Netd delegates its full-snapshot reader to this module and keeps its
+  existing expiry-independent stamp and authorization rules. Callers supply a
+  read-only nonblocking opener; opened descriptors must be regular and bounded.
+  These reads neither create state nor contact the account service.
+
 - **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
   process enumeration, readiness and signal syscalls before spawn. Native pidfds
   bind each signal to its captured process. Only an unavailable pidfd syscall permits the
@@ -1056,6 +1065,15 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   a stolen desk. Session refreshes are serialized across processes by an
   exclusive lock beside `auth.json` (`.auth-refresh.lock`): a refresh token is
   single-use, and the loser of a race uses the session the winner wrote.
+  netd's shutdown, and the teardown before a robot server restart, send the
+  worker SIGTERM as they begin (`EpochSync::signal_stop`, before the robot
+  server stops), and the stop grace runs from that signal. The worker's handler only sets the `stopping` flag
+  `robot_bootstrap::sync_epoch` takes, after which it starts no session
+  fallback, refresh (`login_cmd::refresh_session_if_stale_unless_stopping`
+  reads the flag before the refresh lock and again before the exchange) or
+  certificate renewal, so the grace only has to cover one exchange in flight.
+  Requests that spend no token (the robot-proof fetch, an access read) may
+  still run and end at the grace.
 - **Desks also push.** Both desk dial paths carry the cached epoch
   unconditionally; there is deliberately NO knob to withhold it (by
   design: a withholding knob would be a footgun). The shared substrate is

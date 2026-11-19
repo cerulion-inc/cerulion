@@ -1368,6 +1368,18 @@ produce needs no sequence seed. `resume.stopped_at_anchor` in the
 the resim executes contradicts itself and is refused before the first replayed
 step (`bag internal consistency check failed`, exit 2).
 
+A stopped node's per-message FIFO trigger input with the default `drop_oldest`
+backpressure takes one more frame after the stop, when one arrives, and then
+reads nothing; a later checkpoint states that frame as the node's one
+unconsumed arrival, and the resim keeps the frame held, so that input reads
+nothing in the resim either. A `block` or `sample(N)` trigger input of a
+stopped node reads every frame at every step, in the recording and in the
+resim alike. A node stopped at the checkpoint's own step by a fire that never
+read its `drop_oldest` trigger input (possible only for a node not built with
+`#[cerulion_node]`) holds a frame the checkpoint does not state, and a
+`--verify` of the resim reports a read-log difference at that input's first
+read.
+
 The flag is a positive claim at any format, so a part that carries it states
 the stop on a bag below 10 too. Below 10 a part without it states nothing, and
 so does a node with no complete part at any format (a node that saves no

@@ -23,8 +23,9 @@ be checked against this table.
 - The two arms. `without`: the model on a published three-tool interface (one move tool, done, give up; the
   prompt and tool texts of arXiv 2610.30051, word for word). `with`: the same model on the Cerulion harness's tools.
 - Shared by both arms: the start states, the environment seed (142 plus the start state), the sampling seed 1
-  sent with each model request (the endpoint of the four Claude models refused the seed field, so it was
-  dropped and every request that endpoint answered ran without a seed), 80 model replies, one tool call a reply, 900 control steps (45 simulated
+  sent with each model request (the endpoint of the four Claude models refused the seed and parallel_tool_calls
+  fields, so both were dropped and every request that endpoint answered ran without them; the operator still ran
+  only the first call of a reply), 80 model replies, one tool call a reply, 900 control steps (45 simulated
   seconds), temperature 1.0, high reasoning effort, a 90 minute clock, the benchmark's own success predicate
   read after the episode. Zero-shot: an empty store, nothing learned on any task carried in. One episode a
   start state an arm.

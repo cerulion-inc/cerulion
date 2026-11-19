@@ -22,6 +22,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cerulion_core::graph::config::InputBackpressure;
 use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::{GraphRuntime, PeriodParkStats};
 use cerulion_core::prelude::*;
@@ -200,7 +201,7 @@ fn a_ring_on_a_second_input_does_not_end_a_nap_and_every_frame_is_read() {
 #[serial]
 fn a_period_node_under_the_period_park_sleeps_between_its_ticks() {
     const FIRES: usize = 300;
-    let (ticks, _, stats) = ticker_run("sleeps", true, FIRES);
+    let (ticks, _, stats) = ticker_run("sleeps", true, FIRES, InputBackpressure::DropOldest);
     assert!(ticks.len() >= FIRES, "ran {} fires", ticks.len());
     eprintln!("sleeps: {stats:?}");
     if engages_here() {
@@ -221,34 +222,43 @@ fn a_period_node_under_the_period_park_sleeps_between_its_ticks() {
 #[test]
 #[serial]
 fn with_the_switch_off_the_period_park_never_runs() {
-    let (ticks, _, stats) = ticker_run("off", false, 60);
+    let (ticks, _, stats) = ticker_run("off", false, 60, InputBackpressure::DropOldest);
     assert!(ticks.len() >= 60, "apparatus: ran {} fires", ticks.len());
     assert_eq!(stats, PeriodParkStats::default());
 }
 
-/// The period-park changes when the loop re-polls, never what fires: past the
-/// start-up catch-up (whose burst can overrun the consumer's queue in either
-/// mode), the consumer reads every numbered frame, in order, with the switch on
-/// as with it off.
+/// The period-park changes when the loop re-polls, never what fires: with the
+/// switch on as with it off, the consumer reads every frame the 1 kHz node
+/// writes, from the first, once and in order. The consumer's input is `block`:
+/// a catch-up burst (after the build, or after the loop thread lost its core)
+/// stops at the queue's depth and resumes once the consumer has read the queue,
+/// so how late the loop re-polls changes how many frames one step carries,
+/// never which frames are read. Where the period-park engages, the switch-on
+/// run planned park blocks; in every other run its counters stay at zero.
 #[test]
 #[serial]
 fn the_period_park_changes_when_not_what() {
     const FIRES: usize = 300;
-    const WARMUP: f64 = 100.0;
     for on in [true, false] {
-        let (ticks, seen, _) = ticker_run(if on { "whaton" } else { "whatoff" }, on, FIRES);
+        let tag = if on { "whaton" } else { "whatoff" };
+        let (ticks, seen, stats) = ticker_run(tag, on, FIRES, InputBackpressure::Block);
         assert!(ticks.len() >= FIRES, "apparatus: ran {} fires", ticks.len());
-        let after: Vec<f64> = seen.iter().copied().filter(|n| *n > WARMUP).collect();
-        assert!(
-            after.len() >= FIRES - 120,
-            "switch on={on}: read {} frames past the warm-up",
-            after.len()
-        );
-        let first = after[0];
-        let expected: Vec<f64> = (0..after.len()).map(|k| first + k as f64).collect();
+        let expected: Vec<f64> = (1..=ticks.len()).map(|n| n as f64).collect();
         assert_eq!(
-            after, expected,
-            "switch on={on}: every frame past the warm-up, in order"
+            seen, expected,
+            "switch on={on}: every frame written, once, in order"
         );
+        if on && engages_here() {
+            assert!(
+                stats.blocks > 0,
+                "switch on: no park block planned: {stats:?}"
+            );
+        } else {
+            assert_eq!(
+                stats,
+                PeriodParkStats::default(),
+                "switch on={on}: the period-park does not run here"
+            );
+        }
     }
 }

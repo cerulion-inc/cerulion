@@ -31,6 +31,7 @@ mod support;
 
 use std::time::Duration;
 
+use cerulion_core::graph::config::InputBackpressure;
 use cerulion_core::graph::PeriodParkStats;
 use serial_test::serial;
 use support::{
@@ -135,7 +136,12 @@ fn a_frame_on_a_second_input_is_read_within_about_one_nap() {
 fn a_period_node_under_the_period_park_stays_on_its_grid() {
     const WARMUP: usize = 100;
     const FIRES: usize = 800;
-    let (ticks, _, stats) = ticker_run("gridlat", true, WARMUP + FIRES);
+    let (ticks, _, stats) = ticker_run(
+        "gridlat",
+        true,
+        WARMUP + FIRES,
+        InputBackpressure::DropOldest,
+    );
     assert!(ticks.len() >= WARMUP + FIRES, "ran {} fires", ticks.len());
     let gaps: Vec<u64> = ticks[WARMUP..]
         .windows(2)
