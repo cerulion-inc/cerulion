@@ -131,6 +131,13 @@ class Condition(unittest.TestCase):
         self.assertEqual((cond["host"], cond["extra_body_from"], cond["provider_only"], cond["reasoning_effort"]),
                          ("aiplatform.googleapis.com", "--extra-body", None, None))
 
+    def test_the_recorded_url_holds_no_user_name_password_query_or_fragment(self):
+        for url, shown in (("https://user:secret@openrouter.ai/api/v1?key=secret#x", "https://openrouter.ai/api/v1"),
+                           ("http://[::1]:8080/v1?api-version=1", "http://[::1]:8080/v1"),
+                           ("http://127.0.0.1:9/v1", "http://127.0.0.1:9/v1"),
+                           ("http://h:notaport/v1", "")):
+            self.assertEqual(route.condition(url, MEASURED_BODY, None)["base_url"], shown, url)
+
     def test_the_line(self):
         self.assertEqual(route.condition_line(route.condition(GOOGLE, MEASURED_BODY, None)),
                          'route aiplatform.googleapis.com: every request body adds {"reasoning_effort": "high"} '
@@ -224,6 +231,28 @@ def post(url, body, opener=None):
         return resp.status, resp.read()
 
 
+def raw_endpoint(test, answer):
+    """A server on the loopback address that answers one request with the bytes answer and closes: an answer no
+    HTTP server would send. Returns its base URL; what it was sent is test.raw_seen."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    test.addCleanup(listener.close)
+    test.raw_seen = []
+
+    def serve():
+        conn, _ = listener.accept()
+        with conn:
+            conn.settimeout(10)
+            test.raw_seen.append(conn.recv(65536))
+            conn.sendall(answer)
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    test.addCleanup(t.join, 5)
+    return f"http://127.0.0.1:{listener.getsockname()[1]}/v1"
+
+
 class RelayExchange(unittest.TestCase):
     """The relay between the operator and the endpoint."""
 
@@ -261,7 +290,7 @@ class RelayExchange(unittest.TestCase):
         self.assert_operator_headers(end, [TURN_1, GOOGLE_TURN_2])
         self.assertEqual(first, answer("google", 0))
         self.assertEqual(relay.counts, {"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 0,
-                                        "requests_carrying_blocks": 0})
+                                        "requests_carrying_blocks": 0, "relay_errors": 0})
 
     def test_on_openrouter_the_first_replys_blocks_go_back_at_the_next_turn(self):
         end = self.endpoint("openrouter")
@@ -271,7 +300,7 @@ class RelayExchange(unittest.TestCase):
         self.assertEqual([s[2] for s in end.seen], [TURN_1, ENDPOINT_TURN_2])
         self.assert_operator_headers(end, [TURN_1, ENDPOINT_TURN_2])
         self.assertEqual(relay.counts, {"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 2,
-                                        "requests_carrying_blocks": 1})
+                                        "requests_carrying_blocks": 1, "relay_errors": 0})
 
     def test_an_http_error_comes_back_as_it_came(self):
         end = self.endpoint("openrouter")
@@ -401,7 +430,7 @@ class RelayExchange(unittest.TestCase):
                     self.assertEqual(end.seen, [("/v1/chat/completions", "Bearer " + KEY, TURN_1)])
                     self.assertEqual(relay.counts, {"requests": 1, "not_reached": 0,
                                                     "replies_with_reasoning_blocks": 0,
-                                                    "requests_carrying_blocks": 0})
+                                                    "requests_carrying_blocks": 0, "relay_errors": 0})
         self.assertEqual(elsewhere.seen, [])
 
     def test_a_request_line_that_names_another_host_goes_to_the_given_url_only(self):
@@ -417,6 +446,105 @@ class RelayExchange(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(end.seen, [("/v1/chat/completions", "Bearer " + KEY, TURN_1)])
         self.assertEqual(elsewhere.seen, [])
+
+    def test_an_error_answer_that_carries_blocks_is_not_remembered(self):
+        end = self.endpoint("openrouter")
+        end.answer = (500, {"Content-Type": "application/json"}, answer("openrouter", 0))
+        with route.Relay(end.url + "/v1") as relay:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                post(relay.base_url, TURN_1)
+            self.assertEqual(caught.exception.code, 500)
+            end.answer = None
+            post(relay.base_url, OPERATOR_TURN_2)
+        self.assertEqual(end.seen[1][2], OPERATOR_TURN_2)
+        self.assertEqual((relay.counts["replies_with_reasoning_blocks"], relay.counts["requests_carrying_blocks"]),
+                         (1, 0))   # the second answer's own blocks; none went back
+
+    def test_an_error_answer_whose_body_breaks_off_comes_back_with_its_status_and_no_body(self):
+        url = raw_endpoint(self, b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n"
+                                 b"Content-Length: 100\r\n\r\n{\"err")
+        with route.Relay(url) as relay:
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                post(relay.base_url, TURN_1)
+        self.assertEqual((caught.exception.code, caught.exception.read()), (500, b""))
+        self.assertEqual((relay.counts["not_reached"], relay.counts["relay_errors"]), (0, 0))
+
+    def test_a_request_whose_body_length_is_not_named_is_answered_411_and_not_sent(self):
+        end = self.endpoint("google")
+        with route.Relay(end.url + "/v1") as relay:
+            for name, headers, body in (("no Content-Length", {}, None),
+                                        ("one that is not a count", {"Content-Length": "12x"}, None),
+                                        ("a chunked body", {"Transfer-Encoding": "chunked"}, iter([TURN_1]))):
+                with self.subTest(name):
+                    conn = http.client.HTTPConnection(urllib.parse.urlparse(relay.base_url).netloc, timeout=30)
+                    conn.putrequest("POST", "/v1/chat/completions", skip_accept_encoding=True)
+                    for key, value in dict(headers, Authorization="Bearer " + KEY).items():
+                        conn.putheader(key, value)
+                    conn.endheaders()
+                    if body is not None:
+                        conn.send(b"%x\r\n%s\r\n0\r\n\r\n" % (len(TURN_1), TURN_1))
+                    got = conn.getresponse()
+                    self.assertEqual((got.status, got.read()), (411, b"the relay takes a body with a Content-Length "
+                                                                     b"only\n"))
+                    conn.close()
+        self.assertEqual(end.seen, [])
+        self.assertEqual(relay.counts["requests"], 0)
+
+    def test_an_answer_that_is_not_http_counts_as_not_reached(self):
+        url = raw_endpoint(self, b"not an HTTP answer\r\n\r\n")
+        with route.Relay(url) as relay:
+            with self.assertRaises(OSError):   # the connection closes unanswered
+                post(relay.base_url, TURN_1)
+        self.assertEqual(len(self.raw_seen), 1)
+        self.assertEqual((relay.counts["not_reached"], relay.counts["relay_errors"]), (1, 0))
+
+    def test_a_url_urllib_cannot_send_to_counts_as_not_reached(self):
+        with route.Relay("http://127.0.0.1:notaport/v1") as relay:
+            with self.assertRaises(OSError):
+                post(relay.base_url, TURN_1)
+        self.assertEqual((relay.counts["not_reached"], relay.counts["relay_errors"]), (1, 0))
+
+    def test_an_endpoint_slower_than_the_relays_timeout_counts_as_not_reached(self):
+        end = self.endpoint("google")
+        end.gate = threading.Event()   # answered only once the test is over
+        self.addCleanup(end.gate.set)
+        t0 = time.monotonic()
+        with route.Relay(end.url + "/v1", timeout_s=0.5) as relay:
+            with self.assertRaises(OSError):
+                post(relay.base_url, TURN_1)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertEqual(relay.counts["not_reached"], 1)
+
+    def test_no_header_but_the_operators_three_goes_on(self):
+        end = self.endpoint("google")
+        with route.Relay(end.url + "/v1") as relay:
+            req = urllib.request.Request(relay.base_url + "/chat/completions", data=TURN_1, method="POST",
+                                         headers={"Content-Type": "application/json", "Accept": "application/json",
+                                                  "Authorization": "Bearer " + KEY, "Cookie": "session=1",
+                                                  "X-Forwarded-For": "10.0.0.1", "Proxy-Authorization": "Basic eA=="})
+            urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=30).close()
+        self.assert_operator_headers(end, [TURN_1])
+
+    def test_a_fault_of_the_relay_itself_is_answered_502_and_counted(self):
+        end = self.endpoint("google")
+        with route.Relay(end.url + "/v1") as relay, \
+                mock.patch.object(route.Relay, "exchange", side_effect=RuntimeError("a bug")):
+            with self.assertRaises(urllib.error.HTTPError) as caught:
+                post(relay.base_url, TURN_1)
+        self.assertEqual((caught.exception.code, caught.exception.read()),
+                         (502, b"the relay could not pass this request on (RuntimeError)\n"))
+        self.assertEqual(relay.counts["relay_errors"], 1)
+
+    def test_json_nested_deeper_than_the_parser_goes_goes_on_as_it_came_both_ways(self):
+        end = self.endpoint("openrouter")
+        deep = b"[" * 100_000 + b"]" * 100_000
+        with route.Relay(end.url + "/v1") as relay:
+            post(relay.base_url, TURN_1)   # a reply with blocks: the next request is read for its history
+            end.answer = (200, {"Content-Type": "application/json"}, deep)
+            status, body = post(relay.base_url, deep)
+        self.assertEqual((status, body, end.seen[1][2]), (200, deep, deep))
+        self.assertEqual(relay.counts, {"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 1,
+                                        "requests_carrying_blocks": 0, "relay_errors": 0})
 
     def test_a_base_url_that_is_not_http_with_a_host_is_refused(self):
         for url in ("ftp://example.com/v1", "http://", "example.com/v1"):
