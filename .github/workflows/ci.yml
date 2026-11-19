@@ -3041,47 +3041,6 @@ jobs:
           fi
           echo "built $total waived test binaries for the gate"
 
-      # The #[cerulion_node] diagnostics suite (`node_macro_ui`: one trybuild
-      # check of every compile-fail fixture against its .stderr, then the
-      # compile-pass programs, examples built with no cfg(test), run by
-      # `tests/pass_programs.rs`) and then the node context helper suite run in
-      # the background beside the cerulion_core shard, as the old trybuild test
-      # ran inside it. Their test binaries and examples are built here first, so
-      # the background run builds only in target/tests/trybuild and never waits
-      # on the shared target directory. The helper runs second, so its trybuild
-      # check reuses the dependency build the diagnostics suite leaves there.
-      - name: cerulion_node diagnostics suite and node context helper suite (start)
-        id: macro-suites
-        if: matrix.shard == 2 && (contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') || contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib'))
-        env:
-          RUN_DIAGNOSTICS: ${{ contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
-          RUN_HELPER: ${{ contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/macro-suites"
-          mkdir -p "$dir"
-          if [ "$RUN_DIAGNOSTICS" = true ]; then
-            cargo test --timings --locked -p node_macro_ui --no-run
-          fi
-          if [ "$RUN_HELPER" = true ]; then
-            cargo test --timings --locked -p test_node_macro_cdylib --no-run
-          fi
-          cat > "$dir/run.sh" <<'SCRIPT'
-          dir=$1
-          if [ "$RUN_DIAGNOSTICS" = true ]; then
-            cargo test --timings -p node_macro_ui > "$dir/diagnostics.log" 2>&1
-            echo $? > "$dir/diagnostics.rc"
-          fi
-          if [ "$RUN_HELPER" = true ]; then
-            cargo test --timings -p test_node_macro_cdylib > "$dir/helper.log" 2>&1
-            echo $? > "$dir/helper.rc"
-          fi
-          touch "$dir/done"
-          SCRIPT
-          nohup bash "$dir/run.sh" "$dir" > "$dir/background.log" 2>&1 &
-          echo "$!" > "$dir/pid"
-          echo "started the macro suites in the background (pid $(cat "$dir/pid"))"
-
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
@@ -3089,35 +3048,6 @@ jobs:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
-
-      - name: cerulion_node diagnostics suite and node context helper suite (results)
-        if: ${{ !cancelled() && steps.macro-suites.outcome == 'success' }}
-        timeout-minutes: 45
-        run: |
-          set -uo pipefail
-          dir="$RUNNER_TEMP/macro-suites"
-          pid=$(cat "$dir/pid")
-          while [ ! -e "$dir/done" ]; do
-            if ! kill -0 "$pid" 2>/dev/null && [ ! -e "$dir/done" ]; then
-              echo "::error::the macro suites ended without finishing"
-              cat "$dir/background.log"
-              exit 1
-            fi
-            sleep 5
-          done
-          rc=0
-          for suite in diagnostics helper; do
-            [ -e "$dir/$suite.rc" ] || continue
-            code=$(cat "$dir/$suite.rc")
-            echo "::group::$suite suite (exit $code)"
-            cat "$dir/$suite.log"
-            echo "::endgroup::"
-            if [ "$code" != 0 ]; then
-              echo "::error::the $suite suite failed with exit $code"
-              rc=1
-            fi
-          done
-          exit "$rc"
 
       # The modified raw node fixture once more, built ALONE, the way a user's node
       # builds: `-p` with no sibling package resolves the node's dependency tree
@@ -3284,7 +3214,7 @@ jobs:
       # 18 s, so the file map in `ci_test_shard.sh` stays round-robin and no
       # second pin is warranted. The package steps are the whole imbalance.
       # (The tail is now the `node_macro_ui` package, run by the
-      # `cerulion_node diagnostics suite` steps on this same shard: its
+      # `cerulion_node diagnostics suite` step on this same shard: its
       # compile-pass programs build as cargo examples, so trybuild checks
       # the compile-fail set alone, in one dependency pass. The emptied core
       # binary stays PINNED, which keeps every other file on its shard; see
@@ -3452,6 +3382,15 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
+      # The #[cerulion_node] diagnostics suite: one trybuild check of every
+      # compile-fail fixture against its .stderr, then the compile-pass
+      # programs, each an example cargo builds with no cfg(test) and no
+      # harness, run by `tests/pass_programs.rs`. `-p` names this package alone,
+      # so the programs build with only the features its manifest asks for;
+      # trybuild's scratch project is a workspace of its own either way.
+      - name: cerulion_node diagnostics suite
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui')
+        run: cargo test --timings -p node_macro_ui
       - name: selection marker, node_macro_ui
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
         env:
@@ -3459,6 +3398,11 @@ jobs:
         run: |
           echo "selection: skipped node_macro_ui (selected: $SELECTED)"
 
+      # After the diagnostics suite, so this package's trybuild check reuses the
+      # dependency build that suite leaves in target/tests/trybuild.
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test --timings -p test_node_macro_cdylib
       - name: selection marker, test_node_macro_cdylib
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
         env:
@@ -4387,81 +4331,11 @@ jobs:
           fi
           echo "built $total waived test binaries for the gate"
 
-      # The #[cerulion_node] diagnostics suite (`node_macro_ui`: one trybuild
-      # check of every compile-fail fixture against its .stderr, then the
-      # compile-pass programs, examples built with no cfg(test), run by
-      # `tests/pass_programs.rs`) and then the node context helper suite run in
-      # the background beside the cerulion_core shard, as the old trybuild test
-      # ran inside it. Their test binaries and examples are built here first, so
-      # the background run builds only in target/tests/trybuild and never waits
-      # on the shared target directory. The helper runs second, so its trybuild
-      # check reuses the dependency build the diagnostics suite leaves there.
-      - name: cerulion_node diagnostics suite and node context helper suite (start)
-        id: macro-suites
-        if: matrix.shard == 2 && (contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') || contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib'))
-        env:
-          RUN_DIAGNOSTICS: ${{ contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
-          RUN_HELPER: ${{ contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        run: |
-          set -euo pipefail
-          dir="$RUNNER_TEMP/macro-suites"
-          mkdir -p "$dir"
-          if [ "$RUN_DIAGNOSTICS" = true ]; then
-            cargo test --timings --locked -p node_macro_ui --no-run
-          fi
-          if [ "$RUN_HELPER" = true ]; then
-            cargo test --timings --locked -p test_node_macro_cdylib --no-run
-          fi
-          cat > "$dir/run.sh" <<'SCRIPT'
-          dir=$1
-          if [ "$RUN_DIAGNOSTICS" = true ]; then
-            cargo test --timings -p node_macro_ui > "$dir/diagnostics.log" 2>&1
-            echo $? > "$dir/diagnostics.rc"
-          fi
-          if [ "$RUN_HELPER" = true ]; then
-            cargo test --timings -p test_node_macro_cdylib > "$dir/helper.log" 2>&1
-            echo $? > "$dir/helper.rc"
-          fi
-          touch "$dir/done"
-          SCRIPT
-          nohup bash "$dir/run.sh" "$dir" > "$dir/background.log" 2>&1 &
-          echo "$!" > "$dir/pid"
-          echo "started the macro suites in the background (pid $(cat "$dir/pid"))"
-
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
-
-      - name: cerulion_node diagnostics suite and node context helper suite (results)
-        if: ${{ !cancelled() && steps.macro-suites.outcome == 'success' }}
-        timeout-minutes: 45
-        run: |
-          set -uo pipefail
-          dir="$RUNNER_TEMP/macro-suites"
-          pid=$(cat "$dir/pid")
-          while [ ! -e "$dir/done" ]; do
-            if ! kill -0 "$pid" 2>/dev/null && [ ! -e "$dir/done" ]; then
-              echo "::error::the macro suites ended without finishing"
-              cat "$dir/background.log"
-              exit 1
-            fi
-            sleep 5
-          done
-          rc=0
-          for suite in diagnostics helper; do
-            [ -e "$dir/$suite.rc" ] || continue
-            code=$(cat "$dir/$suite.rc")
-            echo "::group::$suite suite (exit $code)"
-            cat "$dir/$suite.log"
-            echo "::endgroup::"
-            if [ "$code" != 0 ]; then
-              echo "::error::the $suite suite failed with exit $code"
-              rc=1
-            fi
-          done
-          exit "$rc"
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
@@ -4550,6 +4424,15 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
+      # The #[cerulion_node] diagnostics suite: one trybuild check of every
+      # compile-fail fixture against its .stderr, then the compile-pass
+      # programs, each an example cargo builds with no cfg(test) and no
+      # harness, run by `tests/pass_programs.rs`. `-p` names this package alone,
+      # so the programs build with only the features its manifest asks for;
+      # trybuild's scratch project is a workspace of its own either way.
+      - name: cerulion_node diagnostics suite
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui')
+        run: cargo test --timings -p node_macro_ui
       - name: selection marker, node_macro_ui
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
         env:
@@ -4557,6 +4440,11 @@ jobs:
         run: |
           echo "selection: skipped node_macro_ui (selected: $SELECTED)"
 
+      # After the diagnostics suite, so this package's trybuild check reuses the
+      # dependency build that suite leaves in target/tests/trybuild.
+      - name: node context helper compile tests
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
+        run: cargo test --timings -p test_node_macro_cdylib
       - name: selection marker, test_node_macro_cdylib
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
         env:
