@@ -12,11 +12,11 @@ cerulion rcp bench --model YOUR_MODEL            # one benchmark task, with and 
 cerulion rcp bench --verify                      # the code here is the code the benchmark measured
 ```
 
-The release packages do not install this folder. A `cerulion` built in this checkout
-(`cargo run -p cerulion_cli -- rcp --sim`, or `target/debug/cerulion`) finds it from any directory; for any other
-`cerulion`, a release's included, point `CERULION_HARNESS_DIR` at it. Both run it in place while your user can
-write to it. A copy of this folder beside the `cerulion` binary is found too, and nothing writes into it there:
-the first run copies it once to `harness/<version>` under the Cerulion config directory and runs from the copy.
+Every release package installs this folder beside the `cerulion` binary, without `tests/` and the development
+files, and nothing writes into it there: the first run copies it once to `harness/<version>` under the Cerulion
+config directory and runs from the copy. A `cerulion` built in this checkout (`cargo run -p cerulion_cli -- rcp
+--sim`, or `target/debug/cerulion`) finds this folder from any directory, and `CERULION_HARNESS_DIR` points any
+`cerulion` at it; both run it in place while your user can write to it.
 The current directory is never searched for a harness, and the search takes nothing from a folder other users
 can write to.
 
@@ -35,7 +35,7 @@ can write to.
 | `requirements/` | every Python package of both environments, pinned |
 | `macos/` | the simulator host for macOS, which renders through Apple's OpenGL |
 | `container/` | a container recipe; no image is published |
-| `tests/` | standard-library tests that need no simulator and no network |
+| `tests/` | standard-library tests that need no simulator and no network; the release packages leave them out |
 
 The install writes `bx/` (the simulator environment and the benchmark trees), `venv/` (the episode server's
 environment) and `out/` (what the sim server keeps of each episode) inside the folder it runs from: this folder

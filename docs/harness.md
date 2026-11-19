@@ -20,14 +20,12 @@ Both run under the free Cerulion account, as the other `cerulion` commands do: r
 
 ## Try it
 
-The release packages install `cerulion` without the harness folder. Clone this repository once and name its
-`harness/` folder in `CERULION_HARNESS_DIR`, or run a `cerulion` built in the checkout, which finds it on its own
-([Where the harness lives](#where-the-harness-lives)). To run the harness your `cerulion` was released with, add
-`--branch` and the release's tag to the clone: `v` and the version `cerulion --version` prints.
+Every release package installs the harness folder beside `cerulion`: the install script, the release archives,
+the Debian package (`/usr/bin/harness`) and the Homebrew formula. A release's `cerulion` finds it there with no
+clone and no setting, and a `cerulion` built in a checkout of this repository finds that checkout's own
+([Where the harness lives](#where-the-harness-lives)).
 
 ```bash
-git clone --depth 1 https://github.com/cerulion-inc/cerulion   # the harness folder, once
-export CERULION_HARNESS_DIR="$PWD/cerulion/harness"
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
 ```
@@ -49,7 +47,7 @@ when no call arrives for a while; connect again for a new one.
 Without `--http`, `cerulion rcp --sim` serves MCP over stdio, so a client can start it itself:
 
 ```bash
-claude mcp add cerulion-sim -e CERULION_HARNESS_DIR="$CERULION_HARNESS_DIR" -- cerulion rcp --sim
+claude mcp add cerulion-sim -- cerulion rcp --sim
 ```
 
 Run `cerulion rcp --sim` once in a terminal before you add it this way: the first run installs the simulator
@@ -139,14 +137,15 @@ installs nothing and needs only `python3`.
 ## Where the harness lives
 
 The harness is the `harness/` folder of the Cerulion repository (see [harness/README.md](../harness/README.md)).
-The release packages do not install it: a `cerulion` of a release runs it through `CERULION_HARNESS_DIR`, and a
+Every release package installs it beside the `cerulion` binary, without its tests and development files, and a
 `cerulion` built in a checkout finds that checkout's own. `cerulion rcp --sim` and `cerulion rcp bench` find it
 in this order:
 
-1. `CERULION_HARNESS_DIR`, when set and not empty. A value that names a missing folder, or a folder that holds no
-   harness, is an error; the search never falls through to the places below.
-2. `harness/` beside the `cerulion` binary. A link to `cerulion` in a `bin` directory still reaches the folder
-   beside the real binary.
+1. `CERULION_HARNESS_DIR`, when set and not empty, to run another harness folder, such as a checkout's. A value
+   that names a missing folder, or a folder that holds no harness, is an error; the search never falls through to
+   the places below.
+2. `harness/` beside the canonicalized `cerulion` binary, where the release packages install it. A link to
+   `cerulion` in a `bin` directory still reaches the folder beside the real binary.
 3. `harness/` at the root of the Cerulion source checkout the `cerulion` binary sits in: the nearest folder above
    the binary that holds `crates/cerulion_cli/Cargo.toml`. So a `cerulion` that `cargo run` or `cargo build` made
    in a checkout finds that checkout's harness; one built into a target folder outside the checkout

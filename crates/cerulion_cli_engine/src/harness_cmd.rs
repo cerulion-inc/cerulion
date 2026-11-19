@@ -15,8 +15,8 @@
 //!    never a fall through to the rungs below.
 //! 2. `harness/` in the directory of the canonicalized running binary.
 //!    Canonicalized, so a link to `cerulion` in a `bin` directory still
-//!    reaches the folder beside the real binary. The release packages do not
-//!    install a harness there.
+//!    reaches the folder beside the real binary. Every release package
+//!    installs the harness there.
 //! 3. `harness/` at the root of the Cerulion source checkout the
 //!    canonicalized binary sits in: the nearest of the binary's directory and
 //!    the folders above it that holds [`CHECKOUT_MARKER`] ([`checkout_root`]),
