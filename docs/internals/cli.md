@@ -35,7 +35,10 @@ modes. `--duration D` bounds the run in SECONDS OF BAG TIME and is legal in both
 per-rank resim has k step axes and no shared step number, which is why there is no tick
 bound); `--record-out` shapes what the run PRODUCES and is legal in both modes
 (`resim_record_out.rs` owns the file: `create_new`, one channel per produced topic labelled
-with the schema the re-executed graph publishes, a partial file removed on any run that does not finish, and the
+with the schema the re-executed graph publishes, opened only after the whole-run checks so a refused
+bag creates none, a partial file removed on any run that does not finish, its writer abandoned first
+when the run stops before finalize (`BagWriter::abandon`, so no unfinalized-writer warning; a removal
+that fails warns), and the
 engine's `ReplayOutcome.record_out` names it in the report); `--report` and `--tolerance`
 REQUIRE `--verify`, and so does `--feed-index-budget`, the bytes a fed replay's frame
 index and the producer labels it reads are charged (`replay_feed::FeedNeed::check_budget`;
@@ -1354,7 +1357,11 @@ from the engine function the verb's own path refuses with, so its text and exit 
 are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot` and
 `service call`, and `rcp` (exit 2), and `viz --robot` (exit 1). The `rcp`
 family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connect`
-does. The hidden `pair` stub never reaches this check: `dispatch` answers it
+does. `rcp --sim` and the nested `rcp bench` (`families/nested/rcp_bench.rs`) are not
+refused, because they reach no robot and no Cerulion service, and they need an
+identity like every other `rcp` form; both run the harness launcher that
+`harness_cmd::find_harness_dir` finds and `harness_cmd::plan` spells, through
+`connect_cmd::spawn_child_and_wait`. The hidden `pair` stub never reaches this check: `dispatch` answers it
 beside the removed `ros` family, above the switch and the gate, with
 `PAIR_UNAVAILABLE_MSG` and exit 2 for every spelling, because no robot-side verb
 arms a pairing code (`SharedCodePairSessions::arm` has no caller outside tests);

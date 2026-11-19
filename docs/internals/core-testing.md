@@ -329,7 +329,7 @@ CI runs all three in the `fuzz` job (Linux, `continue-on-error`, non-blocking).
 | `liveliness_crash_iox2_test.rs` | TRUE-crash path: a SIGKILLed forked publisher's lingering port → disconnect event. | `#[serial]` tt1 | none |
 | `topic_liveness_iox2_test.rs` | The data-flow liveness observer: dating rule, baselines, cross-clock arms, epoch reset (incl. `a_lull_free_restart_dates_again_within_the_confirmation_window`), budget policy, rate estimate, degradation to UNKNOWN. | parallel | none |
 | `gateway_iox2_test.rs` | Gateway plan oracles + demand-driven egress e2e; liveness-over-egress (`*` arms); demand-plane epoch reset (`*`); rate-over-egress (`*`); slot hand-off ordering (reversing release and attach fails it); a restarted gateway's liveness reaching the latched catalog, and the host teardown dropping the earlier run's frames; a later gateway on one manager demanding its own ingress topics through the shared demand set; the rmw borrow-window gap frame forwarded byte-identical. The `TopicBridgeManager` egress posture gate itself (`enable_bridge` / `disable_bridge` / `register_topic`) is unit-tested in `transport/bridge.rs`. | parallel | none |
-| `gateway_egress_congestion_iox2_test.rs` | Gateway egress through an in-process TCP proxy that stalls the link: a reliable topic loses no frame; a full reliable send queue refuses loudly and every frame is counted; a best-effort topic drops without the drive pass waiting; an undeclared `send_queue` is as deep as the tap; demand end and LAN close discard queued frames; a stalled link does not stall a topic on another link. Each stall stays under zenoh's 5 s `wait_before_close` and asserts it. | timing fence (`threads-required = num-cpus`) | none |
+| `gateway_egress_congestion_iox2_test.rs` | Gateway egress through an in-process TCP proxy that stalls the link: a reliable topic loses no frame; a full reliable send queue refuses loudly and every frame is counted; a best-effort topic drops without the drive pass waiting; an undeclared `send_queue` is as deep as the tap; demand end and LAN close discard queued frames; a stalled link does not stall a topic on another link, whose frames go one at a time, each after the one before it arrived, so its own queue bound cannot decide the result. Each stall stays under zenoh's 5 s `wait_before_close` and asserts it. | timing fence (`threads-required = num-cpus`) | none |
 | `local_transport_test.rs` | In-process delivery between threads, deterministic oracle frames, localhost TCP gateway forwarding, cross-process refusal, loader refusal of cdylibs built without the feature (macro and legacy), and the ignored Android serving role. Run with `--features local-transport`. | `#[serial]` tt1 | `test_node_macro_cdylib`, `test_node_cdylib` (built without the feature) |
 | `cross_machine_data_plane_harness.rs` | Two-machine data-plane A/B diagnostic (env-driven roles); not run in CI. | hardware-only | none |
 | `catalog_query_warn_test.rs` | Loud once-per-robot fallback warn on an undecodable catalog reply. | `#[serial]` | none |
@@ -539,3 +539,11 @@ above.
 - `#[traced_test]` requires the `no-env-filter` feature (already on the dev-dep) or
   production-crate events are silently dropped; assert suppression-latch lines with the
   LEVEL TOKEN, not message text alone.
+- Log fields are evaluated only while a subscriber is installed. Under `cargo test` the
+  first `#[traced_test]` of a binary installs one for every later test in the process;
+  under nextest a test without `#[traced_test]` has none. A binary that moves to nextest
+  calls `cerulion_core::testing::install_nextest_trace_sink()` from its shared fixtures: a
+  TRACE subscriber writing to `io::sink`, installed only when
+  `NEXTEST_EXECUTION_MODE=process-per-test`, never replacing an existing one
+  (`TraceSinkOutcome` says which). Allocation-counting and wall-clock timing binaries do
+  not call it: the subscriber allocates and formats on every event.

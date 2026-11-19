@@ -32,6 +32,10 @@ workspace = true
 # shrink the budget the three `VerifierDecline` budget causes are measured
 # against. Unlike `seed_logged_in_at`, these ARE reached from the integration
 # tests, which is what the dev-dependency self-reference below is for.
+#
+# `login_cmd::PollWaitLog` sits behind it too: it records the device-flow poll
+# waits of a thread that opts in and sleeps 5 ms in their place, so a shipped
+# login always sleeps the interval it computed.
 test-seams = []
 # Oracle MUTANTS: env-armed seams that restore a refused behaviour so a test can
 # show its oracle catches it, among them the private replay feed's
@@ -91,11 +95,11 @@ serde_json = "1"
 cerulion_msgio = { workspace = true }
 # `cerulion bag migrate` stamps the SOURCE bag's SHA-256 into the
 # `__cerulion/migration.json` provenance attachment, so a migrated bag can be
-# checked back against the recording it descends from. `sha2 = "0.10"` is
+# checked back against the recording it descends from. `sha2` is
 # already the workspace's digest crate (cerulion_pairing, cerulion_accountd,
 # cerulion_remoted, cerud, cerulion_viz) and is already allow-listed by
 # `deny.toml` — this adds a version, not a new dependency to audit.
-sha2 = "0.10"
+sha2 = "0.11"
 # Cold-path encoding for the private robot bootstrap process boundary.
 hex = "0.4"
 regex = "1.10"
@@ -196,7 +200,7 @@ rustls = { version = "0.23", default-features = false, features = [
 ed25519-dalek = "2"
 # Generate the 32-byte device seed (0600 `~/.cerulion/desk.key`).
 # Already in the lockfile (cerulion_wireclient / cerulion_accountd use it).
-getrandom = "0.3"
+getrandom = "0.4"
 # Base64url-encode the device public key for `POST /v1/devices`
 # (matches accountd's `parse_pubkey_b64`, URL_SAFE_NO_PAD). Already locked.
 base64 = "0.22"

@@ -2768,7 +2768,7 @@ fn prc_a_slot_beyond_the_parked_mask_degrades_to_the_slice_cadence() {
     // This arm lives entirely inside the `!performed` kernel-block path, so it is
     // only distinguishable on the tier that REACHES that path. Two hosts cannot:
     //
-    //  - a HARDWARE-park machine (x86 WAITPKG, aarch64 WFE): the CPU
+    //  - a HARDWARE-park machine (x86 WAITPKG or MWAITX, aarch64 WFE): the CPU
     //    monitor performs the park, `performed == true`, and the wake-word arm
     //    never runs — so NEITHER an in-mask nor a beyond-mask slot enters the
     //    kernel block, and the counter is 0 for both by design. This is arm A of
