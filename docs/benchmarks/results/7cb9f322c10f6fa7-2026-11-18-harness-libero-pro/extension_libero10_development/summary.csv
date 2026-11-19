@@ -1,0 +1,5 @@
+list,model,arm,column_complete,finished,scored,unscored,not_finished,solved,clean,false_claims
+libero10_development,Gemini 3.8 Flash,without,1,40,40,0,0,8,6,5
+libero10_development,Gemini 3.8 Flash,with,1,40,40,0,0,24,24,7
+libero10_development,GPT-6 Astra,without,1,40,39,1,0,19,13,11
+libero10_development,GPT-6 Astra,with,1,40,40,0,0,22,21,11

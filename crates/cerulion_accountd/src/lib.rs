@@ -73,7 +73,7 @@ pub use config::{
     ServiceConfig, DEFAULT_BIND, DEFAULT_REFRESH_REUSE_WINDOW_NS, MAX_REFRESH_REUSE_WINDOW_NS,
     REFRESH_REUSE_WINDOW_ENV, SEC_NS,
 };
-pub use db::{Db, EpochRow, PreviousRotation, RevocationTarget, RobotRow};
+pub use db::{Db, EpochRow, PreviousRotation, RevocationTarget, RobotChallengeIssue, RobotRow};
 pub use device_code::{
     insert_with_collision_retry, poll_outcome, should_record_poll, AttemptOutcome,
     DeviceCodeSnapshot, DeviceCodeState, PollOutcome, RetryGiveUp,

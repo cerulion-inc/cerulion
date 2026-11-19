@@ -15,7 +15,7 @@ use cerulion_pairing::identity::{
     HighWater, IdentityLayout, KeyOrigin, MachineKey, TeamDirName, HIGH_WATER_LEN,
 };
 use cerulion_pairing::PairingError;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
 const SEED_A: [u8; 32] = [7u8; 32];
@@ -383,10 +383,10 @@ fn no_seed_bytes_reach_debug_or_error_text() {
 
 /// The documented MAC derivation, recomputed independently.
 fn oracle_tag(seed: &[u8; 32], framed: &[u8]) -> [u8; 32] {
-    let mut sub = <Hmac<Sha256> as Mac>::new_from_slice(seed).unwrap();
+    let mut sub = <Hmac<Sha256> as KeyInit>::new_from_slice(seed).unwrap();
     sub.update(b"cerulion-identity-high-water:v1");
     let subkey = sub.finalize().into_bytes();
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&subkey).unwrap();
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&subkey).unwrap();
     mac.update(framed);
     mac.finalize().into_bytes().into()
 }

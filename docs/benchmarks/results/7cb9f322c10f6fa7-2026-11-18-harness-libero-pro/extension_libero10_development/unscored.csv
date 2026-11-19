@@ -1,0 +1,2 @@
+list,cell,arm,model,attempts,reason,usd_attempts,price_date
+libero10_development,l10_t06_i02,without,GPT-6 Astra,3,"the model endpoint refused every attempt: HTTP 400, Image processing blocked due to content policy violation",15.605423,2026-11-17
