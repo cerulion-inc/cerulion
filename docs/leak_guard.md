@@ -207,6 +207,40 @@ the branch name. `media` mode parses PNG, JPEG, GIF, WebP and the MP4 and MOV fa
 for comments, EXIF, XMP, location boxes and trailing bytes; a document, archive or
 container no walker can read is a hit until an allowlist entry names it.
 
+### Co-author trailers
+
+A line that starts with `Co-authored-by:` or `Coauthored-by:` and names someone is the
+`attribution-trailer` class, hard in file contents, diffs, commit messages, pull request
+text and issues, with one exception: the trailer the forge writes when it squashes a pull
+request that more than one identity committed to. On a commit message in the scanned
+range, and on no other surface, a trailer passes when all of these hold:
+
+- it sits in the message's trailer block: the last paragraph, not the subject, with every
+  line in it a `Token: value` trailer;
+- it is spelled exactly as the forge writes it, `Co-authored-by: Name <address>`, with that
+  case, no indentation, single spaces and nothing after the closing bracket;
+- the address is a numbered forge noreply address, `<id>+<login>` or, for an app,
+  `<id>+<slug>[bot]`, at `users.noreply.github.com` and no longer domain;
+- the identity is on record. A person is on record when that exact name and address, as
+  written (no mailmap), author a commit reachable from the start of the scanned range: on
+  a pull request, the base the pull request's merge ref sits on, or the event's base when
+  that ref is stale; on the merge queue, the commit the batch is built on; on a push to
+  `main`, the previous tip. An app is on record the same
+  way, or when it authors the very commit that carries the trailer, and its name must be
+  its own login (`<slug>[bot]`).
+
+On such a line the name is judged the way an author name is: a private pattern tagged
+`@person` does not read the name, though it still reads the rest of the line, the address
+included; a `@never` entry, every other pattern and every generic class read the whole
+line. A line that reads differently in a decoded view of the text gets no exemption.
+Everything else stays a hard finding: a personal or unknown address, an identity not on
+record, a lookalike domain, a trailer outside the trailer block, and a trailer in a pull
+request title or body, a message file or an issue. The same name on any other line of the
+message is judged in full. The summary line counts the trailers let through, those on
+record with no hard finding left on their line, as `coauthors_passed=N`. The commit-msg
+hook scans a message file, so it refuses every trailer; the pull request, merge queue and
+push scans apply the rule above.
+
 ## Install the hooks
 
 ```bash
@@ -292,8 +326,16 @@ reported as `private#<index>@host` and `private#<index>@slug`. Neither value shi
 tree.
 
 The trailing tag is optional and comes from a fixed vocabulary (`@host` `@device`
-`@person` `@login` `@lan` `@nickname` `@slug` `@hygiene`, in any letter case); it
-labels a hit's category without naming anything. The grammar is strict and there is exactly one
+`@person` `@login` `@lan` `@nickname` `@slug` `@hygiene` `@never`, in any letter case); it
+labels a hit's category without naming anything. One tag also narrows where an entry
+reads: a `@person` entry does not read a commit's author or committer name, or the name in
+a co-author trailer on record (see Co-author trailers above), because that name is the
+person's own forge identity. A `@never` entry reads everywhere an untagged entry does,
+both of those names included: use it for a person who is named on no surface at all,
+their own commit identity included. No allowlist waiver can name `private@never`. Because
+`never` is also an ordinary word, it is a tag only as the whitespace separated `@never`
+suffix; spelled bare or glued after an at sign it is part of the entry, so
+`text:now or never` is a literal that ends in that word. The grammar is strict and there is exactly one
 shape per line: blank; a comment (`#` first); or one entry, `word:<literal>`,
 `text:<literal>` or `<regex>`, then optionally whitespace and the tag, then optionally
 whitespace, `#` and a comment. Anything else refuses the whole run with exit 3, naming

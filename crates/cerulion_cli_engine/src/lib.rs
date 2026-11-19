@@ -77,6 +77,8 @@ pub mod flashback_cmd;
 pub mod graph_cmd;
 pub mod graph_edit;
 pub mod graph_launch_args;
+// `cerulion graph live` / `graph fires`: a remote robot's runs and node fires.
+pub mod graph_live;
 pub mod graph_params_check;
 // The hostname-convention discovery rung (well-known robot names).
 pub mod hostname_peers;
@@ -113,6 +115,9 @@ pub mod robot_cmd;
 // cloud AccountId (asserting the cert attests THIS machine's device key). The
 // desk half of the binding the robot side enforces via `device_index`.
 pub mod device_binding;
+// Re-registers this machine's device key before its cached certificate expires.
+#[cfg(unix)]
+pub mod device_cert_renewal;
 /// Consistent local certificate chains for automatic owner access.
 pub mod owner_certificate;
 // The peer-cache discovery rung + best-effort persist to

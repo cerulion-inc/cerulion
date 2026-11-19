@@ -1006,7 +1006,7 @@ async fn ops_wire_bytes_are_cerud_be_frames_not_link_le_frames() {
             chosen_version,
             server_name,
         } => {
-            assert_eq!(chosen_version, 1);
+            assert_eq!(chosen_version, 2);
             assert_eq!(server_name, "cerulion-remoted-test");
         }
         HandshakeReply::Reject { message, .. } => {

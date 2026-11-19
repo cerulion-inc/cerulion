@@ -55,10 +55,13 @@ permissions:
 #
 #   * `pull_request`  ⇒ group = the PR number; cancel-in-progress on. A new
 #     push to the PR cancels the run for the commit it just replaced.
-#   * `merge_group`   ⇒ group = the queue's own temporary branch, which is
-#     unique per BATCH; cancel-in-progress OFF. The queue is waiting on this
+#   * `merge_group`   ⇒ group = the queue's own temporary branch, named per
+#     BATCH (and named the same again when a pull request is queued again on
+#     the same `main`); cancel-in-progress OFF. The queue is waiting on this
 #     run's verdict to decide whether to merge, so a cancelled required
-#     context reads as "not passed" forever and the batch stalls.
+#     context reads as "not passed" forever and the batch stalls. The one
+#     cancel a queue run takes is `queue-watchdog.yml`'s, once a required job
+#     has already failed the batch.
 #   * push / workflow_dispatch / schedule ⇒ group = `github.run_id`, which is
 #     unique per run, so every main commit keeps its own run, nothing is
 #     ever queued behind a sibling, and nothing is ever cancelled.
@@ -199,9 +202,14 @@ jobs:
   # table live in `tools/scripts/ci_changed_paths.sh`, and `lint` runs that
   # table.
   #
-  # PULL REQUESTS ONLY. On `push`, `merge_group` and `workflow_dispatch` there
-  # is no pull request to diff, and the classifier answers with EVERY package
-  # rather than with nothing: the queue run is the last gate before `main`.
+  # PULL REQUESTS, AND HARNESS-ONLY MERGE GROUPS. On `push` and
+  # `workflow_dispatch` the classifier answers with EVERY package rather than
+  # with nothing. On `merge_group` it diffs the group against the commit where
+  # the group leaves its target branch, so every group queued ahead of it that
+  # has not merged is in the diff, and only a group whose every changed path is
+  # under `harness/` is narrowed; any other group selects every package: the
+  # queue run is the last gate before `main`. A pull request touching
+  # `harness/` and anything else selects every package too.
   # The repository variable `CI_SELECTION` is the stop: `off`, and any value the
   # classifier does not know, selects every package on a pull request too.
   #
@@ -227,7 +235,7 @@ jobs:
       # `fetch-depth: 0` because the diff is against the base this job resolves
       # below, which a shallow checkout does not have. It is the whole cost of
       # this job, apart from the workspace resolve below.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -237,6 +245,7 @@ jobs:
         id: classify
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GROUP_BASE_REF: ${{ github.event.merge_group.base_ref }}
         run: |
           set -euo pipefail
           # THE OFF SWITCH, printed on its own line before anything reads it.
@@ -293,8 +302,26 @@ jobs:
             git diff --name-only --no-renames "$BASE...HEAD" > "$RUNNER_TEMP/changed.txt"
             echo "== changed paths =="
             cat "$RUNNER_TEMP/changed.txt"
+          elif [ "${GITHUB_EVENT_NAME}" = "merge_group" ]; then
+            # THE GROUP'S BASE: the merge base of the group and its target
+            # branch, which `fetch-depth: 0` fetched as `origin/<branch>`. The
+            # queue builds each group on the groups ahead of it, so this diff
+            # holds every pull request of this group and of every group ahead
+            # that has not merged yet. The classifier narrows a group only when
+            # every one of those paths is under `harness/`; it selects every
+            # package for any other group and for an empty list, so a base this
+            # run cannot resolve leaves the list empty and the run full rather
+            # than red.
+            if GROUP_BASE=$(git merge-base HEAD "refs/remotes/origin/${GROUP_BASE_REF#refs/heads/}"); then
+              echo "selection: base=$GROUP_BASE, where the group leaves ${GROUP_BASE_REF}"
+              git diff --name-only --no-renames "$GROUP_BASE..HEAD" > "$RUNNER_TEMP/changed.txt"
+              echo "== changed paths =="
+              cat "$RUNNER_TEMP/changed.txt"
+            else
+              echo "selection: no merge base with '${GROUP_BASE_REF}', every package is selected"
+            fi
           else
-            echo "selection: not a pull request, every package is selected"
+            echo "selection: not a pull request or a merge group, every package is selected"
           fi
           ./tools/scripts/ci_changed_paths.sh < "$RUNNER_TEMP/changed.txt" \
             > "$RUNNER_TEMP/classes.txt"
@@ -361,7 +388,7 @@ jobs:
     # compression-bound job.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -379,11 +406,19 @@ jobs:
       # script with the debug profile, so the package the smoke installs on
       # 20.04, 22.04 and 24.04 below carries programs linked the way the
       # released ones are. Writes target/x86_64-unknown-linux-gnu/debug/.
+      #
+      # WITHOUT DEBUG INFO (`CARGO_PROFILE_DEV_DEBUG=0`, this job only; the
+      # release workflow and its script are untouched). Debug info changes
+      # neither the glibc symbols the check below reads nor what the smoke
+      # runs, and it is most of the size of the four binaries, which the
+      # package step below compresses twice, once into the tarball and once
+      # into the `.deb`.
       - name: Build the four release binaries
         run: |
           docker run --rm \
             -e TARGET=x86_64-unknown-linux-gnu \
             -e CARGO_TERM_COLOR \
+            -e CARGO_PROFILE_DEV_DEBUG=0 \
             -e CERULION_BUILD_PROFILE=debug \
             -e CERULION_RELEASE_TOOLCHAIN=1.95.0 \
             -e CERULION_HOST_OWNER="$(id -u):$(id -g)" \
@@ -706,7 +741,7 @@ jobs:
       # `fetch-depth: 0` so the added-line dash gate below can diff against the
       # base it resolves. A shallow checkout does not carry it, and the gate
       # would then refuse rather than read an empty diff.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -768,6 +803,11 @@ jobs:
 
       - name: Advisory issue bookkeeping self-test
         run: ./tools/scripts/test_advisory_issue.sh
+
+      # `queue-watchdog.yml` runs on merge-queue runs only, so its decision is
+      # pinned here, on every pull request.
+      - name: Queue run watchdog self-test
+        run: ./tools/scripts/test_ci_queue_watchdog.sh
 
       # The Android e2e runs on a path filter, so the verdict it applies to the
       # direct data demand probe is pinned here, on every pull request.
@@ -930,7 +970,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1253,7 +1293,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-lint ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1274,7 +1314,7 @@ jobs:
     if: github.event_name != 'pull_request' && github.event_name != 'merge_group'
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain (+ aarch64-linux target)
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -1284,7 +1324,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1350,7 +1390,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' cross-aarch64 '))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1368,7 +1408,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install node compiler
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
@@ -1426,7 +1466,7 @@ jobs:
     if: github.event_name != 'merge_group'
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain (MSRV 1.95.0)
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -1435,7 +1475,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1477,7 +1517,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' msrv-1.95 '))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1519,7 +1559,7 @@ jobs:
       actions: write
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust target
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -1538,7 +1578,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1627,7 +1667,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), ' android-arm64 '))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1647,7 +1687,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -1656,7 +1696,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1746,6 +1786,9 @@ jobs:
       - name: local-transport remote plane host tests
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --features local-transport --test embedded_remote_plane_test -- --test-threads=1
+      - name: local-transport hosted run tests
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --features local-transport --test embedded_hosted_run_test -- --test-threads=1
 
       - name: selection marker, cerulion_core
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
@@ -1820,7 +1863,7 @@ jobs:
       # claim tests read this to tell that from a silent fallback.
       CERULION_RMW_EXPECT_BINDINGS: vendored
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free disk space
         if: >-
@@ -1847,7 +1890,7 @@ jobs:
       # other.
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1914,7 +1957,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' period-park-{0} ', runner.arch)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -1937,7 +1980,7 @@ jobs:
       # target dir, and debuginfo is dead weight for a type-check.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -1946,7 +1989,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -2083,7 +2126,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -2114,7 +2157,7 @@ jobs:
       # own target dir, and debuginfo is dead weight for a test run.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free runner disk
         if: runner.environment == 'github-hosted'
@@ -2171,7 +2214,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -2319,7 +2362,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' examples-go2-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -2415,7 +2458,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The default-cover suite compiles ~70 integration-test binaries
       # + 11 cdylib fixtures in one job — far more link output than an
@@ -2550,7 +2593,7 @@ jobs:
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -2564,7 +2607,7 @@ jobs:
 
       - name: Restore cargo (shards 1-3, no save)
         if: matrix.shard != 0
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -2620,7 +2663,7 @@ jobs:
         run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
 
       - name: Restore the pinned tool tarballs
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
@@ -3170,6 +3213,9 @@ jobs:
       - name: cerulion_android nested publish integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
         run: cargo test -p cerulion_android --test embedded_nested_publish_test -- --test-threads=1
+      - name: cerulion_android hosted run integration tests (serial)
+        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
+        run: cargo test -p cerulion_android --test embedded_hosted_run_test -- --test-threads=1
       # The `local-transport` job runs this file on the in-process transport.
       # This step runs it on the default cross-process transport.
       - name: cerulion_android subscribe and poll integration tests (serial)
@@ -3408,7 +3454,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -3490,7 +3536,7 @@ jobs:
       # the folded viz suites (E4) under the profile they ran under before.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Release installer self-test
         if: matrix.shard == 1
@@ -3623,7 +3669,7 @@ jobs:
       - name: Cache cargo, shard 0 saves (restore)
         id: cache-restore-1
         if: matrix.shard == 0
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -3637,7 +3683,7 @@ jobs:
 
       - name: Restore cargo (shards 1-2, no save)
         if: matrix.shard != 0
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -3683,7 +3729,7 @@ jobs:
         run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
 
       - name: Restore the pinned tool tarballs
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
@@ -4325,7 +4371,7 @@ jobs:
 
       - name: Upload the descriptor sampler log
         if: ${{ always() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: descriptors-macos-shard-${{ matrix.shard }}-${{ github.sha }}
           path: ${{ runner.temp }}/descriptors.log
@@ -4475,16 +4521,109 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
+  # REPEAT RUNS of three `cerulion_core` test binaries whose tests wait on
+  # counters the product exposes, on the hosted macOS runner, where thread
+  # scheduling varies most. Each binary runs 20 times in a row, so a wait that
+  # still depends on how a loaded host schedules threads shows up here as a
+  # counted failed run rather than as a one-off red on an unrelated pull
+  # request.
+  #
+  # NOT a required status context (`tools/ci/required_contexts.txt` does not
+  # name it): a red here reports a flake and blocks no merge. Pushes to `main`
+  # and `workflow_dispatch` runs run it; pull requests and merge-queue batches do
+  # not, because it would hold one more macOS runner that a pull request's own
+  # macOS test shards wait for. Restore-only cache: it reads the macOS test
+  # shards' archive and saves nothing.
+  core-repeat:
+    name: Repeat runs (cerulion_core, macOS)
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'merge_group' && github.event_name != 'pull_request' }}
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    timeout-minutes: 60
+    env:
+      # The profile the macOS test shards build with, so the restored archive
+      # is reused.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
+            cargo-${{ runner.os }}-
+
+      - name: Build the repeated test binaries
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: cargo build -p cerulion_core --test gateway_egress_congestion_iox2_test --test liveliness_sweep_iox2_test --test free_run_ctor_iox2_test
+
+      # The whole binary per run, serially: the stall tests each want the host
+      # to themselves (their nextest timing fence) and the liveliness tests
+      # share the iceoryx2 singleton. A run counts as passed only when cargo
+      # exits 0 AND libtest reports at least one passed test and none failed,
+      # so a run that executed nothing is a failure. Every run of every binary
+      # goes ahead whatever an earlier one did, and the step fails at the end
+      # on any failed run.
+      - name: Repeat each binary 20 times
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
+        run: |
+          # The step shell is `bash -e`; pipefail makes the pipe below carry
+          # cargo's exit status rather than tee's.
+          set -o pipefail
+          runs=20
+          failed=0
+          for test_binary in gateway_egress_congestion_iox2_test liveliness_sweep_iox2_test free_run_ctor_iox2_test; do
+            binary_failed=0
+            for run in $(seq 1 "$runs"); do
+              log="$RUNNER_TEMP/repeat-$test_binary-$run.log"
+              if cargo test -p cerulion_core --test "$test_binary" -- --test-threads=1 2>&1 | tee "$log" \
+                && grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$log"; then
+                echo "repeat: $test_binary run $run of $runs passed"
+              else
+                echo "repeat: $test_binary run $run of $runs FAILED"
+                binary_failed=$((binary_failed + 1))
+              fi
+            done
+            echo "repeat: $test_binary failed $binary_failed of $runs runs"
+            failed=$((failed + binary_failed))
+          done
+          [ "$failed" -eq 0 ]
+
+      - name: selection marker, cerulion_core
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_core (selected: $SELECTED)"
+
   crate-tests:
     name: Crate tests (${{ matrix.os }})
-    needs: [lint, changes]
+    needs: [changes]
     # `!cancelled()` is load bearing, and it is the only job-level condition
     # this file's coverage walk sanctions. `needs:` makes the classifier a
     # prerequisite on every event, and GitHub SKIPS a dependent when its
@@ -4494,13 +4633,10 @@ jobs:
     # `needs.changes.outputs.pkgs` is the empty string, every gated step's
     # `fromJSON('')` is an expression error, the step fails and the job reds.
     #
-    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
-    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
-    # per-dependency form, so a red `lint` no longer skips this job either. That
-    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
-    # required context and a red one still blocks the pull request, and this job
-    # reports its own result rather than being waved through as a skip. What
-    # `needs: [lint]` still buys is the ordering.
+    # NO `lint` in `needs:`: a `lint` verdict is not a data dependency for a
+    # test job, so this job starts beside `lint`, as `test-linux` and
+    # `test-macos` do. `Lint` is its own required context, and a red one still
+    # blocks the pull request.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
@@ -4521,7 +4657,7 @@ jobs:
       # a fraction of a full-debug build.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The leak guard's hook installer is written to bash 3.2 because a
       # contributor's macOS system bash is the one it will actually run
@@ -4560,7 +4696,7 @@ jobs:
       # every other job pays for. Same argument as `viz-tests`.
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -4822,13 +4958,71 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' crates-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
+  # The eye host test, run 20 times in a row on one runner, so a change that
+  # makes it fail now and then shows as a red here even when a single run
+  # passes. It runs on every event but a merge-queue batch, whose pull
+  # request ran it already. Every step past the checkout is gated on
+  # `cerulion_rcpd` being in the classifier's selection, so a pull request
+  # that selects nothing here spends one checkout. It reports no required
+  # context; the `cerulion_rcpd` step of `crate-tests` is the one a merge
+  # waits for.
+  rcpd-eye-host-repeat:
+    name: rcpd eye host test, 20 runs (ubuntu-latest)
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Install Rust toolchain
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-crates-${{ runner.os }}-main-
+            cargo-crates-${{ runner.os }}-
+
+      - name: cerulion_rcpd eye host test, 20 runs
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
+        run: |
+          set -euo pipefail
+          for run in $(seq 1 20); do
+            echo "eye host test: run $run of 20"
+            cargo test -p cerulion_rcpd --test eye_host_test
+          done
+
+      - name: selection marker, cerulion_rcpd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_rcpd (selected: $SELECTED)"
+
   # The Python client (`crates/cerulion_py`) is its own cargo workspace (root
   # `exclude`), so no other job builds it. Both legs build the abi3 wheel,
   # install it into a fresh venv and run the pytest suite from outside the
@@ -4875,7 +5069,7 @@ jobs:
       # the venv's compiled extensions (numpy).
       PYO3_PYTHON: python3
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain (1.95.0)
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -4889,7 +5083,7 @@ jobs:
       # (the `py-<os>` namespace is not in `CACHE_SAVE_NAMESPACES`).
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -4948,7 +5142,7 @@ jobs:
           export CERULION_PY_PATH
           tests="$PWD/tests"
           cd "$RUNNER_TEMP"
-          "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q
+          "$RUNNER_TEMP/pyvenv/bin/python" -m pytest -p no:cacheprovider "$tests" -q --durations=0
       # The SKIP BRANCH of the gate above, under the exact negation of its
       # condition, so the log says what the selection dropped.
       - name: selection marker, cerulion_core
@@ -4982,13 +5176,107 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' py-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             crates/cerulion_py/target
           key: cargo-py-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('crates/cerulion_py/Cargo.lock') }}
+
+  # THE HARNESS FOLDER (`harness/`): Python, shell and data that no Rust package
+  # builds, checked on Linux alone. Nothing in it compiles; the checks are
+  # shellcheck and the standard library's test runner, both on the runner image,
+  # so the job installs and fetches nothing and takes seconds.
+  #
+  # EVERY EVENT, EVERY PULL REQUEST. No `needs:`, no job condition and no step
+  # condition: the classifier narrows the Rust test steps for a harness-only
+  # change, and nothing narrows this job, so a test here that reads a path
+  # outside the folder still runs on the change that touches that path.
+  #
+  # NO FOLDER, NOTHING TO CHECK. With no tracked file under `harness/` the check
+  # step says so and passes. With one, it shellchecks every tracked `*.sh` under
+  # the folder and runs every tracked `test_*.py` under it, at any depth, one
+  # module per file, so a file no `discover` would reach (a folder without
+  # `__init__.py`) still runs. A tracked test file that holds no test fails, and
+  # so does a run that judged no script and no test. Every `git ls-files` runs as
+  # its own command, so a git failure fails the step instead of reading as an
+  # empty folder.
+  harness:
+    name: Harness (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Harness scripts and tests
+        run: |
+          set -euo pipefail
+          git ls-files -z -- harness > "$RUNNER_TEMP/harness-files.lst"
+          tracked=$(tr -cd '\0' < "$RUNNER_TEMP/harness-files.lst" | wc -c)
+          tracked=$((tracked))
+          if [ "$tracked" -eq 0 ]; then
+            echo "harness: no tracked file under harness/, nothing to check"
+            exit 0
+          fi
+          judged=0
+          git ls-files -z -- ':(glob)harness/**/*.sh' > "$RUNNER_TEMP/harness-scripts.lst"
+          scripts=$(tr -cd '\0' < "$RUNNER_TEMP/harness-scripts.lst" | wc -c)
+          scripts=$((scripts))
+          if [ "$scripts" -gt 0 ]; then
+            shellcheck --version
+            xargs -0 shellcheck -x < "$RUNNER_TEMP/harness-scripts.lst"
+            echo "harness: shellchecked ${scripts} script(s)"
+            judged=$((judged + scripts))
+          fi
+          git ls-files -z -- ':(glob)harness/**/test_*.py' > "$RUNNER_TEMP/harness-tests.lst"
+          tests=$(tr -cd '\0' < "$RUNNER_TEMP/harness-tests.lst" | wc -c)
+          tests=$((tests))
+          if [ "$tests" -gt 0 ]; then
+            python3 --version
+            # One module per tracked file, loaded by path under a name built
+            # from that path, so two files sharing a base name stay apart. The
+            # file's own folder goes on `sys.path` first, as `discover` would
+            # put it.
+            python3 -B - "$RUNNER_TEMP/harness-tests.lst" <<'PY'
+          import importlib.util
+          import os
+          import sys
+          import unittest
+
+          with open(sys.argv[1], encoding="utf-8") as listing:
+              paths = [p for p in listing.read().split("\0") if p]
+          suite = unittest.TestSuite()
+          empty = []
+          for path in paths:
+              sys.path.insert(0, os.path.dirname(os.path.abspath(path)))
+              name = path[: -len(".py")].replace("/", ".")
+              spec = importlib.util.spec_from_file_location(name, path)
+              module = importlib.util.module_from_spec(spec)
+              sys.modules[name] = module
+              spec.loader.exec_module(module)
+              found = unittest.defaultTestLoader.loadTestsFromModule(module)
+              print(f"harness: {path} holds {found.countTestCases()} test(s)")
+              if found.countTestCases() == 0:
+                  empty.append(path)
+              suite.addTests(found)
+          if empty:
+              print("::error::tracked test file(s) holding no test: " + ", ".join(empty))
+              sys.exit(1)
+          result = unittest.TextTestRunner(stream=sys.stdout, verbosity=2).run(suite)
+          if result.testsRun != suite.countTestCases():
+              print(f"::error::collected {suite.countTestCases()} test(s) and ran {result.testsRun}")
+              sys.exit(1)
+          sys.exit(0 if result.wasSuccessful() else 1)
+          PY
+            judged=$((judged + tests))
+          fi
+          if [ "$judged" -eq 0 ]; then
+            echo "::error::harness/ tracks ${tracked} file(s) and this step judged no script and no test"
+            exit 1
+          fi
 
   test-latency:
     name: Latency Threshold (Linux)
@@ -5012,7 +5300,7 @@ jobs:
     # bump made in that change). 25m = cold release build + the test's own runtime.
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -5021,7 +5309,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5147,7 +5435,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5180,7 +5468,7 @@ jobs:
     # passed). 45 restores the headroom; cutting the in-job build is a separate issue.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The fresh-tempdir cerulion_core build is large; reclaim the unused
       # preinstalled toolchains (~25 GB) on Linux before building. macOS
@@ -5198,7 +5486,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5243,7 +5531,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' release-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5270,7 +5558,7 @@ jobs:
     timeout-minutes: 15
     continue-on-error: true
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # See PINNED_NIGHTLY in the top-level env block.
       - name: Install the current nightly toolchain
@@ -5282,7 +5570,7 @@ jobs:
       # ~/.cargo/bin/cargo-fuzz skips the from-source compile entirely.
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5360,7 +5648,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' fuzz-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5383,7 +5671,7 @@ jobs:
     needs: [lint]
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Same toolchain as the fuzz job: see PINNED_NIGHTLY in the top-level
       # env block. A nightly that ships without `miri` fails HERE, before any
@@ -5399,7 +5687,7 @@ jobs:
       # entire dependency tree under the (slow) interpreter from scratch.
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5448,7 +5736,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' miri-{0} ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5464,18 +5752,9 @@ jobs:
     permissions:
       contents: read
       actions: write
-    needs: [lint]
-    # `!cancelled()` is load bearing, and it is the only job-level condition
-    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
-    # dependency fails and a skipped required context counts as SATISFIED, so
-    # without this guard a red `lint` waves the pull request through with this
-    # job's context never run. With it the job runs on its own terms and
-    # reports its own result. `Lint` is its own required context and a red one
-    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
-    # The cost is the runner minutes this job spends on a change whose lint is
-    # already red, which is what a context that reports beats a context that is
-    # waved through.
-    if: ${{ !cancelled() }}
+    # No `needs:`, so no job-level condition: this job starts beside `lint`
+    # rather than after it, and nothing it depends on can skip it. `Lint` is
+    # its own required context, and a red one still blocks the pull request.
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
     # `cargo doc --workspace` takes about twice that, and 15 became a coin flip:
@@ -5496,7 +5775,7 @@ jobs:
       # ever-growing target cache.
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Free runner disk
         if: runner.environment == 'github-hosted'
@@ -5512,7 +5791,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5560,7 +5839,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-docs ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5575,23 +5854,14 @@ jobs:
     permissions:
       contents: read
       actions: write
-    needs: [lint]
-    # `!cancelled()` is load bearing, and it is the only job-level condition
-    # this file's coverage walk sanctions. GitHub SKIPS a dependent when its
-    # dependency fails and a skipped required context counts as SATISFIED, so
-    # without this guard a red `lint` waves the pull request through with this
-    # job's context never run. With it the job runs on its own terms and
-    # reports its own result. `Lint` is its own required context and a red one
-    # still blocks the pull request; what `needs: [lint]` buys is the ordering.
-    # The cost is the runner minutes this job spends on a change whose lint is
-    # already red, which is what a context that reports beats a context that is
-    # waved through.
-    if: ${{ !cancelled() }}
+    # No `needs:`, so no job-level condition: this job starts beside `lint`
+    # rather than after it, and nothing it depends on can skip it. `Lint` is
+    # its own required context, and a red one still blocks the pull request.
     timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Reclaim preinstalled SDK bloat (crib test-linux) so the iroh tree has disk
       # headroom on the stock runner.
@@ -5616,7 +5886,7 @@ jobs:
 
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5801,16 +6071,9 @@ jobs:
   # matrix is ubuntu-only. `fail-fast: false` so one lane's failure still
   # reports the other's.
   #
-  # `needs: [lint]`. This job COMPILES
-  # the rerun SDK tree (257 crates, ~7 min measured). Gating it behind `lint` costs
-  # nothing on a healthy PR (the critical path is the ~hour-long `test-linux` /
-  # `test-macos` jobs, which are gated too). It no longer saves a runner on a red
-  # `lint`: the `!cancelled()` guard below lifts the short-circuit over the whole
-  # `needs:` set, so this job runs and reports its own result, and the dependency
-  # buys the ordering alone. NB for anyone comparing: `demos-go2`,
-  # `msrv`, `examples` and `cross-aarch64-linux` also compile source and are NOT
-  # gated — "every compile job is gated" is not the house rule; this one is
-  # gated because it is expensive AND nothing waits on its result.
+  # Not behind `lint`. This job compiles the rerun SDK tree (257 crates, ~7 min
+  # measured) and waits only for the classifier, about a minute; a `lint`
+  # verdict is not a data dependency for it.
   #
   # NOT folded into `test-linux` on purpose — and the reason is the OPPOSITE
   # of comfortable: that job keeps OUTGROWING its ceiling. (The macOS half IS
@@ -5866,16 +6129,180 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}-netd-wan ', runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-netd-wan-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
+  # The remoted rcp unit tests, the whole `rcp::tests::` module run 20 times
+  # in a row on one runner: the module's tests run in parallel and load the
+  # tokio runtime the way a busy runner does, so a test that waits on a
+  # scheduling margin fails here even when a single run passes. A run counts
+  # only when libtest reports at least one passed test and none failed. It
+  # runs on every event but a merge-queue batch, whose pull request ran it
+  # already; every step past the checkout is gated on `cerulion_remoted`
+  # being in the classifier's selection. It reports no required context; the
+  # `cerulion_remoted` step of `crate-tests` is the one a merge waits for.
+  remoted-rcp-repeat:
+    name: remoted rcp tests, 20 runs (ubuntu-latest)
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The iroh tree needs link headroom on the stock runner.
+      - name: Free disk space
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /usr/local/share/powershell \
+                      /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install Rust toolchain
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-crates-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-crates-${{ runner.os }}-main-
+            cargo-crates-${{ runner.os }}-
+
+      - name: cerulion_remoted rcp tests, 20 runs
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
+        run: |
+          set -euo pipefail
+          for run in $(seq 1 20); do
+            echo "rcp tests: run $run of 20"
+            log="$RUNNER_TEMP/rcp-run-$run.log"
+            cargo test -p cerulion_remoted --lib -- rcp::tests:: 2>&1 | tee "$log"
+            if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$log"; then
+              echo "rcp tests: run $run of 20 ran no test or failed one"
+              exit 1
+            fi
+          done
+
+      - name: selection marker, cerulion_remoted
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_remoted (selected: $SELECTED)"
+
+  # The owner pair serving transition test, run 20 times in a row on one
+  # runner, so a change that makes it fail now and then shows as a red here
+  # even when a single run passes. It runs on every event but a merge-queue
+  # batch, whose pull request ran it already. Every step past the checkout is
+  # gated on `cerulion_netd` being in the classifier's selection, so a pull
+  # request that selects nothing here spends one checkout. It restores the
+  # `test-linux` cache for the shared dependencies only (shard 0 saves it,
+  # trimmed to the units its own commands read), builds the rest itself, and
+  # saves nothing. Each run must report exactly one passed test, so a filter
+  # that matches nothing is a red rather than twenty empty passes. It reports
+  # no required context; the `cerulion_netd` step of `test-linux` shard 3 is
+  # the one a merge waits for.
+  netd-owner-pair-transition-repeat:
+    name: netd owner pair transition test, 20 runs (ubuntu-latest)
+    needs: [changes]
+    if: ${{ !cancelled() && github.event_name != 'merge_group' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # Reclaim preinstalled SDK bloat (crib netd-wan) so the restored target
+      # and the iroh tree fit on the stock runner.
+      - name: Free disk space
+        if: >-
+          runner.environment == 'github-hosted'
+          && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        run: |
+          sudo rm -rf /usr/local/lib/android \
+                      /usr/share/dotnet \
+                      /opt/ghc \
+                      /usr/local/.ghcup \
+                      /usr/local/share/powershell \
+                      /usr/share/swift \
+                      /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Install Rust toolchain
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo (restore)
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-main-
+            cargo-${{ runner.os }}-
+
+      - name: cerulion_netd owner pair transition test, 20 runs
+        if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
+        run: |
+          set -euo pipefail
+          cargo build -p cerulion_cli -p cerulion_remoted
+          for run in $(seq 1 20); do
+            echo "owner pair transition test: run $run of 20"
+            cargo test -p cerulion_netd --features wan --test wan_plane_iroh_test -- \
+              --exact owner_pair::controller::transition::serving_transition_restores_canonical_and_observer_pins_on_the_same_subscribers \
+              --test-threads=1 2>&1 | tee "$RUNNER_TEMP/run-$run.log"
+            if ! grep -Eq '^test result: ok\. 1 passed; 0 failed' "$RUNNER_TEMP/run-$run.log"; then
+              echo "owner pair transition test: run $run of 20 did not report exactly one passed test" >&2
+              exit 1
+            fi
+          done
+
+      - name: selection marker, cerulion_netd
+        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
+        env:
+          SELECTED: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          echo "selection: skipped cerulion_netd (selected: $SELECTED)"
+
   viz-tests:
     name: Viz tests (${{ matrix.lane }}, ${{ matrix.os }})
-    needs: [lint, changes]
+    needs: [changes]
     # `!cancelled()` is load bearing, and it is the only job-level condition
     # this file's coverage walk sanctions. `needs:` makes the classifier a
     # prerequisite on every event, and GitHub SKIPS a dependent when its
@@ -5885,13 +6312,10 @@ jobs:
     # `needs.changes.outputs.pkgs` is the empty string, every gated step's
     # `fromJSON('')` is an expression error, the step fails and the job reds.
     #
-    # IT LIFTS THE SHORT-CIRCUIT ON `lint` TOO. A job-level condition replaces
-    # the implicit `success()` over the WHOLE `needs:` set, and GitHub offers no
-    # per-dependency form, so a red `lint` no longer skips this job either. That
-    # direction is the acceptable one: more runs, never fewer. `Lint` is its own
-    # required context and a red one still blocks the pull request, and this job
-    # reports its own result rather than being waved through as a skip. What
-    # `needs: [lint]` still buys is the ordering.
+    # NO `lint` in `needs:`: a `lint` verdict is not a data dependency for a
+    # test job, so this job starts beside `lint`, as `test-linux` and
+    # `test-macos` do. `Lint` is its own required context, and a red one still
+    # blocks the pull request.
     if: ${{ !cancelled() }}
     strategy:
       fail-fast: false
@@ -5933,7 +6357,7 @@ jobs:
       # a failing backtrace, because it ran two files that were expected to pass.)
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Linux-only: the rerun SDK tree needs link headroom on the stock runner
       # (the demos-go2/lint ENOSPC class). macOS runners have ample disk.
@@ -6030,7 +6454,7 @@ jobs:
       # over 50 active entries in the reviewed cache inventory, and GitHub evicts by LRU + 7 days).
       - name: Cache cargo (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -6213,7 +6637,7 @@ jobs:
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' viz-{0}-{1} ', matrix.lane, runner.os)))
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -6230,7 +6654,7 @@ jobs:
     timeout-minutes: 10
     continue-on-error: true
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
@@ -6242,7 +6666,7 @@ jobs:
       # `cargo-fuzz` restore.
       - name: Cache cargo-machete (restore)
         id: cache-restore-1
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-machete
           key: cargo-machete-bin-${{ runner.os }}-v0.9.2
@@ -6281,7 +6705,7 @@ jobs:
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cargo/bin/cargo-machete
           key: cargo-machete-bin-${{ runner.os }}-v0.9.2
@@ -6304,7 +6728,7 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Tool tarball cache key
         id: tool-tarballs-key
@@ -6312,7 +6736,7 @@ jobs:
 
       - name: Cache the pinned tool tarballs (restore)
         id: cache-restore-tool-tarballs
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
@@ -6327,7 +6751,7 @@ jobs:
         if: >-
           steps.cache-restore-tool-tarballs.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
-        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
@@ -6337,7 +6761,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The pinned tool tarballs the `tool-tarballs` job verified and saved.
       # On a miss the install below downloads, as it does with no cache.
@@ -6346,7 +6770,7 @@ jobs:
         run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
 
       - name: Restore the pinned tool tarballs
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
