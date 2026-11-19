@@ -10,7 +10,7 @@ name: Nightly full run
 # and the advisory database move anyway. This run covers all three: it
 # dispatches both workflows on `main`, reruns the failed jobs of a red run once,
 # and records the result on ONE issue (`tools/scripts/nightly_full_run.sh`,
-# oracle `tools/scripts/test_nightly_full_run.sh` in the Lint job).
+# oracle `tools/scripts/test_nightly_full_run.sh` in the `lint-gates` job).
 #
 # The clock lives HERE, not in `ci.yml`: `ci.yml` reports required status
 # contexts, and a workflow that does may trigger only on the events

@@ -15,7 +15,7 @@ name: Queue run watchdog
 # `tools/ci/required_contexts.txt` and the merge queue of the base branch. It
 # cancels the run at the first failed required job, or when the commit is no
 # entry's head commit and not in the base branch on two polls in a row, and
-# stops once the run has completed; the Lint job runs its oracle.
+# stops once the run has completed; the `lint-gates` job runs its oracle.
 #
 # A file of its own, not a job of `ci.yml`: no job there takes `actions: write`
 # except to prune its cache, and this one needs it to cancel. It reports no
@@ -39,8 +39,8 @@ jobs:
     name: Cancel the queue run once its batch fails or leaves the queue
     runs-on: ubuntu-latest
     # Above the longest chain of `ci.yml` jobs (`python-client` after `lint`,
-    # 45 + 90 minutes) plus the wait for a macOS runner, so a slow run that
-    # passes is still watched to its end.
+    # which waits for `lint-clippy`: 45 + 5 + 90 minutes) plus the wait for a
+    # macOS runner, so a slow run that passes is still watched to its end.
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0

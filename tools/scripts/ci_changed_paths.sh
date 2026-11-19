@@ -771,7 +771,7 @@ $name
     esac
 
     # ---- THE EMERGENCY STOP DOES NOT BREAK THIS GATE ---------------------
-    # `lint` runs this self-test with the workflow-level environment, so the
+    # `lint-gates` runs this self-test with the workflow-level environment, so the
     # repository variable `CI_SELECTION=off` reaches it. Every arm above pins
     # the switch, and this arm proves it by running the WHOLE suite again with
     # the variable set: turning the selection off must red nothing.
