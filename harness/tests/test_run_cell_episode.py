@@ -444,6 +444,44 @@ class Interrupts(Bench):
         self.assert_nothing_left()
         self.assertEqual(len(self.end.seen), 2)   # the episode had run to its end
 
+    def test_a_first_signal_on_the_way_out_of_an_error_still_removes_the_scratch_folder(self):
+        os.environ["FAKE_DRIVER_MODE"] = "episode"
+        hold, calls = cli.Signals.hold, []
+
+        def first_hold_raises(signals):
+            if not calls:
+                calls.append(signal.SIGTERM)
+                signals.seen = signal.SIGTERM
+                raise cli.Interrupted(signal.SIGTERM)
+            hold(signals)
+
+        with mock.patch.object(cli.Signals, "hold", first_hold_raises), \
+                mock.patch.object(cli, "read_result", side_effect=RuntimeError("disk")):
+            with self.assertRaises(RuntimeError):   # the error goes on to the caller
+                self.run_cell("--arm", "plain")
+        self.assertEqual(calls, [signal.SIGTERM])
+        self.assert_nothing_left()
+        self.assertTrue(self.stderr.getvalue().startswith(f"{T} stopped by SIGTERM: "), self.stderr.getvalue())
+
+    def test_an_interrupt_while_summary_json_is_written_leaves_it_whole(self):
+        # The first write of summary.json breaks off part way, as a signal there would: the file that is left is
+        # the whole record of the interrupt.
+        dump, calls = cli.json.dump, []
+
+        def dump_breaks_off(record, f, **kw):
+            if not calls:
+                calls.append(1)
+                f.write('{"cell": ')
+                raise cli.Interrupted(signal.SIGINT)
+            dump(record, f, **kw)
+
+        os.environ["FAKE_DRIVER_MODE"] = "episode"
+        with mock.patch.object(cli.json, "dump", dump_breaks_off):
+            self.assertEqual(self.run_cell("--arm", "plain"), 130)
+        self.assertEqual((self.summary()["interrupted"], self.summary()["rows"]), ("SIGINT", []))
+        self.assertEqual(sorted(os.listdir("out")), ["cell.txt", "summary.json"])
+        self.assertEqual(self.end.seen, [])
+
     def test_a_signal_before_any_episode_starts(self):
         with mock.patch.object(layout, "plain_tree", side_effect=cli.Interrupted(signal.SIGINT)):
             self.assertEqual(self.run_cell("--arm", "plain"), 130)

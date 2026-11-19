@@ -227,8 +227,12 @@ def endpoint_refusal(ns):
     url = url if url.endswith("/chat/completions") else url + "/chat/completions"
     key = os.environ[ns.key_env]
     body = {"model": ns.model, "messages": [{"role": "user", "content": "Reply with the word ok."}]}
-    # Merged in as the operator merges it into every request: the test request carries what each episode request does.
-    body.update(json.loads(ns.extra_body) if ns.extra_body is not None else {})
+    # Merged in as the operator merges it into every request body: a key whose value is null is dropped.
+    for name, value in (json.loads(ns.extra_body) if ns.extra_body is not None else {}).items():
+        if value is None:
+            body.pop(name, None)
+        else:
+            body[name] = value
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
     local = any(h in url.split("/")[2] for h in ("127.0.0.1", "localhost", "[::1]")) if "://" in url else False
@@ -502,7 +506,10 @@ def cmd_run_cell(ns):
             interrupted = exc.signum
             code = 128 + exc.signum
         finally:
-            signals.hold()
+            try:
+                signals.hold()
+            except Interrupted as exc:   # a first signal on the way out of an error: no other one raises now
+                interrupted = exc.signum
             if own_work and ns.work:
                 shutil.rmtree(ns.work, ignore_errors=True)
             if interrupted is not None:

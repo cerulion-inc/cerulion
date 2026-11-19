@@ -200,6 +200,10 @@ class Endpoint(unittest.TestCase):
         self.seen.clear()
         self.assertIsNone(cli.endpoint_refusal(self.ns()))   # none set: the model and the message only
         self.assertEqual(sorted(self.seen[0][2]), ["messages", "model"])
+        self.seen.clear()
+        ns.extra_body = '{"reasoning_effort": null, "provider": {"only": ["google-vertex"]}}'
+        self.assertIsNone(cli.endpoint_refusal(ns))   # null drops its key, as in the operator's bodies
+        self.assertEqual(sorted(self.seen[0][2]), ["messages", "model", "provider"])
 
     def test_a_url_that_already_names_the_route_is_used_as_it_is(self):
         self.assertIsNone(cli.endpoint_refusal(self.ns(self.url + "/chat/completions/")))

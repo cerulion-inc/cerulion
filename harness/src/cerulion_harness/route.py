@@ -48,6 +48,7 @@ import http.server
 import ipaddress
 import json
 import os
+import re
 import selectors
 import signal
 import threading
@@ -189,17 +190,14 @@ def with_blocks(body, blocks):
                 break
     if not given:
         return body, 0
-    try:
-        return json.dumps(doc).encode("utf-8"), given
-    except RecursionError:
-        return body, 0
+    return json.dumps(doc).encode("utf-8"), given
 
 
 def content_length(headers):
     """The length of a request's body, or None when it names no Content-Length, names one that is not a count,
     or sends its body in chunks."""
     text = headers.get("Content-Length")
-    if headers.get("Transfer-Encoding") is not None or text is None or not text.strip().isdigit():
+    if headers.get("Transfer-Encoding") is not None or text is None or not re.fullmatch(r"[0-9]+", text.strip()):
         return None
     return int(text)
 
@@ -231,25 +229,24 @@ class Relay:
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
-                length = content_length(self.headers)
-                if length is None:   # its body cannot be read whole: nothing is sent on
-                    self._answer(411, {"Content-Type": "text/plain"}, b"the relay takes a body with a "
-                                                                      b"Content-Length only\n")
-                    return
-                data = self.rfile.read(length) if length > 0 else b""
-                if not self.path.split("?")[0].rstrip("/").endswith("/chat/completions"):
-                    self._answer(404, {"Content-Type": "text/plain"}, b"not found\n")
-                    return
                 try:
-                    answer = relay.exchange(data, dict(self.headers.items()))
+                    answer = self._exchange()
                 except Exception as exc:   # a fault of the relay itself: answered and counted, never a silent close
                     with relay._lock:
                         relay.counts["relay_errors"] += 1
-                    self._answer(502, {"Content-Type": "text/plain"},
-                                 f"the relay could not pass this request on ({type(exc).__name__})\n".encode())
-                    return
+                    answer = (502, {"Content-Type": "text/plain"},
+                              f"the relay could not pass this request on ({type(exc).__name__})\n".encode())
                 if answer is not None:   # else the connection closes unanswered, as the endpoint's would have
                     self._answer(*answer)
+
+            def _exchange(self):
+                length = content_length(self.headers)
+                if length is None:   # its body cannot be read whole: nothing is sent on
+                    return 411, {"Content-Type": "text/plain"}, b"the relay takes a body with a Content-Length only\n"
+                data = self.rfile.read(length) if length > 0 else b""
+                if not self.path.split("?")[0].rstrip("/").endswith("/chat/completions"):
+                    return 404, {"Content-Type": "text/plain"}, b"not found\n"
+                return relay.exchange(data, dict(self.headers.items()))
 
             def _answer(self, status, headers, body):
                 try:
@@ -267,8 +264,8 @@ class Relay:
 
         self._server = _QuietServer(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
-        # handle_request() waits this long for a connection the outer select saw: one that went away meanwhile
-        # must not keep _serve() from seeing close().
+        # handle_request() waits this long for a connection the outer select saw, so one that went away before its
+        # own select does not keep _serve() from seeing close().
         self._server.timeout = 0
         self._wake = os.pipe()
         self._thread = None
@@ -333,7 +330,7 @@ class Relay:
                 body = exc.read()
             except (OSError, http.client.HTTPException):
                 body = b""
-        except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError):
+        except (urllib.error.URLError, OSError, http.client.HTTPException):
             with self._lock:
                 self.counts["not_reached"] += 1
             return None

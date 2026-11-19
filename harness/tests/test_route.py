@@ -474,12 +474,16 @@ class RelayExchange(unittest.TestCase):
         with route.Relay(end.url + "/v1") as relay:
             for name, headers, body in (("no Content-Length", {}, None),
                                         ("one that is not a count", {"Content-Length": "12x"}, None),
-                                        ("a chunked body", {"Transfer-Encoding": "chunked"}, iter([TURN_1]))):
+                                        ("a digit that is not 0 to 9", {"Content-Length": "\u00b2"}, None),
+                                        ("a chunked body", {"Transfer-Encoding": "chunked"}, TURN_1),
+                                        ("a chunked body that also names a length",
+                                         {"Content-Length": str(len(TURN_1)), "Transfer-Encoding": "chunked"},
+                                         TURN_1)):
                 with self.subTest(name):
                     conn = http.client.HTTPConnection(urllib.parse.urlparse(relay.base_url).netloc, timeout=30)
                     conn.putrequest("POST", "/v1/chat/completions", skip_accept_encoding=True)
                     for key, value in dict(headers, Authorization="Bearer " + KEY).items():
-                        conn.putheader(key, value)
+                        conn.putheader(key, value.encode("latin-1"))
                     conn.endheaders()
                     if body is not None:
                         conn.send(b"%x\r\n%s\r\n0\r\n\r\n" % (len(TURN_1), TURN_1))
