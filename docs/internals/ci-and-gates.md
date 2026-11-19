@@ -540,13 +540,18 @@ script refuses `--with` on shard 0, which carries `--lib`, and an extra package 
 a test attribute, a doctest source or a test target outside `tests/*.rs` (see `check_extra`
 in the script), or a `tests/*.rs` named like one of `cerulion_core`'s; each suite's
 compile-pass programs are binaries of its package, which cargo builds for an integration
-test even when targets are named. Their dev-dependencies ask for `test-helpers` on
-`cerulion_core` and `native_ros2_messages`, which `cerulion_core`'s own test build already
-turns on, so every unit the shard compiles for the core tests keeps its features. The
-shard builds `test_node_macro_cdylib`'s library only as a dependency of its test, and cargo
-copies a library's cdylib into `target/debug` only for a library named on the command
-line, so the fixture the shard's core tests load from there is still the workspace
-build's. The
+test even when targets are named. `node_macro_ui`'s dev-dependencies ask for
+`test-helpers` on `cerulion_core` and `native_ros2_messages` and `test_node_macro_cdylib`'s
+for `trybuild` alone, all of which `cerulion_core`'s own test build already turns on, so
+every unit the shard compiles for the core tests keeps its features (the shard-2 unit
+graphs at both counts, with and without the two packages, agree on every unit they share).
+`test_node_macro_cdylib`'s programs build in every build of that package too, so a build
+without dev-dependencies, the workspace build among them, compiles them without
+`cerulion_core`'s `test-helpers`. Cargo copies a cdylib into
+`target/debug` only when the command asks for its library, as `cargo build -p` and
+`--workspace` do, not when it builds the library as a dependency of a test; so during a
+shard run the fixture the core tests load from there is the one the leg's workspace build
+left. The
 selection is read for each package on its own and the script prints a `selection:` line
 for each package it leaves out. In CI every selection that names a package names
 `cerulion_core`, which observes the whole tree, so the step sees `[]` (every package skips)

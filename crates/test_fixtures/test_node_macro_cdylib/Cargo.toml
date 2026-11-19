@@ -23,22 +23,18 @@ workspace = true
 
 [dev-dependencies]
 trybuild = "1"
-# Turns on `cerulion_core/test-helpers` in each test build of this package,
-# which the context-helper programs below require; a build that compiles no
-# test of this package, the workspace build among them, skips them. The
-# cerulion_core shard on shard 2 builds this package's tests with core's own
-# test features, which carry the same feature.
-cerulion_core = { path = "../../cerulion_core", features = ["test-helpers"] }
 
-# The context-helper programs, as binaries. Cargo builds a package's binaries
+# The context-helper programs, as binaries, with the default `cdylib` feature
+# and no `cfg(test)`. Every build of this package compiles them: `cargo build
+# -p test_node_macro_cdylib` resolves only the features this package asks
+# for, as a downstream build does, and no build without dev-dependencies turns
+# on cerulion_core's `test-helpers`. Cargo also builds a package's binaries
 # for each of its integration tests, in the same invocation and with the same
-# features, with the default `cdylib` feature and no `cfg(test)`, as a
-# downstream `cargo build` compiles them, and `tests/context_helpers.rs` runs
-# each one through `CARGO_BIN_EXE_<name>`.
+# features (on shard 2, cerulion_core's test features), and
+# `tests/context_helpers.rs` runs each one through `CARGO_BIN_EXE_<name>`.
 [[bin]]
 name = "pass_annotated_context_helper"
 path = "tests/ui/annotated_context_helper.rs"
-required-features = ["cerulion_core/test-helpers"]
 test = false
 bench = false
 doc = false
@@ -46,7 +42,6 @@ doc = false
 [[bin]]
 name = "pass_data_only_helpers"
 path = "tests/ui/data_only_helpers.rs"
-required-features = ["cerulion_core/test-helpers"]
 test = false
 bench = false
 doc = false
@@ -54,7 +49,6 @@ doc = false
 [[bin]]
 name = "pass_qualified_context_helper"
 path = "tests/ui/qualified_context_helper.rs"
-required-features = ["cerulion_core/test-helpers"]
 test = false
 bench = false
 doc = false

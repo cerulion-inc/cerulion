@@ -180,17 +180,15 @@ priority = 100
 # diagnostics suite before the helper suite by binary order), then the rest
 # beside them.
 #
-# ONE AT A TIME, in the `trybuild` group. Both suites build in one trybuild
-# directory, `target/tests/trybuild`, and each run re-checks its own fixtures
-# when the other suite has run there since: run alone after each other, the
-# diagnostics suite took 2.1 s twice in a row and 44.6 s right after the
-# helper suite, which took 1.4 s after itself and 45.3 s right after the
-# diagnostics suite. Run at the same time they took 221.1 and 176.6 s. A
-# group holds back only its own members, so the core tests keep running
-# beside whichever suite runs; the helper binary's two quick tests wait with
-# it. Each claims one slot, so it fences nothing, and `slow-timeout` below
-# reports it without ending it. A test in `cli_engine`'s coverage suite holds
-# every `binary_id` here to a real test file.
+# ONE AT A TIME, in the `trybuild` group of one slot. Both suites build in
+# one trybuild directory, `target/tests/trybuild`, and each run re-checks its
+# own fixtures when the other suite has run there since, so run at the same
+# time they redo each other's work. The group holds back only its own
+# members, so the core tests keep running beside whichever suite runs; the
+# helper binary's two quick tests wait with it. Each claims one slot and
+# fences nothing outside the group, and `slow-timeout` below reports it
+# without ending it. A test in `cli_engine`'s coverage suite holds every
+# `binary_id` here to a real test file.
 # ---------------------------------------------------------------------------
 [[profile.default.overrides]]
 filter = 'binary_id(=node_macro_ui::compile_fail) | binary_id(=test_node_macro_cdylib::context_helpers)'

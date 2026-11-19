@@ -58,9 +58,11 @@
 #
 # THE EXTRAS' FEATURES ARE MEASURED, NOT GATED. Building an extra in this
 # invocation unions its dev-dependency features into this package's test
-# build. For `node_macro_ui` that union adds nothing: its dev-dependencies ask
-# for `test-helpers` on `cerulion_core` and `native_ros2_messages`, which
-# `cerulion_core`'s own test build already turns on. To check it again after
+# build. For the two shipped extras that union adds nothing: `node_macro_ui`'s
+# dev-dependencies ask for `test-helpers` on `cerulion_core` and
+# `native_ros2_messages`, which `cerulion_core`'s own test build already turns
+# on, and `test_node_macro_cdylib`'s for `trybuild` alone, which that build
+# carries too. To check it again after
 # an extra's manifest changes, compare two unit graphs of the shard-2 build,
 # `cargo test --no-run $(ci_test_shard.sh --list cerulion_core 2 4) --unit-graph
 # -Z unstable-options` with and without `--with <extra>` inside the `$( )`
