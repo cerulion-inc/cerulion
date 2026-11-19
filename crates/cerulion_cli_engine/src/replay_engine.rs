@@ -5490,16 +5490,6 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // `RankBoundarySummary::first_target_ns`'s own doc says the
     // epochs share a DOMAIN, not a VALUE.
     let run_epoch_ns = crate::replay_rank::run_epoch_ns(&boundary_summaries);
-    // `--record-out`: the sink every rank's captures write into. Opened once,
-    // before any pass, so a path that cannot be created fails the run up front.
-    // An unfinalized sink removes its file when dropped (an abort, an error).
-    let record_out = match record_out {
-        Some(plan) => Some(Arc::new(crate::resim_record_out::RecordOut::open(
-            plan,
-            &classes.produced,
-        )?)),
-        None => None,
-    };
 
     // The loop has NO `?`. Each of its fallible seams
     // `break`s out with the failing rank and its error instead, so the
@@ -5549,6 +5539,18 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 e.detail
             ),
         })?;
+    // `--record-out`: the sink every rank's captures write into. Opened once,
+    // after the whole-run checks above and before any pass, so a bag those
+    // checks refuse creates no file, and a path that cannot be created fails
+    // the run before rank 0 runs a step. An unfinalized sink abandons its
+    // writer and removes its file when dropped (an abort, an error).
+    let record_out = match record_out {
+        Some(plan) => Some(Arc::new(crate::resim_record_out::RecordOut::open(
+            plan,
+            &classes.produced,
+        )?)),
+        None => None,
+    };
 
     let aborted: Option<(u32, ReplayError)> = 'passes: {
         for (pass_idx, plan) in plans.iter().enumerate() {

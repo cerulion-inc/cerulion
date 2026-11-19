@@ -1293,9 +1293,9 @@ fn apply_epoch_rejects_a_rolled_back_clock() {
 // ---- test-hardening 8: tag-region flip + valid-HMAC structural arms --------
 
 fn tag_hmac(key: &[u8], framed: &[u8]) -> [u8; 32] {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
-    let mut m = <Hmac<Sha256> as Mac>::new_from_slice(key).unwrap();
+    let mut m = <Hmac<Sha256> as KeyInit>::new_from_slice(key).unwrap();
     m.update(framed);
     m.finalize().into_bytes().into()
 }
