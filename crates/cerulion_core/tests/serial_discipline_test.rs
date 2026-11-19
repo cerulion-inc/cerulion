@@ -605,6 +605,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point reporting the probe's env-resolved settings to its parent",
     ),
     (
+        "env_snapshot_isolation_test.rs",
+        "subprocess_child_builds_a_graph_and_prints_what_its_node_reads",
+        "child",
+        "self-re-exec entry point; a name or value that is not valid UTF-8 is set only in the child's environment, and the parent reads what its node read, what its builds left out and what it logged",
+    ),
+    (
         "reg_channel_iox2_test.rs",
         "subprocess_child_pump_panic_storm_probe",
         "child",

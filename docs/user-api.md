@@ -1554,7 +1554,9 @@ each a contract the runtime holds you to:
   carries an empty snapshot, so every key returns its default rather than
   quietly reading the real environment.
 
-Nodes therefore read the configuration their own run started with. A resim
+Nodes therefore read the configuration their own run started with. A
+variable whose name or value is not valid UTF-8 is not in the snapshot, so
+`ctx.env` and `ctx.env_str` return the default for it. A resim
 does not restore the recording's environment: its nodes read the environment of
 the shell the resim runs in. The resim compares that environment with the record
 the bag carries, warns by name about each differing variable that can change the

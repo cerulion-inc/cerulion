@@ -5706,6 +5706,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 Ok(runtime) => runtime,
                 Err(e) => break 'passes Some((rank, e)),
             };
+            // The resim owns its run and builds every pass in this one process
+            // from the same environment, so it reports what the first pass's
+            // build left out of the nodes' environment, once.
+            if pass_idx == 0 {
+                runtime.node_env_left_out().warn();
+            }
             if let Some(onset) = catchup_onset {
                 runtime.attach_replay_catchup_arm(onset);
             }

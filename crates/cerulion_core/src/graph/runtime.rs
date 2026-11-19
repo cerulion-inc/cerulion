@@ -19,6 +19,7 @@
 //! capable). It requires a caller-owned `TransportManager`.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -4528,6 +4529,9 @@ pub struct GraphRuntime {
     /// Every native node's params as this build resolved them, keyed by node
     /// id: what [`Self::param_differences`] compares a recording against.
     params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce>,
+    /// The variables this build left out of its nodes' environment snapshot:
+    /// what [`Self::node_env_left_out`] returns.
+    node_env_left_out: NodeEnvLeftOut,
     /// Sticky inert-at-launch refusal.
     /// Once [`Self::collect_external_sources`] refuses the live run because one
     /// or more external nodes are provably inert (host-driven / no-source /
@@ -6124,8 +6128,15 @@ impl GraphRuntime {
         // Capture live env once at
         // build time so per-tick `ctx.env(...)` is replay-deterministic
         // (Principle #7). Wrapped in Arc so all NodeContexts in the
-        // graph share one allocation.
-        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
+        // graph share one allocation. A variable whose name or value is not
+        // valid UTF-8 is left out of the snapshot and its name is kept on the
+        // runtime (`node_env_left_out`). The build logs nothing about it: the
+        // process that owns the run reports it once.
+        let NodeEnvCapture {
+            snapshot,
+            left_out: node_env_left_out,
+        } = capture_node_env(std::env::vars_os());
+        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(snapshot);
         let mut handles = IndexMap::new();
         let mut topology_nodes = Vec::with_capacity(config.nodes.len());
         let fire_tap: Arc<OnceLock<FireInstall>> = Arc::new(OnceLock::new());
@@ -10696,6 +10707,7 @@ impl GraphRuntime {
             external_bindings: Vec::new(),
             external_sources_collected: false,
             params_in_force,
+            node_env_left_out,
             // No refusal yet; set the first time
             // `collect_external_sources` rejects a self-source-less external node.
             external_refusal: None,
@@ -17435,6 +17447,16 @@ impl GraphRuntime {
         self.tick_panic_records.clone()
     }
 
+    /// The variables this build left out of the environment snapshot its
+    /// nodes read (`ctx.env`, `ctx.env_str`, `ctx.env_opt`), because a name
+    /// or a value is not valid UTF-8.
+    ///
+    /// The build logs nothing about them. The process that owns the run
+    /// reports them once with [`NodeEnvLeftOut::warn`].
+    pub fn node_env_left_out(&self) -> &NodeEnvLeftOut {
+        &self.node_env_left_out
+    }
+
     /// Every node stopped by a `NodeError::Fatal` from its tick during this
     /// runtime's life, in graph order: `(node_id, the fatal error's message)`.
     ///
@@ -21346,6 +21368,256 @@ fn validate_no_silent_data_trigger(
             trigger_inputs.join(", ")
         ),
     })
+}
+
+/// The process environment as the nodes of one graph read it, split by
+/// [`capture_node_env`].
+struct NodeEnvCapture {
+    /// Every variable whose name and value are both valid UTF-8: the map that
+    /// `ctx.env`, `ctx.env_str` and `ctx.env_opt` read for the whole run.
+    snapshot: HashMap<String, String>,
+    /// Every variable left out of `snapshot` because its name or its value is
+    /// not valid UTF-8.
+    left_out: NodeEnvLeftOut,
+}
+
+/// The variables a graph build left out of the environment snapshot its nodes
+/// read, because a name or a value is not valid UTF-8. A node reads the
+/// default for each of them.
+///
+/// Each build records one ([`GraphRuntime::node_env_left_out`]) and logs
+/// nothing. The process that owns the run calls [`Self::warn`] once, for one
+/// of its builds: a single-process run for its build, the supervisor of a
+/// multi-process run for its planning build, a resim for its first pass. The
+/// workers and the other passes read the same environment and report nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEnvLeftOut {
+    /// Sorted by bytes, each name once.
+    names: Vec<OsString>,
+}
+
+impl NodeEnvLeftOut {
+    /// The name of each variable left out, sorted by bytes, each once.
+    pub fn names(&self) -> &[OsString] {
+        &self.names
+    }
+
+    /// Warn once, naming each variable left out, or do nothing when none was.
+    ///
+    /// The message is constant. The names ride the `names` field, where each
+    /// byte that is not valid UTF-8 prints escaped (`CER_\xFF`). No value is
+    /// printed, because a value may be a secret.
+    pub fn warn(&self) {
+        if self.names.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            names = ?self.names,
+            "node environment: variables whose name or value is not valid UTF-8 are left out, \
+             so ctx.env and ctx.env_str return the default for them"
+        );
+    }
+}
+
+/// Split `vars` into the snapshot the nodes read and the names left out of it.
+///
+/// A variable is kept only when both its name and its value are valid UTF-8,
+/// the case in which `std::env::var` returns its value, so a node reads the
+/// default for any other variable. The split is infallible: no name or value
+/// can fail the build, where `std::env::vars()` panics on the first variable
+/// that is not valid UTF-8.
+// hot-path-alloc-ok-fn: cold: graph BUILD, once per GraphRuntime, before the first step
+fn capture_node_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> NodeEnvCapture {
+    let mut snapshot = HashMap::new();
+    let mut left_out = Vec::new();
+    for (name, value) in vars {
+        match (name.into_string(), value.into_string()) {
+            (Ok(name), Ok(value)) => {
+                snapshot.insert(name, value);
+            }
+            (Ok(name), Err(_)) => left_out.push(OsString::from(name)),
+            (Err(name), _) => left_out.push(name),
+        }
+    }
+    left_out.sort();
+    left_out.dedup();
+    NodeEnvCapture {
+        snapshot,
+        left_out: NodeEnvLeftOut { names: left_out },
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod node_env_capture_tests {
+    //! Hand-written oracles for [`capture_node_env`] and
+    //! [`NodeEnvLeftOut::warn`]. Each input is the `(name, value)` list an
+    //! environment yields, built from raw bytes, so a name or value that is not
+    //! valid UTF-8 never enters this process's own environment. The build-level
+    //! arms, which run a real graph build in a child process, are in
+    //! `tests/env_snapshot_isolation_test.rs`.
+    use super::{capture_node_env, NodeEnvCapture};
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use tracing_test::traced_test;
+
+    fn os(bytes: &[u8]) -> OsString {
+        OsStr::from_bytes(bytes).to_os_string()
+    }
+
+    fn var(name: &[u8], value: &[u8]) -> (OsString, OsString) {
+        (os(name), os(value))
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The warning text, typed out by hand rather than shared with the code.
+    const WARNING: &str = "node environment: variables whose name or value is not valid UTF-8 \
+                           are left out, so ctx.env and ctx.env_str return the default for them";
+
+    #[test]
+    fn node_env_capture_of_a_utf8_environment_keeps_every_pair_and_leaves_nothing_out() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_A", b"1"),
+            var(b"CER_B", b"two"),
+            var(b"PATH", b"/usr/bin:/bin"),
+        ]);
+        assert_eq!(
+            snapshot,
+            map(&[("CER_A", "1"), ("CER_B", "two"), ("PATH", "/usr/bin:/bin")])
+        );
+        assert!(
+            left_out.names().is_empty(),
+            "nothing is left out: {left_out:?}"
+        );
+    }
+
+    #[test]
+    fn node_env_capture_of_an_empty_environment_is_empty() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `caf\xc3\xa9` is "café" in UTF-8, a two-byte sequence the split must
+    /// not mistake for invalid bytes; an empty value is still a value.
+    #[test]
+    fn node_env_capture_keeps_a_multibyte_utf8_value_and_an_empty_value() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_LAYOUT", b"caf\xc3\xa9"), var(b"CER_EMPTY", b"")]);
+        assert_eq!(snapshot, map(&[("CER_LAYOUT", "café"), ("CER_EMPTY", "")]));
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `\xff\xfe` is never UTF-8, and `caf\xe9` is "café" in Latin-1, where
+    /// `\xe9` starts a three-byte UTF-8 sequence that never finishes. Each is
+    /// left out by name; the UTF-8 neighbour is kept.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_value_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_LATIN1", b"caf\xe9"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_LATIN1"), os(b"CER_X")]);
+    }
+
+    /// A name that is not valid UTF-8 is left out whole: no lossy key such as
+    /// `CER_\u{FFFD}` appears in the snapshot.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_name_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_\xff", b"v"), var(b"CER_KEPT", b"kept")]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_\xff")]);
+    }
+
+    /// The left-out names come back in byte order, each once, whatever order
+    /// and however often the environment yields them.
+    #[test]
+    fn node_env_capture_names_each_left_out_variable_once_in_byte_order() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_Z", b"\xff"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_A", b"\xfe"),
+            var(b"CER_Z", b"\xff"),
+        ]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert_eq!(
+            left_out.names(),
+            [os(b"CER_A"), os(b"CER_Z"), os(b"CER_\xff")]
+        );
+    }
+
+    /// Two splits of one environment, in opposite orders, both equal the same
+    /// hand-written oracle.
+    #[test]
+    fn node_env_capture_is_identical_for_reversed_input() {
+        let vars = vec![
+            var(b"CER_KEPT", b"kept"),
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_LAYOUT", b"caf\xc3\xa9"),
+        ];
+        let reversed: Vec<_> = vars.iter().rev().cloned().collect();
+        for input in [vars, reversed] {
+            let NodeEnvCapture { snapshot, left_out } = capture_node_env(input);
+            assert_eq!(
+                snapshot,
+                map(&[("CER_KEPT", "kept"), ("CER_LAYOUT", "café")])
+            );
+            assert_eq!(left_out.names(), [os(b"CER_X"), os(b"CER_\xff")]);
+        }
+    }
+
+    /// The warning names every left-out variable, with its invalid byte
+    /// escaped, and carries no value: neither the secret-named one that is not
+    /// UTF-8 nor the plain value of a name that is not.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_names_every_left_out_variable_and_no_value() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([
+            var(b"CER_TOKEN", b"\xffhunter2"),
+            var(b"CER_\xff", b"plainvalue"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        left_out.warn();
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains(WARNING))
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [line]
+                    if line.contains(" WARN ")
+                        && line.contains(r#"names=["CER_TOKEN", "CER_\xFF"]"#) =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("one WARN line naming both variables: {other:#?}")),
+            }
+        });
+        for absent in ["hunter2", "plainvalue", "CER_KEPT"] {
+            assert!(!logs_contain(absent), "the warning never carries {absent}");
+        }
+    }
+
+    /// The control: nothing left out, nothing printed.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_is_silent_when_nothing_is_left_out() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([var(b"CER_KEPT", b"kept")]);
+        left_out.warn();
+        assert!(!logs_contain("node environment"));
+    }
 }
 
 #[cfg(test)]
