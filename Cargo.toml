@@ -83,6 +83,14 @@ members = [
     "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",
     # Oracle-vector fixture for raw-FFI template emit.
     "crates/test_fixtures/test_node_raw_ffi_template_cdylib",
+    # The two nodes graph_start_order_e2e_test scaffolds with `node create` and
+    # `node modify`, prebuilt: a period producer with one Vector3 output and a
+    # period consumer with one plain Vector3 input. Each lib.rs is the scaffold's
+    # bytes and each manifest is the scaffold's with the package renamed, kept off
+    # crates.io and inheriting the lint table; the test compares both against a
+    # live scaffold before `graph run` loads the libraries.
+    "crates/test_fixtures/test_node_start_order_prod_cdylib",
+    "crates/test_fixtures/test_node_start_order_cons_cdylib",
     "crates/test_fixtures/test_node_unknown_schema_cdylib",
     # Variable-schema spill round-trip across FFI.
     "crates/test_fixtures/test_node_macro_overflow_cdylib",
