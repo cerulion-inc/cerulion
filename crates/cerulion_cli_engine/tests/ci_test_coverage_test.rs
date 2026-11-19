@@ -5566,9 +5566,11 @@ fn the_jobs_a_required_job_needs_are_found_through_every_chain() {
 const LINT_PARTS: &[&str] = &["lint-clippy", "lint-fmt", "lint-gates"];
 
 /// `Lint` is an aggregator: it needs every part, runs when one failed, and its
-/// one step fails unless every part SUCCEEDED. The step's script is run here
-/// over each result a part can carry, so a check that read `skipped` or
-/// `cancelled` as passing, or that a part could leave, is a red.
+/// one step fails unless every part SUCCEEDED. The step hands each part's
+/// result to its script as one environment variable, and the script is run
+/// here with bash alone over each result a part can carry, so a check that
+/// read `skipped` or `cancelled` as passing, ignored a part, or passed a part
+/// missing from `needs` (an empty result) is a red.
 #[cfg(unix)]
 #[test]
 fn the_lint_aggregator_fails_unless_every_part_succeeded() {
@@ -5602,14 +5604,33 @@ fn the_lint_aggregator_fails_unless_every_part_succeeded() {
             "`{part}` must carry no job condition and no needs, so it runs on every event"
         );
     }
-    let jq = std::process::Command::new("jq").arg("--version").output();
-    assert!(
-        matches!(&jq, Ok(out) if out.status.success()),
-        "the aggregator's check reads `needs` with `jq`, and `jq` is not on PATH \
-         here ({jq:?}): install it to run this test"
-    );
     let steps = step_blocks(block);
     assert_eq!(steps.len(), 1, "`Lint` runs one step, the check");
+    // Each part's result reaches the script as `VAR: ${{ needs.<part>.result }}`
+    // in the step's `env:`, one variable per part and every part once.
+    let mut result_vars: Vec<(String, String)> = Vec::new();
+    for line in &steps[0] {
+        if !line.contains("needs.") || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (var, value) = line
+            .trim()
+            .split_once(": ")
+            .unwrap_or_else(|| panic!("`Lint` reads `needs` outside its `env:`: {line:?}"));
+        let part = value
+            .strip_prefix("${{ needs.")
+            .and_then(|rest| rest.strip_suffix(".result }}"))
+            .unwrap_or_else(|| {
+                panic!("`Lint` must hand a part's result alone to an env var: {line:?}")
+            });
+        result_vars.push((part.to_string(), var.to_string()));
+    }
+    result_vars.sort();
+    let parts_read: Vec<&str> = result_vars.iter().map(|(part, _)| part.as_str()).collect();
+    assert_eq!(
+        parts_read, LINT_PARTS,
+        "`Lint` must read the result of every part, once each"
+    );
     let script = run_script_of(&steps[0]).expect("the check has a `run:` script");
     // `run_script_of` keeps the text after `run:` on its first line, which for a
     // literal block is the `|` indicator, not a command.
@@ -5618,48 +5639,42 @@ fn the_lint_aggregator_fails_unless_every_part_succeeded() {
         _ => script,
     };
 
-    let needs_json = |results: &[(&str, &str)]| -> String {
-        let fields: Vec<String> = results
-            .iter()
-            .map(|(id, result)| format!("\"{id}\":{{\"result\":\"{result}\",\"outputs\":{{}}}}"))
-            .collect();
-        format!("{{{}}}", fields.join(","))
-    };
-    let run = |json: &str| -> bool {
-        std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("NEEDS", json)
+    // Runs the script with every part succeeded except the one `failing` names,
+    // whose variable carries the given result, or is left unset for `None`.
+    let run = |failing: Option<(&str, Option<&str>)>| -> bool {
+        let mut command = std::process::Command::new("bash");
+        command.arg("-c").arg(&script);
+        for (part, var) in &result_vars {
+            match failing {
+                Some((bad_part, bad)) if bad_part == part.as_str() => match bad {
+                    Some(result) => command.env(var, result),
+                    None => command.env_remove(var),
+                },
+                _ => command.env(var, "success"),
+            };
+        }
+        command
             .output()
             .expect("bash runs the aggregator's check")
             .status
             .success()
     };
-    fn all(result: &'static str) -> Vec<(&'static str, &'static str)> {
-        LINT_PARTS.iter().map(|p| (*p, result)).collect()
-    }
-    assert!(run(&needs_json(&all("success"))), "three successes pass");
-    for bad in ["failure", "cancelled", "skipped"] {
+    assert!(run(None), "three successes pass");
+    // An empty result is what GitHub hands over for a part missing from `needs`.
+    for bad in ["failure", "cancelled", "skipped", ""] {
         for part in LINT_PARTS {
-            let mut results = all("success");
-            for entry in results.iter_mut() {
-                if entry.0 == *part {
-                    entry.1 = bad;
-                }
-            }
             assert!(
-                !run(&needs_json(&results)),
+                !run(Some((*part, Some(bad)))),
                 "`{part}` ending `{bad}` must red `Lint`"
             );
         }
     }
-    assert!(
-        !run(&needs_json(&[
-            ("lint-gates", "success"),
-            ("lint-fmt", "success")
-        ])),
-        "a part missing from `needs` must red `Lint`"
-    );
+    for part in LINT_PARTS {
+        assert!(
+            !run(Some((*part, None))),
+            "`{part}` with no result variable set must red `Lint`"
+        );
+    }
 }
 
 /// The longest `timeout-minutes` a job-level `always()` job may carry.

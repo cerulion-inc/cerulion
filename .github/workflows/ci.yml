@@ -1413,22 +1413,26 @@ jobs:
     timeout-minutes: 5
     steps:
       # Every part must have SUCCEEDED: `failure`, `cancelled` and `skipped`
-      # all red this job, and so does a part missing from `needs` (the count
-      # below). `ci_test_coverage_test` runs this script over each shape.
+      # all red this job, and so does an empty result, which is what a part
+      # missing from `needs` reads as (actionlint also refuses a `needs.<id>`
+      # the job does not list). Plain bash, so `ci_test_coverage_test` runs this
+      # script over each shape with nothing beyond bash installed.
       - name: Every part of Lint passed
         env:
-          NEEDS: ${{ toJSON(needs) }}
+          LINT_GATES: ${{ needs.lint-gates.result }}
+          LINT_FMT: ${{ needs.lint-fmt.result }}
+          LINT_CLIPPY: ${{ needs.lint-clippy.result }}
         run: |
           set -euo pipefail
-          printf '%s' "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          parts=$(printf '%s' "$NEEDS" | jq 'length')
-          if [ "$parts" -ne 3 ]; then
-            echo "::error::Lint has ${parts} parts; expected 3 (lint-gates, lint-fmt, lint-clippy)"
-            exit 1
-          fi
-          bad=$(printf '%s' "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(" ")')
+          bad=""
+          for part in "lint-gates=${LINT_GATES}" "lint-fmt=${LINT_FMT}" "lint-clippy=${LINT_CLIPPY}"; do
+            echo "$part"
+            if [ "${part#*=}" != success ]; then
+              bad="${bad} ${part}"
+            fi
+          done
           if [ -n "$bad" ]; then
-            echo "::error::Lint parts that did not succeed: ${bad}"
+            echo "::error::Lint parts that did not succeed:${bad}"
             exit 1
           fi
           echo "every part of Lint succeeded"
