@@ -1,0 +1,7 @@
+bx
+venv
+out
+**/__pycache__
+**/*.pyc
+measured/*/runs/derived_mjcf
+body_records/_checked_on_this_machine.json

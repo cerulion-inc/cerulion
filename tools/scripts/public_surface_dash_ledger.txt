@@ -18,7 +18,7 @@
 1 crates/cerud/src/main.rs
 1 crates/cerud/src/receipt.rs
 1 crates/cerud/src/server.rs
-5 crates/cerulion_accountd/src/api.rs
+4 crates/cerulion_accountd/src/api.rs
 1 crates/cerulion_accountd/src/bin/cerulion-accountd.rs
 24 crates/cerulion_accountd/src/team.rs
 1 crates/cerulion_bag/src/catalog.rs
@@ -50,7 +50,7 @@
 7 crates/cerulion_cli_engine/src/auth.rs
 153 crates/cerulion_cli_engine/src/bag_cmd.rs
 22 crates/cerulion_cli_engine/src/bag_migrate.rs
-8 crates/cerulion_cli_engine/src/connect_cmd.rs
+7 crates/cerulion_cli_engine/src/connect_cmd.rs
 4 crates/cerulion_cli_engine/src/device_binding.rs
 6 crates/cerulion_cli_engine/src/discovery_ladder.rs
 18 crates/cerulion_cli_engine/src/flashback_cmd.rs
@@ -98,7 +98,7 @@
 39 crates/cerulion_cli_engine/src/workspace_lock.rs
 5 crates/cerulion_connectd/src/main.rs
 2 crates/cerulion_connectd/src/pair.rs
-5 crates/cerulion_connectd/src/schema.rs
+4 crates/cerulion_connectd/src/schema.rs
 9 crates/cerulion_connectd/src/worker.rs
 6 crates/cerulion_core/src/abi_layout.rs
 27 crates/cerulion_core/src/barrier.rs

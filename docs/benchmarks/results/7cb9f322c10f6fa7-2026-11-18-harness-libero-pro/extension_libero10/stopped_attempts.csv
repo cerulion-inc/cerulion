@@ -1,0 +1,9 @@
+list,cell,arm,model,attempt,started,machine_stopped,ran_at_most_s,episode_scored_later
+libero10,l10_t06_i29,without,Gemini 3.8 Flash,1,2026-11-18T09:16:40Z,2026-11-18T09:30:39Z,839,1
+libero10,l10_t05_i30,without,Gemini 3.8 Flash,1,2026-11-18T09:17:45Z,2026-11-18T09:30:39Z,774,1
+libero10,l10_t07_i47,with,Gemini 3.8 Flash,1,2026-11-18T11:35:16Z,2026-11-18T11:36:02Z,46,1
+libero10,l10_t07_i47,without,Gemini 3.8 Flash,1,2026-11-18T11:30:25Z,2026-11-18T11:36:02Z,337,1
+libero10,l10_t02_i29,without,GPT-6 Astra,1,2026-11-18T09:12:30Z,2026-11-18T09:30:39Z,1089,1
+libero10,l10_t00_i31,with,GPT-6 Astra,1,2026-11-18T09:29:05Z,2026-11-18T09:30:39Z,94,1
+libero10,l10_t06_i44,without,GPT-6 Astra,2,2026-11-18T11:34:28Z,2026-11-18T11:36:02Z,94,1
+libero10,l10_t05_i45,without,GPT-6 Astra,1,2026-11-18T11:26:35Z,2026-11-18T11:36:02Z,567,1

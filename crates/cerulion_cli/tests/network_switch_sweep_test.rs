@@ -88,8 +88,47 @@ struct Recorder {
     thread: Option<JoinHandle<()>>,
 }
 
+/// One turn for every child this file spawns, every listener it binds and
+/// every rebind check. A child starts with a copy of every descriptor this
+/// process holds and keeps the copies until its exec closes the close-on-exec
+/// ones; on macOS std creates a socket and marks it close-on-exec in a second
+/// call, so a child spawned between the two keeps the socket for its whole
+/// run. Inside the turn no child is starting, so the only copy a child holds
+/// of a listener a rebind judges is one a test handed it, and no other
+/// recorder in this process can take a port between its release and the
+/// rebind.
+static SOCKET_TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`SOCKET_TURN`]; a turn a failed test poisoned is still a turn.
+fn socket_turn() -> std::sync::MutexGuard<'static, ()> {
+    SOCKET_TURN.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Spawn `cmd` inside [`SOCKET_TURN`].
+fn spawn_child(cmd: &mut Command) -> Child {
+    let _turn = socket_turn();
+    cmd.spawn().expect("spawn the child")
+}
+
+/// A listener on a fresh loopback port, bound inside [`SOCKET_TURN`].
+fn bind_loopback() -> TcpListener {
+    let _turn = socket_turn();
+    TcpListener::bind("127.0.0.1:0").expect("bind a loopback listener")
+}
+
+/// Bind `addr` again inside [`SOCKET_TURN`], once `release` has run there.
+/// The bind succeeds only when no listener holds the address, in any
+/// process. std's bind sets `SO_REUSEADDR`, so a connection the listener
+/// accepted, open or closed, does not hold it. Nothing connects to the
+/// address, so the check reaches no other recorder.
+fn rebind_after(addr: &str, release: impl FnOnce()) -> std::io::Result<()> {
+    let _turn = socket_turn();
+    release();
+    TcpListener::bind(addr).map(drop)
+}
+
 fn recorder() -> Recorder {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind the recording listener");
+    let listener = bind_loopback();
     listener
         .set_nonblocking(true)
         .expect("a non-blocking listener");
@@ -228,6 +267,7 @@ fn command(
         .env_remove("DO_NOT_TRACK")
         .env_remove("CERULION_TELEMETRY")
         .env_remove("CERULION_CONNECTD_BIN")
+        .env_remove("CERULION_HARNESS_DIR")
         .env("CERULION_HOME", home)
         .env("CERULION_ACCOUNT_SERVICE", &rec.url)
         .env("CERULION_RELAY_URL", &rec.url)
@@ -335,7 +375,7 @@ fn run_bounded(
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn the child");
+        let mut child = spawn_child(&mut cmd);
         let deadline = Instant::now() + bound;
         let stdout = collect(child.stdout.take().expect("a stdout pipe"));
         let stderr = collect(child.stderr.take().expect("a stderr pipe"));
@@ -370,7 +410,7 @@ fn run_bounded(
         }
         let _ = chunks.send(None);
     });
-    let mut child = cmd.spawn().expect("spawn the child");
+    let mut child = spawn_child(&mut cmd);
     let deadline = Instant::now() + bound;
     // `cmd` holds the parent's copies of the slave.
     drop(cmd);
@@ -732,6 +772,51 @@ fn viz_robot_under_a_daemon_switch_refuses_before_the_login_gate() {
     }
 }
 
+#[test]
+fn graph_live_and_fires_under_the_netd_switch_refuse_before_the_login_gate() {
+    // They ask robots through `cerulion-netd`, so its own switch refuses them
+    // as `CERULION_NETWORK` does, before the gate.
+    // With or without `--robot` and `--connect`: every form asks a robot.
+    for argv in [
+        &["graph", "live"][..],
+        &["graph", "live", "--robot", "bench-arm"][..],
+        &["graph", "live", "--connect", "tcp/127.0.0.1:7683"][..],
+        &["graph", "fires"][..],
+        &["graph", "fires", "--robot", "bench-arm"][..],
+        &["graph", "fires", "--connect", "tcp/127.0.0.1:7683"][..],
+    ] {
+        let verb = &argv[..2];
+        let what = format!("{argv:?} under CERULION_NETD_NETWORK=off");
+        let home = tempfile::tempdir().expect("a home");
+        let run = spawn_with(
+            home.path(),
+            None,
+            &[("CERULION_NETD_NETWORK", "off")],
+            argv,
+            true,
+        );
+        assert_eq!(run.code, Some(1), "{what}: stderr={}", run.stderr);
+        assert!(
+            run.stderr.contains(&format!(
+                "Error: cerulion {}: asking robots is disabled by CERULION_NETD_NETWORK=off",
+                verb.join(" ")
+            )),
+            "{what}: stderr={}",
+            run.stderr
+        );
+        assert!(
+            run.stderr
+                .contains("unset CERULION_NETD_NETWORK to ask robots"),
+            "{what}: stderr={}",
+            run.stderr
+        );
+        assert_no_sign_in(&what, &run);
+        assert_no_contact(&what, &run);
+        assert!(run.stdout.is_empty(), "{what}: stdout={}", run.stdout);
+        assert_no_identity_written(&what, home.path());
+    }
+}
+
 /// A signed-in home.
 fn seeded_home() -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("a home");
@@ -891,7 +976,7 @@ fn account_sign_in_is_allowed_under_the_switch_and_reaches_the_account_service()
 
 /// A recorder closes its listener and ends its thread when it is dropped,
 /// whether or not anything connected to it, so a finished row leaves no
-/// socket or thread behind.
+/// socket or thread behind: its address binds again.
 #[test]
 fn a_dropped_recorder_leaves_no_listener_behind() {
     use std::io::Write;
@@ -907,14 +992,45 @@ fn a_dropped_recorder_leaves_no_listener_behind() {
             drop(probe);
             assert_eq!(rec.drain(), ["GET /probe HTTP/1.1"], "{addr}");
         }
-        drop(rec);
-        let refused = TcpStream::connect(&addr).expect_err("the listener is closed");
-        assert_eq!(
-            refused.kind(),
-            std::io::ErrorKind::ConnectionRefused,
-            "{addr} after a drop (connected first: {connect_first})"
+        let live = rebind_after(&addr, || {});
+        assert!(
+            matches!(&live, Err(e) if e.kind() == std::io::ErrorKind::AddrInUse),
+            "{addr} while the recorder is live (connected first: {connect_first}): {live:?}"
+        );
+        let rebound = rebind_after(&addr, || drop(rec));
+        assert!(
+            rebound.is_ok(),
+            "{addr} is still held after a drop (connected first: {connect_first}): {rebound:?}"
         );
     }
+}
+
+/// The rebind judges the socket, not this process's handle to it: a listener
+/// whose descriptor a child holds keeps its address after this process closes
+/// its own copy, and frees it once the child exits (here it is killed and
+/// reaped).
+#[test]
+fn a_listener_a_child_still_holds_keeps_its_address_until_the_child_exits() {
+    let listener = bind_loopback();
+    let addr = listener.local_addr().expect("listener address").to_string();
+    let mut cmd = Command::new("sleep");
+    cmd.arg("30")
+        .stdin(Stdio::from(std::os::fd::OwnedFd::from(listener)))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = spawn_child(&mut cmd);
+    // `cmd` holds this process's last copy of the listener.
+    drop(cmd);
+    let held = rebind_after(&addr, || {});
+    let freed = rebind_after(&addr, || {
+        let _ = child.kill();
+        child.wait().expect("reap the child");
+    });
+    assert!(
+        matches!(&held, Err(e) if e.kind() == std::io::ErrorKind::AddrInUse),
+        "{addr} while the child holds the listener: {held:?}"
+    );
+    assert!(freed.is_ok(), "{addr} after the child is reaped: {freed:?}");
 }
 
 /// A spawn still running at its bound is killed, reaped and named, on plain
