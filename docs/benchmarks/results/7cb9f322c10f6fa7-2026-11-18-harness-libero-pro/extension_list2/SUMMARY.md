@@ -1,6 +1,6 @@
 # Summary of list 2: 400 further start states of LIBERO-PRO, 2 models, both arms
 
-Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-18T17:23:47Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
+Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-19T02:31:37Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
 
 Read these lines before any number here:
 
@@ -185,10 +185,10 @@ The grid's tests are read on the grid's 100 start states only, by the grid's rul
 | Gemini 3.8 Flash SOLVED | the main test: 73 against 25 of 100 (with only 52, without only 4), p 1.10e-11: passes at 0.05 | passes | the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)" |
 | GPT-6 Astra CLEAN | declared secondary: 61 against 44 (26 against 9), p 0.00599: passes at 0.05 | passes | the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)" |
 | GPT-6 Astra SOLVED | in the per-model family: 70 against 71 (13 against 14), p 1: cannot pass at any threshold | does not pass | no statement; both printed |
-| Gemini 3.8 Flash CLEAN | in the grid's CLEAN family, not settled while the grid runs; 68 against 10 (60 against 2), p 8.47e-16, under 0.05 / 15, the strictest threshold that family can set | passes | when the grid's test is settled and passes: the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)"; until then, no upgrade |
-| FALSE CLAIM, a model | the grid's test pools every model and is not settled while the grid runs; the grid's per-model counts (Gemini 3.8 Flash 16 against 30; GPT-6 Astra 14 against 24) are not a grid test | passes for both models | this list's own sentences only |
+| Gemini 3.8 Flash CLEAN | in the grid's CLEAN family, settled; 68 against 10 (60 against 2), p 8.47e-16, under 0.05 / 15, the strictest threshold that family can set | passes | the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)" |
+| FALSE CLAIM, a model | the grid's test pools every model and is settled; the grid's per-model counts (Gemini 3.8 Flash 16 against 30; GPT-6 Astra 14 against 24) are not a grid test | passes for both models | this list's own sentences only |
 
-"Replicated" may be said only where both columns read passes: Gemini 3.8 Flash SOLVED and GPT-6 Astra CLEAN. Not of Gemini 3.8 Flash CLEAN, Gemini 3.8 Flash FALSE CLAIM, GPT-6 Astra FALSE CLAIM from this list. One effect is one statement: the grid's test and this list's test on the same model and measure are one finding, their p values are never combined, and nothing is confirmed twice.
+"Replicated" may be said only where both columns read passes: Gemini 3.8 Flash SOLVED and GPT-6 Astra CLEAN and Gemini 3.8 Flash CLEAN. Not of Gemini 3.8 Flash FALSE CLAIM, GPT-6 Astra FALSE CLAIM from this list. One effect is one statement: the grid's test and this list's test on the same model and measure are one finding, their p values are never combined, and nothing is confirmed twice.
 
 ## The one cross-model pair named beforehand: Gemini 3.8 Flash with Cerulion against GPT-6 Astra without (descriptive, outside the corrected family)
 
