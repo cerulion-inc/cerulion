@@ -1357,7 +1357,11 @@ from the engine function the verb's own path refuses with, so its text and exit 
 are the ones a signed-in machine gets: `--robot` on `topic pub`, `topic snapshot` and
 `service call`, and `rcp` (exit 2), and `viz --robot` (exit 1). The `rcp`
 family refuses with `rcp_cmd::network_refusal` and needs an identity, as `connect`
-does. The hidden `pair` stub never reaches this check: `dispatch` answers it
+does. `rcp --sim` and the nested `rcp bench` (`families/nested/rcp_bench.rs`) are not
+refused, because they reach no robot and no Cerulion service, and they need an
+identity like every other `rcp` form; both run the harness launcher that
+`harness_cmd::find_harness_dir` finds and `harness_cmd::plan` spells, through
+`connect_cmd::spawn_child_and_wait`. The hidden `pair` stub never reaches this check: `dispatch` answers it
 beside the removed `ros` family, above the switch and the gate, with
 `PAIR_UNAVAILABLE_MSG` and exit 2 for every spelling, because no robot-side verb
 arms a pairing code (`SharedCodePairSessions::arm` has no caller outside tests);
