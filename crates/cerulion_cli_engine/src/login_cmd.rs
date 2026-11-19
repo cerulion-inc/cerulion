@@ -776,7 +776,7 @@ pub fn run_login_carrying(
 /// Only a link to a REGULAR file is read: following one to a FIFO with no writer
 /// would hang the login, so anything else answers `false` and takes the ordinary
 /// replace path (which unlinks the link rather than writing through it).
-fn symlink_already_holds(path: &Path, cert: &str) -> bool {
+pub(crate) fn symlink_already_holds(path: &Path, cert: &str) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(md) if md.file_type().is_symlink() => {}
         _ => return false,
@@ -1284,7 +1284,47 @@ fn register_device_with_seed(
     session_token: &str,
     seed: [u8; 32],
 ) -> CliResult<Option<IssuedRegistration>> {
-    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    register_device_key(client, base, session_token, &seed, "human")
+}
+
+#[cfg(unix)]
+/// A certificate re-issued for a device key that is already registered: the
+/// leaf and the intermediate it was issued under, both base64url as served.
+pub(crate) struct ReissuedCert {
+    pub(crate) device_cert: String,
+    pub(crate) intermediate: String,
+}
+
+#[cfg(unix)]
+/// Register `seed`'s key again (`POST /v1/devices/challenge` + `POST
+/// /v1/devices`) and return the certificate the service mints from its stored
+/// row for that key. `None` when the service has no device surface (404).
+/// Never creates or reads any other key.
+pub(crate) fn reregister_device_key(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    session_token: &str,
+    seed: &[u8; 32],
+    principal_kind: &str,
+) -> CliResult<Option<ReissuedCert>> {
+    Ok(
+        register_device_key(client, base, session_token, seed, principal_kind)?.map(|issued| {
+            ReissuedCert {
+                device_cert: issued.response.device_cert,
+                intermediate: issued.response.intermediate,
+            }
+        }),
+    )
+}
+
+fn register_device_key(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    session_token: &str,
+    seed: &[u8; 32],
+    principal_kind: &str,
+) -> CliResult<Option<IssuedRegistration>> {
+    let signing = ed25519_dalek::SigningKey::from_bytes(seed);
     let public_key = signing.verifying_key().to_bytes();
     let Some((pop_challenge, pop_account)) = fetch_pop_challenge(client, base, session_token)?
     else {
@@ -1299,7 +1339,7 @@ fn register_device_with_seed(
     );
     let body = serde_json::json!({
         "public_key": URL_SAFE_NO_PAD.encode(public_key),
-        "principal_kind": "human",
+        "principal_kind": principal_kind,
         "pop_challenge": pop_challenge,
         "pop_signature": URL_SAFE_NO_PAD.encode(pop_signature.0),
     });
@@ -1478,6 +1518,7 @@ pub(crate) fn http_client_without_redirects() -> CliResult<reqwest::blocking::Cl
     build_http_client(reqwest::redirect::Policy::none())
 }
 
+#[cfg(unix)]
 /// [`http_client_without_redirects`] with a per-request timeout of `timeout`, for
 /// callers that make several requests inside a fixed overall deadline.
 pub(crate) fn http_client_bounded(timeout: Duration) -> CliResult<reqwest::blocking::Client> {
