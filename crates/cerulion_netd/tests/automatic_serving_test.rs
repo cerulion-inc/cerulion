@@ -301,6 +301,49 @@ async fn ops_exchange(
     serde_json::from_slice(&bytes).unwrap()
 }
 
+/// One wire/2 catalog request: the reply's bytes and whether it lists `topic`.
+async fn read_catalog(
+    send: &mut cerulion_link::SendStream,
+    recv: &mut cerulion_link::RecvStream,
+    topic: &str,
+) -> (Vec<u8>, bool) {
+    write_frame(send, &serde_json::to_vec(&WireRequest::Catalog).unwrap())
+        .await
+        .unwrap();
+    let bytes = tokio::time::timeout(LIMIT, read_frame(recv, DEFAULT_MAX_FRAME_LEN))
+        .await
+        .unwrap()
+        .unwrap();
+    let WireResponse::Catalog(catalog) = serde_json::from_slice(&bytes).unwrap() else {
+        panic!("authenticated catalog refused")
+    };
+    let listed = catalog.entries.iter().any(|row| row.topic == topic);
+    (bytes, listed)
+}
+
+/// Requests the catalog until it lists `topic`, within `LIMIT`, and returns
+/// that reply's bytes. The remote daemon writes its beacon facts when its
+/// endpoint binds, and its catalog lists a topic only once its own transport
+/// lists that topic, so a read right after the facts appear can lack it.
+async fn catalog_listing(
+    send: &mut cerulion_link::SendStream,
+    recv: &mut cerulion_link::RecvStream,
+    topic: &str,
+) -> Vec<u8> {
+    let deadline = Instant::now() + LIMIT;
+    loop {
+        let (bytes, listed) = read_catalog(send, recv, topic).await;
+        if listed {
+            return bytes;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the served catalog never listed {topic}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 #[test]
 fn no_listen_serves_persisted_pairing_and_expired_login_and_reaps_on_last_release() {
     let _device = PAIRED_DEVICE.lock().unwrap_or_else(|e| e.into_inner());
@@ -366,26 +409,10 @@ fn no_listen_serves_persisted_pairing_and_expired_login_and_reaps_on_last_releas
                 .unwrap()
                 .unwrap();
             let (mut send, mut recv) = open_frame_stream(&connection).await.unwrap();
-            let mut catalogs = Vec::new();
-            for _ in 0..2 {
-                write_frame(
-                    &mut send,
-                    &serde_json::to_vec(&WireRequest::Catalog).unwrap(),
-                )
-                .await
-                .unwrap();
-                let bytes =
-                    tokio::time::timeout(LIMIT, read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN))
-                        .await
-                        .unwrap()
-                        .unwrap();
-                let WireResponse::Catalog(catalog) = serde_json::from_slice(&bytes).unwrap() else {
-                    panic!("authenticated catalog refused")
-                };
-                assert!(catalog.entries.iter().any(|row| row.topic == TOPIC));
-                catalogs.push(bytes);
-            }
-            assert_eq!(catalogs[0], catalogs[1]);
+            let settled = catalog_listing(&mut send, &mut recv, TOPIC).await;
+            let (again, listed) = read_catalog(&mut send, &mut recv, TOPIC).await;
+            assert!(listed, "a catalog that listed {TOPIC} dropped it");
+            assert_eq!(settled, again);
             connection.close(0u32.into(), b"done");
             desk.close().await;
         });
@@ -1090,23 +1117,7 @@ wait "$server_pid"
             .unwrap()
             .unwrap();
         let (mut send, mut recv) = open_frame_stream(&connection).await.unwrap();
-        write_frame(
-            &mut send,
-            &serde_json::to_vec(&WireRequest::Catalog).unwrap(),
-        )
-        .await
-        .unwrap();
-        let bytes = tokio::time::timeout(LIMIT, read_frame(&mut recv, DEFAULT_MAX_FRAME_LEN))
-            .await
-            .unwrap()
-            .unwrap();
-        let WireResponse::Catalog(catalog) = serde_json::from_slice(&bytes).unwrap() else {
-            panic!("replacement refused authenticated catalog")
-        };
-        assert!(catalog
-            .entries
-            .iter()
-            .any(|entry| entry.topic == next_topic));
+        catalog_listing(&mut send, &mut recv, next_topic).await;
         connection.close(0u32.into(), b"done");
         desk.close().await;
     });
