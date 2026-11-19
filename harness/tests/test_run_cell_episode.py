@@ -210,7 +210,7 @@ class GoogleEndpoint(Bench):
             "reasoning_blocks": "sent back on the assistant message whose tool calls they came with, outside the "
                                 "operator's context estimate"})
         self.assertEqual(self.relays(), [{"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 0,
-                                          "requests_carrying_blocks": 0, "relay_errors": 0}] * 2)
+                                          "requests_carrying_blocks": 0, "relay_errors": 0, "refused": 0}] * 2)
         self.assertEqual([(r["arm"], r["scored"], r["list_price_usd"], r["reported_usd"]) for r in doc["rows"]],
                          [("plain", True, 0.0027, None), ("rcp", True, 0.0027, None)])
 
@@ -267,7 +267,7 @@ class OpenRouter(Bench):
         doc = self.summary()
         self.assertEqual(doc["route"]["provider_only"], ["google-vertex"])
         self.assertEqual(self.relays(), [{"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 2,
-                                          "requests_carrying_blocks": 1, "relay_errors": 0}])
+                                          "requests_carrying_blocks": 1, "relay_errors": 0, "refused": 0}])
 
     def test_a_given_extra_body_is_sent_as_given(self):
         self.run_cell("--arm", "plain", "--extra-body", '{"reasoning_effort": "high"}')

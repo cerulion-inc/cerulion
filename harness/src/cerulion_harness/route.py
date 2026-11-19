@@ -19,12 +19,17 @@ So every request of an episode passes through a relay on the loopback address in
     - a reply that carries reasoning_details is remembered by the ids of its tool calls;
     - a later request whose history holds an assistant message with one of those tool calls gets the blocks back
       on that message, unchanged;
-    - the body of every other request and of every answer goes on as it came. Of the headers, only Content-Type,
-      Accept and Authorization go on to the endpoint, and only Content-Type and Retry-After come back. An
-      endpoint that returns no reasoning_details (Google's endpoint returns its signature in extra_content)
-      receives the very bytes the operator sent;
+    - the body of every other request it sends on, and of every answer, goes on as it came. Of the headers,
+      only Content-Type, Accept and Authorization go on to the endpoint, and only Content-Type and Retry-After
+      come back. An endpoint that returns no reasoning_details (Google's endpoint returns its signature in
+      extra_content) receives the very bytes the operator sent;
     - a request that names no Content-Length, names one that is not a count, or sends its body in chunks is
-      answered 411 and not sent on; a fault of the relay itself is answered 502 and counted (relay_errors);
+      answered 411; one to another path is answered 404; one whose body ends before its Content-Length is
+      answered 400, or closed unanswered when its connection broke; one with another method (501), or with a
+      request line or headers http.server cannot read (400, 414, 431 or 505), is answered as http.server
+      answers it. None of these is sent on, and each is counted (refused). A connection that sends a blank
+      request line, or breaks before its headers end, is closed with no answer and no count: no request arrived.
+      A fault of the relay itself is answered 502 and counted (relay_errors);
     - every request goes to the URL given and to no other, with the key the operator sent: the relay follows no
       redirect (redirects.py), and passes a redirect answer back with its status and body but without its
       Location header, so the operator has no other address to send the key to.
@@ -202,6 +207,9 @@ def content_length(headers):
     return int(text)
 
 
+READ_PIECE = 1 << 20   # bytes of a request body read at a time
+
+
 class _QuietServer(http.server.ThreadingHTTPServer):
     def handle_error(self, request, client_address):   # a request that broke off prints nothing to the terminal
         pass
@@ -209,8 +217,9 @@ class _QuietServer(http.server.ThreadingHTTPServer):
 
 class Relay:
     """The loopback endpoint an episode's operator talks to; see the module text. Use as a context manager: it
-    serves from entering to leaving. on_request() is called as each request arrives, before it goes on. Every
-    request goes to completions_url(base_url), whatever path or host the request line names."""
+    serves from entering to leaving. Every request it sends on goes to completions_url(base_url), whatever host
+    the request line names, and on_request() is called for it before it goes on. A request it refuses (see the
+    module text) is counted (refused) and never sent on."""
 
     def __init__(self, base_url, timeout_s=HTTP_TIMEOUT_S, on_request=None):
         self.url = completions_url(base_url)
@@ -224,7 +233,7 @@ class Relay:
         self._blocks = {}
         self._lock = threading.Lock()
         self.counts = {"requests": 0, "not_reached": 0, "replies_with_reasoning_blocks": 0,
-                       "requests_carrying_blocks": 0, "relay_errors": 0}
+                       "requests_carrying_blocks": 0, "relay_errors": 0, "refused": 0}
         relay = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -242,11 +251,42 @@ class Relay:
             def _exchange(self):
                 length = content_length(self.headers)
                 if length is None:   # its body cannot be read whole: nothing is sent on
-                    return 411, {"Content-Type": "text/plain"}, b"the relay takes a body with a Content-Length only\n"
-                data = self.rfile.read(length) if length > 0 else b""
+                    return self._refuse(411, b"the relay takes a body with a Content-Length only\n")
+                try:
+                    data = self._read_body(length)
+                except OSError:   # the operator's connection broke: nobody to answer, nothing is sent on
+                    self._count_refused()
+                    return None
+                if len(data) < length:   # the operator stopped sending: a part of a body is never sent on
+                    return self._refuse(400, b"the request body ended before its Content-Length\n")
                 if not self.path.split("?")[0].rstrip("/").endswith("/chat/completions"):
-                    return 404, {"Content-Type": "text/plain"}, b"not found\n"
+                    return self._refuse(404, b"not found\n")
                 return relay.exchange(data, dict(self.headers.items()))
+
+            def _read_body(self, length):
+                # In pieces, so memory follows the bytes that arrive, not the length a request names.
+                parts = []
+                while length > 0:
+                    piece = self.rfile.read(min(length, READ_PIECE))
+                    if not piece:
+                        break
+                    parts.append(piece)
+                    length -= len(piece)
+                return b"".join(parts)
+
+            def _count_refused(self):
+                with relay._lock:
+                    relay.counts["refused"] += 1
+
+            def _refuse(self, status, text):
+                self._count_refused()
+                return status, {"Content-Type": "text/plain"}, text
+
+            def send_error(self, code, message=None, explain=None):
+                # http.server's own refusals (another method, a request it cannot read as HTTP) come here before
+                # do_POST runs; the relay's own answers go through send_response and are not counted twice.
+                self._count_refused()
+                super().send_error(code, message, explain)
 
             def _answer(self, status, headers, body):
                 try:
@@ -269,6 +309,11 @@ class Relay:
         self._server.timeout = 0
         self._wake = os.pipe()
         self._thread = None
+
+    def snapshot(self):
+        """A copy of the counts, taken under the lock the request threads count under."""
+        with self._lock:
+            return dict(self.counts)
 
     @property
     def base_url(self):

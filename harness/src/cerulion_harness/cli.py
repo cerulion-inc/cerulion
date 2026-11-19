@@ -602,7 +602,7 @@ def run_cell(ns, arms, trees, signals):
             monitor = progress.Progress(arm, scratch_group(ns, arm), ns.cell, ns.model, BUDGET["control_steps"], say)
             with route.Relay(ns.base_url, on_request=monitor.poll) as relay:
                 rc, wall = run_arm(ns, arm, out_dir, cells_file, trees[arm], relay.base_url, signals)
-                counts = {"base_url": relay.base_url, **relay.counts}
+                counts = {"base_url": relay.base_url, **relay.snapshot()}
             try:
                 monitor.poll()   # the last reply: no request follows it
             except Exception:   # a progress line that cannot be read never costs the verdict

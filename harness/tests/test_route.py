@@ -10,6 +10,7 @@ import json
 import os
 import pathlib
 import socket
+import struct
 import sys
 import threading
 import time
@@ -222,6 +223,12 @@ class WithBlocks(unittest.TestCase):
         self.assertEqual(route.with_blocks(OPERATOR_TURN_2, blocks), route.with_blocks(OPERATOR_TURN_2, blocks))
 
 
+def refused_only(n):
+    """The relay's counts after n requests it refused and nothing else."""
+    return {"requests": 0, "not_reached": 0, "replies_with_reasoning_blocks": 0, "requests_carrying_blocks": 0,
+            "relay_errors": 0, "refused": n}
+
+
 def post(url, body, opener=None):
     """One request as the measured operator sends it: its three headers (bench/operators/chat_support.py)."""
     req = urllib.request.Request(url + "/chat/completions", data=body, method="POST",
@@ -290,7 +297,7 @@ class RelayExchange(unittest.TestCase):
         self.assert_operator_headers(end, [TURN_1, GOOGLE_TURN_2])
         self.assertEqual(first, answer("google", 0))
         self.assertEqual(relay.counts, {"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 0,
-                                        "requests_carrying_blocks": 0, "relay_errors": 0})
+                                        "requests_carrying_blocks": 0, "relay_errors": 0, "refused": 0})
 
     def test_on_openrouter_the_first_replys_blocks_go_back_at_the_next_turn(self):
         end = self.endpoint("openrouter")
@@ -300,7 +307,7 @@ class RelayExchange(unittest.TestCase):
         self.assertEqual([s[2] for s in end.seen], [TURN_1, ENDPOINT_TURN_2])
         self.assert_operator_headers(end, [TURN_1, ENDPOINT_TURN_2])
         self.assertEqual(relay.counts, {"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 2,
-                                        "requests_carrying_blocks": 1, "relay_errors": 0})
+                                        "requests_carrying_blocks": 1, "relay_errors": 0, "refused": 0})
 
     def test_an_http_error_comes_back_as_it_came(self):
         end = self.endpoint("openrouter")
@@ -334,6 +341,7 @@ class RelayExchange(unittest.TestCase):
                 urllib.request.build_opener(urllib.request.ProxyHandler({})).open(req, timeout=30)
         self.assertEqual(caught.exception.code, 404)
         self.assertEqual(end.seen, [])
+        self.assertEqual(relay.counts, refused_only(1))
 
     def test_a_request_goes_on_when_the_progress_callback_fails(self):
         end = self.endpoint("google")
@@ -430,7 +438,7 @@ class RelayExchange(unittest.TestCase):
                     self.assertEqual(end.seen, [("/v1/chat/completions", "Bearer " + KEY, TURN_1)])
                     self.assertEqual(relay.counts, {"requests": 1, "not_reached": 0,
                                                     "replies_with_reasoning_blocks": 0,
-                                                    "requests_carrying_blocks": 0, "relay_errors": 0})
+                                                    "requests_carrying_blocks": 0, "relay_errors": 0, "refused": 0})
         self.assertEqual(elsewhere.seen, [])
 
     def test_a_request_line_that_names_another_host_goes_to_the_given_url_only(self):
@@ -492,7 +500,74 @@ class RelayExchange(unittest.TestCase):
                                                                      b"only\n"))
                     conn.close()
         self.assertEqual(end.seen, [])
-        self.assertEqual(relay.counts["requests"], 0)
+        self.assertEqual(relay.counts, refused_only(5))
+
+    def raw_request(self, relay, data, reset=False):
+        """Sends the bytes data to the relay on a socket of its own and half-closes it (or, with reset, resets it
+        at once); returns what came back."""
+        conn = socket.create_connection(urllib.parse.urlparse(relay.base_url).netloc.split(":"), timeout=30)
+        with conn:
+            conn.sendall(data)
+            if reset:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                return b""
+            conn.shutdown(socket.SHUT_WR)
+            got = b""
+            while chunk := conn.recv(65536):
+                got += chunk
+            return got
+
+    def wait_for_counts(self, relay, want):
+        """The relay counts in a request thread of its own: waits until they read want, at most 10 s."""
+        until = time.monotonic() + 10
+        while relay.snapshot() != want and time.monotonic() < until:
+            time.sleep(0.01)
+        self.assertEqual(relay.snapshot(), want)
+
+    def test_a_body_that_ends_before_its_length_is_answered_400_and_not_sent(self):
+        end = self.endpoint("google")
+        with route.Relay(end.url + "/v1") as relay:
+            got = self.raw_request(relay, b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                                          b"Content-Length: 100\r\n\r\n{\"short\"")
+            self.wait_for_counts(relay, refused_only(1))
+        self.assertTrue(got.startswith(b"HTTP/1.0 400 "), got[:40])
+        self.assertTrue(got.endswith(b"\r\n\r\nthe request body ended before its Content-Length\n"), got[-60:])
+        self.assertEqual(end.seen, [])
+
+    def test_a_length_larger_than_memory_is_refused_by_the_bytes_that_arrive(self):
+        end = self.endpoint("google")
+        with route.Relay(end.url + "/v1") as relay:
+            got = self.raw_request(relay, b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                                          b"Content-Length: " + b"9" * 40 + b"\r\n\r\n{}")
+            self.wait_for_counts(relay, refused_only(1))
+        self.assertTrue(got.startswith(b"HTTP/1.0 400 "), got[:40])
+        self.assertEqual(end.seen, [])
+
+    def test_a_connection_that_breaks_inside_the_body_is_refused_not_a_relay_fault(self):
+        end = self.endpoint("google")
+        with route.Relay(end.url + "/v1") as relay:
+            self.raw_request(relay, b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                                    b"Content-Length: 100\r\n\r\n{\"short\"", reset=True)
+            self.wait_for_counts(relay, refused_only(1))
+        self.assertEqual(end.seen, [])
+
+    def test_another_method_or_a_request_that_is_not_http_is_refused_and_counted(self):
+        end = self.endpoint("google")
+        with route.Relay(end.url + "/v1") as relay:
+            for n, (data, status) in enumerate(((b"GET /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n", 501),
+                                                 (b"PUT /v1/chat/completions HTTP/1.1\r\nHost: x\r\n"
+                                                  b"Content-Length: 2\r\n\r\n{}", 501),
+                                                 (b"NOT A REQUEST\r\n\r\n", 400),
+                                                 (b"POST /v1/chat/completions HTTP/9.9\r\n\r\n", 505),
+                                                 (b"POST /" + b"a" * 70000 + b" HTTP/1.1\r\n\r\n", 414),
+                                                 (b"POST /v1/chat/completions HTTP/1.1\r\n"
+                                                  + b"".join(b"X-%d: 1\r\n" % i for i in range(120)) + b"\r\n",
+                                                  431)), 1):
+                with self.subTest(status=status, n=n):
+                    got = self.raw_request(relay, data)   # to a request it cannot read as HTTP/1.x, http.server
+                    self.assertIn(b"Error code: %d" % status, got)   # answers its error page with no status line
+                    self.wait_for_counts(relay, refused_only(n))
+        self.assertEqual(end.seen, [])
 
     def test_an_answer_that_is_not_http_counts_as_not_reached(self):
         url = raw_endpoint(self, b"not an HTTP answer\r\n\r\n")
@@ -537,7 +612,8 @@ class RelayExchange(unittest.TestCase):
                 post(relay.base_url, TURN_1)
         self.assertEqual((caught.exception.code, caught.exception.read()),
                          (502, b"the relay could not pass this request on (RuntimeError)\n"))
-        self.assertEqual(relay.counts["relay_errors"], 1)
+        self.assertEqual(relay.counts, {"requests": 0, "not_reached": 0, "replies_with_reasoning_blocks": 0,
+                                        "requests_carrying_blocks": 0, "relay_errors": 1, "refused": 0})
 
     def test_json_nested_deeper_than_the_parser_goes_goes_on_as_it_came_both_ways(self):
         end = self.endpoint("openrouter")
@@ -548,7 +624,7 @@ class RelayExchange(unittest.TestCase):
             status, body = post(relay.base_url, deep)
         self.assertEqual((status, body, end.seen[1][2]), (200, deep, deep))
         self.assertEqual(relay.counts, {"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 1,
-                                        "requests_carrying_blocks": 0, "relay_errors": 0})
+                                        "requests_carrying_blocks": 0, "relay_errors": 0, "refused": 0})
 
     def test_a_base_url_that_is_not_http_with_a_host_is_refused(self):
         for url in ("ftp://example.com/v1", "http://", "example.com/v1"):
