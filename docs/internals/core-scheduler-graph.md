@@ -282,7 +282,13 @@ naming here because they are easy to get wrong:
   each named node stopped on a runtime about to resume (it sets `disabled` only, through
   `Scheduler::restore_stopped_nodes`) and releases each `block` slot the node holds as a consumer, as
   its stop released it live. That release emits no event and moves no backpressure counter, because
-  the recorded run already reported it.
+  the recorded run already reported it. A named node whose `StoppedAtAnchor` states an unconsumed
+  arrival (its section's pending count above 0) resumes holding a frame on its trigger input when
+  that input is per-message FIFO and drained through the node's own subscriber: a stopped node's
+  drain pops the next frame after the stop and then re-offers it at every boundary, recording
+  nothing, so `drain_data_binding` answers that binding with one arrival and no pop, no read-gate
+  consult and no record. A `consume = latest` trigger, and a separate-subscriber one (`block`,
+  `sample(N)`, or `CERULION_DRAIN_DISCIPLINE=separate`), keeps consulting.
 - `External` nodes are ingress/drivers: `external_source()` returns
   `Fd` (pollable, attached non-owning), `Blocking` (helper thread + doorbell pipe), or
   `HostDriven` (polled seam only). `run_live` refuses any external node provably inert
