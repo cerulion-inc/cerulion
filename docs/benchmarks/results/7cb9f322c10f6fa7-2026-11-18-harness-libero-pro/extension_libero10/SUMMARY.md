@@ -126,7 +126,7 @@ USD a start state and USD a solved start state count the scored rows and the att
 
 A reply's finish reason is the one its model endpoint returned: `tool_calls` a reply with a tool call, `stop` and `length` one that ended on its own or at the output limit, `content_filter` one the provider's content filter stopped, `other` any other. Every reply of each scored attempt is counted, so the five reasons add up to the replies. A request with no reply is a failed request (sent again) or one the endpoint refused for a request field it does not take (sent again without the field).
 
-No reply came back content_filter in any arm.
+No reply came back content_filter in any arm. The provider's image filter answered 209 requests in 39 attempts with HTTP 400 (refusals.csv). A refused request got no reply, so none is a content_filter reply: 8 requests in 2 scored attempts are in the table's requests with no reply; 76 requests in 15 attempts of 5 unscored episodes are in their requests_no_reply in unscored.csv; 125 requests in 22 other attempts of episodes scored on a later attempt are counted nowhere as requests with no reply (lost_attempts.csv lists those attempts).
 
 ## Episodes that ended without a score
 

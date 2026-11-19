@@ -8,7 +8,8 @@ for extension_libero10_development/ it writes counts only. The rules are in RULE
 
 usage: recompute.py [--name NAME] [--check]
   --check  writes nothing; exits 1 if the files on disk differ from what the CSV files give
-  either way it exits 1 if a row of a cells.csv no longer matches its content hash
+  either way it exits 1 if a row of a cells.csv no longer matches its content hash, or if a row of an episodes.csv
+  has replies by finish reason (the five replies_* columns) that do not add up to its requests
 """
 import argparse, csv, json, math, os, sys
 from fractions import Fraction
@@ -443,13 +444,28 @@ def filtered_item(c, arm, f, name):
 
 
 def false_claims_filtered(cols, name):
-    """The false-claim figures read with the content filter: for each arm whose unsolved episodes ended on filtered
-    replies, whether a claim from the model reached any of them (ended_by claim), and its rate per unsolved episode
-    with and without those episodes beside the other arm's; then the pooled rate over every model and without the
-    models of those arms."""
+    """The false-claim figures read with the content filter, descriptive (no rule declared these readings): for each
+    arm whose unsolved episodes ended on filtered replies, whether a claim from the model reached any of them
+    (ended_by claim), and its rate per unsolved episode with and without those episodes beside the other arm's; then
+    the model's two arms compared per unsolved episode twice, with each arm's such episodes counted and left out:
+    when the two comparisons point opposite ways the comparison is read neither way, else the rates are printed with
+    no verdict. Then the pooled rate over every model and without the models of those arms."""
     hit = [(c, arm, f) for c, arm, f in filtered_arms(cols) if f["ended_unsolved"]]
     if not hit:
         return []
+    label = "(descriptive; no rule declared this reading)"
+
+    def rate(c, arm):
+        s, f = c.stats(arm), finish(c, arm)
+        n = s["unsolved"] - f["ended_unsolved"]
+        return (s["false_claims"] - f["ended_false_claims"]) / n if n else None
+
+    def way(a, b):
+        return None if a is None or b is None else (a > b) - (a < b)
+
+    def fmt(v):
+        return "no rate (no unsolved episode left)" if v is None else f"{v:.3f}"
+
     L = []
     for c, arm, f in hit:
         other = "with" if arm == "without" else "without"
@@ -459,7 +475,10 @@ def false_claims_filtered(cols, name):
         by_model = sum(1 for e in ended_un if e["ended_by"] == "claim")
         whole = all(e["ended_by"] == "stopped_calling_tools" and int(e["content_filter_at_end"]) >= STOP_STREAK
                     for e in ended_un)
-        L.append(f"- Read with the content filter: {c.model} {arm} {name} ended {f['ended_unsolved']} of its "
+        raw = per_unsolved(w), per_unsolved(wo)              # with, without: every unsolved episode counted
+        adj = rate(c, "with"), rate(c, "without")            # each arm's such unsolved episodes left out
+        opposite = {way(*raw), way(*adj)} == {1, -1}
+        L.append(f"- Read with the content filter {label}: {c.model} {arm} {name} ended {f['ended_unsolved']} of its "
                  f"{s['unsolved']} unsolved episodes on filtered replies, and "
                  + (("no claim from the model reached any of them"
                      + (": every reply that ended them came back content_filter, with no text and no tool call."
@@ -470,11 +489,12 @@ def false_claims_filtered(cols, name):
                  + f" Its false claims per unsolved episode: {s['false_claims']} of {s['unsolved']} "
                  f"({r3(s['false_claims'], s['unsolved'])}) with them counted, {fl} of the {left} "
                  f"that did not end that way ({r3(fl, left) or 'none left'}); {other} {name}, "
-                 f"{o['false_claims']} of {o['unsolved']} ({r3(o['false_claims'], o['unsolved'])}). Its "
-                 f"{w['false_claims']} against {wo['false_claims']} false claims in all, and "
-                 f"{r3(w['false_claims'], w['unsolved'])} against {r3(wo['false_claims'], wo['unsolved'])} per "
-                 f"unsolved episode, therefore cannot be read as {name} {'raising' if arm == 'without' else 'lowering'} "
-                 f"them.")
+                 f"{o['false_claims']} of {o['unsolved']} ({r3(o['false_claims'], o['unsolved'])}). With {name} "
+                 f"against without, {c.model} made {w['false_claims']} against {wo['false_claims']} false claims in "
+                 f"all, and per unsolved episode {fmt(raw[0])} against {fmt(raw[1])} with them counted, "
+                 f"{fmt(adj[0])} against {fmt(adj[1])} with them left out."
+                 + (" The two readings point opposite ways, so the comparison measures the filter as much as the "
+                    "model and is read neither way." if opposite else ""))
     out = {c.model for c, _, _ in hit}
     rest = [c for c in cols if c.model not in out]
 
@@ -483,11 +503,6 @@ def false_claims_filtered(cols, name):
         fo, uo = sum(c.stats("without")["false_claims"] for c in cs), sum(c.stats("without")["unsolved"] for c in cs)
         return f"{fw} in {uw} ({r3(fw, uw)}) with {name} against {fo} in {uo} ({r3(fo, uo)}) without"
 
-    def rate(c, arm):
-        s, f = c.stats(arm), finish(c, arm)
-        n = s["unsolved"] - f["ended_unsolved"]
-        return (s["false_claims"] - f["ended_false_claims"]) / n if n else None
-
     hi = [c for c in cols if per_unsolved(c.stats("with")) is not None and per_unsolved(c.stats("without")) is not None
           and per_unsolved(c.stats("with")) >= per_unsolved(c.stats("without"))]
     hi2 = [c for c in cols if rate(c, "with") is not None and rate(c, "without") is not None
@@ -495,17 +510,49 @@ def false_claims_filtered(cols, name):
     M = len(cols)
     L.append(f"- The pooled rate per unsolved episode, over all {M} models: {pool(cols)}; with "
              f"{joined(sorted(out))} left out (both arms, so each pool holds the same {len(rest)} models): "
-             f"{pool(rest)}. With each arm's unsolved episodes that ended on filtered replies left out of its count, "
-             f"the arm with {name} claims falsely as often or more for {len(hi2)} of the {M} models, against "
-             f"{len(hi)} with them counted"
+             f"{pool(rest)} {label}. With each arm's unsolved episodes that ended on filtered replies left out of its "
+             f"count, the arm with {name} claims falsely as often or more for {len(hi2)} of the {M} models {label}, "
+             f"against {len(hi)} with them counted"
              + ("; most, either way" if 2 * len(hi) > M and 2 * len(hi2) > M else
                 "; not most, either way" if 2 * len(hi) <= M and 2 * len(hi2) <= M else
                 "; the two counts fall on either side of most, and the rule reads the count with them") + ".")
     return L
 
 
-def finish_table(cols, name):
-    """Every arm's replies by finish reason, over its scored episodes, with its requests that got no reply."""
+def refused_note(cols, refused):
+    """Where the requests of refusals.csv (HTTP 400 from the provider's image filter) are counted: a refused request
+    got no reply, so it is a request with no reply in the scored attempt (episodes.csv) or in an unscored episode's
+    attempts (unscored.csv), and in no count when its attempt is in no row. Empty when the list has no refusal."""
+    if not refused:
+        return ""
+    by = {c.model: c for c in cols}
+    n = lambda k, word: f"{k:,} {word}{'' if k == 1 else 's'}"
+    groups = {"scored": [], "unscored": [], "other": []}
+    for r in refused:
+        a = by[r["model"]].arm[r["arm"]]
+        groups["scored" if int(r["scored_attempt"]) else "unscored" if r["cell"] in a["unscored"] else
+               "other"].append(r)
+    q = {k: sum(int(r["refused_requests"]) for r in rs) for k, rs in groups.items()}
+    parts = []
+    if groups["scored"]:
+        parts.append(f"{n(q['scored'], 'request')} in {n(len(groups['scored']), 'scored attempt')} are in the "
+                     f"table's requests with no reply")
+    if groups["unscored"]:
+        eps = len({(r["model"], r["arm"], r["cell"]) for r in groups["unscored"]})
+        parts.append(f"{n(q['unscored'], 'request')} in {n(len(groups['unscored']), 'attempt')} of "
+                     f"{n(eps, 'unscored episode')} are in their requests_no_reply in unscored.csv")
+    if groups["other"]:
+        parts.append(f"{n(q['other'], 'request')} in {n(len(groups['other']), 'other attempt')} of episodes scored "
+                     f"on a later attempt are counted nowhere as requests with no reply (lost_attempts.csv lists those "
+                     f"attempts)")
+    return (f" The provider's image filter answered {n(sum(q.values()), 'request')} in "
+            f"{n(len(refused), 'attempt')} with HTTP 400 (refusals.csv). A refused request got no reply, so none is "
+            f"a content_filter reply: " + "; ".join(parts) + ".")
+
+
+def finish_table(cols, name, refused=()):
+    """Every arm's replies by finish reason, over its scored episodes, with its requests that got no reply; with the
+    list's refusals.csv rows, where the requests the image filter refused are counted."""
     T = ["| model | arm | replies | tool_calls | stop | length | content_filter | other | requests with no reply | "
          "scored episodes with a content_filter reply | ended on content_filter replies |",
          "|---|---|---|---|---|---|---|---|---|---|---|"]
@@ -526,7 +573,8 @@ def finish_table(cols, name):
           (f"{len(fa)} of the {2 * len(cols)} arms had a content_filter reply: "
            + "; ".join(filtered_item(c, arm, f, name) for c, arm, f in fa) + "." if fa else
            "No reply came back content_filter in any arm.")
-          + (" The unscored episodes' replies are in unscored.csv, per episode." if un else ""), ""]
+          + (" The unscored episodes' replies are in unscored.csv, per episode." if un else "")
+          + refused_note(cols, refused), ""]
     return T
 
 
@@ -707,12 +755,14 @@ def grid_first(cols, name, fam, N, cells, uns, lost):
                     f"before any control step.")
             some = sum(1 for k in ends if k)
             if some:
+                short = sorted({k for k in ends if k})
                 line += (f" {'All' if some == len(stop) else f'{some} of those'} {len(stop)} ended on content_filter "
                          f"replies"
                          + (f": in {'every one' if whole == some else f'{whole} of them'}, the {STOP_STREAK} replies "
                             f"with no tool call that ended it were all ones the provider's content filter stopped."
                             if whole else
-                            f", the last {joined(sorted({str(k) for k in ends if k}))} replies of each that did."))
+                            f", but in each only the last {' or '.join(str(k) for k in short)} of the {STOP_STREAK} "
+                            f"replies with no tool call that ended it came back content_filter."))
             if arm == "without" and 2 * stop_un > unsolved:
                 line += (f" {stop_un} of the {unsolved} start states it did not solve without {name} ended that way, "
                          f"so its gain on SOLVED ({st[c.model, 'with']['solved']} against "
@@ -1952,7 +2002,8 @@ def write_ext_list(L, lists, order, settled, name, grid_cols, check, changed):
     st = stopped_lines(L, name)
     if st:
         T += [""] + st
-    T += ["", "## How the replies ended (finish reason), scored episodes", ""] + finish_table(L.cols, name)[:-1]
+    T += (["", "## How the replies ended (finish reason), scored episodes", ""]
+          + finish_table(L.cols, name, L.refused)[:-1])
     T += ["", "## Episodes that ended without a score", ""] + unscored_lines(L, name)
     T += ["", "## What these numbers allow a sentence to say", "",
           "Each sentence after the lines at the top of this file, with the LIBERO-10 line wherever a LIBERO-10 number "
@@ -2042,12 +2093,25 @@ def main():
             if bad:
                 broken.append(f"{os.path.relpath(os.path.join(folder, 'cells.csv'), HERE)} ({bad} rows whose hash "
                               f"does not match)")
+        # every reply of a scored attempt has one finish reason, so the five replies columns add up to requests;
+        # a row where they do not (or one left blank) fails the run, with or without --check
+        if os.path.exists(os.path.join(folder, "episodes.csv")):
+            off = 0
+            for e in load(folder, "episodes.csv"):
+                v = [e.get(f"replies_{k}") or "" for k in FINISH]
+                off += not all(x.isdigit() for x in v) or not e["requests"].isdigit() \
+                    or sum(map(int, v)) != int(e["requests"])
+            print(f"{os.path.relpath(folder, HERE)}: episodes.csv, {off} scored rows whose replies by finish reason do "
+                  f"not add up to requests")
+            if off:
+                broken.append(f"{os.path.relpath(os.path.join(folder, 'episodes.csv'), HERE)} ({off} scored rows "
+                              f"whose replies by finish reason do not add up to requests)")
     if ns.check:
         print("differs from the CSV files: " + (", ".join(changed + broken) if changed or broken else "nothing"))
         return 1 if changed or broken else 0
     print("written: " + (", ".join(changed) if changed else "nothing changed"))
     if broken:
-        print("cells.csv no longer matches its hashes: " + ", ".join(broken))
+        print("the CSV files fail their own checks: " + ", ".join(broken))
         return 1
     return 0
 

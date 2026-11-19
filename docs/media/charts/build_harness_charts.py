@@ -39,7 +39,8 @@ The form of both charts:
     only when every model's arm without Cerulion had the lower cached share of input, else that count;
   - both footers name every arm that had a reply the provider's content filter stopped (finish reason
     content_filter, the package's filtered_arms()): an arm whose scored episodes ended on such replies by
-    name with its counts, the other arms by count.
+    name with its counts, the other arms by count, every count of replies over scored and unscored
+    episodes together.
 """
 import decimal
 import html
@@ -202,13 +203,17 @@ def fewer_footer(rows, joined):
 
 def filter_footer(filtered):
     """The arms with a reply the provider's content filter stopped: each one whose scored episodes ended on such
-    replies by name with its counts, the rest by count. Wrapped to the footer's width (the widest line drawn)."""
+    replies by name with its counts, the rest by count. Every count of replies is over the arm's scored and
+    unscored episodes together (the package's filtered_item() gives the two apart), for the named arms and the
+    rest alike. Wrapped at 140 characters a line, never at a hyphen: a fixed count of characters, not a measured
+    width, and the other footer lines are not wrapped."""
     named = [(c, arm, f) for c, arm, f in filtered if f["ended"]]
     rest = [f for c, arm, f in filtered if not f["ended"]]
     s = []
     for c, arm, f in named:
-        s.append(f"{c.model} {arm} {NAME}: the provider's content filter stopped {f['content_filter']:,} of its "
-                 f"{f['replies']:,} replies; {len(f['ended'])} of its {c.stats(arm)['scored']} scored episodes ended "
+        s.append(f"{c.model} {arm} {NAME}: the provider's content filter stopped {f['filtered']:,} of its "
+                 f"{f['replies'] + f['unscored_replies']:,} replies; {len(f['ended'])} of its "
+                 f"{c.stats(arm)['scored']} scored episodes ended "
                  f"on them" + (", with no claim from the model."
                                if not any(e["ended_by"] == "claim" for e in f["ended"]) else "."))
     if rest:
@@ -220,7 +225,7 @@ def filter_footer(filtered):
                  + ", ending no scored episode.")
     if not s:
         return []
-    return textwrap.wrap(" ".join(s), 140)
+    return textwrap.wrap(" ".join(s), 140, break_on_hyphens=False)
 
 
 def scope(cells, task_rows):

@@ -66,7 +66,8 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 - [RULES.md](RULES.md): the reading rules, each frozen before the rows of its own lists.
 - recompute.py: computes every SUMMARY.md, summary.csv, paired.csv and task_rows.csv again from the CSV files,
   with Python 3 and its standard library only. With `--check` it writes nothing and says whether the files still
-  match. Either way it fails if a row of a cells.csv no longer matches its content hash.
+  match. Either way it fails if a row of a cells.csv no longer matches its content hash, or if the five replies
+  columns of a row of an episodes.csv do not add up to its `requests`.
 
 ## Files
 
@@ -115,14 +116,14 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 | tokens_cache_write | of those, the tokens the endpoint reported as written to its cache (priced at the write rate where the table has one) |
 | tokens_out | output tokens, reasoning tokens included |
 | failed_requests | requests the endpoint refused or dropped; each was sent again |
-| ended_by | how the episode ended: the model's claim, the episode ending under it, the model no longer calling tools, or a budget |
+| ended_by | how the episode ended: the model's claim, the episode ending under it, the model no longer calling tools (`stopped_calling_tools`; content_filter_at_end says whether the provider's content filter stopped the replies that ended it), or a budget |
 | problems | rows the scorer flagged (an episode with one is not clean) |
 | replies_tool_calls | replies of the scored attempt whose finish reason, as the model endpoint returned it, was `tool_calls`: a reply with a tool call |
 | replies_stop | replies whose finish reason was `stop`: the reply ended on its own |
 | replies_length | replies whose finish reason was `length`: the reply was cut off at the output limit |
 | replies_content_filter | replies whose finish reason was `content_filter`: the provider's content filter stopped the reply, and every such reply here came back with no text and no tool call |
 | replies_other | replies with any other finish reason; the five replies columns add up to `requests` |
-| requests_no_reply | requests of the scored attempt that got no reply: a failed request (counted in failed_requests, sent again) or one the endpoint refused for a request field it does not take (sent again without the field) |
+| requests_no_reply | requests of the scored attempt that got no reply, not counted in `requests` (which counts replies): a failed request (counted in failed_requests, sent again) or one the endpoint refused for a request field it does not take (sent again without the field); in unscored.csv they also include the request each attempt ended on, a failure or one the 90 minute clock cut off, which was not sent again |
 | content_filter_at_end | the replies in a row at the end of the scored attempt that came back `content_filter`, 0 when its last reply did not; three replies in a row with no tool call end an episode, so 3 or more on an episode that ended `stopped_calling_tools` means the provider's content filter stopped every reply that ended it |
 
 ## How the episodes ran
@@ -198,8 +199,9 @@ is in cells.csv, and the success predicate was false at reset on every one.
 - The provider's content filter stopped many of Claude Fable 5.2's replies in its arm without Cerulion and
   none in its arm with Cerulion. A stopped reply comes back with finish reason `content_filter`, and most of
   that arm's episodes ended on three of them in a row, with no claim from the model. SUMMARY.md names every
-  arm with such a reply under "Read these first", with its counts and the false-claim rates read with them;
-  episodes.csv counts every reply by its finish reason.
+  arm with such a reply under "Read these first", with its counts; only an arm whose unsolved episodes ended
+  on filtered replies also gets its false-claim rates read with them. episodes.csv counts every reply by its
+  finish reason.
 - On the LIBERO-10 list the provider's image filter refused GPT-6 Astra's `without` arm, and only that arm, on
   tasks 4 and 6 (HTTP 400, "Image processing blocked due to content policy violation"). No start state was run
   again for it: the requests reached the provider and were answered. GPT-6 Astra's LIBERO-10 SOLVED and FALSE
