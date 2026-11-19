@@ -465,6 +465,9 @@ pub struct BagWriter<S: WritevSink = FileSink> {
     file_msg_end: Option<u64>,
 
     finalized: bool,
+    /// Set by [`abandon`](Self::abandon): the caller removes the file, so
+    /// `Drop` logs nothing about the bag being unfinished.
+    abandoned: bool,
 
     /// TEST SEAM (`test-helpers` feature): make the next `n` CONTENT-bearing
     /// [`flush_chunk`](Self::flush_chunk) calls fail exactly as a `writev(2)`
@@ -868,6 +871,7 @@ impl<S: WritevSink> BagWriter<S> {
             file_msg_start: None,
             file_msg_end: None,
             finalized: false,
+            abandoned: false,
             #[cfg(any(test, feature = "test-helpers"))]
             fault_inject_flush_skip: 0,
             #[cfg(any(test, feature = "test-helpers"))]
@@ -1867,6 +1871,24 @@ impl<S: WritevSink> BagWriter<S> {
         self.finalized = true;
         Ok(())
     }
+
+    /// Close the writer WITHOUT finishing the bag, for a caller that is about
+    /// to delete the file.
+    ///
+    /// Nothing more is written: the open chunk is dropped unwritten and no
+    /// DataEnd, summary or footer follows, so the file keeps exactly the bytes
+    /// already written. The sink is dropped before this returns (a
+    /// [`FileSink`] closes its file). Unlike a writer dropped without
+    /// [`finalize`](Self::finalize), an abandoned one logs no warning that the
+    /// bag is unfinished.
+    ///
+    /// This never removes the file: the caller removes it after this returns.
+    /// A caller that keeps the unfinished file should drop the writer instead,
+    /// whose warning says the bag has no summary and is readable only up to
+    /// its last flushed chunk.
+    pub fn abandon(mut self) {
+        self.abandoned = true;
+    }
 }
 
 // ===========================================================================
@@ -1937,7 +1959,7 @@ impl<S: WritevSink> BagWriter<S> {
 
 impl<S: WritevSink> Drop for BagWriter<S> {
     fn drop(&mut self) {
-        if !self.finalized {
+        if !self.finalized && !self.abandoned {
             tracing::warn!(
                 "BagWriter dropped without finalize(): the bag has no summary/footer and is only \
                  crash-recoverable up to the last flushed chunk"
