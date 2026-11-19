@@ -154,8 +154,8 @@ Run from the workspace root, in order:
       Homebrew formula carry `cerulion`, `cerulion-netd`, `cerulion-connectd`
       and `cerulion-remoted`, and from 2.1.0 the agent harness tree `harness/`
       beside them, staged from the tagged tree by `tools/scripts/stage_harness.sh`,
-      which leaves out its development files (its tests, ignore files and
-      coding-agent instruction files) and removes group and other write. `./tools/scripts/install.sh --self-test`,
+      which leaves out its development files (its tests, its git ignore file and
+      its coding-agent instruction files) and removes group and other write. `./tools/scripts/install.sh --self-test`,
       `./tools/scripts/test_render_homebrew_formula.sh`,
       `./tools/scripts/stage_harness.sh --self-test` and, on Linux,
       `./tools/scripts/test_build_deb.sh` check the lists; the install

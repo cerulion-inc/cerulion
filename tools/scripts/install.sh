@@ -2593,12 +2593,17 @@ RUST_EOF
         -C "$harness_loose_control")
     [ -n "$(find "$harness_loose_control" -perm -0002 -print)" ] ||
         die "self-test: the loose harness fixture extracts with no entry others can write"
-    harness_loose_dir="$harness_root/loose-install"
+    # The install directory and the two folders above it are all new, so
+    # each must come out without group or other write.
+    harness_loose_dir="$harness_root/loose-parent/nested/install"
     (umask 000 && harness_install loose "$harness_loose_dir" loose) ||
         die "self-test: the install of a loose harness tree failed: $(cat "$harness_root/loose-error")"
-    if [ -n "$(find "$harness_loose_dir" -prune \( -perm -0020 -o -perm -0002 \) -print)" ]; then
-        die "self-test: the install directory created under umask 000 is writable by group or others"
-    fi
+    for harness_loose_new in "$harness_root/loose-parent" "$harness_root/loose-parent/nested" \
+        "$harness_loose_dir"; do
+        if [ -n "$(find "$harness_loose_new" -prune \( -perm -0020 -o -perm -0002 \) -print)" ]; then
+            die "self-test: $harness_loose_new, created under umask 000, is writable by group or others"
+        fi
+    done
     harness_loose_writable=$(find "$harness_loose_dir/harness" \( -perm -0020 -o -perm -0002 \) -print)
     [ -z "$harness_loose_writable" ] ||
         die "self-test: group or others can write the installed $harness_loose_writable"
@@ -2610,10 +2615,22 @@ RUST_EOF
     chmod 0777 "$harness_open_dir"
     harness_install first "$harness_open_dir" open ||
         die "self-test: the install into a directory others can write failed: $(cat "$harness_root/open-error")"
-    grep -Fq "other users can write $harness_open_dir, so cerulion rcp will not use the harness installed there" \
+    grep -Fq "every user can write $harness_open_dir, so cerulion rcp will not use the harness installed there" \
         "$harness_root/open-error" ||
         die "self-test: the install did not name a directory others can write: $(cat "$harness_root/open-error")"
     chmod 0755 "$harness_open_dir"
+    # A --dir that is a link to a directory only its owner can write is read
+    # through the link: the link's own mode, which Linux reports as 0777,
+    # names nothing.
+    harness_link_target="$harness_root/link-target-install"
+    mkdir -p "$harness_link_target"
+    chmod 0755 "$harness_link_target"
+    ln -s "$harness_link_target" "$harness_root/link-dir-install"
+    harness_install first "$harness_root/link-dir-install" link-dir ||
+        die "self-test: the install through a linked --dir failed: $(cat "$harness_root/link-dir-error")"
+    if grep -Fq 'so cerulion rcp will not use the harness installed there' "$harness_root/link-dir-error"; then
+        die "self-test: a linked --dir only its owner can write was named as one every user can write"
+    fi
 
     # The move of the staged tree fails, before it moves and after it, and a
     # TERM arrives just after it: each rolls the binaries and the previous
@@ -4238,20 +4255,36 @@ else
     printf '%s\n' 'warning: this older release archive does not include automatic Rust/Cargo setup' >&2
 fi
 
-# `cerulion rcp` takes the harness beside the CLI only when no user but its
-# owner can write the CLI's directory or the harness, so a directory this run
-# creates gets no group or other write whatever the umask, and one that others
-# can already write is named.
+# `cerulion rcp` never takes the harness beside the CLI when every user can
+# write the CLI's directory or the harness, so each directory this run creates
+# gets no group or other write whatever the umask, and an install directory
+# every user can already write is named.
 install_dir_existed=0
 if [ -d "$install_dir" ]; then
     install_dir_existed=1
 fi
+# The directories mkdir -p is about to create, deepest last.
+install_dir_created=
+install_dir_walk=$install_dir
+while [ ! -d "$install_dir_walk" ] && [ ! -L "$install_dir_walk" ]; do
+    install_dir_created="$install_dir_walk
+$install_dir_created"
+    install_dir_walk=$(dirname "$install_dir_walk")
+done
 mkdir -p "$install_dir"
 if [ "$install_dir_existed" -eq 0 ]; then
-    chmod go-w "$install_dir" ||
-        die "could not set the mode of $install_dir"
-elif [ "$archive_harness" -eq 1 ] && [ -n "$(find "$install_dir" -prune -perm -0002 -print 2>/dev/null)" ]; then
-    printf 'warning: other users can write %s, so cerulion rcp will not use the harness installed there\n' \
+    install_dir_old_ifs=$IFS
+    IFS='
+'
+    set -f
+    for install_dir_new in $install_dir_created; do
+        chmod go-w "$install_dir_new" ||
+            die "could not set the mode of $install_dir_new"
+    done
+    set +f
+    IFS=$install_dir_old_ifs
+elif [ "$archive_harness" -eq 1 ] && [ -n "$(find -H "$install_dir" -prune -perm -0002 -print 2>/dev/null)" ]; then
+    printf 'warning: every user can write %s, so cerulion rcp will not use the harness installed there\n' \
         "$install_dir" >&2
 fi
 lock_path="$install_dir/.cerulion-install.lock"

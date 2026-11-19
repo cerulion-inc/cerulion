@@ -7,11 +7,12 @@
 # Copies TREE, the repository's harness/ folder, to DEST, which must not exist
 # yet, leaving out what serves development only: AGENTS.md and CLAUDE.md, the
 # instruction files for coding agents, at any depth; and at the top of the
-# tree tests/, .gitignore and .dockerignore. TREE must hold regular files and
+# tree tests/ and .gitignore. The .dockerignore the shipped container recipe
+# reads stays. TREE must hold regular files and
 # directories only: a symbolic link or any other entry is refused before
 # anything is written. Group and other write are removed from every staged
-# entry, because `cerulion` takes the harness beside its binary only when no
-# user but its owner can write that folder. Files keep their executable bits.
+# entry: `cerulion` never takes the harness beside its binary from a folder
+# that every user can write to. Files keep their executable bits.
 #
 # The release archive (release-artifacts.yml) and the Debian smoke (ci.yml)
 # stage the harness with this script, and the install smoke compares an
@@ -21,7 +22,7 @@
 set -eu
 
 # Left out at the top of the tree.
-TOP_EXCLUDED='tests .gitignore .dockerignore'
+TOP_EXCLUDED='tests .gitignore'
 # Left out wherever they are.
 ANY_DEPTH_EXCLUDED='AGENTS.md CLAUDE.md'
 
@@ -85,12 +86,12 @@ self_test() {
     mkdir -p "$work/stage"
     stage "$tree" "$dest"
     for gone in AGENTS.md CLAUDE.md measured/AGENTS.md measured/rcp/CLAUDE.md \
-        tests .gitignore .dockerignore; do
+        tests .gitignore; do
         if [ -e "$dest/$gone" ] || [ -L "$dest/$gone" ]; then
             die "self-test: the stage kept $gone"
         fi
     done
-    for kept in rcp.sh install.sh README.md measured/rcp/cell.py src/tests/keep.py; do
+    for kept in rcp.sh install.sh README.md measured/rcp/cell.py src/tests/keep.py .dockerignore; do
         cmp -s "$tree/$kept" "$dest/$kept" ||
             die "self-test: the stage lost or changed $kept"
     done
@@ -107,7 +108,7 @@ self_test() {
     # The staged tree holds exactly the kept paths, so nothing new is shipped
     # by accident.
     listing=$(cd "$dest" && find . -type f | LC_ALL=C sort | tr '\n' ' ')
-    [ "$listing" = "./README.md ./install.sh ./measured/rcp/cell.py ./rcp.sh ./src/tests/keep.py " ] ||
+    [ "$listing" = "./.dockerignore ./README.md ./install.sh ./measured/rcp/cell.py ./rcp.sh ./src/tests/keep.py " ] ||
         die "self-test: the stage holds $listing"
 
     # Refusals: a symbolic link in the tree, a destination that exists, a
