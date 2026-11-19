@@ -38,6 +38,10 @@
 //! * `IOX2_LOG_LEVEL=warn` ⇒ the cdylib reports `WARN_LEVEL` (3) — the
 //!   anti-tautology arm: the value is genuinely plumbed from the environment,
 //!   not a hardcoded constant.
+//! * `IOX2_LOG_LEVEL=warn` beside a name and a value that are not valid UTF-8,
+//!   set only in the child's environment ⇒ the build still loads the cdylib,
+//!   the host table still serves it the snapshot, and it reports `WARN_LEVEL`
+//!   (3).
 //!
 //! # The RAW-FFI half
 //!
@@ -82,7 +86,9 @@
 //! cargo test -p cerulion_core --test cdylib_iox2_log_level_test -- --test-threads=1
 //! ```
 
+use std::ffi::OsStr;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -200,7 +206,12 @@ fn subprocess_child_cdylib_level_probe() {
 /// MACRO cdylib reported for its own linked copy.
 fn child_reported_level(level: Option<&str>) -> u8 {
     assert_fixture_built();
-    child_reported_level_inner("subprocess_child_cdylib_level_probe", LEVEL_PREFIX, level)
+    child_reported_level_inner(
+        "subprocess_child_cdylib_level_probe",
+        LEVEL_PREFIX,
+        level,
+        &[],
+    )
 }
 
 /// Same, for the RAW-FFI (`test_node_cdylib`) fixture.
@@ -210,10 +221,19 @@ fn raw_ffi_child_reported_level(level: Option<&str>) -> u8 {
         "subprocess_child_raw_ffi_level_probe",
         RAWFFI_LEVEL_PREFIX,
         level,
+        &[],
     )
 }
 
-fn child_reported_level_inner(child_test: &str, prefix: &str, level: Option<&str>) -> u8 {
+/// Spawn `child_test` with `IOX2_LOG_LEVEL` set to `level` (or unset) and each
+/// of `extra` (raw bytes) added to its environment, and return the level the
+/// cdylib printed after `prefix`.
+fn child_reported_level_inner(
+    child_test: &str,
+    prefix: &str,
+    level: Option<&str>,
+    extra: &[(&[u8], &[u8])],
+) -> u8 {
     let exe = std::env::current_exe().expect("current_exe");
     let mut cmd = std::process::Command::new(exe);
     cmd.args([
@@ -237,6 +257,9 @@ fn child_reported_level_inner(child_test: &str, prefix: &str, level: Option<&str
         None => {
             cmd.env_remove("IOX2_LOG_LEVEL");
         }
+    }
+    for (name, value) in extra {
+        cmd.env(OsStr::from_bytes(name), OsStr::from_bytes(value));
     }
     let mut child = cmd.spawn().expect("spawn child");
     let mut err = child.stderr.take().expect("child stderr");
@@ -311,6 +334,30 @@ fn cdylib_honors_an_explicit_env_level() {
         reported, WARN_LEVEL,
         "IOX2_LOG_LEVEL=warn must reach the CDYLIB's own level static \
          (expected {WARN_LEVEL}); a hardcoded default would report {ERROR_LEVEL}"
+    );
+}
+
+/// A loaded cdylib reads its environment through the host table, from the
+/// snapshot the build took. With a name and a value that are not valid UTF-8
+/// set beside `IOX2_LOG_LEVEL=warn`, only in the child's environment, the build
+/// still loads the library and the library still reads `warn`.
+#[test]
+#[serial]
+fn cdylib_reads_its_env_level_beside_variables_that_are_not_utf8() {
+    assert_fixture_built();
+    let reported = child_reported_level_inner(
+        "subprocess_child_cdylib_level_probe",
+        LEVEL_PREFIX,
+        Some("warn"),
+        &[
+            (b"CER_CDYLIB_LEVEL_NOT_UTF8", b"\xff\xfe"),
+            (b"CER_CDYLIB_LEVEL_NAME_\xff", b"v"),
+        ],
+    );
+    assert_eq!(
+        reported, WARN_LEVEL,
+        "IOX2_LOG_LEVEL=warn must reach the cdylib beside variables that are not valid \
+         UTF-8 (expected {WARN_LEVEL})"
     );
 }
 

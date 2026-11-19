@@ -1,0 +1,22 @@
+{
+  "_about": "Settings of the sim server (harness/playground). A relative path is read against the harness folder; {uid} is this user's id and {cerulion_home} is CERULION_HOME, or ~/.cerulion when that is not set. data_dir keeps the history of ended episodes and, under episodes/, each episode's transcript and pictures. work_root holds each running episode's simulator files and sockets: keep it short. idle_reap: an episode with no call for longer than factor times the stated percentile of the gaps between calls is stopped, so a client that went away does not hold the simulator's memory; connect again for a new episode. lazy_records: before an episode starts, the robot body of its start state is checked for a calibration record on this machine; one that is missing is measured then, once (one to two minutes), and stored in body_records. macos_envhost: on macOS the simulator host starts through this script (Apple's OpenGL); elsewhere it renders with gl.",
+  "product_name": "Cerulion",
+  "source_url": "https://github.com/cerulion-inc/cerulion",
+  "snapshot_root": "measured/rcp",
+  "bench_root": "bx",
+  "body_records": "body_records",
+  "data_dir": "{cerulion_home}/sim",
+  "work_root": "/tmp/pg{uid}",
+  "body_record_module": "cerulion_harness.body_record",
+  "gl": "osmesa",
+  "macos_envhost": ["macos/envhost_macos.sh", "{runtime}", "{env_sock}", "{scoring}", "{gl}"],
+  "env": {"OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "LP_NUM_THREADS": "2"},
+  "idle_reap": {"factor": 10, "percentile": 99, "gap_at_percentile_s": 43.02, "gaps_counted": 2386, "source": "72 model-driven episodes of this server on Linux x86-64, read 2026-11-18 from each episode's own record: a gap runs from the end of one tool call or resource read to the arrival of the next, with no call in flight; 2,386 gaps, median 5.85 s, 99th percentile 43.02 s (nearest rank), longest 104 s"},
+  "lazy_records": true,
+  "default_state": "bowl-on-plate",
+  "states": {
+    "bowl-on-plate": {"cell": "pro_spatial_swap_t00_i00 libero_pro libero_spatial_swap 0 0 swap", "title": "Pick up a bowl and place it on the plate"},
+    "open-drawer": {"cell": "pro_goal_swap_t00_i00 libero_pro libero_goal_swap 0 0 swap", "title": "Open the middle drawer of the cabinet", "note": "the hard one"},
+    "soup-in-basket": {"cell": "pro_object_swap_t00_i00 libero_pro libero_object_swap 0 0 swap", "title": "Pick up a can and place it in the basket"}
+  }
+}

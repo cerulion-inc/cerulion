@@ -124,9 +124,10 @@ pub const CISCO_CDN_BASE: &str = "https://ciscobinary.openh264.org/";
 ///
 /// # Provenance
 ///
-/// These are `openh264-sys2` 0.9.7's `src/blobs/hashes.txt` — the exact list
-/// [`openh264::OpenH264API::from_blob_path`] checks a file against before it will
-/// load it. Taking them from there rather than from a release note means the
+/// These are the OpenH264 2.6.0 entries of `openh264-sys2`'s embedded hash list
+/// (`src/blobs/hashes-2.6.0.txt` from 0.9.10, `src/blobs/hashes.txt` before), the
+/// exact list [`openh264::OpenH264API::from_blob_path`] checks a file against
+/// before it will load it. Taking them from there rather than from a release note means the
 /// fetcher cannot pin a digest the loader would then reject.
 ///
 /// Every entry was independently MEASURED (2026-07-28) by fetching

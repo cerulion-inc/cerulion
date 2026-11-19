@@ -298,8 +298,14 @@ read its body made stands down by name once a count passes that queue (a
 `stand_down` of code `latest_unfired_since_anchor`, which also prints a warning
 on stderr and changes no exit code), because a node that
 returned `NodeError::Fatal` before the pass's anchor records exactly
-that, and so does a running node the scheduler never fired in the pass: the bag
-records no stop and the anchor does not stamp each node's stopped state. A
+that, and so does a running node the scheduler never fired in the pass, and the
+recording does not state which it was: the bag is below trace format 10 and the
+node's checkpoint part carries no stopped flag, or the checkpoint holds no
+complete part for the node (a node that saves no state, or a skipped or torn
+part). From trace format 10 every complete checkpoint part of a stopped node
+carries the stopped flag, and a resumed pass keeps such a node stopped and
+judges no fire of it, and judges a node the checkpoint states as running in
+full. A
 from-start pass re-executes the stop, and a node that fires or reads in its
 body anywhere in a resumed pass is still judged. A `--verify` replay of a
 one-rank bag this build recorded mid-run is refused before its first step when
