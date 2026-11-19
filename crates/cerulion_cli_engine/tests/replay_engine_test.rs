@@ -54933,3 +54933,117 @@ fn an_unheld_relay_on_a_bag_that_states_its_drain_carries_no_caveat() {
     );
     assert!(!outcome.passed);
 }
+
+/// A `period_ms` source that the sink's `block` input holds. The hand
+/// oracle: `src` fires at steps 0 to 2 and the sink drains the first frame;
+/// from step 3 the sink's queue holds two frames and `src` is held at its
+/// deadline (20 ms). Each step after a sink fire (11, 21, 31, 41) `src` fires
+/// the first catch-up instant it owes and the re-check holds the rest, so its
+/// counter publishes `x` 1 to 7 and the sink drains 1 to 5. The bag carries
+/// a clean record-health stamp, so the Period rule allows for the hold where
+/// the bag shows the slot full: the step 3 fires the hold deferred are judged
+/// with it, noted once, and the replay reproduces both topics frame for frame.
+#[test]
+#[serial]
+fn a_period_source_a_block_input_in_its_rank_holds_replays_clean() {
+    let yaml = "name: bhperiod\nprefix: bhp\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: slow_block_sink_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("sink", Box::new(SlowBlockSinkNodeEntry::new())),
+        ])
+    };
+    let rec = record_uniform_with_read_log(yaml, make, &[], BH_STEPS);
+    assert_eq!(
+        bh_xs(&rec, "/bhp/src/out"),
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+    );
+    assert_eq!(bh_xs(&rec, "/bhp/sink/out"), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(bh_fire_steps(&rec, "src"), vec![0, 1, 2, 11, 21, 31, 41]);
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("bh_period.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    bh_assert_period_held_replays(&outcome, "a held period source");
+}
+
+/// A `period_ms` source held by the middle node of a `block` chain: `src` (5
+/// ms) -> `relay` (its trigger input `block`, depth 4) -> `sink` (`block`,
+/// depth 2, `throttle_ms = 50`). The sink holds the relay, and the relay's
+/// full queue holds `src`. The
+/// hand oracle: steps 0 to 2 pass one frame down the chain; `src` fills the
+/// relay's queue at steps 3 to 6 and is held from step 7; each step after a
+/// sink fire (11, 21, 31, 41) the relay fires the next frame it counted, and
+/// the step after that `src` fires one owed instant into the room it freed.
+/// No frame is lost: `src` publishes `x` 1 to 11, the relay 1 to 7, the sink
+/// 1 to 5. The bag carries a clean record-health stamp, so both rules allow
+/// for the holds where the bag shows a slot full: the step 7 fire the relay's
+/// full queue deferred is judged with the hold, noted once, and the replay
+/// reproduces the three topics frame for frame.
+#[test]
+#[serial]
+fn a_period_source_the_middle_of_a_block_chain_holds_replays_clean() {
+    let yaml = "name: bhpchain\nprefix: bhq\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: block_relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: slow_block_sink_node\n    inputs:\n      - name: inp\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(BlockRelayNodeEntry::new())),
+            ("sink", Box::new(SlowBlockSinkNodeEntry::new())),
+        ])
+    };
+    let rec = record_uniform_with_read_log(yaml, make, &[], BH_STEPS);
+    assert_eq!(
+        bh_xs(&rec, "/bhq/src/out"),
+        (1..=11).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        bh_xs(&rec, "/bhq/relay/out"),
+        (1..=7).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(bh_xs(&rec, "/bhq/sink/out"), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(
+        bh_fire_steps(&rec, "src"),
+        vec![0, 1, 2, 3, 4, 5, 6, 12, 22, 32, 42]
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), vec![0, 1, 2, 11, 21, 31, 41]);
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("bh_period_chain.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    bh_assert_period_held_replays(&outcome, "a period source held by a block chain");
+}
+
+/// Assert a held `period_ms` source replays clean: no data violation, no
+/// read-log divergence, a clean verdict, and one stand-down note, the
+/// `period_block_held` of `src`, whose rule judged on.
+fn bh_assert_period_held_replays(outcome: &ReplayOutcome, label: &str) {
+    assert_eq!(bh_violations(outcome), Vec::<String>::new(), "{label}");
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "{label}: {:?}",
+        outcome.read_log_divergence
+    );
+    assert_clean_verdict(outcome, label);
+    let stood_down: Vec<_> = outcome
+        .rederivation_notes
+        .iter()
+        .filter(|n| n.kind == replay_engine::RederivationNoteKind::StandDown)
+        .map(|n| {
+            (
+                n.subject.as_str(),
+                n.code.as_deref(),
+                n.detail.starts_with("judged with a hold allowed for: "),
+            )
+        })
+        .collect();
+    assert_eq!(
+        stood_down,
+        vec![("src", Some("period_block_held"), true)],
+        "{label}"
+    );
+}

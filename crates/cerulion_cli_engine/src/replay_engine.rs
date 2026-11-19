@@ -1946,7 +1946,10 @@ pub struct ReplayInputShortfall {
 #[serde(rename_all = "snake_case")]
 pub enum RederivationNoteKind {
     /// A decider the verifier declined to judge, so a clean report never
-    /// covers it.
+    /// covers it; or one direction of a rule withdrawn at some steps while
+    /// the rule judges the node on (`period_block_held`, and the
+    /// `suppressible_fire` of a Sync node a `block` input in its rank holds),
+    /// whose `detail` leads with "judged with a hold allowed for".
     StandDown,
     /// A credit-conservation breach — evidence about the RECORDING's
     /// accounting, which `RederivationReport::is_clean` deliberately ignores.
@@ -2017,7 +2020,8 @@ pub enum RederivationNoteKind {
 ///
 /// Several kinds, kept in one array because they all answer "what did the
 /// verifier do beyond passing or failing": a `stand_down` (a decider it
-/// declined to judge, so a clean report never covers it), a `conservation`
+/// declined to judge, so a clean report never covers it, or one direction of
+/// a rule withdrawn at some steps while it judges on), a `conservation`
 /// breach (evidence about the recording's credit accounting, which
 /// [`replay_rederive::RederivationReport::is_clean`] ignores by design), and the
 /// EVIDENCE kinds: a read-site census, a producer-label fault, the
@@ -2028,7 +2032,8 @@ pub struct RederivationNote {
     /// The rank whose pass produced it.
     pub rank: u32,
     /// Which of the [`RederivationNoteKind`]s it is — the machine token, as a
-    /// CLOSED set.
+    /// CLOSED set. A `stand_down` can withdraw one direction of a rule at some
+    /// steps while the rule judges the node on; its `detail` says which.
     ///
     /// A closed enum rather than a `String`: a free-form spelling is something
     /// a producer can get wrong and a reader has to match on literally. The
@@ -10932,7 +10937,7 @@ fn derive_trailing_refills(
 /// REFILL (`replay_rederive::fifo_step_carry`): the read log holds one pop more
 /// than fires, the burst fired at least once, and the cap or a pre-fire check
 /// that could defer the node at this step (its throttle window, or a `block`
-/// slot full by the bag's own record: `replay_rederive::FifoDeferral`) left the
+/// slot full by the bag's own record: `replay_rederive::PreFireDeferral`) left the
 /// last popped frame unfired for the next step's first fire. Derived only
 /// from the recording, on the ONE carry walk the verdict takes
 /// (`replay_rederive::FifoCarry`), which `carries` threads across steps; the

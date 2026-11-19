@@ -131,7 +131,7 @@
 # (`BlockHoldEdges`), the counted carry, the supply and the carry dispatcher
 # (`fifo_step_backlog`, `fifo_supply`, `fifo_carry_out`), the deferral
 # predicate and the per-step walk that feeds it, with the slot bound it folds
-# (`fifo_carry_deferrable`, `FifoDeferral`, `SlotBound`), the carry walk the
+# (`fifo_carry_deferrable`, `PreFireDeferral`, `SlotBound`), the carry walk the
 # verdict and the refill plan share (`FifoCarry`), the caveat a finding on a
 # node whose drain the bag does not record carries and its text
 # (`FindingCaveat`, `ScheduleFinding`), the rules that read them
@@ -153,7 +153,7 @@
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --in-diff <the change's diff of the two files> \
-#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain' \
+#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|PreFireDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain' \
 #            --cap-lints true --in-place --timeout 600 \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (in 4 shards; the unmutated baseline passed)
@@ -182,7 +182,7 @@
 #          with a value their types do not have.
 #          Re-run over the change that keeps the count at or below the
 #          slot's, in 2 shards, with
-#          `--re 'SlotBound::|FifoDeferral::|FifoCarry::|verify_fifo|\bverify\b|topic_recorded_whole|fifo_trailing_refills|PassRestore::|PassStart::'`:
+#          `--re 'SlotBound::|PreFireDeferral::|FifoCarry::|verify_fifo|\bverify\b|topic_recorded_whole|fifo_trailing_refills|PassRestore::|PassStart::'`:
 #          47 mutants: 39 caught, 4 unviable, 4 missed, three killed since.
 #          `PassRestore::with_anchor_prev_target` replaced with
 #          `Default::default()`: no vector resumed a pass through it; the
@@ -197,14 +197,14 @@
 #          `--re 'PassRestore::with_anchor_prev_target|SlotBound::step'`:
 #          29 mutants, 28 caught, 1 missed. The 4 unviable
 #          replace `PassRestore::none`, `PassRestore::start`,
-#          `FifoDeferral::step` and `FifoCarry::step` with a value their types
+#          `PreFireDeferral::step` and `FifoCarry::step` with a value their types
 #          do not have.
 #          Re-run over the change that gives a slot whose input sets
 #          `block_timeout_ms` no count and deletes the resumed pass's anchor
 #          tie (where the one missed mutant sat, a tie that changed no
 #          verdict) with `PassRestore::with_anchor_prev_target` and
 #          `PassStart`, with
-#          `--re 'local_block_holds|SlotBound::step|FifoDeferral::new|FifoCarry::new|\bverify\b|fifo_trailing_refills'`:
+#          `--re 'local_block_holds|SlotBound::step|PreFireDeferral::new|FifoCarry::new|\bverify\b|fifo_trailing_refills'`:
 #          14 mutants, 12 caught, 2 unviable, which replace
 #          `local_block_holds` with a map of an edge its type cannot default.
 #          Re-run over the change that gives a slot whose input does not
