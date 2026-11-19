@@ -3734,9 +3734,13 @@ const WINDOW_HEAD_CADENCE_STEPS: u64 = WINDOW_HEAD_CADENCE_MS * NS_PER_MS / FIXT
 /// run is then the window plus two of arm 9's cadences old.
 const WINDOW_HEAD_RUN_FRAMES: usize =
     ((WINDOW_HEAD_WINDOW_MS + 2 * WINDOW_HEAD_CADENCE_MS) * NS_PER_MS / FIXTURE_PERIOD_NS) as usize;
-/// The fewest window heads one measured capture must hold, summed over its
-/// stages: a count over fewer measures nothing.
-const WINDOW_HEAD_FLOOR: usize = 10;
+/// The fewest window heads a capture at `cadence_ms` must hold, summed over its
+/// stages: one per cadence in the rolling window, less two, since the window's
+/// start and its end can each cut one. That is 1 for a capture taken as arm 9's
+/// is and 10 at [`WINDOW_HEAD_SHORT_CADENCE_MS`], which carries the count.
+const fn window_head_floor(cadence_ms: u64) -> usize {
+    (WINDOW_HEAD_WINDOW_MS / cadence_ms).saturating_sub(2) as usize
+}
 
 /// A capture of a one-rank free-run `graph run` whose rolling window is shorter
 /// than the run's age, and the workspace it was taken in.
@@ -4010,13 +4014,14 @@ fn a_one_rank_capture_whose_window_starts_after_the_first_reads_verifies_by_read
 /// [`WINDOW_HEAD_SHORT_CADENCE_MS`], every read stage's records at each
 /// window head's step (`window_head_occupancy`) against the rim its rank
 /// manifest states. The guard: the capture holds at least
-/// [`WINDOW_HEAD_FLOOR`] window heads over its stages, no stage staged an
-/// overflow marker at a head or filled its rim there, and a `--verify` of the
-/// capture exits 0 with neither `read_log_record_dropped` nor
-/// `read_identity_batch_unattributed`. For each cadence arm, each stage prints
-/// one `WINDOW_HEADS` line, prefixed with the arm's `cadence_ms`, with its rim,
-/// its fullest head, the heads measured and the overflow markers at them
-/// (`truncated=`).
+/// [`window_head_floor`] window heads over its stages (10 at the short
+/// cadence, whose capture carries the count, and 1 for arm 9's), no stage
+/// staged an overflow marker at a head or filled its rim there, and a
+/// `--verify` of the capture exits 0 with neither `read_log_record_dropped`
+/// nor `read_identity_batch_unattributed`. For each cadence arm, each stage
+/// prints one `WINDOW_HEADS` line, prefixed with the arm's `cadence_ms` and
+/// floor, with its rim, its fullest head, the heads measured and the overflow
+/// markers at them (`truncated=`).
 #[test]
 #[serial]
 fn the_window_heads_of_the_plain_run_graph_stay_clear_of_its_stage_rims() {
@@ -4024,10 +4029,11 @@ fn the_window_heads_of_the_plain_run_graph_stay_clear_of_its_stage_rims() {
         ("plainwhb", WINDOW_HEAD_CADENCE_MS),
         ("plainwhs", WINDOW_HEAD_SHORT_CADENCE_MS),
     ] {
+        let floor = window_head_floor(cadence_ms);
         let wh = window_head_capture(stem, cadence_ms);
         let stages = window_head_occupancy(&wh.capture);
         for stage in &stages {
-            println!("cadence_ms={cadence_ms} {}", stage.line());
+            println!("cadence_ms={cadence_ms} floor={floor} {}", stage.line());
         }
         assert!(
             !stages.is_empty(),
@@ -4035,9 +4041,10 @@ fn the_window_heads_of_the_plain_run_graph_stay_clear_of_its_stage_rims() {
         );
         let heads: usize = stages.iter().map(|s| s.windows).sum();
         assert!(
-            heads >= WINDOW_HEAD_FLOOR,
-            "cadence {cadence_ms} ms: {heads} window head(s) measured, fewer than \
-             {WINDOW_HEAD_FLOOR}: {stages:?}"
+            heads >= floor,
+            "cadence {cadence_ms} ms: {heads} window head(s) measured, fewer than {floor}, \
+             what a {WINDOW_HEAD_WINDOW_MS} ms window holds at this cadence (the \
+             {WINDOW_HEAD_SHORT_CADENCE_MS} ms capture carries the count): {stages:?}"
         );
         for stage in &stages {
             assert_eq!(
