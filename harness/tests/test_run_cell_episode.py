@@ -210,7 +210,7 @@ class GoogleEndpoint(Bench):
             "reasoning_blocks": "sent back on the assistant message whose tool calls they came with, outside the "
                                 "operator's context estimate"})
         self.assertEqual(self.relays(), [{"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 0,
-                                          "requests_carrying_blocks": 0}] * 2)
+                                          "requests_carrying_blocks": 0, "relay_errors": 0}] * 2)
         self.assertEqual([(r["arm"], r["scored"], r["list_price_usd"], r["reported_usd"]) for r in doc["rows"]],
                          [("plain", True, 0.0027, None), ("rcp", True, 0.0027, None)])
 
@@ -267,7 +267,7 @@ class OpenRouter(Bench):
         doc = self.summary()
         self.assertEqual(doc["route"]["provider_only"], ["google-vertex"])
         self.assertEqual(self.relays(), [{"requests": 2, "not_reached": 0, "replies_with_reasoning_blocks": 2,
-                                          "requests_carrying_blocks": 1}])
+                                          "requests_carrying_blocks": 1, "relay_errors": 0}])
 
     def test_a_given_extra_body_is_sent_as_given(self):
         self.run_cell("--arm", "plain", "--extra-body", '{"reasoning_effort": "high"}')
@@ -329,6 +329,7 @@ class Interrupts(Bench):
         self.assert_nothing_left()
         self.assertEqual(self.summary()["interrupted"], name)
         self.assertIs(self.summary()["running_episode_stopped"], True)
+        self.assertIsNone(self.summary()["stop_problem"])
         self.assertEqual(self.summary()["rows"], [])
         self.assertEqual(self.stderr.getvalue(), f"{T} stopped by {name}: the running episode was ended and the "
                                                  f"scratch folder removed; out/summary.json holds the setups that "
@@ -360,6 +361,7 @@ class Interrupts(Bench):
         self.assertFalse(os.path.exists(self.mark))
         self.assert_nothing_left()
         self.assertIs(self.summary()["running_episode_stopped"], False)
+        self.assertEqual(self.summary()["stop_problem"], cli.STOP_TIMED_OUT)
         self.assertEqual(self.stderr.getvalue(), f"{T} stopped by SIGINT: the running episode did not stop within "
                                                  f"3 s, so its simulator may still be running; the scratch folder was "
                                                  f"removed; out/summary.json holds the setups that finished\n")
@@ -373,6 +375,7 @@ class Interrupts(Bench):
         self.assertTrue(self.gone(info["server"]), "the episode server still runs")
         self.assert_nothing_left()
         self.assertIs(self.summary()["running_episode_stopped"], False)
+        self.assertEqual(self.summary()["stop_problem"], cli.STOP_REPORTED_RUNNING)
         self.assertEqual(self.stderr.getvalue(), f"{T} stopped by SIGTERM: the episode's stop command reported part "
                                                  f"of it still running, so its simulator may still be running; the "
                                                  f"scratch folder was removed; out/summary.json holds the setups "
@@ -391,6 +394,7 @@ class Interrupts(Bench):
         self.assertFalse(os.path.exists(self.mark))
         self.assert_nothing_left()
         self.assertIs(self.summary()["running_episode_stopped"], False)
+        self.assertEqual(self.summary()["stop_problem"], cli.STOP_NOT_STARTED)
         self.assertEqual(self.stderr.getvalue(), f"{T} stopped by SIGINT: the episode's stop command could not be "
                                                  f"started, so its simulator may still be running; the scratch folder "
                                                  f"was removed; out/summary.json holds the setups that finished\n")
@@ -404,6 +408,41 @@ class Interrupts(Bench):
         self.assertIsNotNone(started[0].returncode, "the driver still runs")
         self.assertEqual(self.summary()["interrupted"], "SIGTERM")
         self.assert_nothing_left()
+
+    def test_a_signal_while_the_scratch_folder_is_made_still_removes_it(self):
+        make = cli.scratch_for   # the recording one of Bench
+
+        def scratch_for():
+            path = make()
+            os.kill(os.getpid(), signal.SIGTERM)   # once the folder exists, before run-cell holds its name
+            time.sleep(0.2)
+            return path
+
+        with mock.patch.object(cli, "scratch_for", scratch_for):
+            self.assertEqual(self.run_cell("--arm", "plain"), 143)
+        self.assertEqual(len(self.made), 1)
+        self.assertFalse(os.path.exists(self.made[0]))
+        self.assertEqual(self.stderr.getvalue(), f"{T} stopped by SIGTERM: no episode had started\n")
+        self.assertEqual(self.end.seen, [])
+
+    def test_a_first_signal_just_as_the_run_ends_still_removes_the_scratch_folder(self):
+        # The first signal lands at the last instruction before run-cell holds every signal: its handler raises
+        # there. Stood in for by the first call of hold() raising as that handler would.
+        hold, calls = cli.Signals.hold, []
+
+        def first_hold_raises(signals):
+            if not calls:
+                calls.append(signal.SIGTERM)
+                signals.seen = signal.SIGTERM
+                raise cli.Interrupted(signal.SIGTERM)
+            hold(signals)
+
+        os.environ["FAKE_DRIVER_MODE"] = "episode"   # the episode runs to its end
+        with mock.patch.object(cli.Signals, "hold", first_hold_raises):
+            self.assertEqual(self.run_cell("--arm", "plain"), 143)
+        self.assertEqual(calls, [signal.SIGTERM])
+        self.assert_nothing_left()
+        self.assertEqual(len(self.end.seen), 2)   # the episode had run to its end
 
     def test_a_signal_before_any_episode_starts(self):
         with mock.patch.object(layout, "plain_tree", side_effect=cli.Interrupted(signal.SIGINT)):

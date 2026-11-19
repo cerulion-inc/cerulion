@@ -18,11 +18,12 @@ images. The URL is read from --base-url or OPENAI_BASE_URL; the key is read from
 episode's Python processes that start with run-cell's PYTHONPATH, its driver and model client among them
 (redirects.py), and unless --no-endpoint-check is given, an endpoint that answers the test request with a
 redirect is named before any episode starts. The episode reaches the URL through a relay on the loopback address
-inside this process, which sends the model's reasoning blocks back with the tool calls they came with, so every
-route gives the model the reasoning condition of the measured runs; the operator's context estimate does not
-count those blocks (route.py). The relay follows no redirect either and passes no Location header back to the
-episode. The episode's own files name the relay's address (http://127.0.0.1:PORT/v1); summary.json names the
-URL, and the relay's address each setup used.
+inside this process, which sends the model's reasoning blocks back with the tool calls they came with, as the
+measured runs of Gemini models did with the signature Google's endpoint returns; the operator's context estimate
+does not count those blocks (route.py, which also says where the routes still differ). The relay follows no
+redirect either and passes no Location header back to the episode. The episode's own files name the relay's
+address (http://127.0.0.1:PORT/v1); summary.json names the URL (without a user name, password or query), and the
+relay's address each setup used.
 
 What it prints: a start line with the route, the object every request body adds and what one episode took in the
 measured runs; one line per model reply (UTC time, setup, reply number, control step, tokens, USD so far); each
@@ -216,15 +217,18 @@ def scratch_for(tmp=SCRATCH_PARENT):
 
 
 def endpoint_refusal(ns):
-    """One small request before any simulator starts. Returns the endpoint's own refusal as text when it answers
-    401, 402, 403 or 404 (a wrong key, an account that may not call it, a wrong URL or model name), or says so
-    when the address cannot be reached at all (its name does not resolve, or nothing listens there), or names the
-    address when it answers with a redirect, which is not followed: the key goes to the URL given and to no other.
-    Else None: every other answer or failure is left to the episode, which retries for itself."""
+    """One small request before any simulator starts, with the object every request body adds (--extra-body).
+    Returns the endpoint's own refusal as text when it answers 401, 402, 403 or 404 (a wrong key, an account that
+    may not call it, a wrong URL or model name), or says so when the address cannot be reached at all (its name
+    does not resolve, or nothing listens there), or names the address when it answers with a redirect, which is
+    not followed: the key goes to the URL given and to no other. Else None: every other answer or failure is left
+    to the episode, which retries for itself."""
     url = ns.base_url.rstrip("/")
     url = url if url.endswith("/chat/completions") else url + "/chat/completions"
     key = os.environ[ns.key_env]
     body = {"model": ns.model, "messages": [{"role": "user", "content": "Reply with the word ok."}]}
+    # Merged in as the operator merges it into every request: the test request carries what each episode request does.
+    body.update(json.loads(ns.extra_body) if ns.extra_body is not None else {})
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), method="POST",
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + key})
     local = any(h in url.split("/")[2] for h in ("127.0.0.1", "localhost", "[::1]")) if "://" in url else False
@@ -490,33 +494,13 @@ def cmd_run_cell(ns):
     own_work = ns.own_work
     with Signals() as signals:
         try:
-            refused = refusal_before_start(ns, arms)
-            if refused:
-                say(refused[1], err=True)
-                return refused[0]
-            redirects.refuse_everywhere()   # this process sends the key too: it follows no redirect from here on
-            trees = {"rcp": layout.RCP_TREE}
-            if "plain" in arms:
-                try:
-                    trees["plain"] = layout.plain_tree()
-                except (OSError, ValueError) as exc:
-                    say(f"the plain setup's code tree could not be assembled: {exc}", err=True)
-                    return 2
-            if not ns.no_endpoint_check:
-                refusal = endpoint_refusal(ns)
-                if refusal:
-                    say(f"the model endpoint did not take a test request, so no episode was started.\n  {refusal}\n"
-                        f"Check the URL ({ns.base_url}), the key in {ns.key_env} and the model name ({ns.model}).",
-                        err=True)
-                    return 2
-            if own_work:
-                ns.work = ns.work_shown = scratch_for()
-            else:
-                ns.work, ns.work_shown = os.path.abspath(ns.work), ns.work
-            return run_cell(ns, arms, trees, signals)
+            code = checked_run(ns, arms, signals)
+            # Held inside the try: a first signal before this line is handled below, and none raises after it, so
+            # the clean-up runs to its end.
+            signals.hold()
         except Interrupted as exc:
             interrupted = exc.signum
-            return 128 + exc.signum
+            code = 128 + exc.signum
         finally:
             signals.hold()
             if own_work and ns.work:
@@ -524,6 +508,36 @@ def cmd_run_cell(ns):
             if interrupted is not None:
                 say(f"{progress.utc_now()} stopped by {signal.Signals(interrupted).name}: "
                     + (stopped_text(ns, own_work) if ns.started else "no episode had started"), err=True)
+    return code
+
+
+def checked_run(ns, arms, signals):
+    """Every check before the start, then the run: its exit code."""
+    refused = refusal_before_start(ns, arms)
+    if refused:
+        say(refused[1], err=True)
+        return refused[0]
+    redirects.refuse_everywhere()   # this process sends the key too: it follows no redirect from here on
+    trees = {"rcp": layout.RCP_TREE}
+    if "plain" in arms:
+        try:
+            trees["plain"] = layout.plain_tree()
+        except (OSError, ValueError) as exc:
+            say(f"the plain setup's code tree could not be assembled: {exc}", err=True)
+            return 2
+    if not ns.no_endpoint_check:
+        refusal = endpoint_refusal(ns)
+        if refusal:
+            say(f"the model endpoint did not take a test request, so no episode was started.\n  {refusal}\n"
+                f"Check the URL ({ns.base_url}), the key in {ns.key_env} and the model name ({ns.model}).",
+                err=True)
+            return 2
+    if ns.own_work:
+        with signals.deferred():   # a signal while the folder is made is raised once ns.work names it
+            ns.work = ns.work_shown = scratch_for()
+    else:
+        ns.work, ns.work_shown = os.path.abspath(ns.work), ns.work
+    return run_cell(ns, arms, trees, signals)
 
 
 def stopped_text(ns, own_work):
@@ -540,8 +554,11 @@ def stopped_text(ns, own_work):
 
 
 def write_summary(out_dir, record):
-    with open(os.path.join(out_dir, "summary.json"), "w", encoding="utf-8") as f:
+    """summary.json, replaced whole: a reader, or an interrupt during the write, never finds part of it."""
+    path = os.path.join(out_dir, "summary.json")
+    with open(path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(record, f, indent=2, sort_keys=True)
+    os.replace(path + ".tmp", path)
 
 
 def start_lines(ns, arms, cond):
@@ -562,10 +579,10 @@ def run_cell(ns, arms, trees, signals):
         f.write(cell_line(ns.cell) + "\n")
     cond = route.condition(ns.base_url, ns.extra_body, ns.extra_body_given)
     record = {"cell": ns.cell, "model": ns.model, "budget": BUDGET, "route": cond, "rows": []}
-    write_summary(out_dir, record)
-    for text in start_lines(ns, arms, cond):
-        say(text)
     try:
+        write_summary(out_dir, record)
+        for text in start_lines(ns, arms, cond):
+            say(text)
         for arm in arms:
             if arm == "rcp":
                 problem = body_record_of(ns, out_dir, signals)
@@ -591,6 +608,7 @@ def run_cell(ns, arms, trees, signals):
     except Interrupted as exc:
         record["interrupted"] = signal.Signals(exc.signum).name
         record["running_episode_stopped"] = ns.stop_problem is None
+        record["stop_problem"] = ns.stop_problem   # None, or which of the STOP_* causes left it unconfirmed
         try:
             write_summary(out_dir, record)
         except OSError:

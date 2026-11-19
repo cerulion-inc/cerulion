@@ -189,6 +189,18 @@ class Endpoint(unittest.TestCase):
         self.assertEqual(auth, "Bearer " + KEY)
         self.assertEqual(body["model"], "gemini-3.8-flash")
 
+    def test_the_request_adds_the_object_every_request_body_adds(self):
+        # As cmd_run_cell sets it for OpenRouter: the provider pin is tried before any simulator starts.
+        ns = self.ns()
+        ns.extra_body = '{"reasoning_effort": "high", "provider": {"only": ["google-vertex"]}}'
+        self.assertIsNone(cli.endpoint_refusal(ns))
+        self.assertEqual(self.seen[0][2], {"model": "gemini-3.8-flash", "messages": [
+            {"role": "user", "content": "Reply with the word ok."}], "reasoning_effort": "high",
+            "provider": {"only": ["google-vertex"]}})
+        self.seen.clear()
+        self.assertIsNone(cli.endpoint_refusal(self.ns()))   # none set: the model and the message only
+        self.assertEqual(sorted(self.seen[0][2]), ["messages", "model"])
+
     def test_a_url_that_already_names_the_route_is_used_as_it_is(self):
         self.assertIsNone(cli.endpoint_refusal(self.ns(self.url + "/chat/completions/")))
         self.assertEqual(self.seen[0][0], "/v1/chat/completions")

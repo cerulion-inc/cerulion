@@ -4,8 +4,9 @@ endpoint, and the robot body records the harness setup reads.
 
 A process that imports this package writes no bytecode from then on: run-cell and the body record measurement
 import this package's modules and the measured code (measured/assemble.py, measured/rcp) from the harness
-folder, and leave no __pycache__ folder in it. Python compiles this file before it runs it, so only this file's
-own bytecode is still written, unless Python starts with -B or PYTHONDONTWRITEBYTECODE set."""
+folder, and write no bytecode for any of them. Python compiles this file before it runs it, so this file's own
+bytecode (src/cerulion_harness/__pycache__/__init__.*.pyc) is still written, unless Python starts with -B or with
+PYTHONDONTWRITEBYTECODE set."""
 import sys
 
 sys.dont_write_bytecode = True
