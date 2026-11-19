@@ -25428,8 +25428,7 @@ fn boundary_flags_refusal(
         detail: format!(
             "rank {rank}'s STEP_BOUNDARY record of step {step} sets flag bits {undefined:#x}, \
              which trace format {WINDOW_HEADS_MIN_TRACE_FORMAT} does not define (it defines \
-             bit 0 alone, the reopened writer runs): the bag is corrupt or its \
-             recorder does not follow trace format {WINDOW_HEADS_MIN_TRACE_FORMAT}"
+             bit 0 alone, the reopened writer runs)"
         ),
     })
 }
@@ -40950,8 +40949,7 @@ mod boundary_flag_tests {
                     format!(
                         "rank {rank}'s STEP_BOUNDARY record of step 7 sets flag bits {bits}, \
                          which trace format 11 does not define (it defines bit 0 alone, the \
-                         reopened writer runs): the bag is corrupt or its recorder does not \
-                         follow trace format 11"
+                         reopened writer runs)"
                     )
                 ),
                 other => panic!("a bag fault, RecordingInconsistent: {other:?}"),

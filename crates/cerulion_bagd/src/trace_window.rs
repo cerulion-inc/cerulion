@@ -2234,6 +2234,75 @@ mod tests {
         );
     }
 
+    /// A capture whose window head reopened every writer run: the first kept
+    /// read of each site is already the reopen annotation, here with the body
+    /// site's writer switched from 0xA to 0xB at the head, so the trim keeps
+    /// the window's records exactly as pushed, re-states no dropped note and
+    /// names the body read under 0xB. The control drops the two annotations
+    /// and gets two carried notes, so the dropped notes the carry would
+    /// re-state are present in the input.
+    #[test]
+    fn the_trim_carry_adds_nothing_before_an_annotated_first_read() {
+        use cerulion_core::flashback::resim::NamedFrame;
+        use cerulion_core::read_outcome::ReadSiteRole::{Body, Drain};
+        use cerulion_core::trace_ring::{
+            unpack_read_outcome_meta_full, READ_OUTCOME_PRODUCER, STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+        };
+        let dropped = vec![
+            boundary(3, 3_000),
+            note(3, 1, 0, 30, 0xA, Body),
+            served(3, 1, 0, 30, Body),
+            note(3, 1, 0, 31, 0xE, Drain),
+            served(3, 1, 0, 31, Drain),
+            boundary(4, 4_000),
+            served(4, 1, 0, 40, Body),
+        ];
+        let window = vec![
+            TraceRingRecord {
+                global_level: STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+                ..boundary(5, 5_000)
+            },
+            note(5, 1, 0, 50, 0xB, Body),
+            served(5, 1, 0, 50, Body),
+            note(5, 1, 0, 51, 0xE, Drain),
+            served(5, 1, 0, 51, Drain),
+        ];
+        let out = trim_to_anchor(
+            dropped.iter().chain(window.iter()).copied(),
+            &cut(4),
+            &nodes(),
+        );
+        assert_eq!(out.records, window, "no carried note, nothing reordered");
+        assert_eq!(out.discarded, 7, "steps 3 and 4 hold seven records");
+        let named = |step, writer, sequence| NamedFrame {
+            step,
+            writer,
+            sequence,
+        };
+        assert_eq!(out.named_frames, vec![named(5, 0xB, 50), named(5, 0xE, 51)]);
+
+        let unannotated: Vec<TraceRingRecord> = window
+            .iter()
+            .filter(|r| {
+                r.record_type != cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+                    || unpack_read_outcome_meta_full(r.global_level).1 != READ_OUTCOME_PRODUCER
+            })
+            .copied()
+            .collect();
+        assert_eq!(unannotated.len(), 3, "premise: the two notes are removed");
+        let control = trim_to_anchor(dropped.into_iter().chain(unannotated), &cut(4), &nodes());
+        let carried: Vec<(u64, u64)> = control
+            .records
+            .iter()
+            .filter(|r| {
+                r.record_type == cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+                    && unpack_read_outcome_meta_full(r.global_level).1 == READ_OUTCOME_PRODUCER
+            })
+            .map(|r| (r.duration_ns, r.fire_time_ns))
+            .collect();
+        assert_eq!(carried, vec![(0xA, 50), (0xE, 51)]);
+    }
+
     /// The walk names every frame a kept read consumed under the writer its
     /// site's last kept annotation names, a re-stated note included, and names
     /// nothing a reader of the bag would not look up.
