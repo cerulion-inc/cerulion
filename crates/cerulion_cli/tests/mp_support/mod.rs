@@ -1292,19 +1292,19 @@ pub fn assert_single_bag(recordings: &Path) -> PathBuf {
     bags.into_iter().next().unwrap()
 }
 
-/// One read stage's checkpoint window heads in a bag: the records it staged in
-/// each head's step, against its rim.
+/// One read stage's checkpoint windows in a bag: the records it staged in the
+/// step each window's reopened runs open at, against its rim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowHeadOccupancy {
     /// `r<rank>:<node>[<input>]/<body|drain>`.
     pub stage: String,
     /// The stage's rim, from its rank manifest's `read_log_capacities` row.
     pub rim: u32,
-    /// The most records the stage staged in one window head's step.
+    /// The most records the stage staged in one window's opening step.
     pub max_occupancy: usize,
-    /// Window heads at which the stage staged at least one record.
+    /// Windows in which the stage staged at least one record.
     pub windows: usize,
-    /// Overflow markers the stage staged at window heads.
+    /// Overflow markers the stage staged in its windows' opening steps.
     pub truncated: usize,
 }
 
@@ -1322,21 +1322,26 @@ impl WindowHeadOccupancy {
 /// role byte as `read_log_capacities` rows write it (0 body, 1 drain).
 type RimKey = (u32, String, u16, u8);
 
-/// One stage's records per window head's step, and its overflow markers there.
+/// One stage's records per window opening step, and its overflow markers there.
 #[derive(Default)]
 struct StageHeads {
     per_step: BTreeMap<u64, usize>,
     truncated: usize,
 }
 
-/// PURE: per read stage, the records each checkpoint window head held.
+/// PURE: per read stage, the records each checkpoint window opened with.
 ///
 /// A window head is a step whose STEP_BOUNDARY record on a rank sets bit 0 of
 /// `global_level` (`STEP_BOUNDARY_FLAG_RUNS_REOPENED`): its recorder reopened
-/// every read site's writer run right before that step. A stage stages one
-/// merge window per step, so the READ_OUTCOME records of a rank and a head's
-/// step that a stage holds are that head's window, each record one slot
-/// (a folded run is one record). A record belongs to the stage its rank's
+/// every read site's writer run right before that step. The head's window runs
+/// to the rank's next head, and each site's reopened run opens at its first
+/// read in it, which is in the head's own step only when the stage's node
+/// reads there. So a stage's measured step for a window is the first step of
+/// the window at which it holds READ_OUTCOME records, and its later steps and
+/// every step before the rank's first head are not measured. A stage stages one
+/// merge window per step, so the records it holds at that step are the merge
+/// window the openings land in, each record one slot (a folded run is one
+/// record). A record belongs to the stage its rank's
 /// `(node, input)` rows and its read site name, as the replay places it: the
 /// drain stage for a `drain` or `peek` site where the input owns one, else the
 /// body stage. `ranks` maps each rank
@@ -1366,22 +1371,28 @@ pub fn window_head_occupancy_of(
             }
         }
     }
-    let heads: std::collections::BTreeSet<(u32, u64)> = trace
-        .iter()
-        .filter(|r| {
-            r.record_type == RECORD_TYPE_STEP_BOUNDARY
-                && r.global_level & STEP_BOUNDARY_FLAG_RUNS_REOPENED != 0
-        })
-        .map(|r| (r.rank(), r.step))
-        .collect();
+    let mut heads: BTreeMap<u32, std::collections::BTreeSet<u64>> = BTreeMap::new();
+    for r in trace.iter().filter(|r| {
+        r.record_type == RECORD_TYPE_STEP_BOUNDARY
+            && r.global_level & STEP_BOUNDARY_FLAG_RUNS_REOPENED != 0
+    }) {
+        heads.entry(r.rank()).or_default().insert(r.step);
+    }
+    // Per stage and window head, the window's first step the stage holds a
+    // record at. A rank's ring is one FIFO, so its records arrive in step order
+    // and the first one seen for a window is at that window's first step.
+    let mut opening: BTreeMap<(RimKey, u64), u64> = BTreeMap::new();
     let mut per_stage: BTreeMap<RimKey, StageHeads> = BTreeMap::new();
     for r in trace
         .iter()
         .filter(|r| r.record_type == RECORD_TYPE_READ_OUTCOME)
     {
-        if !heads.contains(&(r.rank(), r.step)) {
+        let Some(&head) = heads
+            .get(&r.rank())
+            .and_then(|steps| steps.range(..=r.step).next_back())
+        else {
             continue;
-        }
+        };
         let node = ranks
             .get(&r.rank())
             .and_then(|(ids, _)| ids.get(r.node_idx as usize))
@@ -1399,6 +1410,9 @@ pub fn window_head_occupancy_of(
             rims.contains_key(&key),
             "no read_log_capacities row names the stage of {r:?}: {key:?}"
         );
+        if *opening.entry((key.clone(), head)).or_insert(r.step) != r.step {
+            continue;
+        }
         let entry = per_stage.entry(key).or_default();
         *entry.per_step.entry(r.step).or_default() += 1;
         if kind == READ_OUTCOME_TRUNCATED {

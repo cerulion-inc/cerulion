@@ -65,12 +65,15 @@
 //!    head, whose first boundary carries bit 0, and `--verify` feeds it by
 //!    read identity: exit 0 twice with one report, the perturbed ticker exit 1.
 //! 10. **THE WINDOW-HEAD COUNT** (`the_window_heads_of_the_plain_run_graph_stay_clear_of_its_stage_rims`):
-//!     a capture taken as arm 9's is and one at a short cadence, measured per
-//!     read stage: the records each window head's step staged against the
-//!     stage's rim, with a floor on the heads measured, no head at its rim or
-//!     with an overflow marker, and a `--verify` that refuses neither
-//!     `read_log_record_dropped` nor `read_identity_batch_unattributed`. Each
-//!     stage prints one `WINDOW_HEADS` line.
+//!     a capture taken as arm 9's is, and captures at a short cadence taken off
+//!     one run until their window heads reach a floor (a capture holds few,
+//!     since it resumes from one of the last checkpoints the recorder holds at
+//!     its close), measured per read stage: the records each window staged
+//!     where its reopened runs open, against the stage's rim, with no window
+//!     at its rim or with an overflow marker there, and a `--verify` of every
+//!     capture that refuses neither `read_log_record_dropped` nor
+//!     `read_identity_batch_unattributed`. Each stage of each capture prints
+//!     one `WINDOW_HEADS` line.
 //!
 //! Arms 1, 3 and 5 drive the DEFAULT execution mode and SAY SO
 //! (`DEFAULT_MODE_ENV`) rather than leaving it to whatever a plain run happens
@@ -3719,28 +3722,38 @@ fn a_lockstep_opt_out_one_rank_capture_stamps_lockstep_and_resims_and_verifies_b
 // ===========================================================================
 
 /// How far back the window-head runs hold their rolling window, in ms. Each
-/// run is older than this when its capture is taken, so the capture holds none
-/// of the run's first reads or their writer annotations.
+/// run is older than this when its first capture is taken, so no capture holds
+/// the run's first reads or their writer annotations.
 const WINDOW_HEAD_WINDOW_MS: u64 = 3_000;
-/// Arm 9's anchor cadence, in ms: a third of the window, so a checkpoint sits
-/// inside it.
+/// Arm 9's anchor cadence, in ms.
 const WINDOW_HEAD_CADENCE_MS: u64 = 1_000;
-/// Arm 10's short anchor cadence, in ms: five ticker periods, so its capture
-/// holds a window head every five steps.
+/// Arm 10's short anchor cadence, in ms: five ticker periods, so a capture's
+/// trace holds a window head every five steps.
 const WINDOW_HEAD_SHORT_CADENCE_MS: u64 = 250;
 /// Arm 9's cadence in ticker steps, one step per period.
 const WINDOW_HEAD_CADENCE_STEPS: u64 = WINDOW_HEAD_CADENCE_MS * NS_PER_MS / FIXTURE_PERIOD_NS;
-/// Ticker frames each run publishes before its capture, one per period: the
-/// run is then the window plus two of arm 9's cadences old.
+/// Ticker frames each run publishes before its first capture, one per period:
+/// the run is then the window plus two of arm 9's cadences old.
 const WINDOW_HEAD_RUN_FRAMES: usize =
     ((WINDOW_HEAD_WINDOW_MS + 2 * WINDOW_HEAD_CADENCE_MS) * NS_PER_MS / FIXTURE_PERIOD_NS) as usize;
-/// The fewest window heads a capture at `cadence_ms` must hold, summed over its
-/// stages: one per cadence in the rolling window, less two, since the window's
-/// start and its end can each cut one. That is 1 for a capture taken as arm 9's
-/// is and 10 at [`WINDOW_HEAD_SHORT_CADENCE_MS`], which carries the count.
-const fn window_head_floor(cadence_ms: u64) -> usize {
-    (WINDOW_HEAD_WINDOW_MS / cadence_ms).saturating_sub(2) as usize
-}
+/// The fewest window heads arm 10 measures at [`WINDOW_HEAD_SHORT_CADENCE_MS`],
+/// summed over the captures it takes off one run and over their stages.
+const WINDOW_HEAD_FLOOR: usize = 10;
+/// The most captures arm 10 takes off one run to reach its floor.
+///
+/// One capture holds few window heads whatever its window and cadence. It
+/// closes the post window (`DEFAULT_FLASHBACK_POST_WINDOW_MS`, 15 s) after its
+/// trigger and resumes from the oldest checkpoint the recorder's anchor
+/// retention still holds then. Once a checkpoint has been measured that
+/// retention's byte ceiling is `FLASHBACK_ANCHOR_GENERATIONS_TARGET` (3) times
+/// the largest one, and it evicts the oldest whole checkpoint even while a
+/// capture wants it, so a capture whose window and post window span more than
+/// three cadences resumes from one of its last three. Its trace begins at the
+/// window head after that checkpoint and holds one head per later checkpoint,
+/// the newest one's possibly past the trace's end. So each capture holds at
+/// least one head and at most three, and the floor is reached within as many
+/// captures as the floor.
+const WINDOW_HEAD_MAX_CAPTURES: usize = WINDOW_HEAD_FLOOR;
 
 /// A capture of a one-rank free-run `graph run` whose rolling window is shorter
 /// than the run's age, and the workspace it was taken in.
@@ -3752,6 +3765,33 @@ struct WindowHeadCapture {
     prefix: String,
     /// The capture's first rank-0 STEP_BOUNDARY record.
     first: TraceRingRecord,
+    /// The capture's `__cerulion/flashback.json`.
+    manifest: serde_json::Value,
+}
+
+/// A one-rank free-run `graph run` whose rolling window is shorter than its
+/// age, held for window-head captures, and the workspace it runs in.
+struct WindowHeadRun {
+    /// The workspace's tempdir, removed with the run's captures.
+    tmp: tempfile::TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    flashbacks: PathBuf,
+    prefix: String,
+    run: RunGuard,
+    stderr_path: PathBuf,
+    /// Every capture in the run's directory, the ones a gate set aside
+    /// included, so each new capture is told apart from them.
+    seen: Vec<PathBuf>,
+}
+
+/// A capture off a [`WindowHeadRun`] that passed the gates arms 6 to 8 retry on.
+struct WindowHeadTaken {
+    capture: PathBuf,
+    /// The capture's first rank-0 STEP_BOUNDARY record.
+    first: TraceRingRecord,
+    /// The capture's `__cerulion/flashback.json`.
+    manifest: serde_json::Value,
 }
 
 /// The capture's `__cerulion/recorder.json`.
@@ -3765,13 +3805,9 @@ fn capture_recorder_json(bag: &Path) -> serde_json::Value {
 }
 
 /// Run the plain graph under free run with the rolling window shortened to
-/// [`WINDOW_HEAD_WINDOW_MS`] and a checkpoint every `cadence_ms`, wait until it
-/// has published [`WINDOW_HEAD_RUN_FRAMES`] ticker frames, and capture it
-/// through `cerulion flashback`. Retried on the gates arms 6 to 8 retry on (a
-/// capture the recorder does not report loss-free, one that begins at step 0,
-/// the frames-begin-late refusal) and refused after
-/// [`CLEAN_CAPTURE_ATTEMPTS`].
-fn window_head_capture(stem: &str, cadence_ms: u64) -> WindowHeadCapture {
+/// [`WINDOW_HEAD_WINDOW_MS`] and a checkpoint every `cadence_ms`, and wait until
+/// it has published [`WINDOW_HEAD_RUN_FRAMES`] ticker frames.
+fn start_window_head_run(stem: &str, cadence_ms: u64) -> WindowHeadRun {
     let window = WINDOW_HEAD_WINDOW_MS.to_string();
     let cadence = cadence_ms.to_string();
     let env = [
@@ -3779,105 +3815,141 @@ fn window_head_capture(stem: &str, cadence_ms: u64) -> WindowHeadCapture {
         ("CERULION_FLASHBACK_WINDOW_MS", window.as_str()),
         ("CERULION_FLASHBACK_CADENCE_MS", cadence.as_str()),
     ];
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    let prefix = unique_prefix(stem);
+    build_workspace(&root, &prefix);
+    let home = root.join("home");
+    let flashbacks = root.join("flashbacks");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&flashbacks).unwrap();
+    let (mut run, stderr_path) = spawn_run(&root, &home, &flashbacks, &[], &env);
+    wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
+    await_the_worker_has_published(&format!("/{prefix}/ticker/cmd"), WINDOW_HEAD_RUN_FRAMES);
+    WindowHeadRun {
+        tmp,
+        root,
+        home,
+        flashbacks,
+        prefix,
+        run,
+        stderr_path,
+        seen: Vec::new(),
+    }
+}
+
+/// Capture `wh`'s run through `cerulion flashback`, its output files numbered
+/// `n`, and judge the capture on the gates arms 6 to 8 retry on: `Err` names
+/// the gate that set it aside (a capture the recorder does not report
+/// loss-free, one that begins at step 0, the frames-begin-late refusal).
+fn take_window_head_capture(wh: &mut WindowHeadRun, n: usize) -> Result<WindowHeadTaken, String> {
+    let out = wh.root.join(format!("flash{n}.stdout"));
+    let err = wh.root.join(format!("flash{n}.stderr"));
+    let mut flash = ChildGuard::single_process(
+        Command::new(env!("CARGO_BIN_EXE_cerulion"))
+            .args(["flashback", "--note", "window-head probe"])
+            .current_dir(&wh.root)
+            .env_remove("CARGO_TARGET_DIR")
+            .env("CERULION_NETWORK", "off")
+            .env("CERULION_HOME", &wh.home)
+            .env("CERULION_FLASHBACK_DIR", &wh.flashbacks)
+            .stdout(Stdio::from(std::fs::File::create(&out).unwrap()))
+            .stderr(Stdio::from(std::fs::File::create(&err).unwrap()))
+            .spawn()
+            .expect("spawn cerulion flashback"),
+    );
+    let flash_status = flash
+        .wait_bounded(CAPTURE_COMPLETES)
+        .unwrap_or_else(|| panic!("`cerulion flashback` never returned"));
+    assert!(
+        flash_status.success(),
+        "`cerulion flashback` must capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\n\
+         run log:\n{}",
+        read_file(&out),
+        read_file(&err),
+        read_file(&wh.stderr_path)
+    );
+    let fresh: Vec<PathBuf> = mcaps(&wh.flashbacks)
+        .into_iter()
+        .filter(|p| !wh.seen.contains(p))
+        .collect();
+    assert_eq!(
+        fresh.len(),
+        1,
+        "exactly one new capture in this run's own directory, got {fresh:?} beside {:?}",
+        wh.seen
+    );
+    let capture = fresh[0].clone();
+    wh.seen.push(capture.clone());
+
+    let loss = capture_loss_indicators(&capture, &wh.prefix).unwrap_or_else(|| {
+        panic!("a finalized capture carries `{CAPTURE_RECORDER_HEALTH_ATTACHMENT}`")
+    });
+    if !loss.is_empty() {
+        return Err(format!(
+            "the recorder does not report a loss-free capture ({})",
+            loss.join("; ")
+        ));
+    }
+    let first = first_rank0_boundary(&capture)
+        .expect("a capture with a trace carries a rank-0 STEP_BOUNDARY");
+    if first.step == 0 {
+        return Err(
+            "the capture's first rank-0 STEP_BOUNDARY is step 0, so it begins from start \
+             and holds the run's first reads"
+                .to_string(),
+        );
+    }
+    let reader = cerulion_bag::BagReader::open(&capture).expect("open the capture");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &reader
+            .attachment("__cerulion/flashback.json")
+            .expect("read the capture manifest")
+            .expect("a capture carries its own manifest")
+            .data,
+    )
+    .expect("the capture manifest is valid JSON");
+    drop(reader);
+    if let Some(reason) = frames_begin_late(&manifest, &wh.prefix) {
+        return Err(format!("frames-begin-late refusal: {reason}"));
+    }
+    assert_eq!(
+        manifest["anchor"]["resimmable"],
+        serde_json::json!(true),
+        "the capture judge's claim, which the resim must honour: {manifest}"
+    );
+    Ok(WindowHeadTaken {
+        capture,
+        first,
+        manifest,
+    })
+}
+
+/// [`start_window_head_run`] and one [`take_window_head_capture`], the run
+/// stopped once the capture is written. A capture a gate sets aside is taken
+/// again off a fresh run, and refused after [`CLEAN_CAPTURE_ATTEMPTS`].
+fn window_head_capture(stem: &str, cadence_ms: u64) -> WindowHeadCapture {
     let mut last_retry = String::new();
     for attempt in 1..=CLEAN_CAPTURE_ATTEMPTS {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let root = tmp.path().to_path_buf();
-        let prefix = unique_prefix(stem);
-        build_workspace(&root, &prefix);
-        let home = root.join("home");
-        let flashbacks = root.join("flashbacks");
-        std::fs::create_dir_all(&home).unwrap();
-        std::fs::create_dir_all(&flashbacks).unwrap();
-
-        let (mut run, stderr_path) = spawn_run(&root, &home, &flashbacks, &[], &env);
-        wait_for_log_line(&mut run.0, &stderr_path, WINDOW_HELD);
-        await_the_worker_has_published(&format!("/{prefix}/ticker/cmd"), WINDOW_HEAD_RUN_FRAMES);
-        let mut flash = ChildGuard::single_process(
-            Command::new(env!("CARGO_BIN_EXE_cerulion"))
-                .args(["flashback", "--note", "window-head probe"])
-                .current_dir(&root)
-                .env_remove("CARGO_TARGET_DIR")
-                .env("CERULION_NETWORK", "off")
-                .env("CERULION_HOME", &home)
-                .env("CERULION_FLASHBACK_DIR", &flashbacks)
-                .stdout(Stdio::from(
-                    std::fs::File::create(root.join("flash.stdout")).unwrap(),
-                ))
-                .stderr(Stdio::from(
-                    std::fs::File::create(root.join("flash.stderr")).unwrap(),
-                ))
-                .spawn()
-                .expect("spawn cerulion flashback"),
-        );
-        let flash_status = flash
-            .wait_bounded(CAPTURE_COMPLETES)
-            .unwrap_or_else(|| panic!("`cerulion flashback` never returned"));
-        assert!(
-            flash_status.success(),
-            "`cerulion flashback` must capture: {flash_status:?}\nstdout:\n{}\nstderr:\n{}\n\
-             run log:\n{}",
-            read_file(&root.join("flash.stdout")),
-            read_file(&root.join("flash.stderr")),
-            read_file(&stderr_path)
-        );
-        let captures = mcaps(&flashbacks);
-        assert_eq!(
-            captures.len(),
-            1,
-            "exactly one capture in this run's own directory, got {captures:?}"
-        );
-        let capture = captures[0].clone();
-        stop_run(&mut run, &stderr_path);
-
-        let loss = capture_loss_indicators(&capture, &prefix).unwrap_or_else(|| {
-            panic!("a finalized capture carries `{CAPTURE_RECORDER_HEALTH_ATTACHMENT}`")
-        });
-        if !loss.is_empty() {
-            last_retry = format!(
-                "attempt {attempt}: the recorder does not report a loss-free capture ({})",
-                loss.join("; ")
-            );
-            eprintln!("{last_retry}");
-            continue;
+        let mut wh = start_window_head_run(stem, cadence_ms);
+        let taken = take_window_head_capture(&mut wh, 1);
+        stop_run(&mut wh.run, &wh.stderr_path);
+        match taken {
+            Ok(taken) => {
+                return WindowHeadCapture {
+                    _tmp: wh.tmp,
+                    root: wh.root,
+                    capture: taken.capture,
+                    prefix: wh.prefix,
+                    first: taken.first,
+                    manifest: taken.manifest,
+                };
+            }
+            Err(reason) => {
+                last_retry = format!("attempt {attempt}: {reason}");
+                eprintln!("{last_retry}");
+            }
         }
-        let first = first_rank0_boundary(&capture)
-            .expect("a capture with a trace carries a rank-0 STEP_BOUNDARY");
-        if first.step == 0 {
-            last_retry = format!(
-                "attempt {attempt}: the capture's first rank-0 STEP_BOUNDARY is step 0, so it \
-                 begins from start and holds the run's first reads"
-            );
-            eprintln!("{last_retry}");
-            continue;
-        }
-        let reader = cerulion_bag::BagReader::open(&capture).expect("open the capture");
-        let manifest: serde_json::Value = serde_json::from_slice(
-            &reader
-                .attachment("__cerulion/flashback.json")
-                .expect("read the capture manifest")
-                .expect("a capture carries its own manifest")
-                .data,
-        )
-        .expect("the capture manifest is valid JSON");
-        drop(reader);
-        if let Some(reason) = frames_begin_late(&manifest, &prefix) {
-            last_retry = format!("attempt {attempt}: frames-begin-late refusal: {reason}");
-            eprintln!("{last_retry}");
-            continue;
-        }
-        assert_eq!(
-            manifest["anchor"]["resimmable"],
-            serde_json::json!(true),
-            "the capture judge's claim, which the resim must honour: {manifest}"
-        );
-        return WindowHeadCapture {
-            _tmp: tmp,
-            root,
-            capture,
-            prefix,
-            first,
-        };
     }
     panic!(
         "could not obtain a loss-free mid-run capture in {CLEAN_CAPTURE_ATTEMPTS} attempts; \
@@ -3888,11 +3960,12 @@ fn window_head_capture(stem: &str, cadence_ms: u64) -> WindowHeadCapture {
 /// Arm 9: a one-rank free-run capture whose rolling window starts after the
 /// run's first reads. The window is [`WINDOW_HEAD_WINDOW_MS`] and the run is
 /// older than that at the trigger, so the capture holds no read that opened a
-/// writer run at the run's start. A checkpoint every
-/// [`WINDOW_HEAD_CADENCE_MS`] keeps one inside the window: the capture begins
-/// at the step after it, the head of that checkpoint's window, whose rank-0
-/// boundary carries bit 0, and every read site named its writer again at its
-/// first read there. So `--verify` feeds every read by read identity (the
+/// writer run at the run's start. The capture resumes from the oldest
+/// checkpoint the recorder still holds when it closes (see
+/// [`WINDOW_HEAD_MAX_CAPTURES`]) and begins at the step after it, the head of
+/// that checkpoint's window, whose rank-0 boundary carries bit 0, and every
+/// read site named its writer again at its first read in that window. So
+/// `--verify` feeds every read by read identity (the
 /// report's `read_identity` is `fed`), passes over both graph topics and exits
 /// 0, twice with one report; the perturbed ticker is a data divergence naming
 /// its topic, exit 1.
@@ -3974,14 +4047,19 @@ fn a_one_rank_capture_whose_window_starts_after_the_first_reads_verifies_by_read
         serde_json::json!(wh.first.step),
         "the resume begins at the capture's first boundary: {report}"
     );
-    // The shortened window took effect. The window is shorter than the post
-    // window, so the capture's deadline clamps to its floor, the window's
-    // start, and the anchor is the OLDEST checkpoint at or after that floor.
-    // The run was the window plus two cadences old at the trigger, so the
-    // floor, and with it the anchor, is about two cadences into the run. The
-    // bound checked is one cadence, a floor that leaves room for step
-    // rounding and checkpoint phase. A window the run ignored reaches back
-    // past the run's start and anchors at step 0, as arms 6 and 7 do.
+    // The shortened window took effect: the capture states the span it held.
+    assert_eq!(
+        wh.manifest["window_span_ms"],
+        serde_json::json!(WINDOW_HEAD_WINDOW_MS),
+        "the capture holds the shortened window: {}",
+        wh.manifest
+    );
+    // The window is shorter than the post window, so the capture's deadline
+    // clamps to its floor, the window's start, and the anchor is the OLDEST
+    // checkpoint at or after that floor that the recorder still holds when the
+    // capture closes: a few cadences before the close, which is the post window
+    // after the trigger (see `WINDOW_HEAD_MAX_CAPTURES`). The bound checked is
+    // one cadence into the run, so the capture resumes mid-run.
     let anchor = report["resume"]["anchor_step"]
         .as_u64()
         .expect("a resumed report names its anchor step");
@@ -4010,66 +4088,111 @@ fn a_one_rank_capture_whose_window_starts_after_the_first_reads_verifies_by_read
     );
 }
 
-/// Arm 10: the window-head count. For a capture taken as arm 9's is and one at
-/// [`WINDOW_HEAD_SHORT_CADENCE_MS`], every read stage's records at each
-/// window head's step (`window_head_occupancy`) against the rim its rank
-/// manifest states. The guard: the capture holds at least
-/// [`window_head_floor`] window heads over its stages (10 at the short
-/// cadence, whose capture carries the count, and 1 for arm 9's), no stage
-/// staged an overflow marker at a head or filled its rim there, and a
-/// `--verify` of the capture exits 0 with neither `read_log_record_dropped`
-/// nor `read_identity_batch_unattributed`. For each cadence arm, each stage
-/// prints one `WINDOW_HEADS` line, prefixed with the arm's `cadence_ms` and
-/// floor, with its rim, its fullest head, the heads measured and the overflow
-/// markers at them (`truncated=`).
+/// Arm 10: the window-head count. Captures off one run at arm 9's cadence and
+/// at [`WINDOW_HEAD_SHORT_CADENCE_MS`], and for each, every read stage's records
+/// at the step each window's reopened runs open at (`window_head_occupancy`)
+/// against the rim its rank manifest states. One capture holds few window
+/// heads (see [`WINDOW_HEAD_MAX_CAPTURES`]), so the short cadence takes
+/// captures off its run until their heads reach [`WINDOW_HEAD_FLOOR`], and arm
+/// 9's cadence takes one. The guard: every capture begins at a window head and
+/// measures at least that head's window, the short cadence reaches its floor
+/// within [`WINDOW_HEAD_MAX_CAPTURES`] captures, no stage staged an overflow
+/// marker in a window's opening step or filled its rim there, and a `--verify`
+/// of every capture exits 0 with neither `read_log_record_dropped` nor
+/// `read_identity_batch_unattributed`. Each stage of each capture prints one
+/// `WINDOW_HEADS` line, prefixed with the arm's `cadence_ms`, its floor and the
+/// capture's number, with its rim, its fullest opening step, the windows
+/// measured and the overflow markers in them (`truncated=`).
 #[test]
 #[serial]
 fn the_window_heads_of_the_plain_run_graph_stay_clear_of_its_stage_rims() {
-    for (stem, cadence_ms) in [
-        ("plainwhb", WINDOW_HEAD_CADENCE_MS),
-        ("plainwhs", WINDOW_HEAD_SHORT_CADENCE_MS),
+    for (stem, cadence_ms, floor) in [
+        ("plainwhb", WINDOW_HEAD_CADENCE_MS, 1),
+        ("plainwhs", WINDOW_HEAD_SHORT_CADENCE_MS, WINDOW_HEAD_FLOOR),
     ] {
-        let floor = window_head_floor(cadence_ms);
-        let wh = window_head_capture(stem, cadence_ms);
-        let stages = window_head_occupancy(&wh.capture);
-        for stage in &stages {
-            println!("cadence_ms={cadence_ms} floor={floor} {}", stage.line());
+        let mut wh = start_window_head_run(stem, cadence_ms);
+        let mut captures = Vec::new();
+        let mut heads = 0usize;
+        let mut set_aside = 0usize;
+        while heads < floor && captures.len() < WINDOW_HEAD_MAX_CAPTURES {
+            let n = captures.len() + set_aside + 1;
+            let taken = match take_window_head_capture(&mut wh, n) {
+                Ok(taken) => taken,
+                Err(reason) => {
+                    set_aside += 1;
+                    eprintln!("cadence {cadence_ms} ms, capture {n}: {reason}");
+                    assert!(
+                        set_aside < CLEAN_CAPTURE_ATTEMPTS,
+                        "cadence {cadence_ms} ms: {set_aside} captures set aside, the last at \
+                         capture {n}: {reason}; refusing to weaken the window-head oracle"
+                    );
+                    continue;
+                }
+            };
+            assert_eq!(
+                taken.first.global_level & STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+                STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+                "cadence {cadence_ms} ms, capture {n}: a capture begins at a window head, so \
+                 its first rank-0 boundary carries bit 0: {:?}",
+                taken.first
+            );
+            let stages = window_head_occupancy(&taken.capture);
+            for stage in &stages {
+                println!(
+                    "cadence_ms={cadence_ms} floor={floor} capture={n} {}",
+                    stage.line()
+                );
+            }
+            let measured: usize = stages.iter().map(|s| s.windows).sum();
+            assert!(
+                measured >= 1,
+                "cadence {cadence_ms} ms, capture {n}: the capture begins at a window head, so \
+                 it measures at least that head's window: {stages:?}"
+            );
+            heads += measured;
+            captures.push((n, taken.capture, stages));
         }
-        assert!(
-            !stages.is_empty(),
-            "the capture states at least one read stage: cadence {cadence_ms} ms"
-        );
-        let heads: usize = stages.iter().map(|s| s.windows).sum();
+        stop_run(&mut wh.run, &wh.stderr_path);
         assert!(
             heads >= floor,
-            "cadence {cadence_ms} ms: {heads} window head(s) measured, fewer than {floor}, \
-             what a {WINDOW_HEAD_WINDOW_MS} ms window holds at this cadence (the \
-             {WINDOW_HEAD_SHORT_CADENCE_MS} ms capture carries the count): {stages:?}"
+            "cadence {cadence_ms} ms: {heads} window head(s) over {} capture(s), fewer than \
+             {floor}",
+            captures.len()
         );
-        for stage in &stages {
+        for (n, capture, stages) in &captures {
+            for stage in stages {
+                assert_eq!(
+                    stage.truncated, 0,
+                    "cadence {cadence_ms} ms, capture {n}: a window dropped records at its rim \
+                     where it opened: {stage:?}"
+                );
+                assert!(
+                    stage.max_occupancy < stage.rim as usize,
+                    "cadence {cadence_ms} ms, capture {n}: a window filled its stage to the rim \
+                     where it opened: {stage:?}"
+                );
+            }
+            let (code, resim_err) = resim(
+                &wh.root,
+                capture,
+                &["--verify"],
+                &format!("resim_heads_{n}"),
+            );
+            for cause in [
+                "read_log_record_dropped",
+                "read_identity_batch_unattributed",
+            ] {
+                assert!(
+                    !resim_err.contains(cause),
+                    "cadence {cadence_ms} ms, capture {n}: the verify refused with \
+                     {cause}:\n{resim_err}"
+                );
+            }
             assert_eq!(
-                stage.truncated, 0,
-                "cadence {cadence_ms} ms: a window head dropped records at its rim: {stage:?}"
-            );
-            assert!(
-                stage.max_occupancy < stage.rim as usize,
-                "cadence {cadence_ms} ms: a window head filled its stage to the rim: {stage:?}"
+                code,
+                Some(0),
+                "cadence {cadence_ms} ms, capture {n}: the capture verifies:\n{resim_err}"
             );
         }
-        let (code, resim_err) = resim(&wh.root, &wh.capture, &["--verify"], "resim_heads");
-        for cause in [
-            "read_log_record_dropped",
-            "read_identity_batch_unattributed",
-        ] {
-            assert!(
-                !resim_err.contains(cause),
-                "cadence {cadence_ms} ms: the verify refused with {cause}:\n{resim_err}"
-            );
-        }
-        assert_eq!(
-            code,
-            Some(0),
-            "cadence {cadence_ms} ms: the capture verifies:\n{resim_err}"
-        );
     }
 }

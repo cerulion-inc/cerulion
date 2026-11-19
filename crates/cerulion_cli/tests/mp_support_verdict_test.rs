@@ -538,21 +538,24 @@ fn an_unreaped_child_is_still_signalled_on_teardown() {
     }
 }
 
-/// `window_head_occupancy_of` counts each stage's records at the steps a
-/// rank's STEP_BOUNDARY flags as checkpoint window heads, and nowhere else.
+/// `window_head_occupancy_of` counts each stage's records at the first step of
+/// each of its rank's checkpoint windows at which the stage holds any, and
+/// nowhere else.
 ///
-/// Hand oracle. Rank 0: heads at steps 3 and 7 (bit 0), step 4 unflagged.
-/// `relay` owns one stage (rim 12): two records at step 3, three at step 4 that
-/// are not a head, and at step 7 an annotation, a read and an overflow marker.
+/// Hand oracle. Rank 0: heads at steps 3, 7 and 9 (bit 0), steps 4, 10 and 11
+/// unflagged. `relay` owns one stage (rim 12): two records at step 3, three at
+/// step 4, a later step of step 3's window, at step 7 an annotation, a read and
+/// an overflow marker, nothing at step 9, an annotation and a read at step 10,
+/// the first step of step 9's window it reads at, and one read at step 11.
 /// `sink` owns a body stage and a drain stage (rim 8 each): at step 3 one body
-/// read, one drain read and one peek, which the drain stage holds, nothing at
-/// step 7. Rank 1: its one head is step 5, and its `meter` (rim 6) reads at
-/// steps 3 and 5, so only its step-5 read is at a head, while rank 0's heads at
-/// 3 and 7 are not its own. So `relay` measures two windows of at most three
-/// records with one marker, `sink`'s body stage one window of one record and
-/// its drain stage one of two, and `meter` one window of one record.
+/// read, one drain read and one peek, which the drain stage holds, nothing
+/// after. Rank 1: its one head is step 5, and its `meter` (rim 6) reads at
+/// steps 3 and 5, so only its step-5 read is in a window, while rank 0's heads
+/// are not its own. So `relay` measures three windows of at most three records
+/// with one marker, `sink`'s body stage one window of one record and its drain
+/// stage one of two, and `meter` one window of one record.
 #[test]
-fn window_head_occupancy_counts_each_stage_at_its_ranks_flagged_steps_only() {
+fn window_head_occupancy_counts_each_stage_at_the_first_step_it_reads_in_each_window() {
     use cerulion_core::read_outcome::ReadOutcomeKind::{DrainedBatch, Served};
     use cerulion_core::read_outcome::ReadSiteRole::Peek;
     use cerulion_core::read_outcome::ReadSiteRole::{Body, Drain};
@@ -594,6 +597,12 @@ fn window_head_occupancy_counts_each_stage_at_its_ranks_flagged_steps_only() {
         TraceRingRecord::read_outcome_producer(7, 1, 0, Some(7), 0xA, Drain),
         read(7, 1, DrainedBatch, 7, Drain),
         TraceRingRecord::read_outcome_truncated(7, 1, 0, 1, Body),
+        boundary(0, 9, STEP_BOUNDARY_FLAG_RUNS_REOPENED),
+        boundary(0, 10, 0),
+        TraceRingRecord::read_outcome_producer(10, 1, 0, Some(10), 0xA, Drain),
+        read(10, 1, DrainedBatch, 10, Drain),
+        boundary(0, 11, 0),
+        read(11, 1, DrainedBatch, 11, Drain),
     ];
     let ranks = std::collections::BTreeMap::from([
         (
@@ -625,7 +634,7 @@ fn window_head_occupancy_counts_each_stage_at_its_ranks_flagged_steps_only() {
     assert_eq!(
         window_head_occupancy_of(&trace, &ranks),
         vec![
-            stage("r0:relay[0]/body", 12, 3, 2, 1),
+            stage("r0:relay[0]/body", 12, 3, 3, 1),
             stage("r0:sink[0]/body", 8, 1, 1, 0),
             stage("r0:sink[0]/drain", 8, 2, 1, 0),
             stage("r1:meter[0]/body", 6, 1, 1, 0),
