@@ -2631,6 +2631,22 @@ RUST_EOF
     if grep -Fq 'so cerulion rcp will not use the harness installed there' "$harness_root/link-dir-error"; then
         die "self-test: a linked --dir only its owner can write was named as one every user can write"
     fi
+    # A --dir whose path climbs out of a new folder with `..` reaches a folder
+    # that already exists; the install creates the rest and leaves that
+    # folder's mode as it found it, even one every user can write.
+    harness_dotdot_home="$harness_root/dotdot-home"
+    mkdir -p "$harness_dotdot_home"
+    chmod 0777 "$harness_dotdot_home"
+    (umask 000 && harness_install first "$harness_dotdot_home/missing/../made" dotdot) ||
+        die "self-test: the install through a --dir with .. failed: $(cat "$harness_root/dotdot-error")"
+    [ -n "$(find "$harness_dotdot_home" -prune -perm 0777 -print)" ] ||
+        die "self-test: the install changed the mode of an existing folder its --dir reaches with .."
+    for harness_dotdot_new in "$harness_dotdot_home/missing" "$harness_dotdot_home/made"; do
+        if [ -n "$(find "$harness_dotdot_new" -prune \( -perm -0020 -o -perm -0002 \) -print)" ]; then
+            die "self-test: $harness_dotdot_new, created under umask 000, is writable by group or others"
+        fi
+    done
+    chmod 0755 "$harness_dotdot_home"
 
     # The move of the staged tree fails, before it moves and after it, and a
     # TERM arrives just after it: each rolls the binaries and the previous
@@ -4256,34 +4272,19 @@ else
 fi
 
 # `cerulion rcp` never takes the harness beside the CLI when every user can
-# write the CLI's directory or the harness, so each directory this run creates
-# gets no group or other write whatever the umask, and an install directory
-# every user can already write is named.
+# write the CLI's directory or the harness, so every directory this run
+# creates is made with no group or other write whatever the umask, and an
+# install directory every user can already write is named. The umask, not a
+# chmod afterwards, keeps a directory that already exists (one a `..` in the
+# path reaches, say) as it is, and leaves no moment when a new one is open.
 install_dir_existed=0
 if [ -d "$install_dir" ]; then
     install_dir_existed=1
 fi
-# The directories mkdir -p is about to create, deepest last.
-install_dir_created=
-install_dir_walk=$install_dir
-while [ ! -d "$install_dir_walk" ] && [ ! -L "$install_dir_walk" ]; do
-    install_dir_created="$install_dir_walk
-$install_dir_created"
-    install_dir_walk=$(dirname "$install_dir_walk")
-done
-mkdir -p "$install_dir"
-if [ "$install_dir_existed" -eq 0 ]; then
-    install_dir_old_ifs=$IFS
-    IFS='
-'
-    set -f
-    for install_dir_new in $install_dir_created; do
-        chmod go-w "$install_dir_new" ||
-            die "could not set the mode of $install_dir_new"
-    done
-    set +f
-    IFS=$install_dir_old_ifs
-elif [ "$archive_harness" -eq 1 ] && [ -n "$(find -H "$install_dir" -prune -perm -0002 -print 2>/dev/null)" ]; then
+(umask go-w && mkdir -p "$install_dir") ||
+    die "could not create the install directory $install_dir"
+if [ "$install_dir_existed" -eq 1 ] && [ "$archive_harness" -eq 1 ] &&
+    [ -n "$(find -H "$install_dir" -prune -perm -0002 -print 2>/dev/null)" ]; then
     printf 'warning: every user can write %s, so cerulion rcp will not use the harness installed there\n' \
         "$install_dir" >&2
 fi
