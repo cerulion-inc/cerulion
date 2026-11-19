@@ -329,3 +329,23 @@ fn netd_wrapper_preserves_shared_snapshot_identity_proof_stamp_and_errors() {
     assert_eq!(shared().err(), Some(SnapshotError::Busy));
     fixture.refuse(SnapshotError::Busy);
 }
+
+#[test]
+fn empty_session_metadata_does_not_change_netd_snapshot_or_public_stamp() {
+    let fixture = Fixture::new();
+    let before = fixture.load();
+    fixture.auth(UUID, "", 0);
+    let after = fixture.load();
+    let shared = local_identity::load_with_proof(
+        fixture.dir.path(),
+        &fixture.path(STORE_LOCK_FILE),
+        &serving_login::open_read_only,
+    )
+    .unwrap();
+    assert!(!shared.session_present());
+    assert_eq!(after.account(), before.account());
+    assert_eq!(after.device_key(), before.device_key());
+    assert_eq!(after.owner_chain_wire(), before.owner_chain_wire());
+    assert!(after.stamp() == before.stamp());
+    assert!(shared.stamp() == before.stamp());
+}
