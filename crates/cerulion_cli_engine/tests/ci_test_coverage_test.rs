@@ -2048,10 +2048,11 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         .map(|(name, _)| name)
         .collect();
     // The cdylib feature is required to compile the node context migration
-    // cases; required Linux and macOS shards run this fixture's tests and
-    // build its examples.
-    // node_macro_ui is the #[cerulion_node] diagnostics suite (trybuild plus
-    // the compile-pass examples), run alone with `-p` on the same shards.
+    // cases: this fixture's integration test checks the refused shape and runs
+    // the binaries built from the accepted ones. node_macro_ui is the
+    // #[cerulion_node] diagnostics suite (trybuild plus the compile-pass
+    // binaries). Both run in the cerulion_core shard step on shard 2 of the
+    // required Linux and macOS jobs (`ci_test_shard.sh --with`).
     let allowed = BTreeSet::from(["test_node_macro_cdylib", "node_macro_ui"]);
     let unexpected: Vec<_> = fixtures
         .iter()

@@ -44,10 +44,10 @@
 # OTHER PACKAGES' TESTS RIDE THE SAME INVOCATION with `--with <package>`. A
 # package step that runs after this one adds its whole time to the leg, while
 # a test in this invocation runs beside the shard's own tests and is built by
-# the same cargo invocation. The `#[cerulion_node]` diagnostics suite rides
-# shard 2 of both lanes this way: its compile-fail test runs trybuild over its
-# fixtures for minutes, and an override in `.config/nextest.toml` starts it
-# first. An extra package adds `-p <package> --test <name>` for each of its
+# the same cargo invocation. The `#[cerulion_node]` diagnostics suite and the
+# node context helper suite ride shard 2 of both lanes this way: each holds a
+# test that runs trybuild over its fixtures, for minutes in the diagnostics
+# suite, and an override in `.config/nextest.toml` starts them first. An extra package adds `-p <package> --test <name>` for each of its
 # `tests/*.rs` at depth 1. Cargo applies `--lib` and every `--test` to all the
 # packages one command selects, so the script refuses an extra that holds a
 # unit test or a doctest under `src/` (neither could run here), or a
@@ -471,6 +471,10 @@ cerulion_core node_macro_ui|[node_macro_ui]|cerulion_core node_macro_ui
 cerulion_core|["node_macro_ui"]|-
 cerulion_core cerulion_viz|["cerulion_vizd"]|-
 cerulion_core node_macro_ui cerulion_viz|["cerulion_viz","node_macro_ui"]|node_macro_ui cerulion_viz
+cerulion_core node_macro_ui test_node_macro_cdylib|["test_node_macro_cdylib"]|test_node_macro_cdylib
+cerulion_core node_macro_ui test_node_macro_cdylib|["test_node_macro_cdylib","node_macro_ui"]|node_macro_ui test_node_macro_cdylib
+cerulion_core node_macro_ui test_node_macro_cdylib|["cerulion_core","test_node_macro_cdylib"]|cerulion_core test_node_macro_cdylib
+cerulion_core node_macro_ui test_node_macro_cdylib|[]|-
 '
 
 check_selection() {

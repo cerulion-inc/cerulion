@@ -522,17 +522,22 @@ policy below names their namespaces, which the default does not. Each sharded jo
 
 `--with <package>` adds another package's integration tests to the same nextest
 invocation: `-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. On shard 2
-of both lanes the step passes `--with node_macro_ui`, so the `#[cerulion_node]`
-diagnostics suite builds in the shard's cargo invocation and its trybuild test runs beside
-the core tests; an override in `.config/nextest.toml` gives that test a priority of 100,
-which starts it first (at the default priority it sorts after every `cerulion_core`
-binary and would start last). Cargo applies `--lib` and each `--test` to every package one
+of both lanes the step passes `--with node_macro_ui --with test_node_macro_cdylib`, so the
+`#[cerulion_node]` diagnostics suite and the node context helper suite build in the
+shard's cargo invocation and their trybuild tests run beside the core tests; an override in
+`.config/nextest.toml` gives both test binaries a priority of 100, which starts them first
+(at the default priority they sort after every `cerulion_core` binary and would start
+last). Cargo applies `--lib` and each `--test` to every package one
 command selects, so the script refuses an extra package that holds a unit test or a
-doctest under `src/`, or a `tests/*.rs` named like one of `cerulion_core`'s; the suite's
-compile-pass programs are binaries of that package, which cargo builds for an integration
-test even when targets are named. Its dev-dependencies ask for `test-helpers` on
+doctest under `src/`, or a `tests/*.rs` named like one of `cerulion_core`'s; each suite's
+compile-pass programs are binaries of its package, which cargo builds for an integration
+test even when targets are named. Their dev-dependencies ask for `test-helpers` on
 `cerulion_core` and `native_ros2_messages`, which `cerulion_core`'s own test build already
-turns on, so every unit the shard compiles for the core tests keeps its features. The selection is read for each package on its own: a
+turns on, so every unit the shard compiles for the core tests keeps its features. The
+shard builds `test_node_macro_cdylib`'s library only as a dependency of its test, and cargo
+copies a library's cdylib into `target/debug` only for a library named on the command
+line, so the fixture the shard's core tests load from there is still the workspace
+build's. The selection is read for each package on its own: a
 change that selects only `node_macro_ui` builds and runs its tests and none of the core
 files, a change that selects only `cerulion_core` runs no extra, and the script prints a
 `selection:` line for each package it leaves out. `--list` applies the same selection and

@@ -3463,12 +3463,6 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_rcpd", "cerulion_cli_engine", "crate-path"),
     // hot_path_dependency_gate walks `examples/go2`, which holds that member.
     ("cerulion_telemetry", "go2_tf_source", "crate-path"),
-    // test_node_macro_cdylib's context-helper runner joins `examples` onto the
-    // profile directory, where cargo puts example binaries; the walk reads it
-    // as the repository's `examples/` tree, which holds that member. The edge
-    // is not real, and it adds this package to the selection when
-    // go2_tf_source or go2_tf changes.
-    ("test_node_macro_cdylib", "go2_tf_source", "crate-path"),
     // heaphook's own unit test reads `../cerulion_heaphook/src`.
     ("rmw_cerulion", "cerulion_heaphook", "crate-path"),
     // rmw_adopt_take_linux_test loads `libcerulion_heaphook.so` out of the
