@@ -1884,7 +1884,13 @@ fn with_tree() -> tempfile::TempDir {
     write("crates/fx/ok/tests/ok_one.rs", "");
     write("crates/fx/ok/tests/ok_two.rs", "");
     write("crates/fx/ok/tests/ui/p.rs", "fn main() {}\n");
-    write("crates/fx/ok2/Cargo.toml", &manifest("ok2"));
+    write(
+        "crates/fx/ok2/Cargo.toml",
+        &format!(
+            "{}\n[lib] # the library\npath = './src/lib.rs'\n\n[[bin]]  # a program\nname = \"q\"\npath = \"tests/ui/q.rs\"\ntest = false\n",
+            manifest("ok2")
+        ),
+    );
     write("crates/fx/ok2/tests/ok2_t.rs", "");
     // One package per refusal, each with a test file of its own name so the
     // refusal is the only thing wrong with it.
@@ -1936,7 +1942,7 @@ fn with_tree() -> tempfile::TempDir {
     write(
         "crates/fx/bn/Cargo.toml",
         &format!(
-            "{}\n[[bin]]\nname = \"p\"\npath = \"tests/ui/p.rs\"\n",
+            "{}\n[[bin]] # a program\nname = \"p\"\npath = \"tests/ui/p.rs\"\n",
             manifest("bn")
         ),
     );
@@ -2299,7 +2305,7 @@ fn every_with_refusal_names_the_package_and_the_rule() {
 /// `--list` on each leg its step's condition selects, names each `--with`
 /// package in order with every one of its `tests/*.rs`, read off the disk, and
 /// adds no `--lib`. The packages each job passes are written out here, so a
-/// line that drops or moves one fails too.
+/// line that drops one fails, and so does a job with a second `--with` line.
 #[cfg(unix)]
 #[test]
 fn every_workflow_with_line_brings_every_test_file_of_its_packages() {
@@ -2401,7 +2407,10 @@ fn every_workflow_with_line_brings_every_test_file_of_its_packages() {
                             );
                         }
                     }
-                    seen.insert(job.clone(), extras);
+                    assert!(
+                        seen.insert(job.clone(), extras).is_none(),
+                        "{job}: a second `--with` line; each job passes its extras on one step"
+                    );
                 }
             }
         }
@@ -2571,27 +2580,39 @@ fn shard_step_legs(cond: Option<&str>, legs: &[String]) -> Result<BTreeSet<Strin
     Ok(out)
 }
 
-/// Every leg of one sharded job runs each package's shard step exactly once:
-/// the steps that run `ci_test_shard.sh <package> ...` are read with the legs
-/// their `if:` selects, and a leg that runs a package's shard twice or never
-/// is named. Returns the complaints and how many shard steps were read.
+/// Every leg of one sharded job runs each package's shard step exactly once,
+/// and each `--with` package rides exactly one leg: the steps that run
+/// `ci_test_shard.sh <package> ...` are read with the legs their `if:`
+/// selects, a leg that runs a package's shard twice or never is named, and so
+/// is a `--with` package that rides no leg or more than one. Returns the
+/// complaints and how many shard steps were read.
 fn shard_leg_complaints(job: &str, block: &str) -> (Vec<String>, usize) {
     let mut complaints = Vec::new();
     let Some(legs) = shard_matrices(block).into_iter().next() else {
         return (complaints, 0);
     };
     let mut runs: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut rides: BTreeMap<String, usize> = BTreeMap::new();
     let mut steps = 0usize;
     for step in step_blocks(block) {
         let script = run_script_of(&step).unwrap_or_default();
-        let packages: Vec<String> = script
-            .lines()
-            .filter_map(|line| {
-                let at = line.find("ci_test_shard.sh ")?;
-                let args = shell_args(&line[at + "ci_test_shard.sh ".len()..]);
-                args.first().filter(|a| !a.starts_with('-')).cloned()
-            })
-            .collect();
+        let mut packages: Vec<String> = Vec::new();
+        let mut extras: Vec<String> = Vec::new();
+        for line in script.lines() {
+            let Some(at) = line.find("ci_test_shard.sh ") else {
+                continue;
+            };
+            let args = shell_args(&line[at + "ci_test_shard.sh ".len()..]);
+            let Some(package) = args.first().filter(|a| !a.starts_with('-')) else {
+                continue;
+            };
+            packages.push(package.clone());
+            extras.extend(
+                args.windows(2)
+                    .filter(|pair| pair[0] == "--with")
+                    .map(|pair| pair[1].clone()),
+            );
+        }
         if packages.is_empty() {
             continue;
         }
@@ -2616,6 +2637,9 @@ fn shard_leg_complaints(job: &str, block: &str) -> (Vec<String>, usize) {
                 *per_leg.entry(leg.clone()).or_default() += 1;
             }
         }
+        for extra in extras {
+            *rides.entry(extra).or_default() += selected.len();
+        }
     }
     for (package, per_leg) in &runs {
         for leg in &legs {
@@ -2625,6 +2649,11 @@ fn shard_leg_complaints(job: &str, block: &str) -> (Vec<String>, usize) {
                     "{job}: leg {leg} runs the `{package}` shard {n} time(s), not once"
                 ));
             }
+        }
+    }
+    for (extra, n) in &rides {
+        if *n != 1 {
+            complaints.push(format!("{job}: `--with {extra}` rides {n} leg(s), not one"));
         }
     }
     (complaints, steps)
@@ -2669,6 +2698,10 @@ fn a_shard_leg_run_twice_or_never_is_named() {
     let is2 = step("        if: matrix.shard == 2\n", " --with x");
     let is3 = step("        if: matrix.shard == 3\n", " --with x");
     let all = step("", "");
+    let not23 = step("        if: matrix.shard != 2 && matrix.shard != 3\n", "");
+    let is2x = step("        if: ${{ matrix.shard == 2 }}\n", " --with x");
+    let is3q = step("        if: matrix.shard == '3'\n", " --with x");
+    let not3 = step("        if: matrix.shard != 3\n", "");
     let rows: &[(String, &[&str])] = &[
         (job(&format!("{not2}{is2}")), &[]),
         (job(&all), &[]),
@@ -2694,6 +2727,22 @@ fn a_shard_leg_run_twice_or_never_is_named() {
         (
             job(&step("        if: always()\n", "")),
             &["t: a shard step's condition: `always()` is not a `matrix.shard` leg selector"],
+        ),
+        // Two leg selectors joined by `&&`, the `${{ }}` form and a quoted
+        // literal read like the bare forms.
+        (job(&format!("{not23}{is2x}{is3q}")), &["t: `--with x` rides 2 leg(s), not one"]),
+        (job(&format!("{not3}{is3q}")), &[]),
+        // A `--with` package on two legs runs its suite twice; on none, never.
+        (
+            job(&format!("{not2}{is2}{is3}")),
+            &[
+                "t: leg 3 runs the `core` shard 2 time(s), not once",
+                "t: `--with x` rides 2 leg(s), not one",
+            ],
+        ),
+        (
+            job(&step("        if: ''\n", "")),
+            &["t: an empty `if:` value: `if: ''` and `if: \"\"` are valid YAML and mean NOTHING at all"],
         ),
     ];
     for (text, want) in rows {
