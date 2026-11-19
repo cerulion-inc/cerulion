@@ -89,7 +89,7 @@ use cerulion_core::state_restore::{
     enforce_strict_state, plan_backlog_admission, plan_restore, refuse_lossy_reexecuted_topics,
     seed_publisher_sequence, AnchorBlob, BacklogAdmission, BacklogClaim, InputServiceCursor,
     NodeFrameworkState, RestorePlan, RestoreRequest, ResumeAnchor, SeedEvidence, SeedRung,
-    TopicFrameCount, TopicLoss, TopicWriters,
+    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters,
 };
 use cerulion_core::trace_ring::{
     unpack_read_outcome_meta, unpack_read_outcome_meta_full, unpack_read_outcome_popped,
@@ -8977,7 +8977,9 @@ enum AnchorStop {
     /// The node's framework section carries the stopped flag: the scheduler
     /// had stopped it by the anchor step, and nothing in a graph run restarts
     /// a stopped node. A positive claim, so it is read at every `trace_format`.
-    Stopped,
+    /// Carries what the same section states about the stopped node's trigger
+    /// queue ([`StoppedAtAnchor::from_section`]).
+    Stopped(StoppedAtAnchor),
     /// The bag is at [`ANCHOR_STOPS_MIN_TRACE_FORMAT`] or later and holds a
     /// complete part for the node without the flag: the node was running.
     Running,
@@ -8998,17 +9000,24 @@ struct AnchorStops {
 impl AnchorStops {
     /// The nodes the checkpoint states as stopped, in id order.
     fn stopped(&self) -> impl Iterator<Item = &str> {
-        self.by_node
-            .iter()
-            .filter(|(_, stop)| **stop == AnchorStop::Stopped)
-            .map(|(node, _)| node.as_str())
+        self.stops_at_anchor().map(|(node, _)| node)
+    }
+
+    /// The nodes the checkpoint states as stopped, each with what its section
+    /// states about its trigger queue, in id order: the input a stop restore
+    /// (`GraphRuntime::restore_stopped_nodes`) takes.
+    fn stops_at_anchor(&self) -> impl Iterator<Item = (&str, StoppedAtAnchor)> {
+        self.by_node.iter().filter_map(|(node, stop)| match stop {
+            AnchorStop::Stopped(at_anchor) => Some((node.as_str(), *at_anchor)),
+            AnchorStop::Running | AnchorStop::Unstated => None,
+        })
     }
 
     /// Does the checkpoint state `node` as stopped? Such a node owes no fire
     /// in the replay, so its pending count, its backlog claim and its
     /// service cursors describe a consumer that will never read again.
     fn is_stopped(&self, node: &str) -> bool {
-        self.by_node.get(node) == Some(&AnchorStop::Stopped)
+        matches!(self.by_node.get(node), Some(AnchorStop::Stopped(_)))
     }
 
     /// The nodes whose stop the checkpoint states, stopped or running, in id
@@ -9053,8 +9062,9 @@ fn resolve_anchor_stops<'a>(
     let by_node = graph_nodes
         .into_iter()
         .map(|node| {
-            let stop = if framework.get(node).is_some_and(|state| state.stopped) {
-                AnchorStop::Stopped
+            let stopped = framework.get(node).and_then(StoppedAtAnchor::from_section);
+            let stop = if let Some(at_anchor) = stopped {
+                AnchorStop::Stopped(at_anchor)
             } else if every_stop_flagged && blobs.contains_key(node) {
                 AnchorStop::Running
             } else {
@@ -10653,15 +10663,24 @@ fn apply_resume(
     // stopped it before the anchor, and nothing in the resumed steps re-runs
     // that stop. The runtime disables it and releases each `block` slot it
     // holds as a consumer, as its live stop did, so a producer it paced is not
-    // held by a consumer that will never drain.
-    let stopped: BTreeSet<String> = plan.stops.stopped().map(str::to_string).collect();
-    runtime
+    // held by a consumer that will never drain. A stopped node whose section
+    // states an unconsumed arrival resumes with its per-message trigger input
+    // drained through its own subscriber (`drop_oldest`) holding the frame its
+    // drain had popped, so that drain reads nothing in the resumed steps, as
+    // the recorded one did.
+    let stopped: BTreeMap<String, StoppedAtAnchor> = plan
+        .stops
+        .stops_at_anchor()
+        .map(|(node, at_anchor)| (node.to_string(), at_anchor))
+        .collect();
+    let held = runtime
         .restore_stopped_nodes(&stopped)
         .map_err(|e| stop_restore_failure(&e))?;
-    for node in &stopped {
+    for node in stopped.keys() {
         tracing::info!(
             node_id = %node,
             anchor_step = plan.anchor.step,
+            holds_trigger_head = held.contains(node),
             "replay resume: the checkpoint states this node had stopped, so the resumed graph \
              keeps it stopped and releases its block slots"
         );
@@ -10720,7 +10739,7 @@ fn apply_resume(
         pre_anchor_frames_already_read: plan.service_skip.clone(),
         service_cursor_notes: plan.service_notes.clone(),
         anchor_pending_fires: plan.anchor_pending_fires.clone(),
-        stopped_at_anchor: stopped.into_iter().collect(),
+        stopped_at_anchor: stopped.into_keys().collect(),
     })
 }
 
@@ -33454,7 +33473,8 @@ mod recorder_info_version_tests {
     /// for a node the graph does not run.
     ///
     /// `stopped` carries a section with the stopped flag and nothing else;
-    /// `fifo_stopped` the flag beside a served cursor; `running` a section
+    /// `fifo_stopped` the flag beside a served cursor and one pending arrival;
+    /// `running` a section
     /// without the flag; `v1` a part with no framework section (what a running
     /// node with nothing to say writes); `absent` no complete part, which is
     /// also every torn or skipped part (`BagAnchors::blobs_at` holds complete
@@ -33466,6 +33486,7 @@ mod recorder_info_version_tests {
             ..Default::default()
         };
         let fifo_stopped_section = NodeFrameworkState {
+            pending_data_count: 1,
             input_service: Some([("inp".to_string(), Some(7u32))].into_iter().collect()),
             stopped: true,
             ..Default::default()
@@ -33489,6 +33510,10 @@ mod recorder_info_version_tests {
             !framework.contains_key("v1"),
             "PRECONDITION: a part with no section decodes to no section"
         );
+        // The FIFO consumer's section states one unconsumed arrival.
+        let held = StoppedAtAnchor {
+            unconsumed_arrival: true,
+        };
         let graph = ["absent", "fifo_stopped", "running", "stopped", "v1"];
         let table = |every_stop_flagged: bool| -> Vec<(String, AnchorStop)> {
             resolve_anchor_stops(graph, &blobs, &framework, every_stop_flagged)
@@ -33505,9 +33530,9 @@ mod recorder_info_version_tests {
             table(recorder_states_anchor_stops_at(Some(&recorder_info_at(10)))),
             hand(&[
                 ("absent", AnchorStop::Unstated),
-                ("fifo_stopped", AnchorStop::Stopped),
+                ("fifo_stopped", AnchorStop::Stopped(held)),
                 ("running", AnchorStop::Running),
-                ("stopped", AnchorStop::Stopped),
+                ("stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
                 ("v1", AnchorStop::Running),
             ]),
             "format 10: a complete part without the flag states a running node"
@@ -33516,9 +33541,9 @@ mod recorder_info_version_tests {
             table(recorder_states_anchor_stops_at(Some(&recorder_info_at(9)))),
             hand(&[
                 ("absent", AnchorStop::Unstated),
-                ("fifo_stopped", AnchorStop::Stopped),
+                ("fifo_stopped", AnchorStop::Stopped(held)),
                 ("running", AnchorStop::Unstated),
-                ("stopped", AnchorStop::Stopped),
+                ("stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
                 ("v1", AnchorStop::Unstated),
             ]),
             "format 9: the flag states the stop, and its absence states nothing"
@@ -33528,6 +33553,14 @@ mod recorder_info_version_tests {
             stops.stopped().collect::<Vec<_>>(),
             vec!["fifo_stopped", "stopped"],
             "a stopped part for a node outside the graph is not a stop"
+        );
+        assert_eq!(
+            stops.stops_at_anchor().collect::<Vec<_>>(),
+            vec![
+                ("fifo_stopped", held),
+                ("stopped", StoppedAtAnchor::default())
+            ],
+            "each stop carries its section's unconsumed arrival"
         );
         for (node, stopped) in [
             ("stopped", true),
@@ -33581,7 +33614,7 @@ mod recorder_info_version_tests {
                 .into_iter()
                 .map(|node| {
                     let stop = if nodes.contains(&node) {
-                        AnchorStop::Stopped
+                        AnchorStop::Stopped(StoppedAtAnchor::default())
                     } else {
                         AnchorStop::Running
                     };
@@ -33612,10 +33645,10 @@ mod recorder_info_version_tests {
     fn a_fire_of_a_node_stated_stopped_is_refused_naming_the_node_and_both_steps() {
         let stops = AnchorStops {
             by_node: [
-                ("a_stopped", AnchorStop::Stopped),
+                ("a_stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
                 ("b_running", AnchorStop::Running),
                 ("c_unstated", AnchorStop::Unstated),
-                ("d_stopped", AnchorStop::Stopped),
+                ("d_stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
             ]
             .into_iter()
             .map(|(node, stop)| (node.to_string(), stop))

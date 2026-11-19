@@ -547,10 +547,11 @@ packages that way rebuilds every crate they share (`cerulion_core` and the third
 under it, up to a dozen times per leg). The runner builds a group of packages in ONE cargo
 invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 
-* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run` over the group's
-  packages, then `cargo test` over the same packages with the script as cargo's target
-  runner. That recording run compiles nothing; for each test binary it records the
-  environment and working directory cargo gives it, in cargo's run order. Cargo then runs
+* **Build.** `build --group NAME SPEC...` runs `cargo test --no-run --timings` over the
+  group's packages, so the job's timing report covers the grouped compile, then
+  `cargo test` over the same packages with the script as cargo's target runner. That
+  recording run compiles nothing; for each test binary it records the environment and
+  working directory cargo gives it, in cargo's run order. Cargo then runs
   the group's doctests against the libraries the build compiled; rustdoc hands each doctest
   it runs to the same runner, which runs any binary outside the target directory. They run
   without a step's `-- --test-threads=1` or env. A package builds
@@ -587,6 +588,25 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 * **Reclaim.** `reclaim` deletes the executables in `target/debug/deps` except the prebuilt
   binaries a later step still runs, libraries (`.so`, `.so.N`, `.dylib`, `.dll`, `.rlib`, `.a`)
   and cargo's `.rmeta` and `.d` files.
+
+Every `test-linux` and `test-macos` leg uses it: the step `Build this shard's package tests
+once and run their doctests` builds the leg's packages, every package step runs through
+`run`, and the leg ends with the audit. `cerulion_core` keeps its own build in its shard step,
+unchanged. A `lint-gates` step runs `check-workflow .github/workflows/ci.yml`.
+
+* **Groups.** One unified build changes some packages' features: a package's tests link a
+  shared crate with the union of what every package of the group enables. The unions in
+  these legs are additive APIs or test seams that stay inert until a test arms them: among
+  them `test-helpers` and `test-seams`, `jazzy` and `live` on `cerulion_dds`, `default` and
+  `wan` on `cerulion_netd`'s library (macOS shard 1 links it into the `cerulion_cli_engine`,
+  `cerulion_cli_tui` and `cerulion_connectd` tests), `test-util` on tokio, and a second
+  rustls provider beside the ring one every client installs. The one that switches
+  behavior is `cerulion_viz`'s `decoder-from-source`, so `cerulion_vizd` builds in a group
+  of its own on macOS shard 2.
+* **Doctests here.** The executing doctests of these legs (`native_ros2_messages`,
+  `cerulion_bag`, `cerulion_cli_engine`) belong to packages whose steps pass no
+  `--test-threads=1`, so they run as they did.
+* **Disk.** The pre-wan reclaim on Linux shard 3 runs `reclaim`.
 
 `crate-tests` is the catch-all lane: one `cargo test -p <package>` step for each package
 no other job runs, which is what keeps every package inside a blocking job. `viz-tests`
@@ -1107,6 +1127,8 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/check_agents_md.sh` | context-file budgets, shims, banned tokens | n/a |
 | `tools/scripts/ci_built_tests.py --self-test` | the build-once runner: the selection rule against the classifier's list (a longer name never matches a shorter one), the `cargo test` command line it accepts and the ones it refuses, which prebuilt binaries a selection runs and in what order, the environment replay (a cargo `[env]` key without `force` yields to the step's own value), the macOS library path in cargo's order, the attribution of compiled units to declared build steps, the wiring check over a hand-written job and nine broken ones, and the modes end to end over a fake cargo: the recording runs no test and a doctest that reaches the runner runs (and fails the build when it fails), a run gets cargo's env and working directory, fail-fast, a missing feature refused, the reclaim keep set (shared libraries kept whatever their mode), a selection naming no package auditing clean, comma feature lists compared as sets, and the audit's refusals (an unrun binary, a binary run only under a filter or `--ignored`, a floor, an unknown `--not-run`, a unit compiled after every step, a floor that is no number) | n/a |
 | `tools/scripts/ci_selected_packages.py --self-test` | the reverse CARGO-DEPENDENCY closure of a set of touched packages, over hand-built metadata documents and over this workspace, with normal, build and dev edges followed, a renamed dependency keyed by its package name, and an unknown name refused. A document that is not an object carrying `packages` (a list), `workspace_members` (a list) and `version` is refused with exit 2 and one line naming the field, in every mode including `--all`, so no caller reads an empty selection as the answer. It does NOT prove that the selected set is everything a change can break: see below | n/a |
+| `tools/scripts/ci_test_router.py --self-test` | a hand-built workspace with every selection written out beside it: own sources through `mod`, inline and `cfg(test)` modules and `include_str!`; a dev-dependency source selecting only the binaries that name it, and its manifest selecting every binary of the package that dev-depends on it; a daemon spawned from library code through a `const` reaching every linker transitively, and a thread named like a daemon reaching none; a proc-macro consumer's manifest; a cdylib found by its table row and by a literal; a one-file crate-path read; build-script inputs and a file the script does not name; an unresolvable `mod` widening its target; the doc-pin markers; `Cargo.lock` narrowed through a normal and through a dev-dependency; the root manifest's tables and its comments; every global input; the empty change; and every row run twice, in reverse order and under two hash seeds, byte-identical. It reads no file of this checkout; `--live-check`, run in `router-shadow`, pins shapes the real tree keeps. The run ends on a case-count floor | n/a |
+| `tools/scripts/ci_router_escapes.py --self-test` | hand-written nextest and libtest logs and TSV extracts: a failure in a skipped binary is an escape and in a selected one is caught, a failure that passed on a rerun at the same head or that a flake issue names (by binary, target or failing test) is a flake and nothing else is, a retry that passed is no failure, a library that failed to compile is an escape only when no selected binary builds it, a failure no binary owns is unplaced, a skipped binary with no verdict is unverified, and two runs give the same document | n/a |
 | `tools/scripts/leak_scan.py --self-test` | every generic class on every surface, the redacted private output contract, exit codes, allowlist and pragma rules, the self-scan | n/a |
 | `tools/scripts/install_hooks.sh --self-test` | the hooks refuse a planted leak and a planted message, pass a clean commit, cover a worktree without `tools/hooks`, and uninstall cleanly | n/a |
 | `tools/scripts/test_nightly_full_run.sh` | the oracle table for `tools/scripts/nightly_full_run.sh`: every issue write of both modes (none, open, comment, comment and close) with its exact text; the run id taken from the dispatch's answer, and found by listing when the answer has none, late, by either actor field, and never a person's dispatch; a dispatch that errors after starting a run is not sent again, one that starts nothing is, and three that start nothing are refused; attempt 1 read by number when someone reran the run by hand, and the nightly's own rerun read at the attempt it started after a rerun by hand; a rerun's attempt answering 404 until it exists; a rerun that reads `completed` on the old attempt for a moment, a refused rerun, a rerun unfinished at the 330-minute deadline and none requested past it; a neutral job and a jobs page cut at 100; the alarm's findings, its silence while a nightly is in progress or in the workflow's first 26 hours, and its once-a-day limit; every refusal; and the same fixtures giving the same calls and text twice. The run ends on a case-count floor | n/a |
@@ -1143,3 +1165,98 @@ shared documentation and tool trees (`docs`, `tools`, `.github`, `benches`,
 `examples`, `harness`) or a root markdown file is pinned, both ways, against the markers in
 `ci.yml`. Cross-crate source literals and dlopen fixtures are an open class. They
 have to be pinned before any CI test step is gated on the selection.
+
+## The per-binary test router (shadow mode)
+
+`router-shadow` (`Test router (shadow)`) runs on every pull request and merge-queue run.
+It computes, with `tools/scripts/ci_test_router.py`, which test binaries of the root
+workspace a change can affect, prints one line per binary, and uploads the answer as the
+`router-shadow-<run id>-<attempt>` artifact. It ROUTES NOTHING: no job `needs:` it, no step
+reads its output, it is not a required context, and every job runs exactly the tests it
+runs without it. On a pull request it diffs against the base the `changes` job resolves; in
+the merge queue against `merge_group.base_sha`, so an entry is scored on everything its run
+built on top of `main`.
+
+A binary is named the way nextest names it (`pkg`, `pkg::test`, `pkg::bin/name`,
+`pkg::example/name`, and `pkg::doctest/<lib>` for the doctests). It is selected when a
+global input changed, or when the diff touches one of its inputs:
+
+* its own sources: the target file, every module a `mod` reaches (`#[path]`, inline modules
+  and `#[cfg(test)]` tracked), and every `include!`, `include_str!` or `include_bytes!` with a
+  literal or manifest-directory path. This is a static reading of the source text, not rustc
+  dep-info, so the job needs no build. A `mod` or include it cannot resolve widens that
+  target to its whole package directory and prints a warning;
+* its crate closure: the normal and build closure of its package, plus the closure of each
+  dev-dependency its own sources name (every dev-dependency for a `trybuild` driver, whose
+  cases name crates the driver never does). A library's build inputs are its build script,
+  what the script names in `rerun-if-changed` (the whole package when it names none or
+  computes one), and the literal paths it opens;
+* every binary it spawns, cdylib it loads and nested build it drives, transitively, and
+  from LIBRARY code too: `crates/cerulion_netd/src/client.rs` spawning `cerulion-netd`,
+  `crates/cerulion_cli_engine/src/viz_client.rs` spawning `cerulion-vizd`, and
+  `crates/cerulion_cli_engine/src/doctor/daemons.rs` looking for `cerulion-remoted` beside the
+  running executable bind every binary that links those libraries, and a spawned binary
+  brings its own sources (`crates/cerulion_netd/src/main.rs`) and its own spawns.
+  `crates/cerulion_android/src/runtime.rs` runs its recorder, gateway and graph as threads named
+  like daemons: that is library code the crate closure already carries, not a spawn;
+* what it reads at run time: the rows of `tools/ci/observation_edges.tsv` and the
+  `# doc-pin:` markers, narrowed to the binaries whose sources carry the row's shape (the
+  whole package when the narrowing cannot see the row's own witness), its own package tree
+  when its sources name a path, every file inside its package a literal names (a test runs
+  with its package as the working directory), and the files a path anchored at
+  `CARGO_MANIFEST_DIR` in library code names;
+* whole-tree walkers, unattributable readers and binaries that run cargo on a scaffold
+  with no lock file run on every change that touches anything.
+
+A MEMBER MANIFEST selects every binary of every package whose test build includes that
+member (its normal, build and EVERY dev-dependency closure, not the per-binary narrowing:
+`cerulion_core` dev-depends on `cerulion_cli_engine`, whose features merge into the core
+library every core test links), every package that shares a `cargo test` command with
+one, and every binary that spawns or loads a workspace artifact, because `cargo build
+--workspace` unifies features across the members. A comment-only manifest change is no
+exception: `crates/cerulion_macros/src/crate_root.rs` reads the consuming crate's `Cargo.toml`
+while it expands, a read rustc's dep-info does not record.
+
+GLOBAL INPUTS select every binary: `.github/workflows/ci.yml`, `.github/actions/**`,
+`.cargo/**`, `.config/**`, `rust-toolchain*`, the router itself,
+`tools/ci/observation_edges.tsv`, the path classifier, its selector and the shard runner,
+every `tools/` path a job that runs tests names, a change to any table of the root
+`Cargo.toml` (a change to its comments alone selects the binaries that read its text),
+`Cargo.lock` when it cannot be read (otherwise it is narrowed: a member whose normal or
+build dependency reaches a changed entry has a changed library, and every binary that
+spawns or loads a workspace artifact runs too; a member whose dev-dependency does has
+every binary selected), metadata that disagrees with the head tree in either direction (a
+target file the head lacks, or a file cargo would make a target that the metadata does not
+list), and any path no rule claims. The separate cargo workspaces (`examples/*`, `benches/*`,
+`crates/cerulion_py`, the fuzz and Android runtime workspaces) are one unit each, selected
+by a path inside them, a changed workspace library or binary, or a changed shared tree.
+
+THE ESCAPE CRITERION. Run by hand on the artifact and the run's job logs,
+`tools/scripts/ci_router_escapes.py --selection <artifact> <job logs>` reads the same run's
+verdicts (nextest status lines, libtest blocks, cargo's rerun
+and compile-failure lines, or the `per_test.tsv` and `per_binary.tsv` extracts) and lists
+every binary that failed while the selection skipped it, as one of two kinds. It is a
+FLAKE when it passed on a later attempt at the same head (`--reruns`, a JSON object of the
+selection's `head` commit, the merge commit on a pull request, to binary ids) or when a
+flake issue, open or closed, names it (`--issues`, a JSON object of key to issue numbers;
+a key is a binary id, a target name only one binary carries, or a binary id and a full
+failing test path separated by a space, and an ambiguous key is refused); the two maps are
+files, so a score is offline and repeatable. Every other one is an ESCAPE. A libtest binary whose
+`Running` line has no `test result:` line before its step ends died, hung or was cancelled,
+and counts as failed, and so does a nextest test whose last status is a word the scorer
+does not know (a `SLOW` in the list after `Summary` is a slow pass). A nextest run with no
+`Summary`, a test list nextest could not build, and a step that failed with no binary named
+are unplaced. A failure it cannot place on a binary is UNPLACED and fails the score
+like an escape (exit 1). A skipped binary with no verdict in the logs it was given is
+UNVERIFIED (exit 3 when nothing else is wrong), because only a job's own log shows its
+tests ran: read every job's log by its name, never the aggregate result of a matrix job,
+which cannot show a leg that never ran. Shadow escapes must be 0 over the shadow period
+before any job is routed, and a maintainer reviews the shadow data, flakes included,
+before any routing lands. A run that left no `router-shadow` artifact counts against the
+period: its selection cannot be scored.
+
+The router's self-test in `lint-gates` reads only its fixture. `router-shadow` first runs
+`ci_test_router.py --live-check`, which pins shapes the real tree keeps (the vizd binary
+reached through `viz_client.rs`, the empty change selecting nothing, a head other than the
+checkout refused), so a change to the tree reds that unrequired job and never `Lint`. The
+selection is computed and uploaded even when the live check fails.

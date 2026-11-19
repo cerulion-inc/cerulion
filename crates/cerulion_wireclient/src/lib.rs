@@ -46,6 +46,7 @@ pub mod config;
 pub mod epoch;
 pub mod error;
 pub mod identity_cache;
+pub mod local_identity;
 pub mod owner_pair;
 pub mod protocol;
 pub mod reader;

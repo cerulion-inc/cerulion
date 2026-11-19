@@ -1,6 +1,6 @@
 # Summary of list 2: 400 further start states of LIBERO-PRO, 2 models, both arms
 
-Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-19T02:31:37Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
+Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-19T08:40:01Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
 
 Read these lines before any number here:
 
@@ -207,6 +207,19 @@ The grid's tests are read on the grid's 100 start states only, by the grid's rul
 | GPT-6 Astra | without Cerulion | 34.2 | 339.2 | 13686 | 1391 | 219,585,114 (11.0 percent) | 3,544,034 | 2154.72 | 1, 2.32 | 5.39 | 7.46 | 818.6 |
 
 USD a start state and USD a solved start state count the scored rows and the attempts in no row (lost_attempts.csv) over all start states of the arm, or over its solved ones. USD is list price only, not a billed amount; part of the gap between the arms is caching (the cached share of input tokens), not only fewer requests. Seconds are wall clock from the episode's start to its end and include the time an endpoint stalled or refused requests; a failed request was sent again inside its episode.
+
+## How the replies ended (finish reason), scored episodes
+
+| model | arm | replies | tool_calls | stop | length | content_filter | other | requests with no reply | scored episodes with a content_filter reply | ended on content_filter replies |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Gemini 3.8 Flash | without Cerulion | 21,890 | 21,865 | 25 | 0 | 0 | 0 | 1 | 0 | 0 |
+| Gemini 3.8 Flash | with Cerulion | 10,746 | 10,649 | 97 | 0 | 0 | 0 | 2 | 0 | 0 |
+| GPT-6 Astra | without Cerulion | 13,686 | 13,686 | 0 | 0 | 0 | 0 | 1,391 | 0 | 0 |
+| GPT-6 Astra | with Cerulion | 6,208 | 6,208 | 0 | 0 | 0 | 0 | 580 | 0 | 0 |
+
+A reply's finish reason is the one its model endpoint returned: `tool_calls` a reply with a tool call, `stop` and `length` one that ended on its own or at the output limit, `content_filter` one the provider's content filter stopped, `other` any other. Every reply of each scored attempt is counted, so the five reasons add up to the replies. A request with no reply is a failed request (sent again) or one the endpoint refused for a request field it does not take (sent again without the field).
+
+No reply came back content_filter in any arm.
 
 ## Episodes that ended without a score
 

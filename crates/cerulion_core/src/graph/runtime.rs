@@ -1431,6 +1431,13 @@ struct DataTriggerBinding {
     /// delivers to one subscriber queue at a time, and the publisher notifies
     /// after the last one).
     unconfirmed_arrival: bool,
+    /// A resume restored this binding's node as stopped while its trigger
+    /// drain held a frame it had popped and no tick took
+    /// ([`GraphRuntime::restore_stopped_nodes`]). From then on
+    /// `drain_data_binding` answers this binding as the drain answers a held
+    /// head: one arrival, no pop, no read-gate consult and no read-outcome
+    /// record. `false` on every binding a build makes.
+    trigger_head_held: bool,
 }
 
 /// Per-input drain binding for a `Sync`/`UnboundedSync` node — the
@@ -8900,6 +8907,7 @@ impl GraphRuntime {
                         consume_latest,
                         probes_body: false,
                         unconfirmed_arrival: false,
+                        trigger_head_held: false,
                     });
                     // Mark the BODY
                     // subscriber this Unified binding drains through, arming
@@ -9146,6 +9154,7 @@ impl GraphRuntime {
                         probes_body: consume_latest
                             && probes_trigger_input.get(&node_def.id) == Some(&true),
                         unconfirmed_arrival: false,
+                        trigger_head_held: false,
                     });
                 }
             }
@@ -19243,11 +19252,10 @@ impl GraphRuntime {
         }
     }
 
-    /// Keep each node in `ids` stopped on a runtime about to resume, as a
+    /// Keep each node in `stops` stopped on a runtime about to resume, as a
     /// recording's framework sections state it
-    /// ([`crate::state_restore::NodeFrameworkState::stopped`]). Called after
-    /// the build and before the first [`Self::step`], like every other
-    /// restore seam.
+    /// ([`crate::state_restore::StoppedAtAnchor`]). Called after the build and
+    /// before the first [`Self::step`], like every other restore seam.
     ///
     /// The node fires no more and this run records no failure for it
     /// ([`Self::node_fatal_errors`] does not name it); see
@@ -19260,6 +19268,20 @@ impl GraphRuntime {
     /// recorded run counted and announced that release when the node stopped,
     /// and this run restores the stop rather than performing it again.
     ///
+    /// A node whose entry states an unconsumed arrival
+    /// ([`crate::state_restore::StoppedAtAnchor::unconsumed_arrival`]) and
+    /// whose trigger input is per-message FIFO, drained through the node's own
+    /// subscriber, resumes with that input holding a frame. The recorded drain
+    /// had popped a frame no tick took, and every later boundary re-offered it,
+    /// popping nothing, consulting no read gate and recording nothing; the
+    /// restored binding answers each boundary the same way. The frame itself is
+    /// not restored: a stopped node never reads it. Every other trigger input
+    /// reads past the arrival: a `consume = latest` drain and a separate drain
+    /// subscriber consult their queue at every boundary, a frame held or not.
+    ///
+    /// Returns the nodes whose trigger input it restored holding a frame, in id
+    /// order.
+    ///
     /// # Errors
     ///
     /// Nothing changes on either refusal.
@@ -19271,8 +19293,8 @@ impl GraphRuntime {
     // hot-path-alloc-ok-fn: cold: a resume edit before step 1
     pub fn restore_stopped_nodes(
         &mut self,
-        ids: &std::collections::BTreeSet<String>,
-    ) -> TransportResult<()> {
+        stops: &std::collections::BTreeMap<String, crate::state_restore::StoppedAtAnchor>,
+    ) -> TransportResult<std::collections::BTreeSet<String>> {
         if self.external_sources_collected {
             return Err(TransportError::GraphError {
                 reason: format!(
@@ -19285,9 +19307,36 @@ impl GraphRuntime {
                 ),
             });
         }
-        self.scheduler.restore_stopped_nodes(ids)?;
-        self.release_block_slots_held_by(ids);
-        Ok(())
+        let ids: std::collections::BTreeSet<String> = stops.keys().cloned().collect();
+        self.scheduler.restore_stopped_nodes(&ids)?;
+        self.release_block_slots_held_by(&ids);
+        Ok(self.hold_restored_trigger_heads(stops))
+    }
+
+    /// Mark the trigger binding of each node in `stops` that states an
+    /// unconsumed arrival as holding a frame, when that binding is a
+    /// per-message FIFO input drained through the node's own subscriber, and
+    /// return those nodes. Called only after `Scheduler::restore_stopped_nodes`
+    /// has accepted `stops`.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    fn hold_restored_trigger_heads(
+        &mut self,
+        stops: &std::collections::BTreeMap<String, crate::state_restore::StoppedAtAnchor>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut held = std::collections::BTreeSet::new();
+        for binding in &mut self.data_trigger_bindings {
+            let unconsumed = stops
+                .get(binding.node_id.as_ref())
+                .is_some_and(|stop| stop.unconsumed_arrival);
+            if unconsumed
+                && matches!(binding.drain, DrainSource::Unified { .. })
+                && !binding.consume_latest
+            {
+                binding.trigger_head_held = true;
+                held.insert(binding.node_id.to_string());
+            }
+        }
+        held
     }
 
     /// Release every `block` slot a node in `ids` holds as a consumer, with no
@@ -20475,7 +20524,21 @@ impl GraphRuntime {
                 // `&self.nodes` borrow and the `&mut self.scheduler` borrows
                 // are sequential (no aliasing).
                 let input = input_name.as_deref(); // Some for any DataTrigger binding.
+                let held = self.data_trigger_bindings[i].trigger_head_held;
+                // `GraphRuntime` exposes no way to re-enable a node, so a node
+                // restored holding a frame stays disabled for the whole run.
+                debug_assert!(
+                    !held || self.scheduler.is_node_disabled(&node_id),
+                    "a held trigger binding's node '{node_id}' is enabled"
+                );
                 let (popped, latest_ts) = match input {
+                    // A stopped node restored holding a frame
+                    // (`restore_stopped_nodes`). The recorded drain re-offered
+                    // its held head here: no pop, no read-gate consult, no
+                    // read-outcome record, and one arrival with the head's
+                    // stamp. The stamp is not in the anchor, so this answers
+                    // the arrival with none.
+                    _ if held => (1, None),
                     Some(name) => match self.nodes.get(node_id.as_ref()) {
                         Some(arc) => match arc.lock() {
                             Ok(mut g) => g.drain_trigger_input(name),
@@ -21929,6 +21992,7 @@ mod chain_call_cut_tests {
             consume_latest: false,
             probes_body: false,
             unconfirmed_arrival: false,
+            trigger_head_held: false,
         }
     }
 

@@ -192,6 +192,20 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Local identity**: `cerulion_wireclient::local_identity` holds the existing
+  never-renamed auth-store lock while reading the account and actual machine key.
+  A busy writer refuses immediately. Identity-only reads never open certificate
+  files; full snapshots also bind the leaf and chain, refusing malformed present
+  proof. Netd delegates its full-snapshot reader to this module and keeps its
+  existing expiry-independent stamp and authorization rules. Callers supply a
+  read-only nonblocking opener; opened descriptors must be regular and bounded.
+  These reads neither create state nor contact the account service.
+  The WAN serving-login adapter also uses the shared bounded reader and parser.
+  The build without WAN retains its local implementation, with literal parsing,
+  FIFO, regular-symlink and size-bound tests pinning parity. An empty saved
+  session token is metadata for account actions, not a new prior-login or
+  durable-pairing prerequisite; the public identity stamp excludes token bytes.
+
 - **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
   process enumeration, readiness and signal syscalls before spawn. Native pidfds
   bind each signal to its captured process. Only an unavailable pidfd syscall permits the
