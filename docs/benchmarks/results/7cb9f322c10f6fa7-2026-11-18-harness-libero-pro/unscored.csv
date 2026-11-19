@@ -1,16 +1,13 @@
 list,cell,arm,model,attempts,reason,usd_attempts,price_date,replies_tool_calls,replies_stop,replies_length,replies_content_filter,replies_other,requests_no_reply
 grid,pro_goal_task_t01_i03,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.096694,2026-11-17,3,0,0,0,0,23
 grid,pro_goal_task_t02_i03,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,10.629089,2026-11-17,87,0,0,0,0,59
-grid,pro_goal_swap_t03_i07,with,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,8.309677,2026-11-17,47,0,0,0,0,48
 grid,pro_spatial_task_t00_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,1.702561,2026-11-17,35,0,0,0,0,56
 grid,pro_spatial_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.535052,2026-11-17,13,0,0,0,0,34
 grid,pro_spatial_task_t02_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,7.006863,2026-11-17,70,0,0,0,0,52
 grid,pro_object_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,3.284183,2026-11-17,46,0,0,0,0,48
 grid,pro_goal_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.435286,2026-11-17,10,0,0,0,0,31
 grid,pro_goal_swap_t02_i08,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.078206,2026-11-17,3,0,0,0,0,20
-grid,pro_goal_swap_t03_i08,with,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.882793,2026-11-17,19,0,0,0,0,31
-grid,pro_goal_task_t00_i04,with,Claude Fable 5.2,1,the 90 minute episode clock ran out,35.528882,2026-11-17,50,0,0,0,0,3
-grid,pro_goal_task_t00_i05,with,Claude Fable 5.2,1,the 90 minute episode clock ran out,29.146153,2026-11-17,40,0,3,0,0,3
+grid,pro_goal_task_t00_i03,with,Claude Fable 5.2,1,the 90 minute episode clock ran out,19.247276,2026-11-17,48,0,0,0,0,3
 grid,pro_goal_swap_t03_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,7.142726,2026-11-17,27,0,0,0,0,5
 grid,pro_goal_swap_t05_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.998314,2026-11-17,37,0,0,0,0,6
 grid,pro_goal_task_t00_i03,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,9.393369,2026-11-17,56,0,0,0,0,4

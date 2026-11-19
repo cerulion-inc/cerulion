@@ -867,9 +867,12 @@ def grid_first(cols, name, fam, N, cells, uns, lost):
                     "on CLEAN." if not moved else
                     "On scored pairs only (start states scored in both arms) these readings change: "
                     + "; ".join(moved) + "."))
-    L += ["- Each start state ran once in each arm. How much the outcome of one start state varies from run to run "
-          "was not measured.",
-          "- How the run went, and where it differed from the protocol (the pause of the Claude models, the start "
+    L += ["- Each start state ran once in each arm, except that the four Claude columns with Cerulion were drawn a "
+          "second time on 2026-11-19, with another picture mode and code snapshot (README.md, \"How the episodes "
+          "ran\"); this package holds that second draw. How much the outcome of one start state varies from run to "
+          "run under the same settings was not measured.",
+          "- How the run went, and where it differed from the protocol (the second draw of the four Claude columns "
+          "with Cerulion, the pause of the Claude models, the start "
           "states whose two arms started more than an hour apart, two machines that stopped and a third whose "
           "waiting episodes were moved, a network outage, one model answered from two provider deployments, the "
           "machines shared with other work), is in README.md under \"Things to know before quoting a number\".", ""]

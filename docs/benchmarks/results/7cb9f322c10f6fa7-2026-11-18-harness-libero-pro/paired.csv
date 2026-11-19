@@ -5,23 +5,23 @@ grid,Gemini 3.8 Flash,false_claim,1,100,6,20,10,64,-0.14,-0.2358,-0.0429,0.00935
 grid,GPT-6 Astra,solved,1,100,13,14,57,16,-0.01,-0.1109,0.0912,1.0,0.05,0,no difference shown
 grid,GPT-6 Astra,clean,1,100,26,9,35,30,0.17,0.0573,0.2755,0.0059881205670535564,0.0167,1,established
 grid,GPT-6 Astra,false_claim,1,100,8,18,6,68,-0.1,-0.1986,-0.0008,0.07551869750022888,,,"descriptive, no test declared"
-grid,Claude Opus 5.5,solved,1,100,46,3,29,22,0.43,0.3136,0.5271,6.981082378842984e-11,0.0042,1,established
-grid,Claude Opus 5.5,clean,1,100,59,3,8,30,0.56,0.4392,0.655,1.724922288337538e-14,0.0038,1,established
-grid,Claude Opus 5.5,false_claim,1,100,3,14,2,81,-0.11,-0.1947,-0.0312,0.012725830078125,,,"descriptive, no test declared"
-grid,Claude Sonnet 5.5,solved,1,100,43,10,6,41,0.33,0.1963,0.4481,5.550520889130439e-06,0.0063,1,established
-grid,Claude Sonnet 5.5,clean,1,100,34,5,2,59,0.29,0.1774,0.3954,2.4299079086631536e-06,0.01,1,established
-grid,Claude Sonnet 5.5,false_claim,1,100,18,12,4,66,0.06,-0.0478,0.1667,0.361594608053565,,,"descriptive, no test declared"
-grid,Claude Haiku 5.5,solved,1,100,39,2,2,57,0.37,0.2635,0.4701,7.839844329282641e-10,0.0045,1,established
-grid,Claude Haiku 5.5,clean,1,100,29,1,0,70,0.28,0.1861,0.3763,5.774199962615967e-08,0.0063,1,established
-grid,Claude Haiku 5.5,false_claim,1,100,22,4,0,74,0.18,0.0841,0.2764,0.0005335211753845215,,,"descriptive, no test declared"
-grid,Claude Fable 5.2,solved,1,100,73,1,9,17,0.72,0.6098,0.7947,7.940933880509066e-21,0.0033,1,established
-grid,Claude Fable 5.2,clean,1,100,62,1,5,32,0.61,0.4982,0.6976,1.3877787807814457e-17,0.0033,1,established
-grid,Claude Fable 5.2,false_claim,1,100,9,4,0,87,0.05,-0.024,0.1277,0.266845703125,,,"descriptive, no test declared"
+grid,Claude Opus 5.5,solved,1,100,45,3,29,23,0.42,0.3042,0.5171,1.312585595769633e-10,0.0042,1,established
+grid,Claude Opus 5.5,clean,1,100,59,2,9,30,0.57,0.4533,0.6615,1.6410484082740595e-15,0.0038,1,established
+grid,Claude Opus 5.5,false_claim,1,100,7,13,3,77,-0.06,-0.1502,0.0289,0.26317596435546875,,,"descriptive, no test declared"
+grid,Claude Sonnet 5.5,solved,1,100,42,7,9,42,0.35,0.2249,0.4602,3.6245783263666453e-07,0.0063,1,established
+grid,Claude Sonnet 5.5,clean,1,100,32,3,4,61,0.29,0.1863,0.3898,4.176981747150421e-07,0.01,1,established
+grid,Claude Sonnet 5.5,false_claim,1,100,22,13,3,62,0.09,-0.0259,0.2033,0.17546524899080396,,,"descriptive, no test declared"
+grid,Claude Haiku 5.5,solved,1,100,43,3,1,53,0.4,0.2862,0.5025,4.6219383875722997e-10,0.0045,1,established
+grid,Claude Haiku 5.5,clean,1,100,33,1,0,66,0.32,0.2219,0.4179,4.0745362639427185e-09,0.0056,1,established
+grid,Claude Haiku 5.5,false_claim,1,100,18,3,1,78,0.15,0.0641,0.2404,0.0014896392822265625,,,"descriptive, no test declared"
+grid,Claude Fable 5.2,solved,1,100,74,0,10,16,0.74,0.6361,0.8087,1.0587911840678754e-22,0.0033,1,established
+grid,Claude Fable 5.2,clean,1,100,61,1,5,33,0.6,0.4883,0.6884,2.7321894746634712e-17,0.0033,1,established
+grid,Claude Fable 5.2,false_claim,1,100,7,3,1,89,0.04,-0.0259,0.1111,0.34375,,,"descriptive, no test declared"
 grid,Gemini 4 Carbon,solved,1,100,13,19,63,5,-0.06,-0.1696,0.051,0.37708558747544885,0.0167,0,no difference shown
 grid,Gemini 4 Carbon,clean,1,100,17,30,41,12,-0.13,-0.2569,0.0031,0.07894069368148848,0.025,0,no difference shown
 grid,Gemini 4 Carbon,false_claim,1,100,5,6,1,88,-0.01,-0.082,0.0609,1.0,,,"descriptive, no test declared"
 grid,Gemini 4 Argon,solved,1,100,29,8,55,8,0.21,0.0955,0.3181,0.0007528970600105822,0.0071,1,established
-grid,Gemini 4 Argon,clean,1,100,50,7,18,25,0.43,0.2992,0.539,4.236709844063213e-09,0.0056,1,established
+grid,Gemini 4 Argon,clean,1,100,50,7,18,25,0.43,0.2992,0.539,4.236709844063213e-09,0.0063,1,established
 grid,Gemini 4 Argon,false_claim,1,100,4,23,3,70,-0.19,-0.2867,-0.0939,0.000310748815536499,,,"descriptive, no test declared"
 grid,Gemini 4 Hydrogen,solved,1,100,48,8,31,13,0.4,0.2677,0.5124,4.688184102041859e-08,0.0056,1,established
 grid,Gemini 4 Hydrogen,clean,1,100,49,2,6,43,0.47,0.3569,0.5672,1.1786127629420662e-12,0.0042,1,established
