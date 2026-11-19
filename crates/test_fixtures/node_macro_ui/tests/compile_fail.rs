@@ -19,7 +19,7 @@
 //!
 //! # Why the compile-pass programs are not in this `TestCases`
 //!
-//! `tests/ui/pass/*.rs` are example targets of this package (listed in its
+//! `tests/ui/pass/*.rs` are binary targets of this package (listed in its
 //! `Cargo.toml`, run by `tests/pass_programs.rs`), not `t.pass(...)` cases. A
 //! single pass case sets trybuild's `has_pass`, and that changes how the whole
 //! set runs (trybuild 1.0.125, `run.rs` and `cargo.rs`):

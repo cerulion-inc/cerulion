@@ -3,6 +3,6 @@
 //!
 //! `tests/compile_fail.rs` runs every `tests/ui/*.rs` fixture through trybuild
 //! and compares its compiler output with the `.stderr` beside it. Each
-//! `tests/ui/pass/*.rs` program is an example target: `cargo test` builds it
-//! and `tests/pass_programs.rs` runs it.
+//! `tests/ui/pass/*.rs` program is a binary target, which cargo builds for
+//! `tests/pass_programs.rs`, and that test runs it.
 #![cfg_attr(not(test), deny(clippy::print_stdout, clippy::print_stderr))]
