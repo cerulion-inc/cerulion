@@ -3207,6 +3207,86 @@ fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
     );
 }
 
+/// A `ci_test_shard.sh` run credits its own package and each `--with` package,
+/// by whole token, and a line that runs no shard credits neither. Each row is
+/// `(line, package, credited?)`, written by hand.
+#[test]
+fn a_shard_line_credits_its_package_and_each_with_package() {
+    const ROWS: &[(&str, &str, bool)] = &[
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha ${{ matrix.shard }} 4 --with beta",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha ${{ matrix.shard }} 4 --with beta",
+            "beta",
+            true,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 --with beta --with gamma",
+            "gamma",
+            true,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 crates/a --with beta",
+            "beta",
+            true,
+        ),
+        (
+            "            2) python3 -B tools/scripts/ci_built_tests.py phase alpha -- ./tools/scripts/ci_test_shard.sh alpha ${{ matrix.shard }} 4 --with beta ;;",
+            "beta",
+            true,
+        ),
+        // Whole tokens: a longer name does not credit its prefix, and the
+        // script takes `--with <package>` only, never `--with=<package>`.
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 --with betax",
+            "beta",
+            false,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 --with=beta",
+            "beta",
+            false,
+        ),
+        // The package of the shard is the first argument, not any later one.
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4 beta",
+            "beta",
+            false,
+        ),
+        // A mode that runs nothing credits nothing.
+        (
+            "        run: args=$(./tools/scripts/ci_test_shard.sh --list alpha 2 4 --with beta)",
+            "beta",
+            false,
+        ),
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh --selected beta",
+            "beta",
+            false,
+        ),
+        // `--with` belongs to the command it is on.
+        (
+            "        run: ./tools/scripts/ci_test_shard.sh alpha 2 4; echo --with beta",
+            "beta",
+            false,
+        ),
+        ("      - name: ci_test_shard.sh alpha 2 4 --with beta", "beta", false),
+    ];
+    let wrong: Vec<String> = ROWS
+        .iter()
+        .filter(|(line, pkg, credited)| line_runs_tests_of(line, pkg) != *credited)
+        .map(|(line, pkg, credited)| format!("  `{line}` credits `{pkg}`: expected {credited}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the shard-line reader disagrees with the hand oracle:\n{}",
+        wrong.join("\n")
+    );
+}
+
 /// The `shard:` matrix is read in BOTH YAML list forms, and per JOB.
 #[test]
 fn the_shard_matrix_is_read_in_both_yaml_forms_and_per_job() {

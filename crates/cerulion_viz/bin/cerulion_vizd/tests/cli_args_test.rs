@@ -8,6 +8,7 @@
 //! daemon (a bounded wait — a regression that starts the daemon would hang, caught
 //! by the wait timeout).
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -17,6 +18,10 @@ use std::time::{Duration, Instant};
 /// that starts the daemon would block forever, so we SIGKILL past the bound and
 /// report a sentinel exit code that fails the assert loudly.
 fn run_vizd(args: &[&str]) -> (i32, String, String) {
+    run_vizd_os(&args.iter().map(OsString::from).collect::<Vec<_>>())
+}
+
+fn run_vizd_os(args: &[OsString]) -> (i32, String, String) {
     let bin = env!("CARGO_BIN_EXE_cerulion-vizd");
     let mut child = Command::new(bin)
         .args(args)
@@ -82,5 +87,44 @@ fn an_unknown_arg_exits_nonzero_with_usage_on_stderr() {
     assert!(
         stderr.contains("unrecognized argument") && stderr.contains("--bogus-flag"),
         "an unknown arg names the offender + prints usage to stderr:\n{stderr}"
+    );
+}
+
+/// `cerulion-vizd <arg>` exits 2 with `line`, a blank line and the usage on
+/// stderr, and nothing on stdout.
+fn assert_refused_with_usage(arg: &[u8], line: &str) {
+    use std::os::unix::ffi::OsStringExt as _;
+    let (code, stdout, stderr) = run_vizd_os(&[OsString::from_vec(arg.to_vec())]);
+    assert!(!stderr.contains("panicked at"), "a panic:\n{stderr}");
+    assert_eq!(code, 2, "stderr:\n{stderr}");
+    let lines: Vec<&str> = stderr.lines().take(6).collect();
+    assert_eq!(lines.len(), 6, "stderr:\n{stderr}");
+    assert_eq!(lines[..2], [line, ""], "stderr:\n{stderr}");
+    assert!(lines[2].starts_with("cerulion-vizd "), "stderr:\n{stderr}");
+    assert_eq!(
+        lines[3..],
+        ["", "USAGE:", "    cerulion-vizd [--help]"],
+        "the usage follows the blank line:\n{stderr}"
+    );
+    assert!(stdout.is_empty(), "nothing on stdout:\n{stdout}");
+}
+
+/// An argument that is not valid UTF-8 is refused with its position and bytes,
+/// a blank line and the usage on stderr, exit 2, and no panic.
+#[test]
+fn an_argument_that_is_not_utf8_is_refused_with_its_position_and_the_usage() {
+    assert_refused_with_usage(
+        b"\xFFrobot",
+        "cerulion-vizd: argument 1 is not valid UTF-8: \"\\xFFrobot\"",
+    );
+}
+
+/// A flag name that is not valid UTF-8 gets the same refusal, not the line for
+/// an unrecognized argument.
+#[test]
+fn a_flag_name_that_is_not_utf8_is_refused_with_its_position_and_the_usage() {
+    assert_refused_with_usage(
+        b"--h\xE9lp",
+        "cerulion-vizd: argument 1 is not valid UTF-8: \"--h\\xE9lp\"",
     );
 }

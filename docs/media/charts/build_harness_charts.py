@@ -36,7 +36,11 @@ The form of both charts:
     running gets no verdict, as in the package;
   - the cost chart's footer says what its figure leaves out (the episodes that ended without a score
     and every attempt in no row) and for how many models part of the factor is caching: "each factor"
-    only when every model's arm without Cerulion had the lower cached share of input, else that count.
+    only when every model's arm without Cerulion had the lower cached share of input, else that count;
+  - both footers name every arm that had a reply the provider's content filter stopped (finish reason
+    content_filter, the package's filtered_arms()): an arm whose scored episodes ended on such replies by
+    name with its counts, the other arms by count, every count of replies over scored and unscored
+    episodes together.
 """
 import decimal
 import html
@@ -44,6 +48,7 @@ import importlib.util
 import json
 import os
 import sys
+import textwrap
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
 PACKAGE = os.path.join(ROOT, "docs", "benchmarks", "results", "7cb9f322c10f6fa7-2026-11-18-harness-libero-pro")
@@ -196,6 +201,33 @@ def fewer_footer(rows, joined):
             "; ".join(f"{v} for {joined(ms)}" for v, ms in groups.items()) + "."]
 
 
+def filter_footer(filtered):
+    """The arms with a reply the provider's content filter stopped: each one whose scored episodes ended on such
+    replies by name with its counts, the rest by count. Every count of replies is over the arm's scored and
+    unscored episodes together (the package's filtered_item() gives the two apart), for the named arms and the
+    rest alike. Wrapped at 140 characters a line, never at a hyphen: a fixed count of characters, not a measured
+    width, and the other footer lines are not wrapped."""
+    named = [(c, arm, f) for c, arm, f in filtered if f["ended"]]
+    rest = [f for c, arm, f in filtered if not f["ended"]]
+    s = []
+    for c, arm, f in named:
+        s.append(f"{c.model} {arm} {NAME}: the provider's content filter stopped {f['filtered']:,} of its "
+                 f"{f['replies'] + f['unscored_replies']:,} replies; {len(f['ended'])} of its "
+                 f"{c.stats(arm)['scored']} scored episodes ended "
+                 f"on them" + (", with no claim from the model."
+                               if not any(e["ended_by"] == "claim" for e in f["ended"]) else "."))
+    if rest:
+        n = sum(f["filtered"] for f in rest)
+        word = NUMBER_WORDS.get(len(rest), str(len(rest))).capitalize()
+        each = "one filtered reply" + (" each" if len(rest) > 1 else "")
+        s.append(f"{word}{' other' if named else ''} arm{'' if len(rest) == 1 else 's'} had "
+                 + (each if n == len(rest) else f"{n:,} filtered replies in all")
+                 + ", ending no scored episode.")
+    if not s:
+        return []
+    return textwrap.wrap(" ".join(s), 140, break_on_hyphens=False)
+
+
 def scope(cells, task_rows):
     """The fine print every chart of these rows carries, one sentence on two subtitle lines so it fits the
     width: what the start states are."""
@@ -207,7 +239,7 @@ def label(r):
     return r["model"] + ("" if r["complete"] else "*") + ("\u2020" if r["late"] else "")
 
 
-def success_chart(rows, when, cells, task_rows, joined):
+def success_chart(rows, when, cells, task_rows, joined, filtered):
     def rate(s):
         return s["solved"] / s["finished"]
 
@@ -232,6 +264,7 @@ def success_chart(rows, when, cells, task_rows, joined):
     footer = ([f"Success rate: solved of finished episodes. The factor is the success rate with {NAME} over the "
                f"rate without."]
               + fewer_footer(rows, joined)
+              + filter_footer(filtered)
               + star_footer(rows, when, cells))
     return frame(f"Success rate, without and with {NAME}",
                  scope(cells, task_rows)
@@ -240,7 +273,7 @@ def success_chart(rows, when, cells, task_rows, joined):
                  "with ÷ without", ticks, [parts_for(r) for r in rows], footer)
 
 
-def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd):
+def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd, filtered):
     scale = (USD_CUT_X - LEFT) / USD_CUT
     broken = sum(1 for r in rows for a in ("without", "with")
                  if r[a]["usd_per_solved"] is not None and r[a]["usd_per_solved"] > USD_CUT)
@@ -294,6 +327,7 @@ def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd):
               f"The factor is the cost per success without {NAME} over the cost with it."
               + (f" A broken bar runs past ${USD_CUT:.0f}." if broken else ""),
               caching] \
+        + filter_footer(filtered) \
         + star_footer(rows, when, cells)
     return frame(f"Model cost per successful episode, without and with {NAME}",
                  scope(cells, task_rows)
@@ -308,11 +342,13 @@ def main(argv):
     rc = load_recompute()
     rows = rows_of(rc)
     when, cells = read_info()
-    listed, _cols, uns = rc.columns(PACKAGE)
+    listed, cols, uns = rc.columns(PACKAGE)
     task_rows = len({x["task_row"] for x in listed})
     lost_usd = sum(float(x["usd_list"]) for x in rc.load(PACKAGE, "lost_attempts.csv"))
-    outputs = {"harness-success-rate.svg": success_chart(rows, when, cells, task_rows, rc.joined),
-               "harness-cost-per-success.svg": cost_chart(rows, when, cells, task_rows, rc.fnum, len(uns), lost_usd)}
+    filtered = rc.filtered_arms(cols)
+    outputs = {"harness-success-rate.svg": success_chart(rows, when, cells, task_rows, rc.joined, filtered),
+               "harness-cost-per-success.svg": cost_chart(rows, when, cells, task_rows, rc.fnum, len(uns), lost_usd,
+                                                          filtered)}
     stale = []
     for name, svg in outputs.items():
         path = os.path.join(MEDIA, name)

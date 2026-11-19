@@ -382,11 +382,11 @@ LIVE_ORACLE = {
     'cerulion_bag': (71, 10),
     'cerulion_cli': (1, 1),
     'cerulion_cli_engine': (71, 6),
-    'cerulion_core': (71, 70),
+    'cerulion_core': (71, 71),
     'cerulion_viz': (2, 2),
     'cerulion_vizd': (1, 1),
     'go2_tf': (4, 4),
-    'native_ros2_messages': (71, 59),
+    'native_ros2_messages': (71, 60),
 }
 
 
@@ -524,15 +524,15 @@ OBSERVATION_ERROR_CASES = [
 # members): its `hot_path_dependency_gate` walks `examples/go2`, so `go2_tf`
 # moves to with=9 without=4; `cerulion_heaphook` is unchanged.
 #
-# `node_macro_ui` and `test_node_macro_cdylib` join it: their pass-program
-# runners join `examples` onto the profile directory, which the walk records as
-# observing that tree, so `go2_tf` moves to with=11 without=4.
+# `test_node_macro_cdylib` joins it: its pass-program runner joins `examples`
+# onto the profile directory, which the walk records as observing that tree, so
+# `go2_tf` moves to with=10 without=4.
 #
 # Dropping the union from the closure shrinks both, which is the mutant these
 # rows exist to kill.
 LIVE_OBSERVATION_ORACLE = {
     'cerulion_heaphook': (6, 1),
-    'go2_tf': (11, 4),
+    'go2_tf': (10, 4),
 }
 
 # `name | document | touched | dev edges followed | expected closure`.

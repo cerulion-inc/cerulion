@@ -379,7 +379,11 @@ def cmd_build(group, features, specs):
         args += ['--features', ','.join(features)] if features else []
         begin = time.time_ns()
         print(f'group {group}: cargo test --no-run {" ".join(args)}', flush=True)
-        proc = subprocess.Popen(['cargo', 'test', '--no-run', '--message-format=json-render-diagnostics'] + args,
+        # `--timings` writes the group's compile report under the target's
+        # `cargo-timings`, where the job's collect step picks it up; the
+        # recording run below compiles nothing, so it records no report.
+        proc = subprocess.Popen(['cargo', 'test', '--no-run', '--timings',
+                                 '--message-format=json-render-diagnostics'] + args,
                                 stdout=subprocess.PIPE, text=True, cwd=ROOT)
         artifacts, native = {}, set()
         for line in proc.stdout:
@@ -696,6 +700,8 @@ def self_test():
 
 FAKE_CARGO = """import json, os, subprocess, sys
 a, tmp = sys.argv[1:], os.environ['FAKE_TMP']
+with open(os.path.join(tmp, 'cargo-args'), 'a') as f:
+    f.write(' '.join(a) + '\\n')
 exes = [os.path.join(tmp, 'target', 'debug', 'deps', n) for n in ('pkg-lib', 'one_test')]
 if a[:2] == ['test', '--no-run']:
     for exe, kind, name in zip(exes, (['lib'], ['test']), ('pkg', 'one_test')):
@@ -744,6 +750,10 @@ def end_to_end(check, refused):
         try:
             cmd_phase('workspace', ['true'])
             check('end to end: build', cmd_build('g', ['pkg/f'], ['pkg']), 0)
+            grouped = [l.split() for l in open(os.path.join(tmp, 'cargo-args')).read().splitlines()
+                       if l.startswith('test --no-run')]
+            check('end to end: the grouped build records cargo timings',
+                  [len(grouped), all('--timings' in g for g in grouped)], [1, True])
             check('end to end: the recording ran no test, and a doctest ran without the recorder state',
                   trace(), ['doctest '])
             check('end to end: one test, serial', cmd_run('cargo test -p pkg --test one_test -- --test-threads=1'

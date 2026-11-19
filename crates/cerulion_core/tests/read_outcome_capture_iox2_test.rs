@@ -7022,3 +7022,321 @@ fn an_external_edge_is_annotated_and_uncapped() {
          the pure oracle pins, now reached by a real build"
     );
 }
+
+// ===========================================================================
+// A node stopped by `NodeError::Fatal`, and a resume that restores the stop
+// ===========================================================================
+
+/// A data-trigger consumer that returns `NodeError::Fatal` from its
+/// `stop_at`-th fire (0 = never), which stops it.
+#[cerulion_node]
+#[derive(Default)]
+struct StoppingTrigSink {
+    #[input(trigger)]
+    inp: Vector3,
+    fires: u32,
+    stop_at: u32,
+}
+
+#[cerulion_node_impl]
+impl StoppingTrigSink {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let _ = self.inp.x;
+        self.fires += 1;
+        if self.fires == self.stop_at {
+            return Err(NodeError::Fatal("the sink stops here".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// A [`StoppingTrigSink`] that stops at its `stop_at`-th fire.
+fn stopping_sink(stop_at: u32) -> Box<dyn NodeEntry> {
+    Box::new(StoppingTrigSinkEntry::with_state(StoppingTrigSink {
+        stop_at,
+        ..Default::default()
+    }))
+}
+
+/// `producer -> consumer` recorded for `steps` steps of 10 ms, with `before`
+/// run on the fresh runtime before step 0: the consumer's kind-6 reads, and
+/// its pending count after each step.
+fn run_stopping(
+    tag: &str,
+    producer: Box<dyn NodeEntry>,
+    consumer: Box<dyn NodeEntry>,
+    steps: u64,
+    before: impl FnOnce(&mut GraphRuntime),
+) -> (Vec<ReadRec>, Vec<u64>) {
+    let (config, factories) = two_node_graph(&format!("ro{tag}"), producer, consumer);
+    let mut pending = Vec::new();
+    let (kind6, _all, _inputs) = run_recorded_driven(
+        tag,
+        config,
+        factories,
+        &["producer", "consumer"],
+        &[&[], &["inp"]],
+        |runtime, _clock| {
+            before(runtime);
+            for _ in 0..steps {
+                runtime.step(Duration::from_millis(10));
+                pending.push(
+                    runtime
+                        .node_handle("consumer")
+                        .expect("consumer handle")
+                        .pending_data_count(),
+                );
+            }
+        },
+    );
+    let consumer: Vec<ReadRec> = kind6.into_iter().filter(|r| r.node_idx == 1).collect();
+    (consumer, pending)
+}
+
+/// What a FIFO trigger drain records once its node is stopped. `StepSrc`
+/// commits seq k at step k, and the sink returns `Fatal` from its second fire:
+///
+///   step 0: pop seq 0 -> DB(0,1); fire 1 serves it.
+///   step 1: pop seq 1 -> DB(1,1); fire 2 serves it and returns `Fatal`.
+///   step 2: no head is held, so the drain pops seq 2 -> DB(2,1) and freezes
+///           it; the node is stopped and no tick takes it.
+///   steps 3 to 7: the drain re-offers held seq 2 and records nothing.
+///
+/// The pending count after each step: 0 while each fire consumes the arrival
+/// its pop minted, then 1 from step 2, the arrival of the held frame, which a
+/// stopped node never consumes and the re-offer does not mint again.
+#[test]
+#[serial]
+fn a_stopped_fifo_trigger_drain_takes_one_more_frame_then_records_nothing() {
+    let (kind6, pending) = run_stopping(
+        "stpa",
+        Box::new(StepSrcEntry::new()),
+        stopping_sink(2),
+        8,
+        |_| {},
+    );
+    assert_eq!(
+        kind6,
+        vec![
+            rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
+            rec(1, READ_OUTCOME_DRAINED_BATCH, 1, 1),
+            rec(2, READ_OUTCOME_DRAINED_BATCH, 2, 1),
+        ],
+        "one more frame after the stop, then nothing"
+    );
+    assert_eq!(pending, vec![0, 0, 1, 1, 1, 1, 1, 1]);
+}
+
+/// The same stop with the writer silent between frames: `SlowSrc` commits
+/// seq 0, 1, 2 at steps 2, 5, 8, and the sink returns `Fatal` from its first
+/// fire (step 2). The stopped drain holds nothing while its queue is empty, so
+/// it consults and records `NoFrame` at steps 3 and 4, pops and holds seq 1 at
+/// step 5, and records nothing after (seq 2 stays queued). Its pending count
+/// stays 0 until that pop and is 1 from step 5.
+#[test]
+#[serial]
+fn a_stopped_fifo_trigger_drain_keeps_consulting_until_a_frame_arrives() {
+    let none = |k| rec(k, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME, 0);
+    let (kind6, pending) = run_stopping(
+        "stpb",
+        Box::new(SlowSrcEntry::new()),
+        stopping_sink(1),
+        10,
+        |_| {},
+    );
+    assert_eq!(
+        kind6,
+        vec![
+            none(0),
+            none(1),
+            rec(2, READ_OUTCOME_DRAINED_BATCH, 0, 1),
+            none(3),
+            none(4),
+            rec(5, READ_OUTCOME_DRAINED_BATCH, 1, 1),
+        ]
+    );
+    assert_eq!(pending, vec![0, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
+}
+
+/// A resume that restores the consumer stopped before step 0. With an
+/// unconsumed arrival its FIFO trigger input resumes holding a frame: the drain
+/// records nothing at any step, as the recorded drain of a stopped node
+/// holding a frame did, and the held frame's one arrival is pending from step
+/// 0. Without one the drain pops the step-0 frame and holds it, as a live stop
+/// with nothing held does: DB(0,1), then nothing. Neither fires.
+#[test]
+#[serial]
+fn a_restored_stop_with_an_unconsumed_arrival_holds_its_fifo_trigger_input() {
+    for (tag, unconsumed_arrival, expected, held) in [
+        ("stpc", true, vec![], vec!["consumer".to_string()]),
+        (
+            "stpd",
+            false,
+            vec![rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1)],
+            vec![],
+        ),
+    ] {
+        let mut marked = None;
+        let (kind6, pending) = run_stopping(
+            tag,
+            Box::new(StepSrcEntry::new()),
+            stopping_sink(0),
+            6,
+            |runtime| {
+                let stops = [(
+                    "consumer".to_string(),
+                    cerulion_core::state_restore::StoppedAtAnchor { unconsumed_arrival },
+                )]
+                .into_iter()
+                .collect();
+                marked = Some(
+                    runtime
+                        .restore_stopped_nodes(&stops)
+                        .expect("the consumer is in the graph"),
+                );
+            },
+        );
+        assert_eq!(
+            marked,
+            Some(held.into_iter().collect::<BTreeSet<_>>()),
+            "{tag}"
+        );
+        assert_eq!(kind6, expected, "{tag}");
+        assert_eq!(pending, vec![1; 6], "{tag}");
+    }
+}
+
+/// A refused stop restore marks no frame held. Each run asks to restore the
+/// consumer with an unconsumed arrival and is refused (an unknown id beside
+/// it, or a runtime that has collected its external sources), then runs with
+/// the sink returning `Fatal` from its first fire: its drain records the live
+/// stop's own shape, DB(0,1) and then the post-stop pop DB(1,1), which a held
+/// mark left behind by the refusal would have answered with nothing.
+#[test]
+#[serial]
+fn a_refused_stop_restore_leaves_the_trigger_input_unheld() {
+    for (tag, collect_first) in [("stpe", false), ("stpf", true)] {
+        let (kind6, _pending) = run_stopping(
+            tag,
+            Box::new(StepSrcEntry::new()),
+            stopping_sink(1),
+            4,
+            |runtime| {
+                if collect_first {
+                    runtime.collect_external_sources_for_test();
+                }
+                let stops = ["consumer", "unknown"]
+                    .into_iter()
+                    .map(|id| {
+                        (
+                            id.to_string(),
+                            cerulion_core::state_restore::StoppedAtAnchor {
+                                unconsumed_arrival: true,
+                            },
+                        )
+                    })
+                    .collect();
+                match runtime.restore_stopped_nodes(&stops) {
+                    Err(TransportError::NodeNotFound { node_id }) if !collect_first => {
+                        assert_eq!(node_id, "unknown");
+                    }
+                    Err(TransportError::GraphError { .. }) if collect_first => {}
+                    other => panic!("{tag}: expected a refusal, got {other:?}"),
+                }
+            },
+        );
+        assert_eq!(
+            kind6,
+            vec![
+                rec(0, READ_OUTCOME_DRAINED_BATCH, 0, 1),
+                rec(1, READ_OUTCOME_DRAINED_BATCH, 1, 1),
+            ],
+            "{tag}"
+        );
+    }
+}
+
+/// Two runs of a resume that restores the consumer stopped with an unconsumed
+/// arrival give one stream: every fire and read record the ring holds, a
+/// fire's measured tick duration left out, and the consumer's pending count
+/// after each step. Hand oracle: the producer fires once at each of the 6
+/// steps and nothing else is recorded (the stopped consumer neither fires nor
+/// reads), and the pending count is 1 from step 0.
+#[test]
+#[serial]
+fn a_restored_held_frame_gives_one_stream_in_two_runs() {
+    const STEPS: u64 = 6;
+    let run = |tag: &str| {
+        let (config, factories) = two_node_graph(
+            &format!("ro{tag}"),
+            Box::new(StepSrcEntry::new()),
+            stopping_sink(0),
+        );
+        let mut pending = Vec::new();
+        let (_kind6, all, _inputs) = run_recorded_driven(
+            tag,
+            config,
+            factories,
+            &["producer", "consumer"],
+            &[&[], &["inp"]],
+            |runtime, _clock| {
+                let stops = [(
+                    "consumer".to_string(),
+                    cerulion_core::state_restore::StoppedAtAnchor {
+                        unconsumed_arrival: true,
+                    },
+                )]
+                .into_iter()
+                .collect();
+                runtime
+                    .restore_stopped_nodes(&stops)
+                    .expect("the consumer is in the graph");
+                for _ in 0..STEPS {
+                    runtime.step(Duration::from_millis(10));
+                    pending.push(
+                        runtime
+                            .node_handle("consumer")
+                            .expect("consumer handle")
+                            .pending_data_count(),
+                    );
+                }
+            },
+        );
+        let fire = cerulion_core::trace_ring::RECORD_TYPE_FIRE;
+        let stream: Vec<(u32, u64, u32, u32, u64, u64)> = all
+            .iter()
+            .filter(|r| r.record_type == fire || r.record_type == RECORD_TYPE_READ_OUTCOME)
+            .map(|r| {
+                let duration = if r.record_type == fire {
+                    0
+                } else {
+                    r.duration_ns
+                };
+                (
+                    r.record_type,
+                    r.step,
+                    r.node_idx,
+                    r.global_level,
+                    r.fire_time_ns,
+                    duration,
+                )
+            })
+            .collect();
+        (stream, pending)
+    };
+    let (first, first_pending) = run("stpg");
+    let (second, second_pending) = run("stph");
+    assert_eq!(first, second, "two runs record one stream");
+    assert_eq!(first_pending, second_pending, "and one pending count");
+    assert_eq!(
+        first
+            .iter()
+            .map(|(kind, step, node, ..)| (*kind, *step, *node))
+            .collect::<Vec<_>>(),
+        (0..STEPS)
+            .map(|k| (cerulion_core::trace_ring::RECORD_TYPE_FIRE, k, 0))
+            .collect::<Vec<_>>(),
+        "the producer's six fires, and nothing of the stopped consumer"
+    );
+    assert_eq!(first_pending, vec![1; STEPS as usize]);
+}

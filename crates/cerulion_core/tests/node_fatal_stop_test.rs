@@ -13,9 +13,11 @@
 //!
 //! `GraphRuntime::restore_stopped_nodes` restores such a stop before the first
 //! step: the node fires on no decide, no planned replay fire and no
-//! `trigger_external` mark, and the run records no failure for it. An unknown
-//! id, and a restore after the external sources are collected, are refused
-//! with nothing stopped and no `block` slot released. Releasing a restored
+//! `trigger_external` mark, and the run records no failure for it. A stopped
+//! node whose entry states an unconsumed arrival resumes holding a frame only
+//! on a per-message FIFO trigger input it drains through its own subscriber.
+//! An unknown id, and a restore after the external sources are collected, are
+//! refused with nothing stopped and no `block` slot released. Releasing a restored
 //! consumer's `block` slot is pinned in `block_slot_release_iox2_test`, whose
 //! fixtures hold a consumer that never drains.
 //!
@@ -24,7 +26,7 @@
 //! nothing is derived from a second run of the code under test, except the
 //! determinism test, which compares two runs AND pins the hand oracle.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -35,6 +37,7 @@ use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::GraphRuntime;
 use cerulion_core::prelude::*;
 use cerulion_core::scheduler::{ReplayFire, TraceEntry};
+use cerulion_core::state_restore::StoppedAtAnchor;
 use indexmap::IndexMap;
 use native_ros2_messages::geometry_msgs::Vector3;
 
@@ -113,6 +116,24 @@ impl Relay {
         if self.fail_at != 0 && self.n >= self.fail_at {
             return Err(error_for(&self.kind));
         }
+        self.out.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// [`Relay`] with a `consume = latest` trigger input, whose drain pops the
+/// whole queue at every boundary.
+#[cerulion_node]
+#[derive(Default)]
+struct LatestRelay {
+    #[input(trigger, consume = latest)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+#[cerulion_node_impl]
+impl LatestRelay {
+    fn tick(&mut self) -> Result<(), NodeError> {
         self.out.x = self.inp.x;
         Ok(())
     }
@@ -770,9 +791,12 @@ fn a_fatal_sync_node_stops_while_both_upstreams_keep_publishing() {
     assert_eq!(ids, vec!["fuse".to_string()]);
 }
 
-/// The set of node ids a stop restore names.
-fn ids(names: &[&str]) -> BTreeSet<String> {
-    names.iter().map(|n| (*n).to_string()).collect()
+/// A stop restore naming `names`, none of them stating an unconsumed arrival.
+fn ids(names: &[&str]) -> BTreeMap<String, StoppedAtAnchor> {
+    names
+        .iter()
+        .map(|n| ((*n).to_string(), StoppedAtAnchor::default()))
+        .collect()
 }
 
 /// `prod0 -> cons0` and `prod1 -> cons1`, plus two host-driven nodes `poked`
@@ -893,6 +917,87 @@ fn a_restored_stop_keeps_the_node_stopped_and_records_no_failure() {
     );
 }
 
+/// A stop restore whose entry states an unconsumed arrival restores a held
+/// frame only on a per-message FIFO trigger input the node drains through its
+/// own subscriber. Four relays of one producer are restored stopped before
+/// step 0, and the restore names `fifo_held` alone: `fifo_unheld` states no
+/// arrival, `latest` reads `consume = latest`, whose drain pops at every
+/// boundary, and `block` reads a `block` input, which a separate drain
+/// subscriber serves.
+///
+/// Hand oracle over 20 steps of one frame each: the producer fires 20 times
+/// and no relay fires. Each relay's pending count is its drain's arrivals.
+/// `fifo_held` answers its first boundary with its held frame's one arrival
+/// and mints no more while the count is not empty: 1. `fifo_unheld` pops the
+/// step-0 frame, holds it and re-offers it after that: 1. `latest` pops at
+/// every step and mints only while its count is empty: 1. The separate drain
+/// of `block` signals every frame it pops: 20.
+#[test]
+fn a_restored_stop_holds_a_frame_only_on_a_fifo_trigger_input_it_drains_itself() {
+    let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    factories.insert(
+        "prod".to_string(),
+        Box::new(ProducerEntry::with_state(Producer::default())),
+    );
+    for id in ["fifo_held", "fifo_unheld", "block"] {
+        factories.insert(
+            id.to_string(),
+            Box::new(RelayEntry::with_state(Relay::default())),
+        );
+    }
+    factories.insert("latest".to_string(), Box::new(LatestRelayEntry::new()));
+    let source = || Some("prod/out".to_string());
+    let mut block = node("block", "relay", source(), true);
+    block.inputs[0].backpressure = Some(InputBackpressure::Block);
+    block.inputs[0].depth = Some(2);
+    let nodes = vec![
+        node("prod", "producer", None, true),
+        node("fifo_held", "relay", source(), true),
+        node("fifo_unheld", "relay", source(), true),
+        node("latest", "latest_relay", source(), true),
+        block,
+    ];
+    let mut rt = finish(nodes, factories).expect("build four relays");
+    let stops: BTreeMap<String, StoppedAtAnchor> = [
+        ("fifo_held", true),
+        ("fifo_unheld", false),
+        ("latest", true),
+        ("block", true),
+    ]
+    .into_iter()
+    .map(|(id, unconsumed_arrival)| (id.to_string(), StoppedAtAnchor { unconsumed_arrival }))
+    .collect();
+    let held = rt
+        .restore_stopped_nodes(&stops)
+        .expect("all four are in the graph");
+    assert_eq!(
+        held,
+        ["fifo_held".to_string()]
+            .into_iter()
+            .collect::<BTreeSet<_>>()
+    );
+    for _ in 0..20 {
+        rt.step(Duration::from_millis(5));
+    }
+    assert_eq!(producer_fires(rt.trace(), "prod"), 20);
+    for (id, pending) in [
+        ("fifo_held", 1u64),
+        ("fifo_unheld", 1),
+        ("latest", 1),
+        ("block", 20),
+    ] {
+        assert!(rt.is_node_stopped(id), "{id}");
+        assert_eq!(producer_fires(rt.trace(), id), 0, "{id} fires nothing");
+        assert_eq!(
+            rt.node_handle(id)
+                .unwrap_or_else(|| panic!("{id} handle"))
+                .pending_data_count(),
+            pending,
+            "{id}"
+        );
+    }
+}
+
 /// The fatal relay's message, as `node_fatal_errors()` reports it.
 const RELAY_FATAL: (&str, &str) = ("relay", FATAL_MSG);
 
@@ -975,7 +1080,7 @@ fn restoring_an_unknown_node_changes_nothing() {
     match rt.restore_stopped_nodes(&ids(&["relay", "unknown"])) {
         Err(TransportError::NodeNotFound { node_id }) => assert_eq!(node_id, "unknown"),
         Err(other) => panic!("expected NodeNotFound, got {other}"),
-        Ok(()) => panic!("an unknown id must be refused"),
+        Ok(_) => panic!("an unknown id must be refused"),
     }
     assert_the_chain_ran_unrestored(rt);
 }
@@ -993,7 +1098,7 @@ fn a_stop_restore_after_external_sources_are_collected_is_refused() {
     match rt.restore_stopped_nodes(&ids(&["relay"])) {
         Err(TransportError::GraphError { reason }) => assert_eq!(reason, COLLECTED_REFUSAL),
         Err(other) => panic!("expected GraphError, got {other}"),
-        Ok(()) => panic!("a restore after the collection must be refused"),
+        Ok(_) => panic!("a restore after the collection must be refused"),
     }
     assert_the_chain_ran_unrestored(rt);
 }

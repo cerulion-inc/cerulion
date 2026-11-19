@@ -158,6 +158,23 @@ filter = '''
 threads-required = 'num-cpus'
 
 # ---------------------------------------------------------------------------
+# The `#[cerulion_node]` diagnostics suite starts first.
+#
+# Its compile-fail test rides the `cerulion_core` shard's invocation
+# (`ci_test_shard.sh ... --with node_macro_ui`, shard 2 of both lanes) and is
+# one test that runs trybuild over its fixtures for minutes. nextest starts
+# tests in binary order, and `node_macro_ui::compile_fail` sorts after every
+# `cerulion_core` binary, so at the default priority it would start only once
+# every core test had started, and run on alone. A higher priority starts it
+# first, and the core tests run beside it. It joins no test group and claims
+# one slot, so it fences nothing, and `slow-timeout` below reports it without
+# ending it.
+# ---------------------------------------------------------------------------
+[[profile.default.overrides]]
+filter = 'binary_id(=node_macro_ui::compile_fail)'
+priority = 100
+
+# ---------------------------------------------------------------------------
 # Run-shape defaults.
 #
 # `slow-timeout` with NO `terminate-after` REPORTS a slow test and keeps

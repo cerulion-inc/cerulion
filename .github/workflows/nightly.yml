@@ -1,0 +1,63 @@
+name: Nightly full run
+
+# The full run of `ci.yml` and `rmw-distros.yml` on `main`, once a day.
+#
+# A push to `main` runs `ci.yml` in full, but a failed step skips every later
+# step of its job, and nothing reruns it to show whether the failure repeats.
+# `rmw-distros.yml` runs only on a change to its own paths, so a shared
+# dependency outside them can break a distro lane that no run then shows. And a
+# day with no push runs nothing, while the runner images, the stable toolchain
+# and the advisory database move anyway. This run covers all three: it
+# dispatches both workflows on `main`, reruns the failed jobs of a red run once,
+# and records the result on ONE issue (`tools/scripts/nightly_full_run.sh`,
+# oracle `tools/scripts/test_nightly_full_run.sh` in the Lint job).
+#
+# The clock lives HERE, not in `ci.yml`: `ci.yml` reports required status
+# contexts, and a workflow that does may trigger only on the events
+# `ci_test_coverage_test` allows (a pull request, a merge-queue batch, a push,
+# a dispatch). A dispatch run of `ci.yml` is one of those, and runs every job
+# a push does.
+#
+# `nightly-alarm.yml` reports when this workflow stops reaching a result.
+#
+# Neither trigger is reachable from a fork: `schedule` and `workflow_dispatch`
+# only ever run on a branch of this repository.
+on:
+  workflow_dispatch:
+  schedule:
+    # 03:30 UTC daily. Off-peak and off the hour, where GitHub queues the whole
+    # world's `0 * * * *` crons at once.
+    - cron: "30 3 * * *"
+
+# `actions: write` dispatches the two workflows and reruns their failed jobs;
+# `issues: write` records the result.
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+# One nightly at a time, so a dispatched run is never taken for another
+# nightly's. Queue rather than cancel: a nightly result is worth finishing (a
+# newer queued run still replaces an older queued one).
+concurrency:
+  group: nightly-full-run
+  cancel-in-progress: false
+
+jobs:
+  full-run:
+    name: Full run of main, rerun once, result on one issue
+    runs-on: ubuntu-latest
+    # The script stops waiting at 330 minutes and writes what it has; this limit
+    # leaves it the time to do so.
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # `GH_TOKEN` is the run's own token, scoped by the permissions above. A
+      # dispatch made with it starts a new run, which other events made with it
+      # do not.
+      - name: Dispatch, wait, rerun the failed jobs once, record the result
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: tools/scripts/nightly_full_run.sh run

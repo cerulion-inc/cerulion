@@ -118,8 +118,9 @@ env:
   #
   # CACHE_SAVE_NAMESPACES: space-separated namespace tokens that may save, the
   # token being the key text between `cargo-` and the scope segment with any
-  # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`,
-  # `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`,
+  # `${{ steps.*.outputs.* }}` segment removed (`macOS`, `Linux`, the test
+  # shards above 0 as `Linux-shard1` to `Linux-shard3` and `macOS-shard1`,
+  # `macOS-shard2`, `android-arm64`, `crates-Linux`, `viz-vizd-Linux`, `Linux-lint`, `py-Linux`, `examples-replay-Linux`,
   # `period-park-X64`, `period-park-ARM64`, and
   # `rmw-distros-jazzy` for `cargo-rmw-distros-jazzy-<header hash>-<scope>-<lock
   # hash>`, whose header hash is a cache generation rather than part of the
@@ -847,6 +848,11 @@ jobs:
       - name: Advisory issue bookkeeping self-test
         run: ./tools/scripts/test_advisory_issue.sh
 
+      # `nightly.yml` and `nightly-alarm.yml` run on a clock, so the script
+      # they share is pinned here, on every pull request.
+      - name: Nightly full run bookkeeping self-test
+        run: ./tools/scripts/test_nightly_full_run.sh
+
       # `queue-watchdog.yml` runs on merge-queue runs only, so its decision is
       # pinned here, on every pull request.
       - name: Queue run watchdog self-test
@@ -1169,9 +1175,11 @@ jobs:
       # The runner the test shards build their package tests with and then run
       # them through: command-line reading, selection rule, environment replay,
       # attribution of compiled units, the workflow wiring rules, and the
-      # modes end to end over a fake cargo.
-      - name: Built-test runner self-test
-        run: python3 -B tools/scripts/ci_built_tests.py --self-test
+      # modes end to end over a fake cargo. Then the shard jobs' own wiring.
+      - name: Built-test runner self-test and the shard wiring
+        run: |
+          python3 -B tools/scripts/ci_built_tests.py --self-test
+          python3 -B tools/scripts/ci_built_tests.py check-workflow .github/workflows/ci.yml
 
       # The path classifier the `changes` job runs. Its table is what decides
       # which test steps a pull request pays for and whether it pays for the
@@ -1182,11 +1190,15 @@ jobs:
       - name: Changed-path classifier self-test
         run: ./tools/scripts/ci_changed_paths.sh --self-test
 
-      # The per-binary test router. Its table is a hand-built workspace with
-      # every selection written out beside it; it reads no file of this
-      # checkout, so a change to the real tree cannot red this step.
+      # The per-binary test router, and the scorer that judges its answer
+      # against a full run. Both tables are hand-built fixtures with every
+      # answer written out beside them; neither reads this checkout, so a
+      # change to the real tree cannot red this step.
       - name: Test router self-test (shadow mode)
         run: python3 -B tools/scripts/ci_test_router.py --self-test
+
+      - name: Test router escape scorer self-test
+        run: python3 -B tools/scripts/ci_router_escapes.py --self-test
 
       # THE SHARD PARTITION AND ITS SELECTION READER. `--check` proves the
       # partition of `cerulion_core`'s test files is total and disjoint, that
@@ -2776,19 +2788,18 @@ jobs:
         with:
           toolchain: stable
 
-      # ONE SAVER, CHOSEN RATHER THAN RACED. All four legs of this matrix share
-      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES
-      # a key at save time: whichever leg finishes first wins, the other three
-      # upload a multi-gigabyte archive that is then rejected ("another job may
-      # be creating this cache"), and the archive that lands is whichever leg's
-      # `target/` happened to be newest — arbitrary, and different run to run.
-      # Shard 0 saves; shards 1-3 restore only.
+      # A KEY PER SHARD, ONE WRITER PER KEY. `actions/cache` RESERVES a key at
+      # save time, so legs sharing one key race and all but the first upload a
+      # multi-gigabyte archive that is then rejected. Each leg has a key of its
+      # own instead (below), so once its namespace may save, each keeps what its
+      # own tests built: with shard 0's archive the only one, shards 1-3 rebuilt
+      # the third-party crates shard 0 never builds on every run.
       #
-      # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a store limit,
-      # and one archive per shard per OS per lockfile would have the shards
-      # evicting each other AND every other job's namespace. One archive, one
-      # writer.
+      # SHARD 3 WOULD SAVE UNDER DISK PRESSURE. Its save would follow the wan step,
+      # which has entered with 824 MB free, and `actions/cache` writes the
+      # compressed archive to the runner's temp directory on `/` first; a tar
+      # that fails there is a warning, not a red. Read "Report free disk after
+      # the wan step" on a run before naming `Linux-shard3` in the policy.
       #
       # BRANCH-QUALIFIED (`main` on a push to `main`, `pr` on every other ref),
       # from a measured failure rather than a theory. On a run on `main` EVERY
@@ -2804,66 +2815,32 @@ jobs:
       # own, and it had done neither for two days. With the ref in the key the
       # two never contend. `restore-keys` lists a run's own qualified prefix,
       # then the `main` prefix (a pull request or merge-queue build reads
-      # `main`'s archive when it has none of its own), then the legacy bare
-      # prefix so the first runs after this change still restore the existing
-      # archives instead of building cold; the bare prefix decays on its own
-      # once nothing writes it. Two consequences a reader should expect: the
-      # first run on `main` after this change builds cold and saves; and a
-      # pull-request or merge-queue run now SAVES on every run (its key can
-      # never equal `main`'s, so it never skips as an exact hit), which adds
-      # upload volume against the repository's cache store.
+      # `main`'s archive when it has none of its own), then shard 0's own two,
+      # then the legacy bare prefix.
       #
-      # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
-      # is a defensible one rather than the best one. It carries `--lib` and
-      # the doctests, so it builds the `cerulion_core` rlib every other leg
-      # also needs — its `target/` is never a strict subset of a bare leg's.
-      # That is the whole claim.
+      # (`lint`, `docs` and `netd-wan` have their own namespaces and fall
+      # through their `restore-keys` to shard 0's archive, `cargo-Linux-main-`.
+      # The trim before each save keeps only the units that shard's own cargo
+      # commands read.)
       #
-      # It is explicitly NOT the deepest tree, and a maintainer weighing the
-      # "move the cache save off shard 0" lever named in the package-map table
-      # should not read it as one. MEASURED against the map below: shard 1's
-      # package tree is a strict SUPERSET of shard 0's (`cerulion_cli` depends
-      # on `cli_engine`, `bagd`, `bag`, `cli_tui` and `dds`), and shard 3's
-      # union is the largest of the four because it alone compiles the ~390-crate
-      # iroh tree. If cache CONTENT ever becomes the deciding factor, shard 3
-      # is the leg to measure — but note it would then also be paying the save
-      # tail on top of the wan step's disk pressure. (Re-derived at the
-      # shard rebalance: shard 0 now carries only `bagd` beside `--lib`, and
-      # `cerulion_cli` depends on `bagd`, so shard 1's tree is still a strict
-      # superset of shard 0's (`rmw_cerulion` rides shard 3). If the package
-      # map moves again, re-derive this
-      # rather than trusting it.)
-      # (Shard 0 is the SOLE saver of `cargo-Linux-`. `lint`, `docs` and
-      # `netd-wan` used to share this key and whichever finished first wrote it;
-      # they have their own namespaces now and fall through their `restore-keys`
-      # to this one. The trim before the save keeps only the units shard 0's own
-      # cargo commands read, so a unit only those jobs or shards 1-3 build is
-      # compiled by them on every run.)
-      - name: Cache cargo, shard 0 saves (restore)
+      # THE KEY. Shard 0's is `cargo-<os>-<scope>-<lock hash>`; shard k > 0 adds
+      # `-shard<k>` after the runner OS. A shard with no archive of its own yet
+      # starts from shard 0's (the `-<scope>-` and `-main-` restore keys after
+      # its own). Shards above 0 save only when the save policy names their
+      # namespace (`Linux-shard1`, `macOS-shard2`, ...) or is `all`; the default
+      # names `Linux` and `macOS`, shard 0's, so until then only shard 0 saves.
+      - name: Cache cargo, per-shard archive (restore)
         id: cache-restore-1
-        if: matrix.shard == 0
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
-            cargo-${{ runner.os }}-main-
-            cargo-${{ runner.os }}-
-
-      - name: Restore cargo (shards 1-3, no save)
-        if: matrix.shard != 0
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-main-
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
@@ -2875,13 +2852,12 @@ jobs:
       # `tools/scripts/ci_cache_trim_target.sh`. Same gate as the save, less the
       # prune's output, and on `main` only: a pull-request run builds only its
       # selected packages, so a trim there would save that narrower graph.
-      - name: Cache cargo, shard 0 saves (age the restored fingerprints)
+      - name: Cache cargo, per-shard archive (age the restored fingerprints)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -2893,7 +2869,7 @@ jobs:
       # used to provide: a dependency edit committed without a regenerated
       # `Cargo.lock` fails here instead of being repaired silently in the job.
       - name: Build test cdylibs
-        run: cargo build --timings --locked --workspace
+        run: python3 -B tools/scripts/ci_built_tests.py phase workspace -- cargo build --timings --locked --workspace
 
       # The whole-workspace build is the job's single biggest disk
       # consumer and was the one point between the reclaim and the wan step with
@@ -3033,7 +3009,7 @@ jobs:
             total=$((total + n))
             echo "building $n waived test binaries for $crate"
             printf '%s\n' "$names" | sed 's/^/--test /' \
-              | xargs cargo test --timings --locked -p "$crate" --no-run
+              | xargs python3 -B tools/scripts/ci_built_tests.py phase "waiver $crate" -- cargo test --timings --locked -p "$crate" --no-run
           done
           if [ "$total" -lt 10 ]; then
             echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
@@ -3044,10 +3020,19 @@ jobs:
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
+        # On shard 2 the `#[cerulion_node]` diagnostics suite (`node_macro_ui`)
+        # rides the same nextest invocation (`--with`), so its trybuild test
+        # runs beside the core tests and builds in the same cargo invocation.
+        # The script reads the selection for each package on its own and
+        # prints a `selection:` line for each one it leaves out.
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
-        run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
+        run: |
+          case "${{ matrix.shard }}" in
+            2) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with node_macro_ui ;;
+            *) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 ;;
+          esac
 
       # The modified raw node fixture once more, built ALONE, the way a user's node
       # builds: `-p` with no sibling package resolves the node's dependency tree
@@ -3074,12 +3059,12 @@ jobs:
           fi
           library=target/debug/libtest_node_modified_raw_cdylib.so
           workspace_sum=$(sha256sum "$library")
-          cargo build --timings --locked -p test_node_modified_raw_cdylib
+          python3 -B tools/scripts/ci_built_tests.py phase raw-node-alone -- cargo build --timings --locked -p test_node_modified_raw_cdylib
           if [ "$(sha256sum "$library")" = "$workspace_sum" ]; then
             echo "::error::the build alone left the workspace build's $library in place"
             exit 1
           fi
-          cargo test --timings --locked -p cerulion_core --test node_raw_ffi_template_test -- --test-threads=1
+          python3 -B tools/scripts/ci_built_tests.py phase raw-node-alone-delivery -- cargo test --timings --locked -p cerulion_core --test node_raw_ffi_template_test -- --test-threads=1
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
@@ -3099,7 +3084,7 @@ jobs:
       # neither of this repo's other two protections.
       - name: cerulion_core doctests
         if: matrix.shard == 0
-        run: cargo test --timings -p cerulion_core --doc
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core-doctests -- cargo test --timings -p cerulion_core --doc
 
       # ======================================================================
       # THE RECLAIM (canonical explanation; the twin before the wan
@@ -3144,11 +3129,10 @@ jobs:
       #     `target/debug/build/`, whose entries are hardlinks to these, and a
       #     hardlink means deleting one copy frees no blocks anyway.
       #
-      # Cache cost, restated now that shard 0 is the sole saver of
-      # `cargo-Linux-` (3.18 GB measured 2026-09-28, this job's own `target/`
-      # included): the save step runs at the END of this job, after this
-      # reclaim, so the executables removed here are not in the archive the next
-      # run restores. Cargo relinks them from the `.rlib`/`.rmeta` artefacts
+      # Cache cost, restated for the per-shard archives (shard 0's was 3.18 GB
+      # measured 2026-09-28, this job's own `target/` included): the save step
+      # runs at the END of this job, after this reclaim, so the executables
+      # removed here are not in the archive the next run restores. Cargo relinks them from the `.rlib`/`.rmeta` artefacts
       # that stay, which is the cost this reclaim already accepted.
       #
       # TWO placements, not one. Before the wan step alone would fix the five
@@ -3174,6 +3158,30 @@ jobs:
           find target/debug/deps -maxdepth 1 -type f -executable \
                ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' \
                ! -name 'build_script_build*' -delete || true
+          df -h / || true
+
+      # BUILD ONCE. A `cargo test -p` per package resolves features for that
+      # package alone and so rebuilds the crates the shard's packages share.
+      # This step compiles them in ONE cargo invocation; each
+      # step then runs its prebuilt binaries through `ci_built_tests.py run`,
+      # one process per binary, with the arguments, environment, working
+      # directory, order and fail-fast rule `cargo test` gives them. A package
+      # builds when the selection names it, as its step's own condition reads;
+      # a `+` package builds on every change because its step carries no
+      # selection condition. Cargo runs the packages' doctests at the end of
+      # this step, against the libraries it compiled. The audit at the end of
+      # the job fails when a built binary never ran or when anything compiles
+      # outside the declared build steps. See `docs/internals/ci-and-gates.md`.
+      - name: Build this shard's package tests once and run their doctests
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          case "${{ matrix.shard }}" in
+            0) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_bagd ;;
+            1) python3 -B tools/scripts/ci_built_tests.py build --group packages +cerulion_cli cerulion_cli_tui ;;
+            2) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_heaphook cerulion_macros test_node_macro_cdylib +cerulion_cli_engine cerulion_android cerulion_discovery cerulion_msgio ;;
+            3) python3 -B tools/scripts/ci_built_tests.py build --group packages rmw_cerulion native_ros2_messages cerulion_bag cerulion_wireclient cerulion_connectd cerulion_netd --features cerulion_netd/wan ;;
+          esac
           df -h / || true
 
       # ---------------------------------------------------------------
@@ -3213,11 +3221,12 @@ jobs:
       # to 51-63 s per shard outside the tail and no other binary exceeds
       # 18 s, so the file map in `ci_test_shard.sh` stays round-robin and no
       # second pin is warranted. The package steps are the whole imbalance.
-      # (The tail is now the `node_macro_ui` package, run by the
-      # `cerulion_node diagnostics suite` step on this same shard: its
-      # compile-pass programs build as cargo examples, so trybuild checks
-      # the compile-fail set alone, in one dependency pass. The emptied core
-      # binary stays PINNED, which keeps every other file on its shard; see
+      # (The tail is now the `node_macro_ui` package, whose tests ride this
+      # shard's core nextest invocation (`--with node_macro_ui`): its
+      # compile-pass programs build as binaries of that package, so trybuild
+      # checks the compile-fail set alone, in one dependency pass, and an
+      # override in `.config/nextest.toml` starts that test first. The emptied
+      # core binary stays PINNED, which keeps every other file on its shard; see
       # `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. The suite does
       # NOT get its own job: a new job is not in branch protection's required
       # list, which would silently demote the only compile-fail gate to
@@ -3273,15 +3282,17 @@ jobs:
       #
       # RE-MEASURE BEFORE RE-TILTING. This is an n=6 median table taken on one
       # runner class, and the macOS twin is a different machine with its own
-      # map. Shard 0's cache SAVE is a real post-job cost this table does not
-      # model (11.8-13.8 min observed on macOS), so a re-measure should read
-      # shard 0 first. The per-binary walls need `final-status-level = "pass"`
+      # map. A shard's cache SAVE is a real post-job cost this table does not
+      # model (11.8-13.8 min observed for shard 0 on macOS), so a re-measure
+      # should read the saving shards first. The per-binary walls need `final-status-level = "pass"`
       # in `.config/nextest.toml` (the final block names every test with its
       # wall); the step walls are the jobs API.
       #
       # `cargo test -p <package>` stays literally on each line — the coverage
       # walk (cerulion_cli_engine/tests/ci_test_coverage_test.rs) reads these
       # lines as its evidence.
+      # Each line runs that command from the binaries the build step above
+      # compiled, so the line still says what runs and how.
       # ---------------------------------------------------------------
       # Touches the iceoryx2 singleton — serial. Shard 3 after the
       # rebalance (see the map above); it runs BEFORE that shard's pre-wan
@@ -3294,7 +3305,7 @@ jobs:
         # every claim test is a disjunction over both sources.
         env:
           CERULION_RMW_EXPECT_BINDINGS: vendored
-        run: cargo test --timings -p rmw_cerulion -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p rmw_cerulion -- --test-threads=1
       - name: selection marker, rmw_cerulion
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
         env:
@@ -3314,7 +3325,7 @@ jobs:
       # `discovery`, and it is named in that job's package map above.
       - name: cerulion_heaphook tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_heaphook')
-        run: cargo test --timings -p cerulion_heaphook
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_heaphook
       - name: selection marker, cerulion_heaphook
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_heaphook') }}
         env:
@@ -3325,7 +3336,7 @@ jobs:
       # doc-pin: native_ros2_messages::upstream_drift_test reads tools
       - name: native_ros2_messages tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
-        run: cargo test --timings -p native_ros2_messages
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p native_ros2_messages
       - name: selection marker, native_ros2_messages
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages') }}
         env:
@@ -3352,7 +3363,7 @@ jobs:
       # grounds.
       - name: cerulion_bag tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
-        run: cargo test --timings -p cerulion_bag
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_bag
       - name: selection marker, cerulion_bag
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag') }}
         env:
@@ -3361,7 +3372,7 @@ jobs:
           echo "selection: skipped cerulion_bag (selected: $SELECTED)"
       - name: cerulion_bagd tests (serial, process-global panic hook)
         if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
-        run: cargo test --timings -p cerulion_bagd -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_bagd -- --test-threads=1
       - name: selection marker, cerulion_bagd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd') }}
         env:
@@ -3374,7 +3385,7 @@ jobs:
       # exercised transitively by `-p cerulion_core`, so name it explicitly.
       - name: cerulion_macros tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
-        run: cargo test --timings -p cerulion_macros
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_macros
       - name: selection marker, cerulion_macros
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros') }}
         env:
@@ -3382,27 +3393,9 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
-      # The #[cerulion_node] diagnostics suite: one trybuild check of every
-      # compile-fail fixture against its .stderr, then the compile-pass
-      # programs, each an example cargo builds with no cfg(test) and no
-      # harness, run by `tests/pass_programs.rs`. `-p` names this package alone,
-      # so the programs build with only the features its manifest asks for;
-      # trybuild's scratch project is a workspace of its own either way.
-      - name: cerulion_node diagnostics suite
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui')
-        run: cargo test --timings -p node_macro_ui
-      - name: selection marker, node_macro_ui
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped node_macro_ui (selected: $SELECTED)"
-
-      # After the diagnostics suite, so this package's trybuild check reuses the
-      # dependency build that suite leaves in target/tests/trybuild.
       - name: node context helper compile tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: cargo test --timings -p test_node_macro_cdylib
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p test_node_macro_cdylib
       - name: selection marker, test_node_macro_cdylib
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
         env:
@@ -3429,99 +3422,99 @@ jobs:
       # doc-pin: cerulion_cli_engine::workspace_lints_manifest_test reads examples
       - name: CLI engine tests
         if: matrix.shard == 2
-        run: cargo test --timings -p cerulion_cli_engine
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli_engine
       - name: cerulion_android host tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --lib -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --lib -- --test-threads=1
       - name: Build the Android runtime test fixture
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo build --timings -p test_node_macro_period_cdylib -p test_node_macro_external_cdylib -p test_node_hang_cdylib -p test_node_failing_cdylib
+        run: python3 -B tools/scripts/ci_built_tests.py phase android-fixtures -- cargo build --timings -p test_node_macro_period_cdylib -p test_node_macro_external_cdylib -p test_node_hang_cdylib -p test_node_failing_cdylib
       - name: cerulion_android embedded runtime integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_runtime_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_runtime_test -- --test-threads=1
       - name: cerulion_android graph finish integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_graph_finish_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_graph_finish_test -- --test-threads=1
       - name: cerulion_android graph launch refusal integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_graph_launch_refusal_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_graph_launch_refusal_test -- --test-threads=1
       - name: cerulion_android component failure integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_component_failure_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_component_failure_test -- --test-threads=1
       - name: cerulion_android schema restart integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_schema_restart_test -- --test-threads=1
       - name: cerulion_android catalog restart integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_catalog_restart_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_catalog_restart_test -- --test-threads=1
       - name: cerulion_android gateway exclusivity integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_gateway_exclusive_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_gateway_exclusive_test -- --test-threads=1
       - name: cerulion_android identity integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_identity_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_identity_test -- --test-threads=1
       - name: cerulion_android LAN access integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test lan_access_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test lan_access_test -- --test-threads=1
       - name: cerulion_android LAN egress list integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test lan_egress_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test lan_egress_test -- --test-threads=1
       - name: cerulion_android LAN connect integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test lan_connect_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test lan_connect_test -- --test-threads=1
       - name: cerulion_android LAN ingress integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test lan_ingress_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test lan_ingress_test -- --test-threads=1
       - name: cerulion_android LAN ownership tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test lan_access_ownership_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test lan_access_ownership_test -- --test-threads=1
       - name: cerulion_android gateway owner tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test gateway_owner_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test gateway_owner_test -- --test-threads=1
       - name: cerulion_android gateway restart baseline tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test gateway_restart_baseline_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test gateway_restart_baseline_test -- --test-threads=1
       - name: cerulion_android first start failure tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test first_start_failure -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test first_start_failure -- --test-threads=1
       - name: cerulion_android linked node integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_linked_nodes_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_linked_nodes_test -- --test-threads=1
       - name: cerulion_android app topic to linked node integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_app_topic_feeds_linked_node_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_app_topic_feeds_linked_node_test -- --test-threads=1
       - name: cerulion_android node tick panic status integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_node_tick_panic_status_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_node_tick_panic_status_test -- --test-threads=1
       - name: cerulion_android logcat sink integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_logcat_sink_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_logcat_sink_test -- --test-threads=1
       - name: cerulion_android logcat egress warning tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_logcat_egress_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_logcat_egress_test -- --test-threads=1
       - name: cerulion_android logcat app subscriber integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_logcat_app_subscriber_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_logcat_app_subscriber_test -- --test-threads=1
       - name: cerulion_android trace cap integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_trace_cap_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_trace_cap_test -- --test-threads=1
       - name: cerulion_android publish stamp integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_publish_stamp_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_publish_stamp_test -- --test-threads=1
       - name: cerulion_android nested publish integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_nested_publish_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_nested_publish_test -- --test-threads=1
       - name: cerulion_android hosted run integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_hosted_run_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_hosted_run_test -- --test-threads=1
       # The `local-transport` job runs this file on the in-process transport.
       # This step runs it on the default cross-process transport.
       - name: cerulion_android subscribe and poll integration tests (serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test embedded_subscribe_poll_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test embedded_subscribe_poll_test -- --test-threads=1
       - name: cerulion_android sample graph asset tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android')
-        run: cargo test --timings -p cerulion_android --test sample_graph_asset_test
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_android --test sample_graph_asset_test
       - name: selection marker, cerulion_android
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_android') }}
         env:
@@ -3531,10 +3524,10 @@ jobs:
       # doc-pin: cerulion_cli::graph_run_validate_gate_e2e_test reads docs
       - name: CLI binary tests
         if: matrix.shard == 1
-        run: cargo test --timings -p cerulion_cli
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli
       - name: CLI TUI tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
-        run: cargo test --timings -p cerulion_cli_tui
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli_tui
       - name: selection marker, cerulion_cli_tui
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui') }}
         env:
@@ -3552,7 +3545,7 @@ jobs:
       # steps below. Leaf crate (std + serde + dirs + tracing) — ~3 s, no transport.
       - name: cerulion_discovery tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
-        run: cargo test --timings -p cerulion_discovery
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_discovery
       - name: selection marker, cerulion_discovery
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery') }}
         env:
@@ -3568,7 +3561,7 @@ jobs:
       # packages they name.
       - name: cerulion_msgio tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
-        run: cargo test --timings -p cerulion_msgio
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_msgio
       - name: selection marker, cerulion_msgio
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio') }}
         env:
@@ -3585,7 +3578,7 @@ jobs:
       # The iroh tree it compiles is shared with the connectd + netd steps below.
       - name: cerulion_wireclient tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
-        run: cargo test --timings -p cerulion_wireclient
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_wireclient
       - name: selection marker, cerulion_wireclient
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient') }}
         env:
@@ -3603,7 +3596,7 @@ jobs:
       # compile (no extra cold cost).
       - name: cerulion_connectd tests
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
-        run: cargo test --timings -p cerulion_connectd
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_connectd
       - name: selection marker, cerulion_connectd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd') }}
         env:
@@ -3621,22 +3614,18 @@ jobs:
         if: matrix.shard == 3
         run: df -h / || true
 
-      # The twin of the reclaim after the `cerulion_core` step —
-      # identical script, canonical explanation there. This is the placement
-      # aimed straight at the five measured firings: every one of them died
-      # linking a netd test binary in the step below, entering it with 824 MB
-      # to 2.3 GB free. The test executables the steps between the two prunes
-      # linked — on THIS shard: ros msgs, bag, wireclient, connectd — have all
-      # RUN, and the step below is the last one in the job, so nothing reads any
-      # of them again. (The list is per-shard because the package steps are
-      # `if:`-gated; pre-split it was every package in the job.)
+      # The twin of the reclaim after the `cerulion_core` step, canonical
+      # explanation there. The five measured firings all died linking a netd
+      # test binary; those binaries now link in the build step with the rest
+      # of the shard's, and that step prints free disk right after the link.
+      # This reclaim frees what the steps above have run (rmw, ros msgs, bag,
+      # wireclient, connectd) before the step below links the binaries netd's
+      # tests spawn, and keeps every prebuilt binary a later step still runs.
       - name: Reclaim disk from already-run test binaries (before the wan step)
         if: matrix.shard == 3
         run: |
           df -h / || true
-          find target/debug/deps -maxdepth 1 -type f -executable \
-               ! -name '*.so' ! -name '*.rlib' ! -name '*.rmeta' ! -name '*.d' \
-               ! -name 'build_script_build*' -delete || true
+          python3 -B tools/scripts/ci_built_tests.py reclaim || true
           df -h / || true
 
       # cerulion_netd's iroh WAN plane. `wan` is DEFAULT-ON, so
@@ -3650,8 +3639,8 @@ jobs:
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 3 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: |
-          cargo build --timings -p cerulion_cli -p cerulion_remoted -p test_node_macro_data_trigger_cdylib
-          cargo test --timings -p cerulion_netd --features wan -- --test-threads=1
+          python3 -B tools/scripts/ci_built_tests.py phase netd-spawned-binaries -- cargo build --timings -p cerulion_cli -p cerulion_remoted -p test_node_macro_data_trigger_cdylib
+          python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_netd --features wan -- --test-threads=1
       # The SKIP BRANCH of the gate above. A skipped step prints nothing of
       # its own, so the one line that says what the selection dropped lives
       # here, beside it, under the exact negation of its condition.
@@ -3663,6 +3652,24 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_netd (selected: $SELECTED)"
+
+      # The audit: every built binary had a whole run, the shard built at least
+      # its floor of test binaries when the selection kept every package (the
+      # count a full run builds), and nothing compiled outside a declared build
+      # step. Three `cerulion_android` binaries build with their package and no step
+      # here runs them: `mdns_beacon_test`'s one arm is `#[ignore]`d (it needs
+      # real multicast), `embedded_remote_plane_test` runs in `local-transport`
+      # and `jni_java_test` in `android-check`.
+      - name: Every built test binary ran and nothing rebuilt
+        run: |
+          case "${{ matrix.shard }}" in
+            0) set -- --floor 27 ;;
+            1) set -- --floor 67 ;;
+            2) set -- --floor 121 --not-run cerulion_android:mdns_beacon_test \
+                 --not-run cerulion_android:embedded_remote_plane_test --not-run cerulion_android:jni_java_test ;;
+            3) set -- --floor 114 ;;
+          esac
+          python3 -B tools/scripts/ci_built_tests.py audit "$@"
 
       # The terminal reading, and the one every post-mortem so far has
       # lacked — `if: always()` because the state that matters is the state a
@@ -3739,45 +3746,42 @@ jobs:
       # (older generations a key roll restored, unused scaffold targets under
       # `target/tmp`) and `incremental/`, and prints the size before and after.
       # Deletes nothing when access times do not update or nothing was read.
-      - name: Cache cargo, shard 0 saves (trim units this run did not use)
+      - name: Cache cargo, per-shard archive (trim units this run did not use)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh trim target
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
-      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+      - name: Cache cargo, per-shard archive (prune the namespace to the current key)
         id: cache-prune
         if: >-
-          matrix.shard == 0
-          && github.event_name != 'merge_group'
+          github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
-      # Saved as the LAST step so a green shard 0 stores what it built, and
+      # Saved as the LAST step so a green shard stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
-      - name: Cache cargo, shard 0 saves (save)
+      - name: Cache cargo, per-shard archive (save)
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
-          && matrix.shard == 0
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
     runs-on: macos-latest
@@ -3933,86 +3937,34 @@ jobs:
         with:
           toolchain: stable
 
-      # ONE SAVER, CHOSEN RATHER THAN RACED. All three legs of this matrix share
-      # `cargo-${{ runner.os }}-<main|pr>-<lockhash>`, and `actions/cache` RESERVES
-      # a key at save time: whichever leg finishes first wins, the other uploads
-      # a multi-gigabyte archive that is then rejected ("another job may be
-      # creating this cache"), and the archive that lands is whichever leg's
-      # `target/` happened to be newest — arbitrary, and different run to run.
-      # Shard 0 saves; shards 1-2 restore only. (This job runs three shards; the
-      # Linux twin above runs four, and its copy of this block says "four".)
-      #
-      # NOT a per-shard key, deliberately: `target/` for this workspace runs to
-      # several GB, GitHub evicts a repository's caches against a store limit,
-      # and one archive per shard per OS per lockfile would have the shards
-      # evicting each other AND every other job's namespace. One archive, one
-      # writer.
+      # A KEY PER SHARD, ONE WRITER PER KEY, as in the Linux twin above (which
+      # runs four shards; this job runs three): each leg restores, and once its
+      # namespace may save saves, under a key of its own, so each keeps the
+      # third-party build its own tests read.
       #
       # BRANCH-QUALIFIED (`main` on a push to `main`, `pr` on every other ref),
-      # from a measured failure rather than a theory. On a run on `main` EVERY
-      # caching job restored nothing ("Cache not found for input keys") and was
-      # then refused at save ("Unable to reserve cache with key ... another job
-      # may be creating this cache") -- including the two crate-test jobs, whose
-      # keys no other job in the run writes, so a race between this run's own
-      # jobs cannot be the cause. The store meanwhile held entries under those
-      # same keys, all created from pull-request and merge-queue refs. A key is
-      # reserved once per repository, and a run on `main` may restore only
-      # entries created on `main`: so while a pull request holds the key for the
-      # current lockfile, `main` can neither read that archive nor write its
-      # own, and it had done neither for two days. With the ref in the key the
-      # two never contend. `restore-keys` lists a run's own qualified prefix,
-      # then the `main` prefix (a pull request or merge-queue build reads
-      # `main`'s archive when it has none of its own), then the legacy bare
-      # prefix so the first runs after this change still restore the existing
-      # archives instead of building cold; the bare prefix decays on its own
-      # once nothing writes it. Two consequences a reader should expect: the
-      # first run on `main` after this change builds cold and saves; and a
-      # pull-request or merge-queue run now SAVES on every run (its key can
-      # never equal `main`'s, so it never skips as an exact hit), which adds
-      # upload volume against the repository's cache store.
+      # for the measured failure the Linux twin's copy of this block records.
+      # `restore-keys` lists a run's own qualified prefix, then the `main`
+      # prefix, then shard 0's own two, then the legacy bare prefix.
       #
-      # WHICH leg writes is a FIXED PICK, not a measured optimum, and shard 0
-      # is a defensible one rather than the best one. It carries `--lib` and
-      # the doctests, so it builds the `cerulion_core` rlib every other leg
-      # also needs — its `target/` is never a strict subset of a bare leg's.
-      # That is the whole claim.
-      #
-      # RE-DERIVED against the 3-way map below rather than carried over: shard 0
-      # now runs `cerulion_cli`, whose tree covers `cli_engine`, `bagd`, `bag`,
-      # `cli_tui` and `dds`, so its `target/` is the broadest of the three on
-      # everything except the two specialist trees (the ~390-crate iroh tree on
-      # shard 1, the rerun tree on shard 2, both of which `cargo build
-      # --workspace` builds on every leg anyway). That makes shard 0 a better
-      # saver under this map than under the 2-way one, not merely a defensible
-      # one. If the package map moves again, re-derive this rather than
-      # trusting it.
-      # (Shard 0 is the SOLE saver of `cargo-macOS-`: no other job on this
-      # runner writes that key.)
-      - name: Cache cargo, shard 0 saves (restore)
+      # THE KEY. Shard 0's is `cargo-<os>-<scope>-<lock hash>`; shard k > 0 adds
+      # `-shard<k>` after the runner OS. A shard with no archive of its own yet
+      # starts from shard 0's (the `-<scope>-` and `-main-` restore keys after
+      # its own). Shards above 0 save only when the save policy names their
+      # namespace (`Linux-shard1`, `macOS-shard2`, ...) or is `all`; the default
+      # names `Linux` and `macOS`, shard 0's, so until then only shard 0 saves.
+      - name: Cache cargo, per-shard archive (restore)
         id: cache-restore-1
-        if: matrix.shard == 0
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
-            cargo-${{ runner.os }}-main-
-            cargo-${{ runner.os }}-
-
-      - name: Restore cargo (shards 1-2, no save)
-        if: matrix.shard != 0
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-main-
             cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
             cargo-${{ runner.os }}-main-
             cargo-${{ runner.os }}-
@@ -4024,13 +3976,12 @@ jobs:
       # `tools/scripts/ci_cache_trim_target.sh`. Same gate as the save, less the
       # prune's output, and on `main` only: a pull-request run builds only its
       # selected packages, so a trim there would save that narrower graph.
-      - name: Cache cargo, shard 0 saves (age the restored fingerprints)
+      - name: Cache cargo, per-shard archive (age the restored fingerprints)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -4039,7 +3990,8 @@ jobs:
       # list (which had gone stale: a deleted crate + two missing ones). Same
       # spirit as the default-cover test model below.
       - name: Build test cdylibs
-        run: cargo build --timings --workspace
+        run: python3 -B tools/scripts/ci_built_tests.py phase workspace -- cargo build --timings --workspace
+
 
       # The pinned tool tarballs the `tool-tarballs` job verified and saved.
       # On a miss the install below downloads, as it does with no cache.
@@ -4081,6 +4033,26 @@ jobs:
       # `--check cerulion_core 3` proves the partition
       # (108 + 108 + 109 files; the trybuild suite runs on shard 2, which is why
       # shard 2 gets the lightest package set below).
+      # ---------------------------------------------------------------
+      # BUILD ONCE and the doctests, as in `test-linux` (see that job's step of
+      # this name). It runs before the first package step, the credit death
+      # arms on shard 0.
+      # `cerulion_vizd` builds in a group of its own: built beside
+      # `cerulion_viz`, it would link the viz library with the
+      # `decoder-from-source` feature that crate's own tests enable, which
+      # switches vizd's decoder from the dlopen path to the compiled one, so
+      # its tests keep the features they build with alone.
+      - name: Build this shard's package tests once and run their doctests
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+        run: |
+          case "${{ matrix.shard }}" in
+            0) python3 -B tools/scripts/ci_built_tests.py build --group packages +cerulion_cli rmw_cerulion cerulion_bagd ;;
+            1) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_bag +cerulion_cli_engine cerulion_cli_tui cerulion_wireclient cerulion_connectd cerulion_netd --features cerulion_netd/wan ;;
+            2) python3 -B tools/scripts/ci_built_tests.py build --group packages native_ros2_messages cerulion_macros test_node_macro_cdylib cerulion_discovery cerulion_msgio cerulion_viz go2_tf
+               python3 -B tools/scripts/ci_built_tests.py build --group vizd cerulion_vizd ;;
+          esac
+
       # ---------------------------------------------------------------
       # Descriptor sampler, recording only what it can read. The kernel's
       # open-file counters at 10 Hz on one line per tick, and once a second a
@@ -4249,7 +4221,7 @@ jobs:
       # non-empty.
       - name: Credit death arms first (shard 0)
         if: matrix.shard == 0
-        run: cargo test --timings -p cerulion_cli --test credit_death_e2e_test c7_
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli --test credit_death_e2e_test c7_
 
       # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
       # observes the whole tree, so the shard runner does the intersection.
@@ -4323,7 +4295,7 @@ jobs:
             total=$((total + n))
             echo "building $n waived test binaries for $crate"
             printf '%s\n' "$names" | sed 's/^/--test /' \
-              | xargs cargo test --timings --locked -p "$crate" --no-run
+              | xargs python3 -B tools/scripts/ci_built_tests.py phase "waiver $crate" -- cargo test --timings --locked -p "$crate" --no-run
           done
           if [ "$total" -lt 10 ]; then
             echo "::error::derived only $total waived test binaries across both crates, expected at least 10"
@@ -4332,10 +4304,16 @@ jobs:
           echo "built $total waived test binaries for the gate"
 
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
+        # Shard 2 runs the `#[cerulion_node]` diagnostics suite in the same
+        # nextest invocation, as in `test-linux`.
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
-        run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
+        run: |
+          case "${{ matrix.shard }}" in
+            2) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 --with node_macro_ui ;;
+            *) python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 ;;
+          esac
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
@@ -4349,7 +4327,7 @@ jobs:
       # happen exactly once.
       - name: cerulion_core doctests
         if: matrix.shard == 0
-        run: cargo test --timings -p cerulion_core --doc
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core-doctests -- cargo test --timings -p cerulion_core --doc
 
       # Shard assignment is macOS's OWN 3-way tilt (it does not mirror
       # `test-linux`'s 4-way table), balanced against the per-step numbers in
@@ -4358,7 +4336,8 @@ jobs:
       #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
       #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
       #            tree kept together (wireclient, connectd, netd-wan)
-      #   shard 2  the cerulion_node diagnostics suite, native_ros2_messages, macros,
+      #   shard 2  the cerulion_node diagnostics suite (in the core shard step),
+      #            native_ros2_messages, macros,
       #            discovery, and the folded viz suites
       #
       # Every `run:` line is byte-identical to the 2-way map, so nothing about
@@ -4371,7 +4350,7 @@ jobs:
         # every claim test is a disjunction over both sources.
         env:
           CERULION_RMW_EXPECT_BINDINGS: vendored
-        run: cargo test --timings -p rmw_cerulion -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p rmw_cerulion -- --test-threads=1
       - name: selection marker, rmw_cerulion
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'rmw_cerulion') }}
         env:
@@ -4381,7 +4360,7 @@ jobs:
 
       - name: native_ros2_messages tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages')
-        run: cargo test --timings -p native_ros2_messages
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p native_ros2_messages
       - name: selection marker, native_ros2_messages
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'native_ros2_messages') }}
         env:
@@ -4394,7 +4373,7 @@ jobs:
       # process-global panic hook, not for iceoryx2.
       - name: cerulion_bag tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag')
-        run: cargo test --timings -p cerulion_bag
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_bag
       - name: selection marker, cerulion_bag
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bag') }}
         env:
@@ -4403,7 +4382,7 @@ jobs:
           echo "selection: skipped cerulion_bag (selected: $SELECTED)"
       - name: cerulion_bagd tests (serial, process-global panic hook)
         if: matrix.shard == 0 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd')
-        run: cargo test --timings -p cerulion_bagd -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_bagd -- --test-threads=1
       - name: selection marker, cerulion_bagd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_bagd') }}
         env:
@@ -4416,7 +4395,7 @@ jobs:
       # exercised transitively by `-p cerulion_core`, so name it explicitly.
       - name: cerulion_macros tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros')
-        run: cargo test --timings -p cerulion_macros
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_macros
       - name: selection marker, cerulion_macros
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_macros') }}
         env:
@@ -4424,27 +4403,9 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
-      # The #[cerulion_node] diagnostics suite: one trybuild check of every
-      # compile-fail fixture against its .stderr, then the compile-pass
-      # programs, each an example cargo builds with no cfg(test) and no
-      # harness, run by `tests/pass_programs.rs`. `-p` names this package alone,
-      # so the programs build with only the features its manifest asks for;
-      # trybuild's scratch project is a workspace of its own either way.
-      - name: cerulion_node diagnostics suite
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui')
-        run: cargo test --timings -p node_macro_ui
-      - name: selection marker, node_macro_ui
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'node_macro_ui') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped node_macro_ui (selected: $SELECTED)"
-
-      # After the diagnostics suite, so this package's trybuild check reuses the
-      # dependency build that suite leaves in target/tests/trybuild.
       - name: node context helper compile tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: cargo test --timings -p test_node_macro_cdylib
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p test_node_macro_cdylib
       - name: selection marker, test_node_macro_cdylib
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
         env:
@@ -4460,15 +4421,15 @@ jobs:
         if: matrix.shard == 1
         # --no-fail-fast so ONE run reports every failing binary: cargo stops at
         # the first by default, which is why a per-binary waiver took three heads.
-        run: cargo test --timings -p cerulion_cli_engine --no-fail-fast
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli_engine --no-fail-fast
       - name: CLI binary tests
         if: matrix.shard == 0
         # --no-fail-fast so ONE run reports every failing binary: cargo stops at
         # the first by default, which is why a per-binary waiver took three heads.
-        run: cargo test --timings -p cerulion_cli --no-fail-fast
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli --no-fail-fast
       - name: CLI TUI tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui')
-        run: cargo test --timings -p cerulion_cli_tui
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli_tui
       - name: selection marker, cerulion_cli_tui
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_cli_tui') }}
         env:
@@ -4486,7 +4447,7 @@ jobs:
       # steps below. Leaf crate (std + serde + dirs + tracing) — ~3 s, no transport.
       - name: cerulion_discovery tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery')
-        run: cargo test --timings -p cerulion_discovery
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_discovery
       - name: selection marker, cerulion_discovery
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_discovery') }}
         env:
@@ -4502,7 +4463,7 @@ jobs:
       # packages they name.
       - name: cerulion_msgio tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio')
-        run: cargo test --timings -p cerulion_msgio
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_msgio
       - name: selection marker, cerulion_msgio
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_msgio') }}
         env:
@@ -4519,7 +4480,7 @@ jobs:
       # The iroh tree it compiles is shared with the connectd + netd steps below.
       - name: cerulion_wireclient tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient')
-        run: cargo test --timings -p cerulion_wireclient
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_wireclient
       - name: selection marker, cerulion_wireclient
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_wireclient') }}
         env:
@@ -4536,7 +4497,7 @@ jobs:
       # (loopback iroh + iceoryx2 both work on macOS), so they gate on both runners.
       - name: cerulion_connectd tests
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd')
-        run: cargo test --timings -p cerulion_connectd
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_connectd
       - name: selection marker, cerulion_connectd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_connectd') }}
         env:
@@ -4558,8 +4519,8 @@ jobs:
       - name: cerulion_netd tests (--features wan)
         if: matrix.shard == 1 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
         run: |
-          cargo build --timings -p cerulion_cli -p cerulion_remoted -p test_node_macro_data_trigger_cdylib
-          cargo test --timings -p cerulion_netd --features wan -- --test-threads=1
+          python3 -B tools/scripts/ci_built_tests.py phase netd-spawned-binaries -- cargo build --timings -p cerulion_cli -p cerulion_remoted -p test_node_macro_data_trigger_cdylib
+          python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_netd --features wan -- --test-threads=1
       - name: selection marker, cerulion_netd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd') }}
         env:
@@ -4582,10 +4543,10 @@ jobs:
       # ceiling still bounds it.
       - name: cerulion_viz tests (whole suite, parallel)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
-        run: cargo test --timings -p cerulion_viz --no-fail-fast
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_viz --no-fail-fast
       - name: cerulion_vizd tests (whole suite, serial)
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd')
-        run: cargo test --timings -p cerulion_vizd --no-fail-fast -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_vizd --no-fail-fast -- --test-threads=1
       - name: selection marker, cerulion_vizd
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_vizd') }}
         env:
@@ -4594,7 +4555,7 @@ jobs:
           echo "selection: skipped cerulion_vizd (selected: $SELECTED)"
       - name: go2_tf tests
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf')
-        run: cargo test --timings -p go2_tf
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p go2_tf
       - name: selection marker, go2_tf
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'go2_tf') }}
         env:
@@ -4603,13 +4564,13 @@ jobs:
           echo "selection: skipped go2_tf (selected: $SELECTED)"
       - name: cargo test -p cerulion_viz --lib openh264_fetch
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
-        run: cargo test --timings -p cerulion_viz --lib openh264_fetch
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_viz --lib openh264_fetch
       - name: cargo test -p cerulion_viz --test openh264_fetch_wiring_test
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
-        run: cargo test --timings -p cerulion_viz --test openh264_fetch_wiring_test
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_viz --test openh264_fetch_wiring_test
       - name: cargo test -p cerulion_viz --test video_decode_test
         if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz')
-        run: cargo test --timings -p cerulion_viz --test video_decode_test -- --test-threads=1
+        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_viz --test video_decode_test -- --test-threads=1
       # The SKIP BRANCH of the gate above. A skipped step prints nothing of
       # its own, so the one line that says what the selection dropped lives
       # here, beside it, under the exact negation of its condition.
@@ -4621,6 +4582,16 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_viz (selected: $SELECTED)"
+
+      # The audit, as in `test-linux`.
+      - name: Every built test binary ran and nothing rebuilt
+        run: |
+          case "${{ matrix.shard }}" in
+            0) set -- --floor 139 ;;
+            1) set -- --floor 138 ;;
+            2) set -- --floor 69 ;;
+          esac
+          python3 -B tools/scripts/ci_built_tests.py audit "$@"
 
       # The same set once, at the moment a step failed, so the numbers do not
       # have to be recovered from the artifact. `getrlimit` is read from inside
@@ -4846,45 +4817,42 @@ jobs:
       # (older generations a key roll restored, unused scaffold targets under
       # `target/tmp`) and `incremental/`, and prints the size before and after.
       # Deletes nothing when access times do not update or nothing was read.
-      - name: Cache cargo, shard 0 saves (trim units this run did not use)
+      - name: Cache cargo, per-shard archive (trim units this run did not use)
         if: >-
-          matrix.shard == 0
-          && steps.cache-restore-1.outputs.cache-hit != 'true'
+          steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         run: bash tools/scripts/ci_cache_trim_target.sh trim target
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
-      - name: Cache cargo, shard 0 saves (prune the namespace to the current key)
+      - name: Cache cargo, per-shard archive (prune the namespace to the current key)
         id: cache-prune
         if: >-
-          matrix.shard == 0
-          && github.event_name != 'merge_group'
+          github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
+        run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
 
-      # Saved as the LAST step so a green shard 0 stores what it built, and
+      # Saved as the LAST step so a green shard stores what it built, and
       # never from a merge-queue build: its branch is deleted after the batch,
       # so nothing could restore what it saved, and the upload only adds
       # eviction pressure on the store.
-      - name: Cache cargo, shard 0 saves (save)
+      - name: Cache cargo, per-shard archive (save)
         if: >-
           steps.cache-restore-1.outputs.cache-hit != 'true'
-          && matrix.shard == 0
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
           && steps.cache-prune.outputs.proceed == 'true'
-          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))
+          && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
 
   # REPEAT RUNS of three `cerulion_core` test binaries whose tests wait on
   # counters the product exposes, on the hosted macOS runner, where thread
@@ -4977,7 +4945,6 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_core (selected: $SELECTED)"
-
   crate-tests:
     name: Crate tests (${{ matrix.os }})
     needs: [changes]
@@ -5382,7 +5349,7 @@ jobs:
 
       - name: Cache cargo (restore)
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_rcpd')
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -6719,7 +6686,7 @@ jobs:
 
       - name: Cache cargo (restore)
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_remoted')
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry

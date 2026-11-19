@@ -1,1 +1,1 @@
-list,cell,arm,model,attempts,reason,usd_attempts,price_date
+list,cell,arm,model,attempts,reason,usd_attempts,price_date,replies_tool_calls,replies_stop,replies_length,replies_content_filter,replies_other,requests_no_reply
