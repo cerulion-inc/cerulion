@@ -468,7 +468,10 @@ woken entities first and then probes, as an entry pass does, and its ready retur
 drained whatever notification the woken entities held at that drain (a notification that
 lands after a bell wake's drain stays readable for the next call's entry pass). Nothing is
 lost that way: every producer commits before it notifies, so the probe after the drain sees
-what the drained notification announced.
+what the drained notification announced. Every listener drain empties the trigger before it
+re-arms the listener (the iceoryx2 fork pinned in the root `Cargo.toml`), so a notify that
+lands inside a drain is delivered by it or leaves the fd readable, and after any drain the next
+publish makes the fd readable again.
 `poll(2)` rather than the iceoryx2 WaitSet: fd snapshots need no `&Listener` borrow pinned
 across the block (lock, snapshot an integer, UNLOCK, block; no entity mutex is held while
 parked), poll has no FD_SETSIZE fd-number ceiling (the select path aborts on fd ≥ 1024 on
@@ -510,8 +513,9 @@ genuinely failed open is retried, on a 256-call throttle, which is also why a
 subscription-only wait set PARKS on Linux), the block PARKS on the doorbells instead of
 sleeping in `ppoll`:
 `park_block` arms the native monitor-wait on the primary doorbell line
-(`cerulion_core::monitor_wait::monitor_wait_until_addr`: UMWAIT on WAITPKG x86_64, WFE on
-aarch64, a bounded ~100 µs sleep-recheck where the CPU has no primitive; never a busy-spin),
+(`cerulion_core::monitor_wait::monitor_wait_until_addr`: UMWAIT on WAITPKG x86_64, MWAITX on
+x86_64 with MWAITX and no WAITPKG, WFE on aarch64, a bounded ~100 µs sleep-recheck where the
+CPU has no primitive; never a busy-spin),
 re-checking every doorbell plus the fd snapshot (`FdWakeSet::check`, a zero-timeout poll)
 each recheck slice; a publish wakes the waiter hardware-instantly on the primary topic;
 guard/service/client fds wake within one slice. The ladder rung bounds every park, so the
@@ -544,14 +548,14 @@ everything. Counters: `park_blocks`, `park_wakes_doorbell`, `park_bell_reopens`.
 scheduler is concerned, so an unbounded park on a shared CPU hands a co-located publisher
 the core only on a scheduler tick, which costs a millisecond-class p50. Every recheck slice
 that times out therefore YIELDS (`park_yields`), and the slice is 20 µs as requested, which
-`UMWAIT` honors; on the aarch64 `WFE` tier (the park's default home) the effective slice is
+`UMWAIT` and `MWAITX` honor; on the aarch64 `WFE` tier (the park's default home) the effective slice is
 one generic-timer event-stream period, which is machine-specific, so a co-located peer runs
 inside one slice. Busy waiting of any kind, the park and a long spin alike, also costs a
 flat penalty against a kernel-sleeping waiter at message periods from 5 ms to 40 ms and
 none at 2 ms: a scheduler and CPU-topology effect around the peer's wake, not a frequency
 one (a full-P-state spin reads the same). `park_policy()` is therefore a platform table:
 aarch64 `WFE` → `FirstRungOnce` (park the first block of a call, then
-the fd block); x86 (`UMWAIT` or none) and off-Linux → `NoPark` (the `ppoll` tier). The
+the fd block); x86 (`UMWAIT`, `MWAITX` or none) and off-Linux → `NoPark` (the `ppoll` tier). The
 aarch64 park-on rows were measured under `ThroughRung` (park every block), which held one
 core per idle subscriber. The shared
 `CERULION_MONITOR_WAIT` flag resolves over that default (`resolve_park`): unset = default,

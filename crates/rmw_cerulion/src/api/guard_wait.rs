@@ -81,8 +81,9 @@
 //! [`WaitSetData::park_block`] arms the native monitor-wait on the
 //! primary doorbell line
 //! ([`cerulion_core::monitor_wait::monitor_wait_until_addr`] — `UMWAIT`
-//! on WAITPKG x86_64, `WFE` on aarch64, a bounded ~100 µs sleep-recheck
-//! where the CPU has no primitive; never a busy-spin) and re-checks every
+//! on WAITPKG x86_64, `MWAITX` on x86_64 with `MWAITX` and no WAITPKG, `WFE`
+//! on aarch64, a bounded ~100 µs sleep-recheck where the CPU has no
+//! primitive; never a busy-spin) and re-checks every
 //! doorbell plus the fd snapshot ([`FdWakeSet::check`], a zero-timeout
 //! poll) each recheck slice. A publish therefore wakes the waiter
 //! hardware-instantly on the primary topic and within one slice on the
@@ -416,8 +417,9 @@ pub enum ParkHorizon {
 }
 
 /// The shipped PLATFORM default (compile-time: Linux aarch64 is always
-/// `WFE`, parked for the call's first rung only; Linux x86_64 is `UMWAIT`
-/// or nothing, both measured slower than the kernel wait; off Linux no
+/// `WFE`, parked for the call's first rung only; Linux x86_64 is `UMWAIT`,
+/// `MWAITX` or nothing and does not park, because the `UMWAIT` park and the
+/// no-primitive wait both measured slower than the kernel wait; off Linux no
 /// ring wakes this park).
 pub fn park_policy() -> ParkHorizon {
     if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
@@ -653,7 +655,7 @@ const PARK_HORIZON_US: u64 = BLOCK_FIRST_RUNG_US;
 /// The park's recheck slice: every slice re-checks the bells and the fd
 /// snapshot, and a slice that times out YIELDS the core. Short enough that
 /// a co-located peer (same core) runs within it — the same-core ping-pong
-/// stays well under 100 µs — while `UMWAIT`/`WFE` still wake instantly on
+/// stays well under 100 µs, while `UMWAIT`/`MWAITX`/`WFE` still wake instantly on
 /// the ring inside a slice. The VALUE is the shared
 /// `cerulion_core::monitor_wait::PARK_RECHECK` — the native live loop's
 /// `monitor_wait_block` hardware arm slices (and yields) at the same
@@ -1514,7 +1516,7 @@ impl WaitSetData {
     }
 
     /// One PARK-tier block: idle on the topic doorbells' SHM lines —
-    /// the hardware monitor-wait (`UMWAIT`/`WFE`) armed on the primary
+    /// the hardware monitor-wait (`UMWAIT`/`MWAITX`/`WFE`) armed on the primary
     /// line (bell `primary`; an index past the mapped bells arms the first)
     /// when the CPU has one, a bounded sleep-recheck slice otherwise
     /// (never a busy-spin) — re-checking every doorbell and the fd

@@ -411,13 +411,22 @@ fn stats_of(stats: &EgressStats, topic: &str) -> EgressTopicStats {
 
 /// Poll `cond` every 20 ms until it holds or `secs` pass; returns whether it
 /// held.
-fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(secs);
+fn wait_until(secs: u64, cond: impl FnMut() -> bool) -> bool {
+    poll_until(
+        Instant::now() + Duration::from_secs(secs),
+        Duration::from_millis(20),
+        cond,
+    )
+}
+
+/// Poll `cond` every `every` until it holds or `deadline` passes; returns
+/// whether it held.
+fn poll_until(deadline: Instant, every: Duration, mut cond: impl FnMut() -> bool) -> bool {
     while Instant::now() < deadline {
         if cond() {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(20));
+        std::thread::sleep(every);
     }
     cond()
 }
@@ -1063,8 +1072,10 @@ fn a_lan_close_discards_frames_queued_for_a_peer() {
 
 /// A stalled link does not hold up a topic sent over another link: while the
 /// slow topic's sender waits on its stalled link and its send queue refuses
-/// frames, every frame of the fast topic reaches its receiver. (Topics sent
-/// to the same peer share zenoh's transmit queue for that peer, so this
+/// frames, every frame of the fast topic reaches its receiver. The fast
+/// frames go one at a time, each after the one before it arrived, so the
+/// fast topic's own queue bound never decides the outcome. (Topics sent to
+/// the same peer share zenoh's transmit queue for that peer, so this
 /// isolation is per link.)
 #[test]
 fn a_stalled_link_does_not_stall_a_topic_on_another_link() {
@@ -1122,34 +1133,77 @@ fn a_stalled_link_does_not_stall_a_topic_on_another_link() {
         "PRECONDITION: the slow topic's send queue must fill: {:?}",
         stats_of(&stats, &slow.topic)
     );
-    publish_burst(
-        &mut fast_pub,
-        0,
-        FAST_FRAMES,
-        fast.frame_len,
-        Duration::from_millis(1),
+    // The fast frames share the stall bound with the fill above, so a fill
+    // that used most of it would leave a missing fast frame unexplained. With
+    // at least half the bound left, a frame that does not arrive was held
+    // behind the stalled link.
+    let filled_after = paused_at.elapsed();
+    assert!(
+        filled_after < STALL_CEILING / 2,
+        "PRECONDITION: the slow topic's send queue took {filled_after:?} of the \
+         {STALL_CEILING:?} stall bound to fill, too little is left to tell a held fast frame \
+         from a slow host"
     );
-    let fast_done = wait_until(3, || {
-        fast_rx.sequences(&fast.topic).len() >= FAST_FRAMES as usize
+    // One fast frame at a time: each is published once the one before it has
+    // reached the receiver, so the fast topic's egress tap and its 4-deep send
+    // queue hold at most one frame and neither can overflow however the host
+    // schedules the drive and sender threads. A frame that does not arrive is
+    // then waiting behind the stalled link. Every wait ends at the stall
+    // bound, past which zenoh would close the stalled link.
+    let fast_deadline = paused_at + STALL_CEILING;
+    let fast_started = paused_at.elapsed();
+    let mut fast_missing = None;
+    for seq in 0..FAST_FRAMES {
+        publish_burst(&mut fast_pub, seq, 1, fast.frame_len, Duration::ZERO);
+        let arrived = poll_until(fast_deadline, Duration::from_millis(1), || {
+            fast_rx.sequences(&fast.topic).len() > seq as usize
+        });
+        if !arrived {
+            fast_missing = Some(seq);
+            break;
+        }
+    }
+    // A frame can reach the receiver before its put has returned to the
+    // sender thread; the counters settle once the last put is counted.
+    let fast_settled = poll_until(fast_deadline, Duration::from_millis(1), || {
+        let s = stats_of(&stats, &fast.topic);
+        s.queued == 0 && s.in_flight == 0
     });
+    let fast_lane = stats_of(&stats, &fast.topic);
     let slow_during = stats_of(&stats, &slow.topic);
     let stalled_for = paused_at.elapsed();
     proxy.paused.store(false, Ordering::Relaxed);
     let _gateway = drive.stop();
 
+    if let Some(seq) = fast_missing {
+        panic!(
+            "the fast topic stalled behind the slow one: frame {seq} of {FAST_FRAMES} did not \
+             arrive while the slow link was stalled for {stalled_for:?} (the fast frames \
+             started {fast_started:?} into the stall); fast send queue: {fast_lane:?}; slow \
+             send queue: {slow_during:?}"
+        );
+    }
     assert!(
         stalled_for < STALL_CEILING,
         "PRECONDITION: the stall lasted {stalled_for:?}, past the bound under zenoh's \
          wait_before_close"
     );
-    assert!(
-        fast_done,
-        "the fast topic stalled behind the slow one: {} of {FAST_FRAMES} arrived",
-        fast_rx.sequences(&fast.topic).len()
-    );
     assert_eq!(
         fast_rx.sequences(&fast.topic),
         (0..FAST_FRAMES).collect::<Vec<_>>()
+    );
+    assert!(
+        fast_settled,
+        "the fast topic's last put did not return: {fast_lane:?}"
+    );
+    assert_eq!(
+        (
+            fast_lane.forwarded,
+            fast_lane.refused,
+            accounted(&fast_lane)
+        ),
+        (u64::from(FAST_FRAMES), 0, u64::from(FAST_FRAMES)),
+        "every fast frame is put once and none is refused: {fast_lane:?}"
     );
     assert_eq!(
         slow_during.in_flight, 1,

@@ -2416,14 +2416,15 @@ impl Daemon {
     /// The ops latch, as `topic-publish` from `desk` reads it: its refusal of
     /// a type no robot knows, past the e-stop check.
     async fn publish_refusal(&self, desk: &Endpoint) -> String {
-        self.publish_refusal_on(desk, "/rcp_e2e/latch").await
+        self.publish_refusal_on(desk, "/rcp_e2e/latch", "nope_msgs/msg/Nope")
+            .await
     }
 
-    /// The refusal of a `topic-publish` from `desk` on `topic`, with a type no
-    /// robot knows: the topic's remote access policy, then the ops latch, are
-    /// checked before the type.
-    async fn publish_refusal_on(&self, desk: &Endpoint, topic: &str) -> String {
-        let args = json!({ "topic": topic, "type": "nope_msgs/msg/Nope", "message": {} });
+    /// The refusal of a `topic-publish` of `type_name` from `desk` on `topic`:
+    /// the ops latch, then the arguments (a type no robot knows is a usage
+    /// error), then the topic's remote access policy are checked.
+    async fn publish_refusal_on(&self, desk: &Endpoint, topic: &str, type_name: &str) -> String {
+        let args = json!({ "topic": topic, "type": type_name, "message": {} });
         match ops_call(desk, self.robot.clone(), "topic-publish", args).await {
             Err(CerudError::Remote { kind, message }) if kind == "verb_error" => message,
             other => panic!("expected the verb's error, got {other:?}"),
@@ -2804,9 +2805,11 @@ async fn local_only_daemon(runs_root: &Path, operator: &Endpoint) -> (Daemon, Lo
         json!({ "code": "local_only", "message": refused }),
         "{r}"
     );
-    // The ops plane refuses a remote publish on the journal's calls topic.
+    // The ops plane refuses a remote publish on the journal's calls topic, a
+    // well-formed one, so the refusal is the topic's policy.
     assert_eq!(
-        d.publish_refusal_on(operator, &calls_topic).await,
+        d.publish_refusal_on(operator, &calls_topic, "std_msgs/msg/String")
+            .await,
         format!("verb error: unavailable: {refused}")
     );
     // The ops latch reads clear: a publish on a topic no run excludes gets

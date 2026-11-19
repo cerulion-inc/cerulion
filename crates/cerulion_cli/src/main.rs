@@ -39,8 +39,8 @@ use cerulion_cli_engine::node_cmd::resolve_create_policy;
 use cerulion_cli_engine::ros_attach_root;
 use cerulion_cli_engine::workspace::CerulionWorkspace;
 use cerulion_cli_engine::{
-    account_cmd, connect_cmd, graph_cmd, login_cmd, node_cmd, partition_emit, ros_cmd, schema_cmd,
-    topic_cmd, viz_client, workspace,
+    account_cmd, connect_cmd, graph_cmd, graph_live, login_cmd, node_cmd, partition_emit, ros_cmd,
+    schema_cmd, topic_cmd, viz_client, workspace,
 };
 use cli::{
     AccountAction, BagAction, Cli, Commands, DevicesAction, GraphAction, NodeAction, NodeLanguage,
@@ -1811,6 +1811,39 @@ fn run(cli: Cli) -> CliResult<()> {
             }
         }
         Commands::Graph { action } => {
+            // `graph live` and `graph fires` ask a remote robot, not a workspace,
+            // so they run from anywhere.
+            let action = match action {
+                GraphAction::Live {
+                    connect,
+                    robot,
+                    json,
+                } => {
+                    return graph_live::graph_live(
+                        &graph_live::RemoteTarget { connect, robot },
+                        json,
+                    );
+                }
+                GraphAction::Fires {
+                    connect,
+                    robot,
+                    run,
+                    follow,
+                    for_secs,
+                    json,
+                } => {
+                    let running = setup_ctrlc_handler()?;
+                    return graph_live::graph_fires(
+                        &graph_live::RemoteTarget { connect, robot },
+                        run.as_deref(),
+                        follow,
+                        for_secs,
+                        json,
+                        running,
+                    );
+                }
+                other => other,
+            };
             let ws = discover_workspace()?;
             match action {
                 GraphAction::Create { name, prefix } => {
@@ -2117,6 +2150,12 @@ fn run(cli: Cli) -> CliResult<()> {
                     unreachable!(
                         "`graph pause|resume` are dispatched in `main` before the workspace \
                          lookup, because they address a live run"
+                    )
+                }
+                GraphAction::Live { .. } | GraphAction::Fires { .. } => {
+                    unreachable!(
+                        "`graph live|fires` are dispatched above, before the workspace lookup, \
+                         because they address a remote robot"
                     )
                 }
                 GraphAction::RunWorker { plan } => {
@@ -3864,14 +3903,15 @@ fn command_needs_identity(command: &Commands) -> bool {
 /// The network kill-switch refusal of a `Commands` verb under `switch`, which
 /// `dispatch` gives before the login gate. Each verb's refusal is the one its
 /// own path gives further down, with the same text and exit code:
-/// `viz --robot` (exit 1) under the run and query parse of
-/// `CERULION_NETWORK`, and under `CERULION_NETD_NETWORK` or
-/// `CERULION_VIZD_NETWORK` at `off` too; `connect` (a warning, exit 0) when
-/// `--network` or `CERULION_NETWORK` is exactly `off`, the value its helper
-/// reads. Every other verb is not refused here: it runs as without the
-/// switch, or does not run through `dispatch`. The match names every
-/// top-level verb, so a new one is decided here before it compiles; a new
-/// subverb of a verb below needs its row in `network_switch/cases.rs`.
+/// `viz --robot`, `graph live` and `graph fires` (exit 1) under the run and
+/// query parse of `CERULION_NETWORK` and under `CERULION_NETD_NETWORK` at
+/// `off`, and `viz --robot` under `CERULION_VIZD_NETWORK` at `off` too;
+/// `connect` (a warning, exit 0) when `--network` or `CERULION_NETWORK` is
+/// exactly `off`, the value its helper reads. Every other verb is not refused
+/// here: it runs as without the switch, or does not run through `dispatch`.
+/// The match names every top-level verb, so a new one is decided here before
+/// it compiles; a new subverb of a verb below needs its row in
+/// `network_switch/cases.rs`.
 fn command_network_refusal(
     command: &Commands,
     switch: &network_switch::SwitchEnv,
@@ -3890,6 +3930,21 @@ fn command_network_refusal(
         Commands::Connect { network, .. } => {
             connect_cmd::network_refusal(network.as_deref(), switch.network.as_deref())
                 .map(|refusal| NetworkRefusal::warning(refusal, 0))
+        }
+        // `graph live` and `graph fires` ask robots with or without `--robot`
+        // and `--connect`, so the query-side switches refuse every form.
+        Commands::Graph { action } => {
+            let verb = match action {
+                GraphAction::Live { .. } => "graph live",
+                GraphAction::Fires { .. } => "graph fires",
+                _ => return None,
+            };
+            let kill = cerulion_cli_engine::graph_cmd::query_network_kill_from(
+                switch.network.clone(),
+                switch.netd.as_deref(),
+            );
+            cerulion_cli_engine::graph_live::network_refusal(verb, &kill)
+                .map(|refusal| NetworkRefusal::error(refusal, 1))
         }
         Commands::Topic { action } => match action {
             TopicAction::Info { robot, .. } => {
@@ -3912,7 +3967,6 @@ fn command_network_refusal(
         Commands::BootstrapRobot { .. } | Commands::RobotSyncEpoch { .. } => None,
         Commands::Workspace { .. }
         | Commands::Node { .. }
-        | Commands::Graph { .. }
         | Commands::Ros { .. }
         | Commands::Pair { .. }
         | Commands::Ros2 { .. }

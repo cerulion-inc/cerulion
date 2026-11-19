@@ -1519,7 +1519,10 @@ fn private_raw_publisher_keeps_scope_until_outstanding_loans_and_port_are_retire
                 0
             );
         }
-        assert!(h.manager.remote_topic_allowed(topic).unwrap());
+        assert!(h
+            .manager
+            .remote_topic_allowed(topic, cerulion_core::transport::TeardownWait::Bounded)
+            .unwrap());
         assert_eq!(
             with_context(h.context.value, |host| Ok(host.outstanding_leases())),
             Ok(0)

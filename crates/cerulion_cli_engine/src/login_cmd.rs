@@ -874,7 +874,7 @@ fn poll_for_tokens(
                 "login timed out waiting for authorization — run `cerulion login` again".into(),
             ));
         }
-        std::thread::sleep(interval);
+        poll_wait(interval);
         let resp = client
             .post(format!("{base}/v1/auth/device/poll"))
             .json(&body)
@@ -916,6 +916,123 @@ fn poll_for_tokens(
                 return Err(CliError::Login(format!("login failed: {detail}")));
             }
         }
+    }
+}
+
+/// Wait `requested` before the next device-flow poll.
+///
+/// The `std::thread::sleep` below is the wait in every build. The statement
+/// above it is compiled only under `cfg(test)` or `test-seams`, and acts only on
+/// a thread inside `PollWaitLog::shorten_during`: it records `requested` in that
+/// log, blocks first if the test called `PollWaitLog::hold_next_wait`, and
+/// answers 5 ms as the duration to sleep. Every other thread, and every build
+/// without the gate, sleeps `requested`.
+fn poll_wait(requested: Duration) {
+    let slept = requested;
+    #[cfg(any(test, feature = "test-seams"))]
+    let slept = poll_wait_log::slept_for(slept);
+    std::thread::sleep(slept);
+}
+
+#[cfg(any(test, feature = "test-seams"))]
+#[doc(hidden)]
+pub use poll_wait_log::PollWaitLog;
+
+#[cfg(any(test, feature = "test-seams"))]
+mod poll_wait_log {
+    use std::cell::RefCell;
+    use std::sync::{mpsc, Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// What an opted-in thread sleeps per poll wait.
+    const SHORT_POLL_WAIT: Duration = Duration::from_millis(5);
+
+    /// **Test-only.** The intervals the device-flow poll loop asked to wait on
+    /// the threads that opted in, so a test pins the 1 s floor and the
+    /// `slow_down` back-off without sleeping them.
+    ///
+    /// The opt-in is per thread: [`PollWaitLog::shorten_during`] sets a
+    /// `thread_local!` slot for the length of its closure, so a login on any
+    /// other thread keeps the shipped wait. Clones share one record.
+    #[derive(Clone, Default)]
+    pub struct PollWaitLog {
+        shared: Arc<Shared>,
+    }
+
+    #[derive(Default)]
+    struct Shared {
+        requested: Mutex<Vec<Duration>>,
+        held: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    thread_local! {
+        static OPTED_IN: RefCell<Option<PollWaitLog>> = const { RefCell::new(None) };
+    }
+
+    impl PollWaitLog {
+        /// Run `f` on the calling thread with every poll wait it makes recorded
+        /// here and shortened to 5 ms. The thread's previous opt-in, if any, is
+        /// restored when `f` returns or unwinds.
+        pub fn shorten_during<T>(&self, f: impl FnOnce() -> T) -> T {
+            struct Restore(Option<PollWaitLog>);
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    let previous = self.0.take();
+                    OPTED_IN.with(|slot| *slot.borrow_mut() = previous);
+                }
+            }
+            let previous = OPTED_IN.with(|slot| slot.replace(Some(self.clone())));
+            let _restore = Restore(previous);
+            f()
+        }
+
+        /// Block the next recorded poll wait until the returned sender sends or
+        /// is dropped. The wait records its interval before it blocks.
+        pub fn hold_next_wait(&self) -> mpsc::Sender<()> {
+            let (release, held) = mpsc::channel();
+            *self
+                .shared
+                .held
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(held);
+            release
+        }
+
+        /// Every interval recorded so far, in the order the loop asked for them.
+        #[must_use]
+        pub fn requested(&self) -> Vec<Duration> {
+            self.shared
+                .requested
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    /// The duration `poll_wait` sleeps for `requested` on the calling thread:
+    /// `requested` itself on a thread that has not opted in. On an opted-in
+    /// thread it records `requested`, waits out a hold set by `hold_next_wait`,
+    /// and answers 5 ms.
+    pub(super) fn slept_for(requested: Duration) -> Duration {
+        let Some(log) = OPTED_IN.with(|slot| slot.borrow().clone()) else {
+            return requested;
+        };
+        log.shared
+            .requested
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(requested);
+        let held = log
+            .shared
+            .held
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(held) = held {
+            // A send and a dropped sender both end the hold.
+            let _ = held.recv();
+        }
+        SHORT_POLL_WAIT
     }
 }
 
