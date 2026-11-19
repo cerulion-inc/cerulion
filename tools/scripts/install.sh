@@ -2639,7 +2639,7 @@ RUST_EOF
     chmod 0777 "$harness_dotdot_home"
     (umask 000 && harness_install first "$harness_dotdot_home/missing/../made" dotdot) ||
         die "self-test: the install through a --dir with .. failed: $(cat "$harness_root/dotdot-error")"
-    [ -n "$(find "$harness_dotdot_home" -prune -perm 0777 -print)" ] ||
+    [ -n "$(find "$harness_dotdot_home" -prune -perm -0777 -print)" ] ||
         die "self-test: the install changed the mode of an existing folder its --dir reaches with .."
     for harness_dotdot_new in "$harness_dotdot_home/missing" "$harness_dotdot_home/made"; do
         if [ -n "$(find "$harness_dotdot_new" -prune \( -perm -0020 -o -perm -0002 \) -print)" ]; then
@@ -4272,11 +4272,12 @@ else
 fi
 
 # `cerulion rcp` never takes the harness beside the CLI when every user can
-# write the CLI's directory or the harness, so every directory this run
-# creates is made with no group or other write whatever the umask, and an
-# install directory every user can already write is named. The umask, not a
-# chmod afterwards, keeps a directory that already exists (one a `..` in the
-# path reaches, say) as it is, and leaves no moment when a new one is open.
+# write the CLI's directory or the harness, so the install directory and the
+# folders above it that mkdir makes for it get no group or other write
+# whatever the umask, and an install directory every user can already write
+# is named. The umask, not a chmod afterwards, keeps a directory that already
+# exists (one a `..` in the path reaches, say) as it is, and leaves no moment
+# when a new one is open.
 install_dir_existed=0
 if [ -d "$install_dir" ]; then
     install_dir_existed=1
