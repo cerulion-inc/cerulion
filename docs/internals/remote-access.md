@@ -252,6 +252,9 @@ Load-bearing boundary contracts:
   final Exit produces a complete result. Timeout or connection loss leaves a
   partial result and must never trigger automatic command replay. OPS uses
   big-endian framing; the link crate's wire-plane framing is little-endian.
+  `exec_client_test.rs` also pins direct typed-frame refusals, duplicate
+  checkpoints, final status/truncation combinations and independent partial
+  snapshots.
 - **Session audit commitments** use a domain-separated SHA-256 chain over the
   canonical event JSON documented in `cerulion_ops_proto::recording`. The builder
   requires exactly one initial Started event, monotonic timestamps and no event

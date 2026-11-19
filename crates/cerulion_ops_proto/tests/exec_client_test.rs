@@ -8,8 +8,8 @@ use cerulion_ops_proto::exec_client::{
 };
 use cerulion_ops_proto::session::{encode_session, read_session_frame, write_session_frame};
 use cerulion_ops_proto::{
-    ClientFrame, HandshakeReply, OpsProtoError, OutputStream, RecordingWitness, ServerFrame,
-    SessionExit, MAX_SESSION_FRAME_BYTES,
+    ClientFrame, ExitReason, HandshakeReply, OpsProtoError, OutputStream, RecordingWitness,
+    ServerFrame, SessionExit, MAX_SESSION_FRAME_BYTES,
 };
 
 const HELLO_JSON: &str = r#"{"min_version":2,"max_version":2,"session":{"type":"exec","argv":["printf","%s","a b","","--json","$(x)","é"]}}"#;
@@ -221,6 +221,22 @@ fn handshake_refusal_and_unoffered_versions_are_terminal() {
 }
 
 #[test]
+fn server_frames_require_the_handshake() {
+    for frame in [
+        frame(STARTED_JSON),
+        frame(STDOUT_JSON),
+        checkpoint("exec-1", H1, 1),
+        ServerFrame::Exit(exit()),
+    ] {
+        let mut client = client(8, 8);
+        let before = client.partial();
+        assert_decode(client.accept_frame(frame).unwrap_err());
+        assert_eq!(client.partial(), before);
+        assert_poisoned(&mut client);
+    }
+}
+
+#[test]
 fn streams_preserve_binary_bytes_and_order_independently() {
     let mut client = ready(8, 8);
     for (prefix, json) in [
@@ -247,6 +263,29 @@ fn streams_preserve_binary_bytes_and_order_independently() {
     assert_eq!(result.stderr, b"ErrB");
     assert!(!result.stdout_truncated);
     assert!(!result.stderr_truncated);
+}
+
+#[test]
+fn zero_capture_distinguishes_empty_from_discarded_bytes() {
+    let mut client = ready(0, 0);
+    for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+        client.accept_frame(data(stream, "")).unwrap();
+    }
+    assert!(!client.partial().stdout_truncated);
+    assert!(!client.partial().stderr_truncated);
+    client
+        .accept_frame(data(OutputStream::Stdout, "QQ=="))
+        .unwrap();
+    assert!(client.partial().stdout_truncated);
+    assert!(!client.partial().stderr_truncated);
+    client
+        .accept_frame(data(OutputStream::Stderr, "Qg=="))
+        .unwrap();
+    let result = complete(&mut client, exit());
+    assert!(result.stdout.is_empty());
+    assert!(result.stderr.is_empty());
+    assert!(result.stdout_truncated);
+    assert!(result.stderr_truncated);
 }
 
 #[test]
@@ -323,6 +362,74 @@ fn hostile_session_order_and_pty_fail_before_state_changes() {
 }
 
 #[test]
+fn directly_constructed_frames_still_require_validation() {
+    let mut conflicting = exit();
+    conflicting.signal = Some(15);
+    for bad in [
+        data(OutputStream::Stdout, "!!!!"),
+        data(OutputStream::Stdout, "AP9hCg"),
+        data(OutputStream::Stdout, "Zh=="),
+        checkpoint("exec-1", "ABC", 4),
+        checkpoint("exec-1", H1, 0),
+        ServerFrame::Exit(conflicting),
+        ServerFrame::Exit(SessionExit {
+            events: 1,
+            ..exit()
+        }),
+        ServerFrame::Exit(SessionExit {
+            recording_head: H1.to_uppercase(),
+            ..exit()
+        }),
+        ServerFrame::Exit(SessionExit {
+            recording_head: "0".into(),
+            ..exit()
+        }),
+    ] {
+        let mut client = ready(8, 8);
+        client.accept_frame(frame(STDOUT_JSON)).unwrap();
+        let before = client.partial();
+        assert_decode(client.accept_frame(bad).unwrap_err());
+        assert_eq!(client.partial(), before);
+        assert_poisoned(&mut client);
+    }
+    // 21,846 complete base64 quanta decode to 65,538 bytes, above the raw cap.
+    let mut client = ready(8, 8);
+    let before = client.partial();
+    assert!(matches!(
+        client.accept_frame(data(OutputStream::Stdout, &"AAAA".repeat(21_846))),
+        Err(OpsProtoError::FrameTooLarge {
+            size: 65_538,
+            max: 65_536
+        })
+    ));
+    assert_eq!(client.partial(), before);
+    assert_poisoned(&mut client);
+}
+
+#[test]
+fn checkpoints_require_monotonic_identity_and_identical_repeats_are_progress() {
+    let mut client = ready(8, 8);
+    assert_eq!(
+        client.accept_frame(checkpoint("exec-1", H1, 4)).unwrap(),
+        ExecEvent::Checkpoint(witness("exec-1", H1, 4))
+    );
+    assert_eq!(
+        client.accept_frame(checkpoint("exec-1", H1, 4)).unwrap(),
+        ExecEvent::Progress
+    );
+    assert_eq!(
+        client
+            .accept_frame(checkpoint("exec-1", H2, u64::MAX))
+            .unwrap(),
+        ExecEvent::Checkpoint(witness("exec-1", H2, u64::MAX))
+    );
+    assert_eq!(
+        client.partial().checkpoint,
+        Some(witness("exec-1", H2, u64::MAX))
+    );
+}
+
+#[test]
 fn bad_checkpoint_cannot_replace_the_last_valid_partial_state() {
     for bad in [
         checkpoint("other", H2, 5),
@@ -372,6 +479,78 @@ fn final_commitment_is_consistent_with_the_started_id_and_latest_checkpoint() {
     let mut client = ready(8, 8);
     let result = complete(&mut client, exit());
     assert_eq!(result.recording, witness("exec-1", H1, 6));
+}
+
+#[test]
+fn final_status_preserves_nonzero_signal_and_absent_status_metadata() {
+    for (code, signal, reason) in [
+        (Some(7), None, ExitReason::Exited),
+        (None, Some(15), ExitReason::Exited),
+        (None, None, ExitReason::Exited),
+        (None, None, ExitReason::ClientClosed),
+        (None, None, ExitReason::Disconnected),
+        (None, None, ExitReason::Revoked),
+        (None, None, ExitReason::ProtocolError),
+        (None, None, ExitReason::RecordingFailed),
+        (Some(0), None, ExitReason::CleanupFailed),
+        (Some(7), None, ExitReason::CleanupFailed),
+        (None, None, ExitReason::SpawnFailed),
+        (None, None, ExitReason::TimedOut),
+        (None, None, ExitReason::ResourceLimit),
+    ] {
+        let mut client = ready(8, 8);
+        let result = complete(
+            &mut client,
+            SessionExit {
+                code,
+                signal,
+                reason,
+                ..exit()
+            },
+        );
+        assert_eq!((result.exit.code, result.exit.signal), (code, signal));
+        assert_eq!(result.exit.reason, reason);
+        assert_eq!(result.recording, witness("exec-1", H1, 6));
+    }
+}
+
+#[test]
+fn server_and_local_truncation_are_combined_without_changing_server_metadata() {
+    let cases = [
+        (false, false, false),
+        (false, true, true),
+        (true, false, true),
+        (true, true, true),
+    ];
+    for (local_out, server_out, expected_out) in cases {
+        for (local_err, server_err, expected_err) in cases {
+            let mut client = ready(0, 0);
+            if local_out {
+                client
+                    .accept_frame(data(OutputStream::Stdout, "QQ=="))
+                    .unwrap();
+            }
+            if local_err {
+                client
+                    .accept_frame(data(OutputStream::Stderr, "Qg=="))
+                    .unwrap();
+            }
+            let result = complete(
+                &mut client,
+                SessionExit {
+                    stdout_truncated: server_out,
+                    stderr_truncated: server_err,
+                    ..exit()
+                },
+            );
+            assert_eq!(result.stdout_truncated, expected_out);
+            assert_eq!(result.stderr_truncated, expected_err);
+            assert_eq!(result.exit.stdout_truncated, server_out);
+            assert_eq!(result.exit.stderr_truncated, server_err);
+            assert_eq!(client.partial().stdout_truncated, local_out);
+            assert_eq!(client.partial().stderr_truncated, local_err);
+        }
+    }
 }
 
 #[test]
@@ -471,4 +650,21 @@ fn completion_moves_bytes_and_cannot_be_replayed() {
     assert_poisoned(&mut client);
     assert_eq!(result.stdout, [0, 255, 97, 10]);
     assert_eq!(result.stderr, b"Err");
+}
+
+#[test]
+fn partial_is_an_independent_snapshot_of_validated_state() {
+    let mut client = ready(8, 8);
+    client.accept_frame(frame(STDOUT_JSON)).unwrap();
+    client.accept_frame(checkpoint("exec-1", H1, 4)).unwrap();
+    let mut snapshot = client.partial();
+    snapshot.stdout.clear();
+    snapshot.stderr.extend_from_slice(b"injected");
+    snapshot.session_id = Some("other".into());
+    snapshot.checkpoint.as_mut().unwrap().events = 99;
+    let retained = client.partial();
+    assert_eq!(retained.stdout, [0, 255, 97, 10]);
+    assert!(retained.stderr.is_empty());
+    assert_eq!(retained.session_id.as_deref(), Some("exec-1"));
+    assert_eq!(retained.checkpoint, Some(witness("exec-1", H1, 4)));
 }
