@@ -86,10 +86,12 @@
 #             reading the run mode gates on, as an exit code (0 rides, 1 does
 #             not) plus one `selection:` line. For a workflow step that spends
 #             something before this script's run step is reached.
-#   --check — prove the partition is TOTAL and DISJOINT: the union of all
+#   --check: prove the partition is TOTAL and DISJOINT: the union of all
 #             shards equals the full file list exactly once. Defaults to the
-#             package + shard count CI actually uses, so a bare `--check` is
-#             the shipped configuration.
+#             package + shard count CI actually uses, so a bare `--check`
+#             partitions the shipped package. It does not read the `--with`
+#             packages; `--list` with them checks those, and the coverage suite
+#             in cerulion_cli_engine runs it on the workflow's own lines.
 #
 # Extra `cargo nextest run` arguments may be passed through the
 # CI_TEST_SHARD_EXTRA environment variable; they are appended to the command
@@ -240,7 +242,7 @@ usage() {
 # construction rather than by an exclusion list that could go stale.
 enumerate() {
     _dir=$1
-    [ -d "$_dir/tests" ] || die "$_dir/tests does not exist — pass the package DIRECTORY as the 4th argument if it differs from the package name"
+    [ -d "$_dir/tests" ] || die "$_dir/tests does not exist: pass the package DIRECTORY after the shard count if it differs from the package name"
     # `ls` rather than a glob so an empty directory yields nothing instead of
     # the literal pattern; `basename`-with-suffix strips `.rs` portably.
     find "$_dir/tests" -maxdepth 1 -type f -name '*.rs' -print \
@@ -379,9 +381,11 @@ selection_holds() {
 # The packages of one invocation that ride the selection, space separated, in
 # command-line order: $1 is the shard's own package, $2 the `--with` packages
 # (space separated), $3 the selection. Each package is read by
-# `selection_holds` on its own, so a change that selects only an extra runs that
-# extra and none of the shard's own files, and a change that selects only the
-# shard's package runs no extra.
+# `selection_holds` on its own, so a selection that names an extra and not the
+# shard's package runs that extra and none of the shard's own files, and one
+# that names only the shard's package runs no extra. In CI every selection that
+# names a package names `cerulion_core`, which observes the whole tree, so the
+# step sees `[]` or `cerulion_core` with or without each extra.
 shard_riders() {
     _riders=
     for _rider in $1 $2; do
@@ -419,12 +423,14 @@ package_dir_of() {
 #     tests only under `--lib` or `--bins`, which would select the shard
 #     package's own;
 #   * a doctest's possible source under `src/`: a fenced block (three
-#     backticks or tildes) in a `//!` or `///` comment, any `#[doc`/`#![doc`
-#     attribute (a `#[doc = "..."]` string or an `include_str!` can hold a
-#     block too) or a `/**`/`/*!` block comment, because nextest runs no
-#     doctest;
-#   * a test target the depth-1 list does not name: a `[[test]]` table, a
-#     `tests/<dir>/main.rs`, or a `[[bin]]` without `test = false`;
+#     backticks or tildes) or a line indented as code (five spaces or a tab
+#     past the marker) in a `//!` or `///` comment, any `#[doc`/`#![doc` attribute (a `#[doc = "..."]`
+#     string or an `include_str!` can hold a block too) or a `/**`/`/*!` block
+#     comment, because nextest runs no doctest;
+#   * a test target the depth-1 list does not name, or test code outside
+#     `src/`: a `[[test]]` table, a `tests/<dir>/main.rs`, a `[[bin]]` without
+#     `test = false`, an `[[example]]` or `[[bench]]` with `test = true`, or a
+#     `[lib]` whose `path` is outside `src/`;
 #   * an integration test named like one of the shard package's, because
 #     `--test` selects that name in every package of the command.
 # The test attribute forms include the ones the coverage walk in
@@ -433,17 +439,22 @@ package_dir_of() {
 check_extra() {
     _unit=$(grep -rlE -e '#\[([A-Za-z_][A-Za-z0-9_]*::)*test[](]' -e '#\[(test_case|rstest)' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
     [ -z "$_unit" ] || die "--with $1: $_unit holds a unit test, which this invocation cannot run (move it to $2/tests/)"
-    _doc=$(grep -rlE -e '^[[:space:]]*//[/!].*(```|~~~)' -e '#!?\[doc' -e '/\*[*!]' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
+    _tab=$(printf '\t')
+    _doc=$(grep -rlE -e '^[[:space:]]*//[/!].*(```|~~~)' -e "^[[:space:]]*//[/!]( {5}| *$_tab)" -e '#!?\[doc' -e '/\*[*!]' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
     [ -z "$_doc" ] || die "--with $1: $_doc holds a doc comment code block or a doc attribute, and nextest runs no doctest"
     grep -q '^\[\[test\]\]' "$2/Cargo.toml" \
         && die "--with $1: $2/Cargo.toml declares a [[test]] target, which the tests/*.rs list does not name"
     _nested=$(find "$2/tests" -mindepth 2 -maxdepth 2 -name main.rs -print 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
     [ -z "$_nested" ] || die "--with $1: $_nested is a test target the tests/*.rs list does not name"
-    awk '
-        /^\[/ { if (inbin && !off) bad = 1; inbin = ($0 == "[[bin]]"); off = 0; next }
-        inbin && /^test[ \t]*=[ \t]*false/ { off = 1 }
-        END { if (inbin && !off) bad = 1; exit bad }' "$2/Cargo.toml" \
-        || die "--with $1: a [[bin]] in $2/Cargo.toml lacks \`test = false\`, so its tests would run only under --bins"
+    # One pass over the manifest's target tables; the first offence decides.
+    _target=$(awk '
+        function close_table() { if (table == "[[bin]]" && !off && !why) why = "a [[bin]] lacks `test = false`, so its tests would run only under --bins" }
+        /^\[/ { close_table(); table = $0; off = 0; next }
+        table == "[[bin]]" && /^test[ \t]*=[ \t]*false/ { off = 1 }
+        (table == "[[example]]" || table == "[[bench]]") && /^test[ \t]*=[ \t]*true/ && !why { why = "a " table " has `test = true`, which the tests/*.rs list does not name" }
+        table == "[lib]" && /^path[ \t]*=/ && !/^path[ \t]*=[ \t]*"src\// && !why { why = "its [lib] path is outside src/, where the unit test scan does not look" }
+        END { close_table(); print why }' "$2/Cargo.toml")
+    [ -z "$_target" ] || die "--with $1: in $2/Cargo.toml, $_target"
     [ -d "$2/tests" ] || die "--with $1: $2/tests does not exist, so it would add nothing to the shard"
     _xtests=$(enumerate "$2")
     [ -n "$_xtests" ] || die "--with $1: $2/tests holds no *.rs files, so it would add nothing to the shard"
@@ -488,8 +499,8 @@ cerulion-wire|["cerulion-wire"]|yes
 '
 
 # The hand table `--check` holds `shard_riders` to: `<package and extras>|
-# <selection>|<riders>`, `-` for none. The second row is a change that selects
-# only the diagnostics suite: it runs that suite and none of the shard's own
+# <selection>|<riders>`, `-` for none. The second row is a selection of the
+# diagnostics suite alone: it runs that suite and none of the shard's own
 # files. An unreadable selection runs every package, as `selection_holds` reads
 # it. The order row says the riders follow the command line, not the selection.
 SHARD_SELECTION_CASES='
@@ -720,8 +731,8 @@ require_index "shard count" "$COUNT"
 # in `--list` alike. One line with the fixed `selection:` prefix for each
 # package the selection leaves out (on stderr under `--list`, whose stdout is
 # the argument list), then exit 0 without invoking cargo when none rides. A
-# `--with` package rides on its own reading: a change that selects only the
-# diagnostics suite runs that suite and none of this package's files.
+# `--with` package rides on its own reading, so a selection that names it and
+# not this package runs it and none of this package's files.
 #
 # The workflow step that runs this shard is deliberately NOT gated on the selection:
 # `cerulion_core` observes the whole repository tree (its whole-tree walks,
@@ -776,7 +787,7 @@ rides() {
 ALL_TESTS=$(enumerate "$PKG_DIR")
 TOTAL_TESTS=$(printf '%s\n' "$ALL_TESTS" | grep -c . || true)
 [ "$TOTAL_TESTS" -gt 0 ] \
-    || die "$PKG_DIR/tests holds no *.rs files — nothing to shard (pass the package DIRECTORY as the 4th argument if it differs from the package name)"
+    || die "$PKG_DIR/tests holds no *.rs files, so there is nothing to shard (pass the package DIRECTORY after the shard count if it differs from the package name)"
 
 # Every `--with` package, checked whether or not it rides, so a wrong one fails
 # on every change that runs any package of this invocation, not only on the

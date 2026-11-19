@@ -2937,9 +2937,10 @@ jobs:
       # tree, and `tools/ci/observation_edges.tsv` records the package
       # as observing `all`, so it rides every selection that names a package; only
       # a change that selects nothing reaches this step with `[]`. The shard
-      # runner intersects its own package with the selection instead of a step
-      # condition and prints one `selection:` line when the intersection is
-      # empty, so the decision and its log line live in one place.
+      # runner intersects its own package and each `--with` package with the
+      # selection instead of a step condition and prints one `selection:` line
+      # for each package it leaves out, so the decision and its log line live in
+      # one place.
       # The waiver gate asks OTHER test binaries what libtest will do with the
       # arms it declares waived. A shard builds only its own files, so on the
       # shard that runs the gate those binaries are absent, or are a

@@ -3423,19 +3423,9 @@ const HAND_SCANNED_OBSERVATION_EDGES: &[(&str, &str, &str)] = &[
     ("cerulion_cli_engine", "cerulion_wsd", "crate-path"),
     // workspace resolves `base.join("crates/native_ros2_messages")`.
     ("cerulion_cli_engine", "native_ros2_messages", "crate-path"),
-    // ci_test_coverage_test reads `crates/test_fixtures/node_macro_ui/tests`, the
-    // files the shard's `--with node_macro_ui` must name.
-    ("cerulion_cli_engine", "node_macro_ui", "crate-path"),
     // ros2_cmd holds `RMW_LIB_FILENAME`, `librmw_cerulion.so`, the artifact
     // rmw_cerulion builds.
     ("cerulion_cli_engine", "rmw_cerulion", "dlopen"),
-    // ci_test_coverage_test reads `crates/test_fixtures/test_node_macro_cdylib/tests`,
-    // the files the shard's `--with test_node_macro_cdylib` must name.
-    (
-        "cerulion_cli_engine",
-        "test_node_macro_cdylib",
-        "crate-path",
-    ),
     // cdylib_iox2_log_level_test's EXCLUSIONS table names `crates/test_fixtures/`,
     // a tree that holds many members, and the same package's
     // serial_discipline_test walks the repository root itself
