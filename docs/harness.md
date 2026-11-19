@@ -129,12 +129,43 @@ sessions of their own, and the stop does not reach them.
 One episode is one draw at temperature 1.0, so a single pair can go either way. The published rates come from
 100 start states a model.
 
+### Pictures
+
+Both setups keep the newest 4 pictures in the model's conversation. The picture mode decides what happens to the
+older ones:
+
+| Mode | What the model is sent |
+|---|---|
+| `append` | every earlier picture stays where it was, so until the conversation passes the context limit each request starts with the whole previous request, and the endpoint's prompt cache can read it instead of writing it again. Past the limit, the pictures beyond the newest 4 go, all of them in one request |
+| `swap` | on every request, each picture beyond the newest 4 is replaced by a short text inside its older turn |
+
+A Claude model (a model name that holds `claude`, in any case) runs `append` with the harness, and its opening
+(the tools, the system text and the first message) carries a prompt cache mark. Every other model, and every
+model without the harness, runs `swap`. The start line names each setup's mode, and `summary.json` records it
+with the operator flags it adds.
+
+`cerulion rcp bench` runs these defaults. To name one mode for both setups, run the program behind it from the
+harness folder with `--image-mode swap` or `--image-mode append`, once a first `cerulion rcp bench` has installed
+the harness:
+
+```bash
+cd harness
+venv/bin/python -P -m cerulion_harness run-cell --model YOUR_MODEL --image-mode swap --out ~/cerulion-bench-swap
+```
+
+It takes the other flags of `cerulion rcp bench` too (`--base-url`, `--key-env`, `--cell`). With `append` named,
+the prompt cache mark still goes only to a Claude model with the harness; `swap` carries no mark.
+
 ## What `--verify` checks
 
 `cerulion rcp bench --verify` hashes every file of the measured code in the harness folder and compares it with
-the manifests of the two code trees the benchmark ran, one for each setup. The SHA-256 of a manifest is that
-tree's snapshot id, and the results package names the same ids. It exits 0 only when every file matches. It
-installs nothing and needs only `python3`.
+the manifests of the two measured code trees, one for each setup. The SHA-256 of a manifest is that tree's
+snapshot id: `sha256:4f8bbe79fdf38df1770c068ec470fd3d5a629fd371f7288887cb3d275f9f747e` with the harness and
+`sha256:6f040ca78bae0efd437005afc04ead78c4295e1e471d854b3e7ff0f9ea01f2a4` without. They are the trees
+`sha256:7cb9f322c10f6fa7e64a3f8da7c22c67d67280eca436a03d2d87683496b4d5b8` and
+`sha256:b73c548a1f0436f52ce41cffc7d4a4a2784e5d6170e2dd2c757c9cabdf146637` with the `append` mode added to two
+operator files, `bench/operators/chat_support.py` and `bench/operators/chat_operator.py`; in `swap` mode they send
+what those trees sent. It exits 0 only when every file matches. It installs nothing and needs only `python3`.
 
 ## Where the harness lives
 

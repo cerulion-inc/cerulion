@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Check the shipped harness code against its provenance files. Standard library only.
 
-provenance/measured-rcp.manifest and measured-plain.manifest list every file of the two code trees the published
-benchmark grid ran, one "SHA256  path" line each. The SHA-256 of a manifest's bytes is that tree's snapshot id,
-the id the results package cites; SNAPSHOTS below holds both.
+provenance/measured-rcp.manifest and measured-plain.manifest list every file of the two measured code trees, one
+"SHA256  path" line each. The SHA-256 of a manifest's bytes is that tree's snapshot id; SNAPSHOTS below holds both.
+Both trees carry the two picture modes of bench/operators/chat_support.py: swap, the operator's default, and append,
+which run-cell gives a Claude model with the harness tools (cerulion_harness.cli.picture_mode).
 
 One tree ships: measured/rcp/, the arm with the Cerulion harness's tools. The plain arm's tree is built from it by
 measured/assemble.py (plain-overlay/ replaces a few files, plain-absent.txt leaves one out); verify builds it in a
@@ -38,8 +39,8 @@ import sys
 import tempfile
 
 SNAPSHOTS = {
-    "rcp": "sha256:7cb9f322c10f6fa7e64a3f8da7c22c67d67280eca436a03d2d87683496b4d5b8",
-    "plain": "sha256:b73c548a1f0436f52ce41cffc7d4a4a2784e5d6170e2dd2c757c9cabdf146637",
+    "rcp": "sha256:4f8bbe79fdf38df1770c068ec470fd3d5a629fd371f7288887cb3d275f9f747e",
+    "plain": "sha256:6f040ca78bae0efd437005afc04ead78c4295e1e471d854b3e7ff0f9ea01f2a4",
 }
 OUTSIDE_SNAPSHOT = ("runs/tools/grid_ext.py",)
 STATUSES = ("identical", "comments_and_docstrings", "text_edited", "strings_edited", "code_edited")

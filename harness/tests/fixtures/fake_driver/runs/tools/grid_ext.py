@@ -9,6 +9,9 @@ model. It takes the flags run-cell passes and, by FAKE_DRIVER_MODE:
               result and the kept log.
     hang      starts a stand-in episode server in a session of its own, notes its pid where the episode stop
               command reads it, writes its own pid to FAKE_DRIVER_READY and waits to be stopped.
+
+With FAKE_DRIVER_OP_ARGS set, it first adds a line to that file: its setup (--arm) and the operator flags it was
+given (--op-args), as JSON.
 """
 import argparse
 import json
@@ -100,6 +103,8 @@ def main():
         p.add_argument(flag)
     p.add_argument("--retry-failed", action="store_true")
     ns = p.parse_args()
+    if os.environ.get("FAKE_DRIVER_OP_ARGS"):
+        append(os.environ["FAKE_DRIVER_OP_ARGS"], {"arm": ns.arm, "op_args": ns.op_args})
     group = os.path.join(os.path.abspath(ns.work), f"{ns.label}_{ns.arm}")
     ep, scoring = os.path.join(group, f"{ns.only}_a1"), os.path.join(group, "_scoring", f"{ns.only}_a1")
     os.makedirs(ep)

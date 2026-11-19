@@ -19,6 +19,8 @@ import urllib.request
 from rcpx.server import END_NAME, SOCK_NAME
 
 DROPPED = "[frame dropped to save context]"
+IMAGE_MODES = ("swap", "append")   # swap: the published rule; append: older turns are never edited for a picture
+PREFIX_MARK = {"type": "ephemeral"}  # the cache mark on the first user message (--cache-prefix-mark)
 SHORTENED = "[older result shortened to save context] "
 CUT_REPLY = " [rest of this older reply trimmed to save context]"
 MAX_ITEMS = 24           # a list longer than this is cut to its first KEEP_ITEMS items and a note
@@ -337,17 +339,31 @@ def _image_parts(m):
 class History:
     """The system text and first user message (the prefix), then one list of messages per model turn.
 
+    image_mode "swap" (the published rule): on every build each image beyond the newest keep_images becomes
+    DROPPED inside its older turn. That edit changes the request's prefix, so an endpoint with a prefix cache
+    writes the whole request again on every turn that brings a picture. image_mode "append": a build never edits
+    an older turn for a picture; the request keeps its prefix byte for byte and only grows at its end. Pictures
+    then go only in an epoch: when more than image_high_water are attached (0: no count limit), or when the
+    estimate passes the token limit, every picture beyond the newest keep_images goes in that one build.
+
     Every trim is permanent and oldest first, so the conversation only ever loses its oldest detail: images
-    beyond keep_images become DROPPED; over the token limit, older tool results take their short form ("_compact"),
+    beyond keep_images become DROPPED (swap; append: in epochs); over the token limit, older tool results take their short form ("_compact"),
     then older replies are cut, then images outside the newest turns go, then whole old turns go (a note in the
     first user message counts them). The newest PROTECT_TURNS turns are never shortened or dropped.
     """
 
-    def __init__(self, system_text, first_user, keep_images):
+    def __init__(self, system_text, first_user, keep_images, image_mode="swap", image_high_water=0,
+                 mark_prefix=False):
         self.prefix = [{"role": "system", "content": system_text}, {"role": "user", "content": first_user}]
         self.turns = []
         self.keep_images = int(keep_images)
-        self.counts = {"frames_dropped": 0, "results_shortened": 0, "replies_shortened": 0, "turns_dropped": 0}
+        if image_mode not in IMAGE_MODES:
+            raise ValueError(f"image_mode must be one of {', '.join(IMAGE_MODES)}")
+        self.image_mode = image_mode
+        self.image_high_water = int(image_high_water)
+        self.mark_prefix = bool(mark_prefix)
+        self.counts = {"frames_dropped": 0, "results_shortened": 0, "replies_shortened": 0, "turns_dropped": 0,
+                       "image_epochs": 0}
 
     def add_turn(self, messages):
         self.turns.append(list(messages))
@@ -379,16 +395,40 @@ class History:
         self.counts["frames_dropped"] += dropped
         return dropped
 
+    def _image_epoch(self, acts):
+        """Append mode's only picture edit: every picture beyond the newest keep_images goes in ONE build, so the
+        request prefix changes once (one cache rewrite) and then stays byte for byte until the next epoch."""
+        dropped = self._drop_images(self.keep_images, [self.prefix] + self.turns)
+        if dropped:
+            self.counts["image_epochs"] += 1
+            acts["image_epochs"] = acts.get("image_epochs", 0) + 1
+        return dropped
+
     def _prefix_messages(self):
-        if not self.counts["turns_dropped"]:
+        """The system text and the first user message. With mark_prefix both are sent as parts and carry a cache
+        mark: one on the system text (the tools and the system text are the same in every episode of an arm, so
+        a later episode can read them) and one on the last part of the first user message's fixed text (every
+        request of this episode can then read the tools, the system text and the first message whatever was
+        edited after them). The dropped-turns note goes after the mark, so the marked bytes never change."""
+        dropped = self.counts["turns_dropped"]
+        if not dropped and not self.mark_prefix:
             return list(self.prefix)
-        note = f"[{self.counts['turns_dropped']} earlier turns dropped to save context]"
+        note = f"[{dropped} earlier turns dropped to save context]" if dropped else None
         first = dict(self.prefix[1])
-        if isinstance(first["content"], list):
+        if self.mark_prefix:
+            parts = list(first["content"]) if isinstance(first["content"], list) \
+                else [{"type": "text", "text": first["content"]}]
+            parts[-1] = dict(parts[-1], cache_control=dict(PREFIX_MARK))
+            first["content"] = parts + ([{"type": "text", "text": note}] if note else [])
+        elif isinstance(first["content"], list):
             first["content"] = first["content"] + [{"type": "text", "text": note}]
         else:
             first["content"] = f"{first['content']}\n\n{note}"
-        return [self.prefix[0], first] + self.prefix[2:]
+        system = self.prefix[0]
+        if self.mark_prefix and isinstance(system["content"], str):   # the tools and this text: every episode's
+            system = dict(system, content=[{"type": "text", "text": system["content"],
+                                            "cache_control": dict(PREFIX_MARK)}])
+        return [system, first] + self.prefix[2:]
 
     def estimate(self, extra_tokens=0):
         msgs = self._prefix_messages() + [m for turn in self.turns for m in turn]
@@ -397,8 +437,15 @@ class History:
     def build(self, limit_tokens, extra_tokens=0):
         """(messages to send, what was trimmed now, estimated tokens). extra_tokens is the estimate for the tool
         definitions sent with the messages."""
-        acts = {"frames_dropped": self._drop_images(self.keep_images, [self.prefix] + self.turns)}
+        acts = {"frames_dropped": 0}
+        if self.image_mode == "swap":
+            acts["frames_dropped"] = self._drop_images(self.keep_images, [self.prefix] + self.turns)
+        elif self.image_high_water > 0 and self.images() > self.image_high_water:
+            acts["frames_dropped"] = self._image_epoch(acts)   # append: one edit for many pictures, not one each
         est = self.estimate(extra_tokens)
+        if self.image_mode == "append" and est > limit_tokens and self.images() > self.keep_images:
+            acts["frames_dropped"] += self._image_epoch(acts)  # the context is tight: pictures go first, at once
+            est = self.estimate(extra_tokens)
         old = self.turns[:-PROTECT_TURNS] if len(self.turns) > PROTECT_TURNS else []
         if est > limit_tokens:
             for turn in old:
