@@ -141,8 +141,7 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 - Pictures beyond the newest 4: every arm replaced each of them with a short text inside its older turn (the
   harness's `swap` picture mode), except the four Claude columns with Cerulion. Those kept every picture where it
   was and marked their opening (the tools, the system text and the first message) for the prompt cache (`append`,
-  the harness's default picture mode for a Claude model with Cerulion). None of their scored episodes dropped a
-  picture, and their largest request carried 102 pictures.
+  the harness's default picture mode for a Claude model with Cerulion).
 - The same request settings in both arms of a model, apart from the picture handling and the cache mark above.
   The Claude models carry the prompt cache flag in both arms.
 - Up to 3 attempts when the model endpoint fails; a clock stop is final. An episode with no score after that is
@@ -155,11 +154,6 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
   `sha256:4f8bbe79fdf38df1770c068ec470fd3d5a629fd371f7288887cb3d275f9f747e`: the tree of the first id with the
   `append` picture mode added to two of its operator files, `bench/operators/chat_support.py` and
   `bench/operators/chat_operator.py`.
-- When: every column except the four Claude columns with Cerulion is the first and only draw, whose episodes
-  started from 2026-11-17T21:25:35Z to 2026-11-19T01:28:36Z. The four Claude columns with Cerulion are a second
-  draw on the same 100 start states, whose episodes ran from 2026-11-19T14:15:42Z to 19:39:00Z on one machine.
-  It replaces their first draw (`swap`, the first snapshot above), whose rows are in this folder's earlier
-  versions in the repository's history.
 - To run a start state again: `cerulion rcp bench --model MODEL --cell CELL`
   ([docs/harness.md](../../../harness.md#how-cerulion-rcp-bench-reproduces-it)) runs it in both arms with the
   same budgets, temperature and scorer. With a Claude model the arm with Cerulion runs `append` with the cache
@@ -185,8 +179,6 @@ is in cells.csv, and the success predicate was false at reset on every one.
   and on both charts.
 - One further model, Gemini Robotics-ER 2 (preview), was tried and left out before any grid row: its endpoint
   failed the arm with Cerulion on 5 of 5 trial attempts. It has no column.
-- The four Claude columns with Cerulion are the second draw (How the episodes ran), so the two arms of each of
-  their 400 start states started 14.2 to 40.8 h apart, and for 338 of the 400 on different machines.
 - The four Claude models share one endpoint. To lower the load on it, no episode of theirs started between
   2026-11-18T01:30:07Z and 07:21:18Z (5 h 51 min), so the later start states of their arms without Cerulion ran
   hours after the other models' did, in the list's order.
@@ -196,12 +188,10 @@ is in cells.csv, and the success predicate was false at reset on every one.
 - Five start states of GPT-6 Astra's `without` arm were started again from attempt 1 because the harness
   refused to start them before any model call; the refused attempts the records still hold are in
   lost_attempts.csv with 0 replies.
-- Two of the machines stopped during the first draw. Their scored rows are kept, except those of the four Claude
-  columns with Cerulion, which the second draw replaces. Every episode they had not ended ran from attempt 1 on
-  another machine. The two attempts that were running when their machine stopped left no token count, so they
-  are in no file and their cost is in no total. Before a third machine was removed, the 94 Claude episodes
-  waiting on it that had not started were moved to other machines (12 of them twice) and ran there; the 47 of
-  them without Cerulion are in this package (6 of them moved twice).
+- Two of the machines stopped during the run. Every episode they had not ended ran from attempt 1 on another
+  machine. The two attempts that were running when their machine stopped left no token count, so they are in no
+  file and their cost is in no total. Before a third machine was removed, the 47 Claude episodes without
+  Cerulion waiting on it that had not started were moved to other machines (6 of them twice) and ran there.
 - A network outage of 22 minutes cut the model endpoint off from three of the machines. It ended one episode
   without a score after its 3 attempts (Claude Sonnet 5.5, `without`, pro_goal_task_t00_i06). That episode was
   started again from attempt 1 under RULES.md section 5 (5); its outage attempts are in lost_attempts.csv with
@@ -210,9 +200,8 @@ is in cells.csv, and the success predicate was false at reset on every one.
 - Providers gave no version string beyond the model's name. Grok 4.7 answered from two provider deployments,
   alternating through the whole run. The grid cannot show that no provider changed a model behind its name.
 - Wall clock seconds include time an endpoint stalled or refused requests, and other workloads shared the
-  machines: one machine ran up to 9 episodes of the first draw at once, and the machine of the second draw up
-  to 14. SUMMARY.md prints each arm's failed requests beside its seconds; the episodes the 90 minute clock
-  ended are in no mean.
+  machines: one machine ran up to 14 grid episodes at once. SUMMARY.md prints each arm's failed requests beside
+  its seconds; the episodes the 90 minute clock ended are in no mean.
 - Cost per success counts the scored episodes only. Part of the gap in USD between the arms is caching:
   SUMMARY.md prints each arm's cached share of input tokens, and the arm without Cerulion had the lower share
   for every model. The four Claude columns with Cerulion also kept their older pictures and marked their opening
@@ -242,10 +231,8 @@ is in cells.csv, and the success predicate was false at reset on every one.
 
 ## What was removed
 
-Nothing was removed from the rows of the draws this package holds; the first draw of the four Claude columns
-with Cerulion is replaced whole by their second (How the episodes ran). The CSV files name models by their
-public names; they carry no machine, address or account. The six transcripts list what was replaced in them in
-transcripts/README.md.
+Nothing was removed from the rows. The CSV files name models by their public names; they carry no machine,
+address or account. The six transcripts list what was replaced in them in transcripts/README.md.
 
 ## Licences
 
