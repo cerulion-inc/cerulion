@@ -281,19 +281,27 @@ clock, `Sync` alignment, FIFO pop counts from the read log, and a
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
 A node that produces a topic a `block` input in its own rank reads can have a
 fire held by that edge's pre-fire check after its trigger drain popped, with no
-record. The FIFO rule allows for it only at a step where the recording cannot
-rule the hold out: where the frames the bag records on the topic, the step's
-own included, outnumber those the consumer's body reads drained before that
-step by at least the input's depth. A slot the bag cannot account for allows
-for no hold: the bag records no frames of the topic or a frame header it
-cannot parse, its record-health stamp is absent or malformed, reports the
-topic lossy or any frame drained and never written, the graph lists the topic
-in `multi_publisher_topics`, or the input is a Sync node's trigger input,
-which its matcher pops outside the node's body. The slot allows for none
-either from the step after a truncated read of the input, from a drain whose
-site the read log does not say, from a consumer fire with no read of the
-input recorded, and on a resumed pass until the consumer first reads its
-queue empty. A consumer's stop releases its slot from the next step on. As
+record. The FIFO rule allows for it only at a step where the recording shows
+the slot full: where the frames the bag records on the topic, the step's own
+included, outnumber those the consumer's body reads drained before that step
+by at least the input's depth. A frame whose stamp several steps share counts
+at the last of them, and a drain at an earlier one is owed against it there.
+A body read that finds the queue empty, or any body read of a
+`consume = latest` input, leaves the slot empty, and inside a stamp several
+steps share it counts none of that stamp's frames. A slot the bag cannot
+account for allows for no hold: the bag records no frames of the topic or a
+frame header it cannot parse, its record-health stamp is absent or malformed,
+keeps no entry for the topic, reports the topic lossy or written by several
+publishers (declared or observed), or any frame drained and never written, the
+graph lists the topic in `multi_publisher_topics`, or the input is a Sync
+node's trigger input, which its matcher pops outside the node's body. From the
+step after a truncated read of the input, a drain whose site the read log does
+not say, or a consumer fire before any read of the input is recorded, the slot
+allows for none; nor on a resumed pass until the consumer first reads its
+queue empty. A consumer's stop releases its slot from the next step on. Not
+supported yet: a `block_timeout_ms` release forgives the slot's frames with no
+record, so after one the rule can excuse a step the live run did not hold,
+until the consumer next reads its queue empty. As
 for a throttle, whose window the rule reads off the recorded clock, a step no
 such check could defer owes every popped frame a fire. Read through one
 subscriber, such a node may leave one popped frame unfired at a step a check
@@ -304,7 +312,7 @@ the next fire serves it. Read through two subscribers (a
 it carries every signal such a step left unfired, up to the scheduler's clamp.
 A bag that does not record how a FIFO input was read judges a `drop_oldest`
 trigger input without allowing for the hold, and a fire-schedule divergence on
-a short step there at which the slot can have been full says so; a `block` or
+a short step there at which the bag shows the slot full says so; a `block` or
 `sample(N)` trigger input is read through two subscribers on any bag, and is
 judged as above.
 A `consume = latest` input read through a second subscriber is also held to the

@@ -54038,8 +54038,8 @@ fn bh_assert_judged(outcome: &ReplayOutcome, label: &str) {
     );
 }
 
-/// Assert the verdict on a bag that carries no record-health stamp, as every
-/// bag this file writes: nothing states that the bag holds every frame of a
+/// Assert the verdict on a bag that carries no record-health stamp: nothing
+/// states that the bag holds every frame of a
 /// slot's topic, so no slot explains a step, and the held node is judged as if
 /// nothing held it. `detail` is the first held step's finding; the replay
 /// plans no refill after a held fire, so the relay's frames diverge where the
@@ -54054,6 +54054,52 @@ fn bh_assert_unaccounted(outcome: &ReplayOutcome, detail: &str, violations: &[&s
     bh_assert_judged(outcome, "a bag with no record-health stamp");
 }
 
+/// The record-health stamp of a bag this file writes from `rec`: every topic
+/// clean, nothing drained and never written. The in-process writer records
+/// every frame the run published, so the stamp states what is true of the bag;
+/// a test that drops a frame on purpose must not use it.
+fn bh_clean_stamp(rec: &Recording) -> RecordHealthReport {
+    let rows: Vec<(&str, u64, u64, bool, bool)> = rec
+        .messages
+        .keys()
+        .map(|topic| (topic.as_str(), 0, 0, false, false))
+        .collect();
+    health_stamp(&rows, 0)
+}
+
+/// A fed `--verify` replay of `bag` under `stamp`.
+fn bh_replay_stamped(
+    bag: &std::path::Path,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+    stamp: RecordHealthReport,
+) -> ReplayOutcome {
+    ri_replay_stamped(
+        bag,
+        make,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        None,
+        stamp,
+        None,
+    )
+    .0
+    .expect("the stamped fed replay runs")
+}
+
+/// Assert a stamped replay reproduced its recording: every frame, every
+/// recorded read, a clean verdict, and every node judged.
+fn bh_assert_replays(outcome: &ReplayOutcome, label: &str) {
+    assert_eq!(bh_violations(outcome), Vec::<String>::new(), "{label}");
+    assert!(
+        outcome.read_log_divergence.is_none(),
+        "{label}: {:?}",
+        outcome.read_log_divergence
+    );
+    assert_clean_verdict(outcome, label);
+    bh_assert_judged(outcome, label);
+}
+
 /// Every `--verify` data violation of `outcome`, as its detail line.
 fn bh_violations(outcome: &ReplayOutcome) -> Vec<String> {
     outcome
@@ -54064,9 +54110,10 @@ fn bh_violations(outcome: &ReplayOutcome) -> Vec<String> {
 }
 
 /// A FIFO relay that a `block` input in its own rank holds, on a bag that
-/// states how each input was read but carries no record-health stamp, as
-/// every bag this file writes: nothing states that the bag holds every frame
-/// of the slot's topic, so no step is excused by the hold. The hold's onset
+/// states how each input was read but carries no record-health stamp:
+/// nothing states that the bag holds every frame of the slot's topic, so no
+/// step is excused by the hold. The other held arms replay the same shapes
+/// under a clean stamp ([`bh_clean_stamp`]). The hold's onset
 /// (step 3: one pop, no fire) is the finding, and the replay plans no refill
 /// after a held fire, so frame 4 serves the oldest frame the relay's queue
 /// kept (`x` 12) where the recording served the frame the hold froze (`x` 5).
@@ -54109,9 +54156,9 @@ fn a_held_relay_on_a_bag_with_no_health_stamp_is_judged_without_the_hold() {
 /// The same recording on a bag that states no per-input stage set: nothing
 /// records whether the relay's `drop_oldest` trigger input was read through
 /// one subscriber or two, so the relay is judged without the hold. The hold's
-/// onset (step 3: one pop, no fire) is the finding. The bag carries no
-/// record-health stamp either, so nothing says its slot can have been full
-/// there, and the finding carries no caveat. The
+/// onset (step 3: one pop, no fire) is the finding, and since its slot was
+/// full there by the clean stamp's record (three frames sent, one taken), the
+/// finding says why the hold was not allowed for. The
 /// replay plans no refill after a held fire either, so from frame 4 on the
 /// replayed relay serves the oldest frame its queue kept where the recording
 /// served the frame its hold froze (frame 4: `x` 5 recorded, 12 replayed), and
@@ -54126,7 +54173,8 @@ fn a_held_relay_on_a_bag_that_does_not_record_its_drain_is_judged_without_the_ho
     let dir = tempfile::tempdir().unwrap();
     let free = dir.path().join("bh_unrecorded.mcap");
     write_bag_with_coordination(&rec, &free, replay_engine::CoordinationMode::FreeRun);
-    let outcome = replay(&free, bh_held_factories, None, None).expect("the free-run replay runs");
+    let outcome = replay_with_health(&free, bh_held_factories, None, bh_clean_stamp(&rec))
+        .expect("the free-run replay runs");
     let divergence = outcome
         .trace_divergence
         .as_ref()
@@ -54134,7 +54182,10 @@ fn a_held_relay_on_a_bag_that_does_not_record_its_drain_is_judged_without_the_ho
     assert_eq!(
         divergence.detail,
         "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 3 \
-         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s); the bag does not \
+         record whether this node's trigger input was read through one subscriber or two, so a \
+         hold by a `block` input in its rank is not allowed for and can read as this divergence; \
+         a recording that states its stage set is judged with the hold"
     );
     assert_eq!(
         bh_violations(&outcome),
@@ -54151,7 +54202,8 @@ fn a_held_relay_on_a_bag_that_does_not_record_its_drain_is_judged_without_the_ho
         outcome.rederivation_notes
     );
     assert!(!outcome.passed);
-    let again = replay(&free, bh_held_factories, None, None).expect("the second replay runs");
+    let again = replay_with_health(&free, bh_held_factories, None, bh_clean_stamp(&rec))
+        .expect("the second replay runs");
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
         serde_json::to_string(&again).unwrap(),
@@ -54210,8 +54262,7 @@ fn a_throttled_fifo_consumer_read_through_two_subscribers_carries_its_count() {
 /// sink drains it. The hand oracle: the relay fires at steps 0 and 1, pops
 /// sequence 2 at step 2 and is held; each step after a sink fire (11, 21,
 /// 31, 41) fires the frozen frame and its refill pops the next (sequences
-/// 3, 11, 21 and 31). The bag carries no record-health stamp, so the replay
-/// is judged without the hold: the onset at step 2 is the finding.
+/// 3, 11, 21 and 31). Stamped clean, the replay reproduces it.
 #[test]
 #[serial]
 fn a_depth_one_block_input_holds_the_relay_after_every_frame() {
@@ -54243,29 +54294,12 @@ fn a_depth_one_block_input_holds_the_relay_after_every_frame() {
     let dir = tempfile::tempdir().unwrap();
     let fed = dir.path().join("bh_depth1.mcap");
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
-    let (outcome, _) = ri_replay(
-        &fed,
-        bh_held_factories,
-        replay_engine::ReplayPurpose::Verify,
-    );
-    let outcome = outcome.expect("the fed replay runs");
-    bh_assert_unaccounted(
-        &outcome,
-        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 2 \
-         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)",
-        &[
-            "/bh/relay/out: frame 3 on '/bh/relay/out' differs at x: recorded 4.0, replayed 12.0 \
-             (recorded 64 B, replayed 64 B)",
-        ],
-    );
-    let (again, _) = ri_replay(
-        &fed,
-        bh_held_factories,
-        replay_engine::ReplayPurpose::Verify,
-    );
+    let outcome = bh_replay_stamped(&fed, bh_held_factories, bh_clean_stamp(&rec));
+    bh_assert_replays(&outcome, "depth-1 block-held relay");
+    let again = bh_replay_stamped(&fed, bh_held_factories, bh_clean_stamp(&rec));
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
-        serde_json::to_string(&again.expect("the second fed replay runs")).unwrap(),
+        serde_json::to_string(&again).unwrap(),
         "two replays of one bag are byte-identical"
     );
 }
@@ -54274,9 +54308,9 @@ fn a_depth_one_block_input_holds_the_relay_after_every_frame() {
 /// is released for the rest of the run. The hand oracle: at step 21 the relay
 /// fires its frozen frame (`x` 5) and then every frame its queue kept
 /// (sequences 11 to 21, `x` 12 to 22) in one burst, and from step 22 on it
-/// fires each frame as it arrives (`x` 23 to 45). The bag carries no
-/// record-health stamp, so the replay is judged without the hold: the onset
-/// at step 3 is the finding.
+/// fires each frame as it arrives (`x` 23 to 45). The held frame and the
+/// burst are one carry the verifier reads clean, and the stamped replay
+/// reproduces both.
 #[test]
 #[serial]
 fn a_held_relay_whose_consumer_stops_fires_its_held_frame_and_its_backlog() {
@@ -54299,30 +54333,12 @@ fn a_held_relay_whose_consumer_stops_fires_its_held_frame_and_its_backlog() {
     let dir = tempfile::tempdir().unwrap();
     let fed = dir.path().join("bh_consumer_stops.mcap");
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
-    let (outcome, _) = ri_replay(
-        &fed,
-        || bh_factories(Some(3.0)),
-        replay_engine::ReplayPurpose::Verify,
-    );
-    let outcome = outcome.expect("the fed replay runs");
-    bh_assert_unaccounted(
-        &outcome,
-        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 3 \
-         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)",
-        &[
-            "/bh/relay/out: recorded 39 frame(s), replay produced 38 on '/bh/relay/out'",
-            "/bh/relay/out: frame 4 on '/bh/relay/out' differs at x: recorded 5.0, replayed 12.0 \
-             (recorded 64 B, replayed 64 B)",
-        ],
-    );
-    let (again, _) = ri_replay(
-        &fed,
-        || bh_factories(Some(3.0)),
-        replay_engine::ReplayPurpose::Verify,
-    );
+    let outcome = bh_replay_stamped(&fed, || bh_factories(Some(3.0)), bh_clean_stamp(&rec));
+    bh_assert_replays(&outcome, "held relay, consumer stopped");
+    let again = bh_replay_stamped(&fed, || bh_factories(Some(3.0)), bh_clean_stamp(&rec));
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
-        serde_json::to_string(&again.expect("the second fed replay runs")).unwrap(),
+        serde_json::to_string(&again).unwrap(),
         "two replays of one bag are byte-identical"
     );
 }
@@ -54358,9 +54374,9 @@ fn bh_fire_steps(rec: &Recording, node: &str) -> Vec<u64> {
 
 /// The block-held recording split across two worker ranks the way the auto
 /// partition places it, `src` on rank 0 and the held pair on rank 1. Rank 1's
-/// relay is judged on its own rank's records: the bag carries no
-/// record-health stamp, so it is judged without the hold, its onset at step 3
-/// is the finding, and two replays are byte-identical.
+/// relay is judged on its own rank's records, the stamped replay plans the
+/// same refills and reproduces every frame, and two replays are
+/// byte-identical.
 #[test]
 #[serial]
 fn a_held_relay_on_its_own_worker_rank_is_judged_on_that_ranks_records() {
@@ -54368,29 +54384,12 @@ fn a_held_relay_on_its_own_worker_rank_is_judged_on_that_ranks_records() {
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("bh_two_rank.mcap");
     ri_two_rank_bag_labelled(&rec, &bag, |id| id != "src", false);
-    let (a, _) = ri_replay(
-        &bag,
-        bh_held_factories,
-        replay_engine::ReplayPurpose::Verify,
-    );
-    let a = a.expect("the two-rank replay runs");
-    bh_assert_unaccounted(
-        &a,
-        "fire-schedule divergence: rank 1 \u{2014} fire-schedule divergence: node 'relay' step 3 \
-         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)",
-        &[
-            "/bh/relay/out: frame 4 on '/bh/relay/out' differs at x: recorded 5.0, replayed 12.0 \
-             (recorded 64 B, replayed 64 B)",
-        ],
-    );
-    let (b, _) = ri_replay(
-        &bag,
-        bh_held_factories,
-        replay_engine::ReplayPurpose::Verify,
-    );
+    let a = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    bh_assert_replays(&a, "two-rank block-held relay");
+    let b = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
     assert_eq!(
         serde_json::to_string(&a).unwrap(),
-        serde_json::to_string(&b.expect("the second two-rank replay runs")).unwrap(),
+        serde_json::to_string(&b).unwrap(),
         "two replays of one bag are byte-identical"
     );
 }
@@ -54411,8 +54410,9 @@ fn a_held_relay_on_its_own_worker_rank_is_judged_on_that_ranks_records() {
 ///   held frame while its refill pops the next, the oldest its depth-10 queue
 ///   kept (`x` 7, then 14 and 24).
 ///
-/// The bag carries no record-health stamp, so the replay is judged without
-/// either hold: the relay's onset at step 5 is the finding.
+/// Stamped clean, the replay reproduces all three topics, and every node is
+/// judged and reads clean, `mid`'s count on two subscribers included: the
+/// verdict holds no finding for any node, not only none first.
 #[test]
 #[serial]
 fn the_middle_of_two_block_holds_carries_its_count() {
@@ -54448,19 +54448,12 @@ fn the_middle_of_two_block_holds_carries_its_count() {
     let dir = tempfile::tempdir().unwrap();
     let fed = dir.path().join("bh_chain.mcap");
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
-    let (outcome, _) = ri_replay(&fed, make, replay_engine::ReplayPurpose::Verify);
-    let outcome = outcome.expect("the fed replay runs");
-    bh_assert_unaccounted(
-        &outcome,
-        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 5 \
-         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)",
-        &["/bhm/relay/out: frame 6 on '/bhm/relay/out' differs at x: recorded 7.0, replayed 14.0 \
-             (recorded 64 B, replayed 64 B)"],
-    );
-    let (again, _) = ri_replay(&fed, make, replay_engine::ReplayPurpose::Verify);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    bh_assert_replays(&outcome, "two block holds");
+    let again = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
-        serde_json::to_string(&again.expect("the second fed replay runs")).unwrap(),
+        serde_json::to_string(&again).unwrap(),
         "two replays of one bag are byte-identical"
     );
 }
@@ -54482,9 +54475,9 @@ fn the_middle_of_two_block_holds_carries_its_count() {
 ///   25 a refill pops the oldest it kept: sequences 15, 19, 25 and 29 (`x`
 ///   16, 20, 26 and 30).
 ///
-/// The bag carries no record-health stamp, so the replay is judged without
-/// the hold: the onset at step 3 is the finding, and two replays are
-/// byte-identical.
+/// The replay plans a refill after each of those fires, so the stamped
+/// replay reproduces the relay's frames, every release reads clean, and two
+/// replays are byte-identical.
 #[test]
 #[serial]
 fn a_held_relay_its_consumer_releases_on_a_timeout() {
@@ -54510,39 +54503,21 @@ fn a_held_relay_its_consumer_releases_on_a_timeout() {
     let dir = tempfile::tempdir().unwrap();
     let fed = dir.path().join("bh_timeout.mcap");
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
-    let (outcome, _) = ri_replay(
-        &fed,
-        bh_held_factories,
-        replay_engine::ReplayPurpose::Verify,
-    );
-    let outcome = outcome.expect("the fed replay runs");
-    bh_assert_unaccounted(
-        &outcome,
-        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 3 \
-         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)",
-        &[
-            "/bh/relay/out: frame 5 on '/bh/relay/out' differs at x: recorded 6.0, replayed 7.0 \
-             (recorded 64 B, replayed 64 B)",
-        ],
-    );
-    let (again, _) = ri_replay(
-        &fed,
-        bh_held_factories,
-        replay_engine::ReplayPurpose::Verify,
-    );
+    let outcome = bh_replay_stamped(&fed, bh_held_factories, bh_clean_stamp(&rec));
+    bh_assert_replays(&outcome, "held relay released on a timeout");
+    let again = bh_replay_stamped(&fed, bh_held_factories, bh_clean_stamp(&rec));
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
-        serde_json::to_string(&again.expect("the second fed replay runs")).unwrap(),
+        serde_json::to_string(&again).unwrap(),
         "two replays of one bag are byte-identical"
     );
 }
 
-/// The fed block-held bag with the relay's step 1 fire taken out, its frame
-/// still recorded: the step's pop left unfired is the finding, with no
-/// caveat, since the bag states the relay's drain. The bag carries no
-/// record-health stamp, so no slot excuses the step; the slot bound alone
-/// would not either (two frames sent by step 1 and one taken), which the
-/// re-derivation's vectors pin.
+/// The fed block-held bag with the relay's step 1 fire record taken out, its
+/// frame still recorded, so the clean stamp still states the bag's frames:
+/// two frames sent by step 1 and one taken leave the sink's slot below its
+/// depth of 2, so no hold explains the step's pop left unfired, and it is the
+/// finding, with no caveat, since the bag states the relay's drain.
 #[test]
 #[serial]
 fn a_held_relay_step_with_a_dropped_fire_is_the_finding() {
@@ -54557,12 +54532,7 @@ fn a_held_relay_step_with_a_dropped_fire_is_the_finding() {
     let dir = tempfile::tempdir().unwrap();
     let fed = dir.path().join("bh_dropped_fire.mcap");
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
-    let (outcome, _) = ri_replay(
-        &fed,
-        bh_held_factories,
-        replay_engine::ReplayPurpose::Verify,
-    );
-    let outcome = outcome.expect("the fed replay runs");
+    let outcome = bh_replay_stamped(&fed, bh_held_factories, bh_clean_stamp(&rec));
     let divergence = outcome
         .trace_divergence
         .as_ref()

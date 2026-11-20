@@ -10867,7 +10867,7 @@ fn derive_trailing_refills(
     rank: u32,
     verification: &PassVerification,
     runtime: &GraphRuntime,
-    resumed: bool,
+    start: replay_rederive::PassStart,
     stops: &replay_rederive::PassStops,
 ) -> Result<BTreeMap<u64, Vec<String>>, ReplayError> {
     let mut out = BTreeMap::new();
@@ -10916,7 +10916,7 @@ fn derive_trailing_refills(
             boundary.target_ns,
             next_clock_ns,
             trust,
-            resumed,
+            start,
             stops,
             &|node: &str| runtime.has_trigger_refill(node),
             &mut carries,
@@ -10932,7 +10932,7 @@ fn derive_trailing_refills(
 /// REFILL (`replay_rederive::fifo_step_carry`): the read log holds one pop more
 /// than fires, the burst fired at least once, and the cap or a pre-fire check
 /// that could defer the node at this step (its throttle window, or a `block`
-/// slot that can have been full: `replay_rederive::FifoDeferral`) left the
+/// slot full by the bag's own record: `replay_rederive::FifoDeferral`) left the
 /// last popped frame unfired for the next step's first fire. Derived only
 /// from the recording, on the ONE carry walk the verdict takes
 /// (`replay_rederive::FifoCarry`), which `carries` threads across steps; the
@@ -10962,7 +10962,7 @@ fn fifo_trailing_refills(
     clock_ns: u64,
     next_clock_ns: Option<u64>,
     trust: replay_rederive::RoleTrust,
-    resumed: bool,
+    start: replay_rederive::PassStart,
     stops: &replay_rederive::PassStops,
     has_refill: &dyn Fn(&str) -> bool,
     carries: &mut std::collections::HashMap<String, replay_rederive::FifoCarry>,
@@ -11001,7 +11001,7 @@ fn fifo_trailing_refills(
         }
         let carry = carries
             .entry(decl.node_id.clone())
-            .or_insert_with(|| replay_rederive::FifoCarry::new(decl, *drain, resumed, stops));
+            .or_insert_with(|| replay_rederive::FifoCarry::new(decl, *drain, start, stops));
         let Ok(popped) =
             replay_rederive::fifo_step_pops(&decl.node_id, trigger_inputs, reads, trust)
         else {
@@ -13124,20 +13124,21 @@ fn slot_record(
 }
 
 /// PURE: does the bag state that it recorded every frame of `topic`? Only a
-/// present record-health stamp says so: it reports the topic clean and no
-/// frame drained and never written anywhere in the bag (that count is
-/// bag-wide). An absent or malformed stamp says nothing, and a topic the graph
-/// lists in `multi_publisher_topics` (`listed`) has writers whose loss the
-/// stamp cannot know.
+/// present record-health stamp says so: no frame drained and never written
+/// anywhere in the bag (that count is bag-wide), and the topic's own entry
+/// read clean the way `cerulion bag info` reads it
+/// ([`crate::bag_cmd::classify_loss`]): measured, with no loss, no second
+/// writer declared or observed, and no baseline reset. A topic the stamp keeps
+/// no entry for, an absent or malformed stamp, and a topic the graph lists in
+/// `multi_publisher_topics` (`listed`), whose writers' loss the stamp cannot
+/// know, all say nothing.
 fn topic_recorded_whole(report: &RecordHealthReport, topic: &str, listed: bool) -> bool {
     match report {
         RecordHealthReport::Present(health) => {
             !listed
                 && health.dropped_unwritten == 0
-                && matches!(
-                    classify_topic_health(report, topic),
-                    TopicHealthClass::Clean
-                )
+                && crate::bag_cmd::classify_loss(health.topics.get(topic))
+                    == crate::bag_cmd::LossReading::Clean
         }
         RecordHealthReport::Absent | RecordHealthReport::Malformed => false,
     }
@@ -15166,11 +15167,7 @@ fn prepare_pass_verification(
     let mut block_holds = local_block_holds(&hold_flows, &|topic, consumer, input| {
         slot_record(
             hold_stamps.get(topic).and_then(Option::as_ref),
-            topic_recorded_whole(
-                record_health,
-                topic,
-                config.multi_publisher_topics.iter().any(|t| t == topic),
-            ),
+            topic_recorded_whole(record_health, topic, config.is_multi_publisher(topic)),
             node_infos
                 .get(consumer)
                 .and_then(|info| consumer_body_drain(info, input)),
@@ -16304,7 +16301,11 @@ fn run_rank_pass(
             plan.rank(),
             &verification,
             runtime,
-            resume.is_some(),
+            resume.map_or(replay_rederive::PassStart::FromStart, |r| {
+                replay_rederive::PassStart::Resumed {
+                    anchor_prev_target_ns: r.anchor_prev_target,
+                }
+            }),
             &rederive_stops,
         )?
     };
@@ -17203,6 +17204,7 @@ fn run_rank_pass(
                         &r.sync_input_timestamps,
                     ))
                     .with_stops_stated(r.stops.stated())
+                    .with_anchor_prev_target(r.anchor_prev_target)
                 }),
                 &rederive_stops,
             );
@@ -39492,13 +39494,15 @@ mod trigger_input_capacity_tests {
     }
 
     /// Only a present record-health stamp says a topic's frames are whole: it
-    /// reports the topic clean and no frame drained and never written anywhere
-    /// in the bag, and the graph does not list the topic in
-    /// `multi_publisher_topics`. An absent or malformed stamp says nothing.
+    /// keeps an entry for the topic that reads clean (no frame lost, one
+    /// publisher declared and observed), no frame is drained and never
+    /// written anywhere in the bag, and the graph does not list the topic in
+    /// `multi_publisher_topics`. A topic the stamp keeps no entry for, or an
+    /// absent or malformed stamp, says nothing.
     #[test]
     fn only_a_present_clean_stamp_says_a_topics_frames_are_whole() {
-        // The stamp as a recorder serializes it, every field the document
-        // carries for a topic present.
+        // A stamp in the recorder's JSON shape, hand-written; the fields it
+        // leaves out take their serde defaults.
         let health = |dropped_unwritten: u64, topics: &[(&str, u64, bool)]| {
             let topics: Vec<String> = topics
                 .iter()
@@ -39521,8 +39525,20 @@ mod trigger_input_capacity_tests {
         let clean = health(0, &[("/t", 0, false)]);
         assert!(topic_recorded_whole(&clean, "/t", false));
         assert!(
-            topic_recorded_whole(&clean, "/unstamped", false),
-            "a topic the stamp does not list lost nothing"
+            !topic_recorded_whole(&clean, "/unstamped", false),
+            "a topic the stamp keeps no record of"
+        );
+        let observed = RecordHealthReport::Present(
+            serde_json::from_str(
+                "{\"version\":2,\"dropped_unwritten\":0,\"topics\":{\"/t\":{\"frames_recorded\":3,\
+                 \"frames_lost\":0,\"gap_events\":0,\"multi_publisher\":false,\"sequence_anomaly\":false,\
+                 \"gap_detection_disabled_reason\":\"observed_multi_publisher\"}}}",
+            )
+            .expect("a recorder's stamp shape"),
+        );
+        assert!(
+            !topic_recorded_whole(&observed, "/t", false),
+            "a second writer observed at record time"
         );
         assert!(!topic_recorded_whole(&clean, "/t", true), "a listed topic");
         assert!(
@@ -39553,7 +39569,7 @@ mod trigger_input_capacity_tests {
     /// trigger input drains one frame per body read, and every other input
     /// drains to its newest frame.
     #[test]
-    fn only_a_sync_trigger_input_is_drained_outside_the_body() {
+    fn a_sync_trigger_input_drains_outside_the_body_and_a_fifo_trigger_one_frame_a_read() {
         use cerulion_core::graph::node::{
             BackpressurePolicy, InputConsume, InputMeta, MacroPolicy, NodeInfo,
         };
@@ -39920,7 +39936,13 @@ mod trailing_refill_tests {
                     at,
                     next_clock_ns,
                     trust,
-                    resumed,
+                    if resumed {
+                        replay_rederive::PassStart::Resumed {
+                            anchor_prev_target_ns: None,
+                        }
+                    } else {
+                        replay_rederive::PassStart::FromStart
+                    },
                     &replay_rederive::PassStops::none(),
                     &|_: &str| has_refill,
                     &mut carries,
