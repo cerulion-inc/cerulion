@@ -2,15 +2,15 @@
 # ci_queue_watchdog.sh: cancel a merge-queue run of ci.yml at its first failed
 # required job, or once its batch has left the queue without merging.
 #
-#   tools/scripts/ci_queue_watchdog.sh <required-contexts-file>
+#   tools/scripts/ci_queue_watchdog.sh <required-contexts-file> <required-parts-file>
 #
 # Runs in `queue-watchdog.yml`, on the same merge-queue event as the `ci.yml`
 # run it watches. It finds that run as the one run of WORKFLOW with event
 # `merge_group` and head commit WATCH_SHA, then every POLL_SECONDS reads the
 # newest attempt's jobs of that run:
 #
-#   a job whose name is a required context ended failure, timed_out or
-#   cancelled                               cancel the run, name the job, exit 0
+#   a job whose name is a required context, or a part of one, ended
+#   failure, timed_out or cancelled         cancel the run, name the job, exit 0
 #   a job is still queued or running        read again
 #   no job is listed, or every one has completed
 #                                           read the run itself: completed,
@@ -58,14 +58,29 @@
 # there cancels nothing through the jobs read; it takes the batch out of the
 # queue, and the dead batch check cancels the run two polls later.
 #
+# THE PARTS. A required context reported by an aggregate job (`Lint`) ends only
+# once every job it needs has ended, and it fails unless every one of them
+# succeeded. The rows of <required-parts-file> (tools/ci/required_parts.txt)
+# are `<part job name>|<required context>`, `#` lines and empty lines skipped,
+# and a part that ended failure, timed_out or cancelled cancels the run as its
+# context would, up to minutes before the aggregate reports. A cancelled part is read
+# the same way. A cancel that is taken ends the watch, so the cancelled jobs it
+# makes are never read as a reason to ask again, and a run that finished
+# cancelling meanwhile is read after the first refused request and asked no
+# more.
+#
 # REFUSALS, exit 2 with one message each: a wrong argument count; an unreadable
-# file or one naming no context; `jq` absent; no repository, commit or base
-# branch named; a run that does not appear, or more than one run for the
-# commit; a jobs, run or run listing read that fails three times. A cancel
-# request refused three times while the run still reads as not completed exits
-# 1; refused because the run had completed meanwhile, it exits 0. Nothing is
-# cancelled on any refusal, and the workflow reports no required context, so
-# none of them can block the batch.
+# file, a contexts file naming no context or a parts file naming no part; a
+# part row that is not `<name>|<context>`, a part listed twice, a part that is
+# itself a required context, or a part of a context the contexts file does not
+# name; `jq` absent; no repository, commit or base branch named; a run that
+# does not appear, or more than one run for the commit; a jobs read, a run
+# read once no job runs, or a run listing read that fails three times. A
+# refused cancel request is followed by a read of the run: completed
+# meanwhile, the watch exits 0 with no second request; after the third
+# refusal with the run not read as completed, or not read at all, it exits 1
+# naming the refusal. Nothing is cancelled on any refusal, and the workflow
+# reports no required context, so none of them can block the batch.
 #
 # ENVIRONMENT. `GH_TOKEN` is read by `gh` itself; `GITHUB_REPOSITORY` (or
 # `GH_REPO`) names the repository, WATCH_SHA the queue commit and
@@ -94,10 +109,47 @@ say() {
     printf 'ci_queue_watchdog: %s\n' "$1"
 }
 
-[ "$#" -eq 1 ] || die 'usage: ci_queue_watchdog.sh <required-contexts-file>' 2
+[ "$#" -eq 2 ] || die 'usage: ci_queue_watchdog.sh <required-contexts-file> <required-parts-file>' 2
 [ -r "$1" ] || die "the required contexts file cannot be read: $1" 2
 required=$(grep -v '^#' "$1" | grep . || true)
 [ -n "$required" ] || die "the required contexts file names no context: $1" 2
+[ -r "$2" ] || die "the required parts file cannot be read: $2" 2
+parts=$(grep -v '^#' "$2" | grep . || true)
+[ -n "$parts" ] || die "the required parts file names no part: $2" 2
+# Whether one parts row is `<part job name>|<required context>`: exactly one
+# `|`, a name on each side, and no blank at either end of a name, since a name
+# with one is a name no job carries.
+part_row_ok() {
+    local part context
+    case $1 in
+        *'|'*) ;;
+        *) return 1 ;;
+    esac
+    part=${1%%|*}
+    context=${1#*|}
+    case $context in
+        *'|'*) return 1 ;;
+    esac
+    [ -n "$part" ] && [ -n "$context" ] || return 1
+    case $part in
+        [[:space:]]* | *[[:space:]]) return 1 ;;
+    esac
+    case $context in
+        [[:space:]]* | *[[:space:]]) return 1 ;;
+    esac
+}
+seen_parts=
+while IFS= read -r row; do
+    part_row_ok "$row" || die "the required parts file row '${row}' is not <part job name>|<required context>: $2" 2
+    part=${row%%|*}
+    context=${row#*|}
+    ! grep -Fxq -- "$part" <<< "$seen_parts" || die "the required parts file lists the part '${part}' twice: $2" 2
+    ! grep -Fxq -- "$part" <<< "$required" ||
+        die "the part '${part}' is itself a required context, so it cannot be a part of '${context}': $2" 2
+    grep -Fxq -- "$context" <<< "$required" ||
+        die "the part '${part}' belongs to '${context}', which the required contexts file does not name: $2" 2
+    seen_parts="${seen_parts}${part}"$'\n'
+done <<< "$parts"
 repository=${GITHUB_REPOSITORY:-${GH_REPO:-}}
 [ -n "$repository" ] || die 'GITHUB_REPOSITORY and GH_REPO are both empty: the run names no repository' 2
 sha=${WATCH_SHA:-}
@@ -169,30 +221,49 @@ run_state() {
 }
 
 # Cancels the run and exits: 0 once the cancel is taken, or when it was refused
-# because the run had completed; 1 when it is refused while the run runs.
+# because the run had completed; 1 when it is refused three times while the run
+# does not read as completed. Each refusal is followed by a read of the run
+# (three tries, as every read), so a run that completed meanwhile is asked no
+# more; a run that cannot be read is said, and the cancel is asked again.
 cancel_run() {
-    local refusal state
-    if api_try -X POST "repos/${repository}/actions/runs/${run_id}/cancel" > /dev/null; then
-        exit 0
-    fi
-    refusal=$(tr '\n' ' ' < "$err_file")
-    state=$(run_state)
-    if [ "${state%% *}" = completed ]; then
-        say "the run completed (${state#* }) before the cancel reached it; nothing to cancel"
-        exit 0
-    fi
-    die "the cancel request was refused: ${refusal}" 1
+    local refusal json state attempt=1
+    while :; do
+        if gh api -X POST "repos/${repository}/actions/runs/${run_id}/cancel" > /dev/null 2> "$err_file"; then
+            exit 0
+        fi
+        refusal=$(tr '\n' ' ' < "$err_file")
+        if json=$(api_try "repos/${repository}/actions/runs/${run_id}"); then
+            state=$(jq -r '"\(.status) \(.conclusion // "none")"' <<< "$json" 2> /dev/null) || {
+                say "the run read after a refused cancel is not JSON; the cancel is asked again"
+                state='unread none'
+            }
+            if [ "${state%% *}" = completed ]; then
+                say "the run completed (${state#* }) before the cancel reached it; nothing to cancel"
+                exit 0
+            fi
+        else
+            say "the run read after a refused cancel failed three times: $(tr '\n' ' ' < "$err_file")"
+        fi
+        [ "$attempt" -lt 3 ] || die "the cancel request was refused: ${refusal}" 1
+        attempt=$((attempt + 1))
+        sleep 10
+    done
 }
 
-# One line: `cancel<TAB><job><TAB><conclusion>`, `running` or `settled`. A job
-# that has not been queued yet is not listed; it is read once it is.
+# One line: `cancel<TAB><job><TAB><conclusion>[<TAB><context>]`, `running` or
+# `settled`; the context is there when the job is a part of one. A job that has
+# not been queued yet is not listed; it is read once it is.
 # shellcheck disable=SC2016  # a jq program, not a shell expansion
 decide='
 ($req | split("\n") | map(select(length > 0))) as $r
+| ($parts | split("\n") | map(select(length > 0) | split("|") | {key: .[0], value: .[1]})
+   | from_entries) as $p
 | [.jobs[]
-   | select((.name | IN($r[])) and (.conclusion | IN("failure", "timed_out", "cancelled")))
+   | select(((.name | IN($r[])) or ($p[.name // ""] != null))
+            and (.conclusion | IN("failure", "timed_out", "cancelled")))
   ] as $bad
-| if ($bad | length) > 0 then "cancel\t\($bad[0].name)\t\($bad[0].conclusion)"
+| if ($bad | length) > 0
+    then "cancel\t\($bad[0].name)\t\($bad[0].conclusion)" + (if $p[$bad[0].name // ""] != null then "\t\($p[$bad[0].name])" else "" end)
   elif any(.jobs[]; .status != "completed") then "running"
   else "settled"
   end'
@@ -316,11 +387,15 @@ while :; do
     if [ "$total" -gt "$MAX_JOBS" ]; then
         say "the run has ${total} jobs; only the first ${MAX_JOBS} are read"
     fi
-    decision=$(jq -r --arg req "$required" "$decide" <<< "$page")
+    decision=$(jq -r --arg req "$required" --arg parts "$parts" "$decide" <<< "$page")
     case $decision in
         cancel*)
-            IFS=$'\t' read -r _ job conclusion <<< "$decision"
-            say "required job \"${job}\" ended ${conclusion}; cancelling run ${run_id}"
+            IFS=$'\t' read -r _ job conclusion context <<< "$decision"
+            if [ -n "$context" ]; then
+                say "job \"${job}\", a part of required \"${context}\", ended ${conclusion}; cancelling run ${run_id}"
+            else
+                say "required job \"${job}\" ended ${conclusion}; cancelling run ${run_id}"
+            fi
             cancel_run
             ;;
         settled)

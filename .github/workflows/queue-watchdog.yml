@@ -12,10 +12,12 @@ name: Queue run watchdog
 # it): that run fails nothing and holds the same minutes to its end.
 # `tools/scripts/ci_queue_watchdog.sh` finds the `ci.yml` run of this event's
 # queue commit and once a minute reads its jobs against
-# `tools/ci/required_contexts.txt` and the merge queue of the base branch. It
-# cancels the run at the first failed required job, or when the commit is no
-# entry's head commit and not in the base branch on two polls in a row, and
-# stops once the run has completed; the `lint-gates` job runs its oracle.
+# `tools/ci/required_contexts.txt`, `tools/ci/required_parts.txt` and the merge
+# queue of the base branch. It cancels the run at the first failed required
+# job or failed part of one (a `Lint (...)` job fails `Lint` up to minutes
+# before `Lint` reports), or when the commit is no entry's head commit and not
+# in the base branch on two polls in a row, and stops once the run has
+# completed; the `lint-gates` job runs its oracle.
 #
 # A file of its own, not a job of `ci.yml`: no job there takes `actions: write`
 # except to prune its cache, and this one needs it to cancel. It reports no
@@ -51,4 +53,4 @@ jobs:
           GH_REPO: ${{ github.repository }}
           WATCH_SHA: ${{ github.event.merge_group.head_sha }}
           WATCH_BASE_REF: ${{ github.event.merge_group.base_ref }}
-        run: tools/scripts/ci_queue_watchdog.sh tools/ci/required_contexts.txt
+        run: tools/scripts/ci_queue_watchdog.sh tools/ci/required_contexts.txt tools/ci/required_parts.txt
