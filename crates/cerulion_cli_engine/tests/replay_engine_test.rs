@@ -53985,8 +53985,9 @@ fn bh_relay_trace(rec: &Recording) -> (Vec<u64>, Vec<(u64, u64)>) {
 ///   sequence 4, which the hold freezes;
 /// * step 20, 30, 40: the sink drains one frame; steps 21, 31, 41: the relay
 ///   fires the frozen frame and its refill pops the oldest frame its depth-11
-///   queue kept (sequences 11, 21 and 31: twenty frames arrive between two
-///   relay fires, and the queue keeps the newest eleven).
+///   queue kept (sequences 11, 21 and 31: ten frames arrive between two relay
+///   fires on top of those still queued, and the queue keeps the newest
+///   eleven).
 fn bh_reference() -> Recording {
     let rec = record_uniform_with_read_log(
         &bh_yaml("slow_block_sink_node", ""),
@@ -54021,6 +54022,20 @@ fn bh_reference() -> Recording {
         "the relay pops sequence 3 at step 3 and fires nothing: the hold engaged"
     );
     rec
+}
+
+/// Assert the fire re-derivation stood no node down on `outcome`: every rule
+/// judged every node.
+fn bh_assert_judged(outcome: &ReplayOutcome, label: &str) {
+    let stood_down: Vec<_> = outcome
+        .rederivation_notes
+        .iter()
+        .filter(|n| n.kind == replay_engine::RederivationNoteKind::StandDown)
+        .collect();
+    assert!(
+        stood_down.is_empty(),
+        "{label}: the verifier judged every node: {stood_down:?}"
+    );
 }
 
 /// Every `--verify` data violation of `outcome`, as its detail line.
@@ -54063,15 +54078,7 @@ fn a_fifo_relay_a_block_input_in_its_rank_holds_replays_frame_for_frame() {
         a.read_log_divergence
     );
     assert_clean_verdict(&a, "block-held relay");
-    let stood_down: Vec<_> = a
-        .rederivation_notes
-        .iter()
-        .filter(|n| n.kind == replay_engine::RederivationNoteKind::StandDown)
-        .collect();
-    assert!(
-        stood_down.is_empty(),
-        "the verifier judged every node: {stood_down:?}"
-    );
+    bh_assert_judged(&a, "block-held relay");
     let (b, _) = ri_replay(
         &fed,
         bh_held_factories,
@@ -54084,11 +54091,11 @@ fn a_fifo_relay_a_block_input_in_its_rank_holds_replays_frame_for_frame() {
     );
 }
 
-/// The same recording on a bag that states no per-input stage set, as an
-/// older recorder wrote it: nothing records whether the relay's trigger input
-/// was read through one subscriber or two, so the relay is judged as it was
-/// before the hold was modelled. The hold's onset (step 3: one pop, no fire)
-/// is the finding, and its detail says why the hold was not allowed for. The
+/// The same recording on a bag that states no per-input stage set: nothing
+/// records whether the relay's `drop_oldest` trigger input was read through
+/// one subscriber or two, so the relay is judged without the hold. The hold's
+/// onset (step 3: one pop, no fire) is the finding, and its detail says why
+/// the hold was not allowed for. The
 /// replay plans no refill after a held fire either, so from frame 4 on the
 /// replayed relay serves the oldest frame its queue kept where the recording
 /// served the frame its hold froze (frame 4: `x` 5 recorded, 12 replayed), and
@@ -54098,7 +54105,7 @@ fn a_fifo_relay_a_block_input_in_its_rank_holds_replays_frame_for_frame() {
 /// byte-identical.
 #[test]
 #[serial]
-fn a_held_relay_on_a_bag_that_does_not_record_its_drain_is_judged_as_before_and_says_why() {
+fn a_held_relay_on_a_bag_that_does_not_record_its_drain_is_judged_without_the_hold_and_says_why() {
     let rec = bh_reference();
     let dir = tempfile::tempdir().unwrap();
     let free = dir.path().join("bh_unrecorded.mcap");
@@ -54177,6 +54184,7 @@ fn a_throttled_fifo_consumer_read_through_two_subscribers_carries_its_count() {
     );
     assert_eq!(bh_violations(&outcome), Vec::<String>::new());
     assert_clean_verdict(&outcome, "throttled two-subscriber consumer");
+    bh_assert_judged(&outcome, "throttled two-subscriber consumer");
     let (again, _) = ri_replay(&fed, make, replay_engine::ReplayPurpose::Verify);
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
@@ -54234,6 +54242,7 @@ fn a_depth_one_block_input_holds_the_relay_after_every_frame_and_replays() {
         outcome.read_log_divergence
     );
     assert_clean_verdict(&outcome, "depth-1 block-held relay");
+    bh_assert_judged(&outcome, "depth-1 block-held relay");
     let (again, _) = ri_replay(
         &fed,
         bh_held_factories,
@@ -54288,6 +54297,7 @@ fn a_held_relay_whose_consumer_stops_fires_its_held_frame_and_its_backlog() {
         outcome.read_log_divergence
     );
     assert_clean_verdict(&outcome, "held relay, consumer stopped");
+    bh_assert_judged(&outcome, "held relay, consumer stopped");
     let (again, _) = ri_replay(
         &fed,
         || bh_factories(Some(3.0)),
@@ -54353,6 +54363,7 @@ fn a_block_held_relay_on_its_own_worker_rank_replays_frame_for_frame() {
         a.read_log_divergence
     );
     assert_clean_verdict(&a, "two-rank block-held relay");
+    bh_assert_judged(&a, "two-rank block-held relay");
     let (b, _) = ri_replay(
         &bag,
         bh_held_factories,
@@ -54424,6 +54435,13 @@ fn the_middle_of_two_block_holds_carries_its_count_and_replays() {
         outcome.read_log_divergence
     );
     assert_clean_verdict(&outcome, "two block holds");
+    bh_assert_judged(&outcome, "two block holds");
+    let (again, _) = ri_replay(&fed, make, replay_engine::ReplayPurpose::Verify);
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again.expect("the second fed replay runs")).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
 /// The sink's `block` input declares `block_timeout_ms: 20`, so a hold that
@@ -54483,13 +54501,23 @@ fn a_held_relay_its_consumer_releases_on_a_timeout_replays() {
         outcome.read_log_divergence
     );
     assert_clean_verdict(&outcome, "held relay released on a timeout");
+    bh_assert_judged(&outcome, "held relay released on a timeout");
+    let (again, _) = ri_replay(
+        &fed,
+        bh_held_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again.expect("the second fed replay runs")).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
-/// The fed block-held bag with the relay's step 21 fire taken out: at step
-/// 21 the relay serves its held frame and its refill pops the next, so the
-/// step owes two fires and records none. No hold explains a step that fires
-/// nothing below a slot with room, so the step is the finding, with no
-/// caveat: the bag states the relay's drain.
+/// The fed block-held bag with the relay's step 1 fire taken out, its frame
+/// still recorded: two frames sent by step 1 and one taken, so the sink's
+/// slot cannot have been full there, and the step's pop left unfired is the
+/// finding, with no caveat (the bag states the relay's drain).
 #[test]
 #[serial]
 fn a_held_relay_step_with_a_dropped_fire_is_the_finding() {
@@ -54498,8 +54526,8 @@ fn a_held_relay_step_with_a_dropped_fire_is_the_finding() {
     let at = rec
         .trace
         .iter()
-        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == 21)
-        .expect("the relay fires at step 21");
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == 1)
+        .expect("the relay fires at step 1");
     rec.trace.remove(at);
     let dir = tempfile::tempdir().unwrap();
     let fed = dir.path().join("bh_dropped_fire.mcap");
@@ -54516,8 +54544,8 @@ fn a_held_relay_step_with_a_dropped_fire_is_the_finding() {
         .expect("the dropped fire is a finding");
     assert_eq!(
         divergence.detail,
-        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 21 \
-         FIFO pop count \u{2014} re-derived 2 fire(s), recorded 0 fire(s)"
+        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 1 \
+         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
     );
     assert!(!outcome.passed);
 }

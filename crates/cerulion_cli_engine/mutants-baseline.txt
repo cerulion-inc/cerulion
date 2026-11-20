@@ -130,16 +130,20 @@
 # changed. In src/replay_rederive.rs: the edges that can hold a node
 # (`BlockHoldEdges`), the counted carry, the supply and the carry dispatcher
 # (`fifo_step_backlog`, `fifo_supply`, `fifo_carry_out`), the deferral
-# predicate and the per-step walk that feeds it (`fifo_carry_deferrable`,
-# `FifoDeferral`), the carry walk the verdict and the refill plan share
-# (`FifoCarry`), the caveat a finding on a node whose drain the bag does not
-# record carries and its text (`FindingCaveat`, `ScheduleFinding`), the rules
-# that read them (`verify_fifo`, `verify_latest`) and the pass entry that
-# hands a node its drain (`verify`). In src/replay_engine.rs: the trailing
-# refill plan (`fifo_trailing_refills`) and the drain a FIFO input's
+# predicate and the per-step walk that feeds it, with the slot bound it folds
+# (`fifo_carry_deferrable`, `FifoDeferral`, `SlotBound`,
+# `most_frames_at_one_stamp`), the carry walk the verdict and the refill plan
+# share (`FifoCarry`), the caveat a finding on a node whose drain the bag does
+# not record carries and its text (`FindingCaveat`, `ScheduleFinding`), the
+# rules that read them (`verify_fifo`, `verify_latest`) and the pass entry
+# that hands a node its drain (`verify`). In src/replay_engine.rs: the
+# trailing refill plan (`fifo_trailing_refills`), the drain a FIFO input's
 # recording or declaration settles (`node_trigger_decl`,
-# `declared_latest_drain`, `never_unifies`). The rank's topology read
-# (`local_block_holds`) and the walk of the trace that drives the refill plan
+# `declared_latest_drain`, `never_unifies`), and the edges that can hold a
+# node with what the bag records of each slot (`local_block_holds`,
+# `slot_record`, `consumer_drains_at_body`). The rank's topology read
+# (`block_hold_flows`), the walk of the bag's frames (`recorded_frame_stamps`)
+# and the walk of the trace that drives the refill plan
 # (`derive_trailing_refills`) read the bag or build a graph, which the
 # mutation rule does not cover.
 #
@@ -147,22 +151,11 @@
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --in-diff <the change's diff of the two files> \
-#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies' \
+#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|SlotBound::|most_frames_at_one_stamp|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|slot_record|consumer_drains_at_body' \
 #            --cap-lints true --in-place --timeout 600 \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (in 4 shards; the unmutated baseline passed)
-# Result:  79 mutants: 72 caught, 5 unviable, 2 missed, both killed since:
-#          `<` replaced with `<=` in `verify_fifo`'s caveat gate, which no
-#          test could catch: a step that fired as many times as it owed
-#          agrees and never reaches the gate. The gate now asks whether the
-#          subtraction has an answer (`checked_sub`). And `FifoCarry::skip`
-#          replaced with `()`: no vector walked the refill plan over a step
-#          whose pops cannot be counted; one now does, on a slot whose bound
-#          needs that step's send. Re-run with
-#          `--re 'verify_fifo|FifoCarry::skip'`: 9 mutants, 9 caught. The 5
-#          unviable replace `node_trigger_decl`, `declared_latest_drain`,
-#          `BlockHoldEdges::none`, `BlockHoldEdges::edges` and
-#          `FifoCarry::step` with a default their types do not have.
+# Result:  PENDING
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

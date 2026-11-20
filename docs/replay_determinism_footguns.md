@@ -281,20 +281,27 @@ clock, `Sync` alignment, FIFO pop counts from the read log, and a
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
 A node that produces a topic a `block` input in its own rank reads can have a
 fire held by that edge's pre-fire check after its trigger drain popped, with no
-record. The FIFO rule allows for it only at a step where the hold was possible:
-where the topic's producers, counting the step's own fires, have sent at least
-the input's depth more frames than the consumer drained before that step. As
-for a throttle, whose window the rule reads off the recorded clock, a step no
-such check could defer owes every popped frame a fire. Read through one
+record. The FIFO rule allows for it only at a step where the recording cannot
+rule the hold out: where the frames the bag records on the topic, the step's
+own included, outnumber those the consumer's body reads drained before that
+step by at least the input's depth. A bag that cannot account for every such
+frame or drain (it records no frames of the topic, its record health reports
+the topic lossy or written by several publishers, the consumer is a Sync
+node, or its read log is truncated or does not say which site drained a
+frame) allows for no hold, and a consumer's stop
+releases its slot from the next step on. As for a throttle, whose window the
+rule reads off the recorded clock, a step no such check could defer owes
+every popped frame a fire. Read through one
 subscriber, such a node may leave one popped frame unfired at a step a check
 could defer, and the replay pops that frame after the step's last fire, as the
 live burst did, so the next fire serves it. Read through two subscribers (a
 `block` or `sample(N)` trigger input, or `CERULION_DRAIN_DISCIPLINE=separate`),
 it carries every signal such a step left unfired, up to the scheduler's clamp.
 A bag that does not record how a FIFO input was read judges a `drop_oldest`
-trigger input as before the hold was allowed for, and a fire-schedule
-divergence on a held node there says so; a `block` or `sample(N)` trigger
-input is read through two subscribers on any bag, and is judged as above.
+trigger input without allowing for the hold, and a fire-schedule divergence on
+a short step there at which the slot can have been full says so; a `block` or
+`sample(N)` trigger input is read through two subscribers on any bag, and is
+judged as above.
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
 node's last fire than that fire's read took, plus two per writer still

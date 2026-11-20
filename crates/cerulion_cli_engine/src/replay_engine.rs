@@ -10868,6 +10868,7 @@ fn derive_trailing_refills(
     verification: &PassVerification,
     runtime: &GraphRuntime,
     resumed: bool,
+    stops: &replay_rederive::PassStops,
 ) -> Result<BTreeMap<u64, Vec<String>>, ReplayError> {
     let mut out = BTreeMap::new();
     let any_fifo = verification.decls.iter().any(|d| {
@@ -10904,6 +10905,7 @@ fn derive_trailing_refills(
             boundary.target_ns,
             trust,
             resumed,
+            stops,
             &|node: &str| runtime.has_trigger_refill(node),
             &mut carries,
         );
@@ -10922,20 +10924,23 @@ fn derive_trailing_refills(
 /// last popped frame unfired for the next step's first fire. Derived only
 /// from the recording, on the ONE carry walk the verdict takes
 /// (`replay_rederive::FifoCarry`), which `carries` threads across steps; the
-/// step's gating clock is `clock_ns`.
+/// step's gating clock is `clock_ns`, and `stops` the stops the pass knows
+/// before it runs (the checkpoint's; a stop the pass makes reaches the
+/// verdict only).
 ///
 /// Only a node read through one subscriber can end on a refill: its burst is
-/// the one that refills before the cap and pre-fire checks. So a node the bag
-/// records as read through two (`FifoDrain::Separate`) plans nothing, a node
-/// with no refill hook in this replay (`has_refill`) plans nothing, and a node
-/// the bag records no drain for (`FifoDrain::Unrecorded`) is planned on the
-/// rule from before the hold was modelled, as it is judged. A node whose reads
+/// the one that refills before the cap and pre-fire checks. So a node read
+/// through two (`FifoDrain::Separate`: the bag states it, or a `block` or
+/// `sample(N)` declaration settles it) plans nothing, a node with no refill
+/// hook in this replay (`has_refill`) plans nothing, and a `drop_oldest` node
+/// on a bag with no stage set (`FifoDrain::Unrecorded`) is planned on the
+/// rule it is judged on, which allows for no hold. A node whose reads
 /// a pop count cannot be taken over (a node a cross-rank `block` edge gates, a
 /// truncated or decimated stream, a declined verification) carries nothing.
 /// A step no carry explains (a stopped node, a fire on a re-offered head that
 /// no pop recorded, a signal clamp) carries nothing and is left to the
 /// re-derivation verdict.
-// Eight parameters, each a distinct role: the step's evidence, the rules'
+// Nine parameters, each a distinct role: the step's evidence, the rules'
 // inputs and the thread of per-node state.
 #[allow(clippy::too_many_arguments)]
 fn fifo_trailing_refills(
@@ -10945,6 +10950,7 @@ fn fifo_trailing_refills(
     clock_ns: u64,
     trust: replay_rederive::RoleTrust,
     resumed: bool,
+    stops: &replay_rederive::PassStops,
     has_refill: &dyn Fn(&str) -> bool,
     carries: &mut std::collections::HashMap<String, replay_rederive::FifoCarry>,
 ) -> Vec<String> {
@@ -10982,16 +10988,16 @@ fn fifo_trailing_refills(
         }
         let carry = carries
             .entry(decl.node_id.clone())
-            .or_insert_with(|| replay_rederive::FifoCarry::new(decl, *drain, resumed));
+            .or_insert_with(|| replay_rederive::FifoCarry::new(decl, *drain, resumed, stops));
         let Ok(popped) =
             replay_rederive::fifo_step_pops(&decl.node_id, trigger_inputs, reads, trust)
         else {
-            carry.skip(clock_ns, &step_fires, reads, trust);
+            carry.skip(step, clock_ns, &step_fires, reads, trust);
             continue;
         };
         let fired = u32::try_from(fires.iter().filter(|f| *f.node_id == *decl.node_id).count())
             .unwrap_or(u32::MAX);
-        let judged = carry.step(popped, fired, clock_ns, &step_fires, reads, trust);
+        let judged = carry.step(popped, fired, step, clock_ns, &step_fires, reads, trust);
         if judged.outcome == Ok(1) && fired > 0 {
             out.push(decl.node_id.clone());
         }
@@ -12988,54 +12994,81 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
     m
 }
 
-/// Per node of the rank, the `block` inputs in the same rank that can hold its
-/// fire, for [`replay_rederive::NodeDecl::may_be_held_by`].
+/// One topic whose `block` consumers hold its producers, as the rank's
+/// runtime wires it: the topic, its producers, and each `block` consumer as
+/// `(node, input, depth)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockHoldFlow {
+    topic: String,
+    producers: Vec<String>,
+    consumers: Vec<(String, String, u64)>,
+}
+
+/// The topics of the rank whose `block` consumers hold their producers.
 ///
 /// The rank's runtime builds a `GraphTopology` from the same subgraph and node
 /// infos, and installs a block pre-fire check on every in-graph producer of a
 /// topic that a `block` input reads, whatever the topic's other consumers
 /// declare (`TopicFlow::holds_its_producers`, the predicate its wiring reads),
 /// with one slot per `block` consumer at that input's depth. This is that set,
-/// read off the same build by the same predicate: per producer, one edge per
-/// `block` consumer of each topic it produces, naming every producer of the
-/// topic with the outputs it writes the topic through ([`producers_by_topic`],
-/// keyed by output name as the runtime's publishers are).
+/// read off the same build by the same predicate.
 ///
 /// # Errors
 ///
 /// [`ReplayError::Internal`] when the topology does not build. The pass's
 /// runtime build calls the same `GraphTopology::build` on the same inputs and
 /// refuses it the same way.
-fn local_block_holds(
+fn block_hold_flows(
     subgraph: &GraphConfig,
     node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
     rank: u32,
-) -> Result<BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>>, ReplayError> {
+) -> Result<Vec<BlockHoldFlow>, ReplayError> {
     let topology = cerulion_core::graph::topology::GraphTopology::build(subgraph, node_infos)
         .map_err(|e| ReplayError::Internal {
             reason: format!(
                 "failed to build rank {rank}'s graph topology for the fire re-derivation: {e}"
             ),
         })?;
-    let outputs = producers_by_topic(subgraph);
+    Ok(topology
+        .topics()
+        .filter(|flow| flow.holds_its_producers())
+        .map(|flow| BlockHoldFlow {
+            topic: flow.topic.clone(),
+            producers: flow.producers.clone(),
+            consumers: flow
+                .consumers
+                .iter()
+                .filter(|c| c.policy == cerulion_core::graph::node::BackpressurePolicy::Block)
+                .map(|c| {
+                    (
+                        c.node_id.clone(),
+                        c.input.clone(),
+                        u64::try_from(c.depth).unwrap_or(u64::MAX),
+                    )
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+/// PURE: per node of the rank, the `block` edges that can hold its fire, for
+/// [`replay_rederive::NodeDecl::may_be_held_by`]: per producer, one edge per
+/// `block` consumer of each topic it produces, each with what the bag records
+/// of its slot (`record_of(topic, consumer, input)`).
+fn local_block_holds(
+    flows: &[BlockHoldFlow],
+    record_of: &dyn Fn(&str, &str, &str) -> replay_rederive::SlotRecord,
+) -> BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> {
     let mut holds: BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> = BTreeMap::new();
-    for flow in topology.topics().filter(|flow| flow.holds_its_producers()) {
-        // One publisher per output name a producer writes the topic through,
-        // the key the runtime opens publishers by.
-        let mut producers: BTreeMap<String, u64> = BTreeMap::new();
-        for (node, _) in outputs.get(&flow.topic).into_iter().flatten() {
-            *producers.entry(node.clone()).or_default() += 1;
-        }
+    for flow in flows {
         let edges: Vec<replay_rederive::BlockHoldEdge> = flow
             .consumers
             .iter()
-            .filter(|c| c.policy == cerulion_core::graph::node::BackpressurePolicy::Block)
-            .map(|c| replay_rederive::BlockHoldEdge {
-                consumer_node: c.node_id.clone(),
-                consumer_input: c.input.clone(),
-                depth: u64::try_from(c.depth).unwrap_or(u64::MAX),
-                producers: producers.clone(),
-                outside_writers_allowed: subgraph.multi_publisher_topics.contains(&flow.topic),
+            .map(|(node, input, depth)| replay_rederive::BlockHoldEdge {
+                consumer_node: node.clone(),
+                consumer_input: input.clone(),
+                depth: *depth,
+                record: record_of(&flow.topic, node, input),
             })
             .collect();
         for producer in &flow.producers {
@@ -13045,7 +13078,87 @@ fn local_block_holds(
                 .extend(edges.iter().cloned());
         }
     }
-    Ok(holds)
+    holds
+}
+
+/// PURE: what the bag records of one `block` slot. Every frame sent to it is
+/// recorded when the bag holds the topic's frames, each with a wire stamp
+/// (`frame_stamps`), and its record health neither reports the topic lossy or
+/// written by several publishers nor reports frames drained and never written
+/// (`unwritten`); the consumer drains it only at its body reads unless the
+/// input is a Sync trigger input (`consumer_drains_at_body`). Anything less
+/// is [`replay_rederive::SlotRecord::Unaccounted`].
+fn slot_record(
+    frame_stamps: Option<&Vec<u64>>,
+    health: &TopicHealthClass,
+    unwritten: u64,
+    consumer_drains_at_body: bool,
+) -> replay_rederive::SlotRecord {
+    let complete = match health {
+        TopicHealthClass::Clean => unwritten == 0,
+        TopicHealthClass::Lossy { .. } | TopicHealthClass::MultiPublisher => false,
+    };
+    match frame_stamps {
+        Some(stamps) if complete && consumer_drains_at_body => {
+            replay_rederive::SlotRecord::Counted {
+                frame_stamps: stamps.clone(),
+            }
+        }
+        Some(_) | None => replay_rederive::SlotRecord::Unaccounted,
+    }
+}
+
+/// Does the consumer drain `input` only at its body reads? A Sync node's
+/// trigger inputs are popped by its matcher, outside the body; every other
+/// input is drained by the body subscriber that carries its `block` probe.
+fn consumer_drains_at_body(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+    use cerulion_core::graph::node::MacroPolicy;
+    let sync_trigger = info
+        .input_meta()
+        .iter()
+        .any(|m| m.name == input && m.trigger);
+    match info.policy() {
+        Some(MacroPolicy::Sync { .. } | MacroPolicy::UnboundedSync) => !sync_trigger,
+        Some(
+            MacroPolicy::Period { .. } | MacroPolicy::External | MacroPolicy::DataTrigger { .. },
+        )
+        | None => true,
+    }
+}
+
+/// The wire stamp of every recorded frame on each of `topics`, ascending, from
+/// one walk of the bag. A topic the bag holds no frames of is absent, and one
+/// with a frame whose header does not parse maps to `None`.
+///
+/// # Errors
+///
+/// A bag the walk cannot read.
+fn recorded_frame_stamps(
+    recorded: &RecordedMessages,
+    topics: &BTreeSet<String>,
+) -> Result<BTreeMap<String, Option<Vec<u64>>>, ReplayError> {
+    let mut stamps: BTreeMap<String, Option<Vec<u64>>> = BTreeMap::new();
+    if topics.is_empty() {
+        return Ok(stamps);
+    }
+    recorded.for_each_frame(&mut |topic, frame| {
+        if !topics.contains(topic) {
+            return;
+        }
+        let at = WireHeader::read_from_buf(frame).map(|h| h.timestamp_ns);
+        let entry = stamps
+            .entry(topic.to_string())
+            .or_insert_with(|| Some(Vec::new()));
+        match (entry.as_mut(), at) {
+            (Some(list), Some(at)) => list.push(at),
+            (Some(_), None) => *entry = None,
+            (None, _) => {}
+        }
+    })?;
+    for list in stamps.values_mut().flatten() {
+        list.sort_unstable();
+    }
+    Ok(stamps)
 }
 
 /// How ONE input's drain consumes its queue.
@@ -14148,6 +14261,8 @@ fn prepare_pass_verification(
     // The graph's `external` (driver) nodes, whose recorded frames an
     // injector counts apart ([`PassVerification::driver_copies`]).
     drivers: &BTreeSet<String>,
+    // The bag's record-health stamp: whether its frames of a topic are whole.
+    record_health: &RecordHealthReport,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -14996,7 +15111,22 @@ fn prepare_pass_verification(
 
     let producers = producers_by_topic(config);
     let local_nodes: BTreeSet<&str> = plan.members().iter().map(String::as_str).collect();
-    let mut block_holds = local_block_holds(plan.subgraph(), node_infos, plan.rank())?;
+    // The `block` slots that can hold a node, each with what the bag records
+    // of it: the frames sent to it, read off the recorded frame stream.
+    let hold_flows = block_hold_flows(plan.subgraph(), node_infos, plan.rank())?;
+    let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
+    let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
+    let unwritten = record_health.dropped_unwritten();
+    let mut block_holds = local_block_holds(&hold_flows, &|topic, consumer, input| {
+        slot_record(
+            hold_stamps.get(topic).and_then(Option::as_ref),
+            &classify_topic_health(record_health, topic),
+            unwritten,
+            node_infos
+                .get(consumer)
+                .is_some_and(|info| consumer_drains_at_body(info, input)),
+        )
+    });
     let decls: Vec<replay_rederive::NodeDecl> = plan
         .members()
         .iter()
@@ -15540,6 +15670,7 @@ fn plan_pass_verification(
         pass.catchup_onset,
         pass.identity,
         pass.driver_nodes,
+        pass.record_health,
     )?;
     Ok(verification)
 }
@@ -16119,7 +16250,14 @@ fn run_rank_pass(
     let trailing_refills = if lockstep {
         BTreeMap::new()
     } else {
-        derive_trailing_refills(&pass, plan.rank(), &verification, runtime, resume.is_some())?
+        derive_trailing_refills(
+            &pass,
+            plan.rank(),
+            &verification,
+            runtime,
+            resume.is_some(),
+            &rederive_stops,
+        )?
     };
     let mut rederive_records = 0usize;
     let mut rederive_over_budget = false;
@@ -39133,19 +39271,21 @@ mod trigger_input_capacity_tests {
         );
     }
 
-    /// The `block` edges that can hold a node are those of every topic it
-    /// produces that a `block` input in the rank reads, whatever the topic's
-    /// other consumers declare: the edges the runtime installs a block
-    /// pre-fire check with. Hand oracle: `p` feeds only a `drop_oldest` input
-    /// (`c.cam`), so nothing holds it; `c` feeds `d`'s `block` input (depth
-    /// 3); `e` feeds `f`'s `block` input beside `g`'s `drop_oldest` one, and
-    /// once `f` reads `drop_oldest` too nothing holds `e`; `h` feeds two
-    /// `block` inputs (`i`, `k`), one edge each; `l` and `m` both write the
-    /// listed `/lb/bus`, `m` through two outputs, and `n` reads it `block`.
+    /// The topics whose `block` consumers hold their producers are every topic
+    /// a `block` input in the rank reads, whatever its other consumers
+    /// declare: the edges the runtime installs a block pre-fire check with.
+    /// Hand oracle: `p` feeds only a `drop_oldest` input (`c.cam`), so nothing
+    /// holds it; `c` feeds `d`'s `block` input (depth 3); `e` feeds `f`'s
+    /// `block` input beside `g`'s `drop_oldest` one, and once `f` reads
+    /// `drop_oldest` too nothing holds `e`; `h` feeds two `block` inputs (`i`
+    /// at depth 2, `k` at 4); `l` and `m` both write the listed `/lb/bus`,
+    /// which `n` reads `block` at depth 5. Each producer gets one edge per
+    /// `block` consumer of each topic it produces, with the slot record the
+    /// bag gives that topic and input.
     #[test]
     fn the_block_edges_that_can_hold_a_node_are_those_of_every_topic_it_produces() {
         use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
-        use replay_rederive::BlockHoldEdge;
+        use replay_rederive::{BlockHoldEdge, SlotRecord};
         let out = "    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
         let bus = |name: &str| {
             format!("      - name: {name}\n        schema: geometry_msgs/Vector3\n        topic: /lb/bus\n")
@@ -39159,7 +39299,7 @@ mod trigger_input_capacity_tests {
              \x20 - id: e\n    type: w\n{out}{f}{g}\
              \x20 - id: h\n    type: w\n{out}{i}{k}\
              \x20 - id: l\n    type: w\n    outputs:\n{l_bus}\
-             \x20 - id: m\n    type: w\n    outputs:\n{m_bus}{m_bus2}{n}",
+             \x20 - id: m\n    type: w\n    outputs:\n{m_bus}{n}",
             c = reads("c", "p/out"),
             d = reads("d", "c/out"),
             f = reads("f", "e/out"),
@@ -39168,7 +39308,6 @@ mod trigger_input_capacity_tests {
             k = reads("k", "h/out"),
             l_bus = bus("bus"),
             m_bus = bus("bus"),
-            m_bus2 = bus("bus2"),
             n = reads("n", "/lb/bus"),
         );
         let config = cerulion_core::graph::parse_graph(&yaml).expect("parses");
@@ -39195,44 +39334,179 @@ mod trigger_input_capacity_tests {
         infos.insert("i".to_string(), input(2, BackpressurePolicy::Block));
         infos.insert("k".to_string(), input(4, BackpressurePolicy::Block));
         infos.insert("n".to_string(), input(5, BackpressurePolicy::Block));
-        let edge = |consumer: &str, depth, producers: &[(&str, u64)], outside_writers_allowed| {
-            BlockHoldEdge {
-                consumer_node: consumer.to_string(),
-                consumer_input: "x".to_string(),
-                depth,
-                producers: producers.iter().map(|&(p, n)| (p.to_string(), n)).collect(),
-                outside_writers_allowed,
+        /// Per topic, its producers and its `block` consumers.
+        type Flows = BTreeMap<String, (Vec<String>, Vec<(String, String, u64)>)>;
+        let flows = |infos: &IndexMap<String, NodeInfo>| -> Flows {
+            block_hold_flows(&config, infos, 0)
+                .expect("builds")
+                .into_iter()
+                .map(|f| (f.topic, (f.producers, f.consumers)))
+                .collect()
+        };
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let consumer = |node: &str, depth| (node.to_string(), "x".to_string(), depth);
+        let mut expected = BTreeMap::from([
+            (
+                "/lb/c/out".to_string(),
+                (names(&["c"]), vec![consumer("d", 3)]),
+            ),
+            (
+                "/lb/e/out".to_string(),
+                (names(&["e"]), vec![consumer("f", 1)]),
+            ),
+            (
+                "/lb/h/out".to_string(),
+                (names(&["h"]), vec![consumer("i", 2), consumer("k", 4)]),
+            ),
+            (
+                "/lb/bus".to_string(),
+                (names(&["l", "m"]), vec![consumer("n", 5)]),
+            ),
+        ]);
+        assert_eq!(flows(&infos), expected);
+
+        // Each edge carries what `record_of` says of its topic and input.
+        let record_of = |topic: &str, node: &str, input: &str| -> SlotRecord {
+            match (topic, node, input) {
+                ("/lb/bus", "n", "x") => SlotRecord::Unaccounted,
+                (_, _, "x") => SlotRecord::Counted {
+                    frame_stamps: vec![u64::try_from(topic.len()).unwrap()],
+                },
+                _ => SlotRecord::Unaccounted,
             }
         };
-        let bus_edge = edge("n", 5, &[("l", 1), ("m", 2)], true);
-        let expected = |with_e: bool| {
-            let mut m = BTreeMap::from([
-                ("c".to_string(), vec![edge("d", 3, &[("c", 1)], false)]),
+        let edge = |node: &str, depth, topic: &str| BlockHoldEdge {
+            consumer_node: node.to_string(),
+            consumer_input: "x".to_string(),
+            depth,
+            record: record_of(topic, node, "x"),
+        };
+        let held = local_block_holds(
+            &block_hold_flows(&config, &infos, 0).expect("builds"),
+            &record_of,
+        );
+        assert_eq!(
+            held,
+            BTreeMap::from([
+                ("c".to_string(), vec![edge("d", 3, "/lb/c/out")]),
+                ("e".to_string(), vec![edge("f", 1, "/lb/e/out")]),
                 (
                     "h".to_string(),
-                    vec![
-                        edge("i", 2, &[("h", 1)], false),
-                        edge("k", 4, &[("h", 1)], false),
-                    ],
+                    vec![edge("i", 2, "/lb/h/out"), edge("k", 4, "/lb/h/out")]
                 ),
-                ("l".to_string(), vec![bus_edge.clone()]),
-                ("m".to_string(), vec![bus_edge.clone()]),
-            ]);
-            if with_e {
-                m.insert("e".to_string(), vec![edge("f", 1, &[("e", 1)], false)]);
-            }
-            m
-        };
-        assert_eq!(
-            local_block_holds(&config, &infos, 0).expect("builds"),
-            expected(true)
+                ("l".to_string(), vec![edge("n", 5, "/lb/bus")]),
+                ("m".to_string(), vec![edge("n", 5, "/lb/bus")]),
+            ])
         );
+
         infos.insert("f".to_string(), input(1, BackpressurePolicy::DropOldest));
+        expected.remove("/lb/e/out");
         assert_eq!(
-            local_block_holds(&config, &infos, 0).expect("builds"),
-            expected(false),
+            flows(&infos),
+            expected,
             "no block input reads e's topic once f reads it drop_oldest"
         );
+    }
+
+    /// A slot is counted only where the bag holds every frame of its topic and
+    /// the consumer drains it at its body reads: hand table over the frames
+    /// recorded, the topic's record health, frames drained and never written,
+    /// and where the consumer drains.
+    #[test]
+    fn a_slot_is_counted_only_where_the_bag_accounts_for_it() {
+        use replay_rederive::SlotRecord;
+        let stamps = vec![5, 9];
+        let counted = SlotRecord::Counted {
+            frame_stamps: stamps.clone(),
+        };
+        let lossy = TopicHealthClass::Lossy {
+            frames_lost: 1,
+            gap_events: 1,
+            sequence_anomaly: false,
+        };
+        /// The frames recorded, the topic's health, frames drained and never
+        /// written, whether the consumer drains at its body, and the record.
+        type Row<'a> = (
+            Option<&'a Vec<u64>>,
+            &'a TopicHealthClass,
+            u64,
+            bool,
+            &'a SlotRecord,
+        );
+        let rows: [Row<'_>; 6] = [
+            (Some(&stamps), &TopicHealthClass::Clean, 0, true, &counted),
+            (
+                None,
+                &TopicHealthClass::Clean,
+                0,
+                true,
+                &SlotRecord::Unaccounted,
+            ),
+            (Some(&stamps), &lossy, 0, true, &SlotRecord::Unaccounted),
+            (
+                Some(&stamps),
+                &TopicHealthClass::MultiPublisher,
+                0,
+                true,
+                &SlotRecord::Unaccounted,
+            ),
+            (
+                Some(&stamps),
+                &TopicHealthClass::Clean,
+                1,
+                true,
+                &SlotRecord::Unaccounted,
+            ),
+            (
+                Some(&stamps),
+                &TopicHealthClass::Clean,
+                0,
+                false,
+                &SlotRecord::Unaccounted,
+            ),
+        ];
+        for (row, (frames, health, unwritten, at_body, want)) in rows.into_iter().enumerate() {
+            assert_eq!(
+                &slot_record(frames, health, unwritten, at_body),
+                want,
+                "row {row}"
+            );
+        }
+    }
+
+    /// A Sync node's matcher pops its trigger inputs outside the body; every
+    /// other input, and every input of another policy, is drained at the body.
+    #[test]
+    fn only_a_sync_trigger_input_is_drained_outside_the_body() {
+        use cerulion_core::graph::node::{
+            BackpressurePolicy, InputConsume, InputMeta, MacroPolicy, NodeInfo,
+        };
+        let meta = |name: &str, trigger| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger,
+            depth: 2,
+            backpressure: BackpressurePolicy::Block,
+            expect_within_ms: None,
+            consume: InputConsume::Latest,
+            accumulate: false,
+        };
+        let inputs = || vec![meta("cam", true), meta("cfg", false)];
+        let sync =
+            NodeInfo::with_meta(inputs(), vec![]).with_policy(MacroPolicy::Sync { window_ms: 10 });
+        assert!(!consumer_drains_at_body(&sync, "cam"));
+        assert!(consumer_drains_at_body(&sync, "cfg"));
+        let unbounded =
+            NodeInfo::with_meta(inputs(), vec![]).with_policy(MacroPolicy::UnboundedSync);
+        assert!(!consumer_drains_at_body(&unbounded, "cam"));
+        let fifo = NodeInfo::with_meta(inputs(), vec![]).with_policy(MacroPolicy::DataTrigger {
+            input_name: "cam".to_string(),
+        });
+        assert!(consumer_drains_at_body(&fifo, "cam"));
+        assert!(consumer_drains_at_body(
+            &NodeInfo::with_meta(inputs(), vec![]),
+            "cam"
+        ));
     }
 
     /// The connections a rank's consumer sees
@@ -39469,14 +39743,28 @@ mod trailing_refill_tests {
         )
     }
 
-    /// The `block` edge `producer` sends into: `consumer.inp` at `depth`.
-    fn holds(producer: &str, consumer: &str, depth: u64) -> replay_rederive::BlockHoldEdges {
+    /// The `block` edge `producer` sends into, `consumer.inp` at `depth`: the
+    /// bag records one frame per fire of `producer` in `rows`, stamped with
+    /// its step's clock.
+    fn holds(
+        producer: &str,
+        consumer: &str,
+        depth: u64,
+        rows: &[Row],
+    ) -> replay_rederive::BlockHoldEdges {
+        let frame_stamps =
+            rows.iter()
+                .flat_map(|(_, clock_us, nodes)| {
+                    nodes.iter().filter(|(id, ..)| *id == producer).flat_map(
+                        move |&(_, _, fired, _)| (0..fired).map(move |_| clock_us * 1_000),
+                    )
+                })
+                .collect();
         replay_rederive::BlockHoldEdges::new(vec![replay_rederive::BlockHoldEdge {
             consumer_node: consumer.to_string(),
             consumer_input: "inp".to_string(),
             depth,
-            producers: BTreeMap::from([(producer.to_string(), 1)]),
-            outside_writers_allowed: false,
+            record: replay_rederive::SlotRecord::Counted { frame_stamps },
         }])
     }
 
@@ -39549,6 +39837,7 @@ mod trailing_refill_tests {
                     at,
                     trust,
                     resumed,
+                    &replay_rederive::PassStops::none(),
                     &|_: &str| has_refill,
                     &mut carries,
                 );
@@ -39612,7 +39901,12 @@ mod trailing_refill_tests {
     #[test]
     fn a_node_read_through_two_subscribers_marks_nothing() {
         let rows: Vec<Row> = vec![(0, 0, vec![("n", 2, 1, 0)])];
-        let with = |drain| verification(vec![decl("n", drain, None, holds("n", "c", 1))], &rows);
+        let with = |drain| {
+            verification(
+                vec![decl("n", drain, None, holds("n", "c", 1, &rows))],
+                &rows,
+            )
+        };
         let one = with(replay_rederive::FifoDrain::Unified);
         assert_eq!(marked(derive(&one, &rows, STAMPED, false, true)), vec![0]);
         let two = with(replay_rederive::FifoDrain::Separate);
@@ -39636,7 +39930,7 @@ mod trailing_refill_tests {
                 "n",
                 replay_rederive::FifoDrain::Unified,
                 None,
-                holds("n", "c", 3),
+                holds("n", "c", 3, &rows),
             )],
             &rows,
         );
@@ -39761,8 +40055,8 @@ mod trailing_refill_tests {
     /// every step whose fire's refill the hold froze, on both recordings, and
     /// at no other step. The same steps of a relay nothing holds mark none
     /// (the onset is a step no carry explains, so its carry is cleared), nor
-    /// do those of a held relay on a bag that does not record its drain,
-    /// which is planned as it is judged, on the rule from before the hold.
+    /// do those of a held `drop_oldest` relay on a bag with no stage set,
+    /// which is planned as it is judged, without the hold.
     #[test]
     fn a_block_held_relay_marks_each_refill_its_hold_froze() {
         for (rows, refills) in [
@@ -39772,7 +40066,7 @@ mod trailing_refill_tests {
             let held = verification(
                 chain(
                     replay_rederive::FifoDrain::Unified,
-                    holds("relay", "sink", 2),
+                    holds("relay", "sink", 2, &rows),
                 ),
                 &rows,
             );
@@ -39793,7 +40087,7 @@ mod trailing_refill_tests {
             let unrecorded = verification(
                 chain(
                     replay_rederive::FifoDrain::Unrecorded,
-                    holds("relay", "sink", 2),
+                    holds("relay", "sink", 2, &rows),
                 ),
                 &rows,
             );
@@ -39816,7 +40110,7 @@ mod trailing_refill_tests {
                 "n",
                 replay_rederive::FifoDrain::Unified,
                 None,
-                holds("n", "c", 1),
+                holds("n", "c", 1, &rows),
             )],
             &rows,
         );
