@@ -13,9 +13,9 @@ What this public text changes against the frozen files: file names, folder names
 names of the people and stages that wrote them are removed; Cerulion is the product's name; sections that
 report earlier measurements on other lists and other benchmarks, and the tables of numbers published by other
 groups, are left out because none of that data is in this package; the wording of some sentences is shortened;
-four lines are reworded: section 4 (c) and (h), section 5 item 4, and the last sentence of section 7's paragraph
-on unscored and lost start states. No other rule was added, dropped or weakened. The two hashes are of the frozen
-files, so a later release of them can be checked against this table.
+nine lines are reworded: section 4 (b) to (f) and (h), section 5 items 4 and 5, and the last sentence of section
+7's paragraph on unscored and lost start states. No other rule was added, dropped or weakened. The two hashes are
+of the frozen files, so a later release of them can be checked against this table.
 
 ## 1. Words
 
@@ -100,15 +100,16 @@ What must hold for each statement:
 ## 4. What must be true of the grid itself
 
 (a) The same start states in both arms of a model; the list frozen and hashed before the first row.
-(b) Every start state fresh: none that was developed on, none that any earlier run used; the source of the
-    robot's calibration record named.
+(b) Every start state fresh: none that was developed on, none that any run before the list's freeze used; the
+    source of the robot's calibration record named.
 (c) The list fixed before the first scored episode; the code snapshot of each arm of each model named.
-(d) Retries for infrastructure only, by a rule set before (3 attempts; a clock stop is final); attempts in no
-    row counted and priced; an unscored start state is a failure for that arm in every rate and is listed.
-(e) Both arms of a model run in the same hours through the same endpoint, interleaved by start state, with the
-    provider's version string logged from the response.
-(f) The effort and cache setting of each arm of each model printed: the same request settings in both arms of
-    a model.
+(d) Retries for infrastructure only, within an episode, by a rule set before (3 attempts; a clock stop is
+    final); the episode's attempts in no row counted and priced; an unscored start state is a failure for that
+    arm in every rate and is listed.
+(e) Both arms of a model run through the same endpoint, with the provider's version string logged from the
+    response.
+(f) The effort, cache setting and picture mode of each arm of each model printed; every other request setting
+    the same in both arms of a model.
 (g) A model with one arm missing is printed as incomplete and is in no comparison.
 (h) Each arm of each model holds one episode of each start state.
 
@@ -121,8 +122,8 @@ What must hold for each statement:
 3. Against Cerulion and not significant: "no difference shown for X (a of n with, b of n without, p)". It still
    counts in the tally "Cerulion ahead in k of m models", which is printed whole.
 4. The same snapshot, prompt and effort for every episode of an arm of that model.
-5. Reruns only where the arm did not run as declared (an endpoint failure, a crashed tool, an unscored start
-   state), by the rule written before, applied to both arms alike, with the first attempt's outcome kept.
+5. Retries only within an episode, and only where it did not run as declared (an endpoint failure, a crashed
+   tool, an unscored start state), by the rule written before, applied to both arms alike.
 6. If the main test itself comes in against Cerulion or null: there is no solve statement.
 
 ## 6. Cost and time

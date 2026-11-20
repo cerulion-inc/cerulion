@@ -229,7 +229,8 @@ def lost_usd(lost, model, arm):
 
 def all_in(c, arm, uns, lost):
     """The arm's means with its unscored episodes counted too: each one the clock ended at CLOCK_S seconds (None for
-    seconds when another reason ended one, whose length no file holds), and every attempt in no row at its cost."""
+    seconds when another reason ended one, whose length no file holds), and the arm's attempts in lost_attempts.csv at
+    their cost."""
     s = c.stats(arm)
     ck = clock_ended(uns).get((c.model, arm), 0)
     usd = s["usd_sum"] + lost_usd(lost, c.model, arm)
@@ -270,8 +271,8 @@ def means_notes(cols, name, uns, lost):
          f"USD is the model's reported token counts of the scored attempt at the list prices of prices.csv on the "
          f"date in that file; cached input is priced at the cached rate; simulator compute is not included; nothing "
          f"here is a billed amount. USD per solved start state is the spend of the arm's scored episodes over the "
-         f"start states it solved: the {len(uns)} episodes that ended without a score and every attempt in no row "
-         f"are not in it ({total_lost:.2f} USD in all, lost_attempts.csv), and no figure counts the robot's "
+         f"start states it solved: the {len(uns)} episodes that ended without a score and the other attempts in "
+         f"lost_attempts.csv are not in it ({total_lost:.2f} USD in all), and no figure counts the robot's "
          f"calibration episodes or the two attempts lost with the stopped machines. Part of the gap in USD between "
          f"the arms is caching, not only fewer requests: cached input is priced lower, and the arm without {name} "
          f"had the lower cached share of input tokens for {lower_cache} of the {M} models. Where an arm's prompt "
@@ -820,7 +821,7 @@ def grid_first(cols, name, fam, N, cells, uns, lost):
                 line += (f" These means are over scored episodes, and {w['unscored']} of its episodes with {name} "
                          f"and {o['unscored']} without ended without a score. Counted too"
                          + (f" (an episode the 90 minute clock ended at its {CLOCK_S} seconds)" if walls else "")
-                         + ", with every attempt in no row at its cost (lost_attempts.csv): " + joined(figs) + ".")
+                         + ", with each arm's attempts in lost_attempts.csv at their cost: " + joined(figs) + ".")
             L.append(line)
     # the column added late, and the passes that do not hold with the task row as the unit
     for m in ADDED_LATE:
@@ -869,10 +870,11 @@ def grid_first(cols, name, fam, N, cells, uns, lost):
                     + "; ".join(moved) + "."))
     L += ["- Each start state ran once in each arm. How much the outcome of one start state varies from run to run "
           "was not measured.",
-          "- How the run went, and where it differed from the protocol (the pause of the Claude models, the start "
-          "states whose two arms started more than an hour apart, two machines that stopped and a third whose "
-          "waiting episodes were moved, a network outage, one model answered from two provider deployments, the "
-          "machines shared with other work), is in README.md under \"Things to know before quoting a number\".", ""]
+          "- How the run went, and where it differed from the protocol (the pause of the Claude models, the other "
+          "models' start states whose two arms started more than an hour apart, two machines that stopped and a "
+          "third whose waiting episodes were moved, a network outage, one model answered from two provider "
+          "deployments, the machines shared with other work), is in README.md under \"Things to know before quoting "
+          "a number\".", ""]
     return L
 
 
@@ -1081,8 +1083,8 @@ def grid(name, check, changed):
             L.append(f"| {m} | {arm} {name} | {len(cs)} | {why} | {', '.join(cs)} |")
     else:
         L.append("None.")
-    L += ["", "Each one counts as not solved, not clean and no false claim for its arm. Attempts that are in no "
-          "row are listed and priced in lost_attempts.csv.", ""]
+    L += ["", "Each one counts as not solved, not clean and no false claim for its arm. Their attempts are listed and "
+          "priced in lost_attempts.csv, as are attempts of scored episodes that are in no row.", ""]
     write(os.path.join(HERE, "SUMMARY.md"), "\n".join(L), check, changed)
     return cols
 

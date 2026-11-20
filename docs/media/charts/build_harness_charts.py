@@ -35,8 +35,9 @@ The form of both charts:
     worded by the package's verdict()) with its exact p as the package prints it; a column still
     running gets no verdict, as in the package;
   - the cost chart's footer says what its figure leaves out (the episodes that ended without a score
-    and every attempt in no row) and for how many models part of the factor is caching: "each factor"
-    only when every model's arm without Cerulion had the lower cached share of input, else that count;
+    and the other attempts in lost_attempts.csv) and for how many models part of the factor is
+    caching: "each factor" only when every model's arm without Cerulion had the lower cached share of
+    input, else that count;
   - both footers name every arm that had a reply the provider's content filter stopped (finish reason
     content_filter, the package's filtered_arms()): an arm whose scored episodes ended on such replies by
     name with its counts, the other arms by count, every count of replies over scored and unscored
@@ -322,8 +323,8 @@ def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd, filtered)
                f"{NAME} had the lower cached share of input: cached input costs less.")
     footer = ["Model spend only; the simulator is not counted. Failed scored episodes are included: their cost is "
               "spread over the successes.",
-              f"The {unscored} episodes that ended without a score and every attempt in no row are left "
-              f"out (${fnum(lost_usd, 2)} of spend in all; lost_attempts.csv).",
+              f"The {unscored} episodes that ended without a score and the other attempts in lost_attempts.csv are "
+              f"left out (${fnum(lost_usd, 2)} of spend in all).",
               f"The factor is the cost per success without {NAME} over the cost with it."
               + (f" A broken bar runs past ${USD_CUT:.0f}." if broken else ""),
               caching] \

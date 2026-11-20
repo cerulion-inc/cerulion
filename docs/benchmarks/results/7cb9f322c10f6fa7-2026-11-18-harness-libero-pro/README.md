@@ -77,7 +77,7 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 | episodes.csv | one row for every scored episode, both arms, every model |
 | unscored.csv | every episode that ended without a score, with its reason, the list-price cost of its attempts, and the replies of those attempts by finish reason with the requests that got no reply (the episodes.csv columns of those names, summed over every attempt the cost covers) |
 | not_finished.csv | every episode not yet ended when the rows were read (empty once the grid is complete) |
-| lost_attempts.csv | every attempt that is in no scored row, priced; `before_rerun` is 1 for an attempt of an episode that was started again from attempt 1 (see below) |
+| lost_attempts.csv | attempts in no scored row of the episodes in episodes.csv and unscored.csv, priced; `before_rerun` is 1 for an attempt from before its episode was started again from attempt 1 after the network outage or a machine stop (see below) |
 | prices.csv | the list prices used, per million tokens, with the page and the date each row was read |
 | summary.csv | per model and arm: counts, Wilson intervals, means per scored episode, the cached share of input tokens, the failed requests in all, and the model's paired counts and exact test on SOLVED |
 | paired.csv | per model and measure (solved, clean, false claim): the paired counts, the difference with its interval, the exact p, the Holm threshold and the verdict; the grid declares no per-model false-claim test, so its false-claim rows read `descriptive, no test declared` |
@@ -138,7 +138,7 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
 - `without`: three tools (move_to, done, give_up) and the prompt of arXiv 2610.30051, word for word.
 - `with`: the Cerulion harness's 44 tools. This arm also reads a record of the robot's own calibration, which
   the other arm does not have.
-- Pictures beyond the newest 4: every arm replaced each of them with a short text inside its older turn (the
+- Pictures beyond the newest 4: every arm swapped each of them for a short text inside its older turn (the
   harness's `swap` picture mode), except the four Claude columns with Cerulion. Those kept every picture where it
   was and marked their opening (the tools, the system text and the first message) for the prompt cache (`append`,
   the harness's default picture mode for a Claude model with Cerulion).
@@ -146,7 +146,8 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
   The Claude models carry the prompt cache flag in both arms.
 - Up to 3 attempts when the model endpoint fails; a clock stop is final. An episode with no score after that is
   a failure for its arm in every count, and is listed in unscored.csv.
-- The simulation ran on cloud machines without a GPU, both arms of a model through the same endpoint.
+- The simulation ran on cloud machines with the CPU renderer (OSMesa); no GPU was used. Both arms of a model ran
+  through the same endpoint.
 - The code of both arms is the measured code of the Cerulion harness, with these snapshot ids:
   with Cerulion `sha256:7cb9f322c10f6fa7e64a3f8da7c22c67d67280eca436a03d2d87683496b4d5b8`,
   without `sha256:b73c548a1f0436f52ce41cffc7d4a4a2784e5d6170e2dd2c757c9cabdf146637`.
@@ -154,7 +155,7 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
   `sha256:4f8bbe79fdf38df1770c068ec470fd3d5a629fd371f7288887cb3d275f9f747e`: the tree of the first id with the
   `append` picture mode added to two of its operator files, `bench/operators/chat_support.py` and
   `bench/operators/chat_operator.py`.
-- To run a start state again: `cerulion rcp bench --model MODEL --cell CELL`
+- To run a start state yourself: `cerulion rcp bench --model MODEL --cell CELL`
   ([docs/harness.md](../../../harness.md#how-cerulion-rcp-bench-reproduces-it)) runs it in both arms with the
   same budgets, temperature and scorer. With a Claude model the arm with Cerulion runs `append` with the cache
   mark, as the four Claude columns here ran; every other model and arm runs `swap`. `cerulion rcp bench --verify`
