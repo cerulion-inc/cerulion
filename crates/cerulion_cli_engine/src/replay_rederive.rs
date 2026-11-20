@@ -9092,7 +9092,8 @@ mod tests {
     ///   relay's step 2 pop is a finding;
     /// * after a hold the sink takes a frame and then reads its queue empty
     ///   (frames a release let in were evicted), so the relay's step 6 pop is
-    ///   a finding; without the empty read the slot still counts two;
+    ///   a finding; without the empty read, or with one at the drain site or
+    ///   on a bag whose roles cannot be believed, the slot still counts two;
     /// * a truncated read stream of the sink's input loses its drains, so from
     ///   its marker at step 2 nothing bounds the slot and the step 3 frame
     ///   carried unfired is a finding; without the marker it is the hold;
@@ -9145,6 +9146,31 @@ mod tests {
         let kept = relay_steps(&evicted_rows);
         let not_reset = verify_unrestored(&relay(sink_holds(2, &kept)), &kept, &[], STAMPED);
         assert!(not_reset.is_clean(), "{:?}", not_reset.findings);
+        // An empty read that is not the body's, or whose role cannot be
+        // believed, says nothing of the slot's queue.
+        let drain_site = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::NoFrame,
+            0,
+            None,
+            ReadSiteRole::Drain,
+        );
+        let trigger_empty = with_read(relay_steps(&evicted_rows), 5, drain_site);
+        let kept_by_site = verify_unrestored(
+            &relay(sink_holds(2, &trigger_empty)),
+            &trigger_empty,
+            &[],
+            STAMPED,
+        );
+        assert!(kept_by_site.is_clean(), "{:?}", kept_by_site.findings);
+        let kept_by_trust = verify_unrestored(
+            &relay(sink_holds(2, &evicted)),
+            &evicted,
+            &[],
+            RoleTrust::Declined,
+        );
+        assert!(kept_by_trust.is_clean(), "{:?}", kept_by_trust.findings);
 
         let marker = read_with_role(
             "sink",

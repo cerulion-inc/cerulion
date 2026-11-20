@@ -155,7 +155,18 @@
 #            --cap-lints true --in-place --timeout 600 \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (in 4 shards; the unmutated baseline passed)
-# Result:  PENDING
+# Result:  run at b44d9532e: 103 mutants: 93 caught, 8 unviable, 2 missed,
+#          both killed since. `&&` replaced with `||` in `SlotBound::step`'s
+#          empty-read reset: no vector held an empty read at the drain site or
+#          on a bag whose roles cannot be believed; one now holds each. And
+#          `FifoCarry::skip` replaced with `()`: once the sends came from the
+#          recorded frames, no vector told a skipped step from an unfolded
+#          one; one now needs the skipped step's drain. Re-run with these
+#          vectors and `--re 'SlotBound::step|FifoCarry::skip'`: 17 mutants,
+#          17 caught. The 8 unviable replace `node_trigger_decl`,
+#          `declared_latest_drain`, `slot_record`, `BlockHoldEdges::none`,
+#          `BlockHoldEdges::edges`, `FifoCarry::step` and (twice)
+#          `local_block_holds` with a value their types do not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

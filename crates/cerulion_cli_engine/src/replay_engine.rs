@@ -39914,32 +39914,57 @@ mod trailing_refill_tests {
     }
 
     /// A step whose pops cannot be counted (a truncated read) carries
-    /// nothing, and its fires still count toward the slot. Hand-built on a
-    /// depth-3 `block` slot: one fire at step 0, a fire at step 1 beside the
-    /// truncated read, and at step 2 a fire and two pops, which only a slot
-    /// at three frames (two sent before the step, one in it) explains.
+    /// nothing, and its consumer's drains still come off the slot. Hand-built
+    /// on a depth-3 `block` slot: a fire at step 0 and at step 1, the
+    /// consumer's body taking a frame at step 1 beside the truncated read, and
+    /// at step 2 a fire and two pops, which only a slot at three frames
+    /// explains. With step 1's drain counted the slot holds one frame before
+    /// step 2 and two with its send, so step 2 marks nothing; without the
+    /// drain it holds three and marks its refill.
     #[test]
-    fn a_step_whose_pops_cannot_be_counted_still_counts_its_sends() {
+    fn a_step_whose_pops_cannot_be_counted_still_folds_its_drains() {
         let rows: Vec<Row> = vec![
             (0, 0, vec![("n", 1, 1, 0)]),
-            (1, 5_000, vec![("n", 0, 1, 0)]),
+            (1, 5_000, vec![("n", 0, 1, 0), ("c", 0, 0, 1)]),
             (2, 10_000, vec![("n", 2, 1, 0)]),
         ];
-        let mut v = verification(
-            vec![decl(
+        let v = |drained: bool| {
+            let rows: Vec<Row> = if drained {
+                rows.clone()
+            } else {
+                rows.iter()
+                    .map(|(n, us, nodes)| {
+                        (
+                            *n,
+                            *us,
+                            nodes.iter().filter(|e| e.0 != "c").copied().collect(),
+                        )
+                    })
+                    .collect()
+            };
+            let mut v = verification(
+                vec![decl(
+                    "n",
+                    replay_rederive::FifoDrain::Unified,
+                    None,
+                    holds("n", "c", 3, &rows),
+                )],
+                &rows,
+            );
+            v.reads_by_step.entry(1).or_default().push(read(
                 "n",
-                replay_rederive::FifoDrain::Unified,
-                None,
-                holds("n", "c", 3, &rows),
-            )],
-            &rows,
+                ReadOutcomeKind::Truncated,
+                ReadSiteRole::Drain,
+            ));
+            (v, rows)
+        };
+        let (with_drain, rows_with) = v(true);
+        assert!(marked(derive(&with_drain, &rows_with, STAMPED, false, true)).is_empty());
+        let (without, rows_without) = v(false);
+        assert_eq!(
+            marked(derive(&without, &rows_without, STAMPED, false, true)),
+            vec![2]
         );
-        v.reads_by_step.entry(1).or_default().push(read(
-            "n",
-            ReadOutcomeKind::Truncated,
-            ReadSiteRole::Drain,
-        ));
-        assert_eq!(marked(derive(&v, &rows, STAMPED, false, true)), vec![2]);
     }
 
     /// A step no carry explains (a stopped node's pops with no fire, more
