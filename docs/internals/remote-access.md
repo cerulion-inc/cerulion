@@ -571,6 +571,23 @@ is stopped if it is still running 100 s after it started (a frame that takes
 longer to send than its period delays the rest). A topic under
 `/__cerulion` is refused. `service-call` also returns `response_text`.
 
+Each verb answers in one order: `topic-publish` and `service-call` read the
+e-stop first; every verb then checks its arguments (required keys, numbers,
+limits and the type's resolution), and only then reads the topic's mirror
+marker and remote access policy (`servable`) and takes its remote lease; the
+`message` or `request` text is parsed and encoded after that, inside the
+`cerulion_msgio` publish or call. Such a malformed request is a usage error and
+an engaged e-stop is the refusal whatever state the topic's markers are in
+(`act_verbs_test.rs`:
+`a_malformed_request_on_an_excluded_topic_is_a_usage_error`,
+`an_engaged_estop_is_the_refusal_on_an_excluded_topic`). A policy or mirror
+marker whose last holder is dropping it is opened again within
+`cerulion_core::transport::marker_teardown`'s budget (20 opens 25 ms apart,
+`TeardownWait::Bounded`) and refuses naming that budget only once it outlasts
+it. The wire plane's demand and schema reads wait the same way; its catalog
+filter and catalog peek pass `TeardownWait::Never`, so a listing opens each
+marker once and leaves out a topic whose marker is being torn down.
+
 ## 6. The wire plane (robot side)
 
 A `cerulion/wire/2` connection (admitted only for a paired `CAP_OBSERVE`
@@ -1181,7 +1198,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 |---|---|
 | `crates/cerulion_remoted/tests/act_verbs_daemon_test.rs` | Every act verb is registered in the production `serve_endpoint` daemon: each answers `{}` with its own usage error over a real ops session |
 | `crates/cerulion_remoted/tests/act_verbs_cloud_test.rs` | The act verbs under the allow-from-cloud switch: a cloud device is refused publish and snapshot only while the switch is off |
-| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, live mirror refusal, reserved-topic usage errors, contextual producer exclusions and local oracle delivery |
+| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, live mirror refusal, reserved-topic usage errors, contextual producer exclusions, usage errors and the e-stop refusal ahead of an excluded topic's policy, and local oracle delivery |
 | `crates/cerulion_pairing/tests/format_vectors_test.rs` | Byte-exact canonical signing vectors from independent hand-serializers; strict epoch-envelope decode |
 | `crates/cerulion_pairing/tests/chain_verify_test.rs` | Chain positive path + full negative matrix (M-of-N, peer binding, expiry, delegation cap, epoch, rollback) |
 | `crates/cerulion_pairing/tests/store_test.rs` | MAC tamper-evidence, atomic save/load, anti-rollback persistence, claim/reset lifecycle, epoch monotonicity |

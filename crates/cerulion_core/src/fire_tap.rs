@@ -106,10 +106,6 @@ pub struct FireRecord {
 }
 
 #[derive(Clone, Copy)]
-#[allow(
-    dead_code,
-    reason = "crate-private producer surface consumed by graph tick instrumentation"
-)]
 pub(crate) struct FireBody {
     pub at_ns: u64,
     pub dur_ns: u32,
@@ -206,10 +202,6 @@ struct Slot {
 }
 
 impl FireTap {
-    #[allow(
-        dead_code,
-        reason = "crate-private constructor consumed by graph tap installation"
-    )]
     pub(crate) fn new(
         config: FireTapConfig,
         node_count: u16,
@@ -270,19 +262,11 @@ impl FireTap {
 
     /// Call after `armed_now` admitted a tick. No clock read is needed again;
     /// a lease explicitly cleared during that tick suppresses its record.
-    #[allow(
-        dead_code,
-        reason = "crate-private producer consumed by graph tick instrumentation"
-    )]
     pub(crate) fn push(&self, body: FireBody) {
         self.push_with(body, |_| {});
     }
 
     #[inline]
-    #[allow(
-        dead_code,
-        reason = "shared producer path with a deterministic test scheduling seam"
-    )]
     fn push_with(&self, body: FireBody, after_claim: impl FnOnce(u64)) {
         if self.lease_until_ns.load(Ordering::Relaxed) == 0 {
             return;
