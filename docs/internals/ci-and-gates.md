@@ -513,10 +513,10 @@ PROJECTED from those per-step costs at 26.6 min warm; the eight default-branch r
 runs `./tools/scripts/ci_test_shard.sh cerulion_core <shard> <count>`, which ENUMERATES
 `crates/cerulion_core/tests/*.rs` at depth 1 and takes every file whose position is
 `index mod count`, GENERATED, never hand-listed, save for ONE pinned name
-(`macro_compile_fail_test`, the serial trybuild tail (see `PINNED_TEST` in that script for the
-per-run measurement), which must not relocate every time a test
-file is added; it lands on `PINNED_SHARD % count`, shard 2 of 4 on Linux, shard 2 of 3 on
-macOS, and `--check` proves the pin), and execs `cargo nextest run --profile ci`
+(`macro_compile_fail_test`, held out of the rotation so the other files keep their shards
+(see `PINNED_TEST` in that script); it lands on `PINNED_SHARD % count`, shard 2 of 4 on
+Linux, shard 2 of 3 on macOS, and `--check` proves the pin; the blocking trybuild suite it
+held runs as the `node_macro_ui` package on that same shard), and execs `cargo nextest run --profile ci`
 (install via `tools/scripts/install_nextest.sh`). It does NOT pass `--test-threads=1`; see the
 serialisation fence below. The split across runners is legal because each VM has its own
 `/dev/shm`.
@@ -524,12 +524,40 @@ serialisation fence below. The split across runners is legal because each VM has
 shards (one per shard on Linux; a hand-balanced 3-way tilt on macOS), with the iroh-tree
 packages kept together so that large tree compiles once. On macOS, shard 2 also carries the
 six viz steps (`cerulion_viz`, `go2_tf`, the serial `cerulion-vizd` suite and the three
-OpenH264 steps) beside the trybuild tail, which is why it takes the lightest package set;
+OpenH264 steps) beside the trybuild suite, which is why it takes the lightest package set;
 there is NO macOS `viz-tests` leg. Every shard of both jobs has a cache key of its own: shard 0
 `cargo-<os>-<scope>-<lock hash>`, shard k above 0 `cargo-<os>-shard<k>-<scope>-<lock hash>`,
 starting from shard 0's archive until it has one. Shards above 0 save only when the cache save
 policy below names their namespaces, which the default does not. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
+
+`--with <package>` adds another package's integration tests to the same nextest
+invocation: `-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. Shard 2
+of both lanes runs its shard in a step of its own (`if: matrix.shard == 2`, so the coverage
+walk sees the leg) that passes `--with node_macro_ui`, so the `#[cerulion_node]`
+diagnostics suite builds in the shard's cargo invocation and its trybuild test runs beside
+the core tests. nextest starts tests by priority, then in binary order, and its queue does
+not start a test past the one at its head, where a test that claims every slot waits for
+every running test to end; so `.config/nextest.toml` gives the timing tests that claim
+every slot priority 100 and the trybuild test 99 (at the default priority it sorts after
+every `cerulion_core` binary and would start last). On the other shards the timing tests
+then run first, each alone, which costs no slot they would not have waited for anyway.
+Cargo applies `--lib` and each `--test` to every package one command selects, so the
+script refuses `--with` on shard 0, which carries `--lib`, and an extra package that holds
+a test attribute, a doctest source or a test target outside `tests/*.rs` (see `check_extra`
+in the script), or a `tests/*.rs` named like one of `cerulion_core`'s; the suite's
+compile-pass programs are binaries of that package, which cargo builds for an integration
+test even when targets are named. Its dev-dependencies ask for `test-helpers` on
+`cerulion_core` and `native_ros2_messages`, which `cerulion_core`'s own test build already
+turns on, so every unit the shard compiles for the core tests keeps its features. The
+selection is read for each package on its own and the script prints a `selection:` line
+for each package it leaves out. In CI every selection that names a package names
+`cerulion_core`, which observes the whole tree, so the step sees `[]` (every package skips)
+or `cerulion_core` with or without each extra; a selection of an extra alone, which the
+script's hand table pins, would run that extra and none of the core files. `--list` applies the same selection and
+prints the argument list the run would hand nextest, which is how to check a change to the
+step without running it. The coverage walk credits each `--with` package on the line; the
+package has no step or selection marker of its own in either job.
 
 Each `test-linux` shard builds the `cerulion_core` test binaries it runs: the shard step
 compiles exactly the quarter `tools/scripts/ci_test_shard.sh` assigns to it and then runs
@@ -597,7 +625,9 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 Every `test-linux` and `test-macos` leg uses it: the step `Build this shard's package tests
 once and run their doctests` builds the leg's packages, every package step runs through
 `run`, and the leg ends with the audit. `cerulion_core` keeps its own build in its shard step,
-unchanged. A `lint-gates` step runs `check-workflow .github/workflows/ci.yml`.
+unchanged, and the `--with` packages build there too: they are in no group and have no
+`run` step, so the audit, which dates every compile, attributes theirs to
+`phase cerulion_core`. A `lint-gates` step runs `check-workflow .github/workflows/ci.yml`.
 
 * **Groups.** One unified build changes some packages' features: a package's tests link a
   shared crate with the union of what every package of the group enables. The unions in
@@ -1137,7 +1167,7 @@ and the target trim's self-test, before the checker reads the real files.
 | `tools/scripts/check_citation_release.sh` | citation version, calendar, and release-date window validation | n/a |
 | `crates/cerulion_cli_engine/tests/workspace_lints_manifest_test.rs` | every member inherits the one lint table; the table's levels | no |
 | `crates/cerulion_cli_engine/tests/library_print_ban_test.rs` | every library crate carries the print ban | no |
-| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` (or, as the `Lint` aggregator does, `always()`) whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. Every job a required job needs, transitively, is held to the same rules; the `Lint` aggregator's check is run over every result its parts can carry; and a job-level `always()` sits only on a job that checks out nothing, runs no cargo and carries `timeout-minutes` of at most 5. The required names are read from `tools/ci/required_contexts.txt`, and `tools/ci/required_parts.txt` equals, both ways, the jobs each required aggregate (a job reporting a required context under a job-level `always()`) needs, read strictly row by row, and no part may be a matrix job, report a name built from an expression, or carry a job condition or `needs:`. The classifier itself, run on hand-written rows per path and per event, answers the harness rule: a harness-only change selects no package on a pull request and on a merge group, and a harness path beside any other selects every package; the `harness` job carries no `needs:`, no job or step condition and no matrix | no |
+| `crates/cerulion_cli_engine/tests/ci_test_coverage_test.rs` | every package runs in a blocking job; the shard partition is total and disjoint; each sharded job's legs run each package's shard step exactly once, and the jobs that run the shard are exactly `test-linux` and `test-macos`; a `ci_test_shard.sh` line credits its package and each `--with` package; the script's `--with` arms (each selection, the order of two extras, an empty own shard, the archive filterset, every refusal) on a synthetic checkout under `bash` and `/bin/bash`; each workflow `--with` line names every test file of its packages; each `binary_id` in `.config/nextest.toml` names a real test file; a step gated on a changed-path selection still runs on the change that selects only its own package. A selection condition counts only where it is GROUNDED: the job `needs:` the classifier, the classifier declares the output, and that declaration is exactly `${{ steps.<id>.outputs.<name> }}` naming a step of it that can set an output OF THAT NAME: a `run:` step whose script writes `<name>=` into `$GITHUB_OUTPUT`, or a `uses:` step, whose action's outputs are not in the file to read. A literal value, an expression carrying another operand, a step that writes no output, and a step that writes some other output's name each ground nothing; the `changes` job probes its resolved base, with a refusal that fails the job, ahead of the diff that lists the changed paths; and a step in a `container:` job whose `run:` script uses a bash-only construct (`pipefail`, another `set -o` option, or the `[[ ... ]]` conditional, never a POSIX class `[[:...]]`) declares `shell: bash`, because a container step with no `shell:` runs the image's `/bin/sh`, which is dash on the ROS base images. The walk prints the count of container `run:` steps it judged and fails on zero. And a job whose name reports a required status context skips on no event its workflow triggers on, the steps that split its work by event together admit every such event, it carries `!cancelled()` (or, as the `Lint` aggregator does, `always()`) whenever it lists `needs:`, and its workflow triggers on no event outside the allowed set. Every job a required job needs, transitively, is held to the same rules; the `Lint` aggregator's check is run over every result its parts can carry; and a job-level `always()` sits only on a job that checks out nothing, runs no cargo and carries `timeout-minutes` of at most 5. The required names are read from `tools/ci/required_contexts.txt`, and `tools/ci/required_parts.txt` equals, both ways, the jobs each required aggregate (a job reporting a required context under a job-level `always()`) needs, read strictly row by row, and no part may be a matrix job, report a name built from an expression, or carry a job condition or `needs:`. The classifier itself, run on hand-written rows per path and per event, answers the harness rule: a harness-only change selects no package on a pull request and on a merge group, and a harness path beside any other selects every package; the `harness` job carries no `needs:`, no job or step condition and no matrix | no |
 | `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs` | the `# doc-pin:` markers in `ci.yml` equal, both ways, the shared-root reads derived from every workspace member's `tests/*.rs` and `src/**/*.rs`: a string literal rooted at `docs`, `tools`, `.github`, `benches`, `examples` or `harness`, or a root markdown file name, that the surrounding code opens or joins as a path, never one it only names, writes, or joins onto its own crate directory. A `src/` read is attributed to the library test binary (`<package>::<package>`). A path assembled at run time, or reached through a helper in the crate's library, is NOT seen: that is a stated limitation, and `cerulion_core::serial_discipline_test`'s shell-script reads are the known case | no |
 | `crates/cerulion_core/tests/tracing_field_discipline_test.rs` | no interpolated log message; no near-spelled field name | no |
 | `crates/cerulion_core/tests/serial_discipline_test.rs` | nextest fence membership equals its declared inventory both ways; every singleton-creating file is fenced; no executing doctest reaches the singleton | no |

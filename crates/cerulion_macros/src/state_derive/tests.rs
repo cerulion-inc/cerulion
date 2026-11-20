@@ -3,9 +3,10 @@
 //! What a proc-macro unit test can see is the classification and the emitted
 //! token stream; what it CANNOT see is whether the emission type-checks, what
 //! bytes it produces, or how many diagnostics rustc renders. Those three live
-//! in `cerulion_core`: `tests/ui/pass/` compiles the happy shapes,
-//! `tests/state_derive_test.rs` drives real captures against hand oracles, and
-//! `tests/state_derive_diagnostic_test.rs` counts `compiler-message` records.
+//! elsewhere: `node_macro_ui`'s `tests/ui/pass/` compiles the happy shapes,
+//! `cerulion_core`'s `tests/state_derive_test.rs` drives real captures against
+//! hand oracles, and `node_macro_ui`'s `.stderr` oracles pin every diagnostic
+//! rustc renders for the refused shapes.
 //! Assertions here are about the DECISION, never about a second run of the
 //! generator.
 

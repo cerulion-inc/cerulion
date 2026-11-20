@@ -54,6 +54,9 @@ members = [
     "crates/test_fixtures/test_node_cdylib",
     "crates/test_fixtures/test_node_stable_abi_cross_compiler",
     "crates/test_fixtures/test_node_macro_cdylib",
+    # The #[cerulion_node] diagnostics suite: trybuild compile-fail cases and
+    # the compile-pass programs as binaries.
+    "crates/test_fixtures/node_macro_ui",
     "crates/test_fixtures/test_node_failing_cdylib",
     # Returns one chosen NodeError arm (env-selected) from init, a chosen
     # tick, or shutdown: the typed error kind across the cdylib boundary.
@@ -83,6 +86,14 @@ members = [
     "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",
     # Oracle-vector fixture for raw-FFI template emit.
     "crates/test_fixtures/test_node_raw_ffi_template_cdylib",
+    # The two nodes graph_start_order_e2e_test scaffolds with `node create` and
+    # `node modify`, prebuilt: a period producer with one Vector3 output and a
+    # period consumer with one plain Vector3 input. Each lib.rs is the scaffold's
+    # bytes and each manifest is the scaffold's with the package renamed, kept off
+    # crates.io and inheriting the lint table; the test compares both against a
+    # live scaffold before `graph run` loads the libraries.
+    "crates/test_fixtures/test_node_start_order_prod_cdylib",
+    "crates/test_fixtures/test_node_start_order_cons_cdylib",
     # The raw template created with one output, after two `node modify` calls.
     "crates/test_fixtures/test_node_modified_raw_cdylib",
     "crates/test_fixtures/test_node_unknown_schema_cdylib",

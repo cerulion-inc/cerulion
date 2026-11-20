@@ -21,7 +21,10 @@ struct ParamNode {
     level: u8,
     #[param(default = true)]
     enabled: bool,
-    #[param(default = "base_link", description = "frame the output is expressed in")]
+    #[param(
+        default = "base_link",
+        description = "frame the output is expressed in"
+    )]
     frame_id: String,
 }
 
@@ -30,7 +33,11 @@ impl ParamNode {
     fn tick(&mut self) -> Result<(), NodeError> {
         self.cmd.x = self.gain;
         self.cmd.y = f64::from(self.offset);
-        self.cmd.z = if self.enabled { f64::from(self.level) } else { -1.0 };
+        self.cmd.z = if self.enabled {
+            f64::from(self.level)
+        } else {
+            -1.0
+        };
         Ok(())
     }
 }
