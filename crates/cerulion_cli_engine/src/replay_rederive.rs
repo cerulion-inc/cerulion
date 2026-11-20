@@ -1085,8 +1085,8 @@ pub struct ScheduleFinding {
 /// What a [`ScheduleFinding`] cannot rule out, rendered after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FindingCaveat {
-    /// A FIFO node fired fewer times than its pops owed at a step where a
-    /// `block` edge in its rank can have held it (`FifoDeferral`), on a bag
+    /// A FIFO node fired fewer times than its pops owed at a step where the
+    /// bag shows the slot of a `block` edge in its rank full (`FifoDeferral`), on a bag
     /// that does not record how its `drop_oldest` trigger input was read
     /// ([`FifoDrain::Unrecorded`]): the hold is not allowed for there, so the
     /// step can be the hold.
@@ -9315,7 +9315,7 @@ mod tests {
         assert_eq!(findings_of(&alone), vec![finding("relay", 0, 2, 1)]);
     }
 
-    /// A node any of whose edges can be full can be held, and only then:
+    /// A node any of whose edges the bag shows full can be held, and only then:
     /// rows `(0: one pop, one fire)` and `(1: one pop, no fire)` with no
     /// drain read clean on edges at depths 1 and 4, and at depths 1 and 1, and
     /// are a finding at step 1 at depths 3 and 4.
@@ -9968,7 +9968,7 @@ mod tests {
                 None,
             ),
             (
-                "a slot that cannot have been full",
+                "a slot the bag does not show full",
                 decl(FifoDrain::Unrecorded, sink_holds(2, &before_any), None),
                 &before_any,
                 None,
@@ -10041,7 +10041,9 @@ mod tests {
     /// counted, and the bound stays at or below the slot's count. Depth 1: the
     /// relay fires at steps 0 and 2, the sink takes the first frame at step 0
     /// and reads its queue empty at step 1, all three at one clock; the
-    /// relay's step 3 pop left unfired is a finding.
+    /// relay's step 3 pop left unfired is a finding. The next clock's frames
+    /// count again: a step 3 that pops two and fires one fills the slot with
+    /// its own frame, and the pop it left unfired is the hold.
     #[test]
     fn an_empty_read_inside_a_shared_clock_counts_none_of_its_frames() {
         let empty = read_with_role(
@@ -10052,18 +10054,24 @@ mod tests {
             None,
             ReadSiteRole::Body,
         );
-        let steps = with_read(
-            vec![
-                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 0, 1)]),
-                fifo_step(1, 0, &[]),
-                fifo_step(2, 0, &[("relay", 1, 1, 0)]),
-                fifo_step(3, 5_000, &[("relay", 1, 0, 0)]),
-            ],
-            1,
-            empty,
-        );
+        let shared = |last: (&'static str, u32, u32, u32)| {
+            with_read(
+                vec![
+                    fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 0, 1)]),
+                    fifo_step(1, 0, &[]),
+                    fifo_step(2, 0, &[("relay", 1, 1, 0)]),
+                    fifo_step(3, 5_000, &[last]),
+                ],
+                1,
+                empty.clone(),
+            )
+        };
+        let steps = shared(("relay", 1, 0, 0));
         let report = verify_unrestored(&relay(sink_holds(1, &steps)), &steps, &[], STAMPED);
         assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+        let refilled = shared(("relay", 2, 1, 0));
+        let report = verify_unrestored(&relay(sink_holds(1, &refilled)), &refilled, &[], STAMPED);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
     }
 
     /// An empty read leaves the slot empty: in a rank's step order the
@@ -10099,11 +10107,11 @@ mod tests {
         assert_eq!(findings_of(&report), vec![finding("relay", 6, 2, 1)]);
     }
 
-    /// On a resumed pass whose anchor step's clock is not stated, a frame
-    /// stamped at the first step's clock can be the anchor step's send, so it
-    /// is not counted. Depth 1: a latest-value sink's read at the first step
-    /// empties the queue, and the relay's step 1 pop left unfired is a
-    /// finding.
+    /// On a resumed pass a frame stamped at the first step's clock can be the
+    /// anchor step's send. Depth 1: a latest-value sink's read at the first
+    /// step empties the queue, so no frame of that clock is left in the slot,
+    /// and the relay's step 1 pop left unfired is a finding, whether the
+    /// anchor step's clock is not stated, is the first step's, or is earlier.
     #[test]
     fn a_resumed_pass_counts_no_frame_its_anchor_step_can_have_sent() {
         let steps = vec![
@@ -10121,28 +10129,74 @@ mod tests {
                 drain: BodyDrain::ToEmpty,
             },
         )]);
-        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
-            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
-        let report = verify(
-            &relay(holds),
+        for anchor in [None, Some(EPOCH), Some(EPOCH - MS)] {
+            let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+                .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]))
+                .with_anchor_prev_target(anchor);
+            let report = verify(
+                &relay(holds.clone()),
+                &steps,
+                &[],
+                STAMPED,
+                &resumed,
+                &PassStops::none(),
+            );
+            assert_eq!(
+                findings_of(&report),
+                vec![finding("relay", 1, 1, 0)],
+                "anchor {anchor:?}"
+            );
+        }
+    }
+
+    /// A frame whose stamp no step's clock carries counts at the next step,
+    /// with that step's own: at depth 3 the relay's frame at 0 ms, one stamped
+    /// at 2 ms and one at the 5 ms step fill the slot there, so the relay's
+    /// step 1 pop left unfired is the hold. Without the 5 ms frame it is a
+    /// finding.
+    #[test]
+    fn a_frame_stamped_between_two_steps_counts_at_the_next_with_its_own() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+        ];
+        let holds = |frame_stamps: Vec<u64>| {
+            BlockHoldEdges::new(vec![slot(
+                "sink",
+                3,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain: BodyDrain::PerFrame,
+                },
+            )])
+        };
+        let held = verify_unrestored(
+            &relay(holds(vec![EPOCH, EPOCH + 2 * MS, EPOCH + 5 * MS])),
             &steps,
             &[],
             STAMPED,
-            &resumed,
-            &PassStops::none(),
         );
-        assert_eq!(findings_of(&report), vec![finding("relay", 1, 1, 0)]);
+        assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+        let short = verify_unrestored(
+            &relay(holds(vec![EPOCH, EPOCH + 2 * MS])),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&short), vec![finding("relay", 1, 1, 0)]);
     }
 
     /// A resumed pass knows nothing of the slot before its consumer reads it
     /// empty, so frames sent in the pass do not prove a hold: at depth 1 a
     /// fire at step 0 then a pop left unfired at step 1 is a finding, and at
-    /// depth 2 two fires then a pop left unfired at step 2. From the pass's
+    /// depth 2 two fires then a pop left unfired at step 2, with the anchor
+    /// step's clock stated before the pass's first step. From the pass's
     /// start each of those slots is full and reads clean.
     #[test]
     fn a_resumed_slot_is_unknown_until_its_consumer_reads_it_empty() {
         let resumed = PassRestore::from_sync_heads(BTreeMap::new())
-            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
+            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]))
+            .with_anchor_prev_target(Some(EPOCH - MS));
         for (depth, rows, step) in [
             (1, vec![(0, 1, 1, 0), (1, 1, 0, 0)], 1),
             (2, vec![(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0)], 2),
