@@ -117,7 +117,7 @@
 //! block scalar, owe the guard exactly as much as a job with a one-line `if:`.
 //! Whether a guarded job is PR-blocking is a separate question, decided by
 //! `job_is_gated` and pinned by
-//! `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+//! `the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking`.
 //!
 //! THE BASE, PROBED BEFORE THE DIFF READS IT. The classifier's step resolves a
 //! base, then diffs `$BASE...HEAD` for the changed paths. An empty base turns
@@ -158,6 +158,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+mod ci_test_line;
+use ci_test_line::{line_runs_tests_of, logical_lines};
 
 /// Packages that have tests and are deliberately NOT named in a CI test step.
 ///
@@ -295,12 +298,14 @@ fn jobs_of(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The ONE job-level condition this walk sanctions, spelled whole.
+/// One of the two job-level conditions this walk sanctions, spelled whole;
+/// [`ALWAYS_CALL`] is the other.
 ///
 /// A job-level `if:` normally disqualifies a job outright: it can stop the job
 /// on a pull request, and a package covered only there is covered by nothing.
-/// `!cancelled()` is the exception and it is the exception for the OPPOSITE
-/// reason: it exists so the job runs when a job it `needs:` FAILED. GitHub
+/// `!cancelled()` is the exception, and `always()` beside it (see
+/// [`ALWAYS_CALL`]), and they are the exceptions for the OPPOSITE reason: they
+/// exist so the job runs when a job it `needs:` FAILED. GitHub
 /// skips a dependant of a failed job, a skipped required context counts as
 /// satisfied, and a pull request would then merge with that job's contexts
 /// never run. So a job carrying exactly this condition runs on every pull
@@ -338,7 +343,9 @@ fn job_if_of(block: &str) -> Option<Result<String, String>> {
 fn job_is_gated(block: &str) -> bool {
     match job_if_of(block) {
         None => false,
-        Some(Ok(cond)) => cond.trim() != JOB_IF_NOT_CANCELLED,
+        Some(Ok(cond)) => {
+            cond.trim() != JOB_IF_NOT_CANCELLED && condition_expression(&cond) != ALWAYS_CALL
+        }
         Some(Err(why)) => panic!(
             "{why}\n\nThe walk cannot say whether this JOB runs on a pull \
              request, so it refuses to guess. Spell the job's `if:` as a \
@@ -1326,55 +1333,15 @@ fn pr_blocking_workflow_texts() -> BTreeMap<String, String> {
     out
 }
 
-/// Does ONE command line name `pkg` as a package it runs tests for?
-///
-/// Two forms, and EVERY package on the line counts in both:
-///
-///   * `cargo test … -p a -p b …` — the ordinary one. Reading
-///     only the package after the FIRST `-p` would leave the `b` of
-///     `cargo test -p a -p b` uncovered. Every
-///     `-p` / `--package` occurrence after `cargo test` is read, in every
-///     spelling cargo accepts (`-p x`, `-px`, `--package x`, `--package=x`).
-///   * `ci_test_shard.sh <pkg> …` — the sharded form
-///     (`tools/scripts/ci_test_shard.sh`, used by the `cerulion_core` legs of
-///     `test-linux` / `test-macos`): the script takes the package name as its
-///     first argument precisely so the name stays LITERALLY present in the
-///     workflow and this walk keeps working across the split.
-///
-/// Matching is by WHOLE WHITESPACE TOKEN, which is what keeps `cerulion_viz`
-/// and `cerulion_vizd` apart: a plain `contains` would report `cerulion_viz`
-/// covered by the `cerulion_vizd` step and vice versa.
-fn line_names_package(line: &str, pkg: &str) -> bool {
-    if let Some(pos) = line.find("ci_test_shard.sh ") {
-        let tail = &line[pos + "ci_test_shard.sh ".len()..];
-        if tail.split_whitespace().next() == Some(pkg) {
-            return true;
-        }
-    }
-    let Some(pos) = line.find("cargo test") else {
-        return false;
-    };
-    let mut it = line[pos..].split_whitespace();
-    while let Some(tok) = it.next() {
-        let named = match tok {
-            "-p" | "--package" => it.next() == Some(pkg),
-            _ => tok
-                .strip_prefix("--package=")
-                .or_else(|| tok.strip_prefix("-p"))
-                .is_some_and(|rest| rest == pkg),
-        };
-        if named {
-            return true;
-        }
-    }
-    false
-}
-
 /// The first PR-blocking workflow whose text names `pkg` in a test command.
 fn workflows_name(texts: &BTreeMap<String, String>, pkg: &str) -> Option<String> {
     texts
         .iter()
-        .find(|(_, text)| text.lines().any(|l| line_names_package(l, pkg)))
+        .find(|(_, text)| {
+            logical_lines(text.lines())
+                .iter()
+                .any(|l| line_runs_tests_of(l, pkg))
+        })
         .map(|(file, _)| file.clone())
 }
 
@@ -3081,6 +3048,169 @@ fn every_package_named_in_one_step_is_credited() {
     assert!(workflows_name(&build_only, "buildonly").is_none());
 }
 
+/// `cargo nextest run` credits its packages like `cargo test` does, and a
+/// command that runs none of a package's unit or integration tests credits
+/// nothing: `--doc` runs only doctests, `--no-run` runs no test, and `list` /
+/// `archive` are not runs. Each row is `(line, package, credited?)`, written by
+/// hand.
+#[test]
+fn a_nextest_run_credits_its_packages_and_a_doc_or_no_run_step_credits_none() {
+    const ROWS: &[(&str, &str, bool)] = &[
+        // nextest, in every package spelling the cargo form takes.
+        (
+            "        run: cargo nextest run --profile ci -p alpha -E 'not kind(lib)'",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "beta",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "gamma",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "delta",
+            true,
+        ),
+        (
+            "        run: cargo nextest run -p alpha -p beta --package gamma --package=delta -pepsilon",
+            "epsilon",
+            true,
+        ),
+        // The whole-token rule holds for nextest too.
+        ("        run: cargo nextest run -p alphab", "alpha", false),
+        // nextest subcommands that run nothing.
+        ("        run: cargo nextest list -p alpha", "alpha", false),
+        (
+            "        run: cargo nextest archive -p alpha --archive-file a.tar.zst",
+            "alpha",
+            false,
+        ),
+        // A step's `name:` is a label, not an invocation.
+        ("      - name: cargo nextest run -p alpha", "alpha", false),
+        ("        name: cargo test -p alpha", "alpha", false),
+        // Steps that run none of the package's ordinary tests.
+        ("        run: cargo test -p alpha --doc", "alpha", false),
+        ("        run: cargo test --doc -p alpha", "alpha", false),
+        ("        run: cargo test -p alpha --no-run", "alpha", false),
+        ("        run: cargo nextest run -p alpha --no-run", "alpha", false),
+        // What follows a bare `--` goes to the test binaries, not to cargo.
+        (
+            "        run: cargo test -p alpha -- --exact -p beta",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha -- --test-threads=1",
+            "alpha",
+            true,
+        ),
+        ("        run: cargo test -p alpha -- --doc", "alpha", true),
+        // Each shell command is read on its own: a `--doc` command does not
+        // cancel the run beside it, and a `-p` of a build command is not a test.
+        (
+            "        run: cargo test -p alpha --lib && cargo test -p alpha --doc",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha --doc && cargo nextest run -p alpha",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha && cargo build -p beta",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cd examples/x && cargo test -p alpha --lib -- --test-threads=1",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p alpha || cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "beta",
+            true,
+        ),
+        (
+            "        run: cargo test -p alpha --doc | tee log; cargo test -p beta",
+            "alpha",
+            false,
+        ),
+        // A `;` glued to a word still ends the command.
+        (
+            "        run: cargo build -p alpha; cargo test -p beta --doc",
+            "beta",
+            false,
+        ),
+        (
+            "        run: cargo test -p alpha; cargo build -p beta",
+            "alpha",
+            true,
+        ),
+        (
+            "        run: cargo build -p x && ./tools/scripts/ci_test_shard.sh alpha 0 4",
+            "alpha",
+            true,
+        ),
+    ];
+    let wrong: Vec<String> = ROWS
+        .iter()
+        .filter(|(line, pkg, credited)| line_runs_tests_of(line, pkg) != *credited)
+        .map(|(line, pkg, credited)| format!("  `{line}` credits `{pkg}`: expected {credited}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the test-line reader disagrees with the hand oracle:\n{}",
+        wrong.join("\n")
+    );
+
+    // End to end through the gate's own lookup: a package whose ONLY step is a
+    // doctest run is uncovered.
+    let doc_only: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "      - run: cargo test -p doconly --doc\n".to_string(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(workflows_name(&doc_only, "doconly").is_none());
+
+    // A `\` continuation belongs to the command it continues, so a flag on
+    // the next line counts, and so does a package named there.
+    let continued: BTreeMap<String, String> = [(
+        "fake.yml".to_string(),
+        "        run: |\n          cargo test -p norun \\\n            --no-run\n          \
+         cargo nextest run --profile ci \\\n            -p later\n"
+            .to_string(),
+    )]
+    .into_iter()
+    .collect();
+    assert!(workflows_name(&continued, "norun").is_none());
+    assert!(workflows_name(&continued, "later").is_some());
+
+    // A `\` followed by a space escapes the space and continues nothing, and
+    // a comment is never continued.
+    assert_eq!(
+        logical_lines(["cargo test -p a \\ ", "--no-run"]),
+        vec!["cargo test -p a \\ ".to_string(), "--no-run".to_string()]
+    );
+    assert_eq!(
+        logical_lines(["# note \\", "cargo test -p a"]),
+        vec!["# note \\".to_string(), "cargo test -p a".to_string()]
+    );
+}
+
 /// The `shard:` matrix is read in BOTH YAML list forms, and per JOB.
 #[test]
 fn the_shard_matrix_is_read_in_both_yaml_forms_and_per_job() {
@@ -3948,6 +4078,9 @@ fn a_gated_step_without_its_marker_is_a_red_walker() {
 /// own.
 const GUARD_CALL: &str = "!cancelled()";
 const GUARD_CALL_AND: &str = "!cancelled() && ";
+/// The condition that runs a job on every outcome of its dependencies and on a
+/// cancelled run, so it gates no event either.
+const ALWAYS_CALL: &str = "always()";
 
 /// One condition as a single normalised expression: the `${{ }}` wrapper off,
 /// runs of whitespace down to one space.
@@ -3966,12 +4099,13 @@ fn condition_expression(cond: &str) -> String {
 /// Does this job condition keep the job running when a job it `needs:` FAILED?
 ///
 /// Exactly `!cancelled()`, or `!cancelled()` as the FIRST term of an `&&`
-/// chain, which is `deb-smoke`'s shape. Nothing else: `success() &&
-/// !cancelled()` carries the call and still skips on a failed dependency,
-/// which is the whole fault.
+/// chain, which is `deb-smoke`'s shape, or exactly `always()`, which also runs
+/// the job on a cancelled run and is the aggregator `Lint`'s shape. Nothing
+/// else: `success() && !cancelled()` carries the call and still skips on a
+/// failed dependency, which is the whole fault.
 fn condition_survives_a_failed_dependency(cond: &str) -> bool {
     let expr = condition_expression(cond);
-    expr == GUARD_CALL || expr.starts_with(GUARD_CALL_AND)
+    expr == GUARD_CALL || expr == ALWAYS_CALL || expr.starts_with(GUARD_CALL_AND)
 }
 
 /// Every dependant of the classifier that does NOT guard itself against the
@@ -4041,7 +4175,7 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
         complaints.is_empty(),
         "these jobs depend on the `{SELECTION_JOB}` job, or gate a step on the \
          selection, and their job-level `if:` does not open with \
-         `{GUARD_CALL}`:\n{}\n\nGitHub skips a dependant of a FAILED job and a \
+         `{GUARD_CALL}` (or read exactly `{ALWAYS_CALL}`):\n{}\n\nGitHub skips a dependant of a FAILED job and a \
          skipped required context reads as satisfied, so without the guard a \
          classifier failure is a silent green around every context these jobs \
          report. `{JOB_IF_NOT_CANCELLED}` is the shape a job with no gate of its \
@@ -4051,9 +4185,11 @@ fn every_job_that_gates_a_step_on_the_selection_guards_itself() {
     );
     assert!(
         guarded >= 6,
-        "only {guarded} job(s) carry the guard: every job that gates steps on \
-         the selection needs it, and so does every dependant reporting a \
-         required context, so either the reader is broken or a guard is gone"
+        "only {guarded} job(s) carry exactly `{JOB_IF_NOT_CANCELLED}`: every job \
+         that gates steps on the selection opens its condition with the guard, \
+         and so does every dependant reporting a required context other than \
+         the `{ALWAYS_CALL}` aggregator, so either the reader is broken or a \
+         guard is gone"
     );
     // The population is not empty, so an emptied reader is not a pass. Five
     // jobs of `ci.yml` need the classifier today.
@@ -4096,7 +4232,7 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
     // A condition that OPENS with the call keeps the job running when the
     // classifier failed, so it satisfies THIS rule; whether such a job is
     // PR-blocking is the separate question `job_is_gated` decides, pinned by
-    // `the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking`.
+    // `the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking`.
     assert_eq!(
         jobs_missing_the_not_cancelled_guard(&job(
             "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}\n"
@@ -4185,16 +4321,27 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
     );
 }
 
-/// A job carrying exactly `!cancelled()` still credits its packages, and one
-/// carrying any other job-level condition still does not.
+/// A job carrying exactly `!cancelled()` or `always()` still credits its
+/// packages, and so does a job that needs it; one carrying any other job-level
+/// condition still does not.
 #[test]
-fn the_not_cancelled_guard_is_the_only_job_condition_that_keeps_a_job_pr_blocking() {
+fn the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking() {
     let body = "    steps:\n      - name: alpha tests\n        run: cargo test -p alpha\n";
     let with = format!("  j:\n    if: {JOB_IF_NOT_CANCELLED}\n{body}");
     let without = format!("  j:\n{body}");
+    let always = format!("  j:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n{body}");
+    let after_always = format!(
+        "  agg:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n    steps:\n      - run: true\n  \
+         j:\n    needs: [agg]\n{body}"
+    );
     let other = format!("  j:\n    if: github.event_name == 'push'\n{body}");
 
-    for (name, text) in [("guarded", &with), ("ungated", &without)] {
+    for (name, text) in [
+        ("guarded", &with),
+        ("ungated", &without),
+        ("always", &always),
+        ("needs-an-always", &after_always),
+    ] {
         assert!(
             pr_blocking_jobs(text).contains("cargo test -p alpha"),
             "the {name} job must stay in the PR-blocking view"
@@ -4225,7 +4372,7 @@ const SHARD_CHECK_RUN: &str = "./tools/scripts/ci_test_shard.sh --check";
 /// keeps its name and its script and stops running on a pull request, which is
 /// the one property the step exists for.
 const SHARD_CHECK_WORKFLOW: &str = "ci.yml";
-const SHARD_CHECK_JOB: &str = "lint";
+const SHARD_CHECK_JOB: &str = "lint-gates";
 
 /// Is this run script the shipped invocation, WHOLE?
 ///
@@ -4334,8 +4481,9 @@ fn shard_check_complaints_in(texts: &BTreeMap<String, String>) -> Vec<String> {
         .collect()
 }
 
-/// The shard check runs on every pull request, in the `lint` job of `ci.yml`,
-/// under a named step, with the invocation the script documents.
+/// The shard check runs on every pull request, in the `lint-gates` job of
+/// `ci.yml` (a part of the required `Lint`), under a named step, with the
+/// invocation the script documents.
 ///
 /// WHY A TEST HOLDS A WORKFLOW STEP. `ci_test_shard.sh --check` carries the
 /// proof that the partition is total and disjoint AND the hand table its
@@ -4381,7 +4529,7 @@ fn the_shard_check_rule_reads_the_main_workflow_and_no_other() {
     };
 
     // (a) THE STEP IN ANOTHER WORKFLOW COVERS NOTHING. `release.yml` carries
-    //     it in a job named `lint` with the shipped shape, so a rule that
+    //     it in a job named like the shard-check job, with the shipped shape, so a rule that
     //     searched every file would read it and pass; the file this rule reads
     //     carries no such step, and that is what is said.
     let elsewhere = tree(Some(bare), &carrying);
@@ -4505,7 +4653,7 @@ fn a_shard_check_step_outside_a_blocking_lint_job_is_named() {
          {complaints:?}"
     );
 
-    // The job id alone is not the rule: `lint` behind an event test is still a
+    // The job id alone is not the rule: the shard-check job behind an event test is still a
     // job the check does not run in on a pull request.
     let gated = format!(
         "jobs:\n  {SHARD_CHECK_JOB}:\n    if: github.event_name != 'pull_request'\n    \
@@ -5024,7 +5172,7 @@ fn events_a_job_skips(block: &str, triggers: &BTreeSet<String>) -> Vec<Skip> {
         ),
     };
     let expr = condition_expression(&cond);
-    let tail = if expr == GUARD_CALL {
+    let tail = if expr == GUARD_CALL || expr == ALWAYS_CALL {
         String::new()
     } else if let Some(tail) = expr.strip_prefix(GUARD_CALL_AND) {
         tail.to_string()
@@ -5232,18 +5380,59 @@ struct RequiredJobWalk {
     dependants: usize,
     /// Which required contexts a job of this workflow reports by name.
     produced: BTreeSet<String>,
+    /// How many jobs are judged because a required job needs them.
+    needed: usize,
+}
+
+/// The ids of the jobs a required context depends on: every job that `needs:`
+/// reaches, transitively, from a job in `required`. A required aggregator such
+/// as `Lint` reports its parts' results under its own name, so a part is held
+/// to the same rules as the job that reports it.
+fn jobs_required_jobs_need(
+    jobs: &[(String, String)],
+    required: &BTreeSet<String>,
+) -> BTreeSet<String> {
+    let mut reached: BTreeSet<String> = BTreeSet::new();
+    let mut frontier: Vec<String> = required.iter().cloned().collect();
+    while let Some(id) = frontier.pop() {
+        let Some((_, block)) = jobs.iter().find(|(name, _)| *name == id) else {
+            continue;
+        };
+        for need in job_needs_of(block) {
+            let exists = jobs.iter().any(|(name, _)| *name == need);
+            if exists && !required.contains(&need) && reached.insert(need.clone()) {
+                frontier.push(need);
+            }
+        }
+    }
+    reached
 }
 
 /// Walk one workflow: pair every job name against the required contexts, then
 /// measure the job's own condition, its steps' conditions and its `needs:` set
-/// against the workflow's triggers.
+/// against the workflow's triggers. A job a required job `needs:` (see
+/// [`jobs_required_jobs_need`]) is measured the same way.
 fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> RequiredJobWalk {
     let triggers = workflow_trigger_events(file, text);
     let mut walk = RequiredJobWalk::default();
-    for (job, block) in jobs_of(text) {
+    let all_jobs = jobs_of(text);
+    let mut required_ids: BTreeSet<String> = BTreeSet::new();
+    for (job, block) in &all_jobs {
+        let name = job_reported_name(job, block);
+        let legs = job_matrix_legs(block);
+        if contexts
+            .iter()
+            .any(|context| name_produces_context(&name, context, &legs).unwrap_or(true))
+        {
+            required_ids.insert(job.clone());
+        }
+    }
+    let needed = jobs_required_jobs_need(&all_jobs, &required_ids);
+    walk.needed = needed.len();
+    for (job, block) in all_jobs {
         let name = job_reported_name(&job, &block);
         let legs = job_matrix_legs(&block);
-        let mut paired = false;
+        let mut paired = needed.contains(&job);
         for context in contexts {
             let produces = name_produces_context(&name, context, &legs).unwrap_or_else(|why| {
                 panic!(
@@ -5316,7 +5505,8 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
             if !guarded {
                 walk.unguarded.push(format!(
                     "  {file} / {job} (\"{name}\") needs {needs:?} and its \
-                     job-level `if:` does not open with `{GUARD_CALL}`"
+                     job-level `if:` does not open with `{GUARD_CALL}` or read \
+                     exactly `{ALWAYS_CALL}`"
                 ));
             }
         }
@@ -5340,6 +5530,249 @@ fn walk_required_context_jobs(file: &str, text: &str, contexts: &[String]) -> Re
         }
     }
     walk
+}
+
+/// The transitive walk over `needs:`, on a hand-written job list: every job a
+/// required job reaches is returned once, through chains and around a cycle,
+/// a required job is never returned as needed, and a need naming no job adds
+/// nothing.
+#[test]
+fn the_jobs_a_required_job_needs_are_found_through_every_chain() {
+    let text = "jobs:\n  r:\n    needs: [a, r2]\n    steps: []\n  \
+                r2:\n    needs: [b, ghost]\n    steps: []\n  \
+                a:\n    needs: [c]\n    steps: []\n  \
+                b:\n    steps: []\n  \
+                c:\n    needs: [a]\n    steps: []\n  \
+                lone:\n    needs: [r]\n    steps: []\n";
+    let jobs = jobs_of(text);
+    assert_eq!(jobs.len(), 6, "the fixture parses into six jobs: {jobs:?}");
+    let required: BTreeSet<String> = ["r", "r2"].iter().map(|s| s.to_string()).collect();
+    let needed = jobs_required_jobs_need(&jobs, &required);
+    let want: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        needed, want,
+        "`a` and `b` directly, `c` through `a`, the cycle back to `a` once, \
+         `r2` not at all (it is required), `ghost` not at all (no such job), \
+         `lone` not at all (it needs a required job, no required job needs it)"
+    );
+    let none: BTreeSet<String> = BTreeSet::new();
+    assert!(
+        jobs_required_jobs_need(&jobs, &none).is_empty(),
+        "with no required job nothing is needed"
+    );
+}
+
+/// The jobs `Lint` reports: its three parts.
+const LINT_PARTS: &[&str] = &["lint-clippy", "lint-fmt", "lint-gates"];
+
+/// `Lint` is an aggregator: it needs every part, runs when one failed, and its
+/// one step fails unless every part SUCCEEDED. The step hands each part's
+/// result to its script as one environment variable, and the script is run
+/// here with bash alone over each result a part can carry, so a check that
+/// read `skipped` or `cancelled` as passing, ignored a part, or passed a part
+/// missing from `needs` (an empty result) is a red.
+#[cfg(unix)]
+#[test]
+fn the_lint_aggregator_fails_unless_every_part_succeeded() {
+    let texts = workflow_texts();
+    let text = texts.get("ci.yml").expect("ci.yml is readable");
+    let jobs = jobs_of(text);
+    let (_, block) = jobs
+        .iter()
+        .find(|(id, _)| id == "lint")
+        .expect("ci.yml has a `lint` job");
+    assert_eq!(
+        job_reported_name("lint", block),
+        "Lint",
+        "the aggregator must report the required context `Lint`"
+    );
+    let mut needs = job_needs_of(block);
+    needs.sort();
+    assert_eq!(needs, LINT_PARTS, "`Lint` must need exactly its parts");
+    assert!(
+        matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL),
+        "`Lint` must carry `${{{{ {ALWAYS_CALL} }}}}` so a failed part and a cancelled run \
+         still run it"
+    );
+    for part in LINT_PARTS {
+        let (_, part_block) = jobs
+            .iter()
+            .find(|(id, _)| id == part)
+            .unwrap_or_else(|| panic!("ci.yml has no `{part}` job"));
+        assert!(
+            job_if_of(part_block).is_none() && job_needs_of(part_block).is_empty(),
+            "`{part}` must carry no job condition and no needs, so it runs on every event"
+        );
+    }
+    let steps = step_blocks(block);
+    assert_eq!(steps.len(), 1, "`Lint` runs one step, the check");
+    // Each part's result reaches the script as `VAR: ${{ needs.<part>.result }}`
+    // in the step's `env:`, one variable per part and every part once.
+    let mut result_vars: Vec<(String, String)> = Vec::new();
+    for line in &steps[0] {
+        if !line.contains("needs.") || line.trim_start().starts_with('#') {
+            continue;
+        }
+        let (var, value) = line
+            .trim()
+            .split_once(": ")
+            .unwrap_or_else(|| panic!("`Lint` reads `needs` outside its `env:`: {line:?}"));
+        let part = value
+            .strip_prefix("${{ needs.")
+            .and_then(|rest| rest.strip_suffix(".result }}"))
+            .unwrap_or_else(|| {
+                panic!("`Lint` must hand a part's result alone to an env var: {line:?}")
+            });
+        result_vars.push((part.to_string(), var.to_string()));
+    }
+    result_vars.sort();
+    let parts_read: Vec<&str> = result_vars.iter().map(|(part, _)| part.as_str()).collect();
+    assert_eq!(
+        parts_read, LINT_PARTS,
+        "`Lint` must read the result of every part, once each"
+    );
+    let script = run_script_of(&steps[0]).expect("the check has a `run:` script");
+    // `run_script_of` keeps the text after `run:` on its first line, which for a
+    // literal block is the `|` indicator, not a command.
+    let script = match script.split_once('\n') {
+        Some((head, body)) if head.trim() == "|" => body.to_string(),
+        _ => script,
+    };
+
+    // Runs the script with every part succeeded except the one `failing` names,
+    // whose variable carries the given result, or is left unset for `None`.
+    let run = |failing: Option<(&str, Option<&str>)>| -> bool {
+        let mut command = std::process::Command::new("bash");
+        command.arg("-c").arg(&script);
+        for (part, var) in &result_vars {
+            match failing {
+                Some((bad_part, bad)) if bad_part == part.as_str() => match bad {
+                    Some(result) => command.env(var, result),
+                    None => command.env_remove(var),
+                },
+                _ => command.env(var, "success"),
+            };
+        }
+        command
+            .output()
+            .expect("bash runs the aggregator's check")
+            .status
+            .success()
+    };
+    assert!(run(None), "three successes pass");
+    // An empty result is what GitHub hands over for a part missing from `needs`.
+    for bad in ["failure", "cancelled", "skipped", ""] {
+        for part in LINT_PARTS {
+            assert!(
+                !run(Some((*part, Some(bad)))),
+                "`{part}` ending `{bad}` must red `Lint`"
+            );
+        }
+    }
+    for part in LINT_PARTS {
+        assert!(
+            !run(Some((*part, None))),
+            "`{part}` with no result variable set must red `Lint`"
+        );
+    }
+}
+
+/// The longest `timeout-minutes` a job-level `always()` job may carry.
+const ALWAYS_JOB_MAX_MINUTES: u32 = 5;
+
+/// The jobs whose job-level condition is exactly `always()` and that check out
+/// the tree, run cargo, or carry no `timeout-minutes` of at most
+/// [`ALWAYS_JOB_MAX_MINUTES`]. The time limit bounds the runner time however
+/// the work is spelled; the checkout and cargo markers name the usual cause.
+fn always_jobs_that_do_work(text: &str) -> Vec<String> {
+    jobs_of(text)
+        .into_iter()
+        .filter(|(_, block)| {
+            matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL)
+        })
+        .filter(|(_, block)| {
+            let short = block.lines().any(|line| {
+                line.strip_prefix("    timeout-minutes:")
+                    .and_then(|v| v.trim().parse::<u32>().ok())
+                    .is_some_and(|minutes| minutes <= ALWAYS_JOB_MAX_MINUTES)
+            });
+            !short
+                || block.contains("actions/checkout@")
+                || step_blocks(block)
+                    .iter()
+                    .any(|step| run_script_of(step).is_some_and(|run| run.contains("cargo ")))
+        })
+        .map(|(job, _)| job)
+        .collect()
+}
+
+/// A job-level `always()` sits only on a short job that checks out and builds
+/// nothing. The guard rules accept `always()`, and GitHub does not cancel a
+/// running job whose condition is `always()`, so a test shard behind it would
+/// keep its runner through every superseded push and every cancel.
+#[test]
+fn a_job_level_always_sits_only_on_a_short_job_that_builds_nothing() {
+    let mut carriers = 0usize;
+    let mut complaints: Vec<String> = Vec::new();
+    for (file, text) in workflow_texts() {
+        carriers += jobs_of(&text)
+            .iter()
+            .filter(|(_, block)| {
+                matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL)
+            })
+            .count();
+        for job in always_jobs_that_do_work(&text) {
+            complaints.push(format!("  {file} / {job}"));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "these jobs carry `{ALWAYS_CALL}` and check out the tree, run cargo or \
+         carry no `timeout-minutes` of at most {ALWAYS_JOB_MAX_MINUTES}:\n{}\n\nA \
+         running `{ALWAYS_CALL}` job is not cancelled with its run, so it holds its \
+         runner after every superseded push. Use `{JOB_IF_NOT_CANCELLED}`, which \
+         also runs the job when a dependency failed.",
+        complaints.join("\n")
+    );
+    assert!(
+        carriers >= 1,
+        "no job carries `{ALWAYS_CALL}`: the `Lint` aggregator does, so the reader \
+         is no longer finding it"
+    );
+    let job = |steps: &str| {
+        format!(
+            "jobs:\n  j:\n    if: ${{{{ {ALWAYS_CALL} }}}}\n    timeout-minutes: 5\n    \
+             steps:\n{steps}"
+        )
+    };
+    assert_eq!(
+        always_jobs_that_do_work(&job(
+            "      - uses: actions/checkout@v4\n      - run: echo ok\n"
+        )),
+        vec!["j".to_string()],
+        "a checkout is work"
+    );
+    assert_eq!(
+        always_jobs_that_do_work(&job("      - run: cargo test -p alpha\n")),
+        vec!["j".to_string()],
+        "a cargo step is work"
+    );
+    assert!(
+        always_jobs_that_do_work(&job("      - run: echo ok\n")).is_empty(),
+        "a step that reads results is not"
+    );
+    let unbounded = job("      - run: echo ok\n").replace("    timeout-minutes: 5\n", "");
+    assert_eq!(
+        always_jobs_that_do_work(&unbounded),
+        vec!["j".to_string()],
+        "a job with no time limit is held to the default six hours"
+    );
+    let long = job("      - run: echo ok\n").replace("timeout-minutes: 5", "timeout-minutes: 6");
+    assert_eq!(
+        always_jobs_that_do_work(&long),
+        vec!["j".to_string()],
+        "a limit above {ALWAYS_JOB_MAX_MINUTES} minutes is refused"
+    );
 }
 
 /// No job reporting a required context can skip: not on an event its own
@@ -5375,6 +5808,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
     let mut pull_request_only_steps = 0usize;
     let mut all_pull_request_only_jobs = 0usize;
     let mut dependants = 0usize;
+    let mut needed = 0usize;
     let mut produced: BTreeSet<String> = BTreeSet::new();
     for (file, text) in workflow_texts() {
         let walk = walk_required_context_jobs(&file, &text, &contexts);
@@ -5388,6 +5822,7 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         pull_request_only_steps += walk.pull_request_only_steps;
         all_pull_request_only_jobs += walk.all_pull_request_only_jobs;
         dependants += walk.dependants;
+        needed += walk.needed;
         produced.extend(walk.produced);
     }
     assert!(
@@ -5428,16 +5863,16 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         triggers.join("\n")
     );
     // The populations are not empty, so a reader that pairs nothing is not a
-    // pass: ten jobs of ci.yml and three of leak-guard.yml carry these names,
-    // all thirteen carry steps, and six of them list a `needs:` set.
+    // pass: eleven jobs of ci.yml and three of leak-guard.yml carry these
+    // names, all fourteen carry steps, and six of them list a `needs:` set.
     assert!(
-        judged >= 13,
-        "only {judged} job(s) carry a name that produces a required context: \
-         the rules above are judging a population the reader is no longer \
-         finding"
+        judged >= 18,
+        "only {judged} job(s) carry a name that produces a required context \
+         or are needed by one: the rules above are judging a population the \
+         reader is no longer finding"
     );
     assert!(
-        step_judged >= 13,
+        step_judged >= 18,
         "only {step_judged} judged job(s) carry steps: the step rule is judging \
          a population the reader is no longer finding"
     );
@@ -5460,6 +5895,17 @@ fn a_required_context_job_never_skips_on_an_event_its_workflow_triggers_on() {
         dependants >= 6,
         "only {dependants} judged job(s) list a `needs:` set: the guard rule is \
          judging a population the reader is no longer finding"
+    );
+    // `Lint` reports its three parts' results, and `period-park`, both test
+    // shard jobs, `crate-tests` and `viz-tests` need the path classifier
+    // `changes`, so those four jobs are judged too: the `judged` and
+    // `step_judged` floors above count them beside the fourteen jobs that
+    // carry a required name.
+    assert!(
+        needed >= 4,
+        "only {needed} job(s) are judged because a required job needs them: \
+         the three parts of `Lint` and `changes` are, so the transitive walk \
+         is no longer finding them"
     );
     // And the export is not stale in the other direction: a context no job
     // reports by name is a context nothing can ever red.
@@ -6480,4 +6926,199 @@ fn all_workflow_texts() -> BTreeMap<String, String> {
     }
     assert!(!out.is_empty(), "no workflow files under {}", dir.display());
     out
+}
+
+// ---------------------------------------------------------------------------
+// The harness path rule, per path and per event, and the harness job.
+// ---------------------------------------------------------------------------
+
+/// The job id of the job that checks the `harness/` folder.
+const HARNESS_JOB: &str = "harness";
+
+/// What one classifier run printed: the `selection: reason=` token and every
+/// `<class>=<value>` line, by class name.
+#[cfg(unix)]
+struct ClassifierAnswer {
+    reason: String,
+    classes: BTreeMap<String, String>,
+}
+
+/// `tools/scripts/ci_changed_paths.sh` on `paths`, with the event and the
+/// switch set explicitly, so the job environment of a CI run reaches neither.
+#[cfg(unix)]
+fn run_classifier(event: &str, switch: &str, paths: &[&str]) -> ClassifierAnswer {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let script = repo_root().join("tools/scripts/ci_changed_paths.sh");
+    let mut child = Command::new("bash")
+        .arg(&script)
+        .env("GITHUB_EVENT_NAME", event)
+        .env("CI_SELECTION", switch)
+        .current_dir(repo_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("running {}: {e}", script.display()));
+    let input: String = paths.iter().map(|p| format!("{p}\n")).collect();
+    child
+        .stdin
+        .take()
+        .expect("the classifier's stdin is piped")
+        .write_all(input.as_bytes())
+        .unwrap_or_else(|e| panic!("writing the changed paths to the classifier: {e}"));
+    let out = child
+        .wait_with_output()
+        .unwrap_or_else(|e| panic!("waiting for the classifier: {e}"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "[{event} {switch}] {paths:?}: the classifier failed\nstdout:\n{stdout}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut reason = None;
+    let mut classes = BTreeMap::new();
+    for line in stdout.lines() {
+        if let Some(token) = line.strip_prefix("selection: reason=") {
+            reason = Some(token.to_string());
+        } else if let Some((class, value)) = line.split_once('=') {
+            classes.insert(class.to_string(), value.to_string());
+        }
+    }
+    ClassifierAnswer {
+        reason: reason.unwrap_or_else(|| {
+            panic!("[{event} {switch}] {paths:?}: no `selection: reason=` line in\n{stdout}")
+        }),
+        classes,
+    }
+}
+
+/// The harness path rule, evaluated per path and per event against
+/// hand-written answers.
+///
+/// A harness-only change selects no package on a pull request AND on a merge
+/// group; a harness path beside any other path selects every package; a
+/// `push` or a dispatch selects every package whatever it touched; and the
+/// switch stops the rule on both events it applies to.
+///
+/// Each row is `<event>|<switch>|<paths>|<code>|<pkgs>|<reason>`,
+/// `,` separating paths. `<pkgs>` is `[]`, `every` for the array a `push` run
+/// prints, or a package name: neither of those, and holding that package.
+#[cfg(unix)]
+#[test]
+fn the_harness_path_rule_is_evaluated_per_path_and_per_event() {
+    const ROWS: &[&str] = &[
+        "pull_request|on|harness/install.sh|false|[]|harness",
+        "pull_request|on|harness/install.sh,harness/tests/test_pins.py|false|[]|harness",
+        "pull_request|on|harness/README.md|false|[]|docs:md,harness",
+        "pull_request|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|harness-mixed",
+        "pull_request|on|harness/install.sh,README.md|true|every|harness-mixed",
+        "pull_request|on|harness/Cargo.toml|true|every|workspace-input:Cargo.toml",
+        "pull_request|on|harnessx/install.sh|true|every|unknown-path",
+        "pull_request|on|crates/cerulion_viz/bin/cerulion_vizd/src/harness/mod.rs\
+         |true|cerulion_vizd|crates:cerulion_vizd",
+        "pull_request|on||false|[]|none",
+        "pull_request|off|harness/install.sh|true|every|switch:off",
+        "merge_group|on|harness/install.sh|false|[]|harness",
+        "merge_group|on|harness/install.sh,crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|event:merge_group",
+        "merge_group|on|crates/cerulion_viz/bin/cerulion_vizd/src/main.rs\
+         |true|every|event:merge_group",
+        "merge_group|on||true|every|event:merge_group",
+        "merge_group|off|harness/install.sh|true|every|switch:off",
+        "push|on|harness/install.sh|true|every|event:push",
+        "workflow_dispatch|on|harness/install.sh|true|every|event:workflow_dispatch",
+    ];
+
+    // The whole-workspace array, read once off a run every rule answers with
+    // everything, and floored so an empty listing cannot stand in for it.
+    let every = run_classifier("push", "on", &["Cargo.lock"])
+        .classes
+        .get("pkgs")
+        .cloned()
+        .expect("a push run prints `pkgs=`");
+    assert!(
+        every.starts_with('[')
+            && every.matches('"').count() >= 40
+            && every.contains("\"cerulion_core\""),
+        "the every-member array reads `{every}`: the listing is not reaching the workspace"
+    );
+
+    let mut complaints = Vec::new();
+    for row in ROWS {
+        let fields: Vec<&str> = row.split('|').collect();
+        let [event, switch, paths, code, pkgs, reason] = fields[..] else {
+            panic!("the row `{row}` does not carry six fields");
+        };
+        let paths: Vec<&str> = paths.split(',').filter(|p| !p.is_empty()).collect();
+        let got = run_classifier(event, switch, &paths);
+        let class = |name: &str| got.classes.get(name).cloned().unwrap_or_default();
+        let got_pkgs = class("pkgs");
+        let pkgs_ok = match pkgs {
+            "[]" => got_pkgs == "[]",
+            "every" => got_pkgs == every,
+            package => {
+                got_pkgs != "[]"
+                    && got_pkgs != every
+                    && got_pkgs.contains(&format!("\"{package}\""))
+            }
+        };
+        if class("code") != code || !pkgs_ok || got.reason != reason {
+            complaints.push(format!(
+                "  [{event} {switch}] {paths:?}: code={} reason={} pkgs={got_pkgs}; \
+                 wanted code={code} reason={reason} pkgs {pkgs}",
+                class("code"),
+                got.reason
+            ));
+        }
+    }
+    assert!(
+        complaints.is_empty(),
+        "the classifier disagrees with the hand-written rows:\n{}",
+        complaints.join("\n")
+    );
+}
+
+/// The `harness` job runs its checks on every event: no `needs:`, no job
+/// condition, no matrix and no step condition, so nothing the classifier
+/// answers can skip a check of the folder.
+#[test]
+fn the_harness_job_runs_its_checks_on_every_event() {
+    let texts = workflow_texts();
+    let ci = texts
+        .get("ci.yml")
+        .unwrap_or_else(|| panic!("ci.yml is not among the workflows"));
+    let job = jobs_of(ci)
+        .into_iter()
+        .find(|(name, _)| name == HARNESS_JOB)
+        .map(|(_, block)| block)
+        .unwrap_or_else(|| panic!("ci.yml carries no `{HARNESS_JOB}` job"));
+
+    assert!(
+        job_if_of(&job).is_none(),
+        "the `{HARNESS_JOB}` job carries a job condition, which can skip it"
+    );
+    assert!(
+        job_needs_of(&job).is_empty(),
+        "the `{HARNESS_JOB}` job lists `needs:`: a failed dependency skips it"
+    );
+    assert!(
+        !job.lines().any(|l| l.trim() == "strategy:"),
+        "the `{HARNESS_JOB}` job carries a matrix: a matrix job reports per-leg names"
+    );
+    let steps = step_blocks(&job);
+    assert!(
+        steps.len() >= 2,
+        "the `{HARNESS_JOB}` job has no check after its checkout"
+    );
+    for step in &steps {
+        assert_eq!(
+            step_if_of(step),
+            Ok(None),
+            "`{}` carries a step condition, which can skip a check",
+            step_name_of(step).unwrap_or_else(|| "<unnamed>".to_string())
+        );
+    }
 }

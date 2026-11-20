@@ -497,7 +497,7 @@ combination is refused by name with the reason, never silently ignored.
 | `-u`, `--duration D` | both | Cover only the first `D` SECONDS of BAG TIME (fractional accepted). Playback stops republishing a channel once it has advanced that far through its OWN timeline, and it stays stopped for the rest of the pass, because the one way a later frame reads as back inside the window is a stamp that went BACKWARDS, which is a producer RESTART (the epoch reset) rather than a new window; a resim stops re-executing a rank once a recorded boundary reaches the run's bag-time ORIGIN plus `D`. The window is half-open on BOTH halves (ONE rule, `replay_rank::beyond_duration_bound`), so `--duration 0` covers nothing and a bound EXACTLY equal to a frame's (or a boundary's) own bag-time elapsed EXCLUDES it. (One rule for both halves matters: if playback excluded at `> D` while a resim excluded at `>= D`, `bag play --duration 0` would republish each channel's first frame while `bag play --resim all --duration 0` executed nothing.) Legal in both resim modes: it bounds the RUN, not the comparison. **The bound is in TIME, not in steps**: a per-rank resim has k step axes and no shared step number, while a bound in TIME has a shared ORIGIN: `replay_rank::run_epoch_ns`, the MINIMUM first-boundary target across the ranks. That is what makes `D` mean one thing for the whole run; it does NOT make the run rank-uniform. Under free-run each rank's clock starts at its own live-loop entry, so the ranks share an origin rather than an epoch value, `D` names one wall interval measured from that origin rather than each rank's own first `D` seconds, and a rank that entered later loses more of its OWN tail. Expect per-rank `ticks_replayed` under a bound to differ (see `rank_execution` in the report). `--max-ticks` is not accepted: it is clap's unknown-argument error (exit 2), never a silently accepted no-op. |
 | `--strict-state` | resim | Refuse the re-execution unless EVERY executed node's state was restored. Inert on a bag that begins at step 0: nothing is restored there. Legal in both resim modes: it is a PRECONDITION on the run, not a claim about the recording, so a neutral resim honours it too (its refusal is the exit-2 not-replay-grade arm, which neutral mode never swallows). |
 | `--allow-param-change` | resim | On a bag that begins MID-RUN, resume on the param values in force even where they differ from the ones the recording names. A param is not node state, so a restore never writes one; without this flag each difference refuses the run with exit 2, one line per param naming the node, the param, the recorded value and the current value. Inert on a bag that begins at step 0. Legal in both resim modes. |
-| `--record-out PATH` | resim | Write the re-executed frames to a new bag at `PATH`: one channel per graph-produced topic holding every frame the re-executed graph published, as the full wire frame stamped with the sequence and timestamp in its own header (a frame shorter than the header is written whole with sequence and timestamp 0, as the recorder does). Each channel's schema hash is the one the re-executed graph publishes: the current workspace's when it resolves, otherwise the input channel's when it was recorded under this build's hash recipe, otherwise the hash in the topic's first frame. Provisioning is copied from the input bag's channel. Its schema name and fixed wire size are copied too when the input channel's hash, under this build's recipe, is the label; otherwise (a schema changed since recording, a legacy recipe, a node added since the recording) the channel takes the current workspace's schema name, else the input's, else `unknown`, and a fixed wire size of 0. A frame whose header names a different schema hash than its channel fails the run, so the output never mislabels a frame; a channel waiting for its first frame to learn its hash, whose first frame has no header, is labelled 0 and holds to it (a headerless frame on a channel already labelled is written under that label). The recorded external inputs a resim injects are not copied, including those re-published on a topic that another rank's graph also writes: they are unchanged and already in the input bag. A custom-type schema catalog in the input bag is carried over, pruned to the schema hashes the output's channels carry (a legacy recipe's hash is not bound in it, so it brings no definition). The output carries no scheduler trace, so it is a recording to read or index, not a bag `--resim` can re-execute. `PATH` must not exist: an existing file (the input bag included) is refused with exit 2 and never overwritten. A run that does not finish removes the partial file. Legal in both resim modes: it shapes what the run produces, not the comparison. With `--report`, the JSON gains a `record_out` field naming the written path (absent without the flag). `--record-out` and `--report` may not name the same file, however each is spelled (`out.mcap` and `./out.mcap`, or a symlink to it). A bag that cannot be finished fails a run that would otherwise exit 0 with exit 5 and removes the file. |
+| `--record-out PATH` | resim | Write the re-executed frames to a new bag at `PATH`: one channel per graph-produced topic holding every frame the re-executed graph published, as the full wire frame stamped with the sequence and timestamp in its own header (a frame shorter than the header is written whole with sequence and timestamp 0, as the recorder does). Each channel's schema hash is the one the re-executed graph publishes: the current workspace's when it resolves, otherwise the input channel's when it was recorded under this build's hash recipe, otherwise the hash in the topic's first frame. Provisioning is copied from the input bag's channel. Its schema name and fixed wire size are copied too when the input channel's hash, under this build's recipe, is the label; otherwise (a schema changed since recording, a legacy recipe, a node added since the recording) the channel takes the current workspace's schema name, else the input's, else `unknown`, and a fixed wire size of 0. A frame whose header names a different schema hash than its channel fails the run, so the output never mislabels a frame; a channel waiting for its first frame to learn its hash, whose first frame has no header, is labelled 0 and holds to it (a headerless frame on a channel already labelled is written under that label). The recorded external inputs a resim injects are not copied, including those re-published on a topic that another rank's graph also writes: they are unchanged and already in the input bag. A custom-type schema catalog in the input bag is carried over, pruned to the schema hashes the output's channels carry (a legacy recipe's hash is not bound in it, so it brings no definition). The output carries no scheduler trace, so it is a recording to read or index, not a bag `--resim` can re-execute. `PATH` must not exist: an existing file (the input bag included) is refused with exit 2 and never overwritten. The file is created only after the bag's whole-run checks, so a bag they refuse leaves no file, and that refusal is reported ahead of a `PATH` that cannot be created. A run that stops after the file is created removes the partial file; if it cannot, a warning says a partial file is left at the `--record-out` path, for you to delete. Legal in both resim modes: it shapes what the run produces, not the comparison. With `--report`, the JSON gains a `record_out` field naming the written path (absent without the flag). `--record-out` and `--report` may not name the same file, however each is spelled (`out.mcap` and `./out.mcap`, or a symlink to it). A bag that cannot be finished fails a run that would otherwise exit 0 with exit 5 and removes the file. |
 | `--report PATH` | resim + `--verify` | Persist the machine-readable verdict JSON. Needs `--verify`: its `passed` / `violations` fields ARE the verdict a bare `--resim` declines to make. Beside the verdict it carries the per-rank REPORT-ONLY arrays, none of which move the exit code: `rank_execution` (one entry per pass: steps executed, first/last step, and whether the `--duration` bound is what stopped it; the per-rank breakdown `ticks_replayed` sums away), `injection_anomalies` (a bag-fed topic whose injected stream differed from the recording's: a sequence the plan did not name, a schedule that over-named the stream, or recorded frames a steered schedule left unaccounted for), and `replay_input_shortfalls` (a node whose trace-driven burst asked for the next recorded frame and got nothing, so it fired on its held head). Read all three before attributing a byte mismatch to the candidate: each says the replay's INPUT differed first. A `byte-mismatch` violation's `class` keeps `index`, `first_diff_byte_offset`, `recorded_len` and `replayed_len` and adds `difference`, one object with the keys `kind` (`field`, `header`, `schema_hash`, `layout` or `undecoded`), `path`, `recorded`, `replayed`, `field_byte`, `field_char`, `byte_offset`, `region` (`fixed_section_padding`, `offset_table`, `field_framing`, `unused_variable_bytes` or `trailing_bytes`), `reason` (`recorded_frame_too_short`, `replayed_frame_too_short`, `unknown_schema_hash`, `recorded_frame_undecodable` or `replayed_frame_undecodable`, the last two whichever decoder refused the frame) and `more`. `more` is an integer, 0 where nothing else is counted (always on `schema_hash`, `layout` and `undecoded`); any other key the kind does not use is `null`. `path` is the field's path for `field`, the wire-header field for `header` and `schema_hash`, and the framed field for `layout` in `field_framing`. `recorded` and `replayed` are a JSON number or boolean where the value is one; a string value is the string itself, without quotes; anything else (`.nan`, a byte such as `0x4c`, a window of a long string) is the line's text. On `field`, `field_byte` is the byte `<k>` inside the field that the line names (`byte <k> of its opaque bytes`, `byte <k> of its bytes`, or `past the NUL at field byte <k>`, where `recorded` and `replayed` then carry the same text), and `field_char` is the `<d>` of `from char <d>`. `first_diff_byte_offset` is the first differing byte in byte order, so it can sit in another field than `path`, which follows declaration order. |
 | `--tolerance PATH` | resim + `--verify` | Relax the byte-comparison per field. Needs `--verify`: there is no comparison to relax without it. |
 | `--feed-index-budget BYTES` | resim + `--verify` | The bytes a fed replay's index of recorded frames is charged (default 1073741824, 1 GiB): 40 for each frame the replayed reads consume, the index's key and slot for it, and 40 for each producer label of the topics they consume, which the build reads to tell a topic's writers apart. The index holds only the frames the replayed reads consume, up to `--duration` when it is given; a replay that needs more is refused with exit 2 (`read_identity_feed_index_budget`), naming the bytes it needs, the budget and this flag. Needs `--verify`: only a verifying resim feeds reads by recorded identity (see "Read identity" below). |
@@ -1159,12 +1159,12 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 9.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 9; a
+`recorder.json` stamps 10.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 10; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Five encodings set the number; the last two, read identity and batch
-frames, have their own section below. Every kind-6 record carries a
+in it. Six encodings set the number; the last three, read identity, batch
+frames and checkpoint stops, have their own sections below. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
@@ -1174,14 +1174,16 @@ makes, an empty boundary drain's `none` record included, and reading a `drain`
 role on a `none` record as that empty consult is what `trace_format` 7 means,
 and producer annotations on every edge (before every read of a multi-writer
 edge, once per writer run on a single-writer one) are what `trace_format` 8
-means, and a `batch_frame` record for each frame a multi-frame read consumed
-besides the one it served is what `trace_format` 9 means.
+means, a `batch_frame` record for each frame a multi-frame read consumed
+besides the one it served is what `trace_format` 9 means, and a stopped flag in
+every complete checkpoint part of a node the scheduler had stopped is what
+`trace_format` 10 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
 decodes as one occurrence each), since read identity every such bag is
-format 8, and since batch frames every such bag is format 9. A bag
+format 8, since batch frames format 9, and since checkpoint stops format 10. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -1349,6 +1351,45 @@ terminal verdict prints a line only for best effort, `reads: best effort, no
 read identity (<reason>)`, because that narrows what the verdict covers. A
 resim without `--verify` keeps each consumer's queue so a changed node's own
 frames reach its in-rank consumers.
+
+### Checkpoint stops (`trace_format` 10)
+
+A format 10 recording states, in every complete checkpoint part, whether the
+scheduler had stopped the node at that boundary: a node that returned
+`NodeError::Fatal` carries the stopped flag in its framework section (section
+version 5, bit 0 of the flags byte after the epoch floor), and a complete part
+without it states a running node. A resim of a bag that begins after a
+checkpoint keeps each node it states as stopped stopped: the node is not
+fired, each `block` slot it held as a consumer starts released, the schedule
+check expects no fire of it, and it is left out of the pre-anchor frame cap,
+the backlog check and `anchor_pending_fires`; a topic only stopped nodes
+produce needs no sequence seed. `resume.stopped_at_anchor` in the
+`--report` JSON names those nodes. A bag that fires such a node in the steps
+the resim executes contradicts itself and is refused before the first replayed
+step (`bag internal consistency check failed`, exit 2).
+
+A stopped node's per-message FIFO trigger input with the default `drop_oldest`
+backpressure takes one more frame after the stop, when one arrives, and then
+reads nothing; a later checkpoint states that frame as the node's one
+unconsumed arrival, and the resim keeps the frame held, so that input reads
+nothing in the resim either. A `block` or `sample(N)` trigger input of a
+stopped node reads every frame at every step, in the recording and in the
+resim alike. A node stopped at the checkpoint's own step by a fire that never
+read its `drop_oldest` trigger input (possible only for a node not built with
+`#[cerulion_node]`) holds a frame the checkpoint does not state, and a
+`--verify` of the resim reports a read-log difference at that input's first
+read.
+
+The flag is a positive claim at any format, so a part that carries it states
+the stop on a bag below 10 too. Below 10 a part without it states nothing, and
+so does a node with no complete part at any format (a node that saves no
+state, or a skipped or torn part): the resumed replay judges such a node as it
+did before format 10. A reader below 10 reads past the flag and would judge a
+node stopped before the checkpoint as one that owed fires, so the stamp moves
+and that reader refuses the bag. A later section version can define more flag
+bits, which this build reads past; a change to what they mean for a resim
+comes with a new `trace_format`, which this build refuses with "upgrade to
+replay it".
 
 ### The kind-6 annotations ride INSIDE the record kind
 

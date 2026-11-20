@@ -1,0 +1,23 @@
+[package]
+name = "test_node_links_host_app"
+version = "0.1.0"
+edition = "2021"
+# Test fixture: never publish to crates.io.
+publish = false
+
+# An app library that depends on a node crate the way an Android app does: as
+# a plain rlib with `default-features = false`. A build that does not also
+# select the node (`cargo build --workspace --exclude test_node_links_timer`)
+# compiles the node's C exports out of it; a plain workspace build selects both
+# and turns them back on. Built and inspected by
+# `crates/cerulion_cli_engine/tests/node_links_as_library_test.rs`.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+cerulion_core = { workspace = true }
+test_node_links_timer = { path = "../test_node_links_timer", default-features = false }
+
+# The ONE strict lint table lives in the root `[workspace.lints]`.
+[lints]
+workspace = true

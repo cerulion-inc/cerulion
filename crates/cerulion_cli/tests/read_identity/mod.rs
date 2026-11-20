@@ -6,7 +6,7 @@
 //!
 //! # How a read is identified, with no runtime hook
 //!
-//! Every node of this workspace is a harness node, and every frame they publish
+//! Every node a fixture runs is a harness node, and every frame they publish
 //! is a `geometry_msgs/Vector3` whose fields carry its identity:
 //!
 //! * `x` = the WRITER: the publishing node's `ri_writer` param. Every writer
@@ -1182,11 +1182,60 @@ fn node_source(scaffolded: &str, t: &NodeType) -> String {
     format!("{}{}{RECORD_FNS}", &scaffolded[..at], t.body)
 }
 
+/// The one node type the harness leaves as `node create` wrote it, source and
+/// manifest: a 100 ms period node with a [`TEMPLATE_OUTPUT`] output named
+/// `out`. No fixture runs it. Its build shows that the template's node body
+/// and a `std_msgs` port compile in a generated workspace; the harness types
+/// cannot show the body, since each replaces it.
+pub const TEMPLATE_NODE: &str = "ri_template";
+
+/// The schema of [`TEMPLATE_NODE`]'s output.
+pub const TEMPLATE_OUTPUT: &str = "std_msgs/Int32";
+
+/// Run `cargo build --workspace` in the new scaffold at `root`, compiling
+/// every node crate in one cargo run, then remove the `Cargo.lock` it wrote,
+/// so the scaffold is unlocked again, as `node create` left it. The first
+/// `node_build` after it therefore resolves the dependencies afresh and writes
+/// the lockfile, as a user's first `cerulion node build` does. A dependency
+/// range whose newest match no longer builds still fails [`workspace`], in
+/// this build; a `node_build` that passes `--locked` fails it at the first
+/// `node_build`.
+fn build_workspace_once(root: &Path) {
+    let lock = root.join("Cargo.lock");
+    assert!(
+        !lock.exists(),
+        "RI_HARNESS: {} exists before the workspace build; the node_build calls \
+         must start from an unlocked scaffold",
+        lock.display()
+    );
+    let out = Command::new("cargo")
+        .args(["build", "--workspace"])
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|e| panic!("RI_HARNESS: spawn cargo build --workspace: {e}"));
+    assert!(
+        out.status.success(),
+        "RI_HARNESS: cargo build --workspace in {} failed:\n{}",
+        root.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::remove_file(&lock)
+        .unwrap_or_else(|e| panic!("RI_HARNESS: remove {}: {e}", lock.display()));
+}
+
 /// Scaffold and build the workspace in a new [`ScaffoldDir`], held by the
 /// caller. Every workspace of one test binary builds into one target
 /// directory ([`scaffold_target_dir`], keyed by the binary's crate name), so
 /// the dependencies compile once per binary and a later workspace rebuilds
 /// only the node crates and what depends on the workspace's schemas.
+///
+/// The node crates compile together in [`build_workspace_once`]. The copy of
+/// each node cdylib cargo places in `<target>/debug` is then deleted, and
+/// `node_build` runs once for every node type under `nodes/`: cargo finds the
+/// crate compiled, unless `node_build`'s own arguments change its build, and
+/// places its cdylib there again. Each cdylib must be absent before its type's
+/// `node_build` and present after it, so each is placed by its own type's
+/// `node_build` and by no `node_build` before it.
 pub fn workspace() -> Workspace {
     let dir = ScaffoldDir::new("ri_ws");
     let ws =
@@ -1232,9 +1281,58 @@ pub fn workspace() -> Workspace {
         std::fs::write(&lib, node_source(&scaffolded, t))
             .unwrap_or_else(|e| panic!("RI_HARNESS: write {}: {e}", lib.display()));
     }
-    for t in NODE_TYPES {
-        node_cmd::node_build(&ws.root, t.name, false)
-            .unwrap_or_else(|e| panic!("RI_HARNESS: node_build {}: {e}", t.name));
+    node_cmd::node_create_with_options(
+        &ws.nodes_dir,
+        &cargo_toml,
+        TEMPLATE_NODE,
+        Some(MacroPolicy::Period { period_ms: 100 }),
+        &NodeCreateOptions {
+            outputs: vec![(TEMPLATE_OUTPUT.to_string(), "out".to_string())],
+            inputs: Vec::new(),
+            trigger: None,
+            raw_ffi: false,
+            language: NodeLanguage::Rust,
+        },
+    )
+    .unwrap_or_else(|e| panic!("RI_HARNESS: node_create {TEMPLATE_NODE}: {e}"));
+    build_workspace_once(&ws.root);
+    let debug = target_dir.join("debug");
+    let mut cdylibs: Vec<(String, PathBuf)> = std::fs::read_dir(&ws.nodes_dir)
+        .unwrap_or_else(|e| panic!("RI_HARNESS: read {}: {e}", ws.nodes_dir.display()))
+        .map(|entry| entry.expect("RI_HARNESS: a nodes/ entry").path())
+        .filter(|node| node.join("Cargo.toml").is_file())
+        .map(|node| {
+            let name = node
+                .file_name()
+                .and_then(|n| n.to_str())
+                .expect("RI_HARNESS: a UTF-8 node name")
+                .to_string();
+            let lib = debug.join(mp_support::dylib_file(&name));
+            (name, lib)
+        })
+        .collect();
+    cdylibs.sort();
+    for (name, lib) in &cdylibs {
+        std::fs::remove_file(lib).unwrap_or_else(|e| {
+            panic!(
+                "RI_HARNESS: delete {name}'s cdylib {} after the workspace build: {e}",
+                lib.display()
+            )
+        });
+    }
+    for (name, lib) in &cdylibs {
+        assert!(
+            !lib.exists(),
+            "RI_HARNESS: {name}'s cdylib {} is back before its node_build",
+            lib.display()
+        );
+        node_cmd::node_build(&ws.root, name, false)
+            .unwrap_or_else(|e| panic!("RI_HARNESS: node_build {name}: {e}"));
+        assert!(
+            lib.exists(),
+            "RI_HARNESS: node_build {name} left no cdylib at {}",
+            lib.display()
+        );
     }
     Workspace {
         _dir: dir,
@@ -1242,15 +1340,6 @@ pub fn workspace() -> Workspace {
         graphs_dir: ws.graphs_dir.clone(),
         target_dir,
     }
-}
-
-/// Every node type's debug cdylib, by type name.
-pub fn built_cdylibs(ws: &Workspace) -> Vec<(&'static str, PathBuf)> {
-    let debug = ws.target_dir.join("debug");
-    NODE_TYPES
-        .iter()
-        .map(|t| (t.name, debug.join(mp_support::dylib_file(t.name))))
-        .collect()
 }
 
 // ===========================================================================

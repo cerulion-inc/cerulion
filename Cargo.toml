@@ -83,6 +83,16 @@ members = [
     "crates/test_fixtures/test_node_macro_burst_ctx_cdylib",
     # Oracle-vector fixture for raw-FFI template emit.
     "crates/test_fixtures/test_node_raw_ffi_template_cdylib",
+    # The two nodes graph_start_order_e2e_test scaffolds with `node create` and
+    # `node modify`, prebuilt: a period producer with one Vector3 output and a
+    # period consumer with one plain Vector3 input. Each lib.rs is the scaffold's
+    # bytes and each manifest is the scaffold's with the package renamed, kept off
+    # crates.io and inheriting the lint table; the test compares both against a
+    # live scaffold before `graph run` loads the libraries.
+    "crates/test_fixtures/test_node_start_order_prod_cdylib",
+    "crates/test_fixtures/test_node_start_order_cons_cdylib",
+    # The raw template created with one output, after two `node modify` calls.
+    "crates/test_fixtures/test_node_modified_raw_cdylib",
     "crates/test_fixtures/test_node_unknown_schema_cdylib",
     # Variable-schema spill round-trip across FFI.
     "crates/test_fixtures/test_node_macro_overflow_cdylib",
@@ -233,6 +243,12 @@ members = [
     # gateway that demands one topic without reading a catalog first, so the
     # e2e can show a paired app refuses a LAN data demand and sends no frame.
     "crates/test_fixtures/android_e2e_demand_probe",
+    # A node crate as `node create` writes it, and an app library that depends
+    # on it with `default-features = false`. Built and inspected by
+    # `crates/cerulion_cli_engine/tests/node_links_as_library_test.rs`, which
+    # also checks the node against `node create`'s output.
+    "crates/test_fixtures/test_node_links_timer",
+    "crates/test_fixtures/test_node_links_host_app",
     # ── Cerulion visualization stack (root members; the `rerun` 0.34 SDK needs
     #    1.93, under the root MSRV of 1.95).
     #    These pull the heavy rerun dep tree, so they are
@@ -399,9 +415,9 @@ default-members = [
     "crates/cerulion_ops_proto",
     # Pure SE(3) transform math, std + thiserror only.
     "crates/cerulion_tf",
-    # The RCP daemon adds only rmcp, sse-stream, a second base64, a second
-    # sha2 (with its digest 0.11 stack) and `h2` to the default build: its
-    # HTTP server and its Jev client run on hyper, already here.
+    # The RCP daemon adds only rmcp, sse-stream, a second base64 and `h2` to
+    # the default build: its HTTP server and its Jev client run on hyper,
+    # already here.
     "crates/cerulion_rcpd",
     # NOTE: `cerulion_netd` is a `members` entry but is
     # DELIBERATELY NOT in `default-members` — its `wan` feature is default-on, and a

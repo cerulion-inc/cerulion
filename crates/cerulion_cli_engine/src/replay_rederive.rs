@@ -237,6 +237,13 @@ pub(crate) struct PassRestore {
     /// step before the recording's first retained one popped
     /// ([`fifo_resume_seed`]).
     resumed: bool,
+    /// The nodes whose stop the checkpoint a resumed pass began from STATES:
+    /// stopped there, or running there on a bag at which every complete
+    /// checkpoint part of a stopped node carries the stopped flag. Every other
+    /// node of a resumed pass is one whose stop the
+    /// recording does not state ([`Self::stop_unstated`]). Empty on every
+    /// from-start pass and on every resumed pass of a bag that states no stop.
+    stops_stated: BTreeSet<String>,
 }
 
 impl PassRestore {
@@ -245,16 +252,35 @@ impl PassRestore {
         Self {
             sync_heads: BTreeMap::new(),
             resumed: false,
+            stops_stated: BTreeSet::new(),
         }
     }
 
     /// The heads a resume plan restored (`ResumePlan::sync_input_timestamps`,
-    /// exactly what `Scheduler::restore_sync_input_timestamps` was handed).
+    /// exactly what `Scheduler::restore_sync_input_timestamps` was handed),
+    /// on a resumed pass whose checkpoint states no node's stop.
     pub(crate) fn from_sync_heads(sync_heads: BTreeMap<String, BTreeMap<String, u64>>) -> Self {
         Self {
             sync_heads,
             resumed: true,
+            stops_stated: BTreeSet::new(),
         }
+    }
+
+    /// The same restore, with the nodes whose stop the checkpoint states
+    /// (`AnchorStops` in the engine: stopped, or running on a bag at
+    /// `trace_format` 10 or later). The engine builds this set and the
+    /// pass's [`PassStops::at_anchor`] seed from one `AnchorStops`, so every
+    /// node seeded stopped at the anchor is in it.
+    pub(crate) fn with_stops_stated(mut self, nodes: BTreeSet<String>) -> Self {
+        self.stops_stated = nodes;
+        self
+    }
+
+    /// On a resumed pass, does the checkpoint leave `node_id`'s stop unstated?
+    /// A from-start pass re-executes every stop, so nothing is unstated there.
+    fn stop_unstated(&self, node_id: &str) -> bool {
+        self.resumed && !self.stops_stated.contains(node_id)
     }
 
     /// The restored heads of ONE node, if the anchor stated any.
@@ -263,33 +289,68 @@ impl PassRestore {
     }
 }
 
-/// Where each node the pass re-executed was STOPPED: `node id -> the step`
-/// whose fire disabled it (a `NodeError::Fatal` return or the panic breaker),
-/// with the stopping fire's position in that step's burst.
+/// Where each node of the pass was STOPPED ([`StopPoint`]): either at the
+/// checkpoint a resumed pass began from, as that checkpoint states it, or by
+/// a fire the re-execution performed (a `NodeError::Fatal` return or the
+/// panic breaker), with the stopping fire's position in that step's burst.
 ///
 /// A stopped node never fires again, so the recording holds no fire of it
-/// after that step, and every decider must stop predicting there: the clock
+/// after the stop, and every decider must stop predicting there: the clock
 /// still passes Period deadlines, and the boundary drain still pops a stopped
 /// node's FIFO inputs and aligns its Sync heads, none of which is an owed fire
-/// any more. The step comes from the RE-EXECUTION, not from the
+/// any more. An in-pass stop comes from the RE-EXECUTION, not from the
 /// recording, so a recording that kept firing past the stop is still a
-/// finding. Replay = Live puts the re-executed stop on the recorded one.
+/// finding. Replay = Live puts the re-executed stop on the recorded one, and
+/// a stop at the checkpoint on the stop the recorded run had made before it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PassStops {
     stopped_at: BTreeMap<String, StopPoint>,
 }
 
-/// Where ONE node was stopped: the step, and how many fires of the node that
-/// step's re-execution performed, the stopping fire included (`1` = the first
-/// fire of the burst stopped it). Both come from the re-execution.
-///
-/// The position is what holds a stop INSIDE a burst to the recording: a
-/// replay that stops on the first of three recorded fires skips the other two,
-/// and the step alone cannot tell that from a replay that stopped on the third.
+/// Where ONE node was stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StopPoint {
-    step: u64,
-    fires: u32,
+pub(crate) enum StopPoint {
+    /// The checkpoint a resumed pass began from states the node as stopped at
+    /// `anchor_step`. Every step this module judges comes after it, so no
+    /// step owes the node a fire, and no step is its stopping step.
+    AtAnchor {
+        /// The checkpoint's step, `S`.
+        anchor_step: u64,
+    },
+    /// The re-execution stopped the node at `step`, and `fires` is how many
+    /// fires of the node that step's re-execution performed, the stopping
+    /// fire included (`1` = the first fire of the burst stopped it).
+    ///
+    /// The position is what holds a stop INSIDE a burst to the recording: a
+    /// replay that stops on the first of three recorded fires skips the other
+    /// two, and the step alone cannot tell that from a replay that stopped on
+    /// the third.
+    InPass {
+        /// The step whose fire stopped the node.
+        step: u64,
+        /// The stopping fire's position in that step's burst.
+        fires: u32,
+    },
+}
+
+impl StopPoint {
+    /// Is `step` after the stop, so the node owes no fire there?
+    fn is_after(self, step: u64) -> bool {
+        match self {
+            Self::AtAnchor { anchor_step } => step > anchor_step,
+            Self::InPass { step: stop, .. } => step > stop,
+        }
+    }
+
+    /// At the step whose fire stopped the node in the pass, how many fires of
+    /// it that step's re-execution performed; `None` at every other step, and
+    /// at every step for a stop at the checkpoint.
+    fn burst_at(self, step: u64) -> Option<u32> {
+        match self {
+            Self::InPass { step: stop, fires } if stop == step => Some(fires),
+            Self::InPass { .. } | Self::AtAnchor { .. } => None,
+        }
+    }
 }
 
 impl PassStops {
@@ -300,16 +361,31 @@ impl PassStops {
         }
     }
 
+    /// The stops the checkpoint a resumed pass began from states: each node
+    /// in `nodes` stopped at `anchor_step` ([`StopPoint::AtAnchor`]).
+    pub(crate) fn at_anchor<'a>(
+        anchor_step: u64,
+        nodes: impl IntoIterator<Item = &'a str>,
+    ) -> Self {
+        Self {
+            stopped_at: nodes
+                .into_iter()
+                .map(|node| (node.to_string(), StopPoint::AtAnchor { anchor_step }))
+                .collect(),
+        }
+    }
+
     /// Note that `node_id` was stopped by a fire at `step`, the `fires`-th
     /// fire of the node in that step (the stopping fire included). The FIRST
-    /// note wins: a node is stopped once.
+    /// stop wins: a node is stopped once, and a node stopped at the
+    /// checkpoint keeps that stop.
     pub(crate) fn note(&mut self, node_id: &str, step: u64, fires: u32) {
         self.stopped_at
             .entry(node_id.to_string())
-            .or_insert(StopPoint { step, fires });
+            .or_insert(StopPoint::InPass { step, fires });
     }
 
-    /// Has `node_id` been noted as stopped?
+    /// Is `node_id` stopped, at the checkpoint or by a noted fire?
     pub(crate) fn contains(&self, node_id: &str) -> bool {
         self.stopped_at.contains_key(node_id)
     }
@@ -320,14 +396,14 @@ impl PassStops {
     }
 }
 
-/// At the step a node was stopped, the recording holds the predicted burst
-/// up to and including the stopping fire: the PREFIX of `expected` whose
-/// length is the stopping fire's position, `stop.fires`. A recording that
-/// stopped earlier or later in the burst, or at other instants, or past the
-/// prediction, is a divergence.
-fn is_stop_step_burst(expected: &StepFires, recorded: &StepFires, stop: StopPoint) -> bool {
+/// At the step a node was stopped in the pass, the recording holds the
+/// predicted burst up to and including the stopping fire: the PREFIX of
+/// `expected` whose length is the stopping fire's position, `fires`
+/// ([`StopPoint::burst_at`]). A recording that stopped earlier or later in
+/// the burst, or at other instants, or past the prediction, is a divergence.
+fn is_stop_step_burst(expected: &StepFires, recorded: &StepFires, fires: u32) -> bool {
     let n = recorded.fire_count();
-    if n == 0 || n != stop.fires || n > expected.fire_count() {
+    if n == 0 || n != fires || n > expected.fire_count() {
         return false;
     }
     // Both sides were built with the same `render_instants` flag, so either
@@ -336,7 +412,7 @@ fn is_stop_step_burst(expected: &StepFires, recorded: &StepFires, stop: StopPoin
     want.is_empty() || want.get(..n as usize) == Some(recorded.instants())
 }
 
-/// After the step that stopped `node`, it fires no more: the expectation is
+/// After `node`'s stop, it fires no more: the expectation is
 /// NO fire, whatever its rule would derive, and a recorded fire there is a
 /// finding under `decider`. Returns `true` when it pushed that finding (the
 /// rule then stops judging the node, as on any other finding).
@@ -1240,22 +1316,42 @@ pub enum StandDownReason {
     /// the rule that owed the fire stops for the node; the one-fire bound
     /// still holds.
     LatestBlockHeld,
-    /// A resumed pass holds no fire of a `consume = latest` node read
-    /// through two subscribers and no read its body made, while the node's
-    /// trigger drain counted more frames than the reads and the frames in
-    /// delivery explain. A node a `NodeError::Fatal` return stopped before the
-    /// pass's anchor records exactly that: a stopped node never fires, and the
-    /// boundary drain keeps counting its trigger input. A running node the
-    /// scheduler never fired in the pass records the same. The bag records
-    /// no stop, and the resumed re-execution fires only what the recording
-    /// fired, so it never stops the node either (the pass's `PassStops` hold
-    /// no stop of it). The unread-frame rule stops for the node; the one-fire
-    /// bound still holds. A from-start pass re-executes the stopping fire, and
-    /// a resumed pass holding any fire or body read of the node shows it ran
-    /// in the pass, so both are still judged. An anchor that stamped each
-    /// node's stopped state would tell the two shapes apart and let a resumed
-    /// pass judge such a node as a from-start pass does.
+    /// A resumed pass holds no fire of a `consume = latest` node and no read
+    /// its body made, while the node's trigger drain counted frames that owed
+    /// it a fire: read through one subscriber, a step whose drain popped a
+    /// frame; otherwise, a step whose counted frames outran the reads and the
+    /// frames in delivery. A node a `NodeError::Fatal` return stopped
+    /// before the pass's anchor records exactly that: a stopped node never
+    /// fires, and the boundary drain keeps counting its trigger input. A
+    /// running node the scheduler never fired in the pass records the same.
+    /// Raised only where the recording does not state the node's stop: a bag
+    /// below `trace_format` 10 whose part for the node carries no stopped
+    /// flag, or a checkpoint that holds no complete part for the node (a node
+    /// that saves no state, or a skipped or torn part). The
+    /// resumed re-execution fires only what the recording fired, so it never
+    /// stops the node either (the pass's `PassStops` hold no stop of it). The
+    /// rule that owed the fire stops for the node, at the first step it would
+    /// convict; the one-fire bound still holds.
+    /// A from-start pass re-executes the stopping fire, a resumed pass holding
+    /// any fire or body read of the node shows it ran in the pass, and a node
+    /// the checkpoint states as stopped or running is judged as a from-start
+    /// pass judges it, so none of them stands down.
     LatestUnfiredSinceAnchor,
+    /// A resumed pass holds no fire of a FIFO `Data` node and no read its
+    /// body made, while its trigger drain popped frames the node did not fire
+    /// on: a stopped node never fires, and the boundary drain keeps popping
+    /// its trigger inputs. Raised where [`Self::LatestUnfiredSinceAnchor`] is,
+    /// for the same reason, at the first step whose pops the in-order input
+    /// rule would convict; the rule stops for the node there.
+    FifoUnfiredSinceAnchor,
+    /// A resumed pass holds no fire of a `Sync` node and no read its body
+    /// made, while its trigger inputs held an aligned set: the boundary drain
+    /// keeps aligning a stopped node's heads. Raised where
+    /// [`Self::LatestUnfiredSinceAnchor`] is, for the same reason, at the
+    /// first aligned step the owed-fire rule would convict; that rule stops
+    /// for the node. The feasibility and set-supply rules judge only recorded
+    /// fires, and such a node has none.
+    SyncUnfiredSinceAnchor,
 }
 
 impl StandDownReason {
@@ -1310,8 +1406,23 @@ impl StandDownReason {
             Self::LatestUnfiredSinceAnchor => {
                 "the resumed pass holds no fire of the node and no read its body made while its \
                  trigger drain counted frames, which a node stopped before the pass's anchor and \
-                 a running node the scheduler never fired in the pass both record; the anchor \
-                 does not stamp each node's stopped state, which is what would tell the two apart"
+                 a running node the scheduler never fired in the pass both record; the recording \
+                 does not state whether the node had stopped at the anchor, which is what would \
+                 tell the two apart"
+            }
+            Self::FifoUnfiredSinceAnchor => {
+                "the resumed pass holds no fire of the node and no read its body made while its \
+                 trigger drain popped frames, which a node stopped before the pass's anchor and \
+                 a running node the scheduler never fired in the pass both record; the recording \
+                 does not state whether the node had stopped at the anchor, which is what would \
+                 tell the two apart"
+            }
+            Self::SyncUnfiredSinceAnchor => {
+                "the resumed pass holds no fire of the node and no read its body made while its \
+                 trigger inputs held an aligned set, which a node stopped before the pass's \
+                 anchor and a running node the scheduler never fired in the pass both record; \
+                 the recording does not state whether the node had stopped at the anchor, which \
+                 is what would tell the two apart"
             }
         }
     }
@@ -1346,6 +1457,8 @@ impl StandDownReason {
             Self::LatestWritersUnnamed => "latest_writers_unnamed",
             Self::LatestBlockHeld => "latest_block_held",
             Self::LatestUnfiredSinceAnchor => "latest_unfired_since_anchor",
+            Self::FifoUnfiredSinceAnchor => "fifo_unfired_since_anchor",
+            Self::SyncUnfiredSinceAnchor => "sync_unfired_since_anchor",
         }
     }
 }
@@ -1842,6 +1955,10 @@ pub fn conservation_breach(published: u64, drained: u64, depth: u32) -> Option<C
 /// mints UNBACKED heads (a stamp with no kind-6 record), which would make the
 /// Sync rule fold a map missing their members: so the restored Sync heads seed
 /// the Sync rule's maps, and a from-start pass hands [`PassRestore::none`].
+/// On a resumed pass the restore also names the nodes whose stop the
+/// checkpoint states, and a node outside them that never runs in the pass
+/// ([`unfired_since_anchor`]) stands each rule that owes it a fire down by
+/// name instead of being convicted.
 pub(crate) fn verify(
     nodes: &[NodeDecl],
     steps: &[RecordedStep],
@@ -1886,6 +2003,10 @@ pub(crate) fn verify(
                 reason: StandDownReason::ImpossibleReadShape,
             });
         } else {
+            // Asked once per node, over the whole pass: every rule below
+            // judges a node of a from-start pass, a node whose stop the
+            // checkpoint states, and a node the resumed pass shows ran.
+            let owed_fire = unfired_since_anchor(restore, &node.node_id, steps, trust);
             match &node.trigger {
                 TriggerDecl::Period {
                     interval_ns,
@@ -1916,6 +2037,7 @@ pub(crate) fn verify(
                         trust,
                         restore.sync_heads_for(&node.node_id),
                         stops.stop_point(&node.node_id),
+                        owed_fire,
                         &mut report,
                     );
                 }
@@ -1928,6 +2050,7 @@ pub(crate) fn verify(
                         trust,
                         restore.resumed,
                         stops.stop_point(&node.node_id),
+                        owed_fire,
                         &mut report,
                     );
                 }
@@ -1938,7 +2061,7 @@ pub(crate) fn verify(
                         trigger_inputs,
                         block_gated,
                         trust,
-                        restore.resumed,
+                        owed_fire,
                         stops.stop_point(&node.node_id),
                         &mut report,
                     );
@@ -2115,8 +2238,8 @@ fn recorded_fires(step: &RecordedStep, node_id: &str, with_instants: bool) -> St
 }
 
 // Eight inputs, each a distinct fact about ONE node's Period rule: the
-// declaration's three fields, the block gate, and where the re-execution
-// stopped the node. Bundling them would only rename the list.
+// declaration's three fields, the block gate, and where the node was
+// stopped. Bundling them would only rename the list.
 #[allow(clippy::too_many_arguments)]
 fn verify_period(
     node: &NodeDecl,
@@ -2142,6 +2265,18 @@ fn verify_period(
             decider: Decider::Period,
             reason: StandDownReason::ZeroInterval,
         });
+        return;
+    }
+
+    // A node the checkpoint states as stopped owes no fire at any judged
+    // step (every step of a resumed slice comes after the checkpoint), so it
+    // needs no phase anchor: its first recorded fire is a finding.
+    if let Some(StopPoint::AtAnchor { .. }) = stop {
+        for step in steps {
+            if recorded_fire_after_stop(node, step, Decider::Period, true, report) {
+                return;
+            }
+        }
         return;
     }
 
@@ -2173,7 +2308,7 @@ fn verify_period(
         // After the step that stopped the node, it fires no more: the
         // expectation is NO fire, whatever the clock says, and a recorded
         // fire there is a finding.
-        if stop.is_some_and(|s| step.step > s.step) {
+        if stop.is_some_and(|s| s.is_after(step.step)) {
             if recorded_fire_after_stop(node, step, Decider::Period, true, report) {
                 return;
             }
@@ -2207,8 +2342,8 @@ fn verify_period(
         };
         let recorded = recorded_fires(step, &node.node_id, render_instants);
         // The stopping step's burst ends at the stopping fire.
-        let agrees = match stop.filter(|s| s.step == step.step) {
-            Some(s) => is_stop_step_burst(&expected, &recorded, s),
+        let agrees = match stop.and_then(|s| s.burst_at(step.step)) {
+            Some(fires) => is_stop_step_burst(&expected, &recorded, fires),
             None => expected == recorded,
         };
 
@@ -2701,17 +2836,20 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 /// * an align pass that exhausts its op budget (a loud wiring desync) skips one
 ///   step's fire while its heads stay filled, so arm C calls that quiet step
 ///   an owed fire (loud on the recording side). A node STOPPED mid-run is not
-///   a residual: [`PassStops`] ends the judging at its stop step;
+///   a residual: [`PassStops`] ends the judging at its stop step, and a node
+///   stopped before a resumed pass's anchor whose stop the checkpoint does
+///   not state, and which the pass never runs, stands arm C down by name
+///   ([`StandDownReason::SyncUnfiredSinceAnchor`]);
 /// * [`ReadOutcomeKind::Decimated`] on a trigger input is ignored — a decimated
 ///   pop installs no head, so it moves none of the three arms (`verify_fifo`
 ///   declines on it for a different reason: pop counts).
-// Nine arguments. Bundling any subset into a struct would break the shape it
+// Ten arguments. Bundling any subset into a struct would break the shape it
 // shares with `verify_period` / `verify_fifo` / `verify_throttle` — every one of
 // them is `(node, steps, its own declared parameters, the gates, report)` — and
 // a per-rule parameter bag for exactly ONE of the four is a worse boundary than
 // the argument count it hides. Each argument is a NAMED type or a declared
-// value, never a positional bool pair (`RoleTrust` is a two-state enum
-// precisely so a swapped call site cannot compile).
+// value, never a positional bool pair (`RoleTrust` and `OwedFire` are
+// two-state enums precisely so a swapped call site cannot compile).
 #[allow(clippy::too_many_arguments)]
 fn verify_sync(
     node: &NodeDecl,
@@ -2722,6 +2860,7 @@ fn verify_sync(
     trust: RoleTrust,
     restored: Option<&BTreeMap<String, u64>>,
     stop: Option<StopPoint>,
+    owed_fire: OwedFire,
     report: &mut RederivationReport,
 ) {
     // Asked BEFORE any stamp is folded: an edge carrying both sites' reads has
@@ -2771,12 +2910,22 @@ fn verify_sync(
     // a node that was not judged cannot have been judged on carried heads;
     // a FINDING keeps it. `SuppressibleFire` above is not a
     // withdrawal: arms A and B still run under it.
+    // A node the checkpoint states as stopped owes no fire at any step, so
+    // no verdict on it rests on carried heads, a finding that it fired
+    // included. Nor does one on a node the pass never ran whose stop the
+    // checkpoint does not state (`OwedFire::StandsDown`): it has no recorded
+    // fire for arms A and B to judge, and arm C reads only the narrow map.
     let note_at = report.carried_heads.len();
-    if node.has_non_trigger_inputs {
+    if node.has_non_trigger_inputs
+        && matches!(owed_fire, OwedFire::Judged)
+        && !matches!(stop, Some(StopPoint::AtAnchor { .. }))
+    {
         report.carried_heads.push(CarriedHeadsNote {
             node_id: node.node_id.clone(),
         });
     }
+    // Arm C's stand-down for a node the pass never ran, pushed once.
+    let mut unfired_noted = false;
     // WIDE carry: per input, the STAMPS of every head this rule admits the
     // matcher may still hold at the step boundary — the `supply − k` most
     // recent ones (see the fn doc's carry section), each a unit of the next
@@ -2837,7 +2986,7 @@ fn verify_sync(
     for step in steps {
         // After the step that stopped the node, no rule below applies: the
         // drain still aligns its heads, but a stopped node owes no fire.
-        if stop.is_some_and(|s| step.step > s.step) {
+        if stop.is_some_and(|s| s.is_after(step.step)) {
             if recorded_fire_after_stop(node, step, Decider::Sync, false, report) {
                 return;
             }
@@ -3025,16 +3174,35 @@ fn verify_sync(
         }
 
         // ── arm C: the OWED FIRE ──────────────────────────────────────────
+        //
+        // A node the pass never ran, whose stop the checkpoint does not
+        // state, can be one stopped before the anchor, which owes no fire:
+        // its first owed fire stands arm C down by name, once, and arm C
+        // owes nothing at any later step. Arms B and A judge only recorded
+        // fires, and such a node has none.
         if k == 0 && sync_aligned(&narrow, trigger_inputs, window_ns) && !suppressible {
-            report.findings.push(ScheduleFinding {
-                node_id: node.node_id.clone(),
-                step: step.step,
-                decider: Decider::Sync,
-                expected: StepFires::count(1),
-                recorded,
-                unread: None,
-            });
-            return;
+            match owed_fire {
+                OwedFire::Judged => {
+                    report.findings.push(ScheduleFinding {
+                        node_id: node.node_id.clone(),
+                        step: step.step,
+                        decider: Decider::Sync,
+                        expected: StepFires::count(1),
+                        recorded,
+                        unread: None,
+                    });
+                    return;
+                }
+                OwedFire::StandsDown if !unfired_noted => {
+                    report.stand_downs.push(StandDown {
+                        node_id: node.node_id.clone(),
+                        decider: Decider::Sync,
+                        reason: StandDownReason::SyncUnfiredSinceAnchor,
+                    });
+                    unfired_noted = true;
+                }
+                OwedFire::StandsDown => {}
+            }
         }
 
         // ── carry forward ─────────────────────────────────────────────────
@@ -3214,7 +3382,7 @@ fn carried_heads(wide_carry: &BTreeMap<String, Vec<u64>>, input: &str) -> u32 {
         .map_or(0, |v| u32::try_from(v.len()).unwrap_or(u32::MAX))
 }
 
-// Eight parameters, each a distinct type, mirroring `verify_sync`'s.
+// Nine parameters, mirroring the shape of `verify_sync`'s.
 #[allow(clippy::too_many_arguments)]
 fn verify_fifo(
     node: &NodeDecl,
@@ -3224,6 +3392,7 @@ fn verify_fifo(
     trust: RoleTrust,
     resumed: bool,
     stop: Option<StopPoint>,
+    owed_fire: OwedFire,
     report: &mut RederivationReport,
 ) {
     if block_gated {
@@ -3244,7 +3413,7 @@ fn verify_fifo(
     for step in steps {
         // After the step that stopped the node, the drain still pops its
         // inputs, but a stopped node owes no fire for them.
-        if stop.is_some_and(|s| step.step > s.step) {
+        if stop.is_some_and(|s| s.is_after(step.step)) {
             if recorded_fire_after_stop(node, step, Decider::FifoPop, false, report) {
                 return;
             }
@@ -3269,8 +3438,8 @@ fn verify_fifo(
         // The stopping step's burst ends at the stopping fire: one fire per
         // pop up to it, so exactly as many as the re-execution performed, at
         // least one and at most `supply`.
-        let agrees = match stop.filter(|s| s.step == step.step) {
-            Some(s) => recorded.count == s.fires && (1..=supply).contains(&recorded.count),
+        let agrees = match stop.and_then(|s| s.burst_at(step.step)) {
+            Some(fires) => recorded.count == fires && (1..=supply).contains(&recorded.count),
             None => match fifo_step_carry(
                 carried_in,
                 popped,
@@ -3285,14 +3454,24 @@ fn verify_fifo(
             },
         };
         if !agrees {
-            report.findings.push(ScheduleFinding {
-                node_id: node.node_id.clone(),
-                step: step.step,
-                decider: Decider::FifoPop,
-                expected: StepFires::count(supply),
-                recorded,
-                unread: None,
-            });
+            match owed_fire {
+                OwedFire::Judged => report.findings.push(ScheduleFinding {
+                    node_id: node.node_id.clone(),
+                    step: step.step,
+                    decider: Decider::FifoPop,
+                    expected: StepFires::count(supply),
+                    recorded,
+                    unread: None,
+                }),
+                // A node the pass never ran, whose stop the checkpoint does
+                // not state, can be one stopped before the anchor, which owes
+                // no fire for any pop: the rule stops for it by name.
+                OwedFire::StandsDown => report.stand_downs.push(StandDown {
+                    node_id: node.node_id.clone(),
+                    decider: Decider::FifoPop,
+                    reason: StandDownReason::FifoUnfiredSinceAnchor,
+                }),
+            }
             return;
         }
     }
@@ -3435,14 +3614,18 @@ pub(crate) fn fifo_resume_seed(first_resumed: bool, popped: u32, fires: u32) -> 
 /// rule down by name ([`StandDownReason::LatestBlockHeld`]); until then both
 /// rules judge it, and the one-fire bound runs throughout.
 ///
-/// A stop reaches this rule only from the re-execution (`stop`), and a
-/// `resumed` pass re-executes only the fires its recording holds, so a node
-/// stopped before the pass's anchor is never stopped in it. Such a node fires
+/// A stop reaches this rule from the re-execution, or from a checkpoint that
+/// states the node stopped (`stop`). A resumed pass re-executes only the fires
+/// its recording holds, so a node stopped before the pass's anchor whose stop
+/// the checkpoint does not state is never stopped in it. Such a node fires
 /// nothing and reads nothing in the pass while its trigger drain keeps
-/// counting, so on a resumed pass that holds no fire of the node and no read
-/// its body made ([`node_ran_in_pass`]), a step the unread-frame rule would
-/// convict stands that rule down by name instead
-/// ([`StandDownReason::LatestUnfiredSinceAnchor`]).
+/// counting, so on such a pass that holds no fire of the node and no read its
+/// body made (`owed_fire`, [`unfired_since_anchor`]), the rule that owes a fire
+/// stands down by name instead of convicting
+/// ([`StandDownReason::LatestUnfiredSinceAnchor`]): on one subscriber, once,
+/// at the first step whose pop owes the node a fire, and otherwise at the
+/// first step the unread-frame rule would convict. The one-fire bound runs
+/// throughout. A node the checkpoint states as running is judged in full.
 #[allow(clippy::too_many_arguments)]
 fn verify_latest(
     node: &NodeDecl,
@@ -3450,7 +3633,7 @@ fn verify_latest(
     trigger_inputs: &[String],
     block_gated: bool,
     trust: RoleTrust,
-    resumed: bool,
+    owed_fire: OwedFire,
     stop: Option<StopPoint>,
     report: &mut RederivationReport,
 ) {
@@ -3482,12 +3665,9 @@ fn verify_latest(
     let mut unread: Option<Vec<LatestUnread>> = (drain != LatestDrain::Unified
         && node.throttle_ns.is_none())
     .then(|| trigger_inputs.iter().map(|_| LatestUnread::new()).collect());
-    // Asked once, over the whole pass: a node that fired or read in its body
-    // anywhere in the pass ran in it, so a stop of it is a fire the
-    // re-execution performs and notes.
-    let unfired_since_anchor = resumed && !node_ran_in_pass(&node.node_id, steps, trust);
     let mut unrecorded_noted = false;
     let mut block_noted = false;
+    let mut unfired_noted = false;
     let mut excuses_noted: Vec<StandDownReason> = Vec::new();
     // The judged notes this call pushes, withdrawn by the read-log
     // stand-downs below (`withdraw_before_first_fire`).
@@ -3496,7 +3676,7 @@ fn verify_latest(
     let mut pops = vec![LatestStepPops::default(); trigger_inputs.len()];
     let mut writers_named = vec![LatestWriters::new(identity); trigger_inputs.len()];
     for step in steps {
-        if stop.is_some_and(|s| step.step > s.step) {
+        if stop.is_some_and(|s| s.is_after(step.step)) {
             if recorded_fire_after_stop(node, step, Decider::LatestFire, false, report) {
                 return;
             }
@@ -3544,14 +3724,20 @@ fn verify_latest(
             pops[idx].add(read, trust, &mut writers_named[idx]);
         }
         let recorded = recorded_fires(step, &node.node_id, false);
-        let at_stop = stop.is_some_and(|s| s.step == step.step);
+        let at_stop = stop.and_then(|s| s.burst_at(step.step)).is_some();
         // A pop owes the fire only on one subscriber, and only where neither a
         // throttle nor an in-rank `block` pre-fire check can have held it.
-        let owes_one = popped > 0
+        let pop_owes_fire = popped > 0
             && node.throttle_ns.is_none()
             && drain == LatestDrain::Unified
             && !node.feeds_local_block_edge
             && !at_stop;
+        // A node the pass never ran can be one stopped before the anchor,
+        // which owes no fire for a pop.
+        let owes_one = match owed_fire {
+            OwedFire::Judged => pop_owes_fire,
+            OwedFire::StandsDown => false,
+        };
         let expected = if owes_one { 1 } else { recorded.count.min(1) };
         if recorded.count != expected {
             report.findings.push(ScheduleFinding {
@@ -3592,6 +3778,17 @@ fn verify_latest(
                 reason: StandDownReason::LatestBlockHeld,
             });
             block_noted = true;
+        }
+        match owed_fire {
+            OwedFire::StandsDown if pop_owes_fire && !unfired_noted => {
+                report.stand_downs.push(StandDown {
+                    node_id: node.node_id.clone(),
+                    decider: Decider::LatestFire,
+                    reason: StandDownReason::LatestUnfiredSinceAnchor,
+                });
+                unfired_noted = true;
+            }
+            OwedFire::StandsDown | OwedFire::Judged => {}
         }
         // The stopping step's fire ends the node, so nothing it counted is
         // owed a later fire.
@@ -3644,23 +3841,25 @@ fn verify_latest(
                             });
                         }
                     }
-                    // A stop before the anchor owes no fire, and nothing in
-                    // the pass can show the node was not stopped there.
-                    LatestUnreadVerdict::Owed(_) if unfired_since_anchor => {
-                        unbounded = Some(StandDownReason::LatestUnfiredSinceAnchor);
-                        break;
-                    }
-                    LatestUnreadVerdict::Owed(frames) => {
-                        report.findings.push(ScheduleFinding {
-                            node_id: node.node_id.clone(),
-                            step: step.step,
-                            decider: Decider::LatestFire,
-                            expected: StepFires::count(1),
-                            recorded,
-                            unread: Some(frames),
-                        });
-                        return;
-                    }
+                    LatestUnreadVerdict::Owed(frames) => match owed_fire {
+                        OwedFire::Judged => {
+                            report.findings.push(ScheduleFinding {
+                                node_id: node.node_id.clone(),
+                                step: step.step,
+                                decider: Decider::LatestFire,
+                                expected: StepFires::count(1),
+                                recorded,
+                                unread: Some(frames),
+                            });
+                            return;
+                        }
+                        // A stop before the anchor owes no fire, and nothing
+                        // in the pass can show the node was not stopped there.
+                        OwedFire::StandsDown => {
+                            unbounded = Some(StandDownReason::LatestUnfiredSinceAnchor);
+                            break;
+                        }
+                    },
                     LatestUnreadVerdict::Unbounded(reason) => {
                         unbounded = Some(reason);
                         break;
@@ -3689,6 +3888,45 @@ fn verify_latest(
 /// unread-frame rule: the steps before it were judged on the allowance.
 fn withdraw_before_first_fire(report: &mut RederivationReport, note_at: usize) {
     report.before_first_fire.truncate(note_at);
+}
+
+/// Whether the rules that owe a node a fire (the FIFO rule, the
+/// `consume = latest` rules and the `Sync` owed-fire arm) judge it, or stand
+/// down as unfired since the anchor ([`unfired_since_anchor`]), answered once
+/// per node before any rule runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwedFire {
+    /// Every rule judges the node: a from-start pass, a node the checkpoint
+    /// states as stopped or running, or a node that fires or reads in its
+    /// body anywhere in the pass.
+    Judged,
+    /// A resumed pass whose checkpoint does not state the node's stop holds
+    /// no fire of it and no read its body made, so nothing in the pass tells
+    /// a node stopped before the anchor from a running node the scheduler
+    /// never fired. The first step a rule that owes the node a fire would
+    /// convict stands that rule down by name
+    /// ([`StandDownReason::FifoUnfiredSinceAnchor`],
+    /// [`StandDownReason::LatestUnfiredSinceAnchor`],
+    /// [`StandDownReason::SyncUnfiredSinceAnchor`]).
+    StandsDown,
+}
+
+/// PURE: the [`OwedFire`] of `node_id` on a pass that restored
+/// `restore`. A resumed pass re-executes only the fires its recording holds,
+/// so a node stopped before the anchor whose stop the checkpoint does not
+/// state ([`PassRestore::stop_unstated`]) is never stopped in it, and only a
+/// fire or a body read in the pass ([`node_ran_in_pass`]) shows the node ran.
+fn unfired_since_anchor(
+    restore: &PassRestore,
+    node_id: &str,
+    steps: &[RecordedStep],
+    trust: RoleTrust,
+) -> OwedFire {
+    if restore.stop_unstated(node_id) && !node_ran_in_pass(node_id, steps, trust) {
+        OwedFire::StandsDown
+    } else {
+        OwedFire::Judged
+    }
 }
 
 /// Does the pass hold a fire of `node_id`, or a read its body made
@@ -4980,7 +5218,6 @@ mod tests {
     #[test]
     fn the_stop_step_burst_rule_matches_hand_cases() {
         let three = StepFires::at(vec![10, 20, 30]);
-        let at = |fires: u32| StopPoint { step: 0, fires };
         let rows: &[(StepFires, u32, bool)] = &[
             (StepFires::at(vec![10]), 1, true),
             (StepFires::at(vec![10, 20]), 2, true),
@@ -4994,7 +5231,7 @@ mod tests {
         ];
         for (recorded, fires, want) in rows {
             assert_eq!(
-                is_stop_step_burst(&three, recorded, at(*fires)),
+                is_stop_step_burst(&three, recorded, *fires),
                 *want,
                 "{recorded:?} stopped at fire {fires} against {three:?}"
             );
@@ -5003,22 +5240,22 @@ mod tests {
         assert!(is_stop_step_burst(
             &StepFires::count(40),
             &StepFires::count(7),
-            at(7)
+            7
         ));
         assert!(!is_stop_step_burst(
             &StepFires::count(40),
             &StepFires::count(7),
-            at(8)
+            8
         ));
         assert!(!is_stop_step_burst(
             &StepFires::count(40),
             &StepFires::count(41),
-            at(41)
+            41
         ));
         assert!(!is_stop_step_burst(
             &StepFires::count(40),
             &StepFires::count(0),
-            at(0)
+            0
         ));
     }
 
@@ -5028,11 +5265,1211 @@ mod tests {
         let mut stops = PassStops::none();
         stops.note("a", 4, 2);
         stops.note("a", 9, 1);
-        assert_eq!(stops.stop_point("a"), Some(StopPoint { step: 4, fires: 2 }));
+        assert_eq!(
+            stops.stop_point("a"),
+            Some(StopPoint::InPass { step: 4, fires: 2 })
+        );
         assert!(stops.contains("a"));
         assert!(!stops.contains("b"));
         assert_eq!(stops.stop_point("b"), None);
         assert_eq!(PassStops::none(), PassStops::default());
+    }
+
+    /// Both stop kinds against a hand table: a stop at the checkpoint comes
+    /// before every judged step and has no stopping step; an in-pass stop is
+    /// after its own step only, and carries its burst at that step alone.
+    #[test]
+    fn a_stop_point_answers_its_hand_table() {
+        let at_anchor = StopPoint::AtAnchor { anchor_step: 3 };
+        let in_pass = StopPoint::InPass { step: 5, fires: 2 };
+        let rows: &[(StopPoint, u64, bool, Option<u32>)] = &[
+            (at_anchor, 2, false, None),
+            (at_anchor, 3, false, None),
+            (at_anchor, 4, true, None),
+            (at_anchor, 9, true, None),
+            (in_pass, 4, false, None),
+            (in_pass, 5, false, Some(2)),
+            (in_pass, 6, true, None),
+        ];
+        for (stop, step, after, burst) in rows {
+            assert_eq!(stop.is_after(*step), *after, "{stop:?} at step {step}");
+            assert_eq!(stop.burst_at(*step), *burst, "{stop:?} at step {step}");
+        }
+    }
+
+    /// The per-step note cannot move a stop the checkpoint stated: a node
+    /// seeded at the anchor keeps it whatever the pass notes later, while a
+    /// node the checkpoint did not name takes its in-pass stop.
+    #[test]
+    fn pass_stops_seeded_at_the_anchor_are_not_renoted() {
+        let mut stops = PassStops::at_anchor(3, ["sink", "relay"]);
+        stops.note("sink", 4, 0);
+        stops.note("other", 6, 1);
+        let at_anchor = Some(StopPoint::AtAnchor { anchor_step: 3 });
+        assert_eq!(stops.stop_point("sink"), at_anchor);
+        assert_eq!(stops.stop_point("relay"), at_anchor);
+        assert_eq!(
+            stops.stop_point("other"),
+            Some(StopPoint::InPass { step: 6, fires: 1 })
+        );
+        assert_eq!(PassStops::at_anchor(3, []), PassStops::none());
+    }
+
+    /// The checkpoint step of the resumed rule tests below: each slice
+    /// begins at step 4.
+    const ANCHOR_STEP: u64 = 3;
+
+    /// `node_id` stated stopped by the checkpoint at [`ANCHOR_STEP`].
+    fn stopped_at_anchor(node_id: &str) -> PassStops {
+        PassStops::at_anchor(ANCHOR_STEP, [node_id])
+    }
+
+    /// A resumed pass whose checkpoint states no node's stop.
+    fn resumed_unstated() -> PassRestore {
+        PassRestore::from_sync_heads(BTreeMap::new())
+    }
+
+    /// A resumed pass whose checkpoint states `node_id` running.
+    fn stated_running(node_id: &str) -> PassRestore {
+        resumed_unstated().with_stops_stated([node_id.to_string()].into())
+    }
+
+    /// [`verify`] on a resumed pass restored with `restore`. With
+    /// `Some(node)` the checkpoint states `node` stopped at [`ANCHOR_STEP`],
+    /// as the engine hands it: seeded in the stops and stated in the restore.
+    /// With `None` it states no stop.
+    fn judge_resumed(
+        nodes: &[NodeDecl],
+        steps: &[RecordedStep],
+        edges: &[BlockEdgeObservation],
+        trust: RoleTrust,
+        restore: PassRestore,
+        stopped: Option<&str>,
+    ) -> RederivationReport {
+        match stopped {
+            Some(node) => verify(
+                nodes,
+                steps,
+                edges,
+                trust,
+                &restore.with_stops_stated([node.to_string()].into()),
+                &stopped_at_anchor(node),
+            ),
+            None => verify(nodes, steps, edges, trust, &restore, &PassStops::none()),
+        }
+    }
+
+    /// The `(step, decider)` of every finding in `report`.
+    fn finding_steps(report: &RederivationReport) -> Vec<(u64, Decider)> {
+        report
+            .findings
+            .iter()
+            .map(|f| (f.step, f.decider))
+            .collect()
+    }
+
+    /// The reason of every stand-down in `report`.
+    fn stand_down_reasons(report: &RederivationReport) -> Vec<StandDownReason> {
+        report
+            .stand_downs
+            .iter()
+            .map(|sd| sd.reason.clone())
+            .collect()
+    }
+
+    /// `node_id` as the producer of a `block` edge, which stands its rule
+    /// down.
+    fn gating(node_id: &str) -> Vec<BlockEdgeObservation> {
+        vec![BlockEdgeObservation {
+            topic: "/blk".to_string(),
+            producer_node: node_id.to_string(),
+            consumer_node: "downstream".to_string(),
+            consumer_input: "inp".to_string(),
+            depth: 4,
+            published_frames: 0,
+        }]
+    }
+
+    /// A resumed slice, steps 4 to 7, of the FIFO `Data` node `sink`: the
+    /// drain pops one frame at every step, and the recording fires `sink`
+    /// at `fires_at`.
+    fn fifo_resumed_slice(fires_at: &[u64]) -> Vec<RecordedStep> {
+        (ANCHOR_STEP + 1..ANCHOR_STEP + 5)
+            .map(|n| RecordedStep {
+                step: n,
+                clock_ns: EPOCH + n * 10 * MS,
+                fires: if fires_at.contains(&n) {
+                    vec![fire("sink", EPOCH + n * 10 * MS)]
+                } else {
+                    vec![]
+                },
+                reads: vec![drained("sink", "inp", None)],
+            })
+            .collect()
+    }
+
+    /// A FIFO `Data` node the checkpoint states as stopped owes no fire for
+    /// any pop of the resumed slice, throttled or not. Where the checkpoint
+    /// states it running, the same slice convicts at its first pop, or,
+    /// throttled, at the second, once the one frame a throttle may defer is
+    /// held. Recorded fires after the stop are one finding expecting none, at
+    /// the first of them, and an in-pass stop noted at the first resumed step
+    /// with no fire, which a restore that states the stop without the seed
+    /// would note, is a finding too. A `block` gate stands the node down
+    /// first, stop or no stop.
+    #[test]
+    fn a_fifo_node_stopped_at_the_anchor_owes_no_fire_for_any_resumed_pop() {
+        let mut throttled = fifo_node();
+        throttled[0].throttle_ns = Some(20 * MS);
+        let judge = |nodes: &[NodeDecl], steps: &[RecordedStep], stopped: Option<&str>| {
+            judge_resumed(
+                nodes,
+                steps,
+                &[],
+                RoleTrust::Declined,
+                resumed_unstated(),
+                stopped,
+            )
+        };
+        let quiet = fifo_resumed_slice(&[]);
+        for nodes in [fifo_node(), throttled.clone()] {
+            let report = judge(&nodes, &quiet, Some("sink"));
+            assert_eq!(report, RederivationReport::default(), "{report:?}");
+            assert_eq!(
+                report,
+                judge(&nodes, &quiet, Some("sink")),
+                "two runs agree"
+            );
+        }
+        let running = |nodes: &[NodeDecl]| {
+            verify(
+                nodes,
+                &quiet,
+                &[],
+                RoleTrust::Declined,
+                &stated_running("sink"),
+                &PassStops::none(),
+            )
+        };
+        let unaware = running(&fifo_node());
+        assert_eq!(finding_steps(&unaware), vec![(4, Decider::FifoPop)]);
+        assert_eq!(unaware.findings[0].expected, StepFires::count(1));
+        let unaware = running(&throttled);
+        assert_eq!(finding_steps(&unaware), vec![(5, Decider::FifoPop)]);
+        assert_eq!(unaware.findings[0].expected, StepFires::count(2));
+
+        let late = judge(&fifo_node(), &fifo_resumed_slice(&[6, 7]), Some("sink"));
+        assert_eq!(finding_steps(&late), vec![(6, Decider::FifoPop)]);
+        assert_eq!(late.findings[0].expected, StepFires::none());
+        assert_eq!(late.findings[0].recorded, StepFires::count(1));
+
+        let unseeded = verify(
+            &fifo_node(),
+            &quiet,
+            &[],
+            RoleTrust::Declined,
+            &stated_running("sink"),
+            &stopped_at_fire("sink", 4, 0),
+        );
+        assert_eq!(finding_steps(&unseeded), vec![(4, Decider::FifoPop)]);
+
+        let gated = judge_resumed(
+            &fifo_node(),
+            &quiet,
+            &gating("sink"),
+            RoleTrust::Declined,
+            resumed_unstated(),
+            Some("sink"),
+        );
+        assert_eq!(
+            stand_down_reasons(&gated),
+            vec![StandDownReason::BlockGated]
+        );
+    }
+
+    /// A `consume = latest` node the checkpoint states as stopped owes no fire
+    /// on either drain, and the report holds nothing at all, the judged note
+    /// included, because no step is judged. Where the checkpoint states the
+    /// node running, the unified drain is a finding at the first pop, and on
+    /// two subscribers the unread-frame rule is a finding at the seventh
+    /// count; where the stop is unstated, that rule stands down by name.
+    #[test]
+    fn a_latest_node_stopped_at_the_anchor_owes_no_fire_on_either_drain() {
+        let slice = |len: u64, fired_at: Option<u64>| -> Vec<RecordedStep> {
+            (ANCHOR_STEP + 1..ANCHOR_STEP + 1 + len)
+                .map(|n| latest_step(n, fired_at == Some(n), vec![counted(n as u32)]))
+                .collect()
+        };
+        let unified = latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH);
+        let separate = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        let judge = |nodes: &[NodeDecl], steps: &[RecordedStep], stopped: Option<&str>| {
+            judge_resumed(nodes, steps, &[], BELIEVED, resumed_unstated(), stopped)
+        };
+        for nodes in [&unified, &separate] {
+            let report = judge(nodes, &slice(20, None), Some("sink"));
+            assert_eq!(report, RederivationReport::default(), "{report:?}");
+            let late = judge(nodes, &slice(20, Some(6)), Some("sink"));
+            assert_eq!(finding_steps(&late), vec![(6, Decider::LatestFire)]);
+            assert_eq!(late.findings[0].expected, StepFires::none());
+        }
+        let unaware = verify(
+            &unified,
+            &slice(4, None),
+            &[],
+            BELIEVED,
+            &stated_running("sink"),
+            &PassStops::none(),
+        );
+        assert_eq!(finding_steps(&unaware), vec![(4, Decider::LatestFire)]);
+
+        let unstated = judge(&separate, &slice(20, None), None);
+        assert!(unstated.is_clean(), "{:?}", unstated.findings);
+        assert_eq!(
+            stand_down_reasons(&unstated),
+            vec![StandDownReason::LatestUnfiredSinceAnchor]
+        );
+        let running = verify(
+            &separate,
+            &slice(20, None),
+            &[],
+            BELIEVED,
+            &stated_running("sink"),
+            &PassStops::none(),
+        );
+        assert!(running.stand_downs.is_empty(), "{:?}", running.stand_downs);
+        assert_eq!(
+            finding_steps(&running),
+            vec![(ANCHOR_STEP + 7, Decider::LatestFire)],
+            "a node the checkpoint states running is judged in full"
+        );
+    }
+
+    /// Below trace format 10 a checkpoint states only the nodes the scheduler
+    /// had stopped, so one that states `ticker` stopped leaves `sink`'s stop
+    /// unstated: on two subscribers the unread-frame rule stands down by name
+    /// for `sink`, exactly as on a checkpoint that states no stop. The stopped
+    /// `ticker` adds nothing to the report.
+    #[test]
+    fn stating_another_nodes_stop_leaves_a_latest_nodes_stop_unstated() {
+        let steps: Vec<RecordedStep> = (ANCHOR_STEP + 1..ANCHOR_STEP + 21)
+            .map(|n| latest_step(n, false, vec![counted(n as u32)]))
+            .collect();
+        let mut nodes = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        nodes.push(node("ticker", period(MS, None)));
+        let report = judge_resumed(
+            &nodes,
+            &steps,
+            &[],
+            BELIEVED,
+            resumed_unstated(),
+            Some("ticker"),
+        );
+        assert!(report.is_clean(), "{:?}", report.findings);
+        assert_eq!(
+            report,
+            RederivationReport {
+                stand_downs: vec![StandDown {
+                    node_id: "sink".to_string(),
+                    decider: Decider::LatestFire,
+                    reason: StandDownReason::LatestUnfiredSinceAnchor,
+                }],
+                before_first_fire: excused_before_first_fire(),
+                ..RederivationReport::default()
+            }
+        );
+    }
+
+    /// A Sync node the checkpoint states as stopped owes no fire when its
+    /// restored head and a fresh arrival align, and a recorded fire of it is
+    /// a finding expecting none. Where the checkpoint states the node
+    /// running, the same aligned pair is owed a fire.
+    #[test]
+    fn a_sync_node_stopped_at_the_anchor_owes_no_fire_on_its_restored_heads() {
+        let slice = |fired: bool| {
+            vec![RecordedStep {
+                step: ANCHOR_STEP + 1,
+                clock_ns: EPOCH + 1015 * MS,
+                fires: if fired {
+                    vec![fire("fuse", EPOCH + 1015 * MS)]
+                } else {
+                    vec![]
+                },
+                reads: vec![drain_at("lidar", 1010 * MS)],
+            }]
+        };
+        let judge = |steps: &[RecordedStep], stopped: Option<&str>| {
+            judge_resumed(
+                &[fuse_node()],
+                steps,
+                &[],
+                RoleTrust::Believed {
+                    consults_recorded: false,
+                },
+                restored_cam_at(EPOCH + 1000 * MS),
+                stopped,
+            )
+        };
+        let seeded = judge(&slice(false), Some("fuse"));
+        assert_eq!(seeded, RederivationReport::default(), "{seeded:?}");
+        // Judged at no step, so not judged on carried heads either.
+        let mut wide = fuse_node();
+        wide.has_non_trigger_inputs = true;
+        let wide = judge_resumed(
+            &[wide],
+            &slice(false),
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+            restored_cam_at(EPOCH + 1000 * MS),
+            Some("fuse"),
+        );
+        assert_eq!(wide, RederivationReport::default(), "{wide:?}");
+        let late = judge(&slice(true), Some("fuse"));
+        assert_eq!(finding_steps(&late), vec![(ANCHOR_STEP + 1, Decider::Sync)]);
+        assert_eq!(late.findings[0].expected, StepFires::none());
+        let unaware = verify(
+            &[fuse_node()],
+            &slice(false),
+            &[],
+            RoleTrust::Believed {
+                consults_recorded: false,
+            },
+            &restored_cam_at(EPOCH + 1000 * MS).with_stops_stated(["fuse".to_string()].into()),
+            &PassStops::none(),
+        );
+        assert_eq!(
+            finding_steps(&unaware),
+            vec![(ANCHOR_STEP + 1, Decider::Sync)]
+        );
+        assert_eq!(unaware.findings[0].recorded, StepFires::none());
+    }
+
+    /// A Period node the checkpoint states as stopped has no phase anchor in
+    /// the slice and needs none: the slice with no fire is clean where the
+    /// unaware pass stands down `no_phase_anchor`, and recorded fires are one
+    /// finding, at the first, with its instant. A zero interval or a `block`
+    /// gate still stands the node down first.
+    #[test]
+    fn a_period_node_stopped_at_the_anchor_needs_no_phase_anchor() {
+        let slice = |fired_at: &[u64]| -> Vec<RecordedStep> {
+            (ANCHOR_STEP + 1..ANCHOR_STEP + 5)
+                .map(|n| {
+                    let at = EPOCH + n * 10 * MS;
+                    let fires = if fired_at.contains(&n) {
+                        vec![fire("ticker", at)]
+                    } else {
+                        vec![]
+                    };
+                    step(n, at, fires)
+                })
+                .collect()
+        };
+        let ticker = vec![node("ticker", period(10 * MS, None))];
+        let judge = |nodes: &[NodeDecl],
+                     steps: &[RecordedStep],
+                     edges: &[BlockEdgeObservation],
+                     stopped: Option<&str>| {
+            judge_resumed(
+                nodes,
+                steps,
+                edges,
+                RoleTrust::Declined,
+                resumed_unstated(),
+                stopped,
+            )
+        };
+        let seeded = judge(&ticker, &slice(&[]), &[], Some("ticker"));
+        assert_eq!(seeded, RederivationReport::default(), "{seeded:?}");
+        let unaware = judge(&ticker, &slice(&[]), &[], None);
+        assert_eq!(
+            stand_down_reasons(&unaware),
+            vec![StandDownReason::NoPhaseAnchor]
+        );
+        let late = judge(&ticker, &slice(&[6, 7]), &[], Some("ticker"));
+        assert_eq!(finding_steps(&late), vec![(6, Decider::Period)]);
+        assert_eq!(late.findings[0].expected, StepFires::none());
+        assert_eq!(
+            late.findings[0].recorded,
+            StepFires::at(vec![EPOCH + 60 * MS])
+        );
+        let zero = judge(
+            &[node("ticker", period(0, None))],
+            &slice(&[6]),
+            &[],
+            Some("ticker"),
+        );
+        assert_eq!(
+            stand_down_reasons(&zero),
+            vec![StandDownReason::ZeroInterval]
+        );
+        assert!(zero.is_clean());
+        let gated = judge(&ticker, &slice(&[6]), &gating("ticker"), Some("ticker"));
+        assert_eq!(
+            stand_down_reasons(&gated),
+            vec![StandDownReason::BlockGated]
+        );
+        assert!(gated.is_clean());
+    }
+
+    /// The parity guard. One recording of five nodes judged twice: from its
+    /// start, where the FIFO sink, the latest sink and the ticker stop on
+    /// their fires at step 2, and from a checkpoint at step 3 that states
+    /// those three stopped. After the stop the two passes judge nothing for
+    /// them, so the two reports are equal: no finding, and the same static
+    /// stand-downs for a zero-interval node and a capture-time Sync node,
+    /// which neither pass judges on its own clock or wire stamps.
+    #[test]
+    fn a_seeded_resumed_pass_reports_what_its_from_start_pass_reports_after_the_stop() {
+        let nodes = vec![
+            node(
+                "fifo",
+                TriggerDecl::Data {
+                    trigger_inputs: inputs(&["inp"]),
+                },
+            ),
+            node(
+                "latest",
+                TriggerDecl::DataLatest {
+                    trigger_inputs: inputs(&["inp"]),
+                    drain: LatestDrain::Unified,
+                    writers: Some(1),
+                    depth: LATEST_DEPTH,
+                    identity: EdgeIdentity::EveryEdge,
+                },
+            ),
+            node("ticker", period(10 * MS, None)),
+            node("zero", period(0, None)),
+            node(
+                "fusion",
+                TriggerDecl::SyncOnCaptureTime {
+                    trigger_inputs: inputs(&["cam", "lidar"]),
+                },
+            ),
+        ];
+        let at = |n: u64| EPOCH + n * 10 * MS;
+        let recording: Vec<RecordedStep> = (0..8u64)
+            .map(|n| RecordedStep {
+                step: n,
+                clock_ns: at(n),
+                fires: if n <= 2 {
+                    vec![
+                        fire("fifo", at(n)),
+                        fire("latest", at(n)),
+                        fire("ticker", at(n)),
+                    ]
+                } else {
+                    vec![]
+                },
+                reads: vec![
+                    read_with_role(
+                        "fifo",
+                        "inp",
+                        ReadOutcomeKind::DrainedBatch,
+                        1,
+                        None,
+                        ReadSiteRole::Drain,
+                    ),
+                    read_with_role(
+                        "latest",
+                        "inp",
+                        ReadOutcomeKind::DrainedBatch,
+                        1,
+                        None,
+                        ReadSiteRole::Drain,
+                    ),
+                ],
+            })
+            .collect();
+        let mut from_start_stops = PassStops::none();
+        for stopped in ["fifo", "latest", "ticker"] {
+            from_start_stops.note(stopped, 2, 1);
+        }
+        let from_start = verify(
+            &nodes,
+            &recording,
+            &[],
+            BELIEVED,
+            &PassRestore::none(),
+            &from_start_stops,
+        );
+        let resumed = verify(
+            &nodes,
+            &recording[ANCHOR_STEP as usize + 1..],
+            &[],
+            BELIEVED,
+            &resumed_unstated()
+                .with_stops_stated(["fifo", "latest", "ticker"].map(String::from).into()),
+            &PassStops::at_anchor(ANCHOR_STEP, ["fifo", "latest", "ticker"]),
+        );
+        assert!(from_start.is_clean(), "{:?}", from_start.findings);
+        assert_eq!(resumed.findings, from_start.findings);
+        assert_eq!(resumed.stand_downs, from_start.stand_downs);
+        assert_eq!(
+            resumed
+                .stand_downs
+                .iter()
+                .map(|sd| (sd.node_id.as_str(), sd.reason.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("zero", StandDownReason::ZeroInterval),
+                ("fusion", StandDownReason::CaptureTimeSync),
+            ]
+        );
+    }
+
+    /// The throttle rule judges a node the checkpoint states as stopped, as
+    /// it judges every node: a crafted recorded fire 10 ms after another
+    /// against a 20 ms cap is the same throttle finding from the start and
+    /// from the checkpoint, beside the finding that a stopped node fired.
+    #[test]
+    fn a_stamped_stopped_nodes_throttle_rule_still_runs() {
+        let mut relay = node(
+            "relay",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp"]),
+            },
+        );
+        relay.throttle_ns = Some(20 * MS);
+        let steps = vec![
+            step(4, EPOCH + 40 * MS, vec![fire("relay", EPOCH + 40 * MS)]),
+            step(5, EPOCH + 50 * MS, vec![fire("relay", EPOCH + 50 * MS)]),
+        ];
+        let throttle_findings = |report: &RederivationReport| -> Vec<u64> {
+            report
+                .findings
+                .iter()
+                .filter(|f| f.decider == Decider::Throttle)
+                .map(|f| f.step)
+                .collect()
+        };
+        let seeded = verify(
+            std::slice::from_ref(&relay),
+            &steps,
+            &[],
+            RoleTrust::Declined,
+            &resumed_unstated().with_stops_stated(["relay".to_string()].into()),
+            &stopped_at_anchor("relay"),
+        );
+        let from_start = verify_unrestored(
+            std::slice::from_ref(&relay),
+            &steps,
+            &[],
+            RoleTrust::Declined,
+        );
+        assert_eq!(throttle_findings(&seeded), vec![5]);
+        assert_eq!(throttle_findings(&from_start), vec![5]);
+        assert_eq!(
+            finding_steps(&seeded)
+                .into_iter()
+                .filter(|(_, d)| *d == Decider::FifoPop)
+                .collect::<Vec<_>>(),
+            vec![(4, Decider::FifoPop)],
+            "the stopped node's first recorded fire is a finding of its own"
+        );
+    }
+
+    // -- a node the pass never ran, whose stop the checkpoint does not state --
+
+    /// `sink`'s FIFO stand-down for a node the resumed pass never ran.
+    fn fifo_unfired() -> StandDown {
+        StandDown {
+            node_id: "sink".to_string(),
+            decider: Decider::FifoPop,
+            reason: StandDownReason::FifoUnfiredSinceAnchor,
+        }
+    }
+
+    /// `sink`'s `consume = latest` stand-down for a node the resumed pass
+    /// never ran.
+    fn latest_unfired() -> StandDown {
+        StandDown {
+            node_id: "sink".to_string(),
+            decider: Decider::LatestFire,
+            reason: StandDownReason::LatestUnfiredSinceAnchor,
+        }
+    }
+
+    /// `fuse`'s Sync stand-down for a node the resumed pass never ran.
+    fn sync_unfired() -> StandDown {
+        StandDown {
+            node_id: "fuse".to_string(),
+            decider: Decider::Sync,
+            reason: StandDownReason::SyncUnfiredSinceAnchor,
+        }
+    }
+
+    /// The FIFO node `sink` on the trigger inputs `inp` and `aux`.
+    fn two_input_fifo_node() -> Vec<NodeDecl> {
+        vec![node(
+            "sink",
+            TriggerDecl::Data {
+                trigger_inputs: inputs(&["inp", "aux"]),
+            },
+        )]
+    }
+
+    /// [`fifo_node`] under a 20 ms `throttle_ms`.
+    fn throttled_fifo_node() -> Vec<NodeDecl> {
+        let mut nodes = fifo_node();
+        nodes[0].throttle_ns = Some(20 * MS);
+        nodes
+    }
+
+    /// Steps 4 to 7 of a resumed slice in which the drain pops one frame on
+    /// each of `sink`'s `inputs` at every step and the recording fires
+    /// `sink` at `fires_at`.
+    fn fifo_slice_on(inputs: &[&str], fires_at: &[u64]) -> Vec<RecordedStep> {
+        fifo_resumed_slice(fires_at)
+            .into_iter()
+            .map(|mut s| {
+                s.reads = inputs.iter().map(|i| drained("sink", i, None)).collect();
+                s
+            })
+            .collect()
+    }
+
+    /// Steps 4 to 4 + `len` - 1 of a resumed slice of the `consume = latest`
+    /// node `sink`: the drain counts frame `n` at every step `n` from
+    /// `first_pop` on, and the recording fires `sink` at `fires_at`.
+    fn latest_slice(len: u64, first_pop: u64, fires_at: &[u64]) -> Vec<RecordedStep> {
+        (ANCHOR_STEP + 1..ANCHOR_STEP + 1 + len)
+            .map(|n| {
+                let reads = if n >= first_pop {
+                    vec![counted(n as u32)]
+                } else {
+                    vec![]
+                };
+                latest_step(n, fires_at.contains(&n), reads)
+            })
+            .collect()
+    }
+
+    /// The trust a format-5 bag's role bits carry, as the Sync oracles use.
+    const SYNC_TRUST: RoleTrust = RoleTrust::Believed {
+        consults_recorded: false,
+    };
+
+    /// Steps 4 to 4 + `len` - 1 of a resumed slice of the Sync node `fuse`:
+    /// at every step `n` the drain fills `cam` at `1000 + 20k` ms and `lidar`
+    /// at `1010 + 20k` ms (`k = n - 4`), an aligned pair inside the 50 ms
+    /// window, and the recording fires `fuse` at `fires_at`.
+    fn sync_slice(len: u64, fires_at: &[u64]) -> Vec<RecordedStep> {
+        (ANCHOR_STEP + 1..ANCHOR_STEP + 1 + len)
+            .map(|n| {
+                let k = n - (ANCHOR_STEP + 1);
+                let at = EPOCH + (1015 + 20 * k) * MS;
+                RecordedStep {
+                    step: n,
+                    clock_ns: at,
+                    fires: if fires_at.contains(&n) {
+                        vec![fire("fuse", at)]
+                    } else {
+                        vec![]
+                    },
+                    reads: vec![
+                        drain_at("cam", (1000 + 20 * k) * MS),
+                        drain_at("lidar", (1010 + 20 * k) * MS),
+                    ],
+                }
+            })
+            .collect()
+    }
+
+    /// [`fuse_node`] wiring a non-trigger input, so its Sync rule runs on
+    /// carried heads.
+    fn wide_fuse_node() -> NodeDecl {
+        let mut n = fuse_node();
+        n.has_non_trigger_inputs = true;
+        n
+    }
+
+    /// [`verify`] of `nodes` over `steps` on a pass restored with `restore`,
+    /// with no stop.
+    fn judge_unstopped(
+        nodes: &[NodeDecl],
+        steps: &[RecordedStep],
+        trust: RoleTrust,
+        restore: &PassRestore,
+    ) -> RederivationReport {
+        verify(nodes, steps, &[], trust, restore, &PassStops::none())
+    }
+
+    /// The hand table of a resumed FIFO slice that never fires `sink`: one
+    /// input convicts at its first pop, expecting the one frame; two inputs
+    /// at the first step, expecting both frames; a throttled node at the
+    /// second step, once the one frame its throttle may defer is held and a
+    /// second is popped. Where the checkpoint does not state the stop, each
+    /// stands the rule down by name instead, once, with no finding; where it
+    /// states the node running, each is the finding of the table.
+    #[test]
+    fn an_unstated_fifo_node_that_never_runs_in_a_resumed_pass_stands_down_by_name() {
+        /// `(shape, nodes, inputs popped, convicting step, frames expected)`.
+        type Row<'a> = (&'a str, Vec<NodeDecl>, &'a [&'a str], u64, u32);
+        let table: [Row; 3] = [
+            ("one input", fifo_node(), &["inp"], 4, 1),
+            ("two inputs", two_input_fifo_node(), &["inp", "aux"], 4, 2),
+            ("throttled", throttled_fifo_node(), &["inp"], 5, 2),
+        ];
+        for (shape, nodes, on, step, expected) in table {
+            let slice = fifo_slice_on(on, &[]);
+            let unstated =
+                judge_unstopped(&nodes, &slice, RoleTrust::Declined, &resumed_unstated());
+            assert_eq!(
+                unstated,
+                RederivationReport {
+                    stand_downs: vec![fifo_unfired()],
+                    ..RederivationReport::default()
+                },
+                "{shape}"
+            );
+            let running =
+                judge_unstopped(&nodes, &slice, RoleTrust::Declined, &stated_running("sink"));
+            assert_eq!(
+                finding_steps(&running),
+                vec![(step, Decider::FifoPop)],
+                "{shape}"
+            );
+            assert_eq!(
+                running.findings[0].expected,
+                StepFires::count(expected),
+                "{shape}"
+            );
+            assert!(
+                running.stand_downs.is_empty(),
+                "{shape}: {:?}",
+                running.stand_downs
+            );
+        }
+        let sd = fifo_unfired();
+        assert_eq!(sd.reason.code(), "fifo_unfired_since_anchor");
+        assert_eq!(
+            sd.reason.label(),
+            "the resumed pass holds no fire of the node and no read its body made while its \
+             trigger drain popped frames, which a node stopped before the pass's anchor and a \
+             running node the scheduler never fired in the pass both record; the recording \
+             does not state whether the node had stopped at the anchor, which is what would \
+             tell the two apart"
+        );
+        let rendered = sd.to_string();
+        assert!(
+            rendered.starts_with("not verified: node 'sink' FIFO pop count ")
+                && rendered.ends_with(sd.reason.label()),
+            "{rendered}"
+        );
+    }
+
+    /// A unified `consume = latest` node that never runs in a resumed slice
+    /// whose first step pops nothing and whose next five steps each pop a
+    /// frame: where the checkpoint states it running the slice convicts at
+    /// step 5, the first pop, expecting one fire; where the stop is unstated
+    /// the rule stands down by name, once, and no later pop is a finding.
+    /// Read through two subscribers the unread-frame rule stands down under
+    /// the same name.
+    #[test]
+    fn an_unstated_unified_latest_node_that_never_runs_stands_down_by_name() {
+        let unified = latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH);
+        let slice = latest_slice(6, 5, &[]);
+        let unstated = judge_unstopped(&unified, &slice, BELIEVED, &resumed_unstated());
+        assert_eq!(
+            unstated,
+            RederivationReport {
+                stand_downs: vec![latest_unfired()],
+                ..RederivationReport::default()
+            }
+        );
+        let running = judge_unstopped(&unified, &slice, BELIEVED, &stated_running("sink"));
+        assert_eq!(finding_steps(&running), vec![(5, Decider::LatestFire)]);
+        assert_eq!(running.findings[0].expected, StepFires::count(1));
+        assert_eq!(running.findings[0].recorded, StepFires::none());
+
+        let separate = latest_node_with(LatestDrain::Separate, Some(1), 4);
+        let deep = latest_slice(20, 4, &[]);
+        let unstated = judge_unstopped(&separate, &deep, BELIEVED, &resumed_unstated());
+        assert!(unstated.is_clean(), "{:?}", unstated.findings);
+        assert_eq!(unstated.stand_downs, vec![latest_unfired()]);
+    }
+
+    /// A Sync node that never runs in a resumed slice whose first step drains
+    /// an aligned `(cam, lidar)` pair: where the checkpoint states it running
+    /// that step owes a fire, a finding at step 4; where the stop is
+    /// unstated, arm C stands down by name instead. On a node that wires a
+    /// non-trigger input the carried-heads note stays beside the finding, and
+    /// none is pushed beside the stand-down: such a node has no recorded fire,
+    /// so no rule judged it on carried heads. A pair that a restored `cam`
+    /// head and a fresh `lidar` arrival align stands down the same way.
+    #[test]
+    fn an_unstated_sync_node_with_an_aligned_set_and_no_fire_stands_down_at_arm_c() {
+        let slice = sync_slice(1, &[]);
+        for (wide, n) in [(false, fuse_node()), (true, wide_fuse_node())] {
+            let nodes = [n];
+            let notes = if wide {
+                vec![CarriedHeadsNote {
+                    node_id: "fuse".to_string(),
+                }]
+            } else {
+                vec![]
+            };
+            let unstated = judge_unstopped(&nodes, &slice, SYNC_TRUST, &resumed_unstated());
+            assert_eq!(
+                unstated,
+                RederivationReport {
+                    stand_downs: vec![sync_unfired()],
+                    ..RederivationReport::default()
+                },
+                "wide: {wide}"
+            );
+            let running = judge_unstopped(&nodes, &slice, SYNC_TRUST, &stated_running("fuse"));
+            assert_eq!(
+                finding_steps(&running),
+                vec![(4, Decider::Sync)],
+                "wide: {wide}"
+            );
+            assert_eq!(running.findings[0].expected, StepFires::count(1));
+            assert_eq!(running.carried_heads, notes, "wide: {wide}");
+        }
+        let mut restored_pair = sync_slice(1, &[]);
+        restored_pair[0].reads.retain(|r| r.input == "lidar");
+        let restored = restored_cam_at(EPOCH + 1000 * MS);
+        let unstated = judge_unstopped(&[fuse_node()], &restored_pair, SYNC_TRUST, &restored);
+        assert!(unstated.is_clean(), "{:?}", unstated.findings);
+        assert_eq!(unstated.stand_downs, vec![sync_unfired()]);
+        let running = judge_unstopped(
+            &[fuse_node()],
+            &restored_pair,
+            SYNC_TRUST,
+            &restored.with_stops_stated(["fuse".to_string()].into()),
+        );
+        assert_eq!(finding_steps(&running), vec![(4, Decider::Sync)]);
+        let sd = sync_unfired();
+        assert_eq!(sd.reason.code(), "sync_unfired_since_anchor");
+        assert_eq!(
+            sd.reason.label(),
+            "the resumed pass holds no fire of the node and no read its body made while its \
+             trigger inputs held an aligned set, which a node stopped before the pass's anchor \
+             and a running node the scheduler never fired in the pass both record; the \
+             recording does not state whether the node had stopped at the anchor, which is \
+             what would tell the two apart"
+        );
+        let rendered = sd.to_string();
+        assert!(
+            rendered.starts_with("not verified: node 'fuse' sync alignment ")
+                && rendered.ends_with(sd.reason.label()),
+            "{rendered}"
+        );
+    }
+
+    /// A node a resumed pass fires once, with no read its body made, ran in
+    /// the pass, so its stop being unstated stands nothing down: FIFO fires
+    /// on step 4's pop and convicts on step 5's, the unified latest node the
+    /// same, and the Sync node fires on step 4's pair and is owed a fire for
+    /// step 5's.
+    #[test]
+    fn a_resumed_node_that_fires_with_no_body_read_is_judged_not_stood_down() {
+        let fifo = judge_unstopped(
+            &fifo_node(),
+            &fifo_slice_on(&["inp"], &[4]),
+            RoleTrust::Declined,
+            &resumed_unstated(),
+        );
+        let unified = latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH);
+        let latest = judge_unstopped(
+            &unified,
+            &latest_slice(4, 4, &[4]),
+            BELIEVED,
+            &resumed_unstated(),
+        );
+        let sync = judge_unstopped(
+            &[fuse_node()],
+            &sync_slice(2, &[4]),
+            SYNC_TRUST,
+            &resumed_unstated(),
+        );
+        for (report, decider) in [
+            (&fifo, Decider::FifoPop),
+            (&latest, Decider::LatestFire),
+            (&sync, Decider::Sync),
+        ] {
+            assert_eq!(finding_steps(report), vec![(5, decider)]);
+            assert_eq!(report.findings[0].expected, StepFires::count(1));
+            assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+        }
+    }
+
+    /// A node with a read its body made in a resumed pass, on an input no
+    /// rule counts, and no fire, ran in the pass too: each rule judges it,
+    /// and the slice convicts at its first owed fire, step 4.
+    #[test]
+    fn a_resumed_node_with_a_body_read_and_no_fire_is_judged() {
+        let body = |node_id: &str, trust: RoleTrust| -> RecordedRead {
+            let role = match trust {
+                RoleTrust::Declined => ReadSiteRole::Unstamped,
+                RoleTrust::Believed { .. } => ReadSiteRole::Body,
+            };
+            read_with_role(node_id, "ctx", ReadOutcomeKind::Served, 1, None, role)
+        };
+        let mut fifo_steps = fifo_slice_on(&["inp"], &[]);
+        fifo_steps[2].reads.push(body("sink", RoleTrust::Declined));
+        let mut latest_steps = latest_slice(4, 4, &[]);
+        latest_steps[2].reads.push(body("sink", BELIEVED));
+        let mut sync_steps = sync_slice(1, &[]);
+        sync_steps[0].reads.push(body("fuse", SYNC_TRUST));
+        let reports = [
+            (
+                judge_unstopped(
+                    &fifo_node(),
+                    &fifo_steps,
+                    RoleTrust::Declined,
+                    &resumed_unstated(),
+                ),
+                Decider::FifoPop,
+            ),
+            (
+                judge_unstopped(
+                    &latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH),
+                    &latest_steps,
+                    BELIEVED,
+                    &resumed_unstated(),
+                ),
+                Decider::LatestFire,
+            ),
+            (
+                judge_unstopped(&[fuse_node()], &sync_steps, SYNC_TRUST, &resumed_unstated()),
+                Decider::Sync,
+            ),
+        ];
+        for (report, decider) in &reports {
+            assert_eq!(finding_steps(report), vec![(4, *decider)]);
+            assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+        }
+    }
+
+    /// A node the checkpoint states as running, and every node of a
+    /// from-start pass, is judged by every rule: the quiet slices of the
+    /// three rules convict at step 4, their first owed fire, under both
+    /// restores.
+    #[test]
+    fn a_stated_running_node_and_a_from_start_pass_convict_at_their_first_owed_fire() {
+        let unified = latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH);
+        /// `(nodes, quiet slice, trust, node id, the rule that convicts)`.
+        type Case<'a> = (
+            &'a [NodeDecl],
+            Vec<RecordedStep>,
+            RoleTrust,
+            &'a str,
+            Decider,
+        );
+        let cases: [Case; 3] = [
+            (
+                &fifo_node(),
+                fifo_slice_on(&["inp"], &[]),
+                RoleTrust::Declined,
+                "sink",
+                Decider::FifoPop,
+            ),
+            (
+                &unified,
+                latest_slice(4, 4, &[]),
+                BELIEVED,
+                "sink",
+                Decider::LatestFire,
+            ),
+            (
+                &[fuse_node()],
+                sync_slice(1, &[]),
+                SYNC_TRUST,
+                "fuse",
+                Decider::Sync,
+            ),
+        ];
+        for (nodes, steps, trust, id, decider) in &cases {
+            for restore in [stated_running(id), PassRestore::none()] {
+                let report = judge_unstopped(nodes, steps, *trust, &restore);
+                assert_eq!(finding_steps(&report), vec![(4, *decider)], "{restore:?}");
+                assert!(report.stand_downs.is_empty(), "{:?}", report.stand_downs);
+            }
+        }
+    }
+
+    /// The stand-down waits for the step its rule would convict: a throttled
+    /// FIFO node whose one frame the throttle may still defer, a unified
+    /// latest node whose drain pops nothing, and a Sync node whose `cam`
+    /// never fills are owed no fire, so nothing is stood down for them.
+    #[test]
+    fn the_stand_down_waits_for_the_step_that_would_convict() {
+        let fifo = judge_unstopped(
+            &throttled_fifo_node(),
+            &fifo_slice_on(&["inp"], &[])[..1],
+            RoleTrust::Declined,
+            &resumed_unstated(),
+        );
+        let latest = judge_unstopped(
+            &latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH),
+            &latest_slice(4, 99, &[]),
+            BELIEVED,
+            &resumed_unstated(),
+        );
+        let mut lidar_only = sync_slice(3, &[]);
+        for s in &mut lidar_only {
+            s.reads.retain(|r| r.input == "lidar");
+        }
+        let sync = judge_unstopped(&[fuse_node()], &lidar_only, SYNC_TRUST, &resumed_unstated());
+        for report in [fifo, latest, sync] {
+            assert_eq!(report, RederivationReport::default(), "{report:?}");
+        }
+    }
+
+    /// The latched stand-downs are pushed once however many later steps
+    /// would have convicted: five popping steps of a unified latest node, and
+    /// three aligned pairs of a Sync node wiring a non-trigger input, each
+    /// give exactly one stand-down and no finding or note. Where the
+    /// checkpoint states the node running, each convicts at its first owed
+    /// step, the Sync node beside its carried-heads note.
+    #[test]
+    fn a_latched_stand_down_is_pushed_once_however_many_steps_would_convict() {
+        let unified = latest_node_with(LatestDrain::Unified, Some(1), LATEST_DEPTH);
+        let latest = judge_unstopped(
+            &unified,
+            &latest_slice(5, 4, &[]),
+            BELIEVED,
+            &resumed_unstated(),
+        );
+        assert_eq!(
+            latest,
+            RederivationReport {
+                stand_downs: vec![latest_unfired()],
+                ..RederivationReport::default()
+            }
+        );
+        let wide = [wide_fuse_node()];
+        let aligned = sync_slice(3, &[]);
+        let sync = judge_unstopped(&wide, &aligned, SYNC_TRUST, &resumed_unstated());
+        assert_eq!(
+            sync,
+            RederivationReport {
+                stand_downs: vec![sync_unfired()],
+                ..RederivationReport::default()
+            }
+        );
+        let running = judge_unstopped(&wide, &aligned, SYNC_TRUST, &stated_running("fuse"));
+        assert_eq!(finding_steps(&running), vec![(4, Decider::Sync)]);
+        assert_eq!(
+            running.carried_heads,
+            vec![CarriedHeadsNote {
+                node_id: "fuse".to_string(),
+            }]
+        );
+    }
+
+    /// One resumed slice of three nodes no step fires, judged twice: the two
+    /// reports are equal, and hold one stand-down per rule in declaration
+    /// order and no finding.
+    #[test]
+    fn three_unfired_nodes_stand_down_in_declaration_order_on_two_verify_calls() {
+        let nodes = vec![
+            node(
+                "fifo",
+                TriggerDecl::Data {
+                    trigger_inputs: inputs(&["inp"]),
+                },
+            ),
+            node(
+                "latest",
+                TriggerDecl::DataLatest {
+                    trigger_inputs: inputs(&["inp"]),
+                    drain: LatestDrain::Unified,
+                    writers: Some(1),
+                    depth: LATEST_DEPTH,
+                    identity: EdgeIdentity::EveryEdge,
+                },
+            ),
+            fuse_node(),
+        ];
+        let steps: Vec<RecordedStep> = sync_slice(4, &[])
+            .into_iter()
+            .map(|mut s| {
+                for id in ["fifo", "latest"] {
+                    s.reads.push(read_with_role(
+                        id,
+                        "inp",
+                        ReadOutcomeKind::DrainedBatch,
+                        1,
+                        None,
+                        ReadSiteRole::Drain,
+                    ));
+                }
+                s
+            })
+            .collect();
+        let judge = || judge_unstopped(&nodes, &steps, SYNC_TRUST, &resumed_unstated());
+        let first = judge();
+        assert_eq!(first, judge(), "two runs agree");
+        assert!(first.is_clean(), "{:?}", first.findings);
+        assert_eq!(
+            first
+                .stand_downs
+                .iter()
+                .map(|sd| (sd.node_id.as_str(), sd.reason.code()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("fifo", "fifo_unfired_since_anchor"),
+                ("latest", "latest_unfired_since_anchor"),
+                ("fuse", "sync_unfired_since_anchor"),
+            ]
+        );
+    }
+
+    /// The per-node answer every rule keys on, from its hand table: only a
+    /// resumed pass that leaves the node's stop unstated and holds no fire and
+    /// no body read of it answers `StandsDown`.
+    #[test]
+    fn unfired_since_anchor_answers_its_hand_table() {
+        let quiet = fifo_slice_on(&["inp"], &[]);
+        let fired = fifo_slice_on(&["inp"], &[6]);
+        let mut body = fifo_slice_on(&["inp"], &[]);
+        body[1]
+            .reads
+            .push(read("sink", "ctx", ReadOutcomeKind::Served, 1, None));
+        let rows: [(&str, PassRestore, &[RecordedStep], OwedFire); 6] = [
+            (
+                "unstated, quiet",
+                resumed_unstated(),
+                &quiet,
+                OwedFire::StandsDown,
+            ),
+            (
+                "unstated, fired",
+                resumed_unstated(),
+                &fired,
+                OwedFire::Judged,
+            ),
+            (
+                "unstated, body read",
+                resumed_unstated(),
+                &body,
+                OwedFire::Judged,
+            ),
+            ("stated", stated_running("sink"), &quiet, OwedFire::Judged),
+            (
+                "from the start",
+                PassRestore::none(),
+                &quiet,
+                OwedFire::Judged,
+            ),
+            (
+                "another node stated",
+                stated_running("other"),
+                &quiet,
+                OwedFire::StandsDown,
+            ),
+        ];
+        for (label, restore, steps, expected) in rows {
+            assert_eq!(
+                unfired_since_anchor(&restore, "sink", steps, RoleTrust::Declined),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     fn drained(node_id: &str, input: &str, stamp: Option<u64>) -> RecordedRead {
@@ -7533,8 +8970,9 @@ mod tests {
             unfired.reason.label(),
             "the resumed pass holds no fire of the node and no read its body made while its \
              trigger drain counted frames, which a node stopped before the pass's anchor and a \
-             running node the scheduler never fired in the pass both record; the anchor does \
-             not stamp each node's stopped state, which is what would tell the two apart"
+             running node the scheduler never fired in the pass both record; the recording \
+             does not state whether the node had stopped at the anchor, which is what would \
+             tell the two apart"
         );
         let rendered = unfired.to_string();
         assert!(
@@ -8940,6 +10378,8 @@ mod tests {
             StandDownReason::LatestWritersUnnamed,
             StandDownReason::LatestBlockHeld,
             StandDownReason::LatestUnfiredSinceAnchor,
+            StandDownReason::FifoUnfiredSinceAnchor,
+            StandDownReason::SyncUnfiredSinceAnchor,
         ];
         let codes: std::collections::BTreeSet<&str> = all.iter().map(|r| r.code()).collect();
         assert_eq!(codes.len(), all.len(), "every reason's token is distinct");
