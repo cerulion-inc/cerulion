@@ -5,7 +5,7 @@ file and branch names, commit messages, commit identities, pull request titles a
 bodies, and the images and clips under `docs/media`. The leak guard is one scanner,
 `tools/scripts/leak_scan.py` (stdlib Python 3, no dependencies), that keeps machine
 names, addresses, home paths, logins, people and location metadata out of all of it.
-It runs in four places: the git hooks on your machine, the `lint` job of the main CI
+It runs in four places: the git hooks on your machine, the `Lint` check of the main CI
 workflow, the tree, names, messages and media scans in the `Leak guard` workflow
 (`.github/workflows/leak-guard.yml`) on every pull request, merge queue batch and push
 to `main`, and the issue and comment body scan in the `Leak guard (issue and comment
@@ -370,7 +370,7 @@ generic class except `style-dash` and `overlay-word`) the text prints only where
 private tier is loaded and the output is a terminal: the hooks, a local `tree` run.
 With no tier loaded the scanner cannot tell that the value is not a name the tier
 would have withheld, and a CI log (`--format github`) outlives the force-push that
-scrubs a branch, so the `lint` step of the main workflow, a fork pull request and every
+scrubs a branch, so the `Lint` step of the main workflow, a fork pull request and every
 `Leak guard` job print the value with each letter and digit replaced (the second
 example): the length and the punctuation stay, which is enough to find the token on
 the line, and the value stays out of the log. When a private pattern touches the same

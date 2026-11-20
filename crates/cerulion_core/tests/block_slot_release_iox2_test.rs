@@ -91,6 +91,7 @@ use cerulion_core::graph::{BuildPurpose, CrossProcessWiring, GraphRuntime};
 use cerulion_core::message::ShmMessage;
 use cerulion_core::prelude::*;
 use cerulion_core::scheduler::BackpressureCounters;
+use cerulion_core::state_restore::StoppedAtAnchor;
 use cerulion_core::transport::publisher::BlockSendHook;
 use cerulion_core::transport::{TransportConfig, TransportManager};
 use cerulion_core::wire::MaxSliceLen;
@@ -2227,8 +2228,12 @@ fn fatal_consumer_graph(prefix: &str) -> GraphConfig {
 #[test]
 fn a_restored_stop_releases_the_consumers_block_slot_as_its_fatal_return_did() {
     let mut rt = build(fatal_consumer_graph("bsr_restored")).expect("build");
-    rt.restore_stopped_nodes(&["dies".to_string()].into_iter().collect())
-        .expect("dies is in the graph");
+    rt.restore_stopped_nodes(
+        &[("dies".to_string(), StoppedAtAnchor::default())]
+            .into_iter()
+            .collect(),
+    )
+    .expect("dies is in the graph");
     for step in 0..STEPS {
         if step == 9 {
             rt.trigger_external("dies").expect("trigger");
@@ -2273,8 +2278,12 @@ fn a_restored_stop_releases_only_the_named_consumers_slot() {
         ],
     ))
     .expect("build");
-    rt.restore_stopped_nodes(&["stopped".to_string()].into_iter().collect())
-        .expect("stopped is in the graph");
+    rt.restore_stopped_nodes(
+        &[("stopped".to_string(), StoppedAtAnchor::default())]
+            .into_iter()
+            .collect(),
+    )
+    .expect("stopped is in the graph");
     for _ in 0..STEPS {
         rt.step(Duration::from_millis(10));
     }

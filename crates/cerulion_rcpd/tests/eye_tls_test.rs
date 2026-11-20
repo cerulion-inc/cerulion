@@ -19,7 +19,9 @@ use cerulion_rcpd::eye::host::{request, Admit, Completed, EyeCore, EyeSettings, 
 use cerulion_rcpd::eye::limits::jpeg_header_for_test;
 use cerulion_rcpd::eye::verdict::Outcome;
 use cerulion_rcpd::manifest::RcpManifest;
-use eye_common::{eyes_yaml, good_body, holds_key, key_file, Reply, Stub, ANSWERED_MODEL};
+use eye_common::{
+    eyes_yaml, good_body, holds_key, key_file, Reply, Stub, ANSWERED_MODEL, EYE_WAIT,
+};
 use serde_json::json;
 
 /// Every log line of the process.
@@ -111,9 +113,10 @@ async fn the_client_checks_the_route_certificate_and_speaks_http2_over_tls() {
     );
     assert_eq!(stub.count(), 0, "no request over an untrusted connection");
     // The stub sees the refused handshake when it reads the client's alert,
-    // which can come after the client has returned.
+    // which can come after the client has returned. The count is read once
+    // more after [`EYE_WAIT`].
     let waited = Instant::now();
-    while stub.handshake_failures() == 0 && waited.elapsed() < Duration::from_secs(10) {
+    while stub.handshake_failures() == 0 && waited.elapsed() < EYE_WAIT {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(stub.handshake_failures() >= 1, "the handshake was refused");

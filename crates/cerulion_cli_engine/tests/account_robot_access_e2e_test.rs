@@ -74,6 +74,8 @@ struct Fixture {
     _server: Server,
     home: tempfile::TempDir,
     robot_id: [u8; 32],
+    app: Arc<AppState>,
+    account: [u8; 32],
 }
 impl Fixture {
     fn new() -> Self {
@@ -111,7 +113,7 @@ impl Fixture {
                 now,
             )
             .unwrap();
-        let server = Server::start(app);
+        let server = Server::start(Arc::clone(&app));
         let home = tempfile::tempdir_in("/tmp").unwrap();
         let env = vec![
             EnvGuard::set("CERULION_HOME", home.path()),
@@ -136,6 +138,8 @@ impl Fixture {
             _server: server,
             home,
             robot_id: robot.robot_id,
+            app,
+            account: owner.account_id,
         }
     }
     fn socket(&self) -> std::path::PathBuf {
@@ -1155,4 +1159,72 @@ fn vector3_walker() -> cerulion_core::codegen::FrameWalker {
     let (walker, warnings) = cerulion_core::codegen::FrameWalker::new(vec![schema]);
     assert!(warnings.is_empty());
     walker
+}
+
+#[test]
+#[serial]
+fn a_viz_target_renews_a_due_device_certificate_once_per_process() {
+    use cerulion_netd::account_access::robot_route;
+    use cerulion_pairing::format::{AccountId, PrincipalKind, PublicKey, Scope};
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let home = fixture.home.path();
+    std::fs::set_permissions(
+        home.join("desk.key"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    // The desk key registered and its chain cached, as a login leaves them, on
+    // the service's own (system) clock.
+    let now = auth::now_unix_ns();
+    let key = PublicKey(
+        ed25519_dalek::SigningKey::from_bytes(&[0x73; 32])
+            .verifying_key()
+            .to_bytes(),
+    );
+    let device = fixture
+        .app
+        .db
+        .register_device(&fixture.account, &key.0, PrincipalKind::Human as u8, now)
+        .unwrap();
+    let issued = cerulion_accountd::encode_b64(&fixture.app.ca.issue_device_cert(
+        key,
+        AccountId(device.account_id),
+        PrincipalKind::Human,
+        Scope::OWNER_FULL,
+        now,
+    ))
+    .unwrap();
+    let intermediate = cerulion_accountd::encode_b64(fixture.app.ca.intermediate()).unwrap();
+    std::fs::write(home.join("device.cert"), &issued).unwrap();
+    std::fs::write(
+        home.join("device-chain.json"),
+        serde_json::json!({ "device_cert": issued, "intermediate": intermediate }).to_string(),
+    )
+    .unwrap();
+    // A window longer than the certificate's lifetime: due now.
+    let _window = EnvGuard::set("CERULION_DEVICE_CERT_RENEW_WINDOW_S", "2592000");
+    let spy = Arc::new(AccessSpy::default());
+    let mut daemon =
+        cerulion_netd::start(fixture.socket(), spy, cerulion_netd::NetdConfig::default()).unwrap();
+    let route = robot_route(&fixture.robot_id);
+    drop(account_robot_access::prepare_viz_target(&route, &[], &[]).unwrap());
+    let renewed = std::fs::read_to_string(home.join("device.cert")).unwrap();
+    assert_ne!(
+        renewed.trim(),
+        issued,
+        "the discovery step renewed the certificate"
+    );
+    let chain = cerulion_cli_engine::owner_certificate::load().unwrap();
+    assert_eq!(
+        cerulion_accountd::encode_b64(&chain.device_cert).unwrap(),
+        renewed.trim()
+    );
+    // Once per process: a second discovery leaves the certificate as it is.
+    drop(account_robot_access::prepare_viz_target(&route, &[], &[]).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(home.join("device.cert")).unwrap(),
+        renewed
+    );
+    daemon.shutdown();
 }

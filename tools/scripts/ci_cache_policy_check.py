@@ -1158,6 +1158,7 @@ def check_text(path, text):
 
             cond = norm(step.cond)
             _check_namespace_gate(add, step, key)
+            _check_one_writer(add, job, step, key, cond)
 
             # R2.
             if MAIN_ONLY_CLAUSE not in cond:
@@ -1266,6 +1267,66 @@ def _check_tool_cache(add, steps, index, step, key):
                 "TOOL_CACHE",
                 "tool-cache save step %r does not carry %s" % (label, wanted),
             )
+
+
+# The key segments R12 reads as one archive per shard: the shard number
+# itself, or nothing on shard 0 and `-shard<k>` on every other shard. Any other
+# expression naming `matrix.shard` can give two shards one key, so it is refused
+# rather than read.
+SHARD_KEY_SEGMENTS = (
+    "${{ matrix.shard }}",
+    "${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}",
+)
+
+
+def _job_declares_shard_matrix(job):
+    """Whether the job's matrix declares `shard`, as a key or in an `include` entry."""
+    strategy = job.node.get("strategy") if job.node.has("strategy") else None
+    if not isinstance(strategy, Map) or not strategy.has("matrix"):
+        return False
+    matrix = strategy.get("matrix")
+    if not isinstance(matrix, Map):
+        return False
+    if matrix.has("shard"):
+        return True
+    include = matrix.get("include") if matrix.has("include") else None
+    return isinstance(include, Seq) and any(
+        isinstance(entry, Map) and entry.has("shard") for entry in include.items
+    )
+
+
+def _check_one_writer(add, job, step, key, cond):
+    """R12. A lockfile-keyed save in a sharded job has ONE writer per archive.
+
+    `actions/cache` reserves a key at save time, so shards sharing one key race:
+    all but the first upload an archive that is refused, and which shard's build
+    lands is arbitrary. A save in a job whose matrix declares `shard` therefore
+    either runs on shard 0 alone (the `matrix.shard == 0` conjunct) or carries
+    one of SHARD_KEY_SEGMENTS in its key, so every shard writes an archive of
+    its own.
+    """
+    if not _job_declares_shard_matrix(job):
+        return
+    conjuncts, _ = split_conjuncts(cond)
+    if SHARD_CLAUSE in conjuncts or any(seg in key for seg in SHARD_KEY_SEGMENTS):
+        return
+    if "matrix.shard" in key:
+        add(
+            step.line,
+            "R12_ONE_WRITER",
+            "save step %r in sharded job %s names `matrix.shard` in its key in a form that "
+            "can give two shards one key; use one of %s, or run the save on shard 0 alone "
+            "(`%s`)"
+            % (step.label(), job.job_id, " or ".join(SHARD_KEY_SEGMENTS), SHARD_CLAUSE),
+        )
+        return
+    add(
+        step.line,
+        "R12_ONE_WRITER",
+        "save step %r in sharded job %s neither runs on shard 0 alone (`%s`) nor puts "
+        "`matrix.shard` in its key, so every shard races for one archive"
+        % (step.label(), job.job_id, SHARD_CLAUSE),
+    )
 
 
 def _check_namespace_gate(add, step, key):
@@ -1993,6 +2054,39 @@ def _mutants():
     """
     clean = CLEAN_WORKFLOW
     out = []
+
+    # R12: the sharded job's save loses `matrix.shard == 0` (from the prune too,
+    # so R3 still pairs them) and keeps the shared key: every shard races.
+    shared = _mut(clean, "          matrix.shard == 0\n          && github.event_name != 'merge_group'\n",
+                  "          github.event_name != 'merge_group'\n")
+    shared = _mut(shared, "          && matrix.shard == 0\n", "", total=1)
+    out.append(("R12 sharded save on a shared key with no shard clause", shared, {"R12_ONE_WRITER"}))
+    # The near-miss: the same gates with the shard in the key, a namespace per
+    # shard and the gate naming it, is one writer per archive and passes.
+    seg = "${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}"
+    per_shard = shared.replace(
+        "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}",
+        "cargo-${{ runner.os }}" + seg + "-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}",
+    )
+    per_shard = _mut(
+        per_shard,
+        "contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))",
+        "contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, "
+        "matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))",
+    )
+    out.append(("R12 near-miss: a key per shard", per_shard, set()))
+    # A key that names the shard but gives shards 1 to 3 one value.
+    repeated = per_shard.replace(seg, "${{ matrix.shard != 0 && '-shard' || '' }}")
+    repeated = repeated.replace(
+        "matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))",
+        "matrix.shard != 0 && '-shard' || '')))",
+    )
+    assert repeated != per_shard
+    out.append(("R12 key names the shard but repeats a value", repeated, {"R12_ONE_WRITER"}))
+    # The shard declared through `include` entries is still a sharded job.
+    included = _mut(shared, "        shard: [0, 1, 2, 3]\n",
+                    "        include:\n          - shard: 0\n          - shard: 1\n")
+    out.append(("R12 shard declared by include entries", included, {"R12_ONE_WRITER"}))
 
     # R1: the lint job's token no longer matches its own key template.
     out.append((

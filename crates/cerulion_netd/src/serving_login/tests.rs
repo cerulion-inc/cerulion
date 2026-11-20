@@ -218,3 +218,123 @@ fn durable_pairing_authorizes_without_login_and_corrupt_or_incomplete_state_does
     };
     assert_eq!(offline.check(), Ok(()));
 }
+
+#[cfg(feature = "wan")]
+#[test]
+fn lean_and_shared_readers_preserve_literal_parse_and_real_file_behavior() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    let account = "00112233-4455-4677-8899-aabbccddeeff";
+    let records = [
+        (EXPIRED.to_vec(), Ok(account.to_owned())),
+        (
+            EXPIRED[..EXPIRED.len() - 1]
+                .iter()
+                .copied()
+                .chain(br#","role":{"future":true}}"#.iter().copied())
+                .collect(),
+            Ok(account.to_owned()),
+        ),
+        (b"{".to_vec(), Err(LoginProblem::Malformed)),
+        (
+            br#"{"account_id":"account","logged_in_ever":true}"#.to_vec(),
+            Err(LoginProblem::Malformed),
+        ),
+        (
+            String::from_utf8(EXPIRED.to_vec())
+                .unwrap()
+                .replace("\"logged_in_ever\":true", "\"logged_in_ever\":false")
+                .into_bytes(),
+            Err(LoginProblem::NeverLoggedIn),
+        ),
+        (
+            String::from_utf8(EXPIRED.to_vec())
+                .unwrap()
+                .replace(
+                    "\"logged_in_ever\":true",
+                    "\"logged_in_ever\":true,\"logged_in_ever\":true",
+                )
+                .into_bytes(),
+            Err(LoginProblem::Malformed),
+        ),
+    ];
+    for (bytes, expected) in records {
+        assert_eq!(lean_identity(&bytes), expected);
+        assert_eq!(identity(&bytes), expected);
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            lean_read_regular_bounded(&path, MAX_AUTH_BYTES),
+            Ok(bytes.clone())
+        );
+        assert_eq!(
+            read_regular_bounded(&path, MAX_AUTH_BYTES),
+            Ok(bytes.clone())
+        );
+        assert_eq!(read_identity_at(&path), expected);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+    std::fs::write(&path, b"abc").unwrap();
+    for (limit, expected) in [
+        (2, Err(LoginProblem::TooLarge)),
+        (3, Ok(b"abc".to_vec())),
+        (u64::MAX, Err(LoginProblem::TooLarge)),
+    ] {
+        assert_eq!(lean_read_regular_bounded(&path, limit), expected);
+        assert_eq!(read_regular_bounded(&path, limit), expected);
+    }
+    std::fs::remove_file(&path).unwrap();
+    for reader in [lean_read_regular_bounded, read_regular_bounded] {
+        assert_eq!(reader(&path, MAX_AUTH_BYTES), Err(LoginProblem::Missing));
+        assert_eq!(
+            reader(dir.path(), MAX_AUTH_BYTES),
+            Err(LoginProblem::NotRegular)
+        );
+    }
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[cfg(all(feature = "wan", unix))]
+#[test]
+fn lean_and_shared_readers_reject_fifos_and_follow_only_regular_file_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    // The owned FIFO has no writer: the production nonblocking opener must return.
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap()
+        .success());
+    for reader in [lean_read_regular_bounded, read_regular_bounded] {
+        assert_eq!(reader(&path, MAX_AUTH_BYTES), Err(LoginProblem::NotRegular));
+    }
+    std::fs::remove_file(&path).unwrap();
+    let target = dir.path().join("stored.json");
+    std::fs::write(&target, EXPIRED).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    for reader in [lean_read_regular_bounded, read_regular_bounded] {
+        assert_eq!(reader(&path, MAX_AUTH_BYTES), Ok(EXPIRED.to_vec()));
+    }
+    assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+    std::fs::remove_file(&target).unwrap();
+    for reader in [lean_read_regular_bounded, read_regular_bounded] {
+        assert_eq!(reader(&path, MAX_AUTH_BYTES), Err(LoginProblem::Missing));
+    }
+}
+
+#[cfg(feature = "wan")]
+#[test]
+fn session_presence_metadata_does_not_change_lean_or_wan_prior_login_policy() {
+    let empty = br#"{"account_id":"00112233-4455-4677-8899-aabbccddeeff","session_token":"","refresh_token":"","expires_at_ns":0,"logged_in_ever":true}"#;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("auth.json");
+    for bytes in [EXPIRED, empty.as_slice()] {
+        assert_eq!(
+            lean_identity(bytes).unwrap(),
+            "00112233-4455-4677-8899-aabbccddeeff"
+        );
+        assert_eq!(identity(bytes), lean_identity(bytes));
+        std::fs::write(&path, bytes).unwrap();
+        assert_eq!(read_at(&path), ServingLogin::Allowed);
+        assert_eq!(read_identity_at(&path), lean_identity(bytes));
+    }
+}

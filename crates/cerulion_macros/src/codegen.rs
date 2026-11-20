@@ -664,7 +664,7 @@ fn gen_wrapper(
     // instead of inline bounds reported a syntax error it did not contain.
     // (Pre-existing, and independent of the state forwards below: reproduced
     // with those removed. Pinned by the `WhereClauseNode` half of
-    // `tests/ui/pass/generic_node_state_bounds_pass.rs`.)
+    // `crates/test_fixtures/node_macro_ui/tests/ui/pass/generic_node_state_bounds_pass.rs`.)
     let default_where_clause = {
         let existing = where_clause.map(|w| {
             let preds = &w.predicates;
