@@ -32,34 +32,65 @@
 # lands in a shard automatically; nothing needs editing.
 #
 # WITH EXACTLY ONE NAMED EXCEPTION, and the rule above is why it is one name
-# and not a list: `macro_compile_fail_test` is PINNED to a fixed shard, because
-# it is a multi-minute serial trybuild tail whose round-robin position — and
-# therefore which runner pays it — changes every time an unrelated test file is
-# added. Everything else still round-robins with no edit here. The evidence,
-# the arithmetic and the bar for adding a second name are at `PINNED_TEST`
+# and not a list: `macro_compile_fail_test` is PINNED to a fixed shard and held
+# out of the rotation, so every other file keeps the shard the package map was
+# balanced against. Everything else still round-robins with no edit here. Why
+# the pin exists and the bar for adding a second name are at `PINNED_TEST`
 # below; `--check` proves the pin landed where it says it did.
 #
 # `--lib` (the package's own unit tests) rides shard 0. It is a single target,
 # it is cheap, and it has to go somewhere exactly once.
 #
+# OTHER PACKAGES' TESTS RIDE THE SAME INVOCATION with `--with <package>`. A
+# package step that runs after this one adds its whole time to the leg, while
+# a test in this invocation runs beside the shard's own tests and is built by
+# the same cargo invocation. The `#[cerulion_node]` diagnostics suite rides
+# shard 2 of both lanes this way: its compile-fail test runs trybuild over its
+# fixtures for minutes, and `.config/nextest.toml` starts it right after the
+# timing tests that claim every slot. An extra package adds `-p <package> --test <name>` for each of its
+# `tests/*.rs` at depth 1. Cargo applies `--lib` and every `--test` to all the
+# packages one command selects, so the script refuses `--with` on shard 0,
+# which carries `--lib`, and refuses an extra that holds a test this
+# invocation could not run (see `check_extra`), or a `tests/*.rs` named like
+# one of this package's (cargo would run that file of this package too). Each
+# package is read against the selection on its own.
+#
+# THE EXTRAS' FEATURES ARE MEASURED, NOT GATED. Building an extra in this
+# invocation unions its dev-dependency features into this package's test
+# build. For `node_macro_ui` that union adds nothing: its dev-dependencies ask
+# for `test-helpers` on `cerulion_core` and `native_ros2_messages`, which
+# `cerulion_core`'s own test build already turns on. To check it again after
+# an extra's manifest changes, compare two unit graphs of the shard-2 build,
+# `cargo test --no-run $(ci_test_shard.sh --list cerulion_core 2 4) --unit-graph
+# -Z unstable-options` with and without `--with <extra>` inside the `$( )`
+# (on stable cargo, with `__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS=nightly`
+# set): every unit both graphs hold must carry the same features, and the
+# second may add only the extra's own units.
+#
 # USAGE
-#   ci_test_shard.sh <package> <shard_index> <shard_count> [package_dir]
-#   ci_test_shard.sh --list  <package> <shard_index> <shard_count> [package_dir]
+#   ci_test_shard.sh <package> <shard_index> <shard_count> [package_dir] [--with <extra>]...
+#   ci_test_shard.sh --list  <package> <shard_index> <shard_count> [package_dir] [--with <extra>]...
 #   ci_test_shard.sh --check [package] [shard_count] [package_dir]
 #   ci_test_shard.sh --selected <package>
 #
 #   run     — invoke `cargo nextest run --profile <p> -p <package> --lib?
-#             --test a --test b ...`
-#   --list  — print the cargo argument list and exit (no cargo, no build);
-#             what the CI log shows and what the tests assert against.
+#             --test a --test b ... [-p <extra> --test c ...]`
+#   --list: print the argument list the run mode would hand nextest, after the
+#             same selection, and exit (no cargo, no build); a `selection:` line
+#             for each package the selection leaves out goes to stderr.
+#   --with: add <extra>'s integration tests to this shard (see above). Each of
+#             <package> and the extras rides when CI_SELECTED_PACKAGES names it;
+#             the shard skips only when none rides.
 #   --selected: answer whether <package> rides CI_SELECTED_PACKAGES, the same
 #             reading the run mode gates on, as an exit code (0 rides, 1 does
 #             not) plus one `selection:` line. For a workflow step that spends
 #             something before this script's run step is reached.
-#   --check — prove the partition is TOTAL and DISJOINT: the union of all
+#   --check: prove the partition is TOTAL and DISJOINT: the union of all
 #             shards equals the full file list exactly once. Defaults to the
-#             package + shard count CI actually uses, so a bare `--check` is
-#             the shipped configuration.
+#             package + shard count CI actually uses, so a bare `--check`
+#             partitions the shipped package. It does not read the `--with`
+#             packages; `--list` with them checks those, and the coverage suite
+#             in cerulion_cli_engine runs it on the workflow's own lines.
 #
 # Extra `cargo nextest run` arguments may be passed through the
 # CI_TEST_SHARD_EXTRA environment variable; they are appended to the command
@@ -101,42 +132,29 @@ DEFAULT_SHARD_COUNT=4
 # because this is a deliberate, single-name carve-out of it and nothing else
 # may follow it in without the same evidence.
 #
-# WHY. `macro_compile_fail_test::compile_fail_tests` is a trybuild harness: it
-# invokes rustc once per `tests/ui/*.rs` case, inside ONE test, serially.
-# THE SIZE IS A PER-RUN MEASUREMENT, and this block is where it is RECORDED — the
-# reading and the earlier samples. Everything else refers to
-# "the serial tail" without a figure, with ONE deliberate exception: the shard-map
-# block in `.github/workflows/ci.yml` restates it at MINUTE scale (~4.4 vs the
-# ~9.2 its sums were built on) because its worked arithmetic is in minutes and an
-# argument you cannot follow is worse than a second copy. That is the whole of the
-# duplication, and it is named in both directions. Latest: 266.771 s
-# (~4.4 min), 99.3 % of its shard's nextest run wall, on `Test (Linux) shard 2`
-# (2026-09-12). On the self-hosted Linux
-# runners, six green runs on 2026-09-14 put shard 2's
-# whole nextest run wall at 228.7 / 247.6 / 296.3 / 265.7 / 250.7 / 428.3 s,
-# against 12-22 s for every other shard's — and in the one of
-# those runs whose log names every test this test alone was
-# 227.0 s of that 228.7. Earlier: 545.2 s and 559.3 s
-# on two green main runs, ~97 % of that wall. The
-# RATIO is what has held across every sample — this one test is essentially the
-# whole of whichever shard holds it, against 20-38 s for every other shard's.
-# That cost is not addressable here: splitting it by expectation WITHIN the
-# same job costs +158 s of trybuild work and +2.4 min of shard-step wall,
-# so it stays whole.
+# WHY. `macro_compile_fail_test` held the serial trybuild tail: one test of a
+# few minutes, essentially the whole of whichever shard held it. That suite is
+# now its own package, `node_macro_ui`, whose tests ride this script's shard 2
+# invocation on both lanes (`--with node_macro_ui`), and this binary keeps only the
+# `#[ignore]`d rustc-rendering group, so by default it runs nothing. The pin
+# still holds the file out of the rotation, which keeps every other file on the
+# shard the package map in `.github/workflows/ci.yml` was balanced against:
+# without it the file rejoins the rotation at its sorted position and every file
+# after it moves to the next shard.
 #
-# WHY PIN IT rather than let the round-robin place it. The round-robin is over
-# the SORTED file list, so the tail's shard is a function of how many
-# `cerulion_core/tests/*.rs` sort before it — i.e. adding ANY test file has a
-# ~1-in-`count` chance of moving that whole block to another runner. It sat on
-# shard 1 for both runs above and moved to shard 2 on ONE added file. That
+# WHY IT WAS PINNED rather than placed by the round-robin. The round-robin is
+# over the SORTED file list, so a binary's shard is a function of how many
+# `cerulion_core/tests/*.rs` sort before it: adding ANY test file had a
+# ~1-in-`count` chance of moving the trybuild tail to another runner. The tail
+# once sat on shard 1 and moved to shard 2 on ONE added file. That
 # makes the fleet's critical path a lottery: no package-to-shard map can be
 # balanced against a load that relocates on an unrelated PR, and the observed
 # walls swung 24 -> 45 min on shards whose own contents never changed.
-# Pinning converts the tail from a variable into a constant, which is what lets
-# the workflow's package map be packed around it: the tail is one FIXED term of
-# shard 2's measured wall, and the package steps are placed largest-first
-# around every shard's fixed term. See the map and its measurement in
-# `.github/workflows/ci.yml` above the package steps.
+# Pinning converted the tail from a variable into a constant, which is what let
+# the workflow's package map be packed around it; that trybuild work now runs
+# as `node_macro_ui`'s tests in the same shard 2 invocation, and the package steps are placed
+# largest-first around every shard's fixed term. See the map and its
+# measurement in `.github/workflows/ci.yml` above the package steps.
 #
 # WHAT IS NOT CHANGED. New test files still round-robin, automatically, with no
 # edit here — the generated-list property the header defends is intact for
@@ -144,9 +162,10 @@ DEFAULT_SHARD_COUNT=4
 # partition is still total and disjoint AND that the pin landed where declared
 # (`do_check` below), so a future arithmetic slip is a red, not a silent drop.
 #
-# ADDING A SECOND NAME HERE NEEDS THE SAME EVIDENCE: a measured wall showing
-# one binary dominates a shard, and a map that is balanced around it. Absent
-# that, the answer is the round-robin.
+# ADDING A SECOND NAME HERE NEEDS EVIDENCE: a measured wall showing one binary
+# dominates a shard, and a map that is balanced around it. Absent that, the
+# answer is the round-robin. The one name here no longer dominates its shard;
+# it stays so the files after it keep their shards.
 #
 # PINNED_SHARD is taken `% count`, so the pin is always a valid index for any
 # shard count: `--check cerulion_core 2` still partitions. TWO counts ship, 4 on
@@ -222,7 +241,7 @@ usage() {
 # construction rather than by an exclusion list that could go stale.
 enumerate() {
     _dir=$1
-    [ -d "$_dir/tests" ] || die "$_dir/tests does not exist — pass the package DIRECTORY as the 4th argument if it differs from the package name"
+    [ -d "$_dir/tests" ] || die "$_dir/tests does not exist: pass the package DIRECTORY after the shard count if it differs from the package name"
     # `ls` rather than a glob so an empty directory yields nothing instead of
     # the literal pattern; `basename`-with-suffix strips `.rs` portably.
     find "$_dir/tests" -maxdepth 1 -type f -name '*.rs' -print \
@@ -358,6 +377,99 @@ selection_holds() {
     return "$_sel_found"
 }
 
+# The packages of one invocation that ride the selection, space separated, in
+# command-line order: $1 is the shard's own package, $2 the `--with` packages
+# (space separated), $3 the selection. Each package is read by
+# `selection_holds` on its own, so a selection that names an extra and not the
+# shard's package runs that extra and none of the shard's own files, and one
+# that names only the shard's package runs no extra. In CI every selection that
+# names a package names `cerulion_core`, which observes the whole tree, so the
+# step sees `[]` or `cerulion_core` with or without each extra.
+shard_riders() {
+    _riders=
+    for _rider in $1 $2; do
+        if selection_holds "$_rider" "$3"; then
+            _riders="${_riders:+$_riders }$_rider"
+        fi
+    done
+    printf '%s\n' "$_riders"
+}
+
+# The directory of the workspace package $1: the one manifest under `crates/`
+# whose `[package]` table carries that name. Anything but exactly one match is
+# fatal, because a `--with` that found no package would run nothing for it.
+package_dir_of() {
+    _hits=$(find crates -maxdepth 4 -name Cargo.toml -not -path '*/target/*' -print | LC_ALL=C sort | while IFS= read -r _manifest; do
+        if awk -v want="$1" '
+            /^\[/ { inpkg = ($0 == "[package]"); next }
+            inpkg && /^name[ \t]*=/ {
+                v = $0; sub(/^name[ \t]*=[ \t]*"/, "", v); sub(/".*$/, "", v)
+                found = (v == want); exit
+            }
+            END { exit found ? 0 : 1 }' "$_manifest"; then
+            dirname "$_manifest"
+        fi
+    done)
+    _nhits=$(printf '%s\n' "$_hits" | grep -c . || true)
+    [ "$_nhits" -eq 1 ] || die "--with $1: $_nhits manifests under crates/ name that package, not exactly one${_hits:+ ($_hits)}"
+    printf '%s\n' "$_hits"
+}
+
+# Refuse an extra package (name $1, directory $2) whose tests this invocation
+# could not run in full:
+#   * a test attribute under `src/` (`#[test]`, `#[<path>::test]`,
+#     `#[test_case`, `#[rstest`): cargo builds an extra's library and binary
+#     tests only under `--lib` or `--bins`, which would select the shard
+#     package's own;
+#   * a doctest's possible source under `src/`: a fenced block (three
+#     backticks or tildes) or a line indented as code (five spaces or a tab
+#     past the marker) in a `//!` or `///` comment. The indent rule is a
+#     heuristic: it counts from the marker, where rustdoc counts from the
+#     indent every line of the comment shares, so it refuses an indented list
+#     continuation and misses a block in a comment written with no space after
+#     the marker. Also refused: any `#[doc`/`#![doc` attribute (a `#[doc =
+#     "..."]` string or an `include_str!` can hold a block too) or a
+#     `/**`/`/*!` block comment. nextest runs no doctest;
+#   * a test target the depth-1 list does not name, or test code outside
+#     `src/`: a `[[test]]` table, a `tests/<dir>/main.rs`, a `[[bin]]` without
+#     `test = false`, an `[[example]]` or `[[bench]]` with `test = true`, or a
+#     `[lib]` whose `path` is outside `src/`;
+#   * an integration test named like one of the shard package's, because
+#     `--test` selects that name in every package of the command.
+# The test attribute forms include the ones the coverage walk in
+# `cerulion_cli_engine/tests/ci_test_coverage_test.rs` reads as tests. Called
+# in this shell, so `die` ends the script.
+check_extra() {
+    _unit=$(grep -rlE -e '#\[([A-Za-z_][A-Za-z0-9_]*::)*test[](]' -e '#\[(test_case|rstest)' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
+    [ -z "$_unit" ] || die "--with $1: $_unit holds a unit test, which this invocation cannot run (move it to $2/tests/)"
+    _tab=$(printf '\t')
+    _doc=$(grep -rlE -e '^[[:space:]]*//[/!].*(```|~~~)' -e "^[[:space:]]*//[/!]( {5}| *$_tab)" -e '#!?\[doc' -e '/\*[*!]' -- "$2/src" 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
+    [ -z "$_doc" ] || die "--with $1: $_doc holds a doc comment code block or a doc attribute, and nextest runs no doctest"
+    grep -q '^\[\[test\]\]' "$2/Cargo.toml" \
+        && die "--with $1: $2/Cargo.toml declares a [[test]] target, which the tests/*.rs list does not name"
+    _nested=$(find "$2/tests" -mindepth 2 -maxdepth 2 -name main.rs -print 2>/dev/null | LC_ALL=C sort | head -n 1 || true)
+    [ -z "$_nested" ] || die "--with $1: $_nested is a test target the tests/*.rs list does not name"
+    # One pass over the manifest's target tables; the first offence decides. A
+    # table header may carry a trailing comment; a `path` may be quoted either
+    # way and start `./`. Inline tables (`lib = { ... }`) are not read.
+    _target=$(awk '
+        function close_table() { if (table == "[[bin]]" && !off && !why) why = "a [[bin]] lacks `test = false`, so its tests would run only under --bins" }
+        /^[ \t]*\[/ { close_table(); table = $0; sub(/^[ \t]+/, "", table); sub(/[ \t]*#.*$/, "", table); sub(/[ \t]+$/, "", table); off = 0; next }
+        table == "[[bin]]" && /^[ \t]*test[ \t]*=[ \t]*false/ { off = 1 }
+        (table == "[[example]]" || table == "[[bench]]") && /^[ \t]*test[ \t]*=[ \t]*true/ && !why { why = "a " table " has `test = true`, which the tests/*.rs list does not name" }
+        table == "[lib]" && /^[ \t]*path[ \t]*=/ && !/^[ \t]*path[ \t]*=[ \t]*["\047](\.\/)?src\// && !why { why = "its [lib] path is outside src/, where the unit test scan does not look" }
+        END { close_table(); print why }' "$2/Cargo.toml")
+    [ -z "$_target" ] || die "--with $1: in $2/Cargo.toml, $_target"
+    [ -d "$2/tests" ] || die "--with $1: $2/tests does not exist, so it would add nothing to the shard"
+    _xtests=$(enumerate "$2")
+    [ -n "$_xtests" ] || die "--with $1: $2/tests holds no *.rs files, so it would add nothing to the shard"
+    while IFS= read -r _xt; do
+        if grep -qxF -- "$_xt" <<<"$ALL_TESTS"; then
+            die "--with $1: tests/$_xt.rs shares its name with $PKG_DIR/tests/$_xt.rs, and --test $_xt would run both"
+        fi
+    done <<<"$_xtests"
+}
+
 # The hand table `--check` holds `selection_holds` to.
 #
 # `<package>|<selection>|<runs>`. Written out rather than generated: the rows
@@ -391,6 +503,25 @@ cerulion_vizd|["cerulion_viz"]|no
 cerulion-wire|["cerulion-wire"]|yes
 '
 
+# The hand table `--check` holds `shard_riders` to: `<package and extras>|
+# <selection>|<riders>`, `-` for none. The second row is a selection of the
+# diagnostics suite alone: it runs that suite and none of the shard's own
+# files. An unreadable selection runs every package, as `selection_holds` reads
+# it. The order row says the riders follow the command line, not the selection.
+SHARD_SELECTION_CASES='
+cerulion_core node_macro_ui|["cerulion_core"]|cerulion_core
+cerulion_core node_macro_ui|["node_macro_ui"]|node_macro_ui
+cerulion_core node_macro_ui|["cerulion_core","node_macro_ui"]|cerulion_core node_macro_ui
+cerulion_core node_macro_ui|["cerulion_bag"]|-
+cerulion_core node_macro_ui|[]|-
+cerulion_core node_macro_ui||cerulion_core node_macro_ui
+cerulion_core node_macro_ui|all|cerulion_core node_macro_ui
+cerulion_core node_macro_ui|[node_macro_ui]|cerulion_core node_macro_ui
+cerulion_core|["node_macro_ui"]|-
+cerulion_core cerulion_viz|["cerulion_vizd"]|-
+cerulion_core node_macro_ui cerulion_viz|["cerulion_viz","node_macro_ui"]|node_macro_ui cerulion_viz
+'
+
 check_selection() {
     _fails=0
     while IFS= read -r _row; do
@@ -406,8 +537,21 @@ check_selection() {
             _fails=$((_fails + 1))
         fi
     done <<< "$SELECTION_CASES"
+    while IFS= read -r _row; do
+        [ -n "$_row" ] || continue
+        _pkgs=${_row%%|*}
+        _rest=${_row#*|}
+        _sel=${_rest%|*}
+        _want=${_rest##*|}
+        _got=$(shard_riders "${_pkgs%% *}" "$(printf '%s' "$_pkgs" | sed 's/^[^ ]*//')" "$_sel")
+        if [ "${_got:--}" != "$_want" ]; then
+            printf 'VIOLATION: shard_riders "%s" "%s" -> %s, wanted %s\n' \
+                "$_pkgs" "$_sel" "${_got:--}" "$_want" >&2
+            _fails=$((_fails + 1))
+        fi
+    done <<< "$SHARD_SELECTION_CASES"
     [ "$_fails" -eq 0 ] || exit 1
-    printf 'ci_test_shard --check: OK, the selection reader agrees with its hand table.\n'
+    printf 'ci_test_shard --check: OK, the selection reader agrees with its hand tables.\n'
 }
 
 # --------------------------------------------------------------------------
@@ -488,7 +632,7 @@ $_members"
             printf 'VIOLATION: %s is pinned to shard %d/%d but is not in it.\n' \
                 "$PINNED_TEST" "$_pin_shard" "$_count" >&2
             printf 'The workflow package map in .github/workflows/ci.yml is balanced around\n' >&2
-            printf 'that shard carrying this serial tail. Fix shard_members() in %s.\n' "$0" >&2
+            printf 'the other files staying where the pin leaves them. Fix shard_members() in %s.\n' "$0" >&2
             exit 1
         fi
         printf 'pinned: %s -> shard %d/%d (the one routing exception)\n' \
@@ -496,13 +640,12 @@ $_members"
     elif [ "$_pkg" = "$PINNED_PACKAGE" ]; then
         printf 'VIOLATION: %s pins %s, but %s/tests holds no such file.\n' \
             "$PINNED_PACKAGE" "$PINNED_TEST" "$_dir" >&2
-        printf 'The pin is now describing nothing, and the serial trybuild tail it\n' >&2
-        printf 'names has silently rejoined the round-robin — which is what the pin\n' >&2
-        printf 'exists to prevent, and what the workflow package map is balanced against.\n' >&2
+        printf 'The pin is now describing nothing, and the file positions the workflow\n' >&2
+        printf 'package map is balanced against no longer hold.\n' >&2
         printf 'Fix ONE of:\n' >&2
         printf '  * restore %s/tests/%s.rs (it was renamed or deleted), or\n' "$_dir" "$PINNED_TEST" >&2
         printf '  * update PINNED_TEST in %s to the new name AND re-check the package\n' "$0" >&2
-        printf '    map in .github/workflows/ci.yml still counts shard %d as carrying the tail.\n' "$PINNED_SHARD" >&2
+        printf '    map in .github/workflows/ci.yml still matches shard %d.\n' "$PINNED_SHARD" >&2
         exit 1
     fi
 
@@ -549,17 +692,50 @@ esac
 PACKAGE=$1
 INDEX=$2
 COUNT=$3
-PKG_DIR=${4:-crates/$PACKAGE}
+shift 3
+# After the three shard arguments: the package directory, at most once, and any
+# number of `--with <package>`, in any order.
+PKG_DIR=
+EXTRAS=
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --with)
+            [ $# -ge 2 ] || die "--with needs a package name"
+            case "$2" in
+                ''|-*|*[!A-Za-z0-9_-]*) die "--with needs a package name (got '$2')" ;;
+            esac
+            [ "$2" != "$PACKAGE" ] || die "--with $2 names the shard's own package"
+            case " $EXTRAS " in
+                *" $2 "*) die "--with $2 is given twice" ;;
+            esac
+            EXTRAS="${EXTRAS:+$EXTRAS }$2"
+            shift 2
+            ;;
+        -*) die "unknown option '$1' after the shard arguments (expected --with <package>)" ;;
+        *)
+            [ -z "$PKG_DIR" ] || die "a second package directory '$1' (the first is '$PKG_DIR')"
+            PKG_DIR=$1
+            shift
+            ;;
+    esac
+done
+PKG_DIR=${PKG_DIR:-crates/$PACKAGE}
 
 require_index "shard index" "$INDEX"
 require_index "shard count" "$COUNT"
 [ "$COUNT" -ge 1 ] || die "shard count must be >= 1 (got '$COUNT')"
 [ "$INDEX" -lt "$COUNT" ] || die "shard index $INDEX is out of range for $COUNT shard(s)"
+[ "$INDEX" -ne 0 ] || [ -z "$EXTRAS" ] \
+    || die "--with on shard 0: that shard carries --lib, and cargo would hand it to every --with package too"
 
-# THE SELECTION, before anything is enumerated or built. One line with the fixed
-# `selection:` prefix, then exit 0 without invoking cargo.
+# THE SELECTION, before anything is enumerated or built, in the run mode and
+# in `--list` alike. One line with the fixed `selection:` prefix for each
+# package the selection leaves out (on stderr under `--list`, whose stdout is
+# the argument list), then exit 0 without invoking cargo when none rides. A
+# `--with` package rides on its own reading, so a selection that names it and
+# not this package runs it and none of this package's files.
 #
-# The workflow step that runs this shard is deliberately NOT gated by an `if:`:
+# The workflow step that runs this shard is deliberately NOT gated on the selection:
 # `cerulion_core` observes the whole repository tree (its whole-tree walks,
 # `serial_discipline_test` among them, read every `.rs` file in the source tree), and
 # `tools/ci/observation_edges.tsv` records it as observing `all`; a package
@@ -574,11 +750,29 @@ require_index "shard count" "$COUNT"
 # this sharded suite skips, by the runner's own reading of the selection. The
 # intersection below is the mechanism for any package whose shard step is added
 # later and whose observation edges the walk can attribute.
-if [ "$MODE" = run ] && ! selection_holds "$PACKAGE" "${CI_SELECTED_PACKAGES:-}"; then
-    printf 'selection: skipped %s shard %s (selected: %s)\n' \
-        "$PACKAGE" "$INDEX" "${CI_SELECTED_PACKAGES:-}"
-    exit 0
-fi
+RIDERS=$(shard_riders "$PACKAGE" "$EXTRAS" "${CI_SELECTED_PACKAGES:-}")
+for _left in $PACKAGE $EXTRAS; do
+    case " $RIDERS " in
+        *" $_left "*) continue ;;
+    esac
+    if [ "$_left" = "$PACKAGE" ]; then
+        _line="selection: skipped $PACKAGE shard $INDEX (selected: ${CI_SELECTED_PACKAGES:-})"
+    else
+        _line="selection: skipped $_left beside $PACKAGE shard $INDEX (selected: ${CI_SELECTED_PACKAGES:-})"
+    fi
+    if [ "$MODE" = list ]; then
+        printf '%s\n' "$_line" >&2
+    else
+        printf '%s\n' "$_line"
+    fi
+done
+[ -n "$RIDERS" ] || exit 0
+rides() {
+    case " $RIDERS " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
 
 # ENUMERATE FIRST, IN THIS SHELL. `enumerate` is otherwise only ever reached
 # from inside a `$( … )`, where its `die` exits the SUBSHELL: a missing or
@@ -594,7 +788,18 @@ fi
 ALL_TESTS=$(enumerate "$PKG_DIR")
 TOTAL_TESTS=$(printf '%s\n' "$ALL_TESTS" | grep -c . || true)
 [ "$TOTAL_TESTS" -gt 0 ] \
-    || die "$PKG_DIR/tests holds no *.rs files — nothing to shard (pass the package DIRECTORY as the 4th argument if it differs from the package name)"
+    || die "$PKG_DIR/tests holds no *.rs files, so there is nothing to shard (pass the package DIRECTORY after the shard count if it differs from the package name)"
+
+# Every `--with` package, checked whether or not it rides, so a wrong one fails
+# on every change that runs any package of this invocation, not only on the
+# changes that select it. A change that runs none exited above.
+# `<package>:<directory>` pairs, space separated.
+EXTRA_PAIRS=
+for _extra in $EXTRAS; do
+    _extra_dir=$(package_dir_of "$_extra")
+    check_extra "$_extra" "$_extra_dir"
+    EXTRA_PAIRS="${EXTRA_PAIRS:+$EXTRA_PAIRS }$_extra:$_extra_dir"
+done
 
 # ARCHIVE MODE (CI's build-once path). When `CI_TEST_SHARD_ARCHIVE` names an
 # existing nextest archive, this shard RUNS the binaries that job already built
@@ -640,6 +845,8 @@ artifacts."
 fi
 
 # Read the argument vector into a positional list (bash 3.2 has no readarray).
+# RUNNING collects the packages that bring at least one target to it.
+RUNNING=
 set -- # clear
 OLDIFS=$IFS
 IFS='
@@ -674,23 +881,73 @@ if [ -n "$ARCHIVE" ]; then
     # by any argument added above — and the cost of that is not a
     # red run, it is an EMPTY shard reporting green.
     _empty_argc=$#
+    # One clause per riding package: this package's shard, then each extra's
+    # binaries. One clause is passed as it stands; several are joined by `or`.
+    _clauses=""
+    _nclauses=0
     _filter=""
-    for term in $(shard_filterset_terms "$PACKAGE" "$PKG_DIR" "$INDEX" "$COUNT"); do
-        if [ -z "$_filter" ]; then
-            _filter="$term"
-        else
-            _filter="$_filter + $term"
-        fi
-    done
+    if rides "$PACKAGE"; then
+        for term in $(shard_filterset_terms "$PACKAGE" "$PKG_DIR" "$INDEX" "$COUNT"); do
+            if [ -z "$_filter" ]; then
+                _filter="$term"
+            else
+                _filter="$_filter + $term"
+            fi
+        done
+    fi
     # An empty shard keeps the SAME meaning it has in build mode (reported
     # below, exit 0) rather than degenerating into "run everything".
     if [ -n "$_filter" ]; then
-        set -- "$@" -E "package($PACKAGE) and ($_filter)"
+        _clauses="package($PACKAGE) and ($_filter)"
+        _nclauses=1
+        RUNNING=$PACKAGE
+    fi
+    IFS=$OLDIFS
+    for _pair in $EXTRA_PAIRS; do
+        rides "${_pair%%:*}" || continue
+        RUNNING="${RUNNING:+$RUNNING }${_pair%%:*}"
+        _filter=""
+        for t in $(enumerate "${_pair#*:}"); do
+            _filter="${_filter:+$_filter + }binary(=$t)"
+        done
+        if [ "$_nclauses" -eq 0 ]; then
+            _clauses="package(${_pair%%:*}) and ($_filter)"
+        elif [ "$_nclauses" -eq 1 ]; then
+            _clauses="($_clauses) or (package(${_pair%%:*}) and ($_filter))"
+        else
+            _clauses="$_clauses or (package(${_pair%%:*}) and ($_filter))"
+        fi
+        _nclauses=$((_nclauses + 1))
+    done
+    IFS='
+'
+    if [ -n "$_clauses" ]; then
+        set -- "$@" -E "$_clauses"
     fi
 else
-    for a in $(shard_args "$PACKAGE" "$PKG_DIR" "$INDEX" "$COUNT"); do
-        set -- "$@" "$a"
+    # This package's `-p` only with at least one target after it: `-p` alone
+    # selects every test target the package has.
+    _empty_argc=0
+    if rides "$PACKAGE"; then
+        _own=$(shard_args "$PACKAGE" "$PKG_DIR" "$INDEX" "$COUNT")
+        if [ "$(printf '%s\n' "$_own" | grep -c .)" -gt 2 ]; then
+            for a in $_own; do
+                set -- "$@" "$a"
+            done
+            RUNNING=$PACKAGE
+        fi
+    fi
+    IFS=$OLDIFS
+    for _pair in $EXTRA_PAIRS; do
+        rides "${_pair%%:*}" || continue
+        RUNNING="${RUNNING:+$RUNNING }${_pair%%:*}"
+        set -- "$@" -p "${_pair%%:*}"
+        for t in $(enumerate "${_pair#*:}"); do
+            set -- "$@" --test "$t"
+        done
     done
+    IFS='
+'
 fi
 IFS=$OLDIFS
 
@@ -703,19 +960,31 @@ fi
 # the log rather than reported as a silent green.
 #
 # The "nothing selected" argument vector differs by mode: in build mode it is
-# just `-p <pkg>` (2 words); in archive mode the archive branch RECORDED its own
-# base count above, because that base is now conditional (the extract directory
-# adds two words when the caller names one) and a hand-counted constant would go
-# stale the next time a flag is added there. Either way the filterset is omitted
-# entirely rather than emitted empty, because an empty `-E` selects EVERYTHING.
-[ -n "$ARCHIVE" ] || _empty_argc=2
-if [ "$INDEX" -gt 0 ] && [ $# -eq "$_empty_argc" ]; then
+# empty, because this package's `-p` is added only with a target after it and
+# an extra always brings at least one; in archive mode the archive branch
+# RECORDED its own base count above, because that base is conditional (the
+# extract directory adds two words when the caller names one) and a
+# hand-counted constant would go stale the next time a flag is added there.
+# Either way the filterset is omitted entirely rather than emitted empty,
+# because an empty `-E` selects EVERYTHING.
+if [ $# -eq "$_empty_argc" ]; then
     printf 'ci_test_shard: shard %s/%s of %s is EMPTY (fewer test files than shards) — nothing to run.\n' \
         "$INDEX" "$COUNT" "$PACKAGE"
     exit 0
 fi
 
-printf 'ci_test_shard: shard %s/%s of %s\n' "$INDEX" "$COUNT" "$PACKAGE"
+if [ -n "$EXTRAS" ]; then
+    case " $RUNNING " in
+        *" $PACKAGE "*) ;;
+        *)
+            rides "$PACKAGE" && printf 'ci_test_shard: shard %s/%s of %s holds none of its files (fewer test files than shards)\n' \
+                "$INDEX" "$COUNT" "$PACKAGE"
+            ;;
+    esac
+    printf 'ci_test_shard: shard %s/%s of %s, running %s\n' "$INDEX" "$COUNT" "$PACKAGE" "$RUNNING"
+else
+    printf 'ci_test_shard: shard %s/%s of %s\n' "$INDEX" "$COUNT" "$PACKAGE"
+fi
 
 # AGENTS.md's pre-commit list and the PR template both tell contributors to run
 # this script, so the missing-tool case is a LOCAL one and deserves the fix

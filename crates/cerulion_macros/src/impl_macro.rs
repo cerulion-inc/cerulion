@@ -2846,7 +2846,7 @@ mod tests {
     //! [`validate_external_source_sig`]. The validator is file-private, so the
     //! tests live inline and parse candidate signatures with `syn::parse_quote!`.
     //! End-to-end rejection rendering is pinned by the trybuild fixtures in
-    //! `crates/cerulion_core/tests/ui/external_source_wrong_signature.rs`; these pin the
+    //! `crates/test_fixtures/node_macro_ui/tests/ui/external_source_wrong_signature.rs`; these pin the
     //! validator's decision surface directly (each malformed shape → `Err`, the
     //! one exact valid shape → `Ok`).
     use super::*;

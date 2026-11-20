@@ -3067,14 +3067,16 @@ jobs:
       # doc-pin: cerulion_core::cerulion_core reads docs
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
-      # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks
+      # NOT gated on the selection, deliberately (only a leg selector splits
+      # shard 2 into its own step). `cerulion_core`'s whole-tree walks
       # (`serial_discipline_test` among them) read every `.rs` file in the source
       # tree, and `tools/ci/observation_edges.tsv` records the package
       # as observing `all`, so it rides every selection that names a package; only
       # a change that selects nothing reaches this step with `[]`. The shard
-      # runner intersects its own package with the selection instead of a step
-      # condition and prints one `selection:` line when the intersection is
-      # empty, so the decision and its log line live in one place.
+      # runner intersects its own package and each `--with` package with the
+      # selection instead of a step condition and prints one `selection:` line
+      # for each package it leaves out, so the decision and its log line live in
+      # one place.
       # The waiver gate asks OTHER test binaries what libtest will do with the
       # arms it declares waived. A shard builds only its own files, so on the
       # shard that runs the gate those binaries are absent, or are a
@@ -3156,10 +3158,25 @@ jobs:
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
+        # Shard 2 runs the step below instead.
+        if: matrix.shard != 2
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
+      - name: cerulion_core tests and the diagnostics suite (shard ${{ matrix.shard }} of 4, nextest)
+        # The same shard step, with the `#[cerulion_node]` diagnostics suite
+        # (`node_macro_ui`) in the same nextest invocation (`--with`): its
+        # trybuild test runs beside the core tests and builds in the same cargo
+        # invocation. The script reads the selection for each package on its
+        # own and prints a `selection:` line for each one it leaves out. A leg
+        # selector of its own, so the coverage walk sees which leg credits the
+        # suite.
+        if: matrix.shard == 2
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+          CI_TEST_SHARD_EXTRA: --timings
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with node_macro_ui
 
       # The modified raw node fixture once more, built ALONE, the way a user's node
       # builds: `-p` with no sibling package resolves the node's dependency tree
@@ -3348,11 +3365,14 @@ jobs:
       # to 51-63 s per shard outside the tail and no other binary exceeds
       # 18 s, so the file map in `ci_test_shard.sh` stays round-robin and no
       # second pin is warranted. The package steps are the whole imbalance.
-      # (The tail itself is not addressable: splitting it by expectation
-      # WITHIN the job measured +158 s of trybuild work, +2.4 min of
-      # shard-step wall. It is PINNED so it cannot relocate
-      # when an unrelated test file is added — evidence and the bar for a
-      # second name at `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. And it does
+      # (The tail is now the `node_macro_ui` package, whose tests ride this
+      # shard's core nextest invocation (`--with node_macro_ui`): its
+      # compile-pass programs build as binaries of that package, so trybuild
+      # checks the compile-fail set alone, in one dependency pass, and
+      # `.config/nextest.toml` starts that test right after the timing tests
+      # that claim every slot. The emptied
+      # core binary stays PINNED, which keeps every other file on its shard; see
+      # `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. The suite does
       # NOT get its own job: a new job is not in branch protection's required
       # list, which would silently demote the only compile-fail gate to
       # advisory.)
@@ -3863,7 +3883,7 @@ jobs:
   # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
   # stay together so that ~390-crate tree compiles once; `--lib` and the
   # doctests ride shard 0 because the shard script puts the lib unit tests
-  # there; and the trybuild tail lands on `PINNED_SHARD % 3` = shard 2, so
+  # there; and the trybuild suite runs on shard 2, so
   # shard 2 gets the lightest package set. Re-tilt if a run shows the legs
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
@@ -4157,8 +4177,8 @@ jobs:
       # `cerulion_cli_engine/tests/ci_test_coverage_test.rs`, which walks every
       # job a pull request can fail and this job is one of them.
       # `--check cerulion_core 3` proves the partition
-      # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
-      # on shard 2, which is why shard 2 gets the lightest package set below).
+      # (108 + 108 + 109 files; the trybuild suite runs on shard 2, which is why
+      # shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
       # BUILD ONCE and the doctests, as in `test-linux` (see that job's step of
       # this name). It runs before the first package step, the credit death
@@ -4349,7 +4369,7 @@ jobs:
         if: matrix.shard == 0
         run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli --test credit_death_e2e_test c7_
 
-      # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
+      # NOT gated on the selection: see the twin step in `test-linux`. `cerulion_core`
       # observes the whole tree, so the shard runner does the intersection.
       # The waiver gate asks OTHER test binaries what libtest will do with the
       # arms it declares waived. A shard builds only its own files, so on the
@@ -4430,10 +4450,19 @@ jobs:
           echo "built $total waived test binaries for the gate"
 
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
+        if: matrix.shard != 2
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
+      - name: cerulion_core tests and the diagnostics suite (shard ${{ matrix.shard }} of 3, nextest)
+        # Shard 2's shard step, with the `#[cerulion_node]` diagnostics suite in
+        # the same nextest invocation, as in `test-linux`.
+        if: matrix.shard == 2
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+          CI_TEST_SHARD_EXTRA: --timings
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 --with node_macro_ui
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
@@ -4456,7 +4485,8 @@ jobs:
       #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
       #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
       #            tree kept together (wireclient, connectd, netd-wan)
-      #   shard 2  the pinned trybuild tail, native_ros2_messages, macros,
+      #   shard 2  the cerulion_node diagnostics suite (in the core shard step),
+      #            native_ros2_messages, macros,
       #            discovery, and the folded viz suites
       #
       # Every `run:` line is byte-identical to the 2-way map, so nothing about

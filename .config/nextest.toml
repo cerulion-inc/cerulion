@@ -156,6 +156,31 @@ filter = '''
 + binary(=streaming_latency_bench_test)
 '''
 threads-required = 'num-cpus'
+# First in the run, each alone, before anything long has started; see the
+# next block for why the order matters.
+priority = 100
+
+# ---------------------------------------------------------------------------
+# The `#[cerulion_node]` diagnostics suite starts next.
+#
+# Its compile-fail test rides the `cerulion_core` shard's invocation
+# (`ci_test_shard.sh ... --with node_macro_ui`, shard 2 of both lanes) and is
+# one test that runs trybuild over its fixtures for minutes. nextest starts
+# tests in priority order and, within one priority, in binary order, and
+# `node_macro_ui::compile_fail` sorts after every `cerulion_core` binary, so
+# at the default priority it would start only once every core test had
+# started, and run on alone. nextest's queue does not start a later test past
+# the one at its head, and a test that claims every slot (the block above)
+# waits at the head until every running test ends, so one queued after a
+# minutes-long test holds every other test back that long. Hence the order:
+# the slot-claiming timing tests first (100), then this test (99), then the
+# rest beside it. This test joins no group and claims one slot, so it fences
+# nothing, and `slow-timeout` below reports it without ending it. A test in
+# `cli_engine`'s coverage suite holds every `binary_id` here to a real test file.
+# ---------------------------------------------------------------------------
+[[profile.default.overrides]]
+filter = 'binary_id(=node_macro_ui::compile_fail)'
+priority = 99
 
 # ---------------------------------------------------------------------------
 # Run-shape defaults.
