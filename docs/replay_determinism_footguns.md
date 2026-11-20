@@ -284,17 +284,22 @@ fire held by that edge's pre-fire check after its trigger drain popped, with no
 record. The FIFO rule allows for it only at a step where the recording cannot
 rule the hold out: where the frames the bag records on the topic, the step's
 own included, outnumber those the consumer's body reads drained before that
-step by at least the input's depth. A bag that cannot account for every such
-frame or drain (it records no frames of the topic, its record health reports
-the topic lossy or written by several publishers, the consumer is a Sync
-node, or its read log is truncated or does not say which site drained a
-frame) allows for no hold, and a consumer's stop
-releases its slot from the next step on. As for a throttle, whose window the
-rule reads off the recorded clock, a step no such check could defer owes
-every popped frame a fire. Read through one
+step by at least the input's depth. A slot the bag cannot account for allows
+for no hold: the bag records no frames of the topic or a frame header it
+cannot parse, its record-health stamp is absent or malformed, reports the
+topic lossy or any frame drained and never written, the graph lists the topic
+in `multi_publisher_topics`, or the input is a Sync node's trigger input,
+which its matcher pops outside the node's body. The slot allows for none
+either from the step after a truncated read of the input, from a drain whose
+site the read log does not say, from a consumer fire with no read of the
+input recorded, and on a resumed pass until the consumer first reads its
+queue empty. A consumer's stop releases its slot from the next step on. As
+for a throttle, whose window the rule reads off the recorded clock, a step no
+such check could defer owes every popped frame a fire. Read through one
 subscriber, such a node may leave one popped frame unfired at a step a check
-could defer, and the replay pops that frame after the step's last fire, as the
-live burst did, so the next fire serves it. Read through two subscribers (a
+could defer, or at a step that fired the scheduler's cap of 64, and the
+replay pops that frame after the step's last fire, as the live burst did, so
+the next fire serves it. Read through two subscribers (a
 `block` or `sample(N)` trigger input, or `CERULION_DRAIN_DISCIPLINE=separate`),
 it carries every signal such a step left unfired, up to the scheduler's clamp.
 A bag that does not record how a FIFO input was read judges a `drop_oldest`

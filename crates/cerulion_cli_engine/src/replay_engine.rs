@@ -10885,17 +10885,28 @@ fn derive_trailing_refills(
     let mut fires: Vec<RecordedFire> = Vec::new();
     let mut carries: std::collections::HashMap<String, replay_rederive::FifoCarry> =
         std::collections::HashMap::new();
-    while let Some(boundary) = boundaries.next()? {
-        // The main loop's `--duration` bound: a step it never executes plans
-        // nothing.
-        if let Some(d) = pass.duration_bound_ns {
-            if crate::replay_rank::beyond_duration_bound(
-                boundary.target_ns.saturating_sub(pass.run_epoch_ns),
+    // The main loop's `--duration` bound: a step it never executes plans
+    // nothing.
+    let executes = |target_ns: u64| {
+        pass.duration_bound_ns.is_none_or(|d| {
+            !crate::replay_rank::beyond_duration_bound(
+                target_ns.saturating_sub(pass.run_epoch_ns),
                 d,
-            ) {
-                break;
-            }
+            )
+        })
+    };
+    // One boundary ahead: a frame whose stamp several steps share is the last
+    // of them's send, so each step needs the next one's clock.
+    let mut next = boundaries.next()?;
+    while let Some(boundary) = next.take() {
+        if !executes(boundary.target_ns) {
+            break;
         }
+        next = boundaries.next()?;
+        let next_clock_ns = next
+            .as_ref()
+            .map(|b| b.target_ns)
+            .filter(|&target| executes(target));
         fires.clear();
         fire_cursors.pull_merged_step_fires(boundary.step, pass.rank_tables, &mut fires)?;
         let trailing = fifo_trailing_refills(
@@ -10903,6 +10914,7 @@ fn derive_trailing_refills(
             &fires,
             boundary.step,
             boundary.target_ns,
+            next_clock_ns,
             trust,
             resumed,
             stops,
@@ -10940,7 +10952,7 @@ fn derive_trailing_refills(
 /// A step no carry explains (a stopped node, a fire on a re-offered head that
 /// no pop recorded, a signal clamp) carries nothing and is left to the
 /// re-derivation verdict.
-// Nine parameters, each a distinct role: the step's evidence, the rules'
+// Ten parameters, each a distinct role: the step's evidence, the rules'
 // inputs and the thread of per-node state.
 #[allow(clippy::too_many_arguments)]
 fn fifo_trailing_refills(
@@ -10948,6 +10960,7 @@ fn fifo_trailing_refills(
     fires: &[RecordedFire],
     step: u64,
     clock_ns: u64,
+    next_clock_ns: Option<u64>,
     trust: replay_rederive::RoleTrust,
     resumed: bool,
     stops: &replay_rederive::PassStops,
@@ -10992,12 +11005,21 @@ fn fifo_trailing_refills(
         let Ok(popped) =
             replay_rederive::fifo_step_pops(&decl.node_id, trigger_inputs, reads, trust)
         else {
-            carry.skip(step, clock_ns, &step_fires, reads, trust);
+            carry.skip(step, clock_ns, next_clock_ns, &step_fires, reads, trust);
             continue;
         };
         let fired = u32::try_from(fires.iter().filter(|f| *f.node_id == *decl.node_id).count())
             .unwrap_or(u32::MAX);
-        let judged = carry.step(popped, fired, step, clock_ns, &step_fires, reads, trust);
+        let judged = carry.step(
+            popped,
+            fired,
+            step,
+            clock_ns,
+            next_clock_ns,
+            &step_fires,
+            reads,
+            trust,
+        );
         if judged.outcome == Ok(1) && fired > 0 {
             out.push(decl.node_id.clone());
         }
@@ -13081,49 +13103,74 @@ fn local_block_holds(
     holds
 }
 
-/// PURE: what the bag records of one `block` slot. Every frame sent to it is
-/// recorded when the bag holds the topic's frames, each with a wire stamp
-/// (`frame_stamps`), and its record health neither reports the topic lossy or
-/// written by several publishers nor reports frames drained and never written
-/// (`unwritten`); the consumer drains it only at its body reads unless the
-/// input is a Sync trigger input (`consumer_drains_at_body`). Anything less
-/// is [`replay_rederive::SlotRecord::Unaccounted`].
+/// PURE: what the bag records of one `block` slot: every frame sent to it
+/// when the bag holds a wire stamp for each frame of the topic
+/// (`frame_stamps`) and states that its record of the topic is whole
+/// (`recorded_whole`, [`topic_recorded_whole`]), drained only at the
+/// consumer's body reads (`drain`, [`consumer_body_drain`]). Anything less is
+/// [`replay_rederive::SlotRecord::Unaccounted`].
 fn slot_record(
     frame_stamps: Option<&Vec<u64>>,
-    health: &TopicHealthClass,
-    unwritten: u64,
-    consumer_drains_at_body: bool,
+    recorded_whole: bool,
+    drain: Option<replay_rederive::BodyDrain>,
 ) -> replay_rederive::SlotRecord {
-    let complete = match health {
-        TopicHealthClass::Clean => unwritten == 0,
-        TopicHealthClass::Lossy { .. } | TopicHealthClass::MultiPublisher => false,
-    };
-    match frame_stamps {
-        Some(stamps) if complete && consumer_drains_at_body => {
-            replay_rederive::SlotRecord::Counted {
-                frame_stamps: stamps.clone(),
-            }
-        }
-        Some(_) | None => replay_rederive::SlotRecord::Unaccounted,
+    match (frame_stamps, drain) {
+        (Some(stamps), Some(drain)) if recorded_whole => replay_rederive::SlotRecord::Counted {
+            frame_stamps: stamps.clone(),
+            drain,
+        },
+        _ => replay_rederive::SlotRecord::Unaccounted,
     }
 }
 
-/// Does the consumer drain `input` only at its body reads? A Sync node's
-/// trigger inputs are popped by its matcher, outside the body; every other
-/// input is drained by the body subscriber that carries its `block` probe.
-fn consumer_drains_at_body(info: &cerulion_core::graph::NodeInfo, input: &str) -> bool {
+/// PURE: does the bag state that it recorded every frame of `topic`? Only a
+/// present record-health stamp says so: it reports the topic clean and no
+/// frame drained and never written anywhere in the bag (that count is
+/// bag-wide). An absent or malformed stamp says nothing, and a topic the graph
+/// lists in `multi_publisher_topics` (`listed`) has writers whose loss the
+/// stamp cannot know.
+fn topic_recorded_whole(report: &RecordHealthReport, topic: &str, listed: bool) -> bool {
+    match report {
+        RecordHealthReport::Present(health) => {
+            !listed
+                && health.dropped_unwritten == 0
+                && matches!(
+                    classify_topic_health(report, topic),
+                    TopicHealthClass::Clean
+                )
+        }
+        RecordHealthReport::Absent | RecordHealthReport::Malformed => false,
+    }
+}
+
+/// How the consumer's body reads drain `input`, or `None` when its reads do
+/// not drain the slot: a Sync node's trigger inputs are popped by its
+/// matcher, outside the body. A FIFO trigger input drains one frame per read;
+/// every other input drains to its newest frame
+/// ([`input_consume_mode`]).
+fn consumer_body_drain(
+    info: &cerulion_core::graph::NodeInfo,
+    input: &str,
+) -> Option<replay_rederive::BodyDrain> {
     use cerulion_core::graph::node::MacroPolicy;
     let sync_trigger = info
         .input_meta()
         .iter()
         .any(|m| m.name == input && m.trigger);
-    match info.policy() {
-        Some(MacroPolicy::Sync { .. } | MacroPolicy::UnboundedSync) => !sync_trigger,
+    let matcher_pops = match info.policy() {
+        Some(MacroPolicy::Sync { .. } | MacroPolicy::UnboundedSync) => sync_trigger,
         Some(
             MacroPolicy::Period { .. } | MacroPolicy::External | MacroPolicy::DataTrigger { .. },
         )
-        | None => true,
+        | None => false,
+    };
+    if matcher_pops {
+        return None;
     }
+    Some(match input_consume_mode(info, input) {
+        replay_inject::ConsumeMode::EachFifo => replay_rederive::BodyDrain::PerFrame,
+        replay_inject::ConsumeMode::Latest => replay_rederive::BodyDrain::ToEmpty,
+    })
 }
 
 /// The wire stamp of every recorded frame on each of `topics`, ascending, from
@@ -15116,15 +15163,17 @@ fn prepare_pass_verification(
     let hold_flows = block_hold_flows(plan.subgraph(), node_infos, plan.rank())?;
     let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
     let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
-    let unwritten = record_health.dropped_unwritten();
     let mut block_holds = local_block_holds(&hold_flows, &|topic, consumer, input| {
         slot_record(
             hold_stamps.get(topic).and_then(Option::as_ref),
-            &classify_topic_health(record_health, topic),
-            unwritten,
+            topic_recorded_whole(
+                record_health,
+                topic,
+                config.multi_publisher_topics.iter().any(|t| t == topic),
+            ),
             node_infos
                 .get(consumer)
-                .is_some_and(|info| consumer_drains_at_body(info, input)),
+                .and_then(|info| consumer_body_drain(info, input)),
         )
     });
     let decls: Vec<replay_rederive::NodeDecl> = plan
@@ -39371,6 +39420,7 @@ mod trigger_input_capacity_tests {
                 ("/lb/bus", "n", "x") => SlotRecord::Unaccounted,
                 (_, _, "x") => SlotRecord::Counted {
                     frame_stamps: vec![u64::try_from(topic.len()).unwrap()],
+                    drain: replay_rederive::BodyDrain::PerFrame,
                 },
                 _ => SlotRecord::Unaccounted,
             }
@@ -39408,79 +39458,106 @@ mod trigger_input_capacity_tests {
         );
     }
 
-    /// A slot is counted only where the bag holds every frame of its topic and
-    /// the consumer drains it at its body reads: hand table over the frames
-    /// recorded, the topic's record health, frames drained and never written,
-    /// and where the consumer drains.
+    /// A slot is counted only where the bag holds a stamp for every frame of
+    /// its topic, states that its record of the topic is whole, and the
+    /// consumer drains it at its body reads: hand table over the three.
     #[test]
     fn a_slot_is_counted_only_where_the_bag_accounts_for_it() {
-        use replay_rederive::SlotRecord;
+        use replay_rederive::{BodyDrain, SlotRecord};
         let stamps = vec![5, 9];
-        let counted = SlotRecord::Counted {
+        let counted = |drain| SlotRecord::Counted {
             frame_stamps: stamps.clone(),
+            drain,
         };
-        let lossy = TopicHealthClass::Lossy {
-            frames_lost: 1,
-            gap_events: 1,
-            sequence_anomaly: false,
-        };
-        /// The frames recorded, the topic's health, frames drained and never
-        /// written, whether the consumer drains at its body, and the record.
-        type Row<'a> = (
-            Option<&'a Vec<u64>>,
-            &'a TopicHealthClass,
-            u64,
-            bool,
-            &'a SlotRecord,
+        assert_eq!(
+            slot_record(Some(&stamps), true, Some(BodyDrain::PerFrame)),
+            counted(BodyDrain::PerFrame)
         );
-        let rows: [Row<'_>; 6] = [
-            (Some(&stamps), &TopicHealthClass::Clean, 0, true, &counted),
-            (
-                None,
-                &TopicHealthClass::Clean,
-                0,
-                true,
-                &SlotRecord::Unaccounted,
-            ),
-            (Some(&stamps), &lossy, 0, true, &SlotRecord::Unaccounted),
-            (
-                Some(&stamps),
-                &TopicHealthClass::MultiPublisher,
-                0,
-                true,
-                &SlotRecord::Unaccounted,
-            ),
-            (
-                Some(&stamps),
-                &TopicHealthClass::Clean,
-                1,
-                true,
-                &SlotRecord::Unaccounted,
-            ),
-            (
-                Some(&stamps),
-                &TopicHealthClass::Clean,
-                0,
-                false,
-                &SlotRecord::Unaccounted,
-            ),
-        ];
-        for (row, (frames, health, unwritten, at_body, want)) in rows.into_iter().enumerate() {
-            assert_eq!(
-                &slot_record(frames, health, unwritten, at_body),
-                want,
-                "row {row}"
-            );
-        }
+        assert_eq!(
+            slot_record(Some(&stamps), true, Some(BodyDrain::ToEmpty)),
+            counted(BodyDrain::ToEmpty)
+        );
+        assert_eq!(
+            slot_record(None, true, Some(BodyDrain::PerFrame)),
+            SlotRecord::Unaccounted
+        );
+        assert_eq!(
+            slot_record(Some(&stamps), false, Some(BodyDrain::PerFrame)),
+            SlotRecord::Unaccounted
+        );
+        assert_eq!(
+            slot_record(Some(&stamps), true, None),
+            SlotRecord::Unaccounted
+        );
     }
 
-    /// A Sync node's matcher pops its trigger inputs outside the body; every
-    /// other input, and every input of another policy, is drained at the body.
+    /// Only a present record-health stamp says a topic's frames are whole: it
+    /// reports the topic clean and no frame drained and never written anywhere
+    /// in the bag, and the graph does not list the topic in
+    /// `multi_publisher_topics`. An absent or malformed stamp says nothing.
+    #[test]
+    fn only_a_present_clean_stamp_says_a_topics_frames_are_whole() {
+        // The stamp as a recorder serializes it, every field the document
+        // carries for a topic present.
+        let health = |dropped_unwritten: u64, topics: &[(&str, u64, bool)]| {
+            let topics: Vec<String> = topics
+                .iter()
+                .map(|&(t, lost, multi)| {
+                    format!(
+                        "\"{t}\":{{\"frames_recorded\":3,\"frames_lost\":{lost},\"gap_events\":{gaps},\
+                         \"multi_publisher\":{multi},\"sequence_anomaly\":false}}",
+                        gaps = u64::from(lost > 0),
+                    )
+                })
+                .collect();
+            let json = format!(
+                "{{\"version\":2,\"dropped_unwritten\":{dropped_unwritten},\"topics\":{{{}}}}}",
+                topics.join(",")
+            );
+            RecordHealthReport::Present(
+                serde_json::from_str(&json).expect("a recorder's stamp shape"),
+            )
+        };
+        let clean = health(0, &[("/t", 0, false)]);
+        assert!(topic_recorded_whole(&clean, "/t", false));
+        assert!(
+            topic_recorded_whole(&clean, "/unstamped", false),
+            "a topic the stamp does not list lost nothing"
+        );
+        assert!(!topic_recorded_whole(&clean, "/t", true), "a listed topic");
+        assert!(
+            !topic_recorded_whole(&health(1, &[("/t", 0, false)]), "/t", false),
+            "frames drained and never written"
+        );
+        assert!(
+            !topic_recorded_whole(&health(0, &[("/t", 2, false)]), "/t", false),
+            "a lossy topic"
+        );
+        assert!(
+            !topic_recorded_whole(&health(0, &[("/t", 0, true)]), "/t", false),
+            "a multi-publisher record"
+        );
+        assert!(!topic_recorded_whole(
+            &RecordHealthReport::Absent,
+            "/t",
+            false
+        ));
+        assert!(!topic_recorded_whole(
+            &RecordHealthReport::Malformed,
+            "/t",
+            false
+        ));
+    }
+
+    /// A Sync node's matcher pops its trigger inputs outside the body; a FIFO
+    /// trigger input drains one frame per body read, and every other input
+    /// drains to its newest frame.
     #[test]
     fn only_a_sync_trigger_input_is_drained_outside_the_body() {
         use cerulion_core::graph::node::{
             BackpressurePolicy, InputConsume, InputMeta, MacroPolicy, NodeInfo,
         };
+        use replay_rederive::BodyDrain;
         let meta = |name: &str, trigger| InputMeta {
             name: name.to_string(),
             schema_hash: 0,
@@ -39488,25 +39565,26 @@ mod trigger_input_capacity_tests {
             depth: 2,
             backpressure: BackpressurePolicy::Block,
             expect_within_ms: None,
-            consume: InputConsume::Latest,
+            consume: InputConsume::Fifo,
             accumulate: false,
         };
         let inputs = || vec![meta("cam", true), meta("cfg", false)];
         let sync =
             NodeInfo::with_meta(inputs(), vec![]).with_policy(MacroPolicy::Sync { window_ms: 10 });
-        assert!(!consumer_drains_at_body(&sync, "cam"));
-        assert!(consumer_drains_at_body(&sync, "cfg"));
+        assert_eq!(consumer_body_drain(&sync, "cam"), None);
+        assert_eq!(consumer_body_drain(&sync, "cfg"), Some(BodyDrain::ToEmpty));
         let unbounded =
             NodeInfo::with_meta(inputs(), vec![]).with_policy(MacroPolicy::UnboundedSync);
-        assert!(!consumer_drains_at_body(&unbounded, "cam"));
+        assert_eq!(consumer_body_drain(&unbounded, "cam"), None);
         let fifo = NodeInfo::with_meta(inputs(), vec![]).with_policy(MacroPolicy::DataTrigger {
             input_name: "cam".to_string(),
         });
-        assert!(consumer_drains_at_body(&fifo, "cam"));
-        assert!(consumer_drains_at_body(
-            &NodeInfo::with_meta(inputs(), vec![]),
-            "cam"
-        ));
+        assert_eq!(consumer_body_drain(&fifo, "cam"), Some(BodyDrain::PerFrame));
+        assert_eq!(consumer_body_drain(&fifo, "cfg"), Some(BodyDrain::ToEmpty));
+        assert_eq!(
+            consumer_body_drain(&NodeInfo::with_meta(inputs(), vec![]), "cam"),
+            Some(BodyDrain::ToEmpty)
+        );
     }
 
     /// The connections a rank's consumer sees
@@ -39764,7 +39842,10 @@ mod trailing_refill_tests {
             consumer_node: consumer.to_string(),
             consumer_input: "inp".to_string(),
             depth,
-            record: replay_rederive::SlotRecord::Counted { frame_stamps },
+            record: replay_rederive::SlotRecord::Counted {
+                frame_stamps,
+                drain: replay_rederive::BodyDrain::PerFrame,
+            },
         }])
     }
 
@@ -39815,8 +39896,10 @@ mod trailing_refill_tests {
     ) -> Vec<(u64, Vec<String>)> {
         let mut carries = std::collections::HashMap::new();
         rows.iter()
-            .map(|(step, clock_us, nodes)| {
+            .enumerate()
+            .map(|(i, (step, clock_us, nodes))| {
                 let at = clock_us * 1_000;
+                let next_clock_ns = rows.get(i + 1).map(|(_, us, _)| us * 1_000);
                 let fires: Vec<RecordedFire> = nodes
                     .iter()
                     .flat_map(|&(id, _, fired, _)| {
@@ -39835,6 +39918,7 @@ mod trailing_refill_tests {
                     &fires,
                     *step,
                     at,
+                    next_clock_ns,
                     trust,
                     resumed,
                     &replay_rederive::PassStops::none(),
