@@ -54038,10 +54038,10 @@ fn bh_assert_judged(outcome: &ReplayOutcome, label: &str) {
     );
 }
 
-/// Assert the verdict on a bag that carries no record-health stamp: nothing
-/// states that the bag holds every frame of a
-/// slot's topic, so no slot explains a step, and the held node is judged as if
-/// nothing held it. `detail` is the first held step's finding; the replay
+/// Assert the verdict on a bag whose slot is unaccounted (no record-health
+/// stamp states that the bag holds every frame of the slot's topic, or the
+/// slot's input sets `block_timeout_ms`): no slot explains a step, and the held
+/// node is judged as if nothing held it. `detail` is the first held step's finding; the replay
 /// plans no refill after a held fire, so the relay's frames diverge where the
 /// hold froze one (`violations`).
 fn bh_assert_unaccounted(outcome: &ReplayOutcome, detail: &str, violations: &[&str]) {
@@ -54051,7 +54051,7 @@ fn bh_assert_unaccounted(outcome: &ReplayOutcome, detail: &str, violations: &[&s
     );
     assert_eq!(bh_violations(outcome), violations);
     assert!(!outcome.passed);
-    bh_assert_judged(outcome, "a bag with no record-health stamp");
+    bh_assert_judged(outcome, "an unaccounted slot");
 }
 
 /// The record-health stamp of a bag this file writes from `rec`: every topic
@@ -54185,7 +54185,7 @@ fn a_held_relay_on_a_bag_that_does_not_record_its_drain_is_judged_without_the_ho
          FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s); the bag does not \
          record whether this node's trigger input was read through one subscriber or two, so a \
          hold by a `block` input in its rank is not allowed for and can read as this divergence; \
-         a recording that states its stage set is judged with the hold"
+         a bag that records how a FIFO input was read is judged with the hold"
     );
     assert_eq!(
         bh_violations(&outcome),
@@ -54475,8 +54475,11 @@ fn the_middle_of_two_block_holds_carries_its_count() {
 ///   25 a refill pops the oldest it kept: sequences 15, 19, 25 and 29 (`x`
 ///   16, 20, 26 and 30).
 ///
-/// The replay plans a refill after each of those fires, so the stamped
-/// replay reproduces the relay's frames, every release reads clean, and two
+/// A release forgives the slot's frames and leaves no record, so a bag cannot
+/// account for a slot whose input sets `block_timeout_ms`, even under a clean
+/// record-health stamp: the replay is judged without the hold. The onset at
+/// step 3 is the finding; the replay plans no refill after the relay's held
+/// fire, so its frame 5 carries `x` 7 where the recording's carries 6; and two
 /// replays are byte-identical.
 #[test]
 #[serial]
@@ -54504,7 +54507,15 @@ fn a_held_relay_its_consumer_releases_on_a_timeout() {
     let fed = dir.path().join("bh_timeout.mcap");
     ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
     let outcome = bh_replay_stamped(&fed, bh_held_factories, bh_clean_stamp(&rec));
-    bh_assert_replays(&outcome, "held relay released on a timeout");
+    bh_assert_unaccounted(
+        &outcome,
+        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step 3 \
+         FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)",
+        &[
+            "/bh/relay/out: frame 5 on '/bh/relay/out' differs at x: recorded 6.0, replayed 7.0 \
+             (recorded 64 B, replayed 64 B)",
+        ],
+    );
     let again = bh_replay_stamped(&fed, bh_held_factories, bh_clean_stamp(&rec));
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),

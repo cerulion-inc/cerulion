@@ -10867,7 +10867,7 @@ fn derive_trailing_refills(
     rank: u32,
     verification: &PassVerification,
     runtime: &GraphRuntime,
-    start: replay_rederive::PassStart,
+    resumed: bool,
     stops: &replay_rederive::PassStops,
 ) -> Result<BTreeMap<u64, Vec<String>>, ReplayError> {
     let mut out = BTreeMap::new();
@@ -10895,8 +10895,8 @@ fn derive_trailing_refills(
             )
         })
     };
-    // One boundary ahead: a frame whose stamp several steps share is the last
-    // of them's send, so each step needs the next one's clock.
+    // One boundary ahead: a frame whose stamp several steps share counts at
+    // the last of them, so each step needs the next one's clock.
     let mut next = boundaries.next()?;
     while let Some(boundary) = next.take() {
         if !executes(boundary.target_ns) {
@@ -10916,7 +10916,7 @@ fn derive_trailing_refills(
             boundary.target_ns,
             next_clock_ns,
             trust,
-            start,
+            resumed,
             stops,
             &|node: &str| runtime.has_trigger_refill(node),
             &mut carries,
@@ -10962,7 +10962,7 @@ fn fifo_trailing_refills(
     clock_ns: u64,
     next_clock_ns: Option<u64>,
     trust: replay_rederive::RoleTrust,
-    start: replay_rederive::PassStart,
+    resumed: bool,
     stops: &replay_rederive::PassStops,
     has_refill: &dyn Fn(&str) -> bool,
     carries: &mut std::collections::HashMap<String, replay_rederive::FifoCarry>,
@@ -11001,7 +11001,7 @@ fn fifo_trailing_refills(
         }
         let carry = carries
             .entry(decl.node_id.clone())
-            .or_insert_with(|| replay_rederive::FifoCarry::new(decl, *drain, start, stops));
+            .or_insert_with(|| replay_rederive::FifoCarry::new(decl, *drain, resumed, stops));
         let Ok(popped) =
             replay_rederive::fifo_step_pops(&decl.node_id, trigger_inputs, reads, trust)
         else {
@@ -13017,13 +13017,23 @@ fn producers_by_topic(config: &GraphConfig) -> BTreeMap<String, BTreeSet<(String
 }
 
 /// One topic whose `block` consumers hold its producers, as the rank's
-/// runtime wires it: the topic, its producers, and each `block` consumer as
-/// `(node, input, depth)`.
+/// runtime wires it: the topic, its producers, and each `block` consumer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockHoldFlow {
     topic: String,
     producers: Vec<String>,
-    consumers: Vec<(String, String, u64)>,
+    consumers: Vec<BlockHoldConsumer>,
+}
+
+/// One `block` consumer of a [`BlockHoldFlow`]: the node and input that hold
+/// the slot, its depth, and whether the input sets `block_timeout_ms`, whose
+/// release forgives the slot's frames and leaves no record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BlockHoldConsumer {
+    node: String,
+    input: String,
+    depth: u64,
+    released_on_timeout: bool,
 }
 
 /// The topics of the rank whose `block` consumers hold their producers.
@@ -13061,12 +13071,11 @@ fn block_hold_flows(
                 .consumers
                 .iter()
                 .filter(|c| c.policy == cerulion_core::graph::node::BackpressurePolicy::Block)
-                .map(|c| {
-                    (
-                        c.node_id.clone(),
-                        c.input.clone(),
-                        u64::try_from(c.depth).unwrap_or(u64::MAX),
-                    )
+                .map(|c| BlockHoldConsumer {
+                    node: c.node_id.clone(),
+                    input: c.input.clone(),
+                    depth: u64::try_from(c.depth).unwrap_or(u64::MAX),
+                    released_on_timeout: c.block_timeout_ms.is_some(),
                 })
                 .collect(),
         })
@@ -13076,7 +13085,10 @@ fn block_hold_flows(
 /// PURE: per node of the rank, the `block` edges that can hold its fire, for
 /// [`replay_rederive::NodeDecl::may_be_held_by`]: per producer, one edge per
 /// `block` consumer of each topic it produces, each with what the bag records
-/// of its slot (`record_of(topic, consumer, input)`).
+/// of its slot (`record_of(topic, consumer, input)`). A consumer whose input
+/// sets `block_timeout_ms` gives [`replay_rederive::SlotRecord::Unaccounted`]:
+/// its release forgives the slot's frames and leaves no record, so the bag
+/// cannot account for the slot.
 fn local_block_holds(
     flows: &[BlockHoldFlow],
     record_of: &dyn Fn(&str, &str, &str) -> replay_rederive::SlotRecord,
@@ -13086,11 +13098,15 @@ fn local_block_holds(
         let edges: Vec<replay_rederive::BlockHoldEdge> = flow
             .consumers
             .iter()
-            .map(|(node, input, depth)| replay_rederive::BlockHoldEdge {
-                consumer_node: node.clone(),
-                consumer_input: input.clone(),
-                depth: *depth,
-                record: record_of(&flow.topic, node, input),
+            .map(|c| replay_rederive::BlockHoldEdge {
+                consumer_node: c.node.clone(),
+                consumer_input: c.input.clone(),
+                depth: c.depth,
+                record: if c.released_on_timeout {
+                    replay_rederive::SlotRecord::Unaccounted
+                } else {
+                    record_of(&flow.topic, &c.node, &c.input)
+                },
             })
             .collect();
         for producer in &flow.producers {
@@ -16301,11 +16317,7 @@ fn run_rank_pass(
             plan.rank(),
             &verification,
             runtime,
-            resume.map_or(replay_rederive::PassStart::FromStart, |r| {
-                replay_rederive::PassStart::Resumed {
-                    anchor_prev_target_ns: r.anchor_prev_target,
-                }
-            }),
+            resume.is_some(),
             &rederive_stops,
         )?
     };
@@ -17204,7 +17216,6 @@ fn run_rank_pass(
                         &r.sync_input_timestamps,
                     ))
                     .with_stops_stated(r.stops.stated())
-                    .with_anchor_prev_target(r.anchor_prev_target)
                 }),
                 &rederive_stops,
             );
@@ -39386,7 +39397,7 @@ mod trigger_input_capacity_tests {
         infos.insert("k".to_string(), input(4, BackpressurePolicy::Block));
         infos.insert("n".to_string(), input(5, BackpressurePolicy::Block));
         /// Per topic, its producers and its `block` consumers.
-        type Flows = BTreeMap<String, (Vec<String>, Vec<(String, String, u64)>)>;
+        type Flows = BTreeMap<String, (Vec<String>, Vec<BlockHoldConsumer>)>;
         let flows = |infos: &IndexMap<String, NodeInfo>| -> Flows {
             block_hold_flows(&config, infos, 0)
                 .expect("builds")
@@ -39395,7 +39406,12 @@ mod trigger_input_capacity_tests {
                 .collect()
         };
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        let consumer = |node: &str, depth| (node.to_string(), "x".to_string(), depth);
+        let consumer = |node: &str, depth| BlockHoldConsumer {
+            node: node.to_string(),
+            input: "x".to_string(),
+            depth,
+            released_on_timeout: false,
+        };
         let mut expected = BTreeMap::from([
             (
                 "/lb/c/out".to_string(),
@@ -39493,6 +39509,117 @@ mod trigger_input_capacity_tests {
         );
     }
 
+    /// A `block` input that sets `block_timeout_ms` leaves its slot
+    /// unaccounted: a release forgives the slot's frames and leaves no record,
+    /// so the frames the bag records can count more than the slot holds.
+    /// Depth 1: the relay fires at step 0, the sink's timeout releases that
+    /// frame, and at step 1 the relay pops a frame and fires none. Counted
+    /// from the frames, the slot is full at step 1 and the short step reads as
+    /// the hold; with the timeout it is the finding. Without the timeout the
+    /// same recording reads clean.
+    #[test]
+    fn a_block_input_with_a_timeout_leaves_its_slot_unaccounted() {
+        use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
+        use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
+        use replay_rederive::{
+            BlockHoldEdges, BodyDrain, FifoDrain, NodeDecl, PassRestore, PassStops, RecordedFire,
+            RecordedRead, RecordedStep, RoleTrust, SlotRecord, TriggerDecl,
+        };
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert(
+            "sink".to_string(),
+            NodeInfo::with_meta(
+                vec![InputMeta {
+                    name: "x".to_string(),
+                    schema_hash: 0,
+                    trigger: true,
+                    depth: 1,
+                    backpressure: BackpressurePolicy::Block,
+                    expect_within_ms: None,
+                    consume: InputConsume::Latest,
+                    accumulate: false,
+                }],
+                vec![],
+            ),
+        );
+        let relay = |timeout: &str| {
+            let yaml = format!(
+                "name: bt\nprefix: bt\nnodes:\n\
+                 \x20 - id: relay\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+                 \x20 - id: sink\n    type: w\n    inputs:\n      - name: x\n        source: relay/out\n{timeout}"
+            );
+            let config = cerulion_core::graph::parse_graph(&yaml).expect("parses");
+            let mut holds = local_block_holds(
+                &block_hold_flows(&config, &infos, 0).expect("builds"),
+                &|_, _, _| SlotRecord::Counted {
+                    frame_stamps: vec![1_000],
+                    drain: BodyDrain::PerFrame,
+                },
+            );
+            NodeDecl {
+                node_id: "relay".to_string(),
+                trigger: TriggerDecl::Data {
+                    trigger_inputs: vec!["inp".to_string()],
+                    drain: FifoDrain::Unified,
+                },
+                throttle_ns: None,
+                may_be_held_by: BlockHoldEdges::new(holds.remove("relay").unwrap_or_default()),
+                has_non_trigger_inputs: false,
+                trigger_input_capacities: Default::default(),
+            }
+        };
+        let pop = RecordedRead {
+            node_id: "relay".to_string(),
+            input: "inp".to_string(),
+            kind: ReadOutcomeKind::DrainedBatch,
+            served_seq: None,
+            popped: 1,
+            wire_stamp_ns: None,
+            role: ReadSiteRole::Drain,
+            writer: None,
+        };
+        let steps = [
+            RecordedStep {
+                step: 0,
+                clock_ns: 1_000,
+                fires: vec![RecordedFire {
+                    node_id: "relay".to_string(),
+                    fire_time_ns: 1_000,
+                }],
+                reads: vec![pop.clone()],
+            },
+            RecordedStep {
+                step: 1,
+                clock_ns: 6_000,
+                fires: vec![],
+                reads: vec![pop],
+            },
+        ];
+        let judge = |decl: NodeDecl| {
+            replay_rederive::verify(
+                &[decl],
+                &steps,
+                &[],
+                RoleTrust::from_stamped(true, true),
+                &PassRestore::none(),
+                &PassStops::none(),
+            )
+        };
+        let released = judge(relay("        block_timeout_ms: 5\n"));
+        assert_eq!(
+            released
+                .findings
+                .iter()
+                .map(|f| (f.node_id.as_str(), f.step))
+                .collect::<Vec<_>>(),
+            vec![("relay", 1)],
+            "{:?}",
+            released.findings
+        );
+        let held = judge(relay(""));
+        assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+    }
+
     /// Only a present record-health stamp says a topic's frames are whole: it
     /// keeps an entry for the topic that reads clean (no frame lost, one
     /// publisher declared and observed), no frame is drained and never
@@ -39539,6 +39666,32 @@ mod trigger_input_capacity_tests {
         assert!(
             !topic_recorded_whole(&observed, "/t", false),
             "a second writer observed at record time"
+        );
+        let flagged = |field: &str| {
+            RecordHealthReport::Present(
+                serde_json::from_str(&format!(
+                    "{{\"version\":2,\"dropped_unwritten\":0,\"topics\":{{\"/t\":{{\
+                     \"frames_recorded\":3,\"frames_lost\":0,\"gap_events\":0,\
+                     \"multi_publisher\":false,{field}}}}}}}"
+                ))
+                .expect("a recorder's stamp shape"),
+            )
+        };
+        assert!(
+            !topic_recorded_whole(&flagged("\"sequence_anomaly\":true"), "/t", false),
+            "a wire-sequence anomaly"
+        );
+        assert!(
+            !topic_recorded_whole(
+                &flagged("\"sequence_anomaly\":false,\"baseline_resets_after_first\":1"),
+                "/t",
+                false
+            ),
+            "a sequence baseline reset after the first frame"
+        );
+        assert!(
+            topic_recorded_whole(&flagged("\"sequence_anomaly\":false"), "/t", false),
+            "the same entry with nothing flagged"
         );
         assert!(!topic_recorded_whole(&clean, "/t", true), "a listed topic");
         assert!(
@@ -39936,13 +40089,7 @@ mod trailing_refill_tests {
                     at,
                     next_clock_ns,
                     trust,
-                    if resumed {
-                        replay_rederive::PassStart::Resumed {
-                            anchor_prev_target_ns: None,
-                        }
-                    } else {
-                        replay_rederive::PassStart::FromStart
-                    },
+                    resumed,
                     &replay_rederive::PassStops::none(),
                     &|_: &str| has_refill,
                     &mut carries,

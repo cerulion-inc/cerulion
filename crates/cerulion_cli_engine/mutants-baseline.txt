@@ -131,8 +131,7 @@
 # (`BlockHoldEdges`), the counted carry, the supply and the carry dispatcher
 # (`fifo_step_backlog`, `fifo_supply`, `fifo_carry_out`), the deferral
 # predicate and the per-step walk that feeds it, with the slot bound it folds
-# (`fifo_carry_deferrable`, `FifoDeferral`, `SlotBound`), the pass start
-# they read (`PassRestore`, `PassStart`), the carry walk the
+# (`fifo_carry_deferrable`, `FifoDeferral`, `SlotBound`), the carry walk the
 # verdict and the refill plan share (`FifoCarry`), the caveat a finding on a
 # node whose drain the bag does not record carries and its text
 # (`FindingCaveat`, `ScheduleFinding`), the rules that read them
@@ -152,7 +151,7 @@
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --in-diff <the change's diff of the two files> \
-#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|SlotBound::|PassRestore::|PassStart::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|slot_record|topic_recorded_whole|consumer_body_drain' \
+#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|slot_record|topic_recorded_whole|consumer_body_drain' \
 #            --cap-lints true --in-place --timeout 600 \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (in 4 shards; the unmutated baseline passed)
@@ -185,25 +184,29 @@
 #          `PassRestore::with_anchor_prev_target` replaced with
 #          `Default::default()`: no vector resumed a pass through it; the
 #          resumed-slot vectors now do. `+` replaced with `-` in
-#          `SlotBound::step`'s count of the frames at a step's clock: no
-#          vector stamped a frame between two steps' clocks; one now does. And
+#          `SlotBound::step`'s count of the frames at a step's clock, which is
+#          equivalent on every bag the replay accepts: the recording
+#          consistency check refuses a frame stamped between two steps'
+#          clocks (exit 2). A vector with such a frame now catches it. And
 #          `!` deleted where `SlotBound::step` stops voiding a shared clock's
 #          frames: no vector counted the frames of the clock after one; one
 #          now does. Re-run with these vectors and
 #          `--re 'PassRestore::with_anchor_prev_target|SlotBound::step'`:
-#          29 mutants, 28 caught, 1 missed, listed below. The 4 unviable
+#          29 mutants, 28 caught, 1 missed. The 4 unviable
 #          replace `PassRestore::none`, `PassRestore::start`,
 #          `FifoDeferral::step` and `FifoCarry::step` with a value their types
 #          do not have.
+#          Re-run over the fourth fix's changes, which give a slot whose
+#          input sets `block_timeout_ms` no count and delete the resumed
+#          pass's anchor tie (where the one missed mutant sat, a tie that
+#          changed no verdict) with `PassRestore::with_anchor_prev_target`
+#          and `PassStart`, with
+#          `--re 'local_block_holds|SlotBound::step|FifoDeferral::new|FifoCarry::new|\bverify\b|fifo_trailing_refills'`:
+#          14 mutants, 12 caught, 2 unviable, which replace
+#          `local_block_holds` with a map of an edge its type cannot default.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
 # it with a test, or list it here with a reason.
 
-src/replay_rederive.rs, SlotBound::step: `==` replaced with `!=` in the test
-of whether a resumed pass's anchor step shares its first step's clock.
-Equivalent: a resumed pass counts nothing in the slot until the consumer
-first reads its queue empty, and that read leaves the slot empty. A frame
-stamped at the first step's clock is counted before that read, or, where the
-read shares that clock, not at all, so whether the first step drops it
-changes no verdict.
+(none)
