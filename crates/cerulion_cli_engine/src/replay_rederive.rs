@@ -9433,8 +9433,9 @@ mod tests {
     ///   frame is the second step's send and the first step's pop is a
     ///   finding;
     /// * a consumer whose input drains to its newest frame: its body read at
-    ///   step 4 empties the queue, so after the hold the relay's step 6 pop is
-    ///   a finding, where one frame per read leaves two counted;
+    ///   step 4, a `Served` or a body `DrainedBatch` read, empties the queue,
+    ///   so after the hold the relay's step 6 pop is a finding, where one
+    ///   frame per read leaves two counted;
     /// * a consumer that fires with no read of the input recorded: from that
     ///   step nothing bounds the slot, so the frame carried into step 3 is a
     ///   finding;
@@ -9477,6 +9478,54 @@ mod tests {
         assert_eq!(findings_of(&latest), vec![finding("relay", 6, 1, 0)]);
         let per_frame = verify_unrestored(&relay(sink_holds(2, &steps)), &steps, &[], STAMPED);
         assert!(per_frame.is_clean(), "{:?}", per_frame.findings);
+        // The same take as a body `DrainedBatch` read (an `accumulate` input's
+        // drain) empties the queue too, and only on an input that drains to
+        // its newest frame.
+        let batch_rows = [
+            (0, 1, 1, 0),
+            (1, 1, 1, 0),
+            (2, 1, 0, 0),
+            (3, 0, 1, 0),
+            (4, 0, 0, 0),
+            (5, 0, 0, 0),
+            (6, 1, 0, 0),
+        ];
+        let batch = read_with_role(
+            "sink",
+            "inp",
+            ReadOutcomeKind::DrainedBatch,
+            1,
+            None,
+            ReadSiteRole::Body,
+        );
+        let batched = with_read(relay_steps(&batch_rows), 4, batch);
+        let drained_to = |drain| {
+            let SlotRecord::Counted { frame_stamps, .. } = sent_by(&batched, &["relay"]) else {
+                unreachable!("sent_by counts")
+            };
+            BlockHoldEdges::new(vec![slot(
+                "sink",
+                2,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain,
+                },
+            )])
+        };
+        let batch_empties = verify_unrestored(
+            &relay(drained_to(BodyDrain::ToEmpty)),
+            &batched,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&batch_empties), vec![finding("relay", 6, 1, 0)]);
+        let batch_takes_one = verify_unrestored(
+            &relay(drained_to(BodyDrain::PerFrame)),
+            &batched,
+            &[],
+            STAMPED,
+        );
+        assert!(batch_takes_one.is_clean(), "{:?}", batch_takes_one.findings);
 
         let unread_rows = vec![
             fifo_step(0, 0, &[("relay", 1, 1, 0)]),
