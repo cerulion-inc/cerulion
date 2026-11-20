@@ -2420,8 +2420,14 @@ fn every_workflow_with_line_brings_every_test_file_of_its_packages() {
         }
     }
     let expected: BTreeMap<String, Vec<String>> = [
-        ("test-linux", &["node_macro_ui"][..]),
-        ("test-macos", &["node_macro_ui"][..]),
+        (
+            "test-linux",
+            &["node_macro_ui", "test_node_macro_cdylib"][..],
+        ),
+        (
+            "test-macos",
+            &["node_macro_ui", "test_node_macro_cdylib"][..],
+        ),
     ]
     .into_iter()
     .map(|(job, extras)| {
@@ -2896,10 +2902,11 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         .map(|(name, _)| name)
         .collect();
     // The cdylib feature is required to compile the node context migration
-    // cases; required Linux and macOS shards run this fixture's lib harness.
-    // node_macro_ui is the #[cerulion_node] diagnostics suite (trybuild plus
-    // the compile-pass binaries), run in the cerulion_core shard step on shard
-    // 2 of the same jobs (`ci_test_shard.sh --with`).
+    // cases: this fixture's integration test checks the refused shape and runs
+    // the binaries built from the accepted ones. node_macro_ui is the
+    // #[cerulion_node] diagnostics suite (trybuild plus the compile-pass
+    // binaries). Both run in the cerulion_core shard step on shard 2 of the
+    // required Linux and macOS jobs (`ci_test_shard.sh --with`).
     let allowed = BTreeSet::from(["test_node_macro_cdylib", "node_macro_ui"]);
     let unexpected: Vec<_> = fixtures
         .iter()

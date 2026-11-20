@@ -233,7 +233,7 @@ or allocator crosses. See [Node ABI](node-abi.md) for the exact contract.
 
 ## Trybuild suite and regen
 
-Compile-fail coverage lives in two places:
+Compile-fail coverage lives in three places:
 
 - **Blocking** (every PR): the `node_macro_ui` package,
   `crates/test_fixtures/node_macro_ui/tests/ui/*.rs`, each fixture failing with a
@@ -244,6 +244,11 @@ Compile-fail coverage lives in two places:
   `cargo build` builds a package that uses the macros, and that test runs it. Locally,
   `cargo test -p node_macro_ui`; CI runs its tests in the `cerulion_core` nextest shard
   step on shard 2 (`ci_test_shard.sh ... --with node_macro_ui`).
+- **Blocking** (every PR): the node context migration under the plugin (`cdylib`)
+  expansion, `crates/test_fixtures/test_node_macro_cdylib/tests/context_helpers.rs`:
+  `tests/ui/free_context_helper.rs` against its `.stderr`, and the three accepted
+  helper shapes in `tests/ui/` as binary targets that test runs. CI runs it beside the
+  diagnostics suite (`--with test_node_macro_cdylib`).
 - **`#[ignore]`d** (toolchain-fragile rustc renderings):
   `crates/cerulion_core/tests/macro_compile_fail_test.rs` over
   `crates/cerulion_core/tests/ui/const_eval/` (const-eval panics) and
@@ -254,6 +259,7 @@ Regen after an intentional diagnostic change or a toolchain bump:
 
 ```bash
 TRYBUILD=overwrite cargo test -p node_macro_ui --test compile_fail
+TRYBUILD=overwrite cargo test -p test_node_macro_cdylib --test context_helpers
 TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test -- --ignored
 ```
 

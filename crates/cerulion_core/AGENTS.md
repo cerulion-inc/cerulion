@@ -39,7 +39,7 @@ Core: wire/codegen/iceoryx2/scheduler/graph/gateway.
   runs one leg (nextest, NOT `--test-threads=1`); fence `.config/nextest.toml`, `serial_discipline_test`.
 - Rebuild ALL cdylib fixtures after any core change (`cargo build -p test_node_*`); stale ones SIGABRT. Executor/step/drain changes run EVERY `GraphRuntime`/`step()` binary.
 - Cross-process credit: `credit_test`, `credit_block_iox2_test`, `free_run_ctor_iox2_test`:
-  parallel-safe, no fence. Re-bless trybuild (`node_macro_ui`, shard 2 `--with`) on drift, from CI's output.
+  parallel-safe, no fence. Re-bless trybuild (`node_macro_ui`, `test_node_macro_cdylib`) from CI's output.
 
 ## Traps
 

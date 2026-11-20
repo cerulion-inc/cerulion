@@ -44,10 +44,11 @@
 # OTHER PACKAGES' TESTS RIDE THE SAME INVOCATION with `--with <package>`. A
 # package step that runs after this one adds its whole time to the leg, while
 # a test in this invocation runs beside the shard's own tests and is built by
-# the same cargo invocation. The `#[cerulion_node]` diagnostics suite rides
-# shard 2 of both lanes this way: its compile-fail test runs trybuild over its
-# fixtures for minutes, and `.config/nextest.toml` starts it right after the
-# timing tests that claim every slot. An extra package adds `-p <package> --test <name>` for each of its
+# the same cargo invocation. The `#[cerulion_node]` diagnostics suite and the
+# node context helper suite ride shard 2 of both lanes this way: each holds a
+# test that runs trybuild over its fixtures, for minutes in the diagnostics
+# suite, and `.config/nextest.toml` starts them right after the timing tests
+# that claim every slot. An extra package adds `-p <package> --test <name>` for each of its
 # `tests/*.rs` at depth 1. Cargo applies `--lib` and every `--test` to all the
 # packages one command selects, so the script refuses `--with` on shard 0,
 # which carries `--lib`, and refuses an extra that holds a test this
@@ -57,9 +58,11 @@
 #
 # THE EXTRAS' FEATURES ARE MEASURED, NOT GATED. Building an extra in this
 # invocation unions its dev-dependency features into this package's test
-# build. For `node_macro_ui` that union adds nothing: its dev-dependencies ask
-# for `test-helpers` on `cerulion_core` and `native_ros2_messages`, which
-# `cerulion_core`'s own test build already turns on. To check it again after
+# build. For the two shipped extras that union adds nothing: `node_macro_ui`'s
+# dev-dependencies ask for `test-helpers` on `cerulion_core` and
+# `native_ros2_messages`, which `cerulion_core`'s own test build already turns
+# on, and `test_node_macro_cdylib`'s for `trybuild` alone, which that build
+# carries too. To check it again after
 # an extra's manifest changes, compare two unit graphs of the shard-2 build,
 # `cargo test --no-run $(ci_test_shard.sh --list cerulion_core 2 4) --unit-graph
 # -Z unstable-options` with and without `--with <extra>` inside the `$( )`
@@ -520,6 +523,10 @@ cerulion_core node_macro_ui|[node_macro_ui]|cerulion_core node_macro_ui
 cerulion_core|["node_macro_ui"]|-
 cerulion_core cerulion_viz|["cerulion_vizd"]|-
 cerulion_core node_macro_ui cerulion_viz|["cerulion_viz","node_macro_ui"]|node_macro_ui cerulion_viz
+cerulion_core node_macro_ui test_node_macro_cdylib|["test_node_macro_cdylib"]|test_node_macro_cdylib
+cerulion_core node_macro_ui test_node_macro_cdylib|["test_node_macro_cdylib","node_macro_ui"]|node_macro_ui test_node_macro_cdylib
+cerulion_core node_macro_ui test_node_macro_cdylib|["cerulion_core","test_node_macro_cdylib"]|cerulion_core test_node_macro_cdylib
+cerulion_core node_macro_ui test_node_macro_cdylib|[]|-
 '
 
 check_selection() {

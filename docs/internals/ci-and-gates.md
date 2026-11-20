@@ -534,22 +534,35 @@ policy below names their namespaces, which the default does not. Each sharded jo
 `--with <package>` adds another package's integration tests to the same nextest
 invocation: `-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. Shard 2
 of both lanes runs its shard in a step of its own (`if: matrix.shard == 2`, so the coverage
-walk sees the leg) that passes `--with node_macro_ui`, so the `#[cerulion_node]`
-diagnostics suite builds in the shard's cargo invocation and its trybuild test runs beside
-the core tests. nextest starts tests by priority, then in binary order, and its queue does
-not start a test past the one at its head, where a test that claims every slot waits for
-every running test to end; so `.config/nextest.toml` gives the timing tests that claim
-every slot priority 100 and the trybuild test 99 (at the default priority it sorts after
-every `cerulion_core` binary and would start last). On the other shards the timing tests
-then run first, each alone, which costs no slot they would not have waited for anyway.
+walk sees the leg) that passes `--with node_macro_ui --with test_node_macro_cdylib`, so the
+`#[cerulion_node]` diagnostics suite and the node context helper suite build in the
+shard's cargo invocation and their trybuild tests run beside the core tests. nextest starts
+tests by priority, then in binary order, and its queue does not start a test past the one
+at its head, where a test that claims every slot waits for every running test to end; so
+`.config/nextest.toml` gives the timing tests that claim every slot priority 100 and the
+two suites' test binaries 99 (at the default priority they sort after every
+`cerulion_core` binary and would start last), in a `trybuild` test group of one slot: the
+suites share `target/tests/trybuild`, and each re-checks its fixtures when the other has
+run there since, so at the same time they took several times as long as one after the
+other. On the other shards the timing tests run first, each alone, which costs no slot
+they would not have waited for anyway.
 Cargo applies `--lib` and each `--test` to every package one command selects, so the
 script refuses `--with` on shard 0, which carries `--lib`, and an extra package that holds
 a test attribute, a doctest source or a test target outside `tests/*.rs` (see `check_extra`
-in the script), or a `tests/*.rs` named like one of `cerulion_core`'s; the suite's
-compile-pass programs are binaries of that package, which cargo builds for an integration
-test even when targets are named. Its dev-dependencies ask for `test-helpers` on
-`cerulion_core` and `native_ros2_messages`, which `cerulion_core`'s own test build already
-turns on, so every unit the shard compiles for the core tests keeps its features. The
+in the script), or a `tests/*.rs` named like one of `cerulion_core`'s; each suite's
+compile-pass programs are binaries of its package, which cargo builds for an integration
+test even when targets are named. `node_macro_ui`'s dev-dependencies ask for
+`test-helpers` on `cerulion_core` and `native_ros2_messages` and `test_node_macro_cdylib`'s
+for `trybuild` alone, all of which `cerulion_core`'s own test build already turns on, so
+every unit the shard compiles for the core tests keeps its features (the shard-2 unit
+graphs at both counts, with and without the two packages, agree on every unit they share).
+`test_node_macro_cdylib`'s programs build in every build of that package that does not
+filter its targets too, so a build without dev-dependencies, the workspace build among
+them, compiles them without `cerulion_core`'s `test-helpers`. Cargo copies a cdylib into
+`target/debug` only when the command asks for its library, as `cargo build -p` and
+`--workspace` do, not when it builds the library as a dependency of a test; so during a
+shard run the fixture the core tests load from there is the one the leg's workspace build
+left. The
 selection is read for each package on its own and the script prints a `selection:` line
 for each package it leaves out. In CI every selection that names a package names
 `cerulion_core`, which observes the whole tree, so the step sees `[]` (every package skips)
