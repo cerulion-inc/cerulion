@@ -15,8 +15,9 @@
 //!
 //! Nothing here touches transport, SHM, the bag reader, the clock, or the
 //! filesystem: the inputs are a [`GraphConfig`] plus two plain-data tables the
-//! caller reads off the bag ([`RankManifest`], [`RankBoundarySummary`]), and
-//! the output is data. That is what lets the planner unit-test on any platform
+//! caller reads off the bag ([`RankManifest`], [`RankBoundarySummary`]) and,
+//! for [`classify_split_block_edges`], the build's node declarations and the
+//! node to rank map its plans give, and the output is data. That is what lets the planner unit-test on any platform
 //! (the module is deliberately NOT `#[cfg(unix)]`-gated, unlike its
 //! `replay_engine` consumer — the `replay_field_registry` precedent) and what
 //! keeps every refusal below reachable from a hand-built oracle.
@@ -57,7 +58,9 @@
 //! fault), never a candidate divergence (exit 1/6) and never a harness bug
 //! (exit 5). The engine maps them onto that vocabulary; the enum is
 //! kept free-standing here so the planner stays platform-independent and
-//! oracle-testable.
+//! oracle-testable. [`SplitBlockEdgeError`] maps otherwise: `Uncreditable` and
+//! `Timeout` are exit 2, `EngineBug` is exit 5, and the replay refuses nothing
+//! on `Topology`.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
@@ -772,9 +775,6 @@ pub enum BlockDeclaredBy {
 /// one producer's outstanding frames, so a several-rank replay refuses the
 /// bag before its first pass.
 ///
-/// The text is a draft of the operator-facing sentence, kept in one `format!`
-/// per sentence so a reworded approval is a one-line change.
-///
 /// The fields are private: [`Self::new`] is the one builder, and it holds the
 /// invariant the sentence states, two or more producers with one or more in
 /// another rank than the consumer.
@@ -792,9 +792,9 @@ pub struct UncreditableSplitEdge {
 impl UncreditableSplitEdge {
     /// The refusal of the `block` input `consumer_node.consumer_input` on
     /// `topic`, in `consumer_rank`, whose topic `producers` write (each with
-    /// its rank, in topic order), or `None` when `producers` names fewer than
-    /// two producers or none in another rank: such an edge is creditable or
-    /// not split.
+    /// its rank, in topic order), or `None` when `producers` names no
+    /// producer or one, or names none in another rank than `consumer_rank`:
+    /// such an edge has no producer to count, is creditable, or is not split.
     #[must_use]
     pub fn new(
         topic: String,
@@ -868,9 +868,6 @@ impl std::error::Error for UncreditableSplitEdge {}
 /// shared credit word, which a timeout release keeps exact only when the
 /// producer and the consumer fire one at a time on one thread, so a
 /// several-rank replay refuses the bag before its first pass.
-///
-/// The text is a draft, kept in one `format!`, as
-/// [`UncreditableSplitEdge`]'s is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitEdgeTimeout {
     /// The resolved absolute topic.
@@ -931,30 +928,32 @@ pub enum SplitBlockEdgeError {
     /// A split one-producer `block` edge whose input sets `block_timeout_ms`.
     #[error(transparent)]
     Timeout(#[from] SplitEdgeTimeout),
-    /// The node to rank map places no rank for `node`. [`plan_ranks`] places
-    /// every node of the graph, so a map built from its plans
-    /// ([`plan_node_ranks`]) never reaches this.
-    #[error(
-        "node '{node}' is in no rank plan, and the split `block` edge check needs every node's \
-         rank; this is a bug in the replay engine, please report"
-    )]
-    Unplaced {
-        /// The node no rank holds.
-        node: String,
+    /// A fact the replay engine guarantees did not hold; `reason` names it.
+    /// Reached through [`classify_split_block_edges`] only by a map that
+    /// places no rank for a native node, which a map [`plan_node_ranks`]
+    /// builds from [`plan_ranks`]' plans never does. Its two other sources
+    /// cannot fire past validation: [`credit_edges_for`]'s depth refusals (a
+    /// depth of 0, or one past `u32`), and a minted timeout edge with more
+    /// than one producer (the mint credits a topic with one producer only).
+    #[error("{reason}; this is a bug in the replay engine, please report")]
+    EngineBug {
+        /// What did not hold.
+        reason: String,
     },
 }
 
 /// Classify every `block` edge the manifests' `node_rank` map splits across
 /// ranks: the creditable ones (`Ok`, the edges a live run mints a cross-process
-/// credit word for, in [`credit_edges_for`]'s order), or the first edge a
-/// several-rank replay refuses (`Err`).
+/// credit word for, in [`credit_edges_for`]'s order), or why not (`Err`): the
+/// first edge a several-rank replay refuses, a whole-graph topology refusal,
+/// or a fact the engine guarantees that did not hold.
 ///
 /// PURE: the whole graph the bag embeds, the build's own node declarations
 /// (`infos`, read before any pass) and the map in, a verdict out. `node_rank`
-/// must place every node of `config`, as a map [`plan_node_ranks`] builds from
-/// [`plan_ranks`]' plans does; one that leaves a node out is
-/// [`SplitBlockEdgeError::Unplaced`]. Over ranks in place of process groups,
-/// the order is:
+/// must place every native (non-`ros2:`) node of `config`, as a map
+/// [`plan_node_ranks`] builds from [`plan_ranks`]' plans does; one that leaves
+/// one out is [`SplitBlockEdgeError::EngineBug`], naming the first in graph
+/// order. Over ranks in place of process groups, the order is:
 ///
 /// 1. the whole-graph topology is built; a build refusal is
 ///    [`SplitBlockEdgeError::Topology`];
@@ -970,13 +969,14 @@ pub enum SplitBlockEdgeError {
 ///    topic, a `block` ring) does not stand in front of this one;
 /// 3. the topology is validated ([`GraphTopology::validate`]); a refusal is
 ///    [`SplitBlockEdgeError::Topology`]. Past it every depth is in
-///    `1..=MAX_CONSUMER_DEPTH`, the range [`credit_edges_for`]'s own depth
-///    refusals guard;
+///    `1..=MAX_CONSUMER_DEPTH`, so [`credit_edges_for`]'s own depth refusals
+///    (a depth of 0, or one past `u32`) cannot fire; one that did would be
+///    [`SplitBlockEdgeError::EngineBug`];
 /// 4. the creditable split edges are [`credit_edges_for`]'s, the live mint,
 ///    and the first whose input sets `block_timeout_ms`
 ///    (`multiprocess::split_edge_timeout_producers`, the live check) is
 ///    refused as [`SplitEdgeTimeout`]. A minted edge has one producer on one
-///    rank; one that names more is [`SplitBlockEdgeError::Topology`], never a
+///    rank; one that names more is [`SplitBlockEdgeError::EngineBug`], never a
 ///    passed timeout.
 ///
 /// Deterministic: topology order, then graph order within a flow; two calls
@@ -990,8 +990,12 @@ pub fn classify_split_block_edges(
         .native_nodes()
         .find(|n| !node_rank.contains_key(n.id.as_str()))
     {
-        return Err(SplitBlockEdgeError::Unplaced {
-            node: node.id.clone(),
+        return Err(SplitBlockEdgeError::EngineBug {
+            reason: format!(
+                "node '{}' is in no rank plan, and the split `block` edge check needs every \
+                 native node's rank",
+                node.id
+            ),
         });
     }
     let topology_err = |reason: String| SplitBlockEdgeError::Topology { reason };
@@ -1025,7 +1029,10 @@ pub fn classify_split_block_edges(
     topology
         .validate()
         .map_err(|e| topology_err(e.to_string()))?;
-    let credited = credit_edges_for(&topology, node_rank).map_err(topology_err)?;
+    let credited =
+        credit_edges_for(&topology, node_rank).map_err(|e| SplitBlockEdgeError::EngineBug {
+            reason: format!("past validation, the credit mint refused the topology: {e}"),
+        })?;
     for edge in &credited {
         let Some(producers) = split_edge_timeout_producers(
             &topology,
@@ -1036,16 +1043,18 @@ pub fn classify_split_block_edges(
             continue;
         };
         let ([producer], [producer_rank]) = (producers, edge.producer_ranks.as_slice()) else {
-            return Err(topology_err(format!(
-                "the split `block` edge '{}' -> '{}.{}' sets `block_timeout_ms` and the mint \
-                 credits it with {} producer(s) on {} rank(s), where a credit word counts one \
-                 producer; this is a bug in the replay engine, please report",
-                edge.topic,
-                edge.consumer_node,
-                edge.consumer_input,
-                producers.len(),
-                edge.producer_ranks.len()
-            )));
+            return Err(SplitBlockEdgeError::EngineBug {
+                reason: format!(
+                    "the split `block` edge '{}' -> '{}.{}' sets `block_timeout_ms` and the \
+                     mint credits it with {} producer(s) on {} rank(s), where a credit word \
+                     counts one producer",
+                    edge.topic,
+                    edge.consumer_node,
+                    edge.consumer_input,
+                    producers.len(),
+                    edge.producer_ranks.len()
+                ),
+            });
         };
         return Err(SplitEdgeTimeout {
             topic: edge.topic.clone(),
@@ -1459,7 +1468,8 @@ mod split_block_edge_tests {
 
     /// The mixed shape: one writer in the consumer's rank, one in another.
     /// The build replayed declares `block`, where the recording's sources may
-    /// have declared `drop_oldest` (a stale build records this split live), so
+    /// have declared `drop_oldest` (`cerulion graph run` accepts this split
+    /// when the node declares `drop_oldest`), so
     /// the refusal names what replay knows: the declaration in this build.
     #[test]
     fn a_split_with_one_local_writer_whose_block_the_build_declares_is_refused() {
@@ -1749,32 +1759,125 @@ mod split_block_edge_tests {
         );
     }
 
-    /// A map that places no rank for a node of the graph is refused, naming
-    /// the first such node in graph order: every rank lookup the check makes
-    /// then has an answer, so no count or list can leave a producer out.
+    /// A map that places no rank for a native node of the graph is the engine
+    /// bug arm, naming the first such node in graph order: every rank lookup
+    /// the check makes then has an answer, so no count or list can leave a
+    /// producer out.
     #[test]
-    fn a_map_that_places_no_rank_for_a_node_is_refused_naming_it() {
+    fn a_map_that_places_no_rank_for_a_node_is_an_engine_bug_naming_it() {
+        let unplaced = |node: &str| SplitBlockEdgeError::EngineBug {
+            reason: format!(
+                "node '{node}' is in no rank plan, and the split `block` edge check needs every \
+                 native node's rank"
+            ),
+        };
         let config = one_writer("");
         let declared = infos(&config, &[("sink", vec![meta("gate", BLOCK, true)])]);
         let verdict = classify_split_block_edges(&config, &declared, &ranks(&[("prod", 0)]));
-        assert_eq!(
-            verdict,
-            Err(SplitBlockEdgeError::Unplaced {
-                node: "sink".to_string()
-            })
-        );
+        assert_eq!(verdict, Err(unplaced("sink")));
         assert_eq!(
             verdict.unwrap_err().to_string(),
-            "node 'sink' is in no rank plan, and the split `block` edge check needs every node's \
-             rank; this is a bug in the replay engine, please report"
+            "node 'sink' is in no rank plan, and the split `block` edge check needs every native \
+             node's rank; this is a bug in the replay engine, please report"
         );
         let bus = shared_bus("");
         let declared_bus = infos(&bus, &[("sink", vec![meta("inp", BLOCK, true)])]);
         assert_eq!(
             classify_split_block_edges(&bus, &declared_bus, &ranks(&[("p2", 1), ("sink", 1)])),
-            Err(SplitBlockEdgeError::Unplaced {
-                node: "p1".to_string()
-            })
+            Err(unplaced("p1"))
+        );
+        // Two nodes unplaced: the first in graph order is named.
+        assert_eq!(
+            classify_split_block_edges(&bus, &declared_bus, &ranks(&[("p2", 1)])),
+            Err(unplaced("p1"))
+        );
+    }
+
+    /// Two one-writer split `block` edges, the first in topology order with no
+    /// `block_timeout_ms` and the second with one: the timeout refusal names
+    /// the second, so an edge with no key is passed over, not the end of the
+    /// check.
+    #[test]
+    fn a_split_edge_without_a_timeout_is_passed_over_for_the_next_one() {
+        let config = graph(
+            &[],
+            &[
+                ("first", Some(""), &[]),
+                ("second", Some(""), &[]),
+                (
+                    "sink",
+                    None,
+                    &[
+                        ("a", "first/out", ""),
+                        ("b", "second/out", "block_timeout_ms: 100"),
+                    ],
+                ),
+            ],
+        );
+        let declared = infos(
+            &config,
+            &[(
+                "sink",
+                vec![meta("a", BLOCK, false), meta("b", BLOCK, false)],
+            )],
+        );
+        assert_eq!(
+            classify_split_block_edges(
+                &config,
+                &declared,
+                &ranks(&[("first", 0), ("second", 0), ("sink", 1)])
+            ),
+            Err(SplitBlockEdgeError::Timeout(SplitEdgeTimeout {
+                topic: "/g/second/out".to_string(),
+                consumer_node: "sink".to_string(),
+                consumer_input: "b".to_string(),
+                consumer_rank: 1,
+                producer: "second".to_string(),
+                producer_rank: 0,
+            }))
+        );
+    }
+
+    /// Both split edges set `block_timeout_ms`: the first in topology order is
+    /// named.
+    #[test]
+    fn of_two_split_edges_with_a_timeout_the_first_is_named() {
+        let config = graph(
+            &[],
+            &[
+                ("first", Some(""), &[]),
+                ("second", Some(""), &[]),
+                (
+                    "sink",
+                    None,
+                    &[
+                        ("a", "first/out", "block_timeout_ms: 100"),
+                        ("b", "second/out", "block_timeout_ms: 100"),
+                    ],
+                ),
+            ],
+        );
+        let declared = infos(
+            &config,
+            &[(
+                "sink",
+                vec![meta("a", BLOCK, false), meta("b", BLOCK, false)],
+            )],
+        );
+        assert_eq!(
+            classify_split_block_edges(
+                &config,
+                &declared,
+                &ranks(&[("first", 0), ("second", 0), ("sink", 1)])
+            ),
+            Err(SplitBlockEdgeError::Timeout(SplitEdgeTimeout {
+                topic: "/g/first/out".to_string(),
+                consumer_node: "sink".to_string(),
+                consumer_input: "a".to_string(),
+                consumer_rank: 1,
+                producer: "first".to_string(),
+                producer_rank: 0,
+            }))
         );
     }
 

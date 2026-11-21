@@ -5541,14 +5541,6 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // is what `run_engine` returns. A pass that fails is not harvested (its
     // runtime dies with the iteration, as it always did): the partial report
     // holds exactly the ranks that COMPLETED.
-    // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
-    //        the first pass ────────────────────────────────────────────────
-    //
-    // A refusal that is a fact about the RECORDING is whole-RUN, so it must not
-    // wait for a rank's turn to execute: this plans every rank's gated edges from
-    // the bag's own staging rows and refuses here, before rank 0 has run a step.
-    // What stays per rank is the pair that needs a built runtime (see
-    // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
     // ── 4a'. Every rank's unlisted `#[cerulion_node]` output, BEFORE the
     //         first pass ─────────────────────────────────────────────────
     //
@@ -5560,11 +5552,20 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     //          pass ───────────────────────────────────────────────────────
     //
     // The same whole-RUN rule, read off the whole graph: a split `block`
-    // edge no credit word can count refuses the replay before rank 0 has run
-    // a step. One plan holds every node, so it splits nothing.
+    // edge no credit word can count exactly (two or more in-graph producers,
+    // or `block_timeout_ms`) refuses the replay before rank 0 has run a step.
+    // One plan holds every node, so it splits nothing.
     if plans.len() > 1 {
         refuse_uncreditable_split_block_edges(&config, &plans, &factories)?;
     }
+    // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
+    //        the first pass ────────────────────────────────────────────────
+    //
+    // A refusal that is a fact about the RECORDING is whole-RUN, so it must not
+    // wait for a rank's turn to execute: this plans every rank's gated edges from
+    // the bag's own staging rows and refuses here, before rank 0 has run a step.
+    // What stays per rank is the pair that needs a built runtime (see
+    // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
     let bag_side = plan_bag_side_admissions(
         &plans,
         &trace,
@@ -9925,7 +9926,8 @@ fn refuse_unlisted_macro_output_in_every_pass(
 }
 
 /// Refuse a replay of more than one rank whose manifests split a `block` edge
-/// no cross-process credit word can count
+/// no cross-process credit word can count exactly (two or more in-graph
+/// producers, or `block_timeout_ms`)
 /// ([`replay_rank::classify_split_block_edges`]).
 ///
 /// The classifier reads the WHOLE graph the bag embeds and each node's
@@ -9933,15 +9935,21 @@ fn refuse_unlisted_macro_output_in_every_pass(
 /// metadata cannot be read is left out, as [`collect_pass_node_infos`] leaves
 /// it out, and its own pass build reports it.
 ///
-/// A whole-graph topology that does not build or validate refuses nothing
-/// here. Each rank's build meets the fault its own subgraph holds, so the
-/// replay keeps the exit, the order and the partial report it gives such a
-/// bag without this check: a refusal made before the first pass and an
-/// earlier rank's verdict still come first, and a fault no rank's subgraph
-/// holds (a rank's subgraph drops the graph's `network:` block) is not
-/// refused at all. The creditable split edges the classifier returns are not
-/// read here: a pass build refuses a `block` input whose producer runs in
-/// another rank.
+/// The classifier asks for a split edge with two or more in-graph producers
+/// after the whole-graph build and before its validation, and for a split
+/// edge with `block_timeout_ms` after both. So a whole-graph build fault skips
+/// the whole check, and a validation fault skips only the `block_timeout_ms`
+/// check; neither refuses anything here. Each such fault fails some rank's
+/// build: a rank's pass carries no credit word, so a `block` input with no
+/// producer in its rank (an ingress input among them, since an ingress topic
+/// has no in-graph producer) is refused there, and every other topology fault
+/// is a fact about one input or one node, which that node's rank build sees.
+/// The replay keeps the exit, the order and the partial report it gave such a
+/// bag before: a refusal made before the first pass and an earlier rank's
+/// failure still come first. An engine bug the classifier reports is
+/// [`ReplayError::Internal`] (exit 5). The creditable split edges the
+/// classifier returns are not read here: a pass build refuses a `block` input
+/// whose producer runs in another rank.
 fn refuse_uncreditable_split_block_edges(
     config: &GraphConfig,
     plans: &[RankPlan],
@@ -9962,11 +9970,11 @@ fn refuse_uncreditable_split_block_edges(
             tracing::debug!(
                 error = %reason,
                 "replay: the whole graph does not build or validate with this build's \
-                 declarations, so its split `block` edges are left to each rank's build"
+                 declarations, so its remaining split `block` edges are left to each rank's build"
             );
             Ok(())
         }
-        Err(e @ replay_rank::SplitBlockEdgeError::Unplaced { .. }) => Err(ReplayError::Internal {
+        Err(e @ replay_rank::SplitBlockEdgeError::EngineBug { .. }) => Err(ReplayError::Internal {
             reason: e.to_string(),
         }),
         Err(replay_rank::SplitBlockEdgeError::Uncreditable(edge)) => {

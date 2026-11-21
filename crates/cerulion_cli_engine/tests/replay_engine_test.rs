@@ -41309,13 +41309,15 @@ fn a_crafted_cross_rank_block_edge_is_refused_at_the_rank_build_never_verified()
 // ---------------------------------------------------------------------------
 //
 // A `block` edge split across ranks is counted live by one cross-process
-// credit word, minted only for a topic with ONE in-graph producer and an input
-// with no `block_timeout_ms`. The arms below split a `block` edge that falls
-// outside that rule: the shared bus, which `left` and `right` both write, and
-// `far.gate` with `block_timeout_ms`. Each bag is written by `write_sb_bag`
-// from a consistent reference run of the same graph in ONE process, so frames,
-// fires and reads agree; the rank split is what is crafted, plus, for the
-// invalid-graph arm, one key of the graph the bag embeds.
+// credit word, which `cerulion graph run` mints only for a topic with ONE
+// in-graph producer and accepts only on an input with no `block_timeout_ms`.
+// The arms below split a `block` edge that falls outside that rule (the shared
+// bus, which `left` and `right` both write, and `far.gate` with
+// `block_timeout_ms`), replay the two-writer shape from a lockstep bag, or
+// embed a `depth: 65` the whole graph does not validate. Each bag comes from a
+// consistent reference run of the same graph in ONE process, so frames, fires
+// and reads agree; the rank split is what is crafted, plus, for the `depth: 65`
+// arms, one key of the graph the bag embeds.
 
 /// [`sb_yaml`] with its one `from` replaced by `to`.
 fn sb_yaml_edit(from: &str, to: &str) -> String {
@@ -41608,25 +41610,64 @@ fn a_several_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_the_rank_
 
 /// The same `depth: 65` bag under `--verify`: a fed replay refuses it before
 /// any pass, because the bag states no per-stage staging rows (exit 2,
-/// `read_identity_unplanned`), as it does when no split check runs. A
-/// whole-graph topology fault never stands in front of a refusal the replay
-/// makes first.
+/// `read_identity_unplanned`, no partial report), as it does when no split
+/// check runs. A whole-graph topology fault never stands in front of a
+/// refusal the replay makes later, before the first pass.
 #[test]
 #[serial]
 fn a_topology_fault_does_not_stand_in_front_of_a_read_identity_refusal() {
     let mut rec = sb_recording();
     rec.graph_yaml = sb_gate_key_yaml("depth: 65");
     let dir = tempfile::tempdir().unwrap();
-    let bag = dir.path().join("sb_gate_depth65_budget.mcap");
+    let bag = dir.path().join("sb_gate_depth65_fed.mcap");
     write_sb_bag(rec, &bag, sb_rank_of, 2);
-    let (outcome, _) = ri_replay(&bag, sb_factories, replay_engine::ReplayPurpose::Verify);
+    let report = dir.path().join("report.json");
+    let (outcome, _) = ri_replay_reporting(
+        &bag,
+        sb_factories,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        Some(report.clone()),
+    );
     let err = outcome.expect_err("a fed replay of a bag with no staging rows is refused");
     match &err {
-        ReplayError::ReadLogNotEnforceable { cause, .. } => {
+        ReplayError::ReadLogNotEnforceable { cause, detail, .. } => {
             assert_eq!(cause, "read_identity_unplanned", "{err}");
+            assert!(
+                detail.starts_with("the bag states no per-stage staging rows"),
+                "{detail}"
+            );
         }
         other => panic!("expected the read-identity refusal, got {other:?}"),
     }
+    assert_eq!(err.exit_code(), 2);
+    assert!(!report.exists(), "refused before any pass, so no report");
+}
+
+/// The two-foreign-writer bag under a fed `--verify`: the split refusal comes
+/// first, before the read-identity refusal its missing staging rows would
+/// give.
+#[test]
+#[serial]
+fn a_split_two_writer_block_edge_is_refused_before_the_read_identity_check() {
+    let rec = record_reference_impl(
+        &sb_bus_block_yaml(),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_two_foreign_fed.mcap");
+    write_sb_bag(rec, &bag, sb_rank_of, 2);
+    let (outcome, _) = ri_replay(&bag, sb_factories, replay_engine::ReplayPurpose::Verify);
+    let err = outcome.expect_err("the split two-writer `block` edge is refused");
+    assert!(
+        matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+        "the split refusal comes first: {err:?}"
+    );
     assert_eq!(err.exit_code(), 2);
 }
 
@@ -41730,6 +41771,405 @@ fn a_one_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_its_build() {
         (serde_json::json!(0), Vec::<u64>::new()),
         "the one pass refused at its build, so no rank ran"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Whole-graph faults a several-rank replay meets at a rank's build
+// ---------------------------------------------------------------------------
+//
+// Each arm embeds a graph that the whole-graph topology check or the rank
+// planner refuses, and pins the exit, the text and the partial report the
+// replay gives it. Each bag comes from a consistent reference run of a valid
+// graph in ONE process; only the rank split and keys of the embedded graph are
+// crafted.
+
+/// `yaml` with its one `from` replaced by `to`.
+fn fk_edit(yaml: &str, from: &str, to: &str) -> String {
+    assert_eq!(
+        yaml.matches(from).count(),
+        1,
+        "the fixture graph carries {from:?} exactly once"
+    );
+    yaml.replacen(from, to, 1)
+}
+
+/// The partial `--report` an aborted run writes, as `(failed_at_rank, the
+/// ranks it executed)`; the report leaves `rank_execution` out when no rank
+/// ran.
+fn fk_partial_report(path: &std::path::Path) -> (serde_json::Value, Vec<u64>) {
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path).expect("the aborted run wrote its partial report"),
+    )
+    .expect("the partial report is JSON");
+    let ranks = json["rank_execution"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|r| r["rank"].as_u64().expect("each entry names its rank"))
+                .collect()
+        })
+        .unwrap_or_default();
+    (json["aborted"]["failed_at_rank"].clone(), ranks)
+}
+
+/// Write `rec` as a free-run bag of `rank_count` ranks, with no clock skew.
+fn fk_bag(
+    rec: &Recording,
+    path: &std::path::Path,
+    rank_of: impl Fn(&str) -> u32,
+    rank_count: u32,
+    publishers: Option<serde_json::Value>,
+    labels: &[ProducerLabel<'_>],
+) {
+    write_multi_rank_bag_impl(
+        rec,
+        rank_of,
+        rank_count,
+        MpLayout::PerStepBatches,
+        path,
+        |_| {},
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture { publishers, labels },
+        None,
+        &[],
+    );
+}
+
+/// A data-triggered node with a latest-value feedback input `fb`. Its tick
+/// body runs once `fb` holds a message, so in a ring it never publishes: the
+/// arms need the ring in the graph, not frames on it.
+#[cerulion_node]
+#[derive(Default)]
+struct FkRingMidNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[input]
+    fb: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl FkRingMidNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x + self.fb.x;
+        Ok(())
+    }
+}
+
+/// `src` feeds `mid`, `mid` feeds `tail`, and `tail` feeds `mid.fb` back:
+/// every edge has one producer.
+fn fk_ring_yaml() -> &'static str {
+    "name: ring\nprefix: rg\nnodes:\n\
+     \x20 - id: src\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n\
+     \x20 - id: mid\n    type: fk_ring_mid_node\n    inputs:\n      - name: inp\n        \
+     source: src/bus\n      - name: fb\n        source: tail/out\n    outputs:\n      \
+     - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: tail\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: mid/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+/// [`fk_ring_yaml`] with `backpressure: block` on `mid.fb` and `tail.inp`: a
+/// ring of two `block` edges.
+fn fk_ring_block_yaml() -> String {
+    let fb = fk_edit(
+        fk_ring_yaml(),
+        "        source: tail/out\n",
+        "        source: tail/out\n        backpressure: block\n",
+    );
+    fk_edit(
+        &fb,
+        "        source: mid/out\n",
+        "        source: mid/out\n        backpressure: block\n",
+    )
+}
+
+fn fk_ring_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SharedBusLeftNodeEntry::new())),
+        ("mid", Box::new(FkRingMidNodeEntry::new())),
+        ("tail", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// (a) A ring of two one-writer `block` edges across ranks (`src` in rank 0,
+/// `mid` in rank 1, `tail` in rank 2). Rank 0 runs, and rank 1's build refuses
+/// `mid.fb` as a `block` input with no in-graph producer: exit 5, after a
+/// partial report for rank 0.
+#[test]
+#[serial]
+fn fk_a_cross_rank_block_ring_of_one_writer_edges_stops_at_a_rank_build() {
+    let mut rec = record_reference_impl(
+        fk_ring_yaml(),
+        fk_ring_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    rec.graph_yaml = fk_ring_block_yaml();
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_ring.mcap");
+    fk_bag(
+        &rec,
+        &bag,
+        |id| match id {
+            "src" => 0,
+            "mid" => 1,
+            _ => 2,
+        },
+        3,
+        None,
+        &[],
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_ring_factories, None, Some(report.clone()))
+        .expect_err("rank 1 cannot be built");
+    eprintln!("FK-RESULT a: exit={} text={err}", err.exit_code());
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'mid.fb' reads topic '/rg/tail/out', which has no \
+             in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    let partial = fk_partial_report(&report);
+    eprintln!("FK-RESULT a: report={partial:?}");
+    assert_eq!(partial, (serde_json::json!(1), vec![0]));
+}
+
+const FK_LT_TOPIC: &str = "/lt/bus";
+
+/// `p1` alone writes `/lt/bus`, which `multi_publisher_topics:` lists, and
+/// `sink.inp` reads it with `backpressure: block`, with `extra` keys.
+fn fk_listed_yaml(extra: &str) -> String {
+    format!(
+        "name: listed\nprefix: lt\nmulti_publisher_topics:\n  - /lt/bus\nnodes:\n\
+         \x20 - id: p1\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+         schema: geometry_msgs/Vector3\n        topic: /lt/bus\n\
+         \x20 - id: sink\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+         source: /lt/bus\n        backpressure: block\n{extra}    outputs:\n      - name: out\n        \
+         schema: geometry_msgs/Vector3\n"
+    )
+}
+
+fn fk_listed_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("p1", Box::new(SharedBusLeftNodeEntry::new())),
+        ("sink", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// (b) A one-writer topic `multi_publisher_topics:` lists, split from its
+/// `block` reader, whose input sets `block_timeout_ms: 100`. The whole graph
+/// does not validate (a timeout on a listed topic), so the split check leaves
+/// it to the rank builds: rank 0 runs, and rank 1's build refuses `sink.inp`
+/// as a `block` input with no in-graph producer, exit 5, after a partial
+/// report for rank 0.
+#[test]
+#[serial]
+fn fk_b_a_timeout_on_a_split_listed_one_writer_topic_stops_at_the_rank_build() {
+    let mut rec = record_reference_impl(
+        &fk_listed_yaml(""),
+        fk_listed_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    rec.graph_yaml = fk_listed_yaml("        block_timeout_ms: 100\n");
+    let labels: Vec<ProducerLabel<'static>> = rec.messages[FK_LT_TOPIC]
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            (
+                FK_LT_TOPIC,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                real_publisher_id(&rec, "p1", "bus"),
+            )
+        })
+        .collect();
+    let publishers = publishers_table(&rec, &[("p1", "bus")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_listed_timeout.mcap");
+    fk_bag(
+        &rec,
+        &bag,
+        |id| u32::from(id == "sink"),
+        2,
+        Some(publishers),
+        &labels,
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_listed_factories, None, Some(report.clone()))
+        .expect_err("rank 1 cannot be built");
+    eprintln!("FK-RESULT b: exit={} text={err}", err.exit_code());
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'sink.inp' reads topic '/lt/bus', which has no \
+             in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    let partial = fk_partial_report(&report);
+    eprintln!("FK-RESULT b: report={partial:?}");
+    assert_eq!(partial, (serde_json::json!(1), vec![0]));
+}
+
+/// (c) The shared bus with `multi_publisher_topics:` removed from the embedded
+/// graph, its two writers in two ranks: the rank planner refuses a
+/// single-writer topic two ranks write (exit 2), before any pass.
+#[test]
+#[serial]
+fn fk_c_an_unlisted_topic_two_ranks_write_is_the_rank_planner_s_refusal() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = fk_edit(
+        sb_yaml(),
+        "multi_publisher_topics:\n  - /sb/shared_bus\n",
+        "",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_unlisted_two_ranks.mcap");
+    write_sb_bag(rec, &bag, sb_split_rank_of, 2);
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, sb_factories, None, Some(report.clone()))
+        .expect_err("the rank planner refuses the bag");
+    eprintln!(
+        "FK-RESULT c: exit={} text={err} report_exists={}",
+        err.exit_code(),
+        report.exists()
+    );
+    assert!(
+        matches!(err, ReplayError::RecordingInconsistent { .. }),
+        "the rank planner's refusal: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "bag internal consistency check failed: topic `/sb/shared_bus` is produced by node \
+             `left` on rank 0 AND by node `right` on rank 1, but it is not listed in the graph's \
+             `multi_publisher_topics:` "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert!(!report.exists(), "refused before any pass, so no report");
+}
+
+/// `src` feeds `mid`, `mid` and `other` both write the listed `/r2/bus`, which
+/// `tail.inp` reads, and `tail` feeds `mid.fb` back.
+fn fk_ring2_yaml() -> &'static str {
+    "name: ring2\nprefix: r2\nmulti_publisher_topics:\n  - /r2/bus\nnodes:\n\
+     \x20 - id: src\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n\
+     \x20 - id: mid\n    type: fk_ring_mid_node\n    inputs:\n      - name: inp\n        \
+     source: src/bus\n      - name: fb\n        source: tail/out\n    outputs:\n      \
+     - name: out\n        schema: geometry_msgs/Vector3\n        topic: /r2/bus\n\
+     \x20 - id: other\n    type: shared_bus_right_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n        topic: /r2/bus\n\
+     \x20 - id: tail\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: /r2/bus\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn fk_ring2_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SharedBusLeftNodeEntry::new())),
+        ("mid", Box::new(FkRingMidNodeEntry::new())),
+        ("other", Box::new(SharedBusRightNodeEntry::new())),
+        ("tail", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+const FK_R2_TOPIC: &str = "/r2/bus";
+
+/// (d) A ring whose `block` edges include a split one with two writers
+/// (`mid` and `other` write `/r2/bus` in rank 0, `tail` reads it in rank 1,
+/// and `tail` feeds `mid.fb` back): the split check refuses the two-writer
+/// edge by name before validation meets the ring, exit 2, before any pass.
+#[test]
+#[serial]
+fn fk_d_a_ring_with_a_split_two_writer_edge_is_refused_by_name() {
+    let mut rec = record_reference_impl(
+        fk_ring2_yaml(),
+        fk_ring2_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let fb = fk_edit(
+        fk_ring2_yaml(),
+        "        source: tail/out\n",
+        "        source: tail/out\n        backpressure: block\n",
+    );
+    rec.graph_yaml = fk_edit(
+        &fb,
+        "        source: /r2/bus\n",
+        "        source: /r2/bus\n        backpressure: block\n",
+    );
+    let labels: Vec<ProducerLabel<'static>> = rec.messages[FK_R2_TOPIC]
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            (
+                FK_R2_TOPIC,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                real_publisher_id(&rec, "other", "bus"),
+            )
+        })
+        .collect();
+    let publishers = publishers_table(&rec, &[("mid", "out"), ("other", "bus")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_ring_two_writer.mcap");
+    fk_bag(
+        &rec,
+        &bag,
+        |id| u32::from(id == "tail"),
+        2,
+        Some(publishers),
+        &labels,
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_ring2_factories, None, Some(report.clone()))
+        .expect_err("the split two-writer edge is refused");
+    assert!(
+        matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+        "the split refusal, exit 2: {err:?}"
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(
+        err.to_string(),
+        "block input 'tail.inp' reads topic '/r2/bus', which has 2 in-graph producers, and this \
+         bag's rank manifests put 'tail' in rank 1, 'mid' in rank 0 and 'other' in rank 0. A \
+         `block` edge can cross ranks only on a topic with exactly one in-graph producer (its \
+         credit word counts one producer's outstanding frames), so this bag cannot be \
+         re-executed with `block` on that input. `block` comes from the graph this bag embeds \
+         (`backpressure: block` on 'tail.inp'), so the bag was changed after it was recorded. \
+         Re-execute an unchanged copy of the bag, or record the run again."
+    );
+    assert!(!report.exists(), "refused before any pass, so no report");
 }
 
 /// The fixture's recorded bus interleave, per step, as `(saw a `left` frame,

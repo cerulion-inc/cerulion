@@ -480,7 +480,8 @@ fn split_edge_timeout_verdict(
 /// edges its credit bindings name instead
 /// (`GraphTopology::validate_with_credit_edges`). The
 /// `block_split_timeout_refusal_off` oracle mutant turns this check off, and
-/// with it the replay's refusal of the key as well as the supervisor's.
+/// with it the supervisor's, `graph levels`' and the replay's refusal of the
+/// key; it also turns off the worker's.
 pub(crate) fn split_edge_timeout_producers<'t>(
     topo: &'t cerulion_core::graph::GraphTopology,
     topic: &str,

@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
 //! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
-//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks on a topic with two or more in-graph producers or with `block_timeout_ms`) |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks on a topic with two or more in-graph producers, or whose input sets `block_timeout_ms`) |
 //! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
 //! | 4 | none | tolerance-YAML validation error |
 //! | 5 | none | internal error (panic, transport, scheduler) |
@@ -866,8 +866,8 @@ impl ReplayError {
             // the same class: this bag is not replay-grade for this binary.
             | ReplayError::ReadLogNotEnforceable { .. }
             // So is a `block` edge the bag splits across ranks that no credit
-            // word can count: the bag's rank split, or the build's `block`, is
-            // the fault.
+            // word counts exactly: the bag (its graph or its rank split), or the
+            // build's `block` declaration, is the fault.
             | ReplayError::SplitBlockEdgeUncreditable { .. }
             | ReplayError::SplitBlockEdgeTimeout { .. } => EXIT_NOT_REPLAY_GRADE,
             ReplayError::NodeLoad { .. } => EXIT_NODE_FAILURE,
