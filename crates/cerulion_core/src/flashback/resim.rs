@@ -646,13 +646,10 @@ pub fn mixed_start(rank_first_steps: &BTreeMap<u32, u64>) -> Option<MixedStart> 
 }
 
 impl MixedStart {
-    /// The sentence a refusal of this recording gives: every rank on each side,
-    /// each late rank's first step, and the remedy.
-    ///
-    /// `from_a_capture` picks the noun: "capture" for a Flashback capture,
-    /// otherwise "bag".
-    pub fn sentence(&self, from_a_capture: bool) -> String {
-        let noun = free_run_noun(from_a_capture);
+    /// The sentence a capture of this recording carries as its reason: every
+    /// rank on each side, each late rank's first step, and the remedy.
+    pub fn sentence(&self) -> String {
+        let noun = bag_noun(true);
         let past = match self.past_zero.as_slice() {
             [(rank, step)] => {
                 format!("worker rank {rank} of this free-run {noun} begins at step {step}")
@@ -1179,7 +1176,7 @@ impl ResimGap {
                                  says which step a resume would begin at. The frames and the \
                                  state are in the bag and readable"
                 .to_string(),
-            Self::MixedStart(start) => start.sentence(true),
+            Self::MixedStart(start) => start.sentence(),
             Self::RankWithoutBoundaryStream { ranks } => {
                 let (subject, has) = match ranks.as_slice() {
                     [rank] => (format!("worker rank {rank}"), "has a trace manifest"),
@@ -3310,44 +3307,44 @@ mod tests {
     }
 
     /// The sentence names each side in the one-rank and the several-rank form,
-    /// lists three as `a, b and c`, and calls a bag that is not a capture a bag.
+    /// and lists three as `a, b and c`.
     #[test]
     fn the_mixed_start_sentence_names_every_rank_on_each_side() {
         let tail = "and re-executing a rank that begins past step 0 beside one that begins at \
                     step 0 is not supported: record the run from its first step with `cerulion \
                     graph run --record`";
         assert_eq!(
-            start(&[(1, 2), (2, 4), (3, 8)], &[0]).sentence(false),
+            start(&[(1, 2), (2, 4), (3, 8)], &[0]).sentence(),
             format!(
                 "worker ranks 1 (first step 2), 2 (first step 4) and 3 (first step 8) of this \
-                 free-run bag begin past step 0 while rank 0 begins at step 0, {tail}"
+                 free-run capture begin past step 0 while rank 0 begins at step 0, {tail}"
             )
         );
         assert_eq!(
-            start(&[(3, 5)], &[0, 1, 2]).sentence(true),
+            start(&[(3, 5)], &[0, 1, 2]).sentence(),
             format!(
                 "worker rank 3 of this free-run capture begins at step 5 while ranks 0, 1 and 2 \
                  begin at step 0, {tail}"
             )
         );
         assert_eq!(
-            start(&[(1, 6)], &[0]).sentence(false),
+            start(&[(1, 6)], &[0]).sentence(),
             format!(
-                "worker rank 1 of this free-run bag begins at step 6 while rank 0 begins at step \
-                 0, {tail}"
+                "worker rank 1 of this free-run capture begins at step 6 while rank 0 begins at \
+                 step 0, {tail}"
             )
         );
         // Every order of one set of ranks renders one sentence, twice alike.
         let one = mixed_start(&by_rank(&[(0, 0), (1, 6), (2, 9), (3, 0)]))
             .expect("a mixed start")
-            .sentence(true);
+            .sentence();
         for pairs in [
             [(3, 0), (2, 9), (1, 6), (0, 0)],
             [(2, 9), (0, 0), (3, 0), (1, 6)],
         ] {
             let start = mixed_start(&by_rank(&pairs)).expect("a mixed start");
-            assert_eq!(start.sentence(true), one, "{pairs:?}");
-            assert_eq!(start.sentence(true), start.sentence(true));
+            assert_eq!(start.sentence(), one, "{pairs:?}");
+            assert_eq!(start.sentence(), start.sentence());
         }
     }
 
