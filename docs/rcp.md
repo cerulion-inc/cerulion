@@ -31,7 +31,7 @@ cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
 claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
 ```
 
-Then ask your model for a task, for example "Put the bowl on the plate." Each MCP connection gets its own
+Then ask your model for a task, for example "With cerulion-sim, put the bowl on the plate." Each MCP connection gets its own
 episode of the simulated robot. Without `--http` the server speaks MCP over stdio, the way `cerulion rcp <robot>`
 does. `--task NAME` sets the robot up for another task: `bowl-on-plate` (the default), `open-drawer` or
 `soup-in-basket`. The first run installs the simulator and the benchmark scenes once, which takes minutes, with
