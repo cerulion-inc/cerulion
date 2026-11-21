@@ -460,8 +460,8 @@ impl NoAnchorReason {
                 "this rank retained no checkpoint: it published no state ring, its plane was \
                  refused at arm time, or it had not reached its first anchor cadence when the \
                  capture was triggered. A capture of several worker ranks does not resume from \
-                 their checkpoints, since per-rank resume is not supported: record the run from \
-                 its first step with `cerulion graph run --record`"
+                 their checkpoints, since per-rank resume is not supported: \
+                 record the run from its first step with `cerulion graph run --record`"
             }
             Self::AllOlderThanTheFrames => {
                 "this rank's checkpoints all predate the frames this capture carries, so \
@@ -2743,8 +2743,19 @@ mod tests {
             "this rank retained no checkpoint: it published no state ring, its plane was \
              refused at arm time, or it had not reached its first anchor cadence when the \
              capture was triggered. A capture of several worker ranks does not resume from \
-             their checkpoints, since per-rank resume is not supported: record the run from its \
-             first step with `cerulion graph run --record`"
+             their checkpoints, since per-rank resume is not supported: \
+             record the run from its first step with `cerulion graph run --record`"
+        );
+        // The remedy's last clause is the one the capture judge's free-run
+        // refusals end with, so a change to either side fails here.
+        let record = "record the run from its first step with `cerulion graph run --record`";
+        assert!(NoAnchorReason::NothingRetained
+            .rank_remedy()
+            .ends_with(record));
+        assert!(
+            cerulion_core::flashback::resim::ResimGap::RankWithoutBoundaryStream { ranks: vec![1] }
+                .reason()
+                .ends_with(record)
         );
         assert_eq!(
             NoAnchorReason::AllOlderThanTheFrames.rank_remedy(),
@@ -3475,8 +3486,8 @@ mod tests {
             "this rank retained no checkpoint: it published no state ring, its plane was \
              refused at arm time, or it had not reached its first anchor cadence when the \
              capture was triggered. A capture of several worker ranks does not resume from \
-             their checkpoints, since per-rank resume is not supported: record the run from its \
-             first step with `cerulion graph run --record`"
+             their checkpoints, since per-rank resume is not supported: \
+             record the run from its first step with `cerulion graph run --record`"
         );
     }
 

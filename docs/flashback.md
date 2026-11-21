@@ -189,10 +189,10 @@ begin at different steps. A capture of a free-run graph with several worker
 ranks is resimmable only when every worker rank begins at step 0. When one
 begins at step 0 and another past it, as in a capture where one rank kept no
 checkpoint (`anchor.missing_ranks`), `anchor.resimmable_reason` names each rank
-and the step it begins at, and it names a worker rank whose trace holds no step
-boundary at all. When rank
-0 begins past step 0, the capture is not resimmable either, since per-rank
-resume is not supported.
+that kept a step boundary and the step it begins at. When every rank that kept a
+step boundary begins at step 0 and a worker rank's trace holds none,
+`anchor.resimmable_reason` names that rank. When rank 0 begins past step 0, the
+capture is not resimmable either, since per-rank resume is not supported.
 
 ---
 

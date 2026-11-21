@@ -59,8 +59,11 @@
 //! boundary arm, ahead of the replay's order: when rank 0 begins at step 0 the
 //! from-start arm would otherwise accept the capture, and when rank 0 is the
 //! late rank the replay refuses the bag later, at its state-ring or free-run
-//! resume gate, while the capture names the ranks. Both sentences give the same
-//! remedy.
+//! resume gate, while the capture names the ranks. A capture that both begins
+//! apart and holds a worker rank with no boundary stream names the mixed start,
+//! while the replay refuses that rank first; the remedy is the same. The
+//! mixed-start sentence gives the remedy the free-run mid-run refusal gives:
+//! record the run from its first step.
 
 use std::collections::BTreeMap;
 
@@ -107,8 +110,9 @@ pub struct ResimFacts<'a> {
     /// from-start claim the reader refuses.
     ///
     /// Under free run every worker rank is read: ranks that begin apart, one at
-    /// step 0 and another past it, are [`ResimGap::MixedStart`], and a worker
-    /// rank with no entry is [`ResimGap::RankWithoutBoundaryStream`].
+    /// step 0 and another past it, are [`ResimGap::MixedStart`], and, when every
+    /// worker rank that has an entry begins at step 0, a worker rank with no
+    /// entry is [`ResimGap::RankWithoutBoundaryStream`].
     ///
     /// No entry for rank 0 means rank 0 kept no boundary. That is NOT the same
     /// as an empty trace (a trace of FIRE records with no boundary is possible
@@ -121,8 +125,9 @@ pub struct ResimFacts<'a> {
     ///
     /// A [`RecordedCoordination::Unreadable`] stamp is
     /// [`ResimGap::CoordinationUnreadable`], since the replay refuses such a
-    /// recording when it reads its `recorder.json`. Two more arms read it, and
-    /// only a free-run stamp takes either: [`ResimGap::MixedStart`] and
+    /// recording when it reads its `recorder.json`. Three more arms read it, and
+    /// only a free-run stamp takes any of them: [`ResimGap::MixedStart`],
+    /// [`ResimGap::RankWithoutBoundaryStream`] and
     /// [`ResimGap::FreeRunResumeUnsupported`].
     pub coordination: RecordedCoordination,
     /// Whether the bag carries a `graph.yaml` attachment `run_replay` can
@@ -610,8 +615,7 @@ const RECORD_FROM_THE_FIRST_STEP: &str =
 /// begins is its own. A rank that begins past step 0 would need its own
 /// checkpoint to be re-executed, and a rank that begins at step 0 is
 /// re-executed from its constructor state; re-executing the two kinds side by
-/// side is not
-/// supported, so a capture of such a recording is not resimmable
+/// side is not supported, so a capture of such a recording is not resimmable
 /// ([`ResimGap::MixedStart`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixedStart {
@@ -800,8 +804,9 @@ pub enum ResimGap {
     MixedStart(MixedStart),
     /// Free-run worker ranks that attach a trace manifest and keep no step
     /// boundary: resim's `RankWithoutBoundaryStream`, which its free-run rank
-    /// plan raises for every worker manifest with no boundary stream. Under
-    /// lockstep the replay plans rank 0 alone, and such a rank does not refuse.
+    /// plan raises for the lowest worker rank whose manifest has no boundary
+    /// stream; the capture names every such rank. Under lockstep the replay
+    /// plans rank 0 alone and does not raise this refusal.
     RankWithoutBoundaryStream {
         /// The worker ranks with no step boundary in the capture, ascending.
         ranks: Vec<u32>,
@@ -809,10 +814,11 @@ pub enum ResimGap {
     /// Some rank carried a step boundary into the capture and keeps none, while
     /// another rank keeps one. See [`ResimFacts::ranks_without_a_kept_step`].
     ///
-    /// Under free run such a rank keeps no boundary stream, which is
-    /// [`ResimGap::RankWithoutBoundaryStream`] on a from-start capture and
-    /// [`ResimGap::FreeRunResumeUnsupported`] on a resumed one, both asked
-    /// first, so this gap is a lockstep one. The recorder declines it because
+    /// Under free run such a rank keeps no boundary stream, so a free-run arm
+    /// asked earlier refuses the capture first ([`ResimGap::MixedStart`] or
+    /// [`ResimGap::RankWithoutBoundaryStream`] from start, [`ResimGap::MultiRing`]
+    /// or [`ResimGap::FreeRunResumeUnsupported`] resumed): this gap is reached
+    /// only under lockstep. The recorder declines it because
     /// the bag carries no record of the rank's removed steps and no reader can
     /// tell the capture is short of that rank; the recorder is the party that
     /// knows it.
@@ -1187,8 +1193,8 @@ impl ResimGap {
                 };
                 format!(
                     "{subject} of this free-run capture {has} and no step boundary, and \
-                     `cerulion bag play --resim` refuses a free-run recording with a worker rank \
-                     whose recorded clock it cannot re-advance before it re-executes anything: \
+                     `cerulion bag play --resim` refuses, before re-executing anything, a free-run \
+                     recording in which a worker rank has no recorded clock to re-advance: \
                      {RECORD_FROM_THE_FIRST_STEP}"
                 )
             }
@@ -1369,10 +1375,11 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 /// looked for. A capture whose window happens to reach the run's own first step
 /// is therefore resimmable with no checkpoint at all, and refusing it for a
 /// missing anchor would be refusing a bag resim would accept. The refusals it
-/// still takes there are a rank left with no complete step
+/// still takes there are a free-run worker rank with no boundary stream
+/// ([`ResimGap::RankWithoutBoundaryStream`]), a rank left with no complete step
 /// ([`ResimGap::RankWithoutCompleteStep`]) and a kept read whose frame the
-/// capture does not hold ([`ResimGap::FrameNotHeld`]), neither of which an
-/// anchor would repair. Under free run the arm accepts a capture only when
+/// capture does not hold ([`ResimGap::FrameNotHeld`]), none of which an anchor
+/// would repair. Under free run the arm accepts a capture only when
 /// every worker rank begins at step 0: a peer that begins past it is
 /// [`ResimGap::MixedStart`], asked before the arm, and a worker rank that kept
 /// no boundary is [`ResimGap::RankWithoutBoundaryStream`], asked first on it.
@@ -3775,6 +3782,8 @@ mod tests {
             Err(ResimGap::RankWithoutBoundaryStream { ranks: vec![1] })
         );
         assert_eq!(three(&[(0, 0), (1, 0), (2, 0)]), Ok(()));
+        // Two judgements of one capture are one verdict.
+        assert_eq!(three(&[(0, 0)]), three(&[(0, 0)]));
         // The mixed start is named first; rank 0 past step 0 is the free-run
         // mid-run refusal, as `resolve_resume` refuses before it plans ranks.
         assert_eq!(
@@ -3827,10 +3836,10 @@ mod tests {
             );
         }
         // The sentence, one rank and several.
-        let tail = "and no step boundary, and `cerulion bag play --resim` refuses a free-run \
-                    recording with a worker rank whose recorded clock it cannot re-advance before \
-                    it re-executes anything: record the run from its first step with `cerulion \
-                    graph run --record`";
+        let tail = "and no step boundary, and `cerulion bag play --resim` refuses, before \
+                    re-executing anything, a free-run recording in which a worker rank has no \
+                    recorded clock to re-advance: \
+                    record the run from its first step with `cerulion graph run --record`";
         assert_eq!(
             ResimGap::RankWithoutBoundaryStream { ranks: vec![1] }.reason(),
             format!("worker rank 1 of this free-run capture has a trace manifest {tail}")

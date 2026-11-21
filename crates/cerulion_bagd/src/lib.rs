@@ -29375,7 +29375,8 @@ mod ranks_begin_apart_judge_tests {
     //! steps, through the adapter, over hand-built traces trimmed the way a
     //! capture trims them and the `recorder.json` the capture carries: the
     //! free-run stamp refuses them by name, and a document that states no
-    //! readable contract refuses every capture. Under the lockstep stamp, a
+    //! readable contract refuses every capture. A free-run worker rank that keeps
+    //! no step boundary is refused by name too. Under the lockstep stamp, a
     //! document with no stamp or no document, the judge reads rank 0 alone: it
     //! does not model the replay's lockstep boundary check, which refuses ranks
     //! whose streams start apart. Every verdict is written out by hand. No
@@ -29688,6 +29689,7 @@ mod ranks_begin_apart_judge_tests {
             [(0, Some(0)), (1, Some(6)), (2, Some(0))]
         );
         assert_eq!(firsts(one_rank_from_its_anchor()), [(0, Some(6))]);
+        assert_eq!(firsts(rank_1_keeps_no_boundary()), [(0, Some(0))]);
     }
 
     /// The free-run stamp: ranks that begin apart, in either direction, are
@@ -29737,6 +29739,7 @@ mod ranks_begin_apart_judge_tests {
             rank_1_begins_later,
             rank_0_begins_later,
             rank_1_begins_later_of_three,
+            rank_1_keeps_no_boundary,
             both_begin_past_step_0,
         ] {
             assert_eq!(

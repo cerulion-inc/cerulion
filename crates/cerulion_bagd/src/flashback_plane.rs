@@ -3253,8 +3253,8 @@ mod tests {
                 "this rank retained no checkpoint: it published no state ring, its plane was \
                  refused at arm time, or it had not reached its first anchor cadence when the \
                  capture was triggered. A capture of several worker ranks does not resume from \
-                 their checkpoints, since per-rank resume is not supported: record the run from \
-                 its first step with `cerulion graph run --record`"
+                 their checkpoints, since per-rank resume is not supported: \
+                 record the run from its first step with `cerulion graph run --record`"
             )
         );
 
