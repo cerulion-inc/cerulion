@@ -6114,9 +6114,10 @@ impl GraphRuntime {
         // moves it into a cdylib.
         purpose: BuildPurpose,
         // How a REPLAY wires this runtime (see `crate::replay_feed`): the
-        // producer-annotation rule its recording staged under, and whether its
-        // read stages subscribe to private feeds. The default (every edge
-        // annotated, no feeds) on every live, recording and test build.
+        // producer-annotation rule its recording staged under, whether its read
+        // stages subscribe to private feeds, and the `block` edges it feeds
+        // from its recording. The default (every edge annotated, no feeds, no
+        // fed `block` edge) on every live, recording and test build.
         replay_wiring: &crate::replay_feed::ReplayWiring,
     ) -> TransportResult<Self> {
         // A `ros2:` entry is SPAWNED by `cerulion graph run` as a supervised
@@ -6310,7 +6311,16 @@ impl GraphRuntime {
         // credited.
         let credit_bound_edges =
             super::topology::CreditedEdges::from_bindings(cross_process.credit_bindings);
-        topology.validate_with_credit_edges(&credit_bound_edges)?;
+        // Which end of each `block` edge a replay feeds from its recording
+        // this build holds, verified against this build's own graph and its
+        // credit bindings (see `BagFedBlockEdges`). Empty on every build but a
+        // replay pass, whose wiring alone can name such an edge.
+        let bag_fed_ends = replay_wiring.bag_fed_block_edges.resolve(
+            &topology,
+            &credit_bound_edges,
+            config.identity(),
+        )?;
+        topology.validate_with_credit_edges(&credit_bound_edges, &bag_fed_ends)?;
 
         // Derive the trigger-aware DAG levels and
         // REJECT algebraic cycles (a feedback loop composed entirely of

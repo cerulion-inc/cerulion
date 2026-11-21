@@ -102,10 +102,12 @@ pub struct ConsumerEdge {
 }
 
 /// The set of `(topic, consumer node, consumer input)` edges a
-/// build carries a CROSS-PROCESS CREDIT WORD for — the one exemption
-/// [`GraphTopology::validate`]'s producer-less-`block` arm honours, and the
-/// edges on which it refuses `block_timeout_ms`. Each edge keeps the producer
-/// node ids its binding names, for that refusal's text.
+/// build carries a CROSS-PROCESS CREDIT WORD for: one of the two exemptions
+/// [`GraphTopology::validate`]'s producer-less-`block` arm honours (the other
+/// is the consumer end of a `block` edge a replay build feeds from its
+/// recording, [`crate::replay_feed::BagFedBlockEdges`]), and the edges on
+/// which it refuses `block_timeout_ms`. Each edge keeps the producer node ids
+/// its binding names, for that refusal's text.
 ///
 /// # Why a newtype rather than a bare `HashSet<(&str, &str, &str)>`
 ///
@@ -621,23 +623,29 @@ impl GraphTopology {
     /// (Pool-slot-count provisioning + the `pool ≥ Σdepths` check land with
     /// the `block` enforcement that consumes them.)
     pub fn validate(&self) -> TransportResult<()> {
-        self.validate_with_credit_edges(&CreditedEdges::none())
+        self.validate_with_credit_edges(
+            &CreditedEdges::none(),
+            &crate::replay_feed::BagFedEnds::default(),
+        )
     }
 
     /// [`Self::validate`] with the set of `(topic, consumer node,
     /// consumer input)` edges this build carries a CROSS-PROCESS CREDIT WORD
-    /// for — the one exemption to the producer-less-`block` refusal below.
+    /// for, and the consumer ends of the `block` edges a replay build feeds
+    /// from its recording (`bag_fed`): the two exemptions to the
+    /// producer-less-`block` refusal below. The fed ends' soundness is stated
+    /// on [`crate::replay_feed::BagFedBlockEdges`].
     ///
-    /// # Why an exemption is sound here and nowhere else
+    /// # Why the credit exemption is sound
     ///
     /// The refusal exists because "this scheduler can only defer a producer in
     /// THIS graph". A credited edge has a producer the scheduler CAN defer — it
     /// is simply in another PROCESS, and the shared credit word
     /// ([`crate::credit::CreditShared`]) is exactly the channel that carries
     /// "your consumer is full" across the boundary. So the premise of the
-    /// refusal is false for these edges and true for every other one; the
-    /// lossless guarantee (Principle #6) is upheld by the word rather than by
-    /// co-location.
+    /// refusal is false for these edges and true for every other edge a live
+    /// build holds; the lossless guarantee (Principle #6) is upheld by the word
+    /// rather than by co-location.
     ///
     /// The token is PLAN-CARRIED and stamped by the supervisor, which is the
     /// only party that holds the whole graph. A worker cannot derive it — that
@@ -652,6 +660,7 @@ impl GraphTopology {
     pub(crate) fn validate_with_credit_edges(
         &self,
         credited: &CreditedEdges<'_>,
+        bag_fed: &crate::replay_feed::BagFedEnds,
     ) -> TransportResult<()> {
         // Defense in depth: a
         // (node, input) pair may appear at most once across ALL consumer
@@ -736,6 +745,7 @@ impl GraphTopology {
                 if matches!(c.policy, BackpressurePolicy::Block)
                     && flow.producers.is_empty()
                     && !credited.contains(&flow.topic, &c.node_id, &c.input)
+                    && !bag_fed.feeds_consumer(&flow.topic, &c.node_id, &c.input)
                 {
                     // This message reaches TWO different situations
                     // and must not prescribe one's remedy for the other.
@@ -824,7 +834,10 @@ impl GraphTopology {
                     }
                     // A credited edge counts on its cross-process word
                     // (`credited` is the token the wiring loop skips by), so
-                    // its producer fires on another thread.
+                    // its producer fires on another thread. A fed edge
+                    // (`bag_fed`) is not credited, and the key is inert on
+                    // it: the key acts only through a producer's defer edge,
+                    // and a fed consumer end has no producer to defer.
                     Some(_) if !crate::oracle_mutant::active("block_split_timeout_refusal_off") => {
                         if let Some(producers) =
                             credited.producers(&flow.topic, &c.node_id, &c.input)

@@ -55,9 +55,9 @@
 //! `depth`, and the once-per-regime `warn!` names the consumer edge.
 //!
 //! Per-test isolated SHM roots + pid/tag-scoped credit namespaces. `#[serial]`
-//! on 48 of the 49 arms: six are `#[traced_test]`, which installs a
+//! on 53 of the 54 arms: six are `#[traced_test]`, which installs a
 //! PROCESS-GLOBAL subscriber, and a sibling running beside one would both
-//! pollute its capture and race the install. The 49th,
+//! pollute its capture and race the install. The 54th,
 //! `the_depth_max_consumer_tracks_the_topology_ceiling`, is a pure constant
 //! drift guard that touches no transport and needs no turn.
 
@@ -72,6 +72,7 @@ use cerulion_core::graph::node::NodeEntry;
 use cerulion_core::graph::topology::MAX_CONSUMER_DEPTH;
 use cerulion_core::graph::{CreditBinding, CreditRole, CrossProcessWiring, GraphRuntime};
 use cerulion_core::prelude::*;
+use cerulion_core::replay_feed::{BagFedBlockEdge, BagFedBlockEdges, ReplayWiring};
 use cerulion_core::scheduler::BackpressureCounters;
 use cerulion_core::transport::publisher::BlockSendHook;
 use cerulion_core::transport::{TransportConfig, TransportManager};
@@ -4717,4 +4718,152 @@ fn an_idle_empty_drain_does_not_close_a_clip_regime() {
     );
     // The level-free twin: in every build, no repeat line was emitted loud.
     logs_assert(|lines: &[&str]| cerulion_core::testing::never_loud(lines, CLIP_REPEAT));
+}
+
+// ===========================================================================
+// A replay build that feeds a `block` edge from its recording
+// ===========================================================================
+
+/// The fed `block` edge on the consumer graph's `consumer.inp`, written by
+/// `producer` in another pass.
+fn fed_edge(topic: &str) -> BagFedBlockEdge {
+    BagFedBlockEdge {
+        topic: topic.to_string(),
+        consumer_node: "consumer".to_string(),
+        consumer_input: "inp".to_string(),
+        producer_nodes: vec!["producer".to_string()],
+    }
+}
+
+/// A replay wiring that feeds `edges` and nothing else.
+fn fed_wiring(edges: Vec<BagFedBlockEdge>) -> ReplayWiring {
+    ReplayWiring {
+        bag_fed_block_edges: BagFedBlockEdges::new(edges),
+        ..ReplayWiring::default()
+    }
+}
+
+/// Build the consumer graph `prefix` for a replay with `wiring` and `bindings`.
+fn replay_consumer_build(
+    prefix: &str,
+    mgr_name: &str,
+    wiring: &ReplayWiring,
+    bindings: &[CreditBinding],
+) -> (
+    Arc<TransportManager>,
+    cerulion_core::TransportResult<GraphRuntime>,
+) {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let clock = Arc::new(VirtualClock::new());
+    let mgr = manager(mgr_name, ix, Arc::clone(&clock));
+    let (cfg, fac) = consumer_graph(
+        prefix,
+        "consumer",
+        "inp",
+        Box::new(SplitBlockConsumerEntry::new()),
+    );
+    let built = GraphRuntime::build_for_replay(
+        cfg,
+        fac,
+        &mgr,
+        clock,
+        None,
+        CrossProcessWiring::with_credit(None, bindings),
+        wiring,
+    );
+    (mgr, built)
+}
+
+/// The consumer end of a fed edge builds for a replay: its `block` input has
+/// no in-graph producer and no credit word, and the build accepts it with no
+/// credit record. The same build with the default wiring is refused as
+/// producer-less, as before the wiring could name a fed edge.
+#[test]
+#[serial]
+fn a_replay_build_holding_a_fed_edge_s_consumer_end_builds() {
+    let (_mgr, built) = replay_consumer_build(
+        "cbfc",
+        "cb_fed_consumer",
+        &fed_wiring(vec![fed_edge(TOPIC)]),
+        &[],
+    );
+    let fed = match built {
+        Ok(rt) => rt,
+        Err(e) => panic!("the consumer end of a fed edge builds: {e}"),
+    };
+    assert_eq!(
+        fed.block_credits().count(),
+        0,
+        "a fed edge counts on no credit word, mapped or local"
+    );
+    fed.shutdown();
+    let (_mgr, default_built) =
+        replay_consumer_build("cbfd", "cb_fed_default", &ReplayWiring::default(), &[]);
+    let err = build_err(
+        default_built,
+        "the default wiring feeds nothing, so the producer-less refusal stands",
+    );
+    assert!(
+        err.to_string().starts_with(
+            "Graph validation error: block input 'consumer.inp' reads topic '/cb/data', which \
+             has no in-graph producer; "
+        ),
+        "{err}"
+    );
+}
+
+/// An entry a MAPPED credit binding also names is refused: the edge counts on
+/// its credit word or is fed from the recording, never both.
+#[test]
+#[serial]
+fn a_fed_edge_a_mapped_credit_binding_also_names_is_refused() {
+    let w = supervisor_word("fedbound", "consumer", "inp", DEPTH as u32);
+    let bound = [binding(
+        &w.consumer_side,
+        "consumer",
+        "inp",
+        DEPTH,
+        CreditRole::Consumer,
+    )];
+    let (_mgr, built) = replay_consumer_build(
+        "cbfb",
+        "cb_fed_bound",
+        &fed_wiring(vec![fed_edge(TOPIC)]),
+        &bound,
+    );
+    let err = build_err(built, "a fed edge a binding also names is refused");
+    assert_eq!(
+        err.to_string(),
+        "Graph validation error: graph 'cbfb_consumer_ctx': the replay wiring feeds `block` edge \
+         '/cb/data' -> 'consumer.inp' from a recording, and a cross-process credit binding \
+         names the same edge: an edge counts on its credit word or is fed from a recording, \
+         never both"
+    );
+}
+
+/// Two builds with two entries the build holds neither end of, the second
+/// with the entries given in the other order, refuse with the same text,
+/// naming the entry first in `Ord` order (`/cb/data` before `/cb/other`).
+#[test]
+#[serial]
+fn two_builds_with_two_bad_fed_entries_refuse_with_the_same_text() {
+    let ghost = BagFedBlockEdge {
+        consumer_node: "ghost".to_string(),
+        ..fed_edge(TOPIC)
+    };
+    let mut texts = Vec::new();
+    for (mgr_name, entries) in [
+        ("cb_fed_bad_1", vec![fed_edge(OTHER_TOPIC), ghost.clone()]),
+        ("cb_fed_bad_2", vec![ghost.clone(), fed_edge(OTHER_TOPIC)]),
+    ] {
+        let (_mgr, built) = replay_consumer_build("cbfx", mgr_name, &fed_wiring(entries), &[]);
+        texts.push(build_err(built, "an entry naming no end here is refused").to_string());
+    }
+    assert_eq!(
+        texts[0],
+        "Graph validation error: graph 'cbfx_consumer_ctx': the replay wiring feeds `block` edge \
+         '/cb/data' -> 'ghost.inp' from a recording, but this build holds neither that input nor \
+         any of its producers (producer)"
+    );
+    assert_eq!(texts[0], texts[1]);
 }

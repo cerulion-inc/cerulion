@@ -403,7 +403,8 @@ pub mod mutants {
 }
 
 /// How a replay wires a runtime it builds: the identity rule its recording was
-/// made under, and whether its read stages subscribe to private feeds.
+/// made under, whether its read stages subscribe to private feeds, and the
+/// `block` edges it feeds from its recording.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayWiring {
     /// The annotation rule, which must be the recording's so both sides stage
@@ -422,6 +423,11 @@ pub struct ReplayWiring {
     /// service is created with its topic's entry; a topic the map omits takes
     /// the slots of the building runtime's own view of the topic.
     pub publisher_slots: std::collections::HashMap<String, usize>,
+    /// The `block` edges this replay feeds from its recording, with no credit
+    /// word, because their producer and consumer run in different passes. Empty
+    /// on every build but a replay pass of a several-rank recording; see
+    /// [`BagFedBlockEdges`] for what the set does and why it is sound.
+    pub bag_fed_block_edges: BagFedBlockEdges,
 }
 
 /// Per topic a native node of `config` writes, the publisher slots a build of
@@ -469,6 +475,194 @@ impl ReplayWiring {
             role,
         };
         Some(feeds.get(&key).copied().unwrap_or(0))
+    }
+}
+
+/// One `block` edge a replay feeds from its recording, with no credit word:
+/// `consumer_node.consumer_input` reads `topic`, which `producer_nodes` write,
+/// and the replay runs the consumer and the producers in different passes.
+///
+/// A build holds at most one end of it, and which end is read off the build's
+/// own graph ([`BagFedBlockEdges`]), never stated by the caller.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BagFedBlockEdge {
+    /// The resolved absolute topic.
+    pub topic: String,
+    /// The consuming node.
+    pub consumer_node: String,
+    /// The consuming input.
+    pub consumer_input: String,
+    /// The topic's in-graph producers, the nodes a live credit word would
+    /// defer.
+    pub producer_nodes: Vec<String>,
+}
+
+/// The `block` edges a replay build feeds from its recording
+/// ([`BagFedBlockEdge`]), held in their `Ord` order, so a build that refuses
+/// two of them names the same one every time.
+///
+/// # What the set changes in a build
+///
+/// * The CONSUMER end: a build that holds `consumer_node`, and no in-graph
+///   producer of `topic`, accepts the `block` input that
+///   [`GraphTopology::validate`](crate::graph::topology::GraphTopology::validate)
+///   refuses as having no producer to defer.
+/// * The PRODUCER end: a build that holds one of `producer_nodes`, and not the
+///   consumer, writes `topic` with its consumer in another pass.
+///
+/// The build verifies the end it holds, the way it verifies a credit
+/// binding's role, and refuses, naming the entry: an entry a mapped credit
+/// binding also names, an entry it holds both ends of or neither end of, and
+/// a consumer end that is not a `block` input or whose topic has an in-graph
+/// producer the entry does not name.
+///
+/// # Why the exemption is sound
+///
+/// [`crate::graph::topology::CreditedEdges`] is the other exemption from the
+/// producer-less `block` refusal, and it can only name an edge whose mapped
+/// credit word some process opened. This set is plain data, so its soundness
+/// rests on where it reaches:
+///
+/// * only [`GraphRuntime::build_for_replay`](crate::graph::GraphRuntime::build_for_replay)
+///   threads a caller's [`ReplayWiring`], and it builds on a
+///   [`VirtualClock`](crate::clock::VirtualClock); every live,
+///   deterministic-live and worker constructor builds with
+///   `ReplayWiring::default()`, whose set is empty;
+/// * a replay pass takes its fires from the recorded trace, so no fire is
+///   decided against a count the build does not keep.
+///
+/// `block_timeout_ms` on a fed edge's input is accepted and has no effect on
+/// either end. The key acts only through a producer's defer edge
+/// (`BlockDeferEdge`), and neither build has one for the edge: the consumer
+/// end has no producer of the topic, and the producer end has no `block`
+/// consumer of it. A recording of an unchanged graph never holds such an
+/// edge, because `cerulion graph run` refuses `block_timeout_ms` on an edge
+/// its partition splits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BagFedBlockEdges {
+    edges: std::collections::BTreeSet<BagFedBlockEdge>,
+}
+
+impl BagFedBlockEdges {
+    /// The set of `edges` (a repeat is held once).
+    #[must_use]
+    pub fn new(edges: impl IntoIterator<Item = BagFedBlockEdge>) -> Self {
+        Self {
+            edges: edges.into_iter().collect(),
+        }
+    }
+
+    /// No edge at all, the set of every build but a replay pass.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.edges.is_empty()
+    }
+
+    /// The edges, in `Ord` order.
+    pub fn iter(&self) -> impl Iterator<Item = &BagFedBlockEdge> {
+        self.edges.iter()
+    }
+
+    /// Which end of each edge the build over `topology` holds, verified
+    /// against that graph (see the type's docs) and refused, at the first
+    /// entry in `Ord` order that fails. `credited` is the build's own
+    /// credit-bound edges and `graph` its identity, for the refusals' text.
+    pub(crate) fn resolve(
+        &self,
+        topology: &crate::graph::topology::GraphTopology,
+        credited: &crate::graph::topology::CreditedEdges<'_>,
+        graph: &str,
+    ) -> crate::error::TransportResult<BagFedEnds> {
+        let mut ends = BagFedEnds::default();
+        for edge in &self.edges {
+            let refuse = |why: String| crate::error::TransportError::GraphError {
+                reason: format!(
+                    "graph '{graph}': the replay wiring feeds `block` edge '{}' -> '{}.{}' from a \
+                     recording, {why}",
+                    edge.topic, edge.consumer_node, edge.consumer_input
+                ),
+            };
+            if credited.contains(&edge.topic, &edge.consumer_node, &edge.consumer_input) {
+                return Err(refuse(
+                    "and a cross-process credit binding names the same edge: an edge counts on \
+                     its credit word or is fed from a recording, never both"
+                        .to_string(),
+                ));
+            }
+            let flow = topology.topic(&edge.topic);
+            let consumer = flow.and_then(|f| {
+                f.consumers
+                    .iter()
+                    .find(|c| c.node_id == edge.consumer_node && c.input == edge.consumer_input)
+            });
+            let local_producers: &[String] = flow.map_or(&[], |f| f.producers.as_slice());
+            let (named, unnamed): (Vec<&str>, Vec<&str>) = local_producers
+                .iter()
+                .map(String::as_str)
+                .partition(|p| edge.producer_nodes.iter().any(|n| n == p));
+            match (consumer, named.is_empty()) {
+                (Some(_), false) => {
+                    return Err(refuse(format!(
+                        "but this build holds both its consumer and its producer ({}); a fed \
+                         edge's producer runs in another pass",
+                        named.join(", ")
+                    )));
+                }
+                (None, true) => {
+                    return Err(refuse(format!(
+                        "but this build holds neither that input nor any of its producers ({})",
+                        edge.producer_nodes.join(", ")
+                    )));
+                }
+                (Some(input), true) => {
+                    if !matches!(input.policy, crate::graph::node::BackpressurePolicy::Block) {
+                        return Err(refuse(format!(
+                            "but this build declares that input {:?}, not `block`",
+                            input.policy
+                        )));
+                    }
+                    // A producer the entry does not name, here: the input
+                    // counts on that producer's local word, which a fed edge
+                    // must never silence.
+                    if !unnamed.is_empty() {
+                        return Err(refuse(format!(
+                            "but this build also holds an in-graph producer of the topic the \
+                             entry does not name ({}), and a `block` input with an in-graph \
+                             producer counts on its local word",
+                            unnamed.join(", ")
+                        )));
+                    }
+                    ends.consumers.push((
+                        edge.topic.clone(),
+                        edge.consumer_node.clone(),
+                        edge.consumer_input.clone(),
+                    ));
+                }
+                // A producer end: this build writes `topic` and its consumer
+                // runs in another pass.
+                (None, false) => {}
+            }
+        }
+        Ok(ends)
+    }
+}
+
+/// Which end of each [`BagFedBlockEdge`] one build holds, resolved by
+/// [`BagFedBlockEdges::resolve`]. Empty on every build whose wiring feeds no
+/// `block` edge.
+#[derive(Debug, Default)]
+pub(crate) struct BagFedEnds {
+    /// `(topic, consumer node, consumer input)` of each consumer end, in the
+    /// set's order.
+    consumers: Vec<(String, String, String)>,
+}
+
+impl BagFedEnds {
+    /// Is `node.input` on `topic` the consumer end of a fed edge?
+    pub(crate) fn feeds_consumer(&self, topic: &str, node: &str, input: &str) -> bool {
+        self.consumers
+            .iter()
+            .any(|(t, n, i)| t == topic && n == node && i == input)
     }
 }
 
@@ -776,8 +970,282 @@ mod tests {
             replay_id: "r1".to_string(),
             feeds: Some(feeds),
             publisher_slots: std::collections::HashMap::new(),
+            bag_fed_block_edges: BagFedBlockEdges::default(),
         };
         assert_eq!(fed.feed_buffer("sink", 2, ReadStageRole::Body), Some(7));
         assert_eq!(fed.feed_buffer("sink", 2, ReadStageRole::Drain), Some(0));
+    }
+}
+
+#[cfg(test)]
+mod bag_fed_block_edge_tests {
+    //! Oracle vectors for [`BagFedBlockEdges::resolve`] and the validation
+    //! exemption it feeds: a hand-written graph and declarations in, the
+    //! hand-written refusal text or end out.
+
+    use super::*;
+    use crate::graph::node::{BackpressurePolicy, InputMeta, NodeInfo};
+    use crate::graph::topology::{CreditedEdges, GraphTopology};
+    use indexmap::IndexMap;
+
+    const PRODUCER: &str = "  - id: prod\n    type: p\n    outputs:\n      - name: out\n        \
+        schema: geometry_msgs/Vector3\n        topic: /fb/data\n";
+    /// A second writer of `/fb/data` that no entry below names.
+    const OTHER_PRODUCER: &str =
+        "  - id: other\n    type: p\n    outputs:\n      - name: out\n        \
+        schema: geometry_msgs/Vector3\n        topic: /fb/data\n";
+    const CONSUMER: &str =
+        "  - id: sink\n    type: s\n    inputs:\n      - name: inp\n        source: /fb/data\n";
+    /// The refusals' common head for the entry `/fb/data -> sink.inp`.
+    const HEAD: &str = "Graph validation error: graph 'fb': the replay wiring feeds `block` edge \
+                        '/fb/data' -> 'sink.inp' from a recording, ";
+
+    /// A graph of `nodes` (YAML node entries) under prefix `fb`, with `sink`'s
+    /// `inp` declared `policy` at depth 2, and its topology.
+    fn topology(nodes: &[&str], policy: BackpressurePolicy) -> GraphTopology {
+        topology_listing("", nodes, policy)
+    }
+
+    /// [`topology`] with `listed` (YAML top-level keys) before the nodes.
+    fn topology_listing(listed: &str, nodes: &[&str], policy: BackpressurePolicy) -> GraphTopology {
+        let yaml = format!("name: fb\nprefix: fb\n{listed}nodes:\n{}", nodes.concat());
+        let config: GraphConfig = serde_yaml::from_str(&yaml).expect("the test graph parses");
+        let infos: IndexMap<String, NodeInfo> = config
+            .nodes
+            .iter()
+            .map(|n| {
+                let metas = if n.id == "sink" {
+                    vec![InputMeta {
+                        name: "inp".to_string(),
+                        schema_hash: 0,
+                        trigger: true,
+                        depth: 2,
+                        backpressure: policy,
+                        expect_within_ms: None,
+                        accumulate: false,
+                        consume: Default::default(),
+                    }]
+                } else {
+                    vec![]
+                };
+                (n.id.clone(), NodeInfo::with_meta(metas, vec![]))
+            })
+            .collect();
+        GraphTopology::build(&config, &infos).expect("the topology builds")
+    }
+
+    /// The entry `topic -> sink.inp`, written by `prod`.
+    fn edge(topic: &str) -> BagFedBlockEdge {
+        BagFedBlockEdge {
+            topic: topic.to_string(),
+            consumer_node: "sink".to_string(),
+            consumer_input: "inp".to_string(),
+            producer_nodes: vec!["prod".to_string()],
+        }
+    }
+
+    /// `set` resolved over `topology` with no credited edge, its refusal as
+    /// text.
+    fn resolve(set: &BagFedBlockEdges, topology: &GraphTopology) -> Result<(), String> {
+        set.resolve(topology, &CreditedEdges::none(), "fb")
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    /// The empty set changes nothing: the consumer-only build is refused as
+    /// a `block` input with no in-graph producer, as before the set existed.
+    #[test]
+    fn the_empty_set_resolves_no_end_and_leaves_the_producer_less_refusal() {
+        let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
+        let ends = BagFedBlockEdges::default()
+            .resolve(&consumer_only, &CreditedEdges::none(), "fb")
+            .expect("the empty set resolves");
+        assert!(!ends.feeds_consumer("/fb/data", "sink", "inp"));
+        let refused = consumer_only
+            .validate_with_credit_edges(&CreditedEdges::none(), &ends)
+            .expect_err("a producer-less `block` input is refused");
+        assert!(
+            refused.to_string().starts_with(
+                "Graph validation error: block input 'sink.inp' reads topic '/fb/data', which has \
+                 no in-graph producer; "
+            ),
+            "{refused}"
+        );
+    }
+
+    /// The consumer end is exempt from the producer-less refusal, for that
+    /// one input only.
+    #[test]
+    fn a_consumer_end_is_exempt_from_the_producer_less_refusal() {
+        let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
+        let set = BagFedBlockEdges::new([edge("/fb/data")]);
+        let ends = set
+            .resolve(&consumer_only, &CreditedEdges::none(), "fb")
+            .expect("the consumer end resolves");
+        assert!(ends.feeds_consumer("/fb/data", "sink", "inp"));
+        assert!(!ends.feeds_consumer("/fb/data", "sink", "other"));
+        assert!(!ends.feeds_consumer("/fb/other", "sink", "inp"));
+        consumer_only
+            .validate_with_credit_edges(&CreditedEdges::none(), &ends)
+            .expect("the fed input is exempt");
+    }
+
+    /// `block_timeout_ms` on a consumer end is accepted: the key is inert
+    /// without a producer's defer edge.
+    #[test]
+    fn a_block_timeout_on_a_consumer_end_is_accepted() {
+        let timed = format!("{CONSUMER}        block_timeout_ms: 100\n");
+        let consumer_only = topology(&[timed.as_str()], BackpressurePolicy::Block);
+        assert_eq!(
+            consumer_only
+                .topic("/fb/data")
+                .map(|f| f.consumers[0].block_timeout_ms),
+            Some(Some(100)),
+            "PRECONDITION: the input carries the key"
+        );
+        let set = BagFedBlockEdges::new([edge("/fb/data")]);
+        let ends = set
+            .resolve(&consumer_only, &CreditedEdges::none(), "fb")
+            .expect("the consumer end resolves");
+        consumer_only
+            .validate_with_credit_edges(&CreditedEdges::none(), &ends)
+            .expect("the timeout on a fed input is accepted");
+    }
+
+    /// The producer end resolves and exempts no input.
+    #[test]
+    fn a_producer_end_resolves_with_no_input_to_exempt() {
+        let producer_only = topology(&[PRODUCER], BackpressurePolicy::Block);
+        let set = BagFedBlockEdges::new([edge("/fb/data")]);
+        let ends = set
+            .resolve(&producer_only, &CreditedEdges::none(), "fb")
+            .expect("the producer end resolves");
+        assert!(!ends.feeds_consumer("/fb/data", "sink", "inp"));
+    }
+
+    #[test]
+    fn an_entry_whose_both_ends_this_build_holds_is_refused() {
+        let both = topology(&[PRODUCER, CONSUMER], BackpressurePolicy::Block);
+        assert_eq!(
+            resolve(&BagFedBlockEdges::new([edge("/fb/data")]), &both),
+            Err(format!(
+                "{HEAD}but this build holds both its consumer and its producer (prod); a fed \
+                 edge's producer runs in another pass"
+            ))
+        );
+    }
+
+    /// Neither end: a build of other nodes, an entry naming an input the
+    /// build's `sink` does not declare, and an entry naming a topic `sink`
+    /// does not read.
+    #[test]
+    fn an_entry_this_build_holds_neither_end_of_is_refused() {
+        let other = "  - id: other\n    type: p\n    outputs:\n      - name: out\n        \
+            schema: geometry_msgs/Vector3\n";
+        let unrelated = topology(&[other], BackpressurePolicy::Block);
+        assert_eq!(
+            resolve(&BagFedBlockEdges::new([edge("/fb/data")]), &unrelated),
+            Err(format!(
+                "{HEAD}but this build holds neither that input nor any of its producers (prod)"
+            ))
+        );
+        let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
+        let mut unknown = edge("/fb/data");
+        unknown.consumer_input = "ghost".to_string();
+        assert_eq!(
+            resolve(&BagFedBlockEdges::new([unknown]), &consumer_only),
+            Err(
+                "Graph validation error: graph 'fb': the replay wiring feeds `block` edge \
+                 '/fb/data' -> 'sink.ghost' from a recording, but this build holds neither that \
+                 input nor any of its producers (prod)"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            resolve(
+                &BagFedBlockEdges::new([edge("/fb/elsewhere")]),
+                &consumer_only
+            ),
+            Err(
+                "Graph validation error: graph 'fb': the replay wiring feeds `block` edge \
+                 '/fb/elsewhere' -> 'sink.inp' from a recording, but this build holds neither \
+                 that input nor any of its producers (prod)"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A consumer end must be a `block` input: a `drop_oldest` and a
+    /// `sample(N)` input are refused, naming the declared policy.
+    #[test]
+    fn a_consumer_end_that_is_not_a_block_input_is_refused() {
+        for (policy, shown) in [
+            (BackpressurePolicy::DropOldest, "DropOldest"),
+            (BackpressurePolicy::Sample(5), "Sample(5)"),
+        ] {
+            let consumer_only = topology(&[CONSUMER], policy);
+            assert_eq!(
+                resolve(&BagFedBlockEdges::new([edge("/fb/data")]), &consumer_only),
+                Err(format!(
+                    "{HEAD}but this build declares that input {shown}, not `block`"
+                ))
+            );
+        }
+    }
+
+    /// A consumer end whose topic has an in-graph producer the entry does
+    /// not name is refused: that producer's local word counts the input, and
+    /// a fed edge must never silence it. With the named producer here too,
+    /// the build holds both ends.
+    #[test]
+    fn a_consumer_end_with_a_local_producer_the_entry_does_not_name_is_refused() {
+        let mixed = topology(&[OTHER_PRODUCER, CONSUMER], BackpressurePolicy::Block);
+        assert_eq!(
+            resolve(&BagFedBlockEdges::new([edge("/fb/data")]), &mixed),
+            Err(format!(
+                "{HEAD}but this build also holds an in-graph producer of the topic the entry \
+                 does not name (other), and a `block` input with an in-graph producer counts on \
+                 its local word"
+            ))
+        );
+        let all_three = topology_listing(
+            "multi_publisher_topics:\n  - /fb/data\n",
+            &[PRODUCER, OTHER_PRODUCER, CONSUMER],
+            BackpressurePolicy::Block,
+        );
+        assert_eq!(
+            resolve(&BagFedBlockEdges::new([edge("/fb/data")]), &all_three),
+            Err(format!(
+                "{HEAD}but this build holds both its consumer and its producer (prod); a fed \
+                 edge's producer runs in another pass"
+            ))
+        );
+    }
+
+    /// Two entries this build holds neither end of: the one first in `Ord`
+    /// order is named, whatever order the set was built in, on every call.
+    #[test]
+    fn the_refusal_names_the_first_entry_in_order_on_every_build() {
+        let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
+        let set = BagFedBlockEdges::new([edge("/fb/z"), edge("/fb/a")]);
+        let want = Err(
+            "Graph validation error: graph 'fb': the replay wiring feeds `block` edge \
+                        '/fb/a' -> 'sink.inp' from a recording, but this build holds neither \
+                        that input nor any of its producers (prod)"
+                .to_string(),
+        );
+        assert_eq!(resolve(&set, &consumer_only), want);
+        assert_eq!(resolve(&set, &consumer_only), want);
+        let reversed = BagFedBlockEdges::new([edge("/fb/a"), edge("/fb/z")]);
+        assert_eq!(resolve(&reversed, &consumer_only), want);
+        assert_eq!(set, reversed);
+        assert_eq!(
+            set.iter().map(|e| e.topic.as_str()).collect::<Vec<_>>(),
+            vec!["/fb/a", "/fb/z"]
+        );
+        let repeated = BagFedBlockEdges::new([edge("/fb/a"), edge("/fb/a")]);
+        assert_eq!(repeated.iter().count(), 1, "a repeat is held once");
+        assert!(BagFedBlockEdges::default().is_empty());
+        assert!(!repeated.is_empty());
     }
 }
