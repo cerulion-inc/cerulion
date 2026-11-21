@@ -255,6 +255,10 @@ in prepare_pass_verification
 #          with `--re 'fold_fire_level|recorded_after|local_block_holds'`:
 #          13 mutants, 11 caught, 2 unviable, which replace
 #          `local_block_holds` with a map of an edge its type cannot default.
+#          Re-run over the change that leaves a latest-value slot unknown
+#          from a consumer fire with no read of it recorded until the
+#          consumer next reads it, with `--re 'SlotBound::step'`: 11 mutants,
+#          11 caught.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

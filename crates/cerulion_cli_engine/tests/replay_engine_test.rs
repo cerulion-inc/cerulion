@@ -55844,6 +55844,113 @@ fn a_non_trigger_block_reader_a_level_after_its_producer_holds_it_and_replays_cl
     bh_assert_replays(&outcome, "a non-trigger reader a level after the relay");
 }
 
+/// A sink triggered on one topic that reads another through a NON-trigger
+/// `block` input (depth 1) at every fire. Each fire publishes the frame its
+/// `block` input read.
+#[cerulion_node]
+#[derive(Default)]
+struct EagerBlockSinkNode {
+    #[input(trigger)]
+    t: Vector3,
+    #[input(backpressure = block, depth = 1)]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl EagerBlockSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.x.x;
+        Ok(())
+    }
+}
+
+/// A latest-value read the bag lost leaves the slot unknown. `src` (5 ms) ->
+/// `relay` (FIFO, outputs `out` and `out2`) -> `sink`, triggered on
+/// `relay/out2` and reading `relay/out` through a non-trigger `block` input of
+/// depth 1 at every fire. The hand oracle at the reference run's 5 ms step:
+/// the relay fires each step's frame (`x` 1 to 10), and the sink, a level
+/// after it, fires each step and takes that frame, so nothing holds the
+/// relay. Taking out the sink's read of `relay/out` at step 5 and the relay's
+/// fire record there, the bag still counts the relay's step 5 frame: read
+/// with no drain the slot is full at step 5 and the relay's pop left unfired
+/// would pass as the hold. The sink fired at step 5 with no read of a
+/// latest-value input, so the slot is unknown from that step, and the pop
+/// left unfired is the finding.
+#[test]
+#[serial]
+fn a_latest_value_read_the_bag_lost_excuses_no_hold() {
+    let yaml = "name: lrgraph\nprefix: lr\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: twin_relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n      - name: out2\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: eager_block_sink_node\n    inputs:\n      - name: t\n        source: relay/out2\n      - name: x\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(TwinRelayNodeEntry::new())),
+            ("sink", Box::new(EagerBlockSinkNodeEntry::new())),
+        ])
+    };
+    let mut rec = record_uniform_with_read_log(yaml, make, &[], NT_STEPS);
+    let one = |l: u32| std::collections::BTreeSet::from([l]);
+    assert_eq!(
+        nt_fire_levels(&rec),
+        BTreeMap::from([
+            ("relay".to_string(), one(1)),
+            ("sink".to_string(), one(2)),
+            ("src".to_string(), one(0)),
+        ])
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "sink"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(
+        bh_xs(&rec, "/lr/sink/out"),
+        (1..=10).map(f64::from).collect::<Vec<_>>(),
+        "the sink takes each step's frame"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let whole = dir.path().join("lr_whole.mcap");
+    ri_bag_labelled(&rec, &whole, ri_free_run_recorder_json(), false);
+    let clean = bh_replay_stamped(&whole, make, bh_clean_stamp(&rec));
+    bh_assert_replays(&clean, "the recording as it ran");
+
+    let sink = rec.node_ids.iter().position(|n| n == "sink").unwrap() as u32;
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let x = rec
+        .input_names
+        .as_ref()
+        .expect("a read-log recording names inputs")["sink"]
+        .iter()
+        .position(|i| i == "x")
+        .expect("the sink's block input") as u16;
+    let before = rec.trace.len();
+    rec.trace.retain(|r| {
+        let lost_read = r.node_idx == sink
+            && r.step == 5
+            && is_read_record(r)
+            && unpack_read_outcome_meta(r.global_level).0 == x;
+        let dropped_fire = r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == 5;
+        !(lost_read || dropped_fire)
+    });
+    assert_eq!(
+        before - rec.trace.len(),
+        2,
+        "one read and one fire taken out"
+    );
+    let fed = dir.path().join("lr_lost_read.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
+             step 5 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+        )
+    );
+    assert!(!outcome.passed);
+}
+
 /// A relay nothing holds, on a bag that states its drain: its last fire is
 /// taken out, so its last step pops a frame and fires nothing. The finding is
 /// that step, and it carries no caveat.

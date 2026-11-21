@@ -304,7 +304,10 @@ matcher pops outside the node's body. A node the recording fired at more than
 one level, or never fired, orders no edge. From the step after a truncated
 read of the input, a drain whose site the read log does not say, or a consumer
 fire before any body read of the input is recorded, the slot allows for none;
-nor on a resumed pass until the consumer first reads its queue empty. A
+nor on a resumed pass until the consumer first reads its queue empty; nor, on
+a latest-value input, which records a read at every fire of its consumer,
+from a consumer fire with no read of it recorded until the consumer next reads
+it. A
 consumer's stop releases its slot from the next step on. As for a throttle,
 whose window the rule reads off the recorded clock, a step no such check could
 defer owes every popped frame a fire. Read through one

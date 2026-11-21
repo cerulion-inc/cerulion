@@ -3859,13 +3859,15 @@ struct SlotBound {
     /// after a truncated read of the input, a drain whose site the read log
     /// does not say, or a consumer fire before any body read of the input is
     /// recorded, the slot allows for none; nor on a resumed pass until the
-    /// consumer first reads its queue empty.
+    /// consumer first reads its queue empty, nor, on a latest-value input,
+    /// from a consumer fire with no read of it recorded until its next read.
     frames: Option<(Vec<u64>, BodyDrain)>,
     /// The first stamp not yet folded in.
     next_frame: usize,
     /// The fewest frames the slot can count at the start of the next step:
     /// `None` while it is unknown (a resumed pass, before the consumer first
-    /// reads its queue empty).
+    /// reads its queue empty, or a latest-value input after a consumer fire
+    /// with no read of it recorded, until the consumer next reads it).
     queued: Option<u64>,
     /// Drains inside the current shared clock past what the bound has
     /// counted: they took frames stamped at that clock, which count only at
@@ -3931,12 +3933,6 @@ impl SlotBound {
             older + at_clock
         };
         let sent = u64::try_from(counted).unwrap_or(u64::MAX);
-        let released = self.consumer_stop.is_some_and(|s| s.is_after(step));
-        let owed_now = if clock_continues { 0 } else { self.owed };
-        let hold = !released
-            && self
-                .queued
-                .is_some_and(|q| q.saturating_add(sent).saturating_sub(owed_now) >= self.depth);
         let mut removed = 0u64;
         let mut emptied = false;
         let mut lost = false;
@@ -3976,6 +3972,19 @@ impl SlotBound {
         }
         self.read_seen |= body_read;
         let consumer_fired = fires.iter().any(|(id, _)| *id == self.consumer_node);
+        // A latest-value input records a read at every fire of its consumer,
+        // so a fire with none is a drain the bag lost (a snapshot drain that
+        // failed after it popped): the slot is unknown from this step until
+        // the consumer next reads it empty. A FIFO input drains only at the
+        // reads its consumer's body makes, so no read there is no drain.
+        let drain_unrecorded = drain == BodyDrain::ToEmpty && consumer_fired && !body_read;
+        let released = self.consumer_stop.is_some_and(|s| s.is_after(step));
+        let owed_now = if clock_continues { 0 } else { self.owed };
+        let hold = !released
+            && !drain_unrecorded
+            && self
+                .queued
+                .is_some_and(|q| q.saturating_add(sent).saturating_sub(owed_now) >= self.depth);
         if let Some(q) = self.queued {
             let available = q.saturating_add(sent);
             if clock_continues {
@@ -3985,6 +3994,10 @@ impl SlotBound {
                 self.queued = Some(available.saturating_sub(owed_now).saturating_sub(removed));
                 self.owed = 0;
             }
+        }
+        if drain_unrecorded {
+            self.queued = None;
+            self.owed = 0;
         }
         if emptied {
             // A body read that found the queue empty, or one that drains it
@@ -4065,7 +4078,10 @@ pub(crate) struct StepDeferral {
 ///   frames with no record); on the consumer's input, from the step
 ///   after a truncated read stream's marker, a drain whose site the read log
 ///   does not say, or a consumer fire before any body read of the input is
-///   recorded. A resumed pass does not know what the slot held at its anchor,
+///   recorded; and on a latest-value input, which records a read at every
+///   fire of its consumer, from a consumer fire with no read of it recorded
+///   until the consumer next reads it, the step of that fire included. A
+///   resumed pass does not know what the slot held at its anchor,
 ///   so the edge explains no step until the consumer first reads its queue
 ///   empty. Frames stamped before the pass's first step are not its sends.
 #[derive(Debug, Clone)]
@@ -10009,6 +10025,137 @@ mod tests {
         assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
         let refilled = shared(("relay", 2, 1, 0));
         let report = verify_unrestored(&relay(sink_holds(1, &refilled)), &refilled, &[], STAMPED);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// The relay's frames as the slot `sink.inp` at `depth` counts them,
+    /// drained the way `drain` says.
+    fn sink_slot(depth: u64, steps: &[RecordedStep], drain: BodyDrain) -> BlockHoldEdges {
+        let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+            unreachable!("sent_by counts")
+        };
+        BlockHoldEdges::new(vec![slot(
+            "sink",
+            depth,
+            SlotRecord::Counted {
+                frame_stamps,
+                drain,
+            },
+        )])
+    }
+
+    /// A latest-value input records a read at every fire of its consumer, so
+    /// a consumer fire with no read recorded is a drain the bag lost: the slot
+    /// is unknown from that step. Depth 2: the sink reads the queue empty at
+    /// step 0, the relay fires one frame at each of steps 1 and 2, and at step
+    /// 3 the sink fires with no read while the relay pops two and fires one.
+    /// Counted with no drain the slot is full there; unknown, the pop left
+    /// unfired is the finding. With the step 3 read present and believed
+    /// empty, the slot was full at the relay's check and the step reads clean.
+    #[test]
+    fn a_latest_value_consumer_fire_with_no_read_leaves_the_slot_unknown() {
+        let lead = |last: Vec<RecordedStep>| {
+            let mut steps = vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+            ];
+            steps.extend(last);
+            steps
+        };
+        let unread = lead(vec![fifo_step(
+            3,
+            15_000,
+            &[("relay", 2, 1, 0), ("sink", 0, 1, 0)],
+        )]);
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &unread, BodyDrain::ToEmpty)),
+            &unread,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 2, 1)]);
+
+        let read_empty = with_read(
+            unread.clone(),
+            3,
+            read_with_role(
+                "sink",
+                "inp",
+                ReadOutcomeKind::NoFrame,
+                0,
+                None,
+                ReadSiteRole::Body,
+            ),
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &read_empty, BodyDrain::ToEmpty)),
+            &read_empty,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// The slot a consumer fire with no read left unknown is known again at
+    /// the consumer's next read, which empties a latest-value input. Depth 2,
+    /// after the rows above with the relay firing once at step 3: a step 4
+    /// that pops two and fires one, before any read, is the finding; with the
+    /// sink reading at step 4 instead, two frames fill the slot by step 6 and
+    /// the step 7 pop left unfired is the hold.
+    #[test]
+    fn a_slot_left_unknown_by_an_unread_fire_is_known_at_the_next_read() {
+        let lead = |rest: Vec<RecordedStep>| {
+            let mut steps = vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+                fifo_step(3, 15_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 0)]),
+            ];
+            steps.extend(rest);
+            steps
+        };
+        let judge = |steps: &[RecordedStep]| {
+            verify_unrestored(
+                &relay(sink_slot(2, steps, BodyDrain::ToEmpty)),
+                steps,
+                &[],
+                STAMPED,
+            )
+        };
+        let unknown = lead(vec![fifo_step(4, 20_000, &[("relay", 2, 1, 0)])]);
+        assert_eq!(
+            findings_of(&judge(&unknown)),
+            vec![finding("relay", 4, 2, 1)]
+        );
+        let known = lead(vec![
+            fifo_step(4, 20_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(5, 25_000, &[("relay", 1, 1, 0)]),
+            fifo_step(6, 30_000, &[("relay", 1, 1, 0)]),
+            fifo_step(7, 35_000, &[("relay", 2, 1, 0)]),
+        ]);
+        let report = judge(&known);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// A FIFO input drains only at the reads its consumer's body makes, so a
+    /// consumer fire that reads it not at all drains nothing and the slot
+    /// keeps its count: the same rows as the latest-value vector, on a
+    /// frame-by-frame input, read clean at step 3.
+    #[test]
+    fn a_fifo_input_its_consumer_fires_without_reading_keeps_its_count() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 15_000, &[("relay", 2, 1, 0), ("sink", 0, 1, 0)]),
+        ];
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &steps, BodyDrain::PerFrame)),
+            &steps,
+            &[],
+            STAMPED,
+        );
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
     }
 
