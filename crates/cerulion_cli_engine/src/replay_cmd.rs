@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
 //! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
-//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks on a topic with two or more in-graph producers, or whose input sets `block_timeout_ms`) |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks whose topic has two or more in-graph producers, or whose input sets `block_timeout_ms` on a topic with one producer that `multi_publisher_topics:` does not list) |
 //! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
 //! | 4 | none | tolerance-YAML validation error |
 //! | 5 | none | internal error (panic, transport, scheduler) |
@@ -807,10 +807,10 @@ pub enum ReplayError {
     /// a `block` edge from a topic that two or more in-graph producers write, one
     /// or more of them in another rank than the consumer. A `block` edge
     /// crosses ranks only on a credit word, which counts one producer's
-    /// frames. Exit 2, the not-replay-grade class: it is refused before the
-    /// first pass, from the whole graph the bag embeds and the replayed
-    /// build's own declarations, and names where the input's `block` comes
-    /// from.
+    /// frames. Exit 2, the not-replay-grade class: when the whole graph the
+    /// bag embeds builds with the replayed build's own declarations, it is
+    /// refused before the first pass and names where the input's `block`
+    /// comes from.
     #[error("{edge}")]
     SplitBlockEdgeUncreditable {
         /// The refused edge and every producer's rank.
@@ -820,9 +820,10 @@ pub enum ReplayError {
     /// A free-run bag with more than one worker rank whose rank manifests split
     /// a one-producer `block` edge whose input sets `block_timeout_ms`: a
     /// timeout release keeps a credit word's count exact only when the
-    /// producer and the consumer fire one at a time on one thread. Exit 2,
-    /// refused before the first pass, as [`Self::SplitBlockEdgeUncreditable`]
-    /// is.
+    /// producer and the consumer fire one at a time on one thread. Exit 2:
+    /// when the whole graph builds and validates (a `block_timeout_ms` on a
+    /// topic `multi_publisher_topics:` lists does not), it is refused before
+    /// the first pass, as [`Self::SplitBlockEdgeUncreditable`] is.
     #[error("{edge}")]
     SplitBlockEdgeTimeout {
         /// The refused edge and both ends' ranks.

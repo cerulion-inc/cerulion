@@ -17,7 +17,8 @@
 //! filesystem: the inputs are a [`GraphConfig`] plus two plain-data tables the
 //! caller reads off the bag ([`RankManifest`], [`RankBoundarySummary`]) and,
 //! for [`classify_split_block_edges`], the build's node declarations and the
-//! node to rank map its plans give, and the output is data. That is what lets the planner unit-test on any platform
+//! node to rank map the rank plans give, and the output is data. That is what
+//! lets the planner unit-test on any platform
 //! (the module is deliberately NOT `#[cfg(unix)]`-gated, unlike its
 //! `replay_engine` consumer — the `replay_field_registry` precedent) and what
 //! keeps every refusal below reachable from a hand-built oracle.
@@ -772,8 +773,8 @@ pub enum BlockDeclaredBy {
 /// A `block` input the bag's rank manifests split from a topic that two or
 /// more in-graph producers write, one or more of them in another rank. A
 /// `block` edge crosses ranks only on a credit word, and a credit word counts
-/// one producer's outstanding frames, so a several-rank replay refuses the
-/// bag before its first pass.
+/// one producer's outstanding frames, so a several-rank replay whose whole
+/// graph builds refuses the bag before its first pass.
 ///
 /// The fields are private: [`Self::new`] is the one builder, and it holds the
 /// invariant the sentence states, two or more producers with one or more in
@@ -867,7 +868,8 @@ impl std::error::Error for UncreditableSplitEdge {}
 /// whose input sets `block_timeout_ms`. Across ranks the edge counts on a
 /// shared credit word, which a timeout release keeps exact only when the
 /// producer and the consumer fire one at a time on one thread, so a
-/// several-rank replay refuses the bag before its first pass.
+/// several-rank replay whose whole graph builds and validates refuses the bag
+/// before its first pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SplitEdgeTimeout {
     /// The resolved absolute topic.
@@ -1031,7 +1033,11 @@ pub fn classify_split_block_edges(
         .map_err(|e| topology_err(e.to_string()))?;
     let credited =
         credit_edges_for(&topology, node_rank).map_err(|e| SplitBlockEdgeError::EngineBug {
-            reason: format!("past validation, the credit mint refused the topology: {e}"),
+            reason: format!(
+                "past validation, the credit mint refused the topology: {}",
+                e.strip_suffix(", so this is a planning-topology bug")
+                    .unwrap_or(&e)
+            ),
         })?;
     for edge in &credited {
         let Some(producers) = split_edge_timeout_producers(
@@ -1469,8 +1475,8 @@ mod split_block_edge_tests {
     /// The mixed shape: one writer in the consumer's rank, one in another.
     /// The build replayed declares `block`, where the recording's sources may
     /// have declared `drop_oldest` (`cerulion graph run` accepts this split
-    /// when the node declares `drop_oldest`), so
-    /// the refusal names what replay knows: the declaration in this build.
+    /// when the node declares `drop_oldest`), so the refusal names what replay
+    /// knows: the declaration in this build.
     #[test]
     fn a_split_with_one_local_writer_whose_block_the_build_declares_is_refused() {
         let config = shared_bus("");

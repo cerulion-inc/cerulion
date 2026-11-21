@@ -5544,16 +5544,17 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // ── 4a'. Every rank's unlisted `#[cerulion_node]` output, BEFORE the
     //         first pass ─────────────────────────────────────────────────
     //
-    // The same whole-RUN rule: a later rank's node with an unlisted output
-    // is a fact about the recording, so it refuses the replay before rank 0
-    // has run a step.
+    // A refusal that is a fact about the recording is whole-RUN: a later rank's
+    // node with an unlisted output is a fact about the recording, so it refuses
+    // the replay before rank 0 has run a step.
     refuse_unlisted_macro_output_in_every_pass(&plans, &factories)?;
     // ── 4a''. Every `block` edge the rank manifests split, BEFORE the first
     //          pass ───────────────────────────────────────────────────────
     //
     // The same whole-RUN rule, read off the whole graph: a split `block`
     // edge no credit word can count exactly (two or more in-graph producers,
-    // or `block_timeout_ms`) refuses the replay before rank 0 has run a step.
+    // or `block_timeout_ms`) refuses the replay before rank 0 has run a step,
+    // when the whole graph builds (and, for `block_timeout_ms`, validates).
     // One plan holds every node, so it splits nothing.
     if plans.len() > 1 {
         refuse_uncreditable_split_block_edges(&config, &plans, &factories)?;
@@ -9940,10 +9941,14 @@ fn refuse_unlisted_macro_output_in_every_pass(
 /// edge with `block_timeout_ms` after both. So a whole-graph build fault skips
 /// the whole check, and a validation fault skips only the `block_timeout_ms`
 /// check; neither refuses anything here. Each such fault fails some rank's
-/// build: a rank's pass carries no credit word, so a `block` input with no
-/// producer in its rank (an ingress input among them, since an ingress topic
-/// has no in-graph producer) is refused there, and every other topology fault
-/// is a fact about one input or one node, which that node's rank build sees.
+/// build, since a rank's pass carries no credit word: a `block` input with no
+/// producer in its rank is refused there, an ingress input among them (the
+/// bag's graph passed `validate_graph` at load, which refuses an in-graph
+/// producer on an ingress topic); a `block` ring lies in one rank, whose build
+/// refuses it, or crosses ranks on a split edge, which has one producer (the
+/// split check refused one with more) and so is refused at its consumer's
+/// rank; and every other topology fault the replay can meet is a fact about
+/// one input or one node, which that node's rank build sees.
 /// The replay keeps the exit, the order and the partial report it gave such a
 /// bag before: a refusal made before the first pass and an earlier rank's
 /// failure still come first. An engine bug the classifier reports is

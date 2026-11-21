@@ -41774,12 +41774,12 @@ fn a_one_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_its_build() {
 }
 
 // ---------------------------------------------------------------------------
-// Whole-graph faults a several-rank replay meets at a rank's build
+// Whole-graph topology faults in a several-rank bag
 // ---------------------------------------------------------------------------
 //
 // Each arm embeds a graph that the whole-graph topology check or the rank
-// planner refuses, and pins the exit, the text and the partial report the
-// replay gives it. Each bag comes from a consistent reference run of a valid
+// planner refuses, and pins the exit, the text and the partial report
+// `run_engine` gives it. Each bag comes from a consistent reference run of a valid
 // graph in ONE process; only the rank split and keys of the embedded graph are
 // crafted.
 
@@ -41813,6 +41813,41 @@ fn fk_partial_report(path: &std::path::Path) -> (serde_json::Value, Vec<u64>) {
     (json["aborted"]["failed_at_rank"].clone(), ranks)
 }
 
+/// The whole-graph topology of `yaml`, built with the declarations of the
+/// nodes `make` builds: the premise check of an arm that embeds a fault.
+fn fk_topology(
+    yaml: &str,
+    make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+) -> cerulion_core::TransportResult<cerulion_core::graph::GraphTopology> {
+    let config = cerulion_core::graph::parse_graph(yaml).expect("the embedded graph parses");
+    let infos: IndexMap<String, cerulion_core::graph::NodeInfo> = make()
+        .iter()
+        .map(|(id, entry)| {
+            (
+                id.clone(),
+                entry.info().expect("the node declares its ports"),
+            )
+        })
+        .collect();
+    cerulion_core::graph::GraphTopology::build(&config, &infos)
+}
+
+/// The premise of a ring arm: the embedded graph builds, and its validation
+/// refuses a ring of `block` edges.
+fn fk_assert_is_a_block_ring(yaml: &str, make: impl Fn() -> IndexMap<String, Box<dyn NodeEntry>>) {
+    let refusal = match fk_topology(yaml, make) {
+        Ok(topology) => topology.validate(),
+        Err(e) => panic!("PRECONDITION: the embedded graph builds: {e}"),
+    };
+    let text = refusal
+        .expect_err("PRECONDITION: the embedded graph's validation refuses it")
+        .to_string();
+    assert!(
+        text.contains("a ring of `block` edges"),
+        "PRECONDITION: the embedded graph is a ring of `block` edges: {text}"
+    );
+}
+
 /// Write `rec` as a free-run bag of `rank_count` ranks, with no clock skew.
 fn fk_bag(
     rec: &Recording,
@@ -41842,8 +41877,8 @@ fn fk_bag(
 }
 
 /// A data-triggered node with a latest-value feedback input `fb`. Its tick
-/// body runs once `fb` holds a message, so in a ring it never publishes: the
-/// arms need the ring in the graph, not frames on it.
+/// body runs once `fb` holds a message, so in a ring nothing outside the ring
+/// feeds (the fk_a ring) it never publishes.
 #[cerulion_node]
 #[derive(Default)]
 struct FkRingMidNode {
@@ -41915,6 +41950,7 @@ fn fk_a_cross_rank_block_ring_of_one_writer_edges_stops_at_a_rank_build() {
         true,
     );
     rec.graph_yaml = fk_ring_block_yaml();
+    fk_assert_is_a_block_ring(&rec.graph_yaml, fk_ring_factories);
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("fk_ring.mcap");
     fk_bag(
@@ -41932,7 +41968,6 @@ fn fk_a_cross_rank_block_ring_of_one_writer_edges_stops_at_a_rank_build() {
     let report = dir.path().join("report.json");
     let err = replay(&bag, fk_ring_factories, None, Some(report.clone()))
         .expect_err("rank 1 cannot be built");
-    eprintln!("FK-RESULT a: exit={} text={err}", err.exit_code());
     assert!(
         matches!(err, ReplayError::Internal { .. }),
         "the rank build's refusal, exit 5: {err:?}"
@@ -41946,9 +41981,7 @@ fn fk_a_cross_rank_block_ring_of_one_writer_edges_stops_at_a_rank_build() {
         "{err}"
     );
     assert_eq!(err.exit_code(), 5);
-    let partial = fk_partial_report(&report);
-    eprintln!("FK-RESULT a: report={partial:?}");
-    assert_eq!(partial, (serde_json::json!(1), vec![0]));
+    assert_eq!(fk_partial_report(&report), (serde_json::json!(1), vec![0]));
 }
 
 const FK_LT_TOPIC: &str = "/lt/bus";
@@ -42018,7 +42051,6 @@ fn fk_b_a_timeout_on_a_split_listed_one_writer_topic_stops_at_the_rank_build() {
     let report = dir.path().join("report.json");
     let err = replay(&bag, fk_listed_factories, None, Some(report.clone()))
         .expect_err("rank 1 cannot be built");
-    eprintln!("FK-RESULT b: exit={} text={err}", err.exit_code());
     assert!(
         matches!(err, ReplayError::Internal { .. }),
         "the rank build's refusal, exit 5: {err:?}"
@@ -42032,14 +42064,14 @@ fn fk_b_a_timeout_on_a_split_listed_one_writer_topic_stops_at_the_rank_build() {
         "{err}"
     );
     assert_eq!(err.exit_code(), 5);
-    let partial = fk_partial_report(&report);
-    eprintln!("FK-RESULT b: report={partial:?}");
-    assert_eq!(partial, (serde_json::json!(1), vec![0]));
+    assert_eq!(fk_partial_report(&report), (serde_json::json!(1), vec![0]));
 }
 
 /// (c) The shared bus with `multi_publisher_topics:` removed from the embedded
 /// graph, its two writers in two ranks: the rank planner refuses a
-/// single-writer topic two ranks write (exit 2), before any pass.
+/// single-writer topic two ranks write (exit 2), before any pass. This pins
+/// `run_engine`: `cerulion bag play --resim` refuses the graph earlier, at
+/// load, where `validate_graph` refuses a duplicate output topic (also exit 2).
 #[test]
 #[serial]
 fn fk_c_an_unlisted_topic_two_ranks_write_is_the_rank_planner_s_refusal() {
@@ -42055,11 +42087,6 @@ fn fk_c_an_unlisted_topic_two_ranks_write_is_the_rank_planner_s_refusal() {
     let report = dir.path().join("report.json");
     let err = replay(&bag, sb_factories, None, Some(report.clone()))
         .expect_err("the rank planner refuses the bag");
-    eprintln!(
-        "FK-RESULT c: exit={} text={err} report_exists={}",
-        err.exit_code(),
-        report.exists()
-    );
     assert!(
         matches!(err, ReplayError::RecordingInconsistent { .. }),
         "the rank planner's refusal: {err:?}"
@@ -42127,30 +42154,30 @@ fn fk_d_a_ring_with_a_split_two_writer_edge_is_refused_by_name() {
         "        source: /r2/bus\n",
         "        source: /r2/bus\n        backpressure: block\n",
     );
-    let labels: Vec<ProducerLabel<'static>> = rec.messages[FK_R2_TOPIC]
+    fk_assert_is_a_block_ring(&rec.graph_yaml, fk_ring2_factories);
+    // Hand count over `sb_deltas()`: `other` and `src` each fire 14 times, one
+    // frame per fire. `mid` fires on every `src` frame and writes the bus once
+    // `fb` holds a message, which `tail` first relays in step 0 from `other`'s
+    // frame, so `mid` writes on 13 fires. The bus carries both writers' frames,
+    // so the bag states no producer labels: the refusal reads none.
+    let other_idx = rec
+        .node_ids
         .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            (
-                FK_R2_TOPIC,
-                cerulion_bag::ProducerAttribution::FrameLabel {
-                    frame_index: i as u64,
-                },
-                real_publisher_id(&rec, "other", "bus"),
-            )
-        })
-        .collect();
-    let publishers = publishers_table(&rec, &[("mid", "out"), ("other", "bus")]);
+        .position(|n| n == "other")
+        .expect("the graph declares `other`") as u32;
+    let other_fires = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == other_idx)
+        .count();
+    assert_eq!(
+        (rec.messages[FK_R2_TOPIC].len(), other_fires),
+        (27, 14),
+        "the bus carries `other`'s 14 frames and `mid`'s 13"
+    );
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("fk_ring_two_writer.mcap");
-    fk_bag(
-        &rec,
-        &bag,
-        |id| u32::from(id == "tail"),
-        2,
-        Some(publishers),
-        &labels,
-    );
+    fk_bag(&rec, &bag, |id| u32::from(id == "tail"), 2, None, &[]);
     let report = dir.path().join("report.json");
     let err = replay(&bag, fk_ring2_factories, None, Some(report.clone()))
         .expect_err("the split two-writer edge is refused");
@@ -42170,6 +42197,127 @@ fn fk_d_a_ring_with_a_split_two_writer_edge_is_refused_by_name() {
          Re-execute an unchanged copy of the bag, or record the run again."
     );
     assert!(!report.exists(), "refused before any pass, so no report");
+}
+
+const FK_IG_EXT: &str = "/ig/ext";
+const FK_IG_BUS: &str = "/ig/bus";
+
+/// `sink` reads the external `/ig/ext`; `w1` and `w2` both write the listed
+/// `/ig/bus`, which `far` reads.
+fn fk_ingress_yaml() -> &'static str {
+    "name: ingress\nprefix: ig\nmulti_publisher_topics:\n  - /ig/bus\nnodes:\n\
+     \x20 - id: w1\n    type: shared_bus_left_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n        topic: /ig/bus\n\
+     \x20 - id: w2\n    type: shared_bus_right_node\n    outputs:\n      - name: bus\n        \
+     schema: geometry_msgs/Vector3\n        topic: /ig/bus\n\
+     \x20 - id: sink\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: /ig/ext\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: far\n    type: relay_node\n    inputs:\n      - name: inp\n        \
+     source: /ig/bus\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn fk_ingress_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("w1", Box::new(SharedBusLeftNodeEntry::new())),
+        ("w2", Box::new(SharedBusRightNodeEntry::new())),
+        ("sink", Box::new(RelayNodeEntry::new())),
+        ("far", Box::new(RelayNodeEntry::new())),
+    ])
+}
+
+/// (e) A graph that does not build: the embedded graph adds `network:` with
+/// `/ig/ext` as an ingress topic and `backpressure: block` on `sink.inp`,
+/// which reads it, and on `far.inp`, a split `block` edge two writers write.
+/// The graph passes `validate_graph`, the check the CLI makes at load, but
+/// the whole-graph build refuses `block` on an ingress input, so the split
+/// check refuses nothing: rank 0 runs, and rank 1's build, whose subgraph has
+/// no `network:`, refuses `sink.inp` as a `block` input with no in-graph
+/// producer, exit 5, after a partial report for rank 0. The reference run
+/// drove `/ig/ext` from outside the graph and declared no `block`.
+#[test]
+#[serial]
+fn fk_e_a_graph_that_does_not_build_stops_at_the_ingress_consumer_s_rank_build() {
+    let drive = ExternalDrive::singles(FK_IG_EXT, (1..=8).map(f64::from).collect());
+    let mut rec = record_reference_impl(
+        fk_ingress_yaml(),
+        fk_ingress_factories,
+        &[drive],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let networked = fk_edit(
+        fk_ingress_yaml(),
+        "nodes:\n",
+        "network:\n  mode: peer\n  ingress:\n    - /ig/ext\nnodes:\n",
+    );
+    let sink_block = fk_edit(
+        &networked,
+        "        source: /ig/ext\n",
+        "        source: /ig/ext\n        backpressure: block\n",
+    );
+    rec.graph_yaml = fk_edit(
+        &sink_block,
+        "        source: /ig/bus\n",
+        "        source: /ig/bus\n        backpressure: block\n",
+    );
+    let config =
+        cerulion_core::graph::parse_graph(&rec.graph_yaml).expect("the embedded graph parses");
+    if let Err(e) = cerulion_core::graph::validate_graph(&config) {
+        panic!("PRECONDITION: the embedded graph passes the CLI's load check: {e}");
+    }
+    match fk_topology(&rec.graph_yaml, fk_ingress_factories) {
+        Ok(_) => panic!("PRECONDITION: the whole-graph build refuses `block` on an ingress input"),
+        Err(e) => assert!(
+            e.to_string().starts_with(
+                "Graph validation error: `block` input 'sink.inp' reads topic '/ig/ext', which \
+                 `network.ingress` brings in from another host. "
+            ),
+            "{e}"
+        ),
+    }
+    let labels: Vec<ProducerLabel<'static>> = rec.messages[FK_IG_BUS]
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let writer = if frame_x(f) < CO_SPLIT { "w1" } else { "w2" };
+            (
+                FK_IG_BUS,
+                cerulion_bag::ProducerAttribution::FrameLabel {
+                    frame_index: i as u64,
+                },
+                real_publisher_id(&rec, writer, "bus"),
+            )
+        })
+        .collect();
+    let publishers = publishers_table(&rec, &[("w1", "bus"), ("w2", "bus")]);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("fk_ingress_block.mcap");
+    fk_bag(
+        &rec,
+        &bag,
+        |id| u32::from(id == "sink" || id == "far"),
+        2,
+        Some(publishers),
+        &labels,
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, fk_ingress_factories, None, Some(report.clone()))
+        .expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, not the split refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'sink.inp' reads topic '/ig/ext', which has no \
+             in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(fk_partial_report(&report), (serde_json::json!(1), vec![0]));
 }
 
 /// The fixture's recorded bus interleave, per step, as `(saw a `left` frame,
