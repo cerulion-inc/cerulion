@@ -737,6 +737,8 @@ jobs:
                 test -x /usr/bin/cerulion-remoted
                 test -d /usr/bin/harness
                 test ! -L /usr/bin/harness
+                test -f /usr/bin/harness/rcp.sh
+                test -f /usr/bin/harness/install.sh
                 cerulion-remoted --version
                 test "$(dirname "$(readlink -f "$(command -v cerulion)")")" = \
                   "$(dirname "$(readlink -f /usr/bin/cerulion-connectd)")"

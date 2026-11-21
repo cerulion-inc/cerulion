@@ -101,6 +101,8 @@ want_line '    harness = Dir["{,*/}harness"].find { |candidate| File.directory?(
 want_line '    odie "release archive is missing harness" unless harness'
 want_line '    bin.install harness'
 want_line '    assert_predicate bin/"harness", :directory?'
+want_line '    assert_predicate bin/"harness/rcp.sh", :file?'
+want_line '    assert_predicate bin/"harness/install.sh", :file?'
 want_line '    (share/"cerulion/install.json").write "{\"method\":\"brew\",\"version\":\"#{version}\"}\n"'
 want_line '        cerulion-install-rust'
 want_text 'Homebrew itself never writes into your'
