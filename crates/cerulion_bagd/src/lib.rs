@@ -29685,13 +29685,18 @@ mod ranks_begin_apart_judge_tests {
              at step 0 is not supported: record the run from its first step with `cerulion \
              graph run --record`"
         );
+        let past = verdict(&both_begin_past_step_0(), Stamp::FreeRun);
         assert_eq!(
-            verdict(&both_begin_past_step_0(), Stamp::FreeRun),
+            past,
             Err(ResimGap::FreeRunResumeUnsupported {
                 first_step: 6,
                 ranks: 2
             })
         );
+        assert!(past.is_err_and(|gap| gap.reason().starts_with(
+            "this capture is stamped `coordination: free_run`, its recording begins MID-RUN \
+             (its first recorded STEP_BOUNDARY is step 6, not step 0), and it holds 2 worker ranks"
+        )));
         // One capture, judged twice, is one verdict.
         for shape in [
             rank_1_begins_later,

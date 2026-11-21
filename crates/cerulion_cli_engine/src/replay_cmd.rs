@@ -756,7 +756,11 @@ pub enum ReplayError {
     /// the reason a Flashback capture of this shape carries too.
     #[error(
         "{}",
-        cerulion_core::flashback::resim::free_run_resume_unsupported_reason(*first_step, *ranks)
+        cerulion_core::flashback::resim::free_run_resume_unsupported_reason(
+            *first_step,
+            *ranks,
+            false
+        )
     )]
     FreeRunResumeUnsupported {
         /// The recording's first recorded (rank-0) STEP_BOUNDARY step.

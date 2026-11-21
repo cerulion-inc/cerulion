@@ -634,11 +634,10 @@ impl MixedStart {
     /// The sentence a refusal of this recording gives: every rank on each side,
     /// each late rank's first step, and the remedy.
     ///
-    /// `from_a_capture` picks the noun: "capture" for a Flashback capture,
-    /// "bag" for any other recording, the noun the free-run mid-run refusal
-    /// ([`free_run_resume_unsupported_reason`]) uses.
+    /// `from_a_capture` picks the noun, as it does for
+    /// [`free_run_resume_unsupported_reason`].
     pub fn sentence(&self, from_a_capture: bool) -> String {
-        let noun = if from_a_capture { "capture" } else { "bag" };
+        let noun = free_run_noun(from_a_capture);
         let past = match self.past_zero.as_slice() {
             [(rank, step)] => {
                 format!("worker rank {rank} of this free-run {noun} begins at step {step}")
@@ -666,6 +665,17 @@ impl MixedStart {
     }
 }
 
+/// The noun a free-run refusal calls the bag it read: [`bag_noun`]'s for a
+/// Flashback capture, and "bag" for any other recording, the word the replay's
+/// free-run refusals print.
+const fn free_run_noun(from_a_capture: bool) -> &'static str {
+    if from_a_capture {
+        bag_noun(true)
+    } else {
+        "bag"
+    }
+}
+
 /// `a`, `a and b`, `a, b and c`.
 fn and_list(items: impl Iterator<Item = String>) -> String {
     let items: Vec<String> = items.collect();
@@ -680,10 +690,17 @@ fn and_list(items: impl Iterator<Item = String>) -> String {
 /// carries ([`ResimGap::FreeRunResumeUnsupported`]).
 ///
 /// `first_step` is rank 0's first recorded step boundary and `ranks` the
-/// worker trace manifests the recording holds.
-pub fn free_run_resume_unsupported_reason(first_step: u64, ranks: usize) -> String {
+/// worker trace manifests the recording holds. `from_a_capture` picks the
+/// noun: "capture" for the reason a Flashback capture carries, "bag" for the
+/// replay's refusal, which reads any recording.
+pub fn free_run_resume_unsupported_reason(
+    first_step: u64,
+    ranks: usize,
+    from_a_capture: bool,
+) -> String {
+    let noun = free_run_noun(from_a_capture);
     format!(
-        "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
+        "this {noun} is stamped `coordination: free_run`, its recording begins MID-RUN (its \
          first recorded STEP_BOUNDARY is step {first_step}, not step 0), and it holds \
          {ranks} worker ranks. A mid-run resume anchors on the ONE first recorded boundary \
          and places the clock off that single value, which holds for exactly one worker \
@@ -1133,7 +1150,7 @@ impl ResimGap {
                 .to_string(),
             Self::MixedStart(start) => start.sentence(true),
             Self::FreeRunResumeUnsupported { first_step, ranks } => {
-                free_run_resume_unsupported_reason(*first_step, *ranks)
+                free_run_resume_unsupported_reason(*first_step, *ranks, true)
             }
             Self::MultiRing {
                 rings,
@@ -1163,11 +1180,13 @@ impl ResimGap {
     }
 }
 
-/// The two remedies a capture whose frames begin late carries.
+/// The first of the two remedies a capture whose frames begin late carries,
+/// which holds for a graph with one worker rank: a capture of several is not
+/// resumed from their checkpoints. The second, for any graph, is
+/// [`RECORD_FROM_THE_FIRST_STEP`].
 const FRAMES_BEGIN_LATE_REMEDY: &str =
-    "A capture taken more than one Flashback window into the run (`CERULION_FLASHBACK_WINDOW_MS`) \
-     resumes from a checkpoint its frames cover, and `cerulion graph run --record` records a run \
-     from its first step";
+    "For a graph with one worker rank, a capture taken more than one Flashback window into the run \
+     (`CERULION_FLASHBACK_WINDOW_MS`) resumes from a checkpoint its frames cover";
 
 /// [`ResimGap::FrameNotHeld`]'s sentence: the "frames begin late" form when the
 /// missing sequence is below the first one held of its writer (or none is
@@ -1196,7 +1215,7 @@ fn frame_not_held_reason(resume_step: u64, gap: &FrameGap) -> String {
             "{lead}, a frame the capture never held: its frames {frames} start later than \
              {attached_after}, because the recorder's taps attached after it, as in a capture \
              taken in the first seconds of a run, or because the window let them go. {readable} \
-             {FRAMES_BEGIN_LATE_REMEDY}"
+             {FRAMES_BEGIN_LATE_REMEDY}. For any graph, {RECORD_FROM_THE_FIRST_STEP}"
         )
     };
     match held_from {
@@ -1867,9 +1886,10 @@ mod tests {
              checkpoint this capture resumes from, because the recorder's taps attached after it, \
              as in a capture taken in the first seconds of a run, or because the window let them \
              go. `cerulion bag play --resim all --verify` cannot judge it. The frames, the state \
-             and the trace are in the bag and readable. A capture taken more than one Flashback window \
-             into the run (`CERULION_FLASHBACK_WINDOW_MS`) resumes from a checkpoint its frames \
-             cover, and `cerulion graph run --record` records a run from its first step"
+             and the trace are in the bag and readable. For a graph with one worker rank, a capture \
+             taken more than one Flashback window into the run (`CERULION_FLASHBACK_WINDOW_MS`) \
+             resumes from a checkpoint its frames cover. For any graph, record the run from its \
+             first step with `cerulion graph run --record`"
         );
         assert_eq!(
             reason(1, 4, 4, Some(0)),
@@ -3269,7 +3289,7 @@ mod tests {
     #[test]
     fn the_free_run_resume_refusal_names_the_step_the_ranks_and_one_remedy() {
         assert_eq!(
-            free_run_resume_unsupported_reason(12, 3),
+            free_run_resume_unsupported_reason(12, 3, false),
             "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
              first recorded STEP_BOUNDARY is step 12, not step 0), and it holds 3 worker ranks. \
              A mid-run resume anchors on the ONE first recorded boundary and places the clock \
@@ -3280,15 +3300,23 @@ mod tests {
              Per-rank resume anchors are not supported yet; record the run from its first step \
              with `cerulion graph run --record`"
         );
+        // The capture's reason is the same sentence about a capture.
+        let capture = ResimGap::FreeRunResumeUnsupported {
+            first_step: 12,
+            ranks: 3,
+        }
+        .reason();
+        assert_eq!(capture, free_run_resume_unsupported_reason(12, 3, true));
         assert_eq!(
-            ResimGap::FreeRunResumeUnsupported {
-                first_step: 12,
-                ranks: 3
-            }
-            .reason(),
-            free_run_resume_unsupported_reason(12, 3),
-            "the capture's reason is the replay's sentence"
+            capture,
+            free_run_resume_unsupported_reason(12, 3, false).replacen(
+                "this bag is stamped",
+                "this capture is stamped",
+                1
+            ),
+            "only the noun differs"
         );
+        assert!(capture.starts_with("this capture is stamped `coordination: free_run`"));
     }
 
     /// Under free run, ranks that begin apart are refused by name in both

@@ -29380,8 +29380,9 @@ fn a_multi_rank_free_run_mid_run_bag_is_refused_by_name() {
             }
             assert_eq!(
                 msg,
-                cerulion_core::flashback::resim::free_run_resume_unsupported_reason(2, 2),
-                "the replay prints the sentence a capture of this shape carries"
+                cerulion_core::flashback::resim::free_run_resume_unsupported_reason(2, 2, false),
+                "the replay prints the sentence about a bag that a capture of this shape carries \
+                 about itself"
             );
         }
         other => panic!("expected FreeRunResumeUnsupported, got {other:?}"),
