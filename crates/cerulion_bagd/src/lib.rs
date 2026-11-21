@@ -9877,11 +9877,20 @@ fn judge_capture_resimmable(
         flashback_plane::AnchorReport::Embedded { run_id, .. } => (*run_id, 1),
         flashback_plane::AnchorReport::Absent(_) => (0, 0),
     };
+    // Each worker rank's first kept boundary, off the per-rank trim. Only the
+    // worker manifest ranks vote: the departure ring's sentinel rank names no
+    // worker's step.
+    let rank_first_steps: Vec<(u32, u64)> = trimmed
+        .per_rank
+        .iter()
+        .filter(|(rank, _)| worker_manifest_ranks.contains(rank))
+        .filter_map(|(rank, per)| per.first_recorded_step.map(|step| (*rank, step)))
+        .collect();
     cerulion_core::flashback::resim::judge_resimmable(
         &cerulion_core::flashback::resim::ResimFacts {
             trace_records: trimmed.records.len(),
             departure_records: trimmed.departures,
-            first_recorded_step: trimmed.first_recorded_step,
+            rank_first_steps: &rank_first_steps,
             // The hole this recorder watched open in its own
             // read of the ring, and the edges of the record stream that has to
             // straddle it for this capture to be holding it. Measured HERE, over

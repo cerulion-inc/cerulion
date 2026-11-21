@@ -71,24 +71,25 @@ pub struct ResimFacts<'a> {
     /// (the trimmed trace), so the two cannot disagree about whether a departure
     /// is present — the caller measures both in one pass.
     pub departure_records: usize,
-    /// The step of the AUTHORITATIVE rank's first kept step-boundary record, which
-    /// is what `resolve_resume` derives the resume point from.
+    /// Each WORKER rank's first kept step-boundary step, as `(rank, step)`: one
+    /// entry per rank that kept a boundary, in any order. A rank that kept none
+    /// has no entry.
     ///
-    /// The two ends of a resume fold in OPPOSITE directions on a multi rank
-    /// capture: the covered range's END is the earliest last kept boundary across
-    /// the ranks that kept one, what the slowest rank can back, while this START
-    /// is rank 0's own first kept boundary, because the replay window is rank 0's
-    /// boundary stream by construction (`resolve_resume` reads
-    /// `first_recorded_boundary`, which walks rank 0 only). Read rank-blind this
-    /// would be the first boundary in retained order, and on a capture whose peer
-    /// carries no anchor that is the peer's step 0, which made the judge stamp a
-    /// from-start resume the reader then refused.
+    /// The resume's START is the AUTHORITATIVE rank's entry, rank 0's, which the
+    /// judge reads out of this list: the replay window is rank 0's boundary
+    /// stream by construction, because `resolve_resume` derives its resume point
+    /// from `first_recorded_boundary`, which walks rank 0 only. The covered
+    /// range's END folds the other way, to the earliest last kept boundary
+    /// across the ranks that kept one, what the slowest rank can back. Read
+    /// rank-blind, the start would be the first boundary in retained order, and
+    /// on a capture whose peer carries no anchor that is the peer's step 0: a
+    /// from-start claim the reader refuses.
     ///
-    /// `None` means rank 0 kept no boundary. That is NOT the same
+    /// No entry for rank 0 means rank 0 kept no boundary. That is NOT the same
     /// as an empty trace (a trace of FIRE records with no boundary is possible
     /// on a torn head) and resim refuses it separately, so the two are kept
     /// apart here too.
-    pub first_recorded_step: Option<u64>,
+    pub rank_first_steps: &'a [(u32, u64)],
     /// Whether the bag carries a `graph.yaml` attachment `run_replay` can
     /// actually USE — present, UTF-8, and parsing as a graph (its gate 4,
     /// immediately after the trace-presence gate).
@@ -125,9 +126,9 @@ pub struct ResimFacts<'a> {
     /// `None` on an empty trace, which cannot straddle anything and is refused
     /// by [`ResimGap::NoTrace`] before this arm is reached anyway.
     ///
-    /// Kept apart from [`first_recorded_step`](Self::first_recorded_step), which
-    /// is the AUTHORITATIVE rank's first kept STEP-BOUNDARY step, the value
-    /// `resolve_resume` derives a resume point from. These two are over ALL
+    /// Kept apart from [`rank_first_steps`](Self::rank_first_steps), whose rank
+    /// 0 entry is the AUTHORITATIVE rank's first kept STEP-BOUNDARY step, the
+    /// value `resolve_resume` derives a resume point from. These two are over ALL
     /// records including
     /// fires, because a hole is a hole in the record stream whatever kind of
     /// record sits either side of it.
@@ -1260,8 +1261,14 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
             departures: facts.departure_records,
         });
     }
-    // 4. Is there a resume point at all?
-    let Some(first_recorded_step) = facts.first_recorded_step else {
+    // 4. Is there a resume point at all? The AUTHORITATIVE rank's own first
+    //    kept boundary, the step `resolve_resume` resumes at (see the field).
+    let Some(first_recorded_step) = facts
+        .rank_first_steps
+        .iter()
+        .find(|(rank, _)| *rank == crate::trace_ring::AUTHORITATIVE_TRACE_RANK)
+        .map(|&(_, step)| step)
+    else {
         return Err(ResimGap::NoBoundary);
     };
     // 4b. A rank with no complete step, the recorder's own observation (see
@@ -1599,7 +1606,7 @@ mod tests {
         for first in [0, 41] {
             assert_eq!(
                 judge_resimmable(&ResimFacts {
-                    first_recorded_step: Some(first),
+                    rank_first_steps: &[(0, first)],
                     ranks_without_a_kept_step: &missing,
                     frame_gap: Some(late_gap()),
                     ..healthy(&nodes, &anchors)
@@ -1611,7 +1618,7 @@ mod tests {
         // The from-start path asks it too: no anchor repairs a missing frame.
         assert_eq!(
             judge_resimmable(&ResimFacts {
-                first_recorded_step: Some(0),
+                rank_first_steps: &[(0, 0)],
                 frame_gap: Some(late_gap()),
                 ..healthy(&[], &[])
             }),
@@ -1692,7 +1699,7 @@ mod tests {
             worker_manifest_ranks: &[0],
             trace_records: 12,
             departure_records: 0,
-            first_recorded_step: Some(41),
+            rank_first_steps: &[(0, 41)],
             // One declared ring, and this recorder is reading it — so
             // the partial-trace gate is inert unless an arm says otherwise.
             trace_rings_declared: 1,
@@ -1715,7 +1722,7 @@ mod tests {
             first_record_refusal: None,
             // A CONTINUOUS trace — no recorder stall — so the lap gate
             // is inert unless an arm says otherwise. The bounds bracket
-            // `first_recorded_step` because a real trace's boundary sits inside
+            // rank 0's first step because a real trace's boundary sits inside
             // the record stream, never outside it.
             trace_gap: None,
             min_recorded_step: Some(41),
@@ -1794,7 +1801,7 @@ mod tests {
             worker_manifest_ranks: &[0],
             trace_records: 0,
             departure_records: 3,
-            first_recorded_step: None,
+            rank_first_steps: &[],
             // A ring nobody read, too — so this also pins that the
             // partial-trace gate does not preempt the no-trace one.
             trace_rings_declared: 2,
@@ -1863,7 +1870,7 @@ mod tests {
             required_nodes_known: false,
             first_record_refusal: Some(TraceRecordRefusal::Fault(TraceRecordFault::ZeroedRecord)),
             departure_records: 3,
-            first_recorded_step: None,
+            rank_first_steps: &[],
             // A rank left without a step, hostile as well.
             ranks_without_a_kept_step: &[1],
             state_rings_declared: 4,
@@ -1934,7 +1941,7 @@ mod tests {
                 trace_gap: Some(gap),
                 min_recorded_step: Some(97),
                 max_recorded_step: Some(140),
-                first_recorded_step: Some(97),
+                rank_first_steps: &[(0, 97)],
                 ..healthy(&nodes, &later)
             }),
             Ok(())
@@ -2416,7 +2423,7 @@ mod tests {
         let nodes = vec!["a".to_string()];
         let gapped = ResimFacts {
             worker_manifest_ranks: &[0, 2],
-            first_recorded_step: Some(41),
+            rank_first_steps: &[(0, 41)],
             required_nodes: &nodes,
             anchor_facts: &anchors,
             ..healthy(&nodes, &anchors)
@@ -2451,7 +2458,7 @@ mod tests {
         let nodes = vec!["a".to_string()];
         let holed = ResimFacts {
             worker_manifest_ranks: &[0, 2],
-            first_recorded_step: Some(41),
+            rank_first_steps: &[(0, 41)],
             required_nodes: &nodes,
             anchor_facts: &anchors,
             ..healthy(&nodes, &anchors)
@@ -2497,7 +2504,7 @@ mod tests {
             required_nodes_known: false,
             state_rings_declared: 2,
             ranks_missing: &[],
-            first_recorded_step: Some(41),
+            rank_first_steps: &[(0, 41)],
             required_nodes: &[],
             anchor_facts: &anchors,
             ..healthy(&[], &anchors)
@@ -2591,7 +2598,7 @@ mod tests {
             judge_resimmable(&ResimFacts {
                 state_rings_declared: 2,
                 ranks_missing: &[1],
-                first_recorded_step: Some(0),
+                rank_first_steps: &[(0, 0)],
                 ..healthy(&nodes, &anchors)
             }),
             Ok(()),
@@ -2760,7 +2767,7 @@ mod tests {
         let nodes = vec!["a".to_string()];
         let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
         let mut facts = healthy(&nodes, &anchors);
-        facts.first_recorded_step = None;
+        facts.rank_first_steps = &[];
         assert_eq!(judge_resimmable(&facts), Err(ResimGap::NoBoundary));
     }
 
@@ -2846,7 +2853,7 @@ mod tests {
     #[test]
     fn a_capture_that_reaches_step_zero_is_resimmable_with_no_anchor_at_all() {
         let mut facts = healthy(&[], &[]);
-        facts.first_recorded_step = Some(0);
+        facts.rank_first_steps = &[(0, 0)];
         // Deliberately hostile on every anchor-side fact — none of them is
         // consulted on this arm.
         facts.state_rings_declared = 0;
@@ -2860,7 +2867,7 @@ mod tests {
     fn a_capture_resuming_at_step_one_still_needs_its_step_zero_anchor() {
         let nodes = vec!["a".to_string()];
         let mut facts = healthy(&nodes, &[]);
-        facts.first_recorded_step = Some(1);
+        facts.rank_first_steps = &[(0, 1)];
         assert!(matches!(
             judge_resimmable(&facts),
             Err(ResimGap::AnchorIncomplete { .. })
@@ -2868,8 +2875,49 @@ mod tests {
 
         let anchors = vec![fact("a", 0, AnchorOutcome::Complete)];
         let mut ok = healthy(&nodes, &anchors);
-        ok.first_recorded_step = Some(1);
+        ok.rank_first_steps = &[(0, 1)];
         assert_eq!(judge_resimmable(&ok), Ok(()));
+    }
+
+    /// The resume starts at RANK 0's first kept step, wherever its entry sits:
+    /// a peer that keeps its step 0 does not make a capture whose rank 0
+    /// resumes at step 41 a from-start one, and a peer's step never stands in
+    /// for a rank 0 that kept no boundary.
+    #[test]
+    fn the_resume_starts_at_rank_0s_own_first_step() {
+        let nodes = vec!["a".to_string()];
+        // No anchor at all: a from-start read accepts this capture, and a resume
+        // at step 41 refuses it for the missing anchor.
+        for firsts in [&[(1, 0), (0, 41)][..], &[(0, 41), (1, 0)][..]] {
+            assert!(
+                matches!(
+                    judge_resimmable(&ResimFacts {
+                        rank_first_steps: firsts,
+                        ..healthy(&nodes, &[])
+                    }),
+                    Err(ResimGap::AnchorIncomplete { .. })
+                ),
+                "{firsts:?}"
+            );
+        }
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                rank_first_steps: &[(2, 0), (0, 0), (1, 0)],
+                ..healthy(&nodes, &[])
+            }),
+            Ok(()),
+            "every rank from step 0 needs no anchor"
+        );
+        for firsts in [&[(1, 0)][..], &[(1, 41), (2, 0)][..]] {
+            assert_eq!(
+                judge_resimmable(&ResimFacts {
+                    rank_first_steps: firsts,
+                    ..healthy(&nodes, &[])
+                }),
+                Err(ResimGap::NoBoundary),
+                "{firsts:?}: no rank 0 entry"
+            );
+        }
     }
 
     /// A rank the capture left with no complete step refuses, from start and
@@ -2882,7 +2930,7 @@ mod tests {
         let missing = [1u32];
         for first in [0, 41] {
             let facts = ResimFacts {
-                first_recorded_step: Some(first),
+                rank_first_steps: &[(0, first)],
                 ranks_without_a_kept_step: &missing,
                 ..healthy(&nodes, &anchors)
             };
@@ -2902,7 +2950,7 @@ mod tests {
         }
         assert_eq!(
             judge_resimmable(&ResimFacts {
-                first_recorded_step: None,
+                rank_first_steps: &[],
                 ranks_without_a_kept_step: &missing,
                 ..healthy(&nodes, &anchors)
             }),

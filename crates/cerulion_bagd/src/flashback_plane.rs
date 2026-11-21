@@ -5081,7 +5081,7 @@ mod tests {
         // …and the kept records are unchanged: the recovery is a lookup, never a
         // widening of what the capture carries.
         assert_eq!(trimmed.records.len(), 2);
-        assert_eq!(trimmed.first_recorded_step, Some(4));
+        assert_eq!(trimmed.per_rank[&0].first_recorded_step, Some(4));
     }
 
     /// THE CAPTURE-END CUT, through the selection the close calls.
