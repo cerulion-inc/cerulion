@@ -34,7 +34,7 @@ In a second terminal, add it to your MCP client and ask for a task:
 
 ```bash
 claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
-claude "Put the bowl on the plate."
+claude "With cerulion-sim, put the bowl on the plate."
 ```
 
 Any MCP client works the same way: point it at `http://127.0.0.1:8765/mcp`. Each connection gets its own episode
@@ -61,8 +61,8 @@ Run `cerulion rcp --sim` once in a terminal before you add it this way: the firs
 and the benchmark scenes, which takes minutes, and a client that starts a stdio server waits only seconds for
 its first answer.
 
-Then rerun a start state of the published benchmark against your own model. Pick one from the results package's
-`cells.csv`; without `--cell` the run uses a start state the harness was developed on, not a published one.
+Then run a start state yourself against your own model. Pick one of the published benchmark from the results
+package's `cells.csv`; without `--cell` the run uses a start state the harness was developed on, not a published one.
 
 ```bash
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
