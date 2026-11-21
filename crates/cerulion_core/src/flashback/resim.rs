@@ -86,7 +86,9 @@ pub struct ResimFacts<'a> {
     /// entry per worker rank that kept a boundary, and none for a rank that
     /// kept none or for any rank that is not a worker (the departure ring's
     /// sentinel rank included). Keyed by rank, so a rank has one first step,
-    /// and the resume start and the mixed-start arm read the same one.
+    /// and the resume start and the free-run arms read the same one. A
+    /// [`worker_manifest_ranks`](Self::worker_manifest_ranks) rank with no entry
+    /// is a worker that kept no boundary.
     ///
     /// The resume's START is the AUTHORITATIVE rank's entry, rank 0's, which the
     /// judge reads out of this list: the replay window is rank 0's boundary
@@ -98,8 +100,9 @@ pub struct ResimFacts<'a> {
     /// on a capture whose peer carries no anchor that is the peer's step 0: a
     /// from-start claim the reader refuses.
     ///
-    /// Under free run every entry is read: a capture whose ranks begin apart,
-    /// one at step 0 and another past it, is [`ResimGap::MixedStart`].
+    /// Under free run every worker rank is read: ranks that begin apart, one at
+    /// step 0 and another past it, are [`ResimGap::MixedStart`], and a worker
+    /// rank with no entry is [`ResimGap::RankWithoutBoundaryStream`].
     ///
     /// No entry for rank 0 means rank 0 kept no boundary. That is NOT the same
     /// as an empty trace (a trace of FIRE records with no boundary is possible
@@ -786,14 +789,24 @@ pub enum ResimGap {
     /// Free-run worker ranks that begin apart: one at step 0 and another past
     /// it. See [`MixedStart`].
     MixedStart(MixedStart),
+    /// Free-run worker ranks that attach a trace manifest and keep no step
+    /// boundary: resim's `RankWithoutBoundaryStream`, which its free-run rank
+    /// plan raises for every worker manifest with no boundary stream. Under
+    /// lockstep the replay plans rank 0 alone, and such a rank does not refuse.
+    RankWithoutBoundaryStream {
+        /// The worker ranks with no step boundary in the capture, ascending.
+        ranks: Vec<u32>,
+    },
     /// Some rank carried a step boundary into the capture and keeps none, while
     /// another rank keeps one. See [`ResimFacts::ranks_without_a_kept_step`].
     ///
-    /// Under free run the replayer refuses such a bag as `RecordingInconsistent`
-    /// when that rank's frames fall inside the covered range. The recorder
-    /// declines it in either mode, because the bag carries no record of the
-    /// rank's removed steps and no reader can tell the capture is short of that
-    /// rank; the recorder is the party that knows it.
+    /// Under free run such a rank keeps no boundary stream, which is
+    /// [`ResimGap::RankWithoutBoundaryStream`] on a from-start capture and
+    /// [`ResimGap::FreeRunResumeUnsupported`] on a resumed one, both asked
+    /// first, so this gap is a lockstep one. The recorder declines it because
+    /// the bag carries no record of the rank's removed steps and no reader can
+    /// tell the capture is short of that rank; the recorder is the party that
+    /// knows it.
     RankWithoutCompleteStep {
         /// The ranks with no complete step in the capture, ascending.
         ranks: Vec<u32>,
@@ -1149,6 +1162,24 @@ impl ResimGap {
                                  state are in the bag and readable"
                 .to_string(),
             Self::MixedStart(start) => start.sentence(true),
+            Self::RankWithoutBoundaryStream { ranks } => {
+                let (subject, has) = match ranks.as_slice() {
+                    [rank] => (format!("worker rank {rank}"), "has a trace manifest"),
+                    several => (
+                        format!(
+                            "worker ranks {}",
+                            and_list(several.iter().map(u32::to_string))
+                        ),
+                        "have trace manifests",
+                    ),
+                };
+                format!(
+                    "{subject} of this free-run capture {has} and no step boundary, and \
+                     `cerulion bag play --resim` refuses a free-run recording with a worker rank \
+                     whose recorded clock it cannot re-advance before it re-executes anything: \
+                     {RECORD_FROM_THE_FIRST_STEP}"
+                )
+            }
             Self::FreeRunResumeUnsupported { first_step, ranks } => {
                 free_run_resume_unsupported_reason(*first_step, *ranks, true)
             }
@@ -1329,9 +1360,10 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 /// still takes there are a rank left with no complete step
 /// ([`ResimGap::RankWithoutCompleteStep`]) and a kept read whose frame the
 /// capture does not hold ([`ResimGap::FrameNotHeld`]), neither of which an
-/// anchor would repair. Under free run the arm is reached only when every
-/// worker rank that kept a boundary begins at step 0: a peer that begins past
-/// it is [`ResimGap::MixedStart`], asked first.
+/// anchor would repair. Under free run the arm accepts a capture only when
+/// every worker rank begins at step 0: a peer that begins past it is
+/// [`ResimGap::MixedStart`], asked before the arm, and a worker rank that kept
+/// no boundary is [`ResimGap::RankWithoutBoundaryStream`], asked first on it.
 pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     // 1. `BagNoSchedulerTrace` — the first thing `run_replay` refuses on.
     if facts.trace_records == 0 {
@@ -1510,6 +1542,21 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     };
     if first_recorded_step == 0 {
         // FromStart — see the doc comment. No anchor is consulted.
+        //
+        // 4d. Under free run the replay plans every worker manifest's boundary
+        //     stream and refuses a rank with none (`RankWithoutBoundaryStream`)
+        //     before its consistency checks, so it is asked ahead of 4b.
+        if free_run {
+            let ranks: Vec<u32> = facts
+                .worker_manifest_ranks
+                .iter()
+                .copied()
+                .filter(|rank| !facts.rank_first_steps.contains_key(rank))
+                .collect();
+            if !ranks.is_empty() {
+                return Err(ResimGap::RankWithoutBoundaryStream { ranks });
+            }
+        }
         rank_without_a_step()?;
         return frames_held();
     }
@@ -3360,14 +3407,16 @@ mod tests {
                 );
             }
         }
-        // Ranks that begin together, and a peer with no boundary, do not vote.
-        for firsts in [by_rank(&[(0, 0), (1, 0)]), by_rank(&[(0, 0)])] {
-            assert_eq!(
-                judge_resimmable(&free_run(&nodes, &anchors, &firsts)),
-                Ok(()),
-                "{firsts:?}"
-            );
-        }
+        // Ranks that begin together.
+        assert_eq!(
+            judge_resimmable(&free_run(&nodes, &anchors, &by_rank(&[(0, 0), (1, 0)]))),
+            Ok(())
+        );
+        // Worker rank 1 has a manifest and no boundary stream.
+        assert_eq!(
+            judge_resimmable(&free_run(&nodes, &anchors, &by_rank(&[(0, 0)]))),
+            Err(ResimGap::RankWithoutBoundaryStream { ranks: vec![1] })
+        );
         // Three worker ranks: one late beside two at step 0, two late beside
         // rank 0, and rank 0 the late one.
         let three = |pairs: &[(u32, u64)]| {
@@ -3689,6 +3738,99 @@ mod tests {
         }
     }
 
+    /// Under free run a worker rank with no boundary stream refuses a
+    /// from-start capture, below the mixed start and above the rank with no
+    /// complete step and the frame check; under lockstep it does not, as the
+    /// replay plans rank 0 alone there.
+    #[test]
+    fn a_free_run_worker_rank_with_no_boundary_stream_refuses_a_from_start_capture() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let at_zero = by_rank(&[(0, 0)]);
+        let three = |pairs: &[(u32, u64)]| {
+            judge_resimmable(&ResimFacts {
+                worker_manifest_ranks: &[0, 1, 2],
+                ..free_run(&nodes, &anchors, &by_rank(pairs))
+            })
+        };
+        assert_eq!(
+            three(&[(0, 0)]),
+            Err(ResimGap::RankWithoutBoundaryStream { ranks: vec![1, 2] })
+        );
+        assert_eq!(
+            three(&[(0, 0), (2, 0)]),
+            Err(ResimGap::RankWithoutBoundaryStream { ranks: vec![1] })
+        );
+        assert_eq!(three(&[(0, 0), (1, 0), (2, 0)]), Ok(()));
+        // The mixed start is named first; rank 0 past step 0 is the free-run
+        // mid-run refusal, as `resolve_resume` refuses before it plans ranks.
+        assert_eq!(
+            three(&[(0, 0), (1, 6)]),
+            Err(ResimGap::MixedStart(start(&[(1, 6)], &[0])))
+        );
+        assert_eq!(
+            three(&[(0, 41)]),
+            Err(ResimGap::FreeRunResumeUnsupported {
+                first_step: 41,
+                ranks: 3,
+            })
+        );
+        // Above the rank with no complete step and the frame check.
+        let missing = [1u32];
+        for facts in [
+            ResimFacts {
+                ranks_without_a_kept_step: &missing,
+                ..free_run(&nodes, &anchors, &at_zero)
+            },
+            ResimFacts {
+                frame_gap: Some(late_gap()),
+                ..free_run(&nodes, &anchors, &at_zero)
+            },
+        ] {
+            assert_eq!(
+                judge_resimmable(&facts),
+                Err(ResimGap::RankWithoutBoundaryStream { ranks: vec![1] })
+            );
+        }
+        // Below an unreadable stamp.
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                coordination: RecordedCoordination::Unreadable(UnreadableCoordination::NotJson),
+                ..free_run(&nodes, &anchors, &at_zero)
+            }),
+            Err(ResimGap::CoordinationUnreadable(
+                UnreadableCoordination::NotJson
+            ))
+        );
+        // Lockstep tolerates the rank.
+        for coordination in lockstep() {
+            assert_eq!(
+                judge_resimmable(&ResimFacts {
+                    coordination: coordination.clone(),
+                    ..free_run(&nodes, &anchors, &at_zero)
+                }),
+                Ok(()),
+                "{coordination:?}"
+            );
+        }
+        // The sentence, one rank and several.
+        let tail = "and no step boundary, and `cerulion bag play --resim` refuses a free-run \
+                    recording with a worker rank whose recorded clock it cannot re-advance before \
+                    it re-executes anything: record the run from its first step with `cerulion \
+                    graph run --record`";
+        assert_eq!(
+            ResimGap::RankWithoutBoundaryStream { ranks: vec![1] }.reason(),
+            format!("worker rank 1 of this free-run capture has a trace manifest {tail}")
+        );
+        assert_eq!(
+            ResimGap::RankWithoutBoundaryStream {
+                ranks: vec![1, 2, 4]
+            }
+            .reason(),
+            format!("worker ranks 1, 2 and 4 of this free-run capture have trace manifests {tail}")
+        );
+    }
+
     /// A rank the capture left with no complete step refuses, from start and
     /// resumed alike, once some boundary exists, and after the anchor gates on
     /// a resumed capture.
@@ -3817,6 +3959,8 @@ mod tests {
                     ..late_gap()
                 },
             },
+            ResimGap::RankWithoutBoundaryStream { ranks: vec![1] },
+            ResimGap::RankWithoutBoundaryStream { ranks: vec![1, 2] },
             // A `recorder.json` that states no readable contract, each way.
             ResimGap::CoordinationUnreadable(UnreadableCoordination::NotJson),
             ResimGap::CoordinationUnreadable(UnreadableCoordination::NotAnObject),

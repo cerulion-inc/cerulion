@@ -29508,6 +29508,38 @@ mod ranks_begin_apart_judge_tests {
         }
     }
 
+    /// Rank 1 attaches a manifest and keeps no record at all, while rank 0 kept
+    /// no checkpoint and keeps its retention from step 0.
+    fn rank_1_keeps_no_boundary() -> Shape {
+        Shape {
+            records: rank_steps(0, 0..=8),
+            anchored: None,
+            worker_ranks: &[0, 1],
+        }
+    }
+
+    /// The free-run stamp refuses a worker rank with no boundary stream by
+    /// name, and a lockstep reading keeps it, as the replay plans rank 0 alone
+    /// under lockstep.
+    #[test]
+    fn a_free_run_worker_rank_with_no_boundary_stream_is_refused_by_name() {
+        let refused = verdict(&rank_1_keeps_no_boundary(), Stamp::FreeRun);
+        assert_eq!(
+            refused,
+            Err(ResimGap::RankWithoutBoundaryStream { ranks: vec![1] })
+        );
+        assert!(refused.is_err_and(|gap| gap.reason().starts_with(
+            "worker rank 1 of this free-run capture has a trace manifest and no step boundary"
+        )));
+        for stamp in [Stamp::Lockstep, Stamp::Unstamped, Stamp::Absent] {
+            assert_eq!(
+                verdict(&rank_1_keeps_no_boundary(), stamp),
+                Ok(()),
+                "{stamp:?}"
+            );
+        }
+    }
+
     /// The controls: two ranks that both begin at step 0 with no checkpoint,
     /// and one rank resuming from its anchor.
     fn both_begin_at_step_0() -> Shape {
