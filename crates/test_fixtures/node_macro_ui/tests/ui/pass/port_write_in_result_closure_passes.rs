@@ -1,4 +1,4 @@
-#![allow(unexpected_cfgs)]
+#![allow(unexpected_cfgs, dead_code, clippy::double_ended_iterator_last)]
 //! Both documented remedies for the
 //! port-write-in-closure limitation compile (numbering matches
 //! USER_API's "Helper methods…" section):

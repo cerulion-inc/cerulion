@@ -76,6 +76,8 @@ base64 = "0.22"
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 
 [dev-dependencies]
+# Pin the published client's handshake mirror to the shared ops protocol.
+cerulion_ops_proto = { path = "../cerulion_ops_proto" }
 # Isolated temp dirs for the desk-key + device-cert file tests.
 tempfile = "3"
 # The device-cert oracle test signs a throwaway `SignedDeviceCert` (`DeviceCert::sign`

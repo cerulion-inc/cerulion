@@ -259,8 +259,8 @@ checkout uses `path` dependencies, which no patch moves; take
 `cerulion_android` from that same checkout with `path =` in place of `git`
 and `rev`. Once crates.io lists `cerulion_android`, a version requirement
 equal to the node workspace's pins replaces the git source and the two
-entries, for example `cerulion_android = "=2.0.0"` beside nodes made by
-`cerulion` 2.0.0. An app that hosts the remote plane keeps the git or `path`
+entries, for example `cerulion_android = "=2.1.0"` beside nodes made by
+`cerulion` 2.1.0. An app that hosts the remote plane keeps the git or `path`
 source: `cerulion_android_remote` is not on crates.io, so it and
 `cerulion_android` come from the same `rev` or checkout (see
 [Host the paired remote plane](#host-the-paired-remote-plane)).
@@ -1163,7 +1163,7 @@ Enable the feature on the dependency used by the app:
 
 ```toml
 [dependencies]
-cerulion_core = { version = "=2.0.0", features = ["local-transport"] }
+cerulion_core = { version = "=2.1.0", features = ["local-transport"] }
 ```
 
 ## Emulator end-to-end test

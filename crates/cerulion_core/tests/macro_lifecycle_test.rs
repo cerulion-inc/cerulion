@@ -82,12 +82,16 @@ fn user_init_and_shutdown_methods_are_invoked() {
     let subscribers: IndexMap<String, AnySubscriber> = IndexMap::new();
     // NodeContext never falls back to live
     // std::env::var when env_snapshot is empty. Build an explicit
-    // snapshot from the live env so this lifecycle test still exercises
-    // the env_str path against the value the test set above.
+    // snapshot from the live env, keeping each variable whose name and value
+    // are valid UTF-8 as the runtime does, so this lifecycle test still
+    // exercises the env_str path against the value the test set above.
     use cerulion_core::graph::node::ShutdownSignal;
     use std::sync::Arc;
-    let live_env_snapshot: Arc<std::collections::HashMap<String, String>> =
-        Arc::new(std::env::vars().collect());
+    let live_env_snapshot: Arc<std::collections::HashMap<String, String>> = Arc::new(
+        std::env::vars_os()
+            .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+            .collect(),
+    );
     let runtime_clock: Arc<dyn cerulion_core::clock::Clock> = Arc::new(RealClock);
     let ctx = NodeContext::with_runtime_env(
         publishers,

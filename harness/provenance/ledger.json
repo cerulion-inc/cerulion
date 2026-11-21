@@ -463,9 +463,9 @@
      "status": "comments_and_docstrings"
     },
     {
-     "measured_sha256": "7acb5bab5b5e1fe860829154991d0e1809892144db396c085ddeac413117aad2",
+     "measured_sha256": "1e00eaa7b12729d05987bbe202f787ebdfac50f00fe3b5e542321501ab1640a4",
      "path": "bench/operators/chat_operator.py",
-     "public_sha256": "36837d674fc2af195534cca40042b32c97cf25863c0512b818d6a409adea1865",
+     "public_sha256": "02d664ed9061ca489bc0f2d3da2d1a8b70d5d45199483b88c5fff92fe5b6be6f",
      "status": "comments_and_docstrings"
     },
     {
@@ -481,9 +481,9 @@
      "status": "comments_and_docstrings"
     },
     {
-     "measured_sha256": "98d36f245413dd71a43534f168456afa5496c937ccd6e44faf951f2c5061e02a",
+     "measured_sha256": "61823662b5e0fa193c4e3475e6eb276a2c6c066d77ca4615527ce173b03ef362",
      "path": "bench/operators/chat_support.py",
-     "public_sha256": "4b9986371be93aedb50b6597d4a114173019675fd4af21fb87d011be4ea32a7d",
+     "public_sha256": "b0f966bd7ac42da318684ee3bd1506287d7973c3ef793859db2064bd6d265250",
      "status": "comments_and_docstrings"
     },
     {
@@ -2752,9 +2752,9 @@
      "status": "comments_and_docstrings"
     },
     {
-     "measured_sha256": "7acb5bab5b5e1fe860829154991d0e1809892144db396c085ddeac413117aad2",
+     "measured_sha256": "1e00eaa7b12729d05987bbe202f787ebdfac50f00fe3b5e542321501ab1640a4",
      "path": "bench/operators/chat_operator.py",
-     "public_sha256": "36837d674fc2af195534cca40042b32c97cf25863c0512b818d6a409adea1865",
+     "public_sha256": "02d664ed9061ca489bc0f2d3da2d1a8b70d5d45199483b88c5fff92fe5b6be6f",
      "status": "comments_and_docstrings"
     },
     {
@@ -2770,9 +2770,9 @@
      "status": "comments_and_docstrings"
     },
     {
-     "measured_sha256": "98d36f245413dd71a43534f168456afa5496c937ccd6e44faf951f2c5061e02a",
+     "measured_sha256": "61823662b5e0fa193c4e3475e6eb276a2c6c066d77ca4615527ce173b03ef362",
      "path": "bench/operators/chat_support.py",
-     "public_sha256": "4b9986371be93aedb50b6597d4a114173019675fd4af21fb87d011be4ea32a7d",
+     "public_sha256": "b0f966bd7ac42da318684ee3bd1506287d7973c3ef793859db2064bd6d265250",
      "status": "comments_and_docstrings"
     },
     {

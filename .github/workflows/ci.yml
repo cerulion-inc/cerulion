@@ -210,7 +210,8 @@ env:
 #   * `Upload the cargo timing reports` uploads that directory as the artifact
 #     `cargo-timings-<job id>[-<matrix values>]-attempt-<run attempt>`, kept 7
 #     days, a shard leg's value reading `shard-<n>`: for example
-#     `cargo-timings-lint-attempt-1` and `cargo-timings-test-linux-shard-0-attempt-1`.
+#     `cargo-timings-lint-clippy-attempt-1` and
+#     `cargo-timings-test-linux-shard-0-attempt-1`.
 #     `runner.txt` is always there, so a job whose cargo steps the path
 #     selection skipped uploads an artifact holding only that file.
 #
@@ -238,8 +239,8 @@ jobs:
   # on a pull request it would otherwise skip. `code`, `docs` and `pkgs` are the
   # test-impact selection and they SKIP test steps, so every rule behind them is
   # fail-closed. The rules, the reason token each one emits and a `--self-test`
-  # table live in `tools/scripts/ci_changed_paths.sh`, and `lint` runs that
-  # table.
+  # table live in `tools/scripts/ci_changed_paths.sh`, and `lint-gates` runs
+  # that table.
   #
   # PULL REQUESTS, AND HARNESS-ONLY MERGE GROUPS. On `push` and
   # `workflow_dispatch` the classifier answers with EVERY package rather than
@@ -412,7 +413,7 @@ jobs:
     steps:
       # `fetch-depth: 0` because the router diffs against the base and reads
       # files at both commits.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -454,7 +455,7 @@ jobs:
 
       - name: Upload the shadow selection
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: router-shadow-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/router-shadow.json
@@ -576,6 +577,9 @@ jobs:
           cp LICENSE README.md "$stage/"
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
+          # build_deb.sh refuses an archive without the agent harness, which
+          # the release archive stages from the tree with the same script.
+          tools/scripts/stage_harness.sh harness "$stage/harness"
           chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
           tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
           deb=$(tools/scripts/build_deb.sh "$archive" amd64 "$RUNNER_TEMP/debs")
@@ -731,6 +735,10 @@ jobs:
                 test -x /usr/bin/cerulion-netd
                 test -x /usr/bin/cerulion-connectd
                 test -x /usr/bin/cerulion-remoted
+                test -d /usr/bin/harness
+                test ! -L /usr/bin/harness
+                test -f /usr/bin/harness/rcp.sh
+                test -f /usr/bin/harness/install.sh
                 cerulion-remoted --version
                 test "$(dirname "$(readlink -f "$(command -v cerulion)")")" = \
                   "$(dirname "$(readlink -f /usr/bin/cerulion-connectd)")"
@@ -821,31 +829,22 @@ jobs:
           KEY_B: ${{ steps['apt-repo'].outputs.key_b }}
           KEY_C: ${{ steps['apt-repo'].outputs.key_c }}
 
-  # Fast lint check — gates all other jobs
-  lint:
-    name: Lint
+  # LINT, IN FOUR JOBS. Three parts run side by side: `lint-gates` (every
+  # script gate and self-test, no compile), `lint-fmt` (rustfmt over the root
+  # workspace and every other one) and `lint-clippy` (the strict clippy run,
+  # which carries this lane's cache). `lint` is the one required context,
+  # `Lint`: it waits for the three and fails unless every one of them
+  # succeeded, so a part that failed, was cancelled or was skipped reds it.
+  # It carries `always()`, so it runs on a cancelled run too and reds there:
+  # the parts report no required context, and a skipped `Lint` would read as
+  # satisfied.
+  # `ci_test_coverage_test` holds the parts to the same rules as a required
+  # job and runs the aggregator's check over every result shape. Jobs that
+  # `needs: [lint]` wait for all three parts.
+  lint-gates:
+    name: Lint (gates)
     runs-on: ubuntu-latest
-    # `actions: write` is for the cache prune step only (it deletes stale
-    # entries of this job's cache namespace). Every other step needs read.
-    permissions:
-      contents: read
-      actions: write
-    # The limit covers runner setup, cache restore, cold compilation of the
-    # iroh tree (netd's `wan` is default-ON, so feature unification pulls it
-    # into `cargo clippy --workspace --all-targets`), the checks, and the cache
-    # save. A cold restore alone can take a quarter of an hour, and a job that
-    # dies before its cache save leaves the next run paying the same cost, so
-    # the budget is wide enough that one slow restore cannot strand it. This is
-    # still a bound, and the required checks and runner routing are unchanged.
-    timeout-minutes: 45
-    env:
-      # Clippy is pure analysis — debuginfo is dead weight, and the workspace's
-      # full-debug target outgrew the hosted runner's disk (after
-      # four large changes merged: every `Lint` run died with the runner's
-      # own "No space left on device" before it could even report). debug=0
-      # shrinks the lint target by tens of GB and composes with the disk-free
-      # step below; test jobs keep their own profiles untouched.
-      CARGO_PROFILE_DEV_DEBUG: "0"
+    timeout-minutes: 30
     steps:
       # `fetch-depth: 0` so the added-line dash gate below can diff against the
       # base it resolves. A shallow checkout does not carry it, and the gate
@@ -853,11 +852,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-
-      - name: Log the runner's CPU and memory
-        run: |
-          mkdir -p "$RUNNER_TEMP/cargo-timings"
-          { uname -m; if [ "$RUNNER_OS" = macOS ]; then sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize; else nproc; lscpu | grep -m1 'Model name' || true; grep MemTotal /proc/meminfo; fi; } | tee "$RUNNER_TEMP/cargo-timings/runner.txt"
 
       - name: Release installer self-test
         run: ./tools/scripts/install.sh --self-test
@@ -908,6 +902,11 @@ jobs:
           fi
           ruby --version
           ./tools/scripts/test_render_homebrew_formula.sh
+
+      # Every release package ships the harness that stage_harness.sh stages,
+      # so the paths it leaves out and the modes it sets are checked here.
+      - name: Harness staging self-test
+        run: ./tools/scripts/stage_harness.sh --self-test
 
       - name: Crates.io wait guard self-test
         run: ./tools/scripts/test_wait_for_crates_io.sh
@@ -1068,104 +1067,6 @@ jobs:
           python3 tools/scripts/ci_cache_policy_check.py --self-test
           python3 tools/scripts/ci_cache_policy_check.py .github/workflows
 
-
-      # The workspace + restored target cache no longer fit ubuntu-latest's
-      # free disk alongside the preinstalled toolchains the workspace never
-      # uses. `ubuntu-latest` ships tens of GB of them, and reclaiming ~25 GB up
-      # front is what keeps this job off ENOSPC; the `df` lines make a
-      # regression diagnosable from the log.
-      - name: Free runner disk
-        if: runner.environment == 'github-hosted'
-        run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
-        with:
-          toolchain: stable
-          components: clippy, rustfmt
-
-      - name: Cache cargo (restore)
-        id: cache-restore-1
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
-            cargo-${{ runner.os }}-lint-main-
-            cargo-${{ runner.os }}-main-
-            cargo-${{ runner.os }}-
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      # `cargo fmt --all` above covers ROOT-WORKSPACE members only. Everything
-      # else in the repo is its own workspace: `examples/go2` (21k lines the
-      # users of the demo actually read), each `benches/*`, each `examples/*`,
-      # and `crates/cerulion_core/fuzz`. None of it had ever been fmt-checked
-      # by anything. Four trees were dirty when this step was written.
-      #
-      # A WALK, not a hand list: a new bench or example is covered the day it
-      # lands, which is the same default-cover reasoning the test jobs use and
-      # the same failure mode (`a hand list goes stale`) this workflow keeps
-      # paying for. `cargo fmt` needs no build, so the whole sweep is seconds.
-      #
-      # SCOPE: the walk names the four TREES that exist today (`benches`,
-      # `examples`, `crates/cerulion_core/fuzz`, `crates/cerulion_android/android`). A brand-new
-      # top-level excluded tree would need a line here, visible in review,
-      # unlike a missing file inside a directory already swept.
-      - name: Check formatting (the workspaces the root does not cover)
-        run: |
-          set -uo pipefail
-          fail=0
-          checked=0
-          # WALK for workspace ROOTS, not a shallow glob. A one-level glob such
-          # as `benches/*/Cargo.toml` cannot see a nested root. Keying on
-          # `[workspace]` finds a root wherever it sits, so a bench or example
-          # added at any depth is covered the day it lands.
-          #
-          # `-not -path '*/target/*'`: a build artefact tree can hold vendored
-          # manifests, and fmt-checking one would report a diff nobody owns.
-          #
-          # EVERY tree is checked before the step fails, so one dirty tree does
-          # not hide the others.
-          while IFS= read -r manifest; do
-            grep -q '^\[workspace\]' "$manifest" || continue
-            echo "::group::cargo fmt --check ${manifest}"
-            cargo fmt --manifest-path "$manifest" --all -- --check || fail=1
-            echo "::endgroup::"
-            checked=$((checked + 1))
-          done < <(find benches examples crates/cerulion_core/fuzz crates/cerulion_android/android \
-                        -type f -name Cargo.toml -not -path '*/target/*' | sort)
-          # A walk that matched nothing would be a silent green. The floor is
-          # the exact number of roots in the tree (two under benches/latency,
-          # benches/wire-formats, eight examples, the fuzz crate, the Android
-          # sample's runtime crate), so losing any one of them trips it.
-          # Raise it in the commit that adds a root.
-          if [ "$checked" -lt 13 ]; then
-            echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
-            exit 1
-          fi
-          echo "fmt-checked ${checked} excluded workspace root(s)"
-          exit $fail
-
-      # THE WORKSPACE LINT. `dead_code` / `unused_imports` / `unused_variables`
-      # are DENY across the root workspace, and `--all-targets` puts every test
-      # and bench target under the same bar.
-      #
-      # It lives in `lint` rather than in a test job because it gates every
-      # other job: a clippy break should cost seconds of ubuntu time, not an
-      # hour of macOS. (`examples/go2` is outside the root workspace and gets its
-      # own strict clippy step inside the job that has already built it.)
-      - name: Run clippy (strict)
-        run: cargo clippy --timings --workspace --all-targets -- -D warnings
-
       # Grep-based lint — heap-allocation patterns in hot-path files
       # (transport/, the graph level executor, the scheduler) must carry an
       # explicit `// hot-path-alloc-ok:` / `-ok-fn:` / `-known:` annotation
@@ -1192,9 +1093,9 @@ jobs:
       # the target), and a banned-token scan over the public agent docs.
       #
       # It was written, and then ran nowhere — the class this change exists to
-      # close. Pure bash, no cargo, ~0 s, and it belongs in `lint` for the same
-      # reason the hot-path lint above does: ubuntu minutes, fails in seconds,
-      # and gates every other job.
+      # close. Pure bash, no cargo, ~0 s, and it belongs in `lint-gates` for the
+      # same reason the hot-path lint above does: ubuntu minutes, fails in
+      # seconds, and reds `Lint`.
       #
       # It guards a real set now (the tree carries a root `AGENTS.md` plus one
       # per crate), and since the Linux lane landed it also carries a narrower
@@ -1236,9 +1137,9 @@ jobs:
       # Which packages a change can reach: the touched packages plus their
       # reverse-dependency closure. The table is hand-built metadata documents
       # with their closures written out beside them, and the live rows run the
-      # walk over this workspace, so the step sits AFTER the toolchain install
-      # above rather than beside the other pure-python gates: those rows shell
-      # out to `cargo metadata`.
+      # walk over this workspace: those rows shell out to `cargo metadata
+      # --no-deps`, which the runner's preinstalled cargo answers, as it does
+      # for the `changes` job.
       - name: Selected-packages closure self-test
         run: python3 -B tools/scripts/ci_selected_packages.py --self-test
 
@@ -1282,7 +1183,7 @@ jobs:
       # makes it a red on a pull request that never runs that package, and the
       # walker's `the_shard_check_runs_in_a_named_lint_step` arm fails if this
       # step is renamed, removed, given an argument, moved into another job or
-      # another workflow, or given an `if:` of its own, and if `lint` stops
+      # another workflow, or given an `if:` of its own, and if `lint-gates` stops
       # running on a pull request.
       - name: Shard partition and selection check
         run: ./tools/scripts/ci_test_shard.sh --check
@@ -1297,8 +1198,8 @@ jobs:
       # backed, and a tracker-id scrub that rewrote the inside of a test's
       # string literal. Each of those is a shape a script can see, so this
       # gate reports them as `file:line: class: message` findings with one
-      # remedy line per class, and it belongs in `lint` for the same reason the
-      # gates above do: pure python3 over `git ls-files`, no cargo, seconds.
+      # remedy line per class, and it belongs in `lint-gates` for the same reason
+      # the gates above do: pure python3 over `git ls-files`, no cargo, seconds.
       #
       # The same class also keeps a page in words (no pictograph: the emoji
       # planes, a curated set of sign and emoji-twin characters, and the
@@ -1402,6 +1303,146 @@ jobs:
           ./tools/scripts/check_pr_title.sh --self-test
           ./tools/scripts/check_pr_title.sh --title "$PR_TITLE" --branch "$PR_BRANCH" --pr "$PR_NUMBER" --author "$PR_AUTHOR"
 
+  lint-fmt:
+    name: Lint (fmt)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # `cargo fmt --all` above covers ROOT-WORKSPACE members only. Everything
+      # else in the repo is its own workspace: `examples/go2` (21k lines the
+      # users of the demo actually read), each `benches/*`, each `examples/*`,
+      # and `crates/cerulion_core/fuzz`. None of it had ever been fmt-checked
+      # by anything. Four trees were dirty when this step was written.
+      #
+      # A WALK, not a hand list: a new bench or example is covered the day it
+      # lands, which is the same default-cover reasoning the test jobs use and
+      # the same failure mode (`a hand list goes stale`) this workflow keeps
+      # paying for. `cargo fmt` needs no build, so the whole sweep is seconds.
+      #
+      # SCOPE: the walk names the four TREES that exist today (`benches`,
+      # `examples`, `crates/cerulion_core/fuzz`, `crates/cerulion_android/android`). A brand-new
+      # top-level excluded tree would need a line here, visible in review,
+      # unlike a missing file inside a directory already swept.
+      - name: Check formatting (the workspaces the root does not cover)
+        run: |
+          set -uo pipefail
+          fail=0
+          checked=0
+          # WALK for workspace ROOTS, not a shallow glob. A one-level glob such
+          # as `benches/*/Cargo.toml` cannot see a nested root. Keying on
+          # `[workspace]` finds a root wherever it sits, so a bench or example
+          # added at any depth is covered the day it lands.
+          #
+          # `-not -path '*/target/*'`: a build artefact tree can hold vendored
+          # manifests, and fmt-checking one would report a diff nobody owns.
+          #
+          # EVERY tree is checked before the step fails, so one dirty tree does
+          # not hide the others.
+          while IFS= read -r manifest; do
+            grep -q '^\[workspace\]' "$manifest" || continue
+            echo "::group::cargo fmt --check ${manifest}"
+            cargo fmt --manifest-path "$manifest" --all -- --check || fail=1
+            echo "::endgroup::"
+            checked=$((checked + 1))
+          done < <(find benches examples crates/cerulion_core/fuzz crates/cerulion_android/android \
+                        -type f -name Cargo.toml -not -path '*/target/*' | sort)
+          # A walk that matched nothing would be a silent green. The floor is
+          # the exact number of roots in the tree (two under benches/latency,
+          # benches/wire-formats, eight examples, the fuzz crate, the Android
+          # sample's runtime crate), so losing any one of them trips it.
+          # Raise it in the commit that adds a root.
+          if [ "$checked" -lt 13 ]; then
+            echo "::error::only ${checked} excluded workspace root(s) were fmt-checked: the walk is not reaching the trees"
+            exit 1
+          fi
+          echo "fmt-checked ${checked} excluded workspace root(s)"
+          exit $fail
+
+  lint-clippy:
+    name: Lint (clippy)
+    runs-on: ubuntu-latest
+    # `actions: write` is for the cache prune step only (it deletes stale
+    # entries of this job's cache namespace). Every other step needs read.
+    permissions:
+      contents: read
+      actions: write
+    # The limit covers runner setup, cache restore, cold compilation of the
+    # iroh tree (netd's `wan` is default-ON, so feature unification pulls it
+    # into `cargo clippy --workspace --all-targets`), clippy, and the cache
+    # save. A cold restore alone can take a quarter of an hour, and a job that
+    # dies before its cache save leaves the next run paying the same cost, so
+    # the budget is wide enough that one slow restore cannot strand it.
+    timeout-minutes: 45
+    env:
+      # Clippy is pure analysis: debuginfo is dead weight, and the workspace's
+      # full-debug target outgrew the hosted runner's disk (after
+      # four large changes merged: every `Lint` run died with the runner's
+      # own "No space left on device" before it could even report). debug=0
+      # shrinks the lint target by tens of GB and composes with the disk-free
+      # step below; test jobs keep their own profiles untouched.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Log the runner's CPU and memory
+        run: |
+          mkdir -p "$RUNNER_TEMP/cargo-timings"
+          { uname -m; if [ "$RUNNER_OS" = macOS ]; then sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize; else nproc; lscpu | grep -m1 'Model name' || true; grep MemTotal /proc/meminfo; fi; } | tee "$RUNNER_TEMP/cargo-timings/runner.txt"
+
+      # The workspace + restored target cache no longer fit ubuntu-latest's
+      # free disk alongside the preinstalled toolchains the workspace never
+      # uses. `ubuntu-latest` ships tens of GB of them, and reclaiming ~25 GB up
+      # front is what keeps this job off ENOSPC; the `df` lines make a
+      # regression diagnosable from the log.
+      - name: Free runner disk
+        if: runner.environment == 'github-hosted'
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Cache cargo (restore)
+        id: cache-restore-1
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-
+            cargo-${{ runner.os }}-lint-main-
+            cargo-${{ runner.os }}-main-
+            cargo-${{ runner.os }}-
+
+      # THE WORKSPACE LINT. `dead_code` / `unused_imports` / `unused_variables`
+      # are DENY across the root workspace, and `--all-targets` puts every test
+      # and bench target under the same bar.
+      #
+      # It lives in `lint-clippy` rather than in a test job: a clippy break
+      # reds `Lint` in minutes of ubuntu time, not an hour of macOS. (`examples/go2` is outside the root workspace and gets its
+      # own strict clippy step inside the job that has already built it.)
+      - name: Run clippy (strict)
+        run: cargo clippy --timings --workspace --all-targets -- -D warnings
+
       - name: Collect the cargo timing reports
         if: always()
         timeout-minutes: 2
@@ -1414,21 +1455,12 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: cargo-timings-lint-attempt-${{ github.run_attempt }}
+          name: cargo-timings-lint-clippy-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
           retention-days: 7
           if-no-files-found: ignore
-
-  # Cross-target type-check for aarch64-unknown-linux-gnu (the
-  # Jetson/Orin robotics deployment target). The monitor-wait/doorbell cfg-matrix
-  # code has per-(os,arch) construction sites; a variant constructed on EVERY cell
-  # except aarch64-linux trips `dead_code = deny` ONLY there — invisible to the
-  # x86_64-linux + macOS-aarch64 runners above (and to local x86_64-linux and
-  # aarch64-macOS machines). `cargo check` (no link; the cross C compiler is for
-  # ring's build script) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
-  # cost on the critical path.
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
       - name: Cache cargo (prune the namespace to the current key)
@@ -1458,6 +1490,50 @@ jobs:
             ~/.cargo/git
             target
           key: cargo-${{ runner.os }}-lint-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
+
+  lint:
+    name: Lint
+    needs: [lint-gates, lint-fmt, lint-clippy]
+    # `always()` so a FAILED part, and a cancelled run, still run this job,
+    # which then fails on it: without it GitHub would skip `Lint`, and a
+    # skipped required context reads as satisfied.
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Every part must have SUCCEEDED: `failure`, `cancelled` and `skipped`
+      # all red this job, and so does an empty result, which is what a part
+      # missing from `needs` reads as (actionlint also refuses a `needs.<id>`
+      # the job does not list). Plain bash, so `ci_test_coverage_test` runs this
+      # script over each shape with nothing beyond bash installed.
+      - name: Every part of Lint passed
+        env:
+          LINT_GATES: ${{ needs.lint-gates.result }}
+          LINT_FMT: ${{ needs.lint-fmt.result }}
+          LINT_CLIPPY: ${{ needs.lint-clippy.result }}
+        run: |
+          set -euo pipefail
+          bad=""
+          for part in "lint-gates=${LINT_GATES}" "lint-fmt=${LINT_FMT}" "lint-clippy=${LINT_CLIPPY}"; do
+            echo "$part"
+            if [ "${part#*=}" != success ]; then
+              bad="${bad} ${part}"
+            fi
+          done
+          if [ -n "$bad" ]; then
+            echo "::error::Lint parts that did not succeed:${bad}"
+            exit 1
+          fi
+          echo "every part of Lint succeeded"
+
+  # Cross-target type-check for aarch64-unknown-linux-gnu (the
+  # Jetson/Orin robotics deployment target). The monitor-wait/doorbell cfg-matrix
+  # code has per-(os,arch) construction sites; a variant constructed on EVERY cell
+  # except aarch64-linux trips `dead_code = deny` ONLY there, invisible to the
+  # x86_64-linux + macOS-aarch64 runners above (and to local x86_64-linux and
+  # aarch64-macOS machines). `cargo check` (no link; the cross C compiler is for
+  # ring's build script) catches that lint pre-link. Separate job → runs in PARALLEL, no serial
+  # cost on the critical path.
   cross-aarch64-linux:
     name: Cross-check (aarch64-linux)
     runs-on: ubuntu-latest
@@ -1527,7 +1603,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-cross-aarch64-linux-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -1689,7 +1765,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-msrv-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -1874,7 +1950,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-android-check-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -2051,7 +2127,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-local-transport-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -2208,7 +2284,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-period-park-${{ matrix.arch }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -2254,7 +2330,7 @@ jobs:
       actions: write
     timeout-minutes: 30
     env:
-      # Same ENOSPC class as the lint job (see its comment): each example
+      # Same ENOSPC class as the `lint-clippy` job (see its comment): each example
       # workspace compiles the full cerulion_core dep tree into its own
       # target dir, and debuginfo is dead weight for a type-check.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -2378,7 +2454,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-examples-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -2455,7 +2531,7 @@ jobs:
       actions: write
     timeout-minutes: 40
     env:
-      # Same ENOSPC class as the lint/examples jobs: this workspace compiles
+      # Same ENOSPC class as the lint-clippy/examples jobs: this workspace compiles
       # its own copy of the cerulion_core + iceoryx2 + rustdds tree into its
       # own target dir, and debuginfo is dead weight for a test run.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -2549,14 +2625,14 @@ jobs:
       - name: cargo build --tests (every target, no GStreamer installed)
         run: cd examples/go2 && cargo build --timings --workspace --tests
 
-      # CLIPPY, in the job that already has the tree compiled. `lint`'s
+      # CLIPPY, in the job that already has the tree compiled. `lint-clippy`'s
       # `cargo clippy --workspace` covers ROOT-workspace members only, so the
       # demo's 21k lines — the code a user of the Go2 demo reads and copies —
       # had no lint gate at all, while the root workspace runs `dead_code`,
       # `unused_imports` and `unused_variables` at DENY.
       #
-      # Here rather than in `lint` because this job has already paid for the
-      # build (`lint` would otherwise pay a second cold compile of
+      # Here rather than in `lint-clippy` because this job has already paid for
+      # the build (`lint-clippy` would otherwise pay a second cold compile of
       # the iceoryx2 + rustdds tree). Measured clean at `-D warnings` on the
       # committed tree, so it ships blocking with no crate-level `allow`s and
       # no exceptions.
@@ -2622,7 +2698,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-demos-go2-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -2889,8 +2965,9 @@ jobs:
       # `main`'s archive when it has none of its own), then shard 0's own two,
       # then the legacy bare prefix.
       #
-      # (`lint`, `docs` and `netd-wan` have their own namespaces and fall
-      # through their `restore-keys` to shard 0's archive, `cargo-Linux-main-`.
+      # (`lint-clippy`, `docs` and `netd-wan` have their own namespaces, and
+      # `lint-clippy`'s is `lint`. Each falls through its `restore-keys` to
+      # shard 0's archive, `cargo-Linux-main-`.
       # The trim before each save keeps only the units that shard's own cargo
       # commands read.)
       #
@@ -3002,14 +3079,16 @@ jobs:
       # doc-pin: cerulion_core::cerulion_core reads docs
       # doc-pin: cerulion_core::doc_inventory_discipline_test reads docs
       # doc-pin: cerulion_core::serial_discipline_test reads .github
-      # NOT gated by an `if:`, deliberately. `cerulion_core`'s whole-tree walks
+      # NOT gated on the selection, deliberately (only a leg selector splits
+      # shard 2 into its own step). `cerulion_core`'s whole-tree walks
       # (`serial_discipline_test` among them) read every `.rs` file in the source
       # tree, and `tools/ci/observation_edges.tsv` records the package
       # as observing `all`, so it rides every selection that names a package; only
       # a change that selects nothing reaches this step with `[]`. The shard
-      # runner intersects its own package with the selection instead of a step
-      # condition and prints one `selection:` line when the intersection is
-      # empty, so the decision and its log line live in one place.
+      # runner intersects its own package and each `--with` package with the
+      # selection instead of a step condition and prints one `selection:` line
+      # for each package it leaves out, so the decision and its log line live in
+      # one place.
       # The waiver gate asks OTHER test binaries what libtest will do with the
       # arms it declares waived. A shard builds only its own files, so on the
       # shard that runs the gate those binaries are absent, or are a
@@ -3091,10 +3170,26 @@ jobs:
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 4, nextest)
         # Each shard compiles the quarter of the `cerulion_core` test binaries
         # `tools/scripts/ci_test_shard.sh` assigns to it and then runs what it built.
+        # Shard 2 runs the step below instead.
+        if: matrix.shard != 2
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
+      - name: cerulion_core tests and the macro suites (shard ${{ matrix.shard }} of 4, nextest)
+        # The same shard step, with the `#[cerulion_node]` diagnostics suite
+        # (`node_macro_ui`) and the node context helper suite
+        # (`test_node_macro_cdylib`) in the same nextest invocation (`--with`):
+        # their trybuild tests run beside the core tests and build in the same
+        # cargo invocation. The script reads the selection for each package on its
+        # own and prints a `selection:` line for each one it leaves out. A leg
+        # selector of its own, so the coverage walk sees which leg credits the
+        # suites.
+        if: matrix.shard == 2
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+          CI_TEST_SHARD_EXTRA: --timings
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with node_macro_ui --with test_node_macro_cdylib
 
       # The modified raw node fixture once more, built ALONE, the way a user's node
       # builds: `-p` with no sibling package resolves the node's dependency tree
@@ -3241,7 +3336,7 @@ jobs:
           case "${{ matrix.shard }}" in
             0) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_bagd ;;
             1) python3 -B tools/scripts/ci_built_tests.py build --group packages +cerulion_cli cerulion_cli_tui ;;
-            2) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_heaphook cerulion_macros test_node_macro_cdylib +cerulion_cli_engine cerulion_android cerulion_discovery cerulion_msgio ;;
+            2) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_heaphook cerulion_macros +cerulion_cli_engine cerulion_android cerulion_discovery cerulion_msgio ;;
             3) python3 -B tools/scripts/ci_built_tests.py build --group packages rmw_cerulion native_ros2_messages cerulion_bag cerulion_wireclient cerulion_connectd cerulion_netd --features cerulion_netd/wan ;;
           esac
           df -h / || true
@@ -3283,11 +3378,14 @@ jobs:
       # to 51-63 s per shard outside the tail and no other binary exceeds
       # 18 s, so the file map in `ci_test_shard.sh` stays round-robin and no
       # second pin is warranted. The package steps are the whole imbalance.
-      # (The tail itself is not addressable: splitting it by expectation
-      # WITHIN the job measured +158 s of trybuild work, +2.4 min of
-      # shard-step wall. It is PINNED so it cannot relocate
-      # when an unrelated test file is added — evidence and the bar for a
-      # second name at `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. And it does
+      # (The tail is now the `node_macro_ui` package, whose tests ride this
+      # shard's core nextest invocation (`--with node_macro_ui`): its
+      # compile-pass programs build as binaries of that package, so trybuild
+      # checks the compile-fail set alone, in one dependency pass, and
+      # `.config/nextest.toml` starts that test right after the timing tests
+      # that claim every slot. The emptied
+      # core binary stays PINNED, which keeps every other file on its shard; see
+      # `PINNED_TEST` in `tools/scripts/ci_test_shard.sh`. The suite does
       # NOT get its own job: a new job is not in branch protection's required
       # list, which would silently demote the only compile-fail gate to
       # advisory.)
@@ -3453,16 +3551,6 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
-      - name: node context helper compile tests
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p test_node_macro_cdylib --lib
-      - name: selection marker, test_node_macro_cdylib
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
-
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
       #
@@ -3583,6 +3671,7 @@ jobs:
         run: |
           echo "selection: skipped cerulion_android (selected: $SELECTED)"
       # doc-pin: cerulion_cli::graph_run_validate_gate_e2e_test reads docs
+      # doc-pin: cerulion_cli::packaged_harness_install_test reads tools
       - name: CLI binary tests
         if: matrix.shard == 1
         run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli
@@ -3726,7 +3815,7 @@ jobs:
           case "${{ matrix.shard }}" in
             0) set -- --floor 27 ;;
             1) set -- --floor 67 ;;
-            2) set -- --floor 121 --not-run cerulion_android:mdns_beacon_test \
+            2) set -- --floor 120 --not-run cerulion_android:mdns_beacon_test \
                  --not-run cerulion_android:embedded_remote_plane_test --not-run cerulion_android:jni_java_test ;;
             3) set -- --floor 114 ;;
           esac
@@ -3755,7 +3844,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-test-linux-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -3798,7 +3887,7 @@ jobs:
   # three constraints: the iroh-tree packages (wireclient, connectd, netd-wan)
   # stay together so that ~390-crate tree compiles once; `--lib` and the
   # doctests ride shard 0 because the shard script puts the lib unit tests
-  # there; and the trybuild tail lands on `PINNED_SHARD % 3` = shard 2, so
+  # there; and the trybuild suite runs on shard 2, so
   # shard 2 gets the lightest package set. Re-tilt if a run shows the legs
   # more than 5 min apart WITH THE SAME CACHE STATE (comparing a warm leg
   # against a cold one measures the cache, not the map).
@@ -3845,10 +3934,42 @@ jobs:
           key: cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}
   test-macos:
     name: Test (macOS) shard ${{ matrix.shard }}
-    runs-on: macos-latest
-    # `needs: [changes]` for the per-package selection only. Every leg still
-    # runs and still reports its own context, and every leg now waits for the
-    # classifier (about a minute) before it starts, on every event.
+    # THE RUNNER FOLLOWS THE `code` CLASS. Where `code` is `true` every leg runs
+    # on macOS with every step its own conditions select. That is every run
+    # that selects every package (`push`, `workflow_dispatch`, every
+    # `merge_group` run that selects every package, and every run under
+    # `CI_SELECTION=off`) and every narrowed run whose change reaches a
+    # package. A classifier that completed reports
+    # `code=false` only for a change that reaches no package at all; then
+    # every leg runs on `ubuntu-latest` and skips every step but the selection
+    # markers. The legs and their names do not depend on the runner, so each
+    # leg still reports its own required context.
+    #
+    # EVERY STEP IS GATED, so no step meets a runner it was not written for.
+    # Each one carries `needs.changes.outputs.code == 'true'` as a top-level
+    # `&&` term (alone, or beside its leg selector, event test or status
+    # call), or the per-package gate, which is false whenever `code` is: the
+    # classifier reports `pkgs=[]` whenever it reports `code=false`. The
+    # selection markers are the one exception: they print one line and read
+    # nothing from the checkout. The cache prune and save carry the `code` term
+    # too, because `runner.os` in their key would name the Linux namespace on
+    # a Linux leg.
+    #
+    # FAIL CLOSED WHEN THE CLASSIFIER FAILS. Its outputs are then the empty
+    # string: the expression below picks `ubuntu-latest`, every `code` gate is
+    # false, and the first condition that reaches `fromJSON('')` is an
+    # expression error that fails its step. Every leg reaches one: a per-package
+    # gate whose leg selector matches gets there first, and otherwise a
+    # selection marker does, whose condition carries no leg selector to
+    # short-circuit ahead of it. So every leg reds.
+    # `cerulion_cli_engine::ci_test_coverage_test` holds this job to that
+    # shape: this exact routing expression, a gate on every step, and at least
+    # one marker whose step only prints its line.
+    runs-on: ${{ needs.changes.outputs.code == 'true' && 'macos-latest' || 'ubuntu-latest' }}
+    # `needs: [changes]` for the selection and for the runner choice above.
+    # Every leg still runs and still reports its own context, and every leg
+    # waits for the classifier (about a minute) before it starts, on every
+    # event.
     needs: [changes]
     # `!cancelled()` is load bearing, and it is the only job-level condition
     # this file's coverage walk sanctions. `needs: [changes]` makes the
@@ -3856,8 +3977,9 @@ jobs:
     # when its dependency fails; a skipped required context counts as
     # SATISFIED, so without this guard a failed classifier would wave the pull
     # request through with this job's contexts never run. With it the job runs,
-    # `needs.changes.outputs.pkgs` is the empty string, every gated step's
-    # `fromJSON('')` is an expression error, the step fails and the job reds.
+    # `needs.changes.outputs.pkgs` is the empty string, and the first condition
+    # that reaches `fromJSON('')` is an expression error that fails its step
+    # (FAIL CLOSED above), so the job reds.
     if: ${{ !cancelled() }}
     # `actions: write` is for the cache prune step only (it deletes stale
     # entries of this job's cache namespace). Every other step needs read.
@@ -3919,14 +4041,16 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.outputs.code == 'true'
 
       - name: Log the runner's CPU and memory
+        if: needs.changes.outputs.code == 'true'
         run: |
           mkdir -p "$RUNNER_TEMP/cargo-timings"
           { uname -m; if [ "$RUNNER_OS" = macOS ]; then sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize; else nproc; lscpu | grep -m1 'Model name' || true; grep MemTotal /proc/meminfo; fi; } | tee "$RUNNER_TEMP/cargo-timings/runner.txt"
 
       - name: Release installer self-test
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.changes.outputs.code == 'true'
         run: ./tools/scripts/install.sh --self-test
 
       # This job has NO reclaim step and, until now, no `df` anywhere —
@@ -3947,7 +4071,7 @@ jobs:
       # An unparseable figure simply skips the reclaim (verified on real BSD `df`:
       # empty and non-numeric both fall through the guard, exit 0).
       - name: Report free disk (reclaim only if tight)
-        if: runner.environment == 'github-hosted'
+        if: runner.environment == 'github-hosted' && needs.changes.outputs.code == 'true'
         run: |
           df -h / || true
           avail=$(df -g / | awk 'NR==2 {print $4}') || true
@@ -3960,6 +4084,7 @@ jobs:
           fi
 
       - name: Raise the open-file limits
+        if: needs.changes.outputs.code == 'true'
         # A shared memory creation on shard 0 failed with ENFILE, which
         # iceoryx2 reports as "the system-wide file handle limit was reached"
         # and a caller sees only as a creation that failed with no errno. In
@@ -3994,6 +4119,7 @@ jobs:
           echo "ulimit -n soft: $(ulimit -Sn) hard: $(ulimit -Hn)"
 
       - name: Install Rust toolchain
+        if: needs.changes.outputs.code == 'true'
         uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
           toolchain: stable
@@ -4015,6 +4141,7 @@ jobs:
       # namespace (`Linux-shard1`, `macOS-shard2`, ...) or is `all`; the default
       # names `Linux` and `macOS`, shard 0's, so until then only shard 0 saves.
       - name: Cache cargo, per-shard archive (restore)
+        if: needs.changes.outputs.code == 'true'
         id: cache-restore-1
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -4043,6 +4170,7 @@ jobs:
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
+          && needs.changes.outputs.code == 'true'
         run: bash tools/scripts/ci_cache_trim_target.sh age target
 
       # Build the cdylib test fixtures (loaded via libloading at runtime, so
@@ -4051,22 +4179,26 @@ jobs:
       # list (which had gone stale: a deleted crate + two missing ones). Same
       # spirit as the default-cover test model below.
       - name: Build test cdylibs
+        if: needs.changes.outputs.code == 'true'
         run: python3 -B tools/scripts/ci_built_tests.py phase workspace -- cargo build --timings --workspace
 
 
       # The pinned tool tarballs the `tool-tarballs` job verified and saved.
       # On a miss the install below downloads, as it does with no cache.
       - name: Tool tarball cache key
+        if: needs.changes.outputs.code == 'true'
         id: tool-tarballs-key
         run: ./tools/scripts/tool_tarball_cache.sh key >> "$GITHUB_OUTPUT"
 
       - name: Restore the pinned tool tarballs
+        if: needs.changes.outputs.code == 'true'
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/cerulion-tool-tarballs
           key: ${{ steps.tool-tarballs-key.outputs.key }}
 
       - name: Install cargo-nextest
+        if: needs.changes.outputs.code == 'true'
         env:
           CERULION_TOOL_TARBALLS: ~/.cache/cerulion-tool-tarballs
         run: ./tools/scripts/install_nextest.sh
@@ -4092,8 +4224,8 @@ jobs:
       # `cerulion_cli_engine/tests/ci_test_coverage_test.rs`, which walks every
       # job a pull request can fail and this job is one of them.
       # `--check cerulion_core 3` proves the partition
-      # (88 + 88 + 89 files, `PINNED_SHARD % 3 == 2` so the trybuild tail lands
-      # on shard 2, which is why shard 2 gets the lightest package set below).
+      # (108 + 108 + 109 files; the trybuild suite runs on shard 2, which is why
+      # shard 2 gets the lightest package set below).
       # ---------------------------------------------------------------
       # BUILD ONCE and the doctests, as in `test-linux` (see that job's step of
       # this name). It runs before the first package step, the credit death
@@ -4104,13 +4236,14 @@ jobs:
       # switches vizd's decoder from the dlopen path to the compiled one, so
       # its tests keep the features they build with alone.
       - name: Build this shard's package tests once and run their doctests
+        if: needs.changes.outputs.code == 'true'
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: |
           case "${{ matrix.shard }}" in
             0) python3 -B tools/scripts/ci_built_tests.py build --group packages +cerulion_cli rmw_cerulion cerulion_bagd ;;
             1) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_bag +cerulion_cli_engine cerulion_cli_tui cerulion_wireclient cerulion_connectd cerulion_netd --features cerulion_netd/wan ;;
-            2) python3 -B tools/scripts/ci_built_tests.py build --group packages native_ros2_messages cerulion_macros test_node_macro_cdylib cerulion_discovery cerulion_msgio cerulion_viz go2_tf
+            2) python3 -B tools/scripts/ci_built_tests.py build --group packages native_ros2_messages cerulion_macros cerulion_discovery cerulion_msgio cerulion_viz go2_tf
                python3 -B tools/scripts/ci_built_tests.py build --group vizd cerulion_vizd ;;
           esac
 
@@ -4126,6 +4259,7 @@ jobs:
       # job. `lsof` runs at 1 Hz rather than 10 because it costs a process per
       # pid per tick.
       - name: Start the descriptor sampler
+        if: needs.changes.outputs.code == 'true'
         run: |
           cat > "$RUNNER_TEMP/sampler.py" <<'PY'
           import datetime, glob, os, signal, subprocess, sys, time
@@ -4281,11 +4415,12 @@ jobs:
       # covered set, and emptied the set that gate's floor requires to be
       # non-empty.
       - name: Credit death arms first (shard 0)
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && needs.changes.outputs.code == 'true'
         run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli --test credit_death_e2e_test c7_
 
-      # NOT gated by an `if:`: see the twin step in `test-linux`. `cerulion_core`
-      # observes the whole tree, so the shard runner does the intersection.
+      # Gated on `code` alone, never on a package: see the twin step in
+      # `test-linux`, which carries no condition. Its script reads the selection
+      # itself (`ci_test_shard.sh --selected cerulion_core`).
       # The waiver gate asks OTHER test binaries what libtest will do with the
       # arms it declares waived. A shard builds only its own files, so on the
       # shard that runs the gate those binaries are absent, or are a
@@ -4311,6 +4446,7 @@ jobs:
       # here and is owed; the shard map above is packed against measured walls, so
       # the figure belongs beside its other terms once one run has it.
       - name: Build the binaries the waiver gate asks (its shard only)
+        if: needs.changes.outputs.code == 'true'
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
         run: |
@@ -4364,11 +4500,25 @@ jobs:
           fi
           echo "built $total waived test binaries for the gate"
 
+      # Each `cerulion_core` shard step carries its leg selector and the `code`
+      # gate, never a per-package gate: `cerulion_core` observes the whole
+      # tree, so the shard runner does the intersection, and `code` is false
+      # only where that intersection is empty anyway.
       - name: cerulion_core tests (shard ${{ matrix.shard }} of 3, nextest)
+        if: matrix.shard != 2 && needs.changes.outputs.code == 'true'
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
+      - name: cerulion_core tests and the macro suites (shard ${{ matrix.shard }} of 3, nextest)
+        # Shard 2's shard step, with the `#[cerulion_node]` diagnostics suite and
+        # the node context helper suite in the same nextest invocation, as in
+        # `test-linux`.
+        if: matrix.shard == 2 && needs.changes.outputs.code == 'true'
+        env:
+          CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
+          CI_TEST_SHARD_EXTRA: --timings
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 --with node_macro_ui --with test_node_macro_cdylib
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
@@ -4381,7 +4531,7 @@ jobs:
       # already-built rlib. Shard 0 for the same reason `--lib` does: it has to
       # happen exactly once.
       - name: cerulion_core doctests
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && needs.changes.outputs.code == 'true'
         run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core-doctests -- cargo test --timings -p cerulion_core --doc
 
       # Shard assignment is macOS's OWN 3-way tilt (it does not mirror
@@ -4391,7 +4541,9 @@ jobs:
       #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
       #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
       #            tree kept together (wireclient, connectd, netd-wan)
-      #   shard 2  the pinned trybuild tail, native_ros2_messages, macros,
+      #   shard 2  the cerulion_node diagnostics and node context helper
+      #            suites (in the core shard step),
+      #            native_ros2_messages, macros,
       #            discovery, and the folded viz suites
       #
       # Every `run:` line is byte-identical to the 2-way map, so nothing about
@@ -4457,27 +4609,17 @@ jobs:
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
 
-      - name: node context helper compile tests
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p test_node_macro_cdylib --lib
-      - name: selection marker, test_node_macro_cdylib
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
-
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite
       # is the single most expensive package step on this job (10.4 min warm)
       # and the engine's is the third (6.2 min).
       - name: CLI engine tests
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.changes.outputs.code == 'true'
         # --no-fail-fast so ONE run reports every failing binary: cargo stops at
         # the first by default, which is why a per-binary waiver took three heads.
         run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli_engine --no-fail-fast
       - name: CLI binary tests
-        if: matrix.shard == 0
+        if: matrix.shard == 0 && needs.changes.outputs.code == 'true'
         # --no-fail-fast so ONE run reports every failing binary: cargo stops at
         # the first by default, which is why a per-binary waiver took three heads.
         run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p cerulion_cli --no-fail-fast
@@ -4563,7 +4705,7 @@ jobs:
       # the red PRs. macOS has no measured ENOSPC — see the reclaim step at the
       # top of this job — so this line exists to say whether it ever gets close.
       - name: Report free disk before the wan step
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && needs.changes.outputs.code == 'true'
         run: df -h / || true
 
       # cerulion_netd's iroh WAN plane (loopback iroh + iceoryx2). The
@@ -4629,7 +4771,8 @@ jobs:
       # its own, so the one line that says what the selection dropped lives
       # here, beside it, under the exact negation of its condition.
       # `cerulion_cli_engine::ci_test_coverage_test` requires one of these
-      # for every gated step in this job.
+      # for every package a step of this job is gated on; a step gated on
+      # `code` alone needs none.
       - name: selection marker, cerulion_viz
         if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_viz') }}
         env:
@@ -4639,11 +4782,12 @@ jobs:
 
       # The audit, as in `test-linux`.
       - name: Every built test binary ran and nothing rebuilt
+        if: needs.changes.outputs.code == 'true'
         run: |
           case "${{ matrix.shard }}" in
             0) set -- --floor 139 ;;
             1) set -- --floor 138 ;;
-            2) set -- --floor 69 ;;
+            2) set -- --floor 68 ;;
           esac
           python3 -B tools/scripts/ci_built_tests.py audit "$@"
 
@@ -4652,7 +4796,7 @@ jobs:
       # a process this step starts, because the limit a running process holds
       # is the one it inherited and not what `launchctl limit` reports.
       - name: Descriptor snapshot on failure
-        if: ${{ failure() }}
+        if: failure() && needs.changes.outputs.code == 'true'
         run: |
           sysctl kern.num_files kern.maxfiles kern.maxfilesperproc || true
           python3 -c 'import resource; s, h = resource.getrlimit(resource.RLIMIT_NOFILE); print("getrlimit RLIMIT_NOFILE soft", s, "hard", h)'
@@ -4685,7 +4829,7 @@ jobs:
           tail -200 "$RUNNER_TEMP/descriptors.log" 2>/dev/null || echo "no sampler log"
 
       - name: Stop the descriptor sampler
-        if: ${{ always() }}
+        if: always() && needs.changes.outputs.code == 'true'
         run: |
           pid="$(cat "$RUNNER_TEMP/sampler.pid" 2>/dev/null || true)"
           if [ -z "$pid" ]; then
@@ -4733,7 +4877,7 @@ jobs:
           fi
 
       - name: Upload the descriptor sampler log
-        if: ${{ always() }}
+        if: always() && needs.changes.outputs.code == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: descriptors-macos-shard-${{ matrix.shard }}-${{ github.sha }}
@@ -4741,7 +4885,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Collect the cargo timing reports
-        if: always()
+        if: always() && needs.changes.outputs.code == 'true'
         timeout-minutes: 2
         run: |
           for dir in target; do
@@ -4749,10 +4893,10 @@ jobs:
           done
 
       - name: Upload the cargo timing reports
-        if: always()
+        if: always() && needs.changes.outputs.code == 'true'
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-test-macos-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -4877,6 +5021,7 @@ jobs:
           && github.event_name != 'merge_group'
           && github.ref == 'refs/heads/main'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
+          && needs.changes.outputs.code == 'true'
         run: bash tools/scripts/ci_cache_trim_target.sh trim target
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
@@ -4885,6 +5030,7 @@ jobs:
         if: >-
           github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && needs.changes.outputs.code == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: bash tools/scripts/ci_cache_prune.sh "cargo-${{ runner.os }}${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('Cargo.lock') }}"
@@ -4898,6 +5044,7 @@ jobs:
           steps.cache-restore-1.outputs.cache-hit != 'true'
           && github.event_name != 'merge_group'
           && (github.ref == 'refs/heads/main' || (env.CACHE_SAVE_ON_PULL_REQUEST != '' && github.event.pull_request.head.repo.full_name == github.repository))
+          && needs.changes.outputs.code == 'true'
           && steps.cache-prune.outputs.proceed == 'true'
           && (env.CACHE_SAVE_NAMESPACES == 'all' || contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -4934,7 +5081,7 @@ jobs:
       # is reused.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust toolchain
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
@@ -4945,7 +5092,7 @@ jobs:
       - name: Cache cargo (restore)
         id: cache-restore-1
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_core')
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -5012,7 +5159,7 @@ jobs:
     # `fromJSON('')` is an expression error, the step fails and the job reds.
     #
     # NO `lint` in `needs:`: a `lint` verdict is not a data dependency for a
-    # test job, so this job starts beside `lint`, as `test-linux` and
+    # test job, so this job starts beside `lint`'s parts, as `test-linux` and
     # `test-macos` do. `Lint` is its own required context, and a red one still
     # blocks the pull request.
     if: ${{ !cancelled() }}
@@ -5307,7 +5454,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-crate-tests-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -5388,7 +5535,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Log the runner's CPU and memory
         run: |
@@ -5443,7 +5590,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-rcpd-eye-host-repeat-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -5597,7 +5744,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-python-client-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -5661,7 +5808,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Harness scripts and tests
         run: |
@@ -5871,7 +6018,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-test-latency-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -6011,7 +6158,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-cli-e2e-latency-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -6262,9 +6409,10 @@ jobs:
     permissions:
       contents: read
       actions: write
-    # No `needs:`, so no job-level condition: this job starts beside `lint`
-    # rather than after it, and nothing it depends on can skip it. `Lint` is
-    # its own required context, and a red one still blocks the pull request.
+    # No `needs:`, so no job-level condition: this job starts beside `lint`'s
+    # parts rather than after `lint`, and nothing it depends on can skip it.
+    # `Lint` is its own required context, and a red one still blocks the pull
+    # request.
     # 30, and the number follows the MACHINE rather than the job. On a 4-core
     # runner the healthy build ran 8m56s-9m18s and 15 was ample; on a 2-core one
     # `cargo doc --workspace` takes about twice that, and 15 became a coin flip:
@@ -6280,7 +6428,7 @@ jobs:
     # request cannot merge past.
     timeout-minutes: 30
     env:
-      # Same ENOSPC class as the lint job (see its comment): rustdoc's dep
+      # Same ENOSPC class as the `lint-clippy` job (see its comment): rustdoc's dep
       # builds don't need debuginfo either, and this job restores the same
       # ever-growing target cache.
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -6336,20 +6484,20 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-docs-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
           retention-days: 7
           if-no-files-found: ignore
 
-  # `wan` went DEFAULT-ON, so the workspace `lint` clippy + the
+  # `wan` went DEFAULT-ON, so the workspace `lint-clippy` clippy + the
   # `docs` job now ALSO compile netd's iroh tree via feature unification — this
   # dedicated job is now belt-and-suspenders (its explicit `--features wan`
   # invocations are redundant-but-harmless) PLUS the lean-variant rot-guard: it lints
   # the `--no-default-features` (zenoh-only) build so the opt-out path keeps
   # compiling. It still compiles the iroh tree COLD on its own budget, keeping the
-  # explicit-feature + lean-variant analysis OFF the tight `lint`/`docs` gates. Pure
+  # explicit-feature + lean-variant analysis OFF the tight `lint-clippy`/`docs` gates. Pure
   # analysis (clippy + doc), so no debuginfo. It gates NO other job.
 
       # Cache save policy: see the CACHE_SAVE_* keys in the workflow `env` block.
@@ -6388,9 +6536,10 @@ jobs:
     permissions:
       contents: read
       actions: write
-    # No `needs:`, so no job-level condition: this job starts beside `lint`
-    # rather than after it, and nothing it depends on can skip it. `Lint` is
-    # its own required context, and a red one still blocks the pull request.
+    # No `needs:`, so no job-level condition: this job starts beside `lint`'s
+    # parts rather than after `lint`, and nothing it depends on can skip it.
+    # `Lint` is its own required context, and a red one still blocks the pull
+    # request.
     timeout-minutes: 25
     env:
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -6466,7 +6615,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-netd-wan-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings
@@ -6487,7 +6636,7 @@ jobs:
   # test files, so treat them as as-of-this-PR snapshots rather than facts to
   # re-verify.
   #
-  # WHY THIS JOB EXISTS. `cargo clippy --workspace --all-targets` (the `lint`
+  # WHY THIS JOB EXISTS. `cargo clippy --workspace --all-targets` (the `lint-clippy`
   # job) COMPILES every viz test target, so a compile break was always caught —
   # but no job EXECUTED a viz test binary other than the two the predecessor job
   # named, so a FAILING ASSERTION shipped green. A pin that cannot fail a PR is
@@ -6715,7 +6864,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # The iroh tree needs link headroom on the stock runner.
       - name: Free disk space
@@ -6796,7 +6945,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Reclaim preinstalled SDK bloat (crib netd-wan) so the restored target
       # and the iroh tree fit on the stock runner.
@@ -6823,7 +6972,7 @@ jobs:
 
       - name: Cache cargo (restore)
         if: contains(fromJSON(needs.changes.outputs.pkgs), 'cerulion_netd')
-        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -6871,7 +7020,7 @@ jobs:
     # `fromJSON('')` is an expression error, the step fails and the job reds.
     #
     # NO `lint` in `needs:`: a `lint` verdict is not a data dependency for a
-    # test job, so this job starts beside `lint`, as `test-linux` and
+    # test job, so this job starts beside `lint`'s parts, as `test-linux` and
     # `test-macos` do. `Lint` is its own required context, and a red one still
     # blocks the pull request.
     if: ${{ !cancelled() }}
@@ -6896,7 +7045,7 @@ jobs:
     # That 40 was set for a Linux-only job building TWO test binaries against a
     # WARM cache; this builds 29, and while it still had a macOS leg that leg
     # was the first job in the workflow ever to
-    # cold-compile the rerun tree (`lint`,
+    # cold-compile the rerun tree (`lint-clippy`,
     # which compiles it via `clippy --all-targets`, is ubuntu-only). Both test
     # jobs were raised 45 → 55 for exactly that reason on the iroh tree. A
     # cold-cache timeout is self-sustaining — the job dies before `actions/cache`
@@ -6923,7 +7072,7 @@ jobs:
           { uname -m; if [ "$RUNNER_OS" = macOS ]; then sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize; else nproc; lscpu | grep -m1 'Model name' || true; grep MemTotal /proc/meminfo; fi; } | tee "$RUNNER_TEMP/cargo-timings/runner.txt"
 
       # Linux-only: the rerun SDK tree needs link headroom on the stock runner
-      # (the demos-go2/lint ENOSPC class). macOS runners have ample disk.
+      # (the demos-go2/lint-clippy ENOSPC class). macOS runners have ample disk.
       #
       # This is `test-linux`'s FULLER reclaim, not the predecessor job's shorter
       # one, because the two changes that came with this job both push the other
@@ -6960,7 +7109,7 @@ jobs:
       #
       # The two real reasons:
       #   1. PROFILE. The shared key is a single namespace that five jobs write
-      #      under at different `CARGO_PROFILE_DEV_DEBUG` settings (`lint` and
+      #      under at different `CARGO_PROFILE_DEV_DEBUG` settings (`lint-clippy` and
       #      `docs` at "0", `test-linux` and `test-macos` at
       #      `line-tables-only`). Every mismatch re-fingerprints and rebuilds
       #      what it restored. A private namespace means this job's `line-tables-only`
@@ -7141,7 +7290,7 @@ jobs:
         if: always()
         continue-on-error: true
         timeout-minutes: 5
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-timings-viz-tests-${{ matrix.lane }}-${{ matrix.os }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/cargo-timings

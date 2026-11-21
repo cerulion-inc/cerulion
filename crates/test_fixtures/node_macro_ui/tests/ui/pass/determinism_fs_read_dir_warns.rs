@@ -1,4 +1,4 @@
-#![allow(unexpected_cfgs)]
+#![allow(unexpected_cfgs, clippy::doc_lazy_continuation)]
 //! Pass case: `fs::read_dir` is a WARN (IO-class), NOT a deny.
 //! Calling it in a tick body WITHOUT any opt-out attribute must COMPILE — the
 //! macro half emits deny errors only and stays silent for warn-class symbols

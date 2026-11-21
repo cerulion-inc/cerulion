@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // The happy shapes must COMPILE.
 //
 // A pass fixture is the anti-tautology half of the compile-fail group: without

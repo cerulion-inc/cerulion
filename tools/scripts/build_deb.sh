@@ -11,7 +11,8 @@
 # librmw_cerulion.so (the ROS 2 Jazzy rmw)
 # and libcerulion_heaphook.so (the LD_PRELOAD heap hook the CLI injects into
 # ROS 2 nodes). All of them land in /usr/bin so the CLI finds its siblings by
-# its own directory.
+# its own directory. So does harness/, the agent harness tree the archive
+# carries on every target: the CLI resolves it in its own directory too.
 #
 # A release archive also carries install_rust.sh, the compiler bootstrap the
 # tarball installer runs for itself. A package cannot run it: apt installs
@@ -143,6 +144,14 @@ for library in $shipped_libraries; do
     fi
 done
 
+# The agent harness. Every archive this script packages carries it, and the
+# CLI looks for it beside itself, so a package without it is refused like one
+# without a binary. The listing check above already refused any entry inside
+# it that is not a regular file or a directory.
+if [ ! -d "$archive_dir/harness" ] || [ -L "$archive_dir/harness" ]; then
+    die "archive is missing harness"
+fi
+
 # The compiler bootstrap is install_rust.sh alone, run with no arguments. An
 # archive that still carries rustc-version.txt is a 1.x archive, whose helper
 # needs that file as an argument; package it with the build_deb.sh of its own
@@ -172,6 +181,13 @@ for library in $staged_libraries; do
     cp "$archive_dir/$library" "$stage/usr/bin/$library"
     chmod 0644 "$stage/usr/bin/$library"
 done
+# The harness tree sits beside the binaries as well. Its directories take
+# 0755, a file the archive marks executable 0755 and every other file 0644,
+# whatever the umask.
+cp -R "$archive_dir/harness" "$stage/usr/bin/harness"
+find "$stage/usr/bin/harness" -type d -exec chmod 0755 {} +
+find "$stage/usr/bin/harness" -type f -perm -0100 -exec chmod 0755 {} +
+find "$stage/usr/bin/harness" -type f ! -perm -0100 -exec chmod 0644 {} +
 for notice in $notice_files; do
     cp "$archive_dir/$notice" "$stage/usr/share/doc/cerulion/$notice"
     chmod 0644 "$stage/usr/share/doc/cerulion/$notice"
@@ -244,8 +260,9 @@ Description: Zero-copy deterministic communication for real-time robotics
  Cerulion provides deterministic, zero-copy communication tools for robotics.
  The package includes the CLI and its daemon siblings (network, desk-side
  connect and robot-side remote access), plus librmw_cerulion.so, the ROS 2
- Jazzy rmw that cerulion ros2 run and cerulion ros2 launch load, and
- libcerulion_heaphook.so, the heap hook those verbs preload into ROS 2 nodes.
+ Jazzy rmw that cerulion ros2 run and cerulion ros2 launch load,
+ libcerulion_heaphook.so, the heap hook those verbs preload into ROS 2 nodes,
+ and /usr/bin/harness, the agent harness the CLI reads beside itself.
  ROS 2 Jazzy itself (ros-jazzy-ros-base on Ubuntu 24.04) is installed
  separately.
 EOF

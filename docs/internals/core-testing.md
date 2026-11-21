@@ -16,11 +16,11 @@ document; when a row and the file's own header disagree, the header wins; fix th
   depth 1 and takes every file whose position is `index mod count`, so a new test file
   joins a shard with nothing to edit, with ONE named exception: the script PINS
   `macro_compile_fail_test` to shard `PINNED_SHARD % count` (2 of 4 on Linux, 2 of 3 on
-  macOS), because that trybuild harness is the serial tail: one test that is essentially the
-  whole of whichever shard holds it. Unpinned, its position shifts whenever any unrelated
-  test file is added, moving which runner is the critical path. Its SIZE is a per-run
-  measurement this doc does not restate: the reading lives in `PINNED_TEST` in that script,
-  which is also where the bar for adding a second pinned name lives. `--check` proves the
+  macOS) and holds it out of the rotation. The blocking trybuild suite it held is now the
+  `node_macro_ui` package, whose tests run in that same shard's nextest invocation
+  (`--with node_macro_ui`); the pin keeps every
+  other file on the shard the package map was balanced against. `PINNED_TEST` in that
+  script is where the bar for adding a second pinned name lives. `--check` proves the
   pin landed where declared, and that the partition is total and disjoint. The script execs
   `cargo nextest run --profile ci` (install: `tools/scripts/install_nextest.sh`). It does
   NOT pass `--test-threads=1`, and the absence is deliberate: nextest gives each test its
@@ -71,9 +71,12 @@ cargo test -p cerulion_core --test <name> -- --test-threads=1
 cargo test -p cerulion_core --test latency_threshold_test --release -- --test-threads=1
 cargo test -p cerulion_core --test graph_latency_test --release -- --test-threads=1
 
-# Trybuild: ignored toolchain-fragile groups; re-bless after diagnostic edits:
+# Trybuild: the blocking suites are their own packages; re-bless after diagnostic edits:
+cargo test -p node_macro_ui -p test_node_macro_cdylib
+TRYBUILD=overwrite cargo test -p node_macro_ui --test compile_fail
+TRYBUILD=overwrite cargo test -p test_node_macro_cdylib --test context_helpers
+# The ignored toolchain-fragile groups stay in cerulion_core:
 cargo test -p cerulion_core --test macro_compile_fail_test -- --ignored
-TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test
 
 # After touching notify elision or the live-loop boundary resweep:
 cargo test -p cerulion_core --test notify_elision_resweep_iox2_test \
@@ -439,7 +442,7 @@ needs a real `GraphRuntime`, a real SHM mapping or a real `fork(2)` to be observ
 | `macro_lifecycle_test.rs` | User-defined `init`/`shutdown` lifecycle methods are invoked. | parallel | none |
 | `macro_shim_methods_test.rs` / `macro_chunks_ef_adversarial_test.rs` | Injected shim methods reach the runtime; auto-`Default` + hidden context fields adversarial. | parallel | none |
 | `cerulion_node_impl_test.rs` | The AST-rewriting impl macro end-to-end. | parallel | none |
-| `macro_compile_fail_test.rs` | trybuild: blocking own-`compile_error!` diagnostics; `#[ignore]`'d toolchain-fragile rustc-diagnostic groups. | parallel | none |
+| `macro_compile_fail_test.rs` | trybuild: the `#[ignore]`'d toolchain-fragile rustc-diagnostic groups. The blocking own-`compile_error!` diagnostics are the `node_macro_ui` package. | parallel | none |
 | `in_code_pipeline_test.rs` | Two multi-node pipelines driven as tests: a macro-defined pipeline builds and steps over the real transport, `step(delta)` advances the clock exactly once, the camera and detector pair publishes fully initialised frames and counts the lit pixels; hand oracles from the period arithmetic. | parallel | none |
 | `macro_params_test.rs` | `#[param]` on an in-process macro node: specs reach `info()`, defaults land at construction, values handed over through `NodeEntry::set_params` reach `init` and the first tick, an undeclared name is refused rather than dropped, and a param is not node state (left out of the shape, and a restore keeps the graph's value); hand oracles from the node body. | parallel | none |
 

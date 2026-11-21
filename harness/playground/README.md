@@ -3,6 +3,8 @@
 Experimental. `cerulion rcp --sim` starts this server: the harness's MCP tools on a simulated robot arm, one
 episode per client session, on your own machine. Your model client does the thinking; the simulator runs here.
 
+To serve it through `cerulion`, as a new user does, follow the [quickstart](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/README.md#quickstart).
+
 It also runs on its own, with the Python of the harness install (it carries the MCP SDK and the server's pins):
 
 ```bash

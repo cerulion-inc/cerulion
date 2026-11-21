@@ -37,11 +37,9 @@ Codegen/rewriter changes run core and cerulion tests with root serial discipline
   `rewriter_var_field_assign_test` (parallel-safe); `macro_cdylib_test`,
   `macro_graph_test`, `abi_version_mismatch_test`, `lazy_loan_iox2_test` need
   `-- --test-threads=1` (they touch the process-global transport singleton).
-- Diagnostics: `cargo test -p cerulion_core --test macro_compile_fail_test` (trybuild).
-  Re-bless after a deliberate message change:
-  `TRYBUILD=overwrite cargo test -p cerulion_core --test macro_compile_fail_test`.
-  The rustc-rendered groups (`tests/ui/const_eval/`, `tests/ui/type_error/`) are
-  `#[ignore]`d (toolchain-fragile); run them via `-- --ignored`.
+- Diagnostics: `cargo test -p node_macro_ui` (trybuild, then the pass programs). Re-bless:
+  `TRYBUILD=overwrite cargo test -p node_macro_ui --test compile_fail`. Rustc-rendered
+  groups: core's `macro_compile_fail_test`, `#[ignore]`d; run via `-- --ignored`.
 
 ## Gotchas
 - `Ident::to_string()` keeps the `r#` prefix: strip it before `format_ident!` (it panics) and

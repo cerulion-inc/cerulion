@@ -1133,6 +1133,11 @@ DRIVERS.
 | `coordination` | "Which execution contract was I recorded under?": `lockstep` or `free_run` |
 | `node_external` | "Which of my nodes ran as `external` (driver) nodes?": a map of node id to `true` or `false`, one entry for every node of the recorded graph but its `ros2:` entries, `true` where the loaded node declared the `external` policy. A resim judges drivers by it and refuses a build that declares any node differently (exit 2, naming each node). ABSENT on a bag recorded before the key existed: the build you replay declares the drivers, and a warning says so. A value that is not such a map (`null` included), or one that names a node the embedded graph does not run or leaves one out, is refused with exit 2. A Cerulion older than the key reads the bag and ignores it |
 
+`recorder.json` also carries `env_names_left_out`: how many environment
+variables the bag's `env.json` left out because their name is not valid UTF-8,
+`0` when none was. It is data, not part of the contract: a replay does not read
+it. A bag recorded before the count has no such key.
+
 ### The `coordination` contract, and what each reading does
 
 | Stamp | Bag it came from | Behaviour |

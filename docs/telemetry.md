@@ -10,6 +10,7 @@ off.
 Events are sent only by a build that has a telemetry key. The key is baked
 into the release artifacts (the install script, the Debian package and the
 Homebrew formula) when they are built, if the release pipeline provides one.
+The 2.1.0 release artifacts carry one; the 2.0.0 artifacts carried none.
 A build from source (`cargo install`, `cargo build`) has no baked key unless
 `CERULION_POSTHOG_KEY` is set in its environment while it compiles. A build
 with neither a baked key nor `POSTHOG_API_KEY` sends nothing whatever the
@@ -208,10 +209,11 @@ sends `graph_run_started` while it runs. Sending never delays a command's
 exit by more than 300 ms: if the network is slow or down, the events are
 dropped, never written to disk and retried.
 
-PostHog records the IP address each request comes from (`$ip`) and, from
-it, an approximate location stored with the event as `$geoip_*` properties:
+PostHog receives the IP address each request comes from and derives from it
+an approximate location, stored with the event as `$geoip_*` properties:
 continent, country, region, city, postal code, time zone, and a latitude and
-longitude near the city. Events
+longitude near the city. The IP address itself is discarded before the event
+is stored. Events
 are kept for PostHog's event retention period, from one to seven years
 depending on the project's plan
 (<https://posthog.com/docs/data/events-retention>).

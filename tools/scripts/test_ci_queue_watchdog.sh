@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-CASES_EXPECTED=43
+CASES_EXPECTED=53
 
 script_dir=$(CDPATH='' cd "$(dirname "$0")" && pwd)
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cerulion-watchdog-test.XXXXXX")
@@ -140,6 +140,11 @@ OTHER=fedcba9876543210fedcba9876543210fedcba98
     printf '%s\n' 'Lint' 'Test (macOS) shard 1' 'Viz tests (viz, ubuntu-latest)'
 } > "$workdir/required"
 printf '%s\n' '# nothing but a comment' '' > "$workdir/required_empty"
+# The parts list: a comment, a blank line and the three parts of `Lint`.
+{
+    printf '%s\n' '# The jobs Lint is made of.' ''
+    printf '%s\n' 'Lint (clippy)|Lint' 'Lint (fmt)|Lint' 'Lint (gates)|Lint'
+} > "$workdir/parts"
 
 key_of() {
     printf '%s %s' "$1" "$2" | tr -c 'A-Za-z0-9._-' '_'
@@ -222,9 +227,10 @@ new_case() {
     queue_page false MQ "$OTHER" "$SHA" null | answer POST "$QUEUE"
 }
 
-# run_case [<args>...]; the default argument is the three-name required list.
+# run_case [<args>...]; the default arguments are the three-name required list
+# and the three-part parts list.
 run_case() {
-    [ "$#" -gt 0 ] || set -- "$workdir/required"
+    [ "$#" -gt 0 ] || set -- "$workdir/required" "$workdir/parts"
     set +e
     output=$(
         PATH="$shim_bin:${FAKE_PATH-$PATH}" \
@@ -362,6 +368,93 @@ expect_output 'required job "Viz tests (viz, ubuntu-latest)" ended cancelled'
 expect_cancels 1
 ok 'a cancelled required job cancels the run'
 
+# A part of `Lint` fails while `Lint` still waits for the others: cancel once,
+# naming the part and its context, without waiting for `Lint` to report.
+new_case part_failure
+jobs 'Lint (gates)|completed|failure' 'Lint (clippy)|in_progress|null' 'Lint|queued|null' |
+    answer GET "$JOBS"
+: | answer POST "$CANCEL"
+run_case
+expect_status 0
+expect_output 'job "Lint (gates)", a part of required "Lint", ended failure; cancelling run 555'
+expect_reads 1
+expect_run_reads 0
+expect_cancels 1
+expect_sleeps
+ok 'a failed part cancels the run before its context reports'
+
+# A part that timed out is a failed part too.
+new_case part_timed_out
+jobs 'Lint (clippy)|completed|timed_out' 'Lint|queued|null' | answer GET "$JOBS"
+: | answer POST "$CANCEL"
+run_case
+expect_status 0
+expect_output 'job "Lint (clippy)", a part of required "Lint", ended timed_out'
+expect_cancels 1
+ok 'a timed-out part cancels the run'
+
+# A job listed with a null name is no part and no required job, and the part
+# after it is still read.
+new_case part_after_a_null_name
+printf '%s\n' '{"total_count":2,"jobs":[{"name":null,"status":"completed","conclusion":"failure"},{"name":"Lint (fmt)","status":"completed","conclusion":"failure"}]}' |
+    answer GET "$JOBS"
+: | answer POST "$CANCEL"
+run_case
+expect_status 0
+expect_output 'job "Lint (fmt)", a part of required "Lint", ended failure'
+expect_cancels 1
+ok 'a job with a null name is skipped and the part after it cancels'
+
+# The run is already cancelling: a part reads cancelled while the others and
+# `Lint` have not ended, and the run itself is not completed yet. One cancel
+# request, accepted, ends the watch: the jobs are not read again, so the
+# cancelled jobs this cancel makes cannot ask for another.
+new_case part_cancelled_run_cancelling
+jobs 'Lint (fmt)|completed|cancelled' 'Lint (clippy)|in_progress|null' 'Lint|queued|null' \
+    'Test (macOS) shard 1|in_progress|null' | answer GET "$JOBS" 1
+jobs 'Lint (fmt)|completed|cancelled' 'Lint (clippy)|completed|cancelled' 'Lint|completed|failure' \
+    'Test (macOS) shard 1|completed|cancelled' | answer GET "$JOBS"
+: | answer POST "$CANCEL"
+run_case
+expect_status 0
+expect_output 'job "Lint (fmt)", a part of required "Lint", ended cancelled; cancelling run 555'
+expect_reads 1
+expect_run_reads 0
+expect_cancels 1
+expect_sleeps
+ok 'a run already cancelling is asked to cancel once and read no more'
+
+# The run finished cancelling between the jobs read and the cancel request:
+# the request is refused, the run reads completed, and no second request is
+# sent.
+new_case part_cancelled_run_completed
+jobs 'Lint (gates)|completed|cancelled' 'Lint|queued|null' | answer GET "$JOBS"
+printf 'FAIL: HTTP 409: Cannot cancel a workflow run that is completed.\n' | answer POST "$CANCEL"
+run_json completed '"cancelled"' | answer GET "$RUN"
+run_case
+expect_status 0
+expect_output 'the run completed (cancelled) before the cancel reached it; nothing to cancel'
+expect_reads 1
+expect_run_reads 1
+expect_cancels 1
+expect_sleeps
+ok 'a cancel refused because the run finished cancelling is not sent again'
+
+# Parts that succeed cancel nothing, and neither does a failed job that is not
+# required, nor one whose name only looks like a part.
+new_case parts_succeed
+jobs 'Lint (gates)|completed|success' 'Lint (fmt)|completed|success' 'Lint (docs)|completed|failure' \
+    'Fuzz (Linux)|completed|failure' 'Lint (clippy)|in_progress|null' 'Lint|queued|null' | answer GET "$JOBS" 1
+jobs 'Lint (gates)|completed|success' 'Lint (fmt)|completed|success' 'Lint (docs)|completed|failure' \
+    'Fuzz (Linux)|completed|failure' 'Lint (clippy)|completed|success' 'Lint|completed|success' | answer GET "$JOBS"
+run_json completed '"failure"' | answer GET "$RUN"
+run_case
+expect_status 0
+expect_output 'run 555 completed (failure); nothing to cancel'
+expect_reads 2
+expect_cancels 0
+ok 'succeeded parts and unlisted failures cancel nothing'
+
 # The run completes with no required job failed: nothing is cancelled. The
 # run is read only once no job is left running, and read again until it says
 # completed. A failed job that is not required is not a reason.
@@ -455,6 +548,7 @@ printf 'FAIL: HTTP 502\n' | answer POST "$CANCEL" 1
 run_case
 expect_status 0
 expect_cancels 2
+expect_run_reads 1
 expect_sleeps 10
 ok 'a cancel refused once is retried'
 
@@ -466,7 +560,40 @@ run_case
 expect_status 1
 expect_output 'the cancel request was refused: FAIL: HTTP 403'
 expect_cancels 3
+expect_run_reads 3
+expect_sleeps 10 10
 ok 'a cancel refused while the run runs exits 1'
+
+# A refused cancel whose run read fails too: the failed read is said, the
+# cancel is asked again, and the third refusal exits 1 naming the refusal,
+# not the read.
+new_case cancel_refused_run_unread
+jobs 'Lint|completed|failure' | answer GET "$JOBS"
+printf 'FAIL: HTTP 502: cancel\n' | answer POST "$CANCEL"
+printf 'FAIL: HTTP 502: run\n' | answer GET "$RUN"
+run_case
+expect_status 1
+expect_output 'the run read after a refused cancel failed three times: FAIL: HTTP 502: run'
+expect_output 'the cancel request was refused: FAIL: HTTP 502: cancel'
+expect_cancels 3
+expect_run_reads 9
+expect_sleeps 10 10 10 10 10 10 10 10
+ok 'a refused cancel whose run read fails is asked again and exits 1 naming the refusal'
+
+# A refused cancel whose run read answers something that is not JSON: said,
+# and the cancel is asked again, which this time is taken.
+new_case cancel_refused_run_not_json
+jobs 'Lint|completed|failure' | answer GET "$JOBS"
+printf 'FAIL: HTTP 502: cancel\n' | answer POST "$CANCEL" 1
+: | answer POST "$CANCEL"
+printf '<html>busy</html>\n' | answer GET "$RUN"
+run_case
+expect_status 0
+expect_output 'the run read after a refused cancel is not JSON; the cancel is asked again'
+expect_cancels 2
+expect_run_reads 1
+expect_sleeps 10
+ok 'a refused cancel whose run read is not JSON is asked again'
 
 # The failed required job was the last to finish, so the run completed before
 # the cancel reached it: that refusal is no error.
@@ -481,21 +608,31 @@ ok 'a cancel refused because the run had completed exits 0'
 
 # A file naming no context refuses before any call: the watch would be blind.
 new_case empty_required
-run_case "$workdir/required_empty"
+run_case "$workdir/required_empty" "$workdir/parts"
 expect_status 2
 expect_output 'the required contexts file names no context'
 expect_no_gh_at_all
 ok 'a required list naming no context is refused'
 
-# The committed list is read as the watch reads it: a failed `Lint` cancels.
+# The committed lists are read as the watch reads them: a failed `Lint`
+# cancels, and so does a failed part of it.
 new_case committed_required_list
 jobs 'Lint|completed|failure' | answer GET "$JOBS"
 : | answer POST "$CANCEL"
-run_case "$script_dir/../ci/required_contexts.txt"
+run_case "$script_dir/../ci/required_contexts.txt" "$script_dir/../ci/required_parts.txt"
 expect_status 0
 expect_output 'required job "Lint" ended failure'
 expect_cancels 1
 ok 'the committed required list names the jobs the watch reads'
+
+new_case committed_parts_list
+jobs 'Lint (gates)|completed|failure' 'Lint|queued|null' | answer GET "$JOBS"
+: | answer POST "$CANCEL"
+run_case "$script_dir/../ci/required_contexts.txt" "$script_dir/../ci/required_parts.txt"
+expect_status 0
+expect_output 'job "Lint (gates)", a part of required "Lint", ended failure'
+expect_cancels 1
+ok 'the committed parts list names the parts the watch reads'
 
 # More jobs than one page: said, and the first page still decides.
 new_case more_jobs_than_a_page
@@ -509,12 +646,18 @@ ok 'a run with more jobs than one page says so'
 
 # The argument and environment refusals, each before any call.
 new_case usage
-run_case "$workdir/required" extra
+run_case "$workdir/required"
 expect_status 2
-expect_output 'usage: ci_queue_watchdog.sh <required-contexts-file>'
-run_case "$workdir/no_such_file"
+expect_output 'usage: ci_queue_watchdog.sh <required-contexts-file> <required-parts-file>'
+run_case "$workdir/required" "$workdir/parts" extra
+expect_status 2
+expect_output 'usage: ci_queue_watchdog.sh <required-contexts-file> <required-parts-file>'
+run_case "$workdir/no_such_file" "$workdir/parts"
 expect_status 2
 expect_output 'the required contexts file cannot be read'
+run_case "$workdir/required" "$workdir/no_such_file"
+expect_status 2
+expect_output 'the required parts file cannot be read'
 FAKE_REPOSITORY='' run_case
 expect_status 2
 expect_output 'GITHUB_REPOSITORY and GH_REPO are both empty'
@@ -536,6 +679,32 @@ expect_status 2
 expect_output 'jq is not on PATH'
 expect_no_gh_at_all
 ok 'a wrong argument, an unreadable file, a missing commit or base branch and a missing jq are refused'
+
+# A parts file the watch could misread refuses before any call: a part that
+# no job could match would leave its context's early cancel silently off.
+# parts_refused <rows> <message>: one invocation with those parts rows.
+new_case parts_refused
+parts_refused() {
+    printf '%s\n' "$1" > "$workdir/bad_parts"
+    run_case "$workdir/required" "$workdir/bad_parts"
+    expect_status 2
+    expect_output "$2"
+    expect_no_gh_at_all
+}
+parts_refused '# nothing but a comment' 'the required parts file names no part'
+parts_refused 'Lint (gates)' "the required parts file row 'Lint (gates)' is not <part job name>|<required context>"
+parts_refused 'Lint (gates)|Lint|Lint' "row 'Lint (gates)|Lint|Lint' is not"
+parts_refused '|Lint' "row '|Lint' is not"
+parts_refused 'Lint (gates)|' "row 'Lint (gates)|' is not"
+parts_refused 'Lint (gates) |Lint' "row 'Lint (gates) |Lint' is not"
+parts_refused 'Lint (gates)| Lint' "row 'Lint (gates)| Lint' is not"
+parts_refused '   ' "row '   ' is not"
+# A CRLF file leaves a carriage return at the end of each row.
+parts_refused "$(printf 'Lint (gates)|Lint\r')" "row 'Lint (gates)|Lint"
+parts_refused "$(printf '%s\n' 'Lint (gates)|Lint' 'Lint (gates)|Lint')" "lists the part 'Lint (gates)' twice"
+parts_refused 'Test (macOS) shard 1|Lint' "the part 'Test (macOS) shard 1' is itself a required context"
+parts_refused 'Lint (gates)|Lints' "the part 'Lint (gates)' belongs to 'Lints', which the required contexts file does not name"
+ok 'an empty parts file, a malformed row, a repeated part, a part that is a context and a part of no context are refused'
 
 # The run is listed only on the third read; the first listing holds only a
 # run of another commit, which is not it.
@@ -925,7 +1094,8 @@ expect_calls "api $LIST" "api $JOBS" 'api graphql -f query=<query> -f owner=owne
     "api $R/compare/release/2.x...$SHA?per_page=1" "api -X POST $CANCEL"
 ok 'the base branch comes from the event'
 
-# The dead batch's run completed before the cancel reached it: no error.
+# The dead batch's run completed before the cancel reached it: no error, and
+# the run read after the refusal ends the watch with no second request.
 new_case dead_cancel_after_the_run_ended
 queue_page false MQ "$OTHER" | answer POST "$QUEUE"
 compare_json ahead | answer GET "$COMPARE"
@@ -935,7 +1105,7 @@ printf 'FAIL: HTTP 409: Cannot cancel a workflow run that is completed.\n' | ans
 run_case
 expect_status 0
 expect_output 'the run completed (success) before the cancel reached it; nothing to cancel'
-expect_cancels 3
+expect_cancels 1
 ok 'a dead batch cancel refused because the run had completed exits 0'
 
 # The same answers twice give the same calls, waits and exit.
@@ -985,8 +1155,8 @@ cmp -s "$case_dir/sleeps" "$workdir/first_dead_sleeps" || fail "$case_name: the 
 [ "$output" = "$first_dead_output" ] || fail "$case_name: the output differs from the first run"
 ok 'the same dead answers give the same calls and output'
 
-# `usage` ran seven invocations and each of the last two cases two; the table
-# counts behaviours.
-cases=$((cases - 8))
+# `usage` ran nine invocations, `parts_refused` twelve and each of the last two
+# cases two; the table counts behaviours.
+cases=$((cases - 21))
 [ "$cases" -eq "$CASES_EXPECTED" ] || fail "ran $cases case(s), CASES_EXPECTED is $CASES_EXPECTED"
 printf 'test_ci_queue_watchdog: all %s cases passed\n' "$cases"
