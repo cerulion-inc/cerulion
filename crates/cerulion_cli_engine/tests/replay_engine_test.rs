@@ -36123,21 +36123,34 @@ fn a_hostile_run_count_in_the_census_is_counted_whole() {
     );
 }
 
-/// **A `--verify` of a lockstep recording is not limited by either budget.**
+/// **A `--verify` of a lockstep recording is not limited by any of the three
+/// whole-recording budgets.**
 ///
 /// The never-failing recording written as a lockstep bag holds the 26 reads
-/// and the 12 consumed frames ([`LS_READS`], [`LS_FRAMES`]) that the same
-/// recording written as a free-run bag is refused over. A lockstep replay plans
-/// no read from the bag, so under a read-log budget one short, a frame-index
-/// budget one short, and both, it verifies both produced topics with no rank
-/// declined, no topic stood down and no comparison declined.
+/// and the 12 consumed frames ([`LS_READS`], [`LS_FRAMES`]) the same recording
+/// written as a free-run bag is held to. A lockstep replay plans no read from
+/// the bag: it takes no census, builds no frame index of the frames its ranks
+/// consume and accumulates no schedule, so under each of the three budgets
+/// lowered to one it verifies both produced topics with no rank declined, no
+/// topic stood down and no comparison declined. The read-log budget also
+/// bounds one step's records in the per-edge read-log verifier, which runs in
+/// every mode, so under that budget alone the verifier stands the sink's
+/// edges down by name, and the verdict is unchanged.
 ///
-/// CONTROL, on the free-run bag under the same budgets: each is refused with
-/// exit 2, by the census first when both are short, so each budget is low
-/// enough to bite.
+/// CONTROL, on the free-run bag under the same budget: the read-log and the
+/// frame-index budget refuse it with exit 2, and the schedule budget declines
+/// its re-derivation verdict, so each budget is low enough to bite.
 #[test]
 #[serial]
-fn a_verify_of_a_lockstep_recording_is_not_limited_by_either_budget() {
+fn a_verify_of_a_lockstep_recording_is_not_limited_by_the_whole_recording_budgets() {
+    /// What the free-run control does under one budget of one.
+    enum FreeRun {
+        /// Refused before its first step, with this cause.
+        Refused(&'static str),
+        /// Run, with rank 0's verdict declined with this code.
+        Declined(&'static str),
+    }
+    type Lower = fn(usize) -> replay_engine::VerifierBudgetGuard;
     let dir = tempfile::tempdir().unwrap();
     let rec = ls_never_failing_reference();
     let free_run = dir.path().join("ls_budget_free_run.mcap");
@@ -36148,53 +36161,102 @@ fn a_verify_of_a_lockstep_recording_is_not_limited_by_either_budget() {
         &lockstep,
         pre_stamp_recorder_json(replay_engine::CoordinationMode::Lockstep),
     );
-    let reads = Some(LS_READS as usize - 1);
-    let frames = Some(LS_FRAMES as usize - 1);
-    for (read_log, frame_index, free_run_cause) in [
-        (reads, None, "read_identity_unplanned"),
-        (None, frames, "read_log_budget_declined"),
-        (reads, frames, "read_identity_unplanned"),
+    let verify = |bag: &std::path::Path| {
+        ri_replay(
+            bag,
+            ls_never_failing_factories,
+            replay_engine::ReplayPurpose::Verify,
+        )
+        .0
+    };
+    for (site, lower, control) in [
+        (
+            "read log",
+            replay_engine::override_read_log_record_budget as Lower,
+            FreeRun::Refused("read_identity_unplanned"),
+        ),
+        (
+            "frame index",
+            replay_engine::override_frame_index_record_budget as Lower,
+            FreeRun::Refused("read_log_budget_declined"),
+        ),
+        (
+            "schedule",
+            replay_engine::override_schedule_record_budget as Lower,
+            FreeRun::Declined("verifier_declined_schedule_budget"),
+        ),
     ] {
-        let label = format!("budgets {read_log:?}/{frame_index:?}");
-        let refused = ls_verify_under(&free_run, read_log, frame_index)
-            .expect_err(&format!("{label}: the free-run bag is refused"));
-        assert_eq!(refused.exit_code(), 2, "{label}: {refused}");
-        let ReplayError::ReadLogNotEnforceable { cause, .. } = &refused else {
-            panic!("{label}: a read-log refusal: {refused:?}");
-        };
-        assert_eq!(cause, free_run_cause, "{label}");
+        let _guard = lower(1);
+        match control {
+            FreeRun::Refused(want) => {
+                let refused =
+                    verify(&free_run).expect_err(&format!("{site}: the free-run bag is refused"));
+                assert_eq!(refused.exit_code(), 2, "{site}: {refused}");
+                let ReplayError::ReadLogNotEnforceable { cause, .. } = &refused else {
+                    panic!("{site}: a read-log refusal: {refused:?}");
+                };
+                assert_eq!(cause, want, "{site}");
+            }
+            FreeRun::Declined(code) => {
+                let declined = verify(&free_run)
+                    .unwrap_or_else(|e| panic!("{site}: the free-run bag runs: {e}"));
+                assert_eq!(
+                    verifier_decline_codes(&declined),
+                    vec![(0, code.to_string())],
+                    "{site}: the free-run bag's verdict is declined"
+                );
+            }
+        }
 
-        let outcome = ls_verify_under(&lockstep, read_log, frame_index)
-            .unwrap_or_else(|e| panic!("{label}: the lockstep bag verifies: {e}"));
+        let outcome =
+            verify(&lockstep).unwrap_or_else(|e| panic!("{site}: the lockstep bag verifies: {e}"));
         match &outcome.read_identity {
             replay_engine::ReadIdentityReport::BestEffort { reason } => assert_eq!(
                 reason, "a lockstep recording replays on its one gating clock",
-                "{label}"
+                "{site}"
             ),
-            other => panic!("{label}: a lockstep replay is not fed: {other:?}"),
+            other => panic!("{site}: a lockstep replay is not fed: {other:?}"),
         }
-        assert!(outcome.passed, "{label}: {:?}", outcome.violations);
-        assert_eq!(resim_exit(&outcome, true), 0, "{label}");
+        assert!(outcome.passed, "{site}: {:?}", outcome.violations);
+        assert_eq!(resim_exit(&outcome, true), 0, "{site}");
         assert_eq!(
             (outcome.topics_checked, outcome.topics_passed),
             (2, 2),
-            "{label}: the counter's and the sink's topics are compared and match"
+            "{site}: the counter's and the sink's topics are compared and match"
         );
-        assert_eq!(
-            verifier_decline_codes(&outcome),
-            Vec::<(u32, String)>::new(),
-            "{label}: no rank is declined"
+        assert!(
+            outcome.rederivation_notes.is_empty(),
+            "{site}: no rank's verdict stands down: {:?}",
+            outcome.rederivation_notes
         );
         assert_eq!(
             stand_down_codes(&outcome),
             Vec::<(u32, String, String)>::new(),
-            "{label}: no topic stands down"
+            "{site}: no topic stands down"
         );
         assert!(
             outcome.declined_frame_comparisons.is_empty(),
-            "{label}: no comparison is declined: {:?}",
+            "{site}: no comparison is declined: {:?}",
             outcome.declined_frame_comparisons
         );
+        let quarantined: Vec<(&str, &str)> = outcome
+            .read_log_quarantine
+            .iter()
+            .map(|q| (q.node_id.as_str(), q.reason.as_str()))
+            .collect();
+        if site == "read log" {
+            assert!(
+                !quarantined.is_empty()
+                    && quarantined.iter().all(|(node, reason)| *node == "sink"
+                        && reason.contains("exceeds this replay's per-step read-log budget")),
+                "{site}: the per-step bound stands only the sink's edges down: {quarantined:?}"
+            );
+        } else {
+            assert!(
+                quarantined.is_empty(),
+                "{site}: nothing is quarantined: {quarantined:?}"
+            );
+        }
     }
 }
 
@@ -36208,18 +36270,28 @@ fn a_verify_of_a_lockstep_recording_is_not_limited_by_either_budget() {
 /// stamped at format 7 with its producer annotations removed, the read log a
 /// format 7 recorder writes for edges with one writer each.
 ///
-/// Under a read-log budget of one, and under a frame-index budget of one, the
-/// replay is not refused and re-executes every step: rank 1 is declined with
-/// the budget's code, naming its count, both topics it injects stand down with
-/// that code, and the comparison of the topic it produces is declined, while
-/// rank 0's two topics are compared and match. The read-log verifier still
-/// compares rank 1's reads, which now come from the recorded-clock fallback,
-/// so any edge it convicts is one of `fusion`'s inputs. CONTROL: at the
-/// shipped budgets nothing is declined and all three topics match.
+/// One read over the read-log budget, and one frame over the frame-index
+/// budget ([`SyBudgetCounts`]), each with the other at the shipped value: the
+/// replay is not refused and re-executes every step. Rank 1 is declined with
+/// the budget's code, naming its count, on its note and on a warning that
+/// carries the count and the budget as fields; both topics it injects stand
+/// down with that code and fall back to the recorded-clock injection window,
+/// so nothing is steered, and the comparison of the topic it produces is
+/// declined, while rank 0's two topics are compared and match. The read-log
+/// verifier still compares every step of rank 1's reads, with nothing
+/// quarantined: rank 1's clock is skewed past the whole recording
+/// ([`SY_SKEW_NS`]), so the fallback window admits rank 0's whole stream at
+/// rank 1's first step, and each of `fusion`'s drains pops a frame at step 0
+/// where the recording popped none. That edge-read difference fails the run
+/// with exit 6. Two runs write byte-identical reports.
+///
+/// CONTROL: at the shipped budgets nothing is declined, all three topics match
+/// and the read log verifies clean.
 #[test]
 #[serial]
+#[tracing_test::traced_test]
 fn a_verify_below_format_eight_runs_a_rank_over_a_budget_that_gates_nothing() {
-    const TINY_BUDGET: usize = 1;
+    type Lower = fn(usize) -> replay_engine::VerifierBudgetGuard;
     let dir = tempfile::tempdir().unwrap();
     let (bag, counts) = sy_read_log_bag_counted_as(
         &dir,
@@ -36245,6 +36317,7 @@ fn a_verify_below_format_eight_runs_a_rank_over_a_budget_that_gates_nothing() {
         other => panic!("a format 7 bag is not fed: {other:?}"),
     }
     assert!(control.passed, "the control: {:?}", control.violations);
+    assert_eq!(resim_exit(&control, true), 0, "the control");
     assert_eq!(
         control.ticks_replayed,
         2 * SY_STEPS,
@@ -36260,33 +36333,66 @@ fn a_verify_below_format_eight_runs_a_rank_over_a_budget_that_gates_nothing() {
         Vec::<(u32, String)>::new(),
         "at the shipped budgets no rank is declined"
     );
+    assert!(
+        matches!(
+            control.read_log,
+            replay_engine::ReadLogStatus::VerifiedClean { .. }
+        ) && control.read_log_quarantine.is_empty(),
+        "the control's read log verifies clean: {:?} {:?}",
+        control.read_log,
+        control.read_log_quarantine
+    );
 
+    let reads_budget = counts.reads() as usize - 1;
+    let frames_budget = counts.rank1_frames - 1;
     let read_log_cause = format!(
-        "it holds {} reads, more than the verifier's budget of {TINY_BUDGET} reads per rank, \
+        "it holds {} reads, more than the verifier's budget of {reads_budget} reads per rank, \
          and reaches the budget at step {}",
         counts.reads(),
-        counts.run_out_step(TINY_BUDGET as u64)
+        counts.run_out_step(reads_budget as u64)
     );
     let frame_cause = format!(
-        "it consumes {} recorded frames, more than the verifier's budget of {TINY_BUDGET} \
+        "it consumes {} recorded frames, more than the verifier's budget of {frames_budget} \
          frames per rank",
         counts.rank1_frames
     );
-    type Lower = fn(usize) -> replay_engine::VerifierBudgetGuard;
-    for (code, lower, cause) in [
+    let read_log_warn = format!(
+        "cause=\"verifier_declined_read_log_budget\" reads={} budget={reads_budget}",
+        counts.reads()
+    );
+    let frame_warn = format!(
+        "rank=1 frames={} budget={frames_budget}",
+        counts.rank1_frames
+    );
+    // The edge-read difference the fallback makes on each of `fusion`'s
+    // inputs: (node, input, step, recorded, replayed).
+    let moved: [(&str, &str, u64, &str, &str); 2] = [
+        ("fusion", "a", 0, "none(drain)", "drained_batch(drain)"),
+        ("fusion", "b", 0, "none(drain)", "drained_batch(drain)"),
+    ];
+    for (code, lower, budget, cause, warn) in [
         (
             "verifier_declined_read_log_budget",
             replay_engine::override_read_log_record_budget as Lower,
+            reads_budget,
             read_log_cause.as_str(),
+            read_log_warn.as_str(),
         ),
         (
             "verifier_declined_frame_index_budget",
             replay_engine::override_frame_index_record_budget as Lower,
+            frames_budget,
             frame_cause.as_str(),
+            frame_warn.as_str(),
         ),
     ] {
-        let _guard = lower(TINY_BUDGET);
+        assert!(!logs_contain(warn), "PREMISE {code}: no such warning yet");
+        let _guard = lower(budget);
         let outcome = verify().unwrap_or_else(|e| panic!("{code}: the replay runs: {e}"));
+        assert!(
+            logs_contain(warn),
+            "{code}: the decline's warning names the count and the budget ({warn})"
+        );
         assert!(
             outcome.aborted.is_none() && outcome.node_failures.is_empty(),
             "{code}: {:?} {:?}",
@@ -36296,27 +36402,6 @@ fn a_verify_below_format_eight_runs_a_rank_over_a_budget_that_gates_nothing() {
         assert_eq!(
             outcome.ticks_replayed, control.ticks_replayed,
             "{code}: every step the control ran is re-executed"
-        );
-        assert!(
-            outcome.violations.is_empty() && outcome.trace_divergence.is_none(),
-            "{code}: no frame or fire-schedule verdict: {:?} {:?}",
-            outcome.violations,
-            outcome.trace_divergence
-        );
-        // The read-log verifier still compares rank 1's reads, which now come
-        // from the recorded-clock fallback, so any edge it convicts is one of
-        // `fusion`'s two inputs.
-        let convicted: Vec<(&str, &str)> = outcome
-            .read_log_verdict
-            .iter()
-            .flat_map(|v| v.edges.iter())
-            .map(|e| (e.node_id.as_str(), e.input.as_str()))
-            .collect();
-        assert!(
-            convicted
-                .iter()
-                .all(|edge| [("fusion", "a"), ("fusion", "b")].contains(edge)),
-            "{code}: only the declined rank's reads are judged: {convicted:?}"
         );
         assert_eq!(
             verifier_decline_codes(&outcome),
@@ -36337,6 +36422,21 @@ fn a_verify_below_format_eight_runs_a_rank_over_a_budget_that_gates_nothing() {
             ],
             "{code}: both topics rank 1 injects stand down"
         );
+        for sd in &outcome.injection_stand_downs {
+            assert!(
+                sd.detail.contains(cause)
+                    && sd
+                        .detail
+                        .contains("fell back to the recorded-clock injection window"),
+                "{code}: the stand-down names the cause and the fallback: {}",
+                sd.detail
+            );
+        }
+        assert!(
+            outcome.injection_coverage.is_empty(),
+            "{code}: a declined pass steers nothing: {:?}",
+            outcome.injection_coverage
+        );
         let declined: Vec<(&str, &[u32], &str)> = outcome
             .declined_frame_comparisons
             .iter()
@@ -36352,7 +36452,134 @@ fn a_verify_below_format_eight_runs_a_rank_over_a_budget_that_gates_nothing() {
             (3, 2),
             "{code}: rank 0's two topics are compared and match"
         );
+        assert!(
+            outcome.violations.is_empty() && outcome.trace_divergence.is_none(),
+            "{code}: no frame or fire-schedule verdict: {:?} {:?}",
+            outcome.violations,
+            outcome.trace_divergence
+        );
+        assert!(
+            outcome.read_log_quarantine.is_empty(),
+            "{code}: the read-log verifier quarantines nothing: {:?}",
+            outcome.read_log_quarantine
+        );
+        assert!(
+            matches!(outcome.read_log, replay_engine::ReadLogStatus::Diverged),
+            "{code}: every step of the read log is compared: {:?}",
+            outcome.read_log
+        );
+        let convicted: Vec<(&str, &str, u64, &str, &str)> = outcome
+            .read_log_verdict
+            .iter()
+            .flat_map(|v| v.edges.iter())
+            .map(|e| {
+                (
+                    e.node_id.as_str(),
+                    e.input.as_str(),
+                    e.step,
+                    e.recorded.as_ref().map_or("", |r| r.kind.as_str()),
+                    e.replayed.as_ref().map_or("", |r| r.kind.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            convicted, moved,
+            "{code}: the fallback moves each of fusion's step-0 drains"
+        );
+        assert!(!outcome.passed, "{code}: the edge-read difference fails it");
+        assert_eq!(resim_exit(&outcome, true), 6, "{code}");
+        // Determinism: two runs under the same budget write byte-identical
+        // reports.
+        ri_two_reports(dir.path(), code, |report| {
+            ri_replay_reporting(
+                &bag,
+                sy_bounded_factories,
+                replay_engine::ReplayPurpose::Verify,
+                None,
+                None,
+                Some(report),
+            )
+            .0
+        });
     }
+}
+
+/// **A rank that recorded no read is declined, not refused, over the
+/// frame-index budget.**
+///
+/// A neutral `--resim all` of the never-failing free-run bag gates the
+/// counter's topic, which its one rank both produces and consumes, so one frame
+/// over the frame-index budget ([`LS_FRAMES`]) refuses it at its pass
+/// (`read_log_budget_declined`, exit 2). The same recording with all 26 of the
+/// rank's read-outcome records removed ([`LS_READS`]) holds no read of the
+/// rank, so there is no read log for the gate to lose: under the same budget
+/// the resim runs every step, and the rank's re-derivation verdict is
+/// declined with the frame-index code and the count. The rank injects
+/// nothing, so no topic stands down and no comparison is declined.
+#[test]
+#[serial]
+fn a_rank_that_recorded_no_read_is_declined_not_refused_over_the_frame_index_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = ls_never_failing_reference();
+    let with_reads = dir.path().join("ls_frames_with_reads.mcap");
+    write_ls_free_run_bag(&rec, &with_reads);
+    let mut stripped = rec.clone();
+    stripped
+        .trace
+        .retain(|r| r.record_type != RECORD_TYPE_READ_OUTCOME);
+    assert_eq!(
+        rec.trace.len() - stripped.trace.len(),
+        LS_READS as usize,
+        "PREMISE: every read-outcome record of the rank is removed"
+    );
+    let without_reads = dir.path().join("ls_frames_without_reads.mcap");
+    write_ls_free_run_bag(&stripped, &without_reads);
+    let resim = |bag: &std::path::Path| {
+        ri_replay(
+            bag,
+            ls_never_failing_factories,
+            replay_engine::ReplayPurpose::Resim,
+        )
+        .0
+    };
+
+    let _budget = replay_engine::override_frame_index_record_budget(LS_FRAMES as usize - 1);
+    let refused = resim(&with_reads).expect_err("the rank that recorded reads is refused");
+    assert_eq!(refused.exit_code(), 2, "{refused}");
+    let ReplayError::ReadLogNotEnforceable { cause, .. } = &refused else {
+        panic!("a read-log refusal: {refused:?}");
+    };
+    assert_eq!(cause, "read_log_budget_declined");
+
+    let outcome = resim(&without_reads).expect("the rank that recorded no read runs");
+    assert_eq!(
+        outcome.ticks_replayed, LS_STEPS,
+        "the resim re-executes every recorded step"
+    );
+    assert_eq!(resim_exit(&outcome, false), 0);
+    assert_eq!(
+        verifier_decline_codes(&outcome),
+        vec![(0, "verifier_declined_frame_index_budget".to_string())],
+        "the rank's verdict is declined"
+    );
+    let note = sole_verifier_decline_note(&outcome);
+    assert!(
+        note.detail.contains(
+            "it consumes 12 recorded frames, more than the verifier's budget of 11 frames per rank"
+        ),
+        "the note names the frames and the budget: {}",
+        note.detail
+    );
+    assert_eq!(
+        stand_down_codes(&outcome),
+        Vec::<(u32, String, String)>::new(),
+        "the rank injects nothing, so nothing stands down"
+    );
+    assert!(
+        outcome.declined_frame_comparisons.is_empty(),
+        "no comparison is declined: {:?}",
+        outcome.declined_frame_comparisons
+    );
 }
 
 /// **The bag-time epoch is the MINIMUM first target across the ranks, not rank

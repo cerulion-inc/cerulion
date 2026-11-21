@@ -1302,8 +1302,10 @@ of N identical reads counting N, and the recorded frames with a wire header on
 the topics the rank consumes, up to the verifier's budget of 200000 of each.
 Both cover the whole recording, whatever `--duration` bounds. A lockstep
 recording replays on its one gating clock and plans no read from the bag, so
-neither budget limits its replay. A free-run rank over a budget is refused
-only where the replay feeds or gates its recorded reads:
+neither budget limits its replay; the 200000 recorded frames that attributing
+a `multi_publisher_topics` topic's frames to their writers needs, above, apply
+to it as to any replay. A free-run rank over a budget is refused only where
+the replay feeds or gates its recorded reads:
 
 - A `--verify` of a recording at `trace_format` 8 or later feeds every read,
   as above, so a rank that consumes any topic is refused (exit 2): over the

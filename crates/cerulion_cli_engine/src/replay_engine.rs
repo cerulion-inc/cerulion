@@ -10996,24 +10996,29 @@ fn fifo_trailing_refills(
 ///
 /// A LOCKSTEP pass plans no read from the recording
 /// ([`PassVerification::inert`]): it takes no census, builds no frame index of
-/// the frames its ranks consume and accumulates no schedule, so no budget
-/// refuses a lockstep replay or stands its verdict down. The frame index of a
-/// co-located `multi_publisher_topics` capture diff reads the same site in
-/// every mode, and past it that diff falls back to one stream and refuses
-/// nothing ([`build_capture_partitionings`]). The rest is a FREE-RUN pass's.
+/// the frames its ranks consume and accumulates no schedule, so none of the
+/// three whole-recording budgets refuses a lockstep replay or stands its
+/// verdict down. The two per-step sites run in every mode, lockstep included,
+/// and past one of them the per-edge verifier stands the edge down by name.
+/// The frame index of a co-located `multi_publisher_topics` capture diff reads
+/// the frame-index site in every mode too, and past it that diff falls back to
+/// one stream and refuses nothing ([`build_capture_partitionings`]). The rest
+/// is a FREE-RUN pass's.
 ///
 /// Past the census budget, a rank that consumes a topic refuses a fed replay
-/// (a `--verify` of a free-run bag that records read identity) before its
-/// first step (`read_identity_unplanned`). Past the census or the frame-index
-/// budget, a pass that gates a topic over a read log (every topic a fed pass
-/// consumes, and otherwise a topic its rank both produces and consumes and no
-/// other rank writes, [`rank_enforce_topics`]) is refused at its prepare
-/// (`read_log_budget_declined`), past the frame index only when its rank
-/// recorded a read. Any other pass stands down its read-log-steered injection
-/// and its re-derivation verdict ([`VerifierDecline`]) and runs. Past the
-/// schedule budget the re-derivation verdict stands down with a note. A census
-/// refusal names the reads the rank holds, the budget, the step of the first
-/// read past it and that step's time in the rank's recording
+/// (a `--verify` of a free-run bag that records read identity) in the pre-pass
+/// ([`plan_bag_side_admissions`]), before any rank's first step
+/// (`read_identity_unplanned`), so a fed pass never reaches a census refusal
+/// of its own. Past the frame-index budget, and past the census on a pass that
+/// is not fed, a pass that gates a topic over a read log (every topic a fed
+/// pass consumes, and otherwise a topic its rank both produces and consumes
+/// and no other rank writes, [`rank_enforce_topics`]) is refused at its
+/// prepare (`read_log_budget_declined`), past the frame index only when its
+/// rank recorded a read. Any other pass stands down its read-log-steered
+/// injection and its re-derivation verdict ([`VerifierDecline`]) and runs.
+/// Past the schedule budget the re-derivation verdict stands down with a note.
+/// A census refusal names the reads the rank holds, the budget, the step of
+/// the first read past it and that step's time in the rank's recording
 /// ([`ReadLogOverrun`]); a frame-index refusal names the frames and the budget
 /// ([`FrameIndexOverrun`]).
 const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
