@@ -114,6 +114,16 @@
 #          unviable mutant is the `Some(Default::default())` from
 #          `mixed_start` above.
 #
+# And once the from-start arm refused a free-run worker rank with no boundary
+# stream (`ResimGap::RankWithoutBoundaryStream`, its `ResimGap::reason`
+# sentence) and the unreadable-stamp sentence named both unreadable variants:
+#
+# Run:     cargo mutants -p cerulion_core --in-place --cap-lints true \
+#            -f crates/cerulion_core/src/flashback/resim.rs \
+#            --in-diff <those changes' diff of that file> -- --lib flashback
+# Result:  5 mutants: 5 caught, 0 missed. Two of them delete a `!` in the new
+#          arm, one in its worker-rank filter and one in its refusal.
+#
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
 # each test named here, and a run without it must pass that test.
