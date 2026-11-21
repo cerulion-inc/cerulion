@@ -458,8 +458,9 @@ pub(crate) struct TrimmedTrace {
     /// (`ResimGap::RankWithoutCompleteStep`). Empty when no rank keeps a
     /// boundary, which the judge reports as `ResimGap::NoBoundary` instead.
     pub ranks_without_a_kept_step: Vec<u32>,
-    /// Each rank's first kept boundary and the four facts above PER RANK, keyed
-    /// by the rank on the record.
+    /// Each rank's first kept boundary, and its twins of `anchor_target_ns`,
+    /// `last_boundary_target_ns`, `executed_nodes` and `discarded`, keyed by the
+    /// rank on the record.
     ///
     /// # Why the scalars above cannot serve
     ///
@@ -470,7 +471,7 @@ pub(crate) struct TrimmedTrace {
     /// this map answers the question a per-rank reader asks, which is the one
     /// `bag play --resim` will ask once it stops refusing k>1.
     ///
-    /// Exactly one entry for a lockstep or k=1 capture, whose numbers ARE the
+    /// Exactly one entry for a k=1 capture, whose four twinned numbers ARE the
     /// scalars.
     pub per_rank: BTreeMap<u32, RankTrim>,
 }

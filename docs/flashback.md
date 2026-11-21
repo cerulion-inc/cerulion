@@ -376,21 +376,21 @@ own graph, and the resim exits 2 blaming corruption.
 **A capture from a run's first seconds may not be re-runnable.** A
 `graph run` takes its first checkpoint at step 0, and its window recorder starts
 a moment after the run is released, so its taps miss the frames published before
-they attach. A capture taken within one Flashback window of the start resumes
-from that checkpoint. When a step it re-executes reads a frame published before
+they attach. On a graph with one worker rank, a capture taken within one
+Flashback window of the start resumes from that checkpoint. When a step it re-executes reads a frame published before
 the taps attached, the capture is stamped not resimmable, and
 `anchor.resimmable_reason` names the topic, the step, the writer and the
 sequences. A capture whose trace reads a frame the window lost later in the run
 is refused the same way. For a graph with one worker rank, take the capture more
 than one Flashback window into the run (`CERULION_FLASHBACK_WINDOW_MS`); a later
-capture of several free-run worker ranks is not resimmable either, since
-per-rank resume is not supported. Either way, `cerulion graph run --record`
+capture of several worker ranks is not resimmable either, since per-rank resume
+is not supported. Either way, `cerulion graph run --record`
 records the run with a recorder that is ready before step 0. A capture
 written by 2.0.0 was not checked this way: it can claim
 `anchor.resimmable: true` and then be refused by
 `bag play --resim all --verify`, so take it again.
 
-**An early capture of several free-run worker ranks is not resimmable.** In a
+**An early capture whose free-run worker ranks begin apart is not resimmable.** In a
 capture taken within one Flashback window of the start, a rank that kept no
 checkpoint keeps its trace from step 0, while a rank that kept one begins at
 its checkpoint. Re-executing ranks that begin apart is not supported, so the

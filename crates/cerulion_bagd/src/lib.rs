@@ -29374,10 +29374,12 @@ mod ranks_begin_apart_judge_tests {
     //! The capture judge on two-rank captures whose ranks begin at different
     //! steps, through the adapter, over hand-built traces trimmed the way a
     //! capture trims them and the `recorder.json` the capture carries: the
-    //! free-run stamp refuses them by name, a document that states no readable
-    //! contract refuses every capture, and the lockstep stamp, a document with
-    //! no stamp and no document keep the judgement of a recording with no
-    //! stamp. Every verdict is written out by hand. No shared memory, no race.
+    //! free-run stamp refuses them by name, and a document that states no
+    //! readable contract refuses every capture. Under the lockstep stamp, a
+    //! document with no stamp or no document, the judge reads rank 0 alone: it
+    //! does not model the replay's lockstep boundary check, which refuses ranks
+    //! whose streams start apart. Every verdict is written out by hand. No
+    //! shared memory, no race.
     use super::*;
     use cerulion_core::flashback::resim::{ResimGap, UnreadableCoordination};
     use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
@@ -29389,14 +29391,15 @@ mod ranks_begin_apart_judge_tests {
     /// `src_c` on rank 2.
     const NODES: [&str; 3] = ["src_a", "src_b", "src_c"];
 
-    /// A `recorder.json` as `graph run --record` writes it, with `coordination`
-    /// holding the JSON value `coordination`, or no such key for `None`.
+    /// A `recorder.json` as `graph run --record` writes it for this graph, with
+    /// `coordination` holding the JSON value `coordination`, or no such key for
+    /// `None`.
     fn recorder_json(coordination: Option<&str>) -> (String, Vec<u8>) {
         let key = coordination.map_or(String::new(), |v| format!(r#""coordination":{v},"#));
         (
             RECORDER_JSON_ATTACHMENT.to_string(),
             format!(
-                r#"{{"arch":"aarch64","os":"linux","cerulion_version":"2.0.0","recorded_at_ns":7,"trace_format":10,{key}"node_external":{{"src_a":false,"src_b":false}}}}"#
+                r#"{{"arch":"aarch64","os":"linux","cerulion_version":"2.0.0","recorded_at_ns":7,"trace_format":10,{key}"node_external":{{"src_a":false,"src_b":false,"src_c":false}}}}"#
             )
             .into_bytes(),
         )
@@ -29746,11 +29749,12 @@ mod ranks_begin_apart_judge_tests {
     /// The documents that state no readable contract.
     const UNREADABLE: [Stamp; 2] = [Stamp::Unknown, Stamp::NotJson];
 
-    /// The lockstep stamp, a document with no stamp and no document keep the
-    /// judgement of a recording with no stamp: rank 1 beginning later reads
-    /// resimmable (rank 0's first kept step is 0), and both shapes whose rank 0
-    /// resumes mid-run read the unknown node map of a recorder holding two
-    /// trace rings.
+    /// Under the lockstep stamp, a document with no stamp or no document, the
+    /// judge reads rank 0 alone. Rank 1 beginning later reads resimmable, since
+    /// rank 0's first kept step is 0 and this judge does not model the replay's
+    /// lockstep boundary check, which refuses ranks whose streams start apart.
+    /// Both shapes whose rank 0 resumes mid-run read the unknown node map of a
+    /// recorder holding two trace rings.
     #[test]
     fn under_a_lockstep_reading_ranks_that_begin_apart_are_judged_on_rank_0_alone() {
         for stamp in STAMPS

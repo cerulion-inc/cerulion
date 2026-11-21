@@ -753,7 +753,9 @@ pub enum ReplayError {
     ///
     /// The sentence is
     /// [`cerulion_core::flashback::resim::free_run_resume_unsupported_reason`]'s,
-    /// the reason a Flashback capture of this shape carries too.
+    /// the reason a Flashback capture of this shape carries too, about a
+    /// capture, when no worker rank begins at step 0 and it embeds one rank's
+    /// checkpoint.
     #[error(
         "{}",
         cerulion_core::flashback::resim::free_run_resume_unsupported_reason(

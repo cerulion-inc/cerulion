@@ -3252,9 +3252,9 @@ mod tests {
             serde_json::json!(
                 "this rank retained no checkpoint: it published no state ring, its plane was \
                  refused at arm time, or it had not reached its first anchor cadence when the \
-                 capture was triggered. A capture taken after that cadence holds one, and a \
-                 resume from it needs a graph with one worker rank, since per-rank resume is not \
-                 supported"
+                 capture was triggered. A capture of several worker ranks does not resume from \
+                 their checkpoints, since per-rank resume is not supported: record the run from \
+                 its first step with `cerulion graph run --record`"
             )
         );
 

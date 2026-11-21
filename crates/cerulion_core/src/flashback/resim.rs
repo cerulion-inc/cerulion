@@ -47,14 +47,20 @@
 //! refused it at the earlier record under a different error entirely, which is
 //! precisely the drift a shared verdict exists to prevent.
 //!
-//! Three arms read the capture's coordination stamp. A stamp this build cannot
-//! read ([`ResimGap::CoordinationUnreadable`]) is refused right after the
-//! record walk, where the replay reads `recorder.json`. Two judge free run
-//! only: worker ranks that begin apart ([`ResimGap::MixedStart`]), asked right
-//! below the boundary arm because a rank that begins at step 0 never reaches an
-//! anchor arm, and several worker ranks whose rank 0 resumes mid-run
-//! ([`ResimGap::FreeRunResumeUnsupported`]), asked right below the state-ring
-//! arm, where `resolve_resume` refuses it.
+//! Four arms read the capture's coordination stamp. A `recorder.json` that
+//! states no contract this build can read ([`ResimGap::CoordinationUnreadable`])
+//! is refused right after the record walk, where the replay reads that
+//! attachment. Three judge free run only. Several worker ranks whose rank 0
+//! resumes mid-run ([`ResimGap::FreeRunResumeUnsupported`]) are asked right
+//! below the state-ring arm, where `resolve_resume` refuses them. A worker rank
+//! with no boundary stream ([`ResimGap::RankWithoutBoundaryStream`]) is asked
+//! first on the from-start arm, where the replay's rank plan refuses it. Worker
+//! ranks that begin apart ([`ResimGap::MixedStart`]) are asked right below the
+//! boundary arm, ahead of the replay's order: when rank 0 begins at step 0 the
+//! from-start arm would otherwise accept the capture, and when rank 0 is the
+//! late rank the replay refuses the bag later, at its state-ring or free-run
+//! resume gate, while the capture names the ranks. Both sentences give the same
+//! remedy.
 
 use std::collections::BTreeMap;
 
@@ -91,7 +97,7 @@ pub struct ResimFacts<'a> {
     /// is a worker that kept no boundary.
     ///
     /// The resume's START is the AUTHORITATIVE rank's entry, rank 0's, which the
-    /// judge reads out of this list: the replay window is rank 0's boundary
+    /// judge reads out of this map: the replay window is rank 0's boundary
     /// stream by construction, because `resolve_resume` derives its resume point
     /// from `first_recorded_boundary`, which walks rank 0 only. The covered
     /// range's END folds the other way, to the earliest last kept boundary
@@ -590,7 +596,8 @@ pub fn stated_coordination(
     }
 }
 
-/// The remedy every free-run refusal of where a recording begins gives: a
+/// The remedy a refusal of where a recording begins gives (the free-run
+/// refusals and the frames-begin-late form of [`ResimGap::FrameNotHeld`]): a
 /// recording taken from the run's first step needs no resume.
 const RECORD_FROM_THE_FIRST_STEP: &str =
     "record the run from its first step with `cerulion graph run --record`";
@@ -600,9 +607,10 @@ const RECORD_FROM_THE_FIRST_STEP: &str =
 /// neither side is empty and each is ascending by rank.
 ///
 /// Each free-run rank keeps its own boundary stream, so where its recording
-/// begins is its own. A rank that begins past step 0 can only be re-executed
-/// from its own checkpoint, and a rank that begins at step 0 from its
-/// constructor state; re-executing the two kinds side by side is not
+/// begins is its own. A rank that begins past step 0 would need its own
+/// checkpoint to be re-executed, and a rank that begins at step 0 is
+/// re-executed from its constructor state; re-executing the two kinds side by
+/// side is not
 /// supported, so a capture of such a recording is not resimmable
 /// ([`ResimGap::MixedStart`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -637,8 +645,8 @@ impl MixedStart {
     /// The sentence a refusal of this recording gives: every rank on each side,
     /// each late rank's first step, and the remedy.
     ///
-    /// `from_a_capture` picks the noun, as it does for
-    /// [`free_run_resume_unsupported_reason`].
+    /// `from_a_capture` picks the noun: "capture" for a Flashback capture,
+    /// otherwise "bag".
     pub fn sentence(&self, from_a_capture: bool) -> String {
         let noun = free_run_noun(from_a_capture);
         let past = match self.past_zero.as_slice() {
@@ -670,7 +678,7 @@ impl MixedStart {
 
 /// The noun a free-run refusal calls the bag it read: [`bag_noun`]'s for a
 /// Flashback capture, and "bag" for any other recording, the word the replay's
-/// free-run refusals print.
+/// `FreeRunResumeUnsupported` refusal prints.
 const fn free_run_noun(from_a_capture: bool) -> &'static str {
     if from_a_capture {
         bag_noun(true)
@@ -727,7 +735,7 @@ pub enum ResimGap {
     /// A trace record the replay gate refuses outright.
     ///
     /// Carries the rendered detail rather than the fault, so the gap stays a
-    /// plain reason string like its six siblings.
+    /// plain reason string like its siblings.
     TraceRecordRejected {
         /// The fault, already rendered.
         detail: String,
@@ -787,7 +795,8 @@ pub enum ResimGap {
     /// `BagNoStepBoundaries`.
     NoBoundary,
     /// Free-run worker ranks that begin apart: one at step 0 and another past
-    /// it. See [`MixedStart`].
+    /// it. See [`MixedStart`]. Asked ahead of `run_replay`'s order: see the
+    /// module docs.
     MixedStart(MixedStart),
     /// Free-run worker ranks that attach a trace manifest and keep no step
     /// boundary: resim's `RankWithoutBoundaryStream`, which its free-run rank
@@ -856,7 +865,7 @@ pub enum ResimGap {
     FreeRunResumeUnsupported {
         /// Rank 0's first kept step.
         first_step: u64,
-        /// The worker ranks the capture attaches manifests for.
+        /// How many worker ranks the capture attaches manifests for.
         ranks: usize,
     },
     /// Two runs' anchors at the resume step — resim's `AmbiguousRun`.
@@ -1135,10 +1144,13 @@ impl ResimGap {
                 let stated = match why {
                     UnreadableCoordination::UnknownStamp(stamp) => {
                         format!(
-                            "stamps `coordination` {stamp}, a contract this Cerulion does not know"
+                            "stamps `coordination` {stamp}, which is not a contract this Cerulion \
+                             knows"
                         )
                     }
-                    other => format!("is {other}, so it states no coordination contract"),
+                    UnreadableCoordination::NotJson | UnreadableCoordination::NotAnObject => {
+                        format!("is {why}, so it states no coordination contract")
+                    }
                 };
                 format!(
                     "this capture's `__cerulion/recorder.json` {stated}, and `cerulion bag play \
@@ -1280,7 +1292,7 @@ fn frame_not_held_reason(resume_step: u64, gap: &FrameGap) -> String {
 /// The sentence a RESIMMABLE capture carries.
 ///
 /// Its own constant rather than a literal at the render site, so the positive
-/// claim is as reviewable as the six negative ones.
+/// claim is as reviewable as the negative ones.
 pub const RESIMMABLE_FROM_START_REASON: &str =
     "this capture's window reaches its run's own step 0, so it carries a scheduler trace and \
      needs no checkpoint: `cerulion bag play <bag> --resim all` re-executes it from the start";
@@ -1301,7 +1313,7 @@ pub const RESIMMABLE_REASON: &str =
 /// reaches, and says plainly that the remainder is present and simply outside
 /// the range.
 ///
-/// Its own constant so the sentence is as reviewable as the seven refusals, and
+/// Its own constant so the sentence is as reviewable as the refusals, and
 /// composed by [`resimmable_reason`] so no render site can state the verdict
 /// without it.
 pub const RESIM_COVERED_THROUGH_CLAUSE: &str =
@@ -1504,9 +1516,10 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
         return Err(ResimGap::NoBoundary);
     };
     // 4a. Free-run worker ranks that begin apart, the recording's own shape
-    //     rather than a fact about any one step, so it is asked before the
-    //     from-start arm, which a rank past step 0 must not take, and before
-    //     every anchor arm, which a rank at step 0 never reaches.
+    //     rather than a fact about any one step. Asked before the from-start
+    //     arm, which a rank past step 0 must not take, and before every anchor
+    //     arm, which judges only the checkpoints the capture embeds and so never
+    //     sees a rank that begins at step 0.
     if free_run {
         if let Some(start) = mixed_start(facts.rank_first_steps) {
             return Err(ResimGap::MixedStart(start));
@@ -3728,7 +3741,7 @@ mod tests {
             ),
             (
                 UnreadableCoordination::UnknownStamp("\"barrier\"".to_string()),
-                "stamps `coordination` \"barrier\", a contract this Cerulion does not know",
+                "stamps `coordination` \"barrier\", which is not a contract this Cerulion knows",
             ),
         ] {
             assert_eq!(
