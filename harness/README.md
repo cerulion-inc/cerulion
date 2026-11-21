@@ -8,8 +8,8 @@ through the `cerulion` command; the guide is [docs/harness.md](../docs/harness.m
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # the harness's MCP tools with a simulated robot
 claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
-cerulion rcp bench --model YOUR_MODEL            # one benchmark task, with and without the harness
-cerulion rcp bench --verify                      # the code here is the code the benchmark measured
+cerulion rcp bench --model YOUR_MODEL            # one start state, with and without the harness
+cerulion rcp bench --verify                      # check the measured code against its provenance ledger
 ```
 
 Every release package installs this folder beside the `cerulion` binary, without `tests/` and the development
@@ -43,8 +43,8 @@ environment) and `out/` (what the sim server keeps of each episode) inside the f
 when it runs in place, its copy when it sits beside the binary. Git ignores all three. Nothing of the benchmark's
 scenes is committed here: they are fetched and checked against their pins.
 
-The measured code keeps the package names it ran under, `rcpx` and `bench`, so that it stays byte for byte the
-code the benchmark measured. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](../docs/rcp.md).
+The measured code keeps the package names it ran under, `rcpx` and `bench`, as the measured manifests name them;
+the provenance ledger lists how each shipped file differs from the measured one. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](../docs/rcp.md).
 
 ## Licence
 

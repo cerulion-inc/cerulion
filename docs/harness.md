@@ -13,8 +13,8 @@ You reach the harness through `cerulion rcp`, Cerulion's MCP server command:
 | Command | What it does |
 |---|---|
 | `cerulion rcp --sim` | Serves the harness's tools with a simulated robot on this machine, to any MCP client. |
-| `cerulion rcp bench` | Reruns one task of the published benchmark with and without the harness, against your own model. |
-| `cerulion rcp bench --verify` | Checks that the harness code on disk is the code the benchmark measured. |
+| `cerulion rcp bench` | Reruns one start state with and without the harness, against your own model: one of the published benchmark with `--cell`, otherwise one the harness was developed on. |
+| `cerulion rcp bench --verify` | Checks every file of the harness's measured code against the provenance ledger that ties it to the code the benchmark measured. |
 
 Both run under the free Cerulion account, as the other `cerulion` commands do: run `cerulion login` once.
 
@@ -61,13 +61,21 @@ Run `cerulion rcp --sim` once in a terminal before you add it this way: the firs
 and the benchmark scenes, which takes minutes, and a client that starts a stdio server waits only seconds for
 its first answer.
 
-Then rerun a task of the benchmark against your own model:
+Then rerun a start state of the published benchmark against your own model. Pick one from the results package's
+`cells.csv`; without `--cell` the run uses a start state the harness was developed on, not a published one.
 
 ```bash
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
 export OPENAI_API_KEY=your-key
-cerulion rcp bench --model YOUR_MODEL
+cerulion rcp bench --model YOUR_MODEL --cell CELL_ID
 ```
+
+The hosted Cerulion MCP also serves the harness's tools on a simulated arm, with nothing to install: run
+`claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion` and sign in with your Cerulion
+account from `/mcp` in Claude Code. Your model starts the arm in Cerulion's cloud with `sim_start` and stops it
+with `sim_end`, and the simulator runs on your account's sim credits, one credit for each second it is held
+open. The hosted endpoints are in early access; [Give your model Cerulion](../README.md#give-your-model-cerulion)
+shows a prompt.
 
 ## What the first run installs
 
@@ -107,14 +115,15 @@ models, 100 start states each, one episode a start state an arm. The start state
 rows the harness was developed on at other start states, so the tasks themselves are not new to it.
 
 Every count, cost and episode is in the [results package](https://github.com/cerulion-inc/cerulion/tree/main/docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro),
-with the reading rules frozen before the first row and a script that computes every figure again from the rows.
+with the reading rules, each frozen before the rows of its own lists, and a script that computes every figure
+again from the rows.
 
 ## How `cerulion rcp bench` reproduces it
 
 `cerulion rcp bench --model YOUR_MODEL` runs one cell (one task at one start state) twice, once in each setup the
 benchmark compared, with the same budget, temperature and scorer, and prints the benchmark's own verdict for
-each. The code that runs is the code the benchmark measured: the harness folder carries it unchanged, and
-`--verify` proves it.
+each. The code that runs is the harness's measured code, and `--verify` checks every file of it against the
+provenance ledger that ties it to the code the benchmark measured.
 
 | Flag | Meaning |
 |---|---|
@@ -136,10 +145,14 @@ One episode is one draw at temperature 1.0, so a single pair can go either way. 
 
 ## What `--verify` checks
 
-`cerulion rcp bench --verify` hashes every file of the measured code in the harness folder and compares it with
-the manifests of the two code trees the benchmark ran, one for each setup. The SHA-256 of a manifest is that
-tree's snapshot id, and the results package names the same ids. It exits 0 only when every file matches. It
-installs nothing and needs only `python3`.
+`cerulion rcp bench --verify` hashes every file of the measured code in the harness folder and checks it against
+the provenance ledger. For each shipped file the ledger holds the hash of the measured file it came from and
+whether it is that file byte for byte or differs in comments and docstrings, prose, strings or code, with each
+changed string and code edit listed. The measured files are those of the manifests of the two code trees the
+benchmark ran, one for each setup; the SHA-256 of a manifest is that tree's snapshot id, and the results package
+names the same ids. It exits 0 only when both manifests have their snapshot ids and every file matches its
+ledger row. It installs nothing; it needs `python3` on your PATH or a finished install, and, as every
+`cerulion rcp` command does, a signed-in Cerulion account.
 
 ## Where the harness lives
 

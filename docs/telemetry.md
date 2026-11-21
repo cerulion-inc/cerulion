@@ -10,6 +10,7 @@ off.
 Events are sent only by a build that has a telemetry key. The key is baked
 into the release artifacts (the install script, the Debian package and the
 Homebrew formula) when they are built, if the release pipeline provides one.
+The 2.1.0 release artifacts carry one; the 2.0.0 artifacts carried none.
 A build from source (`cargo install`, `cargo build`) has no baked key unless
 `CERULION_POSTHOG_KEY` is set in its environment while it compiles. A build
 with neither a baked key nor `POSTHOG_API_KEY` sends nothing whatever the

@@ -37,12 +37,13 @@ does. `--task NAME` sets the robot up for another task: `bowl-on-plate` (the def
 `soup-in-basket`. The first run installs the simulator and the benchmark scenes once, which takes minutes, with
 its progress on stderr.
 
-`cerulion rcp bench --model YOUR_MODEL` reruns a task of the published benchmark twice against your own model
-endpoint, once with the harness and once without, and prints the benchmark's verdict for each;
-`cerulion rcp bench --verify` checks that the harness code on disk is the code the benchmark measured. See
+`cerulion rcp bench --model YOUR_MODEL` reruns a start state twice against your own model endpoint, once with
+the harness and once without, and prints the benchmark's verdict for each: one of the published benchmark with
+`--cell`, otherwise one the harness was developed on. `cerulion rcp bench --verify` checks every file of the
+harness's measured code against the provenance ledger that ties it to the code the benchmark measured. See
 [the harness guide](harness.md) for both, and `docs/user-api.md` for every flag.
 
-The harness's tools on real robots through `cerulion rcp` come in the next release.
+Experimental: in this release the harness's tools drive a simulated robot only.
 
 ## Run it
 
