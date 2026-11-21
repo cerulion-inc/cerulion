@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `cerulion_cli_engine::replay_rederive::NodeDecl` replaces `feeds_local_block_edge: bool` with `may_be_held_by: BlockHoldEdges`, the `block` inputs in the node's rank that read a topic it produces, each a `BlockHoldEdge` with a `SlotRecord` of what the bag records of its slot: `SlotRecord::Counted { drain }`, the frames are whole and `drain` is a `BodyDrain`, how the consumer's body reads drain the input, or `SlotRecord::Unaccounted`, and `TriggerDecl::Data` gains `drain: FifoDrain`, which states whether the recording read the trigger input through one subscriber or two, or, as `FifoDrain::Unrecorded`, that it does not say, so a struct literal of either names the new field. `BlockHoldEdge` carries `reads_before: ReadsBefore`, the inputs its consumer's tick reads before the `block` input, each a `ViewedInput`. `ScheduleFinding` gains `caveat: Option<FindingCaveat>`, and `replay_engine::RecorderInfo` gains `input_queues: Option<RecordedInputQueues>`, the recording's `node_inputs`.
+- `cerulion node build` of a Python node, and the Python node host when it loads one, refuse a declaration that carries `publisher_for_every_output`, which only the `#[cerulion_node]` macro sets.
 
 ### Fixed
 

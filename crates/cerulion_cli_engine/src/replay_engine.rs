@@ -13492,7 +13492,8 @@ fn topic_recorded_whole(report: &RecordHealthReport, topic: &str, listed: bool) 
 /// read as a `#[cerulion_node]` node, which sets that flag: its generated tick
 /// views its inputs in the order its input metadata declares them, accumulate
 /// ports aside, so it reads the ones before `input` first. A raw FFI info block
-/// or a hand-written entry that sets the flag is read the same way. Each input
+/// or a hand-written entry that sets the flag is read the same way; a Python
+/// node declaration cannot set it. Each input
 /// it reads first is a trigger input where the node's policy wakes it on that
 /// input, as the runtime partitions them (the `build_snapshot_input_names`
 /// table): none on a `period_ms` or `external` node, the trigger-marked ones on
