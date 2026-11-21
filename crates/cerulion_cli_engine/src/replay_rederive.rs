@@ -803,8 +803,13 @@ pub enum BodyDrain {
 /// and record no fire with nothing in the bag to say why. Whether a hold was
 /// possible at a given step is bounded from the recording, from each edge's
 /// depth, the stamps of the frames recorded on its topic and its consumer's
-/// body drains ([`SlotRecord`]); the `consume = latest` rule asks only whether
-/// an edge exists ([`Self::any`]).
+/// body drains ([`SlotRecord`]). The FIFO, `period_ms` and Sync rules read
+/// that bound; the `consume = latest` rule asks only whether an edge exists
+/// ([`Self::any`]). A `block` edge is counted only where the bag's fire
+/// records put its consumer on a later level than its producer: on any other
+/// the consumer's read can drain the slot before the producer decides, or the
+/// bag does not show the order, and the replay gives it
+/// [`SlotRecord::Unaccounted`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockHoldEdges {
     edges: Vec<BlockHoldEdge>,
@@ -855,9 +860,16 @@ pub struct NodeDecl {
     /// covers, and the replay pops a frame left in the slot after the step's
     /// last fire, as the live burst did. For a `drop_oldest` input on a bag
     /// with no stage set ([`FifoDrain::Unrecorded`]) the hold is not allowed
-    /// for. The `consume = latest` rule holds such a node to no fire it did not
+    /// for. The `period_ms` rule judges a step at which an edge's slot was
+    /// full by the bag's own record on the first fires it owed
+    /// ([`StandDownReason::PeriodBlockHeld`]), and the Sync rule does not
+    /// convict an aligned set left unfired there
+    /// ([`StandDownReason::SuppressibleFire`] with `in_rank_hold`). The
+    /// `consume = latest` rule holds such a node to no fire it did not
     /// record: the first step that would owe one stands the rule down
-    /// ([`StandDownReason::LatestBlockHeld`]).
+    /// ([`StandDownReason::LatestBlockHeld`]). A `block` edge is counted only
+    /// where the bag's fire records put its consumer on a later level than its
+    /// producer; any other is [`SlotRecord::Unaccounted`].
     pub may_be_held_by: BlockHoldEdges,
     /// Does this node wire any input that is NOT
     /// `#[input(trigger)]`-marked?
@@ -10562,7 +10574,7 @@ mod tests {
     #[test]
     fn a_held_period_producer_is_still_convicted_off_its_schedule() {
         let src = |at: u64| [("src", at)];
-        let drained = [("sink", 0, 0, 1)];
+        let drained = [("sink", 1, 1, 1)];
         // Depth 1: fires at 5 and 10 ms, held at 15 ms, then one owed fire per
         // release (the deadline moves 5 ms each time); the sink takes a frame
         // in the step before each release.
@@ -10582,6 +10594,25 @@ mod tests {
             STAMPED,
         );
         assert_eq!(unheld.findings[0].step, 3);
+
+        // Resumed at step 2: the slot is unknown until the sink reads its
+        // queue empty, which a frame-by-frame read never does, so the step 3
+        // hold is not allowed for. From the start, the same steps read clean.
+        let later = &depth_one[1..];
+        assert!(verify_unrestored(&held(later), later, &[], STAMPED).is_clean());
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+            .with_stops_stated(BTreeSet::from(["src".to_string(), "sink".to_string()]));
+        let found = verify(
+            &held(later),
+            later,
+            &[],
+            STAMPED,
+            &resumed,
+            &PassStops::none(),
+        )
+        .findings;
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].step, 3);
 
         // Off the owed instants: step 4 fires at 16 ms where 15 was owed.
         let mut off = depth_one.clone();
@@ -10738,8 +10769,7 @@ mod tests {
     /// holds that frame at step 1, where the set is left unfired and the
     /// consumer fires and its body takes the frame; the held set fires at step
     /// 2, which fills the slot again, and step 3's aligned set is left unfired
-    /// too. Two
-    /// held steps, one stand-down. Not held, or held before it has sent a
+    /// too. Two held steps, one stand-down. Not held, or held before it has sent a
     /// frame, or after its consumer took the frame (a step later, or in the
     /// step that sent it), the aligned unfired step is the finding.
     #[test]
@@ -10803,6 +10833,20 @@ mod tests {
         ];
         let held = verify_unrestored(&held_over(&quiet), &quiet, &[], STAMPED);
         assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+        // Resumed at step 0, the slot is unknown until the consumer reads its
+        // queue empty, which a frame-by-frame read never does: the step 1 set
+        // left unfired is the finding.
+        let resumed = verify(
+            &held_over(&quiet),
+            &quiet,
+            &[],
+            STAMPED,
+            &PassRestore::from_sync_heads(BTreeMap::new())
+                .with_stops_stated(BTreeSet::from(["fusion".to_string(), "ctl".to_string()])),
+            &PassStops::none(),
+        );
+        assert_eq!(resumed.findings.len(), 1, "{:?}", resumed.findings);
+        assert_eq!(resumed.findings[0].step, 1);
         assert_eq!(
             held.stand_downs,
             vec![StandDown {

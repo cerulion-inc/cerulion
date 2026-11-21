@@ -320,10 +320,13 @@ a short step there at which the bag shows the slot full says so; a `block` or
 `sample(N)` trigger input is read through two subscribers on any bag, and is
 judged as above.
 A `period_ms` node held at a step where the recording shows the slot full,
-counted as above (so never on an input that sets `block_timeout_ms`), is judged on that step's first owed fires, its next deadline
-the first owed instant it did not fire, and the first step that fires fewer
-than it owed is noted once (a `stand_down` of code `period_block_held`, judged
-with a hold allowed for); a fire off that schedule is still a finding. A
+counted as above (so never on an input that sets `block_timeout_ms`, or on
+an edge whose consumer the bag's fire records do not put on a later level
+than its producer), is judged on that step's first owed fires, its next
+deadline the first owed instant it did not fire, and the first step that
+fires fewer than it owed is noted once (a `stand_down` of code
+`period_block_held`, judged with a hold allowed for); a fire off that schedule
+is still a finding. A
 `Sync` node's aligned set left unfired at such a step is not convicted, the
 first such step noted once (a `suppressible_fire` judged with a hold allowed
 for), and the node is still judged on every other step and on the sets it

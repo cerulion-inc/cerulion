@@ -54896,6 +54896,94 @@ fn a_non_trigger_block_reader_a_level_after_its_producer_holds_it_and_replays_cl
     bh_assert_replays(&outcome, "a non-trigger reader a level after the relay");
 }
 
+/// A `period_ms` source whose topic a NON-trigger `block` input reads:
+/// `reader` (10 ms period, non-trigger `block` input, depth 2) is declared
+/// before `pulse` (5 ms period). Both sit at level 0, and nodes on a `block`
+/// edge tick one at a time in graph order within a level, so the reader
+/// drains the pulse's topic before the pulse decides in the same step. The
+/// hand oracle, from the declared schedules at the reference run's 5 ms step
+/// (step `k` runs at `(k + 1) * 5` ms):
+///
+/// * the pulse fires at every step, `x = k + 1` at step `k`, its frame
+///   carrying sequence `k`: the reader empties the queue before the pulse
+///   decides, so the slot holds at most one frame at a decide and nothing
+///   holds the pulse;
+/// * the reader fires at the 10 ms steps 1, 3, 5, 7 and 9: at step `2j + 1`
+///   it serves the pulse's step `2j` frame (`x = 2j + 1`), not the step
+///   `2j + 1` one, which the pulse publishes after it.
+///
+/// Then the pulse's step 9 fire record is taken out, its frame still
+/// recorded, so the clean stamp still states the bag's frames. The pulse had
+/// room at step 9, since the reader drained the queue before it decided, so
+/// the fire its schedule owed there (at 50 ms) is the finding. The bag records
+/// the reader at the pulse's level, so the slot is unaccounted, the pulse is
+/// judged as if nothing held it, and the recording as it ran still replays
+/// clean.
+#[test]
+#[serial]
+fn a_period_fire_dropped_at_a_step_its_non_trigger_block_reader_drained_first_is_the_finding() {
+    let yaml = "name: ntpgraph\nprefix: nt\nnodes:\n\
+         \x20 - id: reader\n    type: paced_block_reader_node\n    inputs:\n      - name: inp\n        source: pulse/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: pulse\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("reader", Box::new(PacedBlockReaderNodeEntry::new())),
+            ("pulse", Box::new(SourceNodeEntry::new())),
+        ])
+    };
+    let mut rec = record_uniform_with_read_log(yaml, make, &[], NT_STEPS);
+    assert_eq!(
+        nt_fire_levels(&rec),
+        BTreeMap::from([
+            ("pulse".to_string(), std::collections::BTreeSet::from([0])),
+            ("reader".to_string(), std::collections::BTreeSet::from([0])),
+        ]),
+        "the reader and the pulse both fire at level 0"
+    );
+    assert_eq!(
+        bh_xs(&rec, "/nt/pulse/out"),
+        (1..=10).map(f64::from).collect::<Vec<_>>(),
+        "the pulse fires at every step: nothing holds it"
+    );
+    assert_eq!(bh_fire_steps(&rec, "pulse"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "reader"), vec![1, 3, 5, 7, 9]);
+    assert_eq!(
+        bh_xs(&rec, "/nt/reader/out"),
+        vec![1.0, 3.0, 5.0, 7.0, 9.0],
+        "the reader reads before the pulse fires in its step"
+    );
+    assert_eq!(
+        nt_reader_served(&rec),
+        vec![(1, 0), (3, 2), (5, 4), (7, 6), (9, 8)],
+        "at step 2j + 1 the reader serves the pulse's step 2j frame"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let whole = dir.path().join("ntp_whole.mcap");
+    ri_bag_labelled(&rec, &whole, ri_free_run_recorder_json(), false);
+    let clean = bh_replay_stamped(&whole, make, bh_clean_stamp(&rec));
+    bh_assert_replays(&clean, "the recording as it ran");
+
+    let pulse = rec.node_ids.iter().position(|n| n == "pulse").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == pulse && r.step == 9)
+        .expect("the pulse fires at step 9");
+    rec.trace.remove(at);
+    let fed = dir.path().join("ntp_dropped_fire.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'pulse' \
+             step 9 period_ms schedule \u{2014} re-derived 1 fire(s) at [50000000], recorded 0 \
+             fire(s)"
+        )
+    );
+    assert!(!outcome.passed);
+}
+
 /// A relay nothing holds, on a bag that states its drain: its last fire is
 /// taken out, so its last step pops a frame and fires nothing. The finding is
 /// that step, and it carries no caveat.
@@ -54972,8 +55060,8 @@ fn a_period_source_a_block_input_in_its_rank_holds_replays_clean() {
 /// A `period_ms` source held by the middle node of a `block` chain: `src` (5
 /// ms) -> `relay` (its trigger input `block`, depth 4) -> `sink` (`block`,
 /// depth 2, `throttle_ms = 50`). The sink holds the relay, and the relay's
-/// full queue holds `src`. The
-/// hand oracle: steps 0 to 2 pass one frame down the chain; `src` fills the
+/// full queue holds `src`. The hand oracle: steps 0 to 2 pass one frame down
+/// the chain; `src` fills the
 /// relay's queue at steps 3 to 6 and is held from step 7; each step after a
 /// sink fire (11, 21, 31, 41) the relay fires the next frame it counted, and
 /// the step after that `src` fires one owed instant into the room it freed.
