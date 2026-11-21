@@ -170,6 +170,7 @@ pub fn others_can_write(_dir: &Path) -> bool {
 /// Whether `dir` has the sticky bit (S_ISVTX), as a shared folder such as
 /// `/tmp` has: every user may create entries there, so its write bit for
 /// others is meant, and taking it off would lock every other user out.
+/// `false` for a folder whose mode cannot be read.
 #[cfg(unix)]
 fn is_sticky(dir: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -297,8 +298,8 @@ pub fn find_harness_dir(
     }
     // The closing remedy: a harness beside the binary refused only for its
     // mode is fixed by that folder's mode, unless the folder is a sticky
-    // shared one such as /tmp, whose mode is meant; otherwise no harness is
-    // anywhere.
+    // shared one such as /tmp, whose mode is meant; otherwise, and for a
+    // sticky folder, the release-package remedy.
     let remedy = match (beside.as_deref(), beside_shared) {
         (Some(dir), Some(shared)) if holds_harness(dir) && !is_sticky(shared) => format!(
             "The harness beside cerulion is not used only because every user can write to \
