@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """List prices used to turn token counts into a cost, and the arithmetic. Standard library only.
 
-The table was read from the model makers' public price pages on the date in DATE (one row was read a day later,
-see its note). Prices are USD per million tokens. A cost printed from this table is a list-price estimate from
-the token counts your endpoint reported; it is not a bill. Your endpoint may charge other prices.
+The table was read from the model makers' public price pages on the date in DATE, apart from the rows in READ_LATER,
+each read on the date it gives (date_of). Prices are USD per million tokens. A cost printed from this table is a
+list-price estimate from the token counts your endpoint reported; it is not a bill. Your endpoint may charge other
+prices.
 """
 
 DATE = "2026-11-17"
+# The rows read after DATE, with the date each was read (the read_on column of the package's prices.csv).
+READ_LATER = {"gpt-6.1-terra": "2026-11-18", "gemini-4-neon": "2026-11-21"}
 SOURCES = {
     "openai": "https://developers.openai.com/api/docs/pricing",
     "google": "https://cloud.google.com/vertex-ai/generative-ai/pricing",
@@ -23,13 +26,15 @@ PRICES = {
     "gemini-4-argon": (2.00, 0.10, 10.00, None, None, None, None, None, "google"),
     "gemini-4-carbon": (2.00, 0.10, 10.00, None, None, None, None, None, "google"),
     "gemini-4-hydrogen": (1.50, 0.075, 7.50, None, None, None, None, None, "google"),
+    # global standard tier
+    "gemini-4-neon": (3.00, 0.15, 15.00, None, None, None, None, None, "google"),
     "gemini-3.8-flash": (0.75, 0.075, 3.75, None, None, None, None, None, "google"),
     "gpt-6.2-astra": (8.00, 0.40, 40.00, None, 272000, 16.00, 0.80, 60.00, "openai"),
     "gpt-6.2-sol": (2.00, 0.10, 10.00, None, 272000, 4.00, 0.20, 15.00, "openai"),
     "gpt-6-astra": (10.00, 1.00, 50.00, None, 272000, 20.00, 2.00, 75.00, "openai"),
     "gpt-6.1-sol": (2.00, 0.10, 10.00, None, 272000, 4.00, 0.20, 15.00, "openai"),
     "gpt-6-luna": (0.10, 0.01, 0.50, None, 272000, 0.20, 0.02, 0.75, "openai"),
-    # read 2026-11-18, standard tier, short context
+    # standard tier, short context
     "gpt-6.1-terra": (1.00, 0.05, 5.00, None, None, None, None, None, "openai"),
     "grok-4.7": (2.00, 0.50, 6.00, None, 200000, 4.00, 1.00, 12.00, "xai"),
 }
@@ -40,11 +45,17 @@ NAMES = [
     ("claude-haiku-5-5", "claude-haiku-5.5"), ("claude-haiku-5.5", "claude-haiku-5.5"),
     ("claude-fable-5-2", "claude-fable-5.2"), ("claude-fable-5.2", "claude-fable-5.2"),
     ("gemini-4-argon", "gemini-4-argon"), ("gemini-4-carbon", "gemini-4-carbon"),
-    ("gemini-4-hydrogen", "gemini-4-hydrogen"), ("gemini-3.8-flash", "gemini-3.8-flash"),
+    ("gemini-4-hydrogen", "gemini-4-hydrogen"), ("gemini-4-neon", "gemini-4-neon"),
+    ("gemini-3.8-flash", "gemini-3.8-flash"),
     ("gpt-6.2-astra", "gpt-6.2-astra"), ("gpt-6.2-sol", "gpt-6.2-sol"), ("gpt-6-astra", "gpt-6-astra"),
     ("gpt-6.1-sol", "gpt-6.1-sol"), ("gpt-6.1-terra", "gpt-6.1-terra"), ("gpt-6-luna", "gpt-6-luna"),
     ("grok-4.7", "grok-4.7"),
 ]
+
+
+def date_of(key):
+    """The date the table's row for a key was read: its READ_LATER date, else DATE."""
+    return READ_LATER.get(key, DATE)
 
 
 def key_of(model):

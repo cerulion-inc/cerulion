@@ -100,6 +100,13 @@ class Cerulion < Formula
       end
     end
 
+    # The agent harness tree ships in every archive and sits beside the CLI,
+    # where the CLI looks for it. Homebrew links no directory under bin onto
+    # the PATH, so it stays in the keg beside the binaries.
+    harness = Dir["{,*/}harness"].find { |candidate| File.directory?(candidate) && !File.symlink?(candidate) }
+    odie "release archive is missing harness" unless harness
+    bin.install harness
+
     # The license notices the archive carries. Installing these binaries
     # redistributes the dependency graph they statically link, and most of
     # those licenses require the license text and the copyright notice to
@@ -169,6 +176,9 @@ class Cerulion < Formula
 
   test do
     assert_match version.to_s, shell_output("#{bin}/cerulion --version")
+    assert_predicate bin/"harness", :directory?
+    assert_predicate bin/"harness/rcp.sh", :file?
+    assert_predicate bin/"harness/install.sh", :file?
   end
 end
 RUBY

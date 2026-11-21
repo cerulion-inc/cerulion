@@ -289,6 +289,21 @@ class Results(unittest.TestCase):
         self.assertEqual(row["list_price_usd"], 0.1125)
         self.assertEqual(row["price_table"], {"key": "gemini-3.8-flash", "date": "2026-11-17"})
 
+    def test_a_row_read_after_the_tables_date_records_its_own_date(self):
+        write_json(os.path.join(self.group, CELL + ".json"), {"success": True, "grid": {"attempt": 1}})
+        logs = os.path.join(self.group, "_episodes", CELL, "a1")
+        os.makedirs(logs)
+        usage = {"prompt_tokens": 100_000, "completion_tokens": 10_000,
+                 "prompt_tokens_details": {"cached_tokens": 40_000}}
+        with open(os.path.join(logs, "operator.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": "reply", "usage": usage}) + "\n")
+        ns = cli.parser().parse_args(["run-cell", "--model", "google/gemini-4-neon", "--out", self.out])
+        row = cli.read_result(ns, "rcp", self.out)
+        # gemini-4-neon: 60,000 x 3.00 + 40,000 x 0.15 + 10,000 x 15.00 = 0.18 + 0.006 + 0.15 = 0.336 USD.
+        self.assertEqual(row["list_price_usd"], 0.336)
+        self.assertEqual(row["price_table"], {"key": "gemini-4-neon", "date": "2026-11-21"})
+        self.assertEqual(cli.cost_text(row), "0.3360 USD at list price (the package's price table of 2026-11-21)")
+
     def test_a_model_the_price_table_lacks_has_no_price(self):
         write_json(os.path.join(self.out, "rcp", "libero_pro", "run_with", CELL + ".json"), {"success": False})
         ns = cli.parser().parse_args(["run-cell", "--model", "a-local-model", "--out", self.out])

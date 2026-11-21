@@ -2,10 +2,10 @@
 """The shipped measured code against its provenance files, and the plain arm's assembly.
 
 cerulion_harness.verify and measured/assemble.py are loaded from their paths. The oracles are written here: the two
-snapshot ids the results package cites, the file counts of the ledger, the paths of the plain overlay and its absent
-list, and the hashes of the two texts the model reads unchanged from the measured trees. Every tampering test works on
-a copy of the folder in a temporary directory. The command-line tests run python -m cerulion_harness.verify with this
-folder's src/ on the path.
+snapshot ids of the measured trees, the file counts of the ledger, the paths of the plain overlay and its absent
+list, the hashes of the two operator files that carry the picture modes, and the hashes of the two texts the model
+reads unchanged from the measured trees. Every tampering test works on a copy of the folder in a temporary directory.
+The command-line tests run python -m cerulion_harness.verify with this folder's src/ on the path.
 """
 
 import contextlib
@@ -36,8 +36,16 @@ def load(name, path):
 V = load("cerulion_harness_verify_under_test", HARNESS / "src" / "cerulion_harness" / "verify.py")
 A = load("cerulion_harness_assemble_under_test", MEASURED / "assemble.py")
 
-RCP_SNAPSHOT = "sha256:7cb9f322c10f6fa7e64a3f8da7c22c67d67280eca436a03d2d87683496b4d5b8"
-PLAIN_SNAPSHOT = "sha256:b73c548a1f0436f52ce41cffc7d4a4a2784e5d6170e2dd2c757c9cabdf146637"
+RCP_SNAPSHOT = "sha256:4f8bbe79fdf38df1770c068ec470fd3d5a629fd371f7288887cb3d275f9f747e"
+PLAIN_SNAPSHOT = "sha256:6f040ca78bae0efd437005afc04ead78c4295e1e471d854b3e7ff0f9ea01f2a4"
+# The two operator files that carry the picture modes, shared by both trees: (measured, shipped) SHA-256. The
+# shipped file is the measured one with the licence line added, and in chat_operator.py one comment shortened.
+PICTURE_MODE_FILES = {
+    "bench/operators/chat_operator.py": ("1e00eaa7b12729d05987bbe202f787ebdfac50f00fe3b5e542321501ab1640a4",
+                                         "02d664ed9061ca489bc0f2d3da2d1a8b70d5d45199483b88c5fff92fe5b6be6f"),
+    "bench/operators/chat_support.py": ("61823662b5e0fa193c4e3475e6eb276a2c6c066d77ca4615527ce173b03ef362",
+                                        "b0f966bd7ac42da318684ee3bd1506287d7973c3ef793859db2064bd6d265250"),
+}
 OVERLAY = sorted([
     "rcpx/bounds_book.py", "rcpx/control_expect.py", "rcpx/control_hold.py", "rcpx/control_hold_close.py",
     "rcpx/control_sense.py", "rcpx/r2/device_bounds.py", "rcpx/r2/epochs_book.py", "rcpx/r2/probe.py",
@@ -105,6 +113,18 @@ class ShippedTree(unittest.TestCase):
         self.assertEqual("sha256:" + sha(HARNESS / "provenance" / "measured-rcp.manifest"), RCP_SNAPSHOT)
         self.assertEqual("sha256:" + sha(HARNESS / "provenance" / "measured-plain.manifest"), PLAIN_SNAPSHOT)
         self.assertEqual(V.SNAPSHOTS, {"rcp": RCP_SNAPSHOT, "plain": PLAIN_SNAPSHOT})
+
+    def test_the_picture_mode_files_are_rows_of_both_arms(self):
+        with open(HARNESS / "provenance" / "ledger.json", encoding="utf-8") as f:
+            arms = json.load(f)["arms"]
+        for rel, (measured, shipped) in PICTURE_MODE_FILES.items():
+            self.assertEqual(sha(MEASURED / "rcp" / rel), shipped, rel)
+            for arm in ("rcp", "plain"):
+                rows = [r for r in arms[arm]["files"] if r["path"] == rel]
+                self.assertEqual(rows, [{"measured_sha256": measured, "path": rel, "public_sha256": shipped,
+                                         "status": "comments_and_docstrings"}], (arm, rel))
+                manifest = (HARNESS / "provenance" / f"measured-{arm}.manifest").read_text(encoding="utf-8")
+                self.assertIn(f"{measured}  {rel}\n", manifest, (arm, rel))
 
     def test_the_texts_the_model_reads_are_the_measured_bytes(self):
         for rel, want in MODEL_TEXTS.items():

@@ -87,8 +87,8 @@ cargo test -p cerulion_core --tests --lib -- --test-threads=1
 > matches CI exactly.
 
 If the build and core tests succeed, your environment is healthy. To see
-Cerulion run end to end, install the CLI and follow the quickstart in the
-[README](../README.md):
+Cerulion run end to end, install the CLI and follow the
+[quickstart](../README.md#quickstart):
 
 ```bash
 cargo build --release --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd \
@@ -100,7 +100,10 @@ install -m 0755 target/release/cerulion target/release/cerulion-netd \
 
 The quickstart's commands run under a Cerulion account: sign in once on that
 machine with `cerulion login` before the first one; later commands read the
-result locally and work offline.
+result locally and work offline. The copies in `$HOME/.cargo/bin` have no
+harness beside them and sit outside this checkout, so before the quickstart's
+harness steps export `CERULION_HARNESS_DIR` as the absolute path of this
+checkout's `harness/` folder, in the shell you start the quickstart from.
 
 The `cerulion ros2 run` and `cerulion ros2 launch` verbs also need
 `librmw_cerulion.so` beside the CLI. The release packages carry it on Linux;

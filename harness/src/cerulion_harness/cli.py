@@ -2,7 +2,7 @@
 """Run one benchmark cell with and without the Cerulion harness, against your own model endpoint.
 
     python -m cerulion_harness run-cell --model MODEL [--base-url URL] [--key-env NAME] [--cell ID]
-                                        [--arm both|plain|rcp] [--out DIR]
+                                        [--arm both|plain|rcp] [--image-mode swap|append] [--out DIR]
     python -m cerulion_harness cells
 
 cerulion rcp bench runs run-cell. It starts the simulator, serves the robot to the model through one of two tool
@@ -12,7 +12,22 @@ sets, lets the model work within the budget, and scores the episode with the ben
     rcp     the Cerulion harness tools
 
 Both setups get the same start state, the same budget (80 model replies, 900 control steps), temperature 1.0 and
-one tool call per reply. The model endpoint is any OpenAI-compatible chat completions URL that supports tools and
+one tool call per reply, and the operator keeps the newest 4 pictures (--keep-images 4). The picture mode decides
+what happens to the older ones (the operator's --image-mode):
+
+    swap     on every request, each picture beyond the newest 4 becomes a text inside its older turn
+    append   an older turn is never edited for a picture, so until the context estimate passes its limit each
+             request starts with the whole previous request, and an endpoint's prompt cache can read it instead of
+             writing it again; past the limit, the pictures beyond the newest 4 go, all of them in one request
+
+A Claude model (a model name that holds claude, in any case) runs append with the Cerulion harness tools,
+its opening (the tools, the system text and the first message) marked for the prompt cache (--cache-prefix-mark);
+every other model, and every model with the plain tools, runs swap. --image-mode names one mode for every setup of
+the run instead: with append, the cache mark still goes only to a Claude model with the Cerulion harness tools,
+and swap carries none. The start line says which mode each setup runs, and summary.json records it with the
+setup's operator flags.
+
+The model endpoint is any OpenAI-compatible chat completions URL that supports tools and
 images. The URL is read from --base-url or OPENAI_BASE_URL; the key is read from the environment variable named by
 --key-env (default OPENAI_API_KEY) and is sent only to that URL: urllib follows no redirect in run-cell or in the
 episode's Python processes that start with run-cell's PYTHONPATH, its driver and model client among them
@@ -64,6 +79,11 @@ ARMS = {
     "plain": {"grid_arm": "without", "work": "p", "flags": []},
     "rcp": {"grid_arm": "with", "work": "r", "flags": ["--packages", "all,place"]},
 }
+# The operator's picture modes (bench/operators/chat_support.py, History). swap is the operator's own default and
+# takes no flag; append is --image-mode append, with --cache-prefix-mark for a Claude model with the harness tools.
+IMAGE_MODES = ("swap", "append")
+APPEND_FLAGS = ("--image-mode", "append")
+PREFIX_MARK_FLAG = "--cache-prefix-mark"
 THREADS = {"MUJOCO_GL": "osmesa", "PYOPENGL_PLATFORM": "osmesa", "PYTHONDONTWRITEBYTECODE": "1",
            "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "LP_NUM_THREADS": "2",
            "PYTHONPATH": "."}
@@ -198,9 +218,41 @@ def cell_line(cell_id):
                      f"l10_tNN_iNN")
 
 
-def op_args(extra_text):
-    """The operator flags of every episode: the measured runs' flags, with this route's --extra-body."""
-    return OP_ARGS.format(timeout=route.HTTP_TIMEOUT_S, extra=extra_text)
+def is_claude(model):
+    """A Claude model: its name holds claude, in any case."""
+    return "claude" in str(model).lower()
+
+
+def picture_mode(model, arm, given=None):
+    """(mode, operator flags) of one setup's episode. The mode is the one given (--image-mode), else append for a
+    Claude model with the harness tools and swap for every other model and setup. swap adds no flag: it is the
+    operator's default. append adds --image-mode append, and for a Claude model with the harness tools also
+    --cache-prefix-mark, which marks the opening (the tools, the system text and the first message) for the prompt
+    cache with the cache_control field Claude's request format reads; the plain tools never get the mark."""
+    claude_rcp = arm == "rcp" and is_claude(model)
+    mode = given if given is not None else ("append" if claude_rcp else "swap")
+    if mode not in IMAGE_MODES:
+        raise ValueError(f"unknown picture mode {mode!r}: use one of {', '.join(IMAGE_MODES)}")
+    if mode == "swap":
+        return mode, []
+    return mode, list(APPEND_FLAGS) + ([PREFIX_MARK_FLAG] if claude_rcp else [])
+
+
+def picture_line(model, arms, given=None):
+    """One line: each setup's picture mode, and whether --image-mode named it."""
+    parts = []
+    for arm in arms:
+        mode, flags = picture_mode(model, arm, given)
+        parts.append(f"{arm} {mode}" + (" with the opening marked for the prompt cache" if PREFIX_MARK_FLAG in flags
+                                        else ""))
+    why = "named by --image-mode" if given is not None else "the default for this model; --image-mode names another"
+    return f"pictures: {', '.join(parts)} ({why})"
+
+
+def op_args(extra_text, picture_flags=()):
+    """The operator flags of one episode: the measured runs' flags, with this route's --extra-body, then the flags of
+    the setup's picture mode (picture_mode)."""
+    return " ".join([OP_ARGS.format(timeout=route.HTTP_TIMEOUT_S, extra=extra_text), *picture_flags])
 
 
 def longest_socket_path(work, label, cell):
@@ -357,9 +409,10 @@ def run_arm(ns, arm, out_dir, cells_file, tree, base_url, signals):
     else:
         env["RCPX_SELFKNOW_DIR"] = layout.RECORDS
     results = os.path.join(out_dir, arm)
+    _, picture_flags = picture_mode(ns.model, arm, ns.image_mode)
     argv = [sys.executable, "runs/tools/grid_ext.py", "run", "--model", ns.model, "--base-url", base_url,
             "--key-env", ns.key_env, "--cells", cells_file, "--only", ns.cell, "-j", "1", "--label", ns.label,
-            "--results", results, "--op-args", op_args(ns.extra_body), "--clock", str(ns.clock),
+            "--results", results, "--op-args", op_args(ns.extra_body, picture_flags), "--clock", str(ns.clock),
             "--max-attempts", str(MAX_ATTEMPTS), "--retry-wait", "60", "--retry-failed", "--egl-slots", "0",
             "--budget-requests", str(BUDGET["model_replies"]), "--budget-steps", str(BUDGET["control_steps"]),
             "--arm", spec["grid_arm"], *spec["flags"], "--work", os.path.join(ns.work, spec["work"])]
@@ -416,7 +469,7 @@ def read_result(ns, arm, out_dir):
         "attempt": attempt,
         "end_reason": res.get("end_reason"),
         "list_price_usd": prices.cost_of(usages, key) if key else None,
-        "price_table": {"key": key, "date": prices.DATE},
+        "price_table": {"key": key, "date": prices.date_of(key)},
         "reported_usd": round(sum(own), 6) if own else None,
         "reported_cost_replies": len(own),
         "usage_replies": len(usages),
@@ -568,10 +621,21 @@ def write_summary(out_dir, record):
     os.replace(path + ".tmp", path)
 
 
+def pictures(ns, arms):
+    """What summary.json records of the picture modes: where the mode came from, and each setup's mode and operator
+    flags."""
+    arms_record = {}
+    for arm in arms:
+        mode, flags = picture_mode(ns.model, arm, ns.image_mode)
+        arms_record[arm] = {"image_mode": mode, "operator_flags": flags}
+    return {"from": "--image-mode" if ns.image_mode is not None else "the default for this model", "arms": arms_record}
+
+
 def start_lines(ns, arms, cond):
     return [
         f"{progress.utc_now()} start: {ns.cell} with {ns.model}, setup {' then '.join(arms)}; results in {ns.out}",
         "  " + route.condition_line(cond),
+        "  " + picture_line(ns.model, arms, ns.image_mode),
         "  " + expected.expected_line(ns.model, arms, BUDGET, ns.clock),
         f"  scratch folder: {ns.work_shown}" + (" (removed at the end)" if ns.own_work else ""),
     ]
@@ -585,7 +649,8 @@ def run_cell(ns, arms, trees, signals):
     with open(cells_file, "w", encoding="utf-8") as f:
         f.write(cell_line(ns.cell) + "\n")
     cond = route.condition(ns.base_url, ns.extra_body, ns.extra_body_given)
-    record = {"cell": ns.cell, "model": ns.model, "budget": BUDGET, "route": cond, "rows": []}
+    record = {"cell": ns.cell, "model": ns.model, "budget": BUDGET, "route": cond, "pictures": pictures(ns, arms),
+              "rows": []}
     try:
         write_summary(out_dir, record)
         for text in start_lines(ns, arms, cond):
@@ -653,6 +718,12 @@ def parser():
                    help='JSON object merged into every request body (default: {"reasoning_effort": "high"}, and '
                         'through OpenRouter a google/ model also gets {"provider": {"only": ["google-vertex"]}}, '
                         'the backend the measured runs used)')
+    r.add_argument("--image-mode", default=None, choices=IMAGE_MODES,
+                   help="what happens to the pictures beyond the newest 4, in every setup of the run: swap (each "
+                        "becomes a text in its older turn, on every request) or append (they stay, so each request "
+                        "starts with the whole previous one, and go all at once only when the context estimate passes "
+                        "its limit). Default: append for a Claude model with the Cerulion harness tools, swap "
+                        "otherwise")
     r.add_argument("--clock", type=float, default=5400.0, help="wall seconds before an episode is stopped")
     r.add_argument("--no-endpoint-check", action="store_true",
                    help="skip the one small test request that is sent to the endpoint before the simulator starts")

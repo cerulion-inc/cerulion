@@ -240,7 +240,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
@@ -289,7 +289,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_macros"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -300,7 +300,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_node_abi"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libloading",
  "stabby",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_pairing"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "dirs",
  "ed25519-dalek",
@@ -1753,7 +1753,7 @@ dependencies = [
 
 [[package]]
 name = "native_ros2_messages"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
 ]

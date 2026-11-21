@@ -641,7 +641,10 @@ fn load_pynode(
         output_subscribers.push((name.to_string(), harness));
     }
     println!("node_info={info}");
-    let mut runtime_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // Each variable whose name and value are valid UTF-8, as the runtime keeps.
+    let mut runtime_env: std::collections::HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     runtime_env.insert(
         "CERULION_WORKSPACE".to_string(),
         workspace.to_string_lossy().into_owned(),
