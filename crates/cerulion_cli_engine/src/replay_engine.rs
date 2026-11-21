@@ -10994,18 +10994,28 @@ fn fifo_trailing_refills(
 /// verifier, which counts one step's expansion, and its replayed half, which
 /// counts one edge's within one step.
 ///
-/// Past the census budget a fed replay (a `--verify` of a free-run bag that
-/// records read identity) is refused before its first step
-/// (`read_identity_unplanned`). Past the census or the frame-index budget, a
-/// pass that gates a topic over a read log (every topic a fed pass consumes,
-/// and otherwise a topic its rank both produces and consumes) is refused at
-/// its prepare (`read_log_budget_declined`), and any other pass stands down its
-/// read-log-steered injection and its re-derivation verdict
-/// ([`VerifierDecline`]). Past the schedule budget the re-derivation verdict
-/// stands down with a note. A census refusal names the reads the rank holds,
-/// the budget, the step of the first read past it and that step's time in the
-/// rank's recording ([`ReadLogOverrun`]); a frame-index refusal names the
-/// frames and the budget ([`FrameIndexOverrun`]).
+/// A LOCKSTEP pass plans no read from the recording
+/// ([`PassVerification::inert`]): it takes no census, builds no frame index of
+/// the frames its ranks consume and accumulates no schedule, so no budget
+/// refuses a lockstep replay or stands its verdict down. The frame index of a
+/// co-located `multi_publisher_topics` capture diff reads the same site in
+/// every mode, and past it that diff falls back to one stream and refuses
+/// nothing ([`build_capture_partitionings`]). The rest is a FREE-RUN pass's.
+///
+/// Past the census budget, a rank that consumes a topic refuses a fed replay
+/// (a `--verify` of a free-run bag that records read identity) before its
+/// first step (`read_identity_unplanned`). Past the census or the frame-index
+/// budget, a pass that gates a topic over a read log (every topic a fed pass
+/// consumes, and otherwise a topic its rank both produces and consumes and no
+/// other rank writes, [`rank_enforce_topics`]) is refused at its prepare
+/// (`read_log_budget_declined`), past the frame index only when its rank
+/// recorded a read. Any other pass stands down its read-log-steered injection
+/// and its re-derivation verdict ([`VerifierDecline`]) and runs. Past the
+/// schedule budget the re-derivation verdict stands down with a note. A census
+/// refusal names the reads the rank holds, the budget, the step of the first
+/// read past it and that step's time in the rank's recording
+/// ([`ReadLogOverrun`]); a frame-index refusal names the frames and the budget
+/// ([`FrameIndexOverrun`]).
 const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
 
 /// WHICH of the verifier's three record budgets a call site is asking for.
@@ -12861,25 +12871,30 @@ impl VerifierDecline {
     }
 
     /// The remedy a refusal on this cause names, for the causes a shorter
-    /// recording cures: each budget counts what a verifying replay holds in
-    /// memory, so a recording that holds less is what fits. `None` for a cause
-    /// in the recording's manifest, whose refusal names a re-record instead.
+    /// recording cures: each budget counts what the refused free-run replay
+    /// holds in memory, so a recording that holds less is what fits. `None`
+    /// for a cause in the recording's manifest, whose refusal names a
+    /// re-record instead.
     ///
-    /// The schedule budget declines mid-pass with a note and refuses nothing,
-    /// so no refusal prints its remedy.
+    /// Two refusals print it: a fed replay's census refusal
+    /// ([`declined_census_detail`]) and a gated rank's
+    /// ([`enforcement_blocked_by_decline`]), which a resim without `--verify`
+    /// reaches too, so the sentence speaks of this replay rather than of a
+    /// verifying one. The schedule budget declines mid-pass with a note and
+    /// refuses nothing, so no refusal prints its remedy.
     fn remedy(self) -> Option<&'static str> {
         match self {
             Self::ReadLogBudget(_) => Some(
-                "A verifying replay holds each rank's read log in memory up to this budget, \
-                 so verify a recording of this graph no longer than that",
+                "This replay holds each rank's read log in memory up to this budget, so \
+                 replay a recording of this graph no longer than that",
             ),
             Self::FrameIndexBudget(_) => Some(
-                "A verifying replay holds the frames each rank consumes in memory up to this \
-                 budget, so verify a shorter recording of this graph",
+                "This replay holds the frames each rank consumes in memory up to this budget, \
+                 so replay a shorter recording of this graph",
             ),
             Self::ScheduleBudget => Some(
-                "A verifying replay holds each pass's recorded schedule in memory up to this \
-                 budget, so verify a shorter recording of this graph",
+                "This replay holds each pass's recorded schedule in memory up to this budget, \
+                 so replay a shorter recording of this graph",
             ),
             Self::InputTables | Self::ReadLogUnplaceable | Self::StagingRegime => None,
         }
@@ -40843,9 +40858,9 @@ mod verifier_budget_overrun_tests {
             declined_census_detail(0, VerifierDecline::ReadLogBudget(timed)),
             "rank 0's read log was declined (verifier_declined_read_log_budget): it holds 26 \
              reads, more than the verifier's budget of 25 reads per rank, and reaches the \
-             budget at step 11, 0.055 s into the rank's 0.055 s of recording. A verifying \
-             replay holds each rank's read log in memory up to this budget, so verify a \
-             recording of this graph no longer than that."
+             budget at step 11, 0.055 s into the rank's 0.055 s of recording. This replay \
+             holds each rank's read log in memory up to this budget, so replay a recording of \
+             this graph no longer than that."
         );
         let untimed = ReadLogOverrun {
             time: None,
@@ -40934,14 +40949,13 @@ mod verifier_budget_overrun_tests {
         const RE_RECORD: &str = "Re-record the bag with this binary, or replay it under \
                                  CERULION_EXECUTION_MODE=lockstep, whose one gating clock \
                                  orders every publish against every step";
-        const READ_LOG: &str = "A verifying replay holds each rank's read log in memory up to \
-                                this budget, so verify a recording of this graph no longer \
-                                than that";
-        const FRAMES: &str = "A verifying replay holds the frames each rank consumes in memory \
-                              up to this budget, so verify a shorter recording of this graph";
-        const SCHEDULE: &str = "A verifying replay holds each pass's recorded schedule in \
-                                memory up to this budget, so verify a shorter recording of \
-                                this graph";
+        const READ_LOG: &str = "This replay holds each rank's read log in memory up to this \
+                                budget, so replay a recording of this graph no longer than \
+                                that";
+        const FRAMES: &str = "This replay holds the frames each rank consumes in memory up to \
+                              this budget, so replay a shorter recording of this graph";
+        const SCHEDULE: &str = "This replay holds each pass's recorded schedule in memory up \
+                                to this budget, so replay a shorter recording of this graph";
         let read_log = ReadLogOverrun {
             reads: 26,
             budget: 25,

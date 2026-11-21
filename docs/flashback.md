@@ -101,11 +101,13 @@ needs a checkpoint at or before its own start to be re-runnable from there.
 Shortening it below that would produce captures anchored *after* the thing that
 went wrong.
 
-A `--verify` of a capture is held to the limits of any recording: up to 200000
-reads, and 200000 recorded frames consumed, per process or executor unit (see
-`docs/bag.md`, Known limits). A capture of the default length, 30 s back and
-15 s forward, is refused only when one process or executor unit of the graph
-makes more reads, or consumes more frames, than that within it.
+A `--verify` of a capture taken from a free-run run is held to the limits of
+any free-run recording: up to 200000 reads, and 200000 recorded frames
+consumed, per process or executor unit (see `docs/bag.md`, Known limits). A
+capture taken from a lockstep run is not limited. A capture of the default
+length, 30 s back and 15 s forward, is refused only when one process or
+executor unit of the graph makes more reads, or consumes more frames, than
+that within it.
 
 ## Captures the runtime takes on its own
 
