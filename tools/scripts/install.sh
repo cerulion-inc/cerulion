@@ -2626,6 +2626,19 @@ RUST_EOF
         "$harness_root/open-error" ||
         die "self-test: the install did not name a directory others can write: $(cat "$harness_root/open-error")"
     chmod 0755 "$harness_open_dir"
+    # A sticky one, such as /tmp, is named too, with no chmod to offer.
+    harness_sticky_dir="$harness_root/sticky-install"
+    mkdir -p "$harness_sticky_dir"
+    chmod 1777 "$harness_sticky_dir"
+    harness_install first "$harness_sticky_dir" sticky ||
+        die "self-test: the install into a sticky directory every user can write failed: $(cat "$harness_root/sticky-error")"
+    grep -Fq "every user can write $harness_sticky_dir, so cerulion rcp will not use the harness installed there" \
+        "$harness_root/sticky-error" ||
+        die "self-test: the install did not name a sticky directory every user can write: $(cat "$harness_root/sticky-error")"
+    if grep -Fq 'chmod o-w' "$harness_root/sticky-error"; then
+        die "self-test: the install offered a chmod for a sticky directory: $(cat "$harness_root/sticky-error")"
+    fi
+    chmod 0755 "$harness_sticky_dir"
     # A --dir that is a link to a directory only its owner can write is read
     # through the link: the link's own mode, which Linux reports as 0777,
     # names nothing.
@@ -4345,8 +4358,15 @@ fi
     die "could not create the install directory $install_dir"
 if [ "$install_dir_existed" -eq 1 ] && [ "$archive_harness" -eq 1 ] &&
     [ -n "$(find -H "$install_dir" -prune -perm -0002 -print 2>/dev/null)" ]; then
-    printf 'warning: every user can write %s, so cerulion rcp will not use the harness installed there; run chmod o-w %s to use it\n' \
-        "$install_dir" "$install_dir" >&2
+    # A sticky directory such as /tmp is meant to be writable by every user,
+    # so the warning offers no chmod for it.
+    if [ -n "$(find -H "$install_dir" -prune -perm -1000 -print 2>/dev/null)" ]; then
+        printf 'warning: every user can write %s, so cerulion rcp will not use the harness installed there\n' \
+            "$install_dir" >&2
+    else
+        printf 'warning: every user can write %s, so cerulion rcp will not use the harness installed there; run chmod o-w %s to use it\n' \
+            "$install_dir" "$install_dir" >&2
+    fi
 fi
 lock_path="$install_dir/.cerulion-install.lock"
 lock_temp_path=

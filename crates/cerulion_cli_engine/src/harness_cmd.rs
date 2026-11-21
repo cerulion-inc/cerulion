@@ -849,6 +849,15 @@ mod tests {
             "{said}"
         );
         assert!(!said.contains("A release package installs"), "{said}");
+        // A folder every user can write with no harness beside the binary has
+        // no mode to fix: the release-package remedy, and no chmod.
+        std::fs::remove_dir_all(&beside).expect("the harness beside the binary");
+        let said = message(find_harness_dir(None, Some(&exe_dir)));
+        assert!(
+            said.contains("The current directory is never searched. A release package installs"),
+            "{said}"
+        );
+        assert!(!said.contains("chmod o-w"), "{said}");
         chmod(&exe_dir, 0o755);
         // At the root of the checkout the binary sits in.
         let root = scratch();
