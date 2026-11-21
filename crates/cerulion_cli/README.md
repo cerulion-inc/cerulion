@@ -54,7 +54,8 @@ or by commands. A `cerulion` installed with `cargo install` has no harness
 beside it: before the harness steps, clone this repository at the tag of its
 version (`git clone --depth 1 --branch v<version>
 https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version`
-prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder. The
+prints) and export `CERULION_HARNESS_DIR` as the absolute path of the clone's
+`harness/` folder, in the shell you start the quickstart from. The
 [API reference](https://github.com/cerulion-inc/cerulion/blob/main/docs/user-api.md)
 documents every verb.
 

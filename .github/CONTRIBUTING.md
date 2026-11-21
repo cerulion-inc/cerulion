@@ -102,7 +102,8 @@ The quickstart's commands run under a Cerulion account: sign in once on that
 machine with `cerulion login` before the first one; later commands read the
 result locally and work offline. The copies in `$HOME/.cargo/bin` have no
 harness beside them and sit outside this checkout, so before the quickstart's
-harness steps set `CERULION_HARNESS_DIR` to this checkout's `harness/` folder.
+harness steps export `CERULION_HARNESS_DIR` as the absolute path of this
+checkout's `harness/` folder, in the shell you start the quickstart from.
 
 The `cerulion ros2 run` and `cerulion ros2 launch` verbs also need
 `librmw_cerulion.so` beside the CLI. The release packages carry it on Linux;
