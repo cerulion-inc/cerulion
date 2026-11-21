@@ -469,7 +469,7 @@ def read_result(ns, arm, out_dir):
         "attempt": attempt,
         "end_reason": res.get("end_reason"),
         "list_price_usd": prices.cost_of(usages, key) if key else None,
-        "price_table": {"key": key, "date": prices.DATE},
+        "price_table": {"key": key, "date": prices.date_of(key)},
         "reported_usd": round(sum(own), 6) if own else None,
         "reported_cost_replies": len(own),
         "usage_replies": len(usages),

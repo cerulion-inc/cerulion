@@ -207,7 +207,9 @@ class Expected(unittest.TestCase):
         self.assertEqual(expected.MEASURED["claude-haiku-5.5"], {"plain": ("100", "65.36", "1102.673", "0.2558"),
                                                                  "rcp": ("100", "17.08", "189.998", "0.0233")})
         self.assertEqual(expected.MEASURED["claude-fable-5.2"]["rcp"], ("99", "14.8586", "485.8212", "1.822"))
-        self.assertEqual(len(expected.MEASURED), 15)  # the package's 15 models, every column complete
+        self.assertEqual(expected.MEASURED["gemini-4-neon"], {"plain": ("100", "25.19", "552.19", "4.0139"),
+                                                              "rcp": ("100", "16.51", "190.831", "1.246")})
+        self.assertEqual(len(expected.MEASURED), 16)  # the package's 16 models, every column complete
 
     def test_every_row_is_a_price_key_with_both_setups(self):
         from cerulion_harness import prices
