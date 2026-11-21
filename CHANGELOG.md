@@ -21,6 +21,7 @@ What 2.1.0 does differently from 2.0.0 where a graph, a script or a recording ca
 - `CERULION_MONITOR_WAIT=0` turns the live-loop park off on every host. On a Linux host with a monitor-wait instruction, 2.0.0 turned it back on when `CERULION_DOORBELL` was unset.
 - `cerulion bag play --resim all --verify` of a free-run recording with a driver (`external`) node replays the driver's outputs from the bag, so such a recording that failed with `missing-topic` now passes or fails on the topics the other nodes write, and a driver topic whose frames the bag lost fails with `record-side-tap-loss` (exit 1) or `read_identity_frame_missing` (exit 2). A recording this version makes records which nodes are drivers, and `--resim all` refuses with exit 2, naming each node, when the build it replays declares one differently.
 - On Linux aarch64, `rmw_cerulion` runs the period-learned park by default; `CERULION_RMW_PERIOD_PARK=0` restores the 2.0.0 wait.
+- The release packages carry a usage telemetry key, so the `cerulion` they install sends the usage events `docs/telemetry.md` lists, and shows its one-line notice once, on the first run at a terminal, which sends nothing. `cerulion telemetry off`, `DO_NOT_TRACK=1` or `CERULION_TELEMETRY=0` turns it off, and nothing is sent while `CERULION_NETWORK=off` engages the kill switch. The 2.0.0 packages carried no key and sent nothing. PostHog derives an approximate location from each request's IP address and discards the address before the event is stored.
 
 ### Migration
 
