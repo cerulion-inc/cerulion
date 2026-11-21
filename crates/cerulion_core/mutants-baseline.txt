@@ -102,6 +102,18 @@
 #          now holds it. Re-run over `and_list` (--re and_list) after that
 #          test: 5 mutants, 5 caught, 0 missed.
 #
+# The same file again, once the first steps became a map keyed by rank and
+# `free_run_noun` (the capture's noun in both free-run sentences), the
+# unreadable-stamp arm and its `ResimGap::reason` sentence and the one-rank
+# later-capture remedy in `frame_not_held_reason` were in:
+#
+# Run:     cargo mutants -p cerulion_core --in-place --cap-lints true \
+#            -f crates/cerulion_core/src/flashback/resim.rs \
+#            --in-diff <those changes' diff of that file> -- --lib flashback
+# Result:  14 mutants: 13 caught, 1 unviable (do not compile), 0 missed. The
+#          unviable mutant is the `Some(Default::default())` from
+#          `mixed_start` above.
+#
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
 # each test named here, and a run without it must pass that test.
