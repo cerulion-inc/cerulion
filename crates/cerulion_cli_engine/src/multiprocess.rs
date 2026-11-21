@@ -473,10 +473,14 @@ fn split_edge_timeout_verdict(
 /// `consumer_node.consumer_input` a `block_timeout_ms`, or `None` when the
 /// input sets none (or `topo` has no such edge).
 ///
-/// The one check behind every refusal of the key on a split `block` edge:
-/// the live run's ([`split_edge_timeout_verdict`]) and a several-rank
-/// replay's ([`crate::replay_rank::classify_split_block_edges`]), which each
-/// word the refusal for their own surface.
+/// The key check the supervisor's refusal ([`split_edge_timeout_verdict`]) and
+/// a several-rank replay's split check
+/// ([`crate::replay_rank::classify_split_block_edges`]) share, each wording the
+/// refusal for its own surface. A worker's own build refuses the key on the
+/// edges its credit bindings name instead
+/// (`GraphTopology::validate_with_credit_edges`). The
+/// `block_split_timeout_refusal_off` oracle mutant turns this check off, and
+/// with it the replay's refusal of the key as well as the supervisor's.
 pub(crate) fn split_edge_timeout_producers<'t>(
     topo: &'t cerulion_core::graph::GraphTopology,
     topic: &str,

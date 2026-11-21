@@ -41432,20 +41432,9 @@ fn a_split_block_edge_from_two_foreign_writers_is_refused_by_name_before_any_pas
     for run in 1..=2 {
         let err = replay(&bag, sb_factories, None, Some(report.clone()))
             .expect_err("the split two-writer `block` edge is refused");
-        let ReplayError::SplitBlockEdgeUncreditable { edge } = &err else {
-            panic!("run {run}: the split refusal, exit 2: {err:?}");
-        };
-        assert_eq!(
-            edge,
-            &cerulion_cli_engine::replay_rank::UncreditableSplitEdge {
-                topic: SB_TOPIC.to_string(),
-                consumer_node: "far".to_string(),
-                consumer_input: "bus".to_string(),
-                consumer_rank: 1,
-                producers: vec![("left".to_string(), 0), ("right".to_string(), 0)],
-                block_from: cerulion_cli_engine::replay_rank::BlockDeclaredBy::Graph,
-            },
-            "run {run}"
+        assert!(
+            matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+            "run {run}: the split refusal, exit 2: {err:?}"
         );
         assert_eq!(err.exit_code(), 2, "run {run}");
         assert!(
@@ -41582,37 +41571,111 @@ fn a_split_block_edge_with_a_block_timeout_is_refused_by_name_before_any_pass() 
 
 /// A two-rank bag whose embedded graph declares `depth: 65`, above the
 /// maximum of 64, on `far.gate`, an edge both of whose ends rank 1 holds. The
-/// whole-graph topology check refuses it before any pass: exit 5, the
-/// internal error a rank build gives it, in the validation's own words, and no
-/// report, since no rank ran.
+/// whole graph does not validate, so the split check leaves it to the rank
+/// builds: rank 0 runs and rank 1's build refuses the depth, exit 5, after a
+/// partial report for rank 0. The reference run used the valid graph; only
+/// the embedded graph's key is changed.
 #[test]
 #[serial]
-fn a_several_rank_bag_whose_graph_declares_a_depth_above_64_stops_before_any_pass() {
+fn a_several_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_the_rank_build() {
     let mut rec = sb_recording();
     rec.graph_yaml = sb_gate_key_yaml("depth: 65");
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("sb_gate_depth65.mcap");
     write_sb_bag(rec, &bag, sb_rank_of, 2);
     let report = dir.path().join("report.json");
-    let err = replay(&bag, sb_factories, None, Some(report.clone()))
-        .expect_err("the whole-graph topology is refused");
+    let err =
+        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
     assert!(
         matches!(err, ReplayError::Internal { .. }),
-        "the topology check's refusal, exit 5: {err:?}"
+        "the rank build's refusal, exit 5: {err:?}"
     );
     assert!(
         err.to_string().starts_with(
-            "internal replay error: failed to build the replay graph topology: Graph validation \
-             error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; the maximum \
-             queue depth is 64 "
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; \
+             the maximum queue depth is 64 "
         ),
         "{err}"
     );
     assert_eq!(err.exit_code(), 5);
-    assert!(
-        !report.exists(),
-        "refused before any pass, so no report was written"
+    assert_eq!(
+        sb_partial_report(&report),
+        (serde_json::json!(1), vec![0]),
+        "rank 0 ran before rank 1 refused"
     );
+}
+
+/// The same `depth: 65` bag under `--verify`: a fed replay refuses it before
+/// any pass, because the bag states no per-stage staging rows (exit 2,
+/// `read_identity_unplanned`), as it does when no split check runs. A
+/// whole-graph topology fault never stands in front of a refusal the replay
+/// makes first.
+#[test]
+#[serial]
+fn a_topology_fault_does_not_stand_in_front_of_a_read_identity_refusal() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = sb_gate_key_yaml("depth: 65");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_depth65_budget.mcap");
+    write_sb_bag(rec, &bag, sb_rank_of, 2);
+    let (outcome, _) = ri_replay(&bag, sb_factories, replay_engine::ReplayPurpose::Verify);
+    let err = outcome.expect_err("a fed replay of a bag with no staging rows is refused");
+    match &err {
+        ReplayError::ReadLogNotEnforceable { cause, .. } => {
+            assert_eq!(cause, "read_identity_unplanned", "{err}");
+        }
+        other => panic!("expected the read-identity refusal, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A several-rank LOCKSTEP bag of the two-foreign-writer shape replays as one
+/// whole-graph pass, which splits nothing, so it is not refused and verifies.
+/// Written with no clock skew: a lockstep run shares one boundary stream.
+#[test]
+#[serial]
+fn a_lockstep_bag_whose_manifests_split_a_two_writer_block_edge_replays() {
+    let rec = record_reference_impl(
+        &sb_bus_block_yaml(),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_two_foreign_lockstep.mcap");
+    let labels = sb_labels(&rec);
+    let mp = write_multi_rank_bag_impl(
+        &rec,
+        sb_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::Lockstep,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(sb_publishers(&rec)),
+            labels: &labels,
+        },
+        None,
+        &[],
+    );
+    assert_eq!(
+        mp.tables[1],
+        ["gate_src".to_string(), "far".to_string()],
+        "the manifests put the consumer in rank 1 and both writers in rank 0"
+    );
+    let outcome = replay(&bag, sb_factories, None, None)
+        .expect("a lockstep bag replays as one pass, which splits nothing");
+    assert_eq!(resim_exit(&outcome, true), 0, "{:?}", outcome.violations);
+    assert_eq!((outcome.topics_checked, outcome.topics_passed), (4, 4));
 }
 
 /// The same `depth: 65` graph in a ONE-rank free-run bag: one pass builds the

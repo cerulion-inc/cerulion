@@ -2919,14 +2919,15 @@ mod tests {
             // never an internal error.
             (
                 ReplayError::SplitBlockEdgeUncreditable {
-                    edge: crate::replay_rank::UncreditableSplitEdge {
-                        topic: "/x/bus".to_string(),
-                        consumer_node: "sink".to_string(),
-                        consumer_input: "inp".to_string(),
-                        consumer_rank: 1,
-                        producers: vec![("a".to_string(), 0), ("b".to_string(), 1)],
-                        block_from: crate::replay_rank::BlockDeclaredBy::Node,
-                    },
+                    edge: crate::replay_rank::UncreditableSplitEdge::new(
+                        "/x/bus".to_string(),
+                        "sink".to_string(),
+                        "inp".to_string(),
+                        1,
+                        vec![("a".to_string(), 0), ("b".to_string(), 1)],
+                        crate::replay_rank::BlockDeclaredBy::Node,
+                    )
+                    .expect("two producers, one in another rank"),
                 },
                 2,
             ),

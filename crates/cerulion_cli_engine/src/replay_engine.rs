@@ -9931,11 +9931,17 @@ fn refuse_unlisted_macro_output_in_every_pass(
 /// The classifier reads the WHOLE graph the bag embeds and each node's
 /// declaration in this build, before any pass takes its entry; a node whose
 /// metadata cannot be read is left out, as [`collect_pass_node_infos`] leaves
-/// it out, and its own pass build reports it. A whole-graph topology that does
-/// not build or validate is [`ReplayError::Internal`] (exit 5), as the rank
-/// build that would meet it reports it, but before the first pass. The
-/// creditable split edges the classifier returns are not read here: a pass
-/// build refuses a `block` input whose producer runs in another rank.
+/// it out, and its own pass build reports it.
+///
+/// A whole-graph topology that does not build or validate refuses nothing
+/// here. Each rank's build meets the fault its own subgraph holds, so the
+/// replay keeps the exit, the order and the partial report it gives such a
+/// bag without this check: a refusal made before the first pass and an
+/// earlier rank's verdict still come first, and a fault no rank's subgraph
+/// holds (a rank's subgraph drops the graph's `network:` block) is not
+/// refused at all. The creditable split edges the classifier returns are not
+/// read here: a pass build refuses a `block` input whose producer runs in
+/// another rank.
 fn refuse_uncreditable_split_block_edges(
     config: &GraphConfig,
     plans: &[RankPlan],
@@ -9952,8 +9958,16 @@ fn refuse_uncreditable_split_block_edges(
     let node_rank = replay_rank::plan_node_ranks(plans);
     match replay_rank::classify_split_block_edges(config, &infos, &node_rank) {
         Ok(_) => Ok(()),
-        Err(replay_rank::SplitBlockEdgeError::Topology { reason }) => Err(ReplayError::Internal {
-            reason: format!("failed to build the replay graph topology: {reason}"),
+        Err(replay_rank::SplitBlockEdgeError::Topology { reason }) => {
+            tracing::debug!(
+                error = %reason,
+                "replay: the whole graph does not build or validate with this build's \
+                 declarations, so its split `block` edges are left to each rank's build"
+            );
+            Ok(())
+        }
+        Err(e @ replay_rank::SplitBlockEdgeError::Unplaced { .. }) => Err(ReplayError::Internal {
+            reason: e.to_string(),
         }),
         Err(replay_rank::SplitBlockEdgeError::Uncreditable(edge)) => {
             Err(ReplayError::SplitBlockEdgeUncreditable { edge })
