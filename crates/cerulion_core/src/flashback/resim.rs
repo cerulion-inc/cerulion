@@ -54,6 +54,8 @@
 //! ([`ResimGap::FreeRunResumeUnsupported`]), asked right below the state-ring
 //! arm, where `resolve_resume` refuses it.
 
+use std::collections::BTreeMap;
+
 use crate::state_restore::{plan_restore, AnchorFact, RestoreRequest};
 
 /// The facts a verdict is computed from.
@@ -78,9 +80,11 @@ pub struct ResimFacts<'a> {
     /// (the trimmed trace), so the two cannot disagree about whether a departure
     /// is present — the caller measures both in one pass.
     pub departure_records: usize,
-    /// Each WORKER rank's first kept step-boundary step, as `(rank, step)`: one
-    /// entry per rank that kept a boundary, in any order. A rank that kept none
-    /// has no entry.
+    /// Each WORKER rank's first kept step-boundary step, keyed by rank: one
+    /// entry per worker rank that kept a boundary, and none for a rank that
+    /// kept none or for any rank that is not a worker (the departure ring's
+    /// sentinel rank included). Keyed by rank, so a rank has one first step,
+    /// and the resume start and the mixed-start arm read the same one.
     ///
     /// The resume's START is the AUTHORITATIVE rank's entry, rank 0's, which the
     /// judge reads out of this list: the replay window is rank 0's boundary
@@ -99,7 +103,7 @@ pub struct ResimFacts<'a> {
     /// as an empty trace (a trace of FIRE records with no boundary is possible
     /// on a torn head) and resim refuses it separately, so the two are kept
     /// apart here too.
-    pub rank_first_steps: &'a [(u32, u64)],
+    pub rank_first_steps: &'a BTreeMap<u32, u64>,
     /// The coordination contract the capture's `__cerulion/recorder.json`
     /// states, read through [`recorded_coordination`], the stamp `bag play
     /// --resim` reads.
@@ -605,18 +609,16 @@ pub struct MixedStart {
 }
 
 /// PURE: which of `rank_first_steps` begin at step 0 and which past it, or
-/// `None` unless there is at least one of each.
+/// `None` unless there is at least one of each, which takes two ranks.
 ///
-/// `rank_first_steps` holds each worker rank's first recorded step boundary
-/// as `(rank, step)`, in any order, one entry per rank that has one. Both
-/// sides come out sorted by rank, so the order the ranks arrive in cannot
-/// change the sentence; a rank listed twice keeps its earlier step.
-pub fn mixed_start(rank_first_steps: &[(u32, u64)]) -> Option<MixedStart> {
-    let mut firsts = rank_first_steps.to_vec();
-    firsts.sort_unstable();
-    firsts.dedup_by_key(|&mut (rank, _)| rank);
-    let (at_zero, past_zero): (Vec<_>, Vec<_>) =
-        firsts.into_iter().partition(|&(_, step)| step == 0);
+/// `rank_first_steps` holds each worker rank's first recorded step boundary,
+/// keyed by rank. Both sides come out in the map's rank order, so the order
+/// the ranks were found in cannot change the sentence.
+pub fn mixed_start(rank_first_steps: &BTreeMap<u32, u64>) -> Option<MixedStart> {
+    let (at_zero, past_zero): (Vec<_>, Vec<_>) = rank_first_steps
+        .iter()
+        .map(|(&rank, &step)| (rank, step))
+        .partition(|&(_, step)| step == 0);
     if at_zero.is_empty() || past_zero.is_empty() {
         return None;
     }
@@ -1411,11 +1413,9 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     }
     // 4. Is there a resume point at all? The AUTHORITATIVE rank's own first
     //    kept boundary, the step `resolve_resume` resumes at (see the field).
-    let Some(first_recorded_step) = facts
+    let Some(&first_recorded_step) = facts
         .rank_first_steps
-        .iter()
-        .find(|(rank, _)| *rank == crate::trace_ring::AUTHORITATIVE_TRACE_RANK)
-        .map(|&(_, step)| step)
+        .get(&crate::trace_ring::AUTHORITATIVE_TRACE_RANK)
     else {
         return Err(ResimGap::NoBoundary);
     };
@@ -1545,6 +1545,17 @@ mod tests {
     use crate::trace_ring::{TraceRecordFault, TraceRecordRefusal};
 
     const RUN: u64 = 0xC1E5;
+
+    /// Rank 0 at step 41, the first steps `healthy` carries.
+    static RANK_0_AT_41: std::sync::LazyLock<BTreeMap<u32, u64>> =
+        std::sync::LazyLock::new(|| BTreeMap::from([(0, 41)]));
+    /// No rank kept a boundary.
+    static NO_FIRST_STEP: BTreeMap<u32, u64> = BTreeMap::new();
+
+    /// First steps keyed by rank, from `(rank, step)` pairs.
+    fn by_rank(pairs: &[(u32, u64)]) -> BTreeMap<u32, u64> {
+        pairs.iter().copied().collect()
+    }
 
     /// A record-level fault the walk would report — spelled once so the arms
     /// read as "the first refusing record was a fault" rather than as a type
@@ -1779,7 +1790,7 @@ mod tests {
         for first in [0, 41] {
             assert_eq!(
                 judge_resimmable(&ResimFacts {
-                    rank_first_steps: &[(0, first)],
+                    rank_first_steps: &by_rank(&[(0, first)]),
                     ranks_without_a_kept_step: &missing,
                     frame_gap: Some(late_gap()),
                     ..healthy(&nodes, &anchors)
@@ -1791,7 +1802,7 @@ mod tests {
         // The from-start path asks it too: no anchor repairs a missing frame.
         assert_eq!(
             judge_resimmable(&ResimFacts {
-                rank_first_steps: &[(0, 0)],
+                rank_first_steps: &by_rank(&[(0, 0)]),
                 frame_gap: Some(late_gap()),
                 ..healthy(&[], &[])
             }),
@@ -1872,7 +1883,7 @@ mod tests {
             worker_manifest_ranks: &[0],
             trace_records: 12,
             departure_records: 0,
-            rank_first_steps: &[(0, 41)],
+            rank_first_steps: &RANK_0_AT_41,
             // A recording with no stamp, judged as lockstep, so the two
             // free-run arms are inert unless an arm says otherwise.
             coordination: RecordedCoordination::Lockstep { stamped: false },
@@ -1977,7 +1988,7 @@ mod tests {
             worker_manifest_ranks: &[0],
             trace_records: 0,
             departure_records: 3,
-            rank_first_steps: &[],
+            rank_first_steps: &NO_FIRST_STEP,
             // Free run, which the two free-run arms read, hostile as well.
             coordination: RecordedCoordination::FreeRun,
             // A ring nobody read, too — so this also pins that the
@@ -2048,7 +2059,7 @@ mod tests {
             required_nodes_known: false,
             first_record_refusal: Some(TraceRecordRefusal::Fault(TraceRecordFault::ZeroedRecord)),
             departure_records: 3,
-            rank_first_steps: &[],
+            rank_first_steps: &NO_FIRST_STEP,
             coordination: RecordedCoordination::FreeRun,
             // A rank left without a step, hostile as well.
             ranks_without_a_kept_step: &[1],
@@ -2120,7 +2131,7 @@ mod tests {
                 trace_gap: Some(gap),
                 min_recorded_step: Some(97),
                 max_recorded_step: Some(140),
-                rank_first_steps: &[(0, 97)],
+                rank_first_steps: &by_rank(&[(0, 97)]),
                 ..healthy(&nodes, &later)
             }),
             Ok(())
@@ -2602,7 +2613,7 @@ mod tests {
         let nodes = vec!["a".to_string()];
         let gapped = ResimFacts {
             worker_manifest_ranks: &[0, 2],
-            rank_first_steps: &[(0, 41)],
+            rank_first_steps: &by_rank(&[(0, 41)]),
             required_nodes: &nodes,
             anchor_facts: &anchors,
             ..healthy(&nodes, &anchors)
@@ -2637,7 +2648,7 @@ mod tests {
         let nodes = vec!["a".to_string()];
         let holed = ResimFacts {
             worker_manifest_ranks: &[0, 2],
-            rank_first_steps: &[(0, 41)],
+            rank_first_steps: &by_rank(&[(0, 41)]),
             required_nodes: &nodes,
             anchor_facts: &anchors,
             ..healthy(&nodes, &anchors)
@@ -2683,7 +2694,7 @@ mod tests {
             required_nodes_known: false,
             state_rings_declared: 2,
             ranks_missing: &[],
-            rank_first_steps: &[(0, 41)],
+            rank_first_steps: &by_rank(&[(0, 41)]),
             required_nodes: &[],
             anchor_facts: &anchors,
             ..healthy(&[], &anchors)
@@ -2777,7 +2788,7 @@ mod tests {
             judge_resimmable(&ResimFacts {
                 state_rings_declared: 2,
                 ranks_missing: &[1],
-                rank_first_steps: &[(0, 0)],
+                rank_first_steps: &by_rank(&[(0, 0)]),
                 ..healthy(&nodes, &anchors)
             }),
             Ok(()),
@@ -2946,7 +2957,7 @@ mod tests {
         let nodes = vec!["a".to_string()];
         let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
         let mut facts = healthy(&nodes, &anchors);
-        facts.rank_first_steps = &[];
+        facts.rank_first_steps = &NO_FIRST_STEP;
         assert_eq!(judge_resimmable(&facts), Err(ResimGap::NoBoundary));
     }
 
@@ -3032,7 +3043,8 @@ mod tests {
     #[test]
     fn a_capture_that_reaches_step_zero_is_resimmable_with_no_anchor_at_all() {
         let mut facts = healthy(&[], &[]);
-        facts.rank_first_steps = &[(0, 0)];
+        let firsts_facts = by_rank(&[(0, 0)]);
+        facts.rank_first_steps = &firsts_facts;
         // Deliberately hostile on every anchor-side fact — none of them is
         // consulted on this arm.
         facts.state_rings_declared = 0;
@@ -3046,7 +3058,8 @@ mod tests {
     fn a_capture_resuming_at_step_one_still_needs_its_step_zero_anchor() {
         let nodes = vec!["a".to_string()];
         let mut facts = healthy(&nodes, &[]);
-        facts.rank_first_steps = &[(0, 1)];
+        let firsts_facts = by_rank(&[(0, 1)]);
+        facts.rank_first_steps = &firsts_facts;
         assert!(matches!(
             judge_resimmable(&facts),
             Err(ResimGap::AnchorIncomplete { .. })
@@ -3054,24 +3067,25 @@ mod tests {
 
         let anchors = vec![fact("a", 0, AnchorOutcome::Complete)];
         let mut ok = healthy(&nodes, &anchors);
-        ok.rank_first_steps = &[(0, 1)];
+        let firsts_ok = by_rank(&[(0, 1)]);
+        ok.rank_first_steps = &firsts_ok;
         assert_eq!(judge_resimmable(&ok), Ok(()));
     }
 
-    /// The resume starts at RANK 0's first kept step, wherever its entry sits:
-    /// a peer that keeps its step 0 does not make a capture whose rank 0
-    /// resumes at step 41 a from-start one, and a peer's step never stands in
-    /// for a rank 0 that kept no boundary.
+    /// The resume starts at RANK 0's first kept step: a peer that keeps its
+    /// step 0 does not make a capture whose rank 0 resumes at step 41 a
+    /// from-start one, and a peer's step never stands in for a rank 0 that kept
+    /// no boundary.
     #[test]
     fn the_resume_starts_at_rank_0s_own_first_step() {
         let nodes = vec!["a".to_string()];
         // No anchor at all: a from-start read accepts this capture, and a resume
         // at step 41 refuses it for the missing anchor.
-        for firsts in [&[(1, 0), (0, 41)][..], &[(0, 41), (1, 0)][..]] {
+        for firsts in [by_rank(&[(1, 0), (0, 41)]), by_rank(&[(0, 41), (2, 0)])] {
             assert!(
                 matches!(
                     judge_resimmable(&ResimFacts {
-                        rank_first_steps: firsts,
+                        rank_first_steps: &firsts,
                         ..healthy(&nodes, &[])
                     }),
                     Err(ResimGap::AnchorIncomplete { .. })
@@ -3081,16 +3095,16 @@ mod tests {
         }
         assert_eq!(
             judge_resimmable(&ResimFacts {
-                rank_first_steps: &[(2, 0), (0, 0), (1, 0)],
+                rank_first_steps: &by_rank(&[(2, 0), (0, 0), (1, 0)]),
                 ..healthy(&nodes, &[])
             }),
             Ok(()),
             "every rank from step 0 needs no anchor"
         );
-        for firsts in [&[(1, 0)][..], &[(1, 41), (2, 0)][..]] {
+        for firsts in [by_rank(&[(1, 0)]), by_rank(&[(1, 41), (2, 0)])] {
             assert_eq!(
                 judge_resimmable(&ResimFacts {
-                    rank_first_steps: firsts,
+                    rank_first_steps: &firsts,
                     ..healthy(&nodes, &[])
                 }),
                 Err(ResimGap::NoBoundary),
@@ -3104,7 +3118,7 @@ mod tests {
     fn free_run<'a>(
         nodes: &'a [String],
         anchors: &'a [AnchorFact],
-        rank_first_steps: &'a [(u32, u64)],
+        rank_first_steps: &'a BTreeMap<u32, u64>,
     ) -> ResimFacts<'a> {
         ResimFacts {
             coordination: RecordedCoordination::FreeRun,
@@ -3136,40 +3150,34 @@ mod tests {
     }
 
     /// `mixed_start` answers only when a rank begins at step 0 AND another past
-    /// it, each side sorted by rank whatever order the ranks arrive in.
+    /// it, each side in rank order whatever order the ranks were found in.
     #[test]
     fn a_mixed_start_needs_a_rank_at_step_0_and_one_past_it() {
         for firsts in [
-            &[][..],
-            &[(0, 0)][..],
-            &[(0, 6)][..],
-            &[(0, 0), (1, 0), (2, 0)][..],
-            &[(0, 3), (1, 6)][..],
-            // One rank listed twice is one rank, and its earlier step is 0.
-            &[(1, 6), (1, 0)][..],
+            by_rank(&[]),
+            by_rank(&[(0, 0)]),
+            by_rank(&[(0, 6)]),
+            by_rank(&[(0, 0), (1, 0), (2, 0)]),
+            by_rank(&[(0, 3), (1, 6)]),
         ] {
-            assert_eq!(mixed_start(firsts), None, "{firsts:?}");
+            assert_eq!(mixed_start(&firsts), None, "{firsts:?}");
         }
-        assert_eq!(mixed_start(&[(0, 0), (1, 1)]), Some(start(&[(1, 1)], &[0])));
-        assert_eq!(mixed_start(&[(0, 5), (1, 0)]), Some(start(&[(0, 5)], &[1])));
+        let mixed = |pairs: &[(u32, u64)]| mixed_start(&by_rank(pairs));
+        assert_eq!(mixed(&[(0, 0), (1, 1)]), Some(start(&[(1, 1)], &[0])));
+        assert_eq!(mixed(&[(0, 5), (1, 0)]), Some(start(&[(0, 5)], &[1])));
         assert_eq!(
-            mixed_start(&[(0, 0), (1, u64::MAX)]),
+            mixed(&[(0, 0), (1, u64::MAX)]),
             Some(start(&[(1, u64::MAX)], &[0]))
         );
         let want = Some(start(&[(1, 6), (2, 9)], &[0, 3]));
-        for firsts in [
+        for pairs in [
             [(0, 0), (1, 6), (2, 9), (3, 0)],
             [(3, 0), (2, 9), (1, 6), (0, 0)],
             [(2, 9), (0, 0), (3, 0), (1, 6)],
             [(1, 6), (3, 0), (0, 0), (2, 9)],
         ] {
-            assert_eq!(mixed_start(&firsts), want, "{firsts:?}");
+            assert_eq!(mixed(&pairs), want, "{pairs:?}");
         }
-        // A rank listed twice keeps its earlier step.
-        assert_eq!(
-            mixed_start(&[(1, 6), (0, 0), (1, 4)]),
-            Some(start(&[(1, 4)], &[0]))
-        );
     }
 
     /// The list joins one item alone, two with `and`, and three or more with
@@ -3212,15 +3220,15 @@ mod tests {
             )
         );
         // Every order of one set of ranks renders one sentence, twice alike.
-        let one = mixed_start(&[(0, 0), (1, 6), (2, 9), (3, 0)])
+        let one = mixed_start(&by_rank(&[(0, 0), (1, 6), (2, 9), (3, 0)]))
             .expect("a mixed start")
             .sentence(true);
-        for firsts in [
+        for pairs in [
             [(3, 0), (2, 9), (1, 6), (0, 0)],
             [(2, 9), (0, 0), (3, 0), (1, 6)],
         ] {
-            let start = mixed_start(&firsts).expect("a mixed start");
-            assert_eq!(start.sentence(true), one, "{firsts:?}");
+            let start = mixed_start(&by_rank(&pairs)).expect("a mixed start");
+            assert_eq!(start.sentence(true), one, "{pairs:?}");
             assert_eq!(start.sentence(true), start.sentence(true));
         }
     }
@@ -3259,8 +3267,8 @@ mod tests {
     fn free_run_ranks_that_begin_apart_are_refused_by_name() {
         let nodes = vec!["a".to_string()];
         let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
-        let later = [(0, 0), (1, 6)];
-        let reverse = [(1, 0), (0, 41)];
+        let later = by_rank(&[(0, 0), (1, 6)]);
+        let reverse = by_rank(&[(1, 0), (0, 41)]);
         assert_eq!(
             judge_resimmable(&free_run(&nodes, &anchors, &later)),
             Err(ResimGap::MixedStart(start(&[(1, 6)], &[0])))
@@ -3270,7 +3278,7 @@ mod tests {
             Err(ResimGap::MixedStart(start(&[(0, 41)], &[1])))
         );
         for coordination in not_free_run() {
-            for firsts in [&later[..], &reverse[..]] {
+            for firsts in [&later, &reverse] {
                 assert_eq!(
                     judge_resimmable(&ResimFacts {
                         coordination: coordination.clone(),
@@ -3282,13 +3290,33 @@ mod tests {
             }
         }
         // Ranks that begin together, and a peer with no boundary, do not vote.
-        for firsts in [&[(0, 0), (1, 0)][..], &[(0, 0)][..]] {
+        for firsts in [by_rank(&[(0, 0), (1, 0)]), by_rank(&[(0, 0)])] {
             assert_eq!(
-                judge_resimmable(&free_run(&nodes, &anchors, firsts)),
+                judge_resimmable(&free_run(&nodes, &anchors, &firsts)),
                 Ok(()),
                 "{firsts:?}"
             );
         }
+        // Three worker ranks: one late beside two at step 0, two late beside
+        // rank 0, and rank 0 the late one.
+        let three = |pairs: &[(u32, u64)]| {
+            judge_resimmable(&ResimFacts {
+                worker_manifest_ranks: &[0, 1, 2],
+                ..free_run(&nodes, &anchors, &by_rank(pairs))
+            })
+        };
+        assert_eq!(
+            three(&[(0, 0), (1, 6), (2, 0)]),
+            Err(ResimGap::MixedStart(start(&[(1, 6)], &[0, 2])))
+        );
+        assert_eq!(
+            three(&[(0, 0), (1, 6), (2, 9)]),
+            Err(ResimGap::MixedStart(start(&[(1, 6), (2, 9)], &[0])))
+        );
+        assert_eq!(
+            three(&[(0, 41), (1, 0), (2, 0)]),
+            Err(ResimGap::MixedStart(start(&[(0, 41)], &[1, 2])))
+        );
         // Two judgements of one capture are one verdict.
         let facts = free_run(&nodes, &anchors, &later);
         assert_eq!(judge_resimmable(&facts), judge_resimmable(&facts.clone()));
@@ -3300,7 +3328,7 @@ mod tests {
     fn the_mixed_start_arm_sits_below_the_boundary_arm_and_above_every_anchor_arm() {
         let nodes = vec!["a".to_string()];
         let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
-        let firsts = [(0, 41), (1, 0)];
+        let firsts = by_rank(&[(0, 41), (1, 0)]);
         let mixed = free_run(&nodes, &anchors, &firsts);
         let above = [
             (
@@ -3357,7 +3385,24 @@ mod tests {
             ),
             (
                 ResimFacts {
-                    rank_first_steps: &[(1, 0), (2, 41)],
+                    first_record_refusal: fault(9),
+                    ..mixed.clone()
+                },
+                ResimGap::TraceRecordRejected {
+                    detail: TraceRecordFault::UnsupportedRecordType { record_type: 9 }.detail(),
+                },
+            ),
+            // The backstop: departures counted with no walk to place them.
+            (
+                ResimFacts {
+                    departure_records: 2,
+                    ..mixed.clone()
+                },
+                ResimGap::FaultReplay { departures: 2 },
+            ),
+            (
+                ResimFacts {
+                    rank_first_steps: &by_rank(&[(1, 0), (2, 41)]),
                     ..mixed.clone()
                 },
                 ResimGap::NoBoundary,
@@ -3412,9 +3457,9 @@ mod tests {
             })
         };
         // Both ranks past step 0, and a peer that kept no boundary.
-        for firsts in [&[(0, 41), (1, 38)][..], &[(0, 41)][..]] {
+        for firsts in [by_rank(&[(0, 41), (1, 38)]), by_rank(&[(0, 41)])] {
             assert_eq!(
-                judge_resimmable(&free_run(&nodes, &anchors, firsts)),
+                judge_resimmable(&free_run(&nodes, &anchors, &firsts)),
                 refusal(2),
                 "{firsts:?}"
             );
@@ -3422,11 +3467,11 @@ mod tests {
         assert_eq!(
             judge_resimmable(&ResimFacts {
                 worker_manifest_ranks: &[0, 1, 2],
-                ..free_run(&nodes, &anchors, &[(0, 41), (2, 45)])
+                ..free_run(&nodes, &anchors, &by_rank(&[(0, 41), (2, 45)]))
             }),
             refusal(3)
         );
-        let firsts = [(0, 41), (1, 38)];
+        let firsts = by_rank(&[(0, 41), (1, 38)]);
         let both = free_run(&nodes, &anchors, &firsts);
         assert!(matches!(
             judge_resimmable(&ResimFacts {
@@ -3461,7 +3506,7 @@ mod tests {
         assert_eq!(
             judge_resimmable(&ResimFacts {
                 worker_manifest_ranks: &[0],
-                ..free_run(&nodes, &anchors, &[(0, 41)])
+                ..free_run(&nodes, &anchors, &by_rank(&[(0, 41)]))
             }),
             Ok(())
         );
@@ -3487,7 +3532,7 @@ mod tests {
         let missing = [1u32];
         for first in [0, 41] {
             let facts = ResimFacts {
-                rank_first_steps: &[(0, first)],
+                rank_first_steps: &by_rank(&[(0, first)]),
                 ranks_without_a_kept_step: &missing,
                 ..healthy(&nodes, &anchors)
             };
@@ -3507,7 +3552,7 @@ mod tests {
         }
         assert_eq!(
             judge_resimmable(&ResimFacts {
-                rank_first_steps: &[],
+                rank_first_steps: &by_rank(&[]),
                 ranks_without_a_kept_step: &missing,
                 ..healthy(&nodes, &anchors)
             }),

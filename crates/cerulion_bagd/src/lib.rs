@@ -9880,7 +9880,7 @@ fn judge_capture_resimmable(
     // Each worker rank's first kept boundary, off the per-rank trim. Only the
     // worker manifest ranks vote: the departure ring's sentinel rank names no
     // worker's step.
-    let rank_first_steps: Vec<(u32, u64)> = trimmed
+    let rank_first_steps: BTreeMap<u32, u64> = trimmed
         .per_rank
         .iter()
         .filter(|(rank, _)| worker_manifest_ranks.contains(rank))
@@ -29384,8 +29384,9 @@ mod ranks_begin_apart_judge_tests {
 
     const MS: u64 = 1_000_000;
     const RUN: u64 = 0xC1E5;
-    /// The one node on each rank: `src_a` on rank 0, `src_b` on rank 1.
-    const NODES: [&str; 2] = ["src_a", "src_b"];
+    /// The one node on each rank: `src_a` on rank 0, `src_b` on rank 1 and
+    /// `src_c` on rank 2.
+    const NODES: [&str; 3] = ["src_a", "src_b", "src_c"];
 
     /// A `recorder.json` as `graph run --record` writes it, with `coordination`
     /// holding the JSON value `coordination`, or no such key for `None`.
@@ -29491,6 +29492,21 @@ mod ranks_begin_apart_judge_tests {
         }
     }
 
+    /// Three ranks: rank 1 resumes from its anchor (first kept step 6), while
+    /// ranks 0 and 2 kept no checkpoint and keep their retention from step 0.
+    fn rank_1_begins_later_of_three() -> Shape {
+        Shape {
+            records: [
+                rank_steps(0, 0..=8),
+                rank_steps(1, 0..=8),
+                rank_steps(2, 0..=8),
+            ]
+            .concat(),
+            anchored: Some(1),
+            worker_ranks: &[0, 1, 2],
+        }
+    }
+
     /// The controls: two ranks that both begin at step 0 with no checkpoint,
     /// and one rank resuming from its anchor.
     fn both_begin_at_step_0() -> Shape {
@@ -29574,7 +29590,7 @@ mod ranks_begin_apart_judge_tests {
         };
         let mut attachments = vec![(
             GRAPH_ATTACHMENT.to_string(),
-            b"prefix: mp\nnodes:\n  - id: src_a\n    type: t\n  - id: src_b\n    type: t\n"
+            b"prefix: mp\nnodes:\n  - id: src_a\n    type: t\n  - id: src_b\n    type: t\n  - id: src_c\n    type: t\n"
                 .to_vec(),
         )];
         match stamp {
@@ -29631,6 +29647,10 @@ mod ranks_begin_apart_judge_tests {
             [(0, Some(6)), (1, Some(2))]
         );
         assert_eq!(firsts(both_begin_at_step_0()), [(0, Some(0)), (1, Some(0))]);
+        assert_eq!(
+            firsts(rank_1_begins_later_of_three()),
+            [(0, Some(0)), (1, Some(6)), (2, Some(0))]
+        );
         assert_eq!(firsts(one_rank_from_its_anchor()), [(0, Some(6))]);
     }
 
@@ -29658,6 +29678,13 @@ mod ranks_begin_apart_judge_tests {
              run --record`"
         );
         assert_eq!(
+            reason(rank_1_begins_later_of_three()),
+            "worker rank 1 of this free-run capture begins at step 6 while ranks 0 and 2 begin \
+             at step 0, and re-executing a rank that begins past step 0 beside one that begins \
+             at step 0 is not supported: record the run from its first step with `cerulion \
+             graph run --record`"
+        );
+        assert_eq!(
             verdict(&both_begin_past_step_0(), Stamp::FreeRun),
             Err(ResimGap::FreeRunResumeUnsupported {
                 first_step: 6,
@@ -29668,6 +29695,7 @@ mod ranks_begin_apart_judge_tests {
         for shape in [
             rank_1_begins_later,
             rank_0_begins_later,
+            rank_1_begins_later_of_three,
             both_begin_past_step_0,
         ] {
             assert_eq!(
