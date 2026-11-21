@@ -20,15 +20,18 @@
 # `$BASE` above is the tip the pull request was merged onto whenever the event's
 # `base.sha` is an ancestor of the checked-out merge commit's first parent, and
 # ci.yml takes the base from that first parent. Otherwise `$BASE` is `base.sha`
-# itself.
+# itself. On a `merge_group` run `$BASE` is the commit where the group leaves its
+# target branch, so the diff holds the group and every group queued ahead of it
+# that has not merged yet.
 #
 # FOUR CLASSES, and two directions. `packaging` only ever ADDS work: it runs a
 # push-only job on a pull request that touches its inputs. `code`, `docs` and
 # `pkgs` do the opposite: ci.yml gates test steps on them, so a rule that is too
 # NARROW skips a test the change could have broken, and skips it silently. Every
 # rule below is therefore fail-closed: an unclassifiable path, an event that is
-# not a pull request, a switch this script cannot read, or a selector that
-# refuses, all select EVERYTHING.
+# not a pull request (a harness-only merge group aside), a harness path beside
+# any other path, a switch this script cannot read, or a selector that refuses,
+# all select EVERYTHING.
 #
 # `packaging` is the inputs of the `deb-smoke` job (Debian and APT package
 # smoke). That job is push-only because it is 22 minutes of compression-bound
@@ -54,11 +57,15 @@
 #
 # `code`, `docs`, `pkgs`: the test-impact selection. THE RULES, IN THIS ORDER.
 #
-#   1. Not a `pull_request` event. Selection gates pull-request runs ONLY.
-#      `merge_group` and `push` runs on `main` stay full: the queue run is the
-#      last gate before `main` and the one place a miss has no later catch.
+#   1. Not a `pull_request` event, with ONE exception: a `merge_group` run
+#      whose every changed path is under `harness/` (rule 6). Every other
+#      `merge_group` run, an empty one included, and every `push` run on `main`
+#      stays full: the queue run is the last gate before `main` and the one place
+#      a miss has no later catch.
 #   2. `CI_SELECTION` is `off`, or carries any value this script does not know.
 #      One repository variable stops an outward misfire with no pull request.
+#      Then, read over the WHOLE change before any path is judged: a path under
+#      `harness/` beside any path outside it selects everything.
 #   3. A WORKSPACE-LEVEL INPUT. Any `Cargo.toml` (root or member: feature
 #      unification and `default-members` change another package's build without
 #      touching it), `Cargo.lock`, `.cargo/**`, `.config/**`, `rust-toolchain*`,
@@ -81,7 +88,14 @@
 #      carry crates (one of them a workspace member reached through a path
 #      dev-dependency), and a path alone cannot say which workspace they belong
 #      to.
-#   6. Anything else selects everything.
+#   6. A path under `harness/`, in a change whose every path is under it: every
+#      package the doc-pin markers in ci.yml name as reading `harness` is
+#      touched, and nothing else. The folder is Python, shell and data that no
+#      Rust package builds, so a harness-only change selects no package a
+#      marker does not name and every per-package test step skips, on every
+#      runner. The folder's own checks are the `harness` job, which runs on
+#      every event whatever this script answers.
+#   7. Anything else selects everything.
 #
 # `pkgs` is the selector's answer over the touched set: the reverse cargo
 # dependency closure UNIONED with the observation edges
@@ -107,7 +121,7 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 
-# The workflow whose doc-pin markers rule 5 reads.
+# The workflow whose doc-pin markers rules 5 and 6 read.
 CI_WORKFLOW_REL=".github/workflows/ci.yml"
 # The derived observation-edge table the selector unions into the closure.
 OBSERVATION_EDGES_REL="tools/ci/observation_edges.tsv"
@@ -161,6 +175,20 @@ matches_packaging() {
             *)  [ "$path" = "$entry" ] && return 0 ;;
         esac
     done <<< "$PACKAGING_PATHS"
+    return 1
+}
+
+# The harness tree, one prefix, read by rule 6 and by the mixed-change rule, so
+# the two cannot disagree on what is inside it. Its doc-pin root is the prefix
+# without the separator.
+HARNESS_PREFIX='harness/'
+HARNESS_ROOT=${HARNESS_PREFIX%/}
+
+matches_harness() {
+    # $1 is one changed path.
+    case "$1" in
+        "$HARNESS_PREFIX"*) return 0 ;;
+    esac
     return 1
 }
 
@@ -259,8 +287,9 @@ marker_packages_for_root() {
 # Kept separate so the self-test can drive the RULES without a cargo resolve.
 classify_touched() {
     local docs=false everything=false path owner name root entry rule
-    local touched=" " reasons=""
+    local touched=" " reasons="" input
     local switch=${CI_SELECTION:-on}
+    local harness_seen=false other_seen=false harness_only=false
 
     # One token per RULE that fired, so the log line and every self-test row
     # name the rule rather than the answer. Two rules that agree on the answer
@@ -286,7 +315,24 @@ $1
         esac
     }
 
-    if [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ]; then
+    # The whole change, read once before any path is judged: rule 1's exception
+    # and the mixed-change rule both ask whether EVERY path is under the harness
+    # tree, which no single path can answer. An empty change is not harness-only.
+    input=$(cat)
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        if matches_harness "$path"; then
+            harness_seen=true
+        else
+            other_seen=true
+        fi
+    done <<< "$input"
+    if $harness_seen && ! $other_seen; then
+        harness_only=true
+    fi
+
+    if [ "${GITHUB_EVENT_NAME:-}" != "pull_request" ] \
+        && ! { [ "${GITHUB_EVENT_NAME:-}" = "merge_group" ] && $harness_only; }; then
         everything=true
         note "event:${GITHUB_EVENT_NAME:-none}"
     elif [ "$switch" != "on" ]; then
@@ -294,6 +340,11 @@ $1
         # cannot read, and an unreadable switch selects everything.
         everything=true
         note "switch:$switch"
+    elif $harness_seen && $other_seen; then
+        # A harness path beside any other path: the narrow answer is for a
+        # change that is ALL harness, never for one that only includes some.
+        everything=true
+        note "harness-mixed"
     fi
 
     while IFS= read -r path; do
@@ -358,11 +409,23 @@ $1
         case "$path" in
             crates/*) everything=true; note "unowned-crate"; continue ;;
             docs/*|benches/*|examples/*) continue ;;
+        esac
+        if matches_harness "$path"; then
+            # Rule 6. Reached only in a harness-only change: a mixed one
+            # selected everything above and skips this loop.
+            note "harness"
+            while IFS= read -r name; do
+                [ -n "$name" ] || continue
+                touch_package "$name"
+            done < <(marker_packages_for_root "$HARNESS_ROOT")
+            continue
+        fi
+        case "$path" in
             *.md) continue ;;
         esac
         everything=true
         note "unknown-path"
-    done
+    done <<< "$input"
 
     # QUOTED, so a reason naming a path with a space stays ONE token. The
     # accumulator is newline separated, so the sort and the join need no word
@@ -487,7 +550,7 @@ crates/cerulion_core/src/wire.rs;tools/scripts/build_apt_repo.sh|true
 crates/cerulion_core/src/wire.rs;README.md|false
 |false
 '
-    local line paths want got
+    local line paths want got event switch head
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         cases=$((cases + 1))
@@ -567,10 +630,27 @@ pull_request;;LICENSE|true|true|all|unknown-path
 pull_request;;.github/CODEOWNERS|true|true|all|unknown-path
 pull_request;;CITATION.cff|true|true|all|unknown-path
 pull_request;;README.md|true|true|cerulion_cli_engine|docs:README.md
+pull_request;;harness/install.sh|false|false||harness
+pull_request;;harness/install.sh,harness/tests/test_pins.py|false|false||harness
+pull_request;;harness/README.md|false|true||docs:md,harness
+pull_request;;harness/install.sh,crates/cerulion_core/src/wire.rs|true|true|all|harness-mixed
+pull_request;;harness/install.sh,README.md|true|true|all|harness-mixed
+pull_request;;harness/install.sh,docs/harness.md|true|true|all|harness-mixed
+pull_request;;harness/Cargo.toml|true|true|all|workspace-input:Cargo.toml
+pull_request;;harness/build.rs|true|true|all|workspace-input:build.rs
+pull_request;;harnessx/install.sh|true|true|all|unknown-path
+pull_request;off;harness/install.sh|true|true|all|switch:off
+merge_group;;harness/install.sh|false|false||harness
+merge_group;;harness/install.sh,harness/README.md|false|true||docs:md,harness
+merge_group;;harness/install.sh,crates/cerulion_core/src/wire.rs|true|true|all|event:merge_group
+merge_group;;harness/install.sh,README.md|true|true|all|event:merge_group
+merge_group;;|true|true|all|event:merge_group
+merge_group;off;harness/install.sh|true|true|all|switch:off
+push;;harness/install.sh|true|true|all|event:push
+workflow_dispatch;;harness/install.sh|true|true|all|event:workflow_dispatch
 pull_request;;My Notes.md|false|true||docs:My Notes.md
 pull_request;;|false|false||none
 '
-    local event switch head
     while IFS= read -r line; do
         [ -n "$line" ] || continue
         cases=$((cases + 1))
@@ -691,7 +771,7 @@ $name
     esac
 
     # ---- THE EMERGENCY STOP DOES NOT BREAK THIS GATE ---------------------
-    # `lint` runs this self-test with the workflow-level environment, so the
+    # `lint-gates` runs this self-test with the workflow-level environment, so the
     # repository variable `CI_SELECTION=off` reaches it. Every arm above pins
     # the switch, and this arm proves it by running the WHOLE suite again with
     # the variable set: turning the selection off must red nothing.

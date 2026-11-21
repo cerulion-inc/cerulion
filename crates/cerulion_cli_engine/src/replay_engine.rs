@@ -89,7 +89,7 @@ use cerulion_core::state_restore::{
     enforce_strict_state, plan_backlog_admission, plan_restore, refuse_lossy_reexecuted_topics,
     seed_publisher_sequence, AnchorBlob, BacklogAdmission, BacklogClaim, InputServiceCursor,
     NodeFrameworkState, RestorePlan, RestoreRequest, ResumeAnchor, SeedEvidence, SeedRung,
-    TopicFrameCount, TopicLoss, TopicWriters,
+    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters,
 };
 use cerulion_core::trace_ring::{
     unpack_read_outcome_meta, unpack_read_outcome_meta_full, unpack_read_outcome_popped,
@@ -2320,29 +2320,11 @@ impl RecorderInfo {
     }
 }
 
-/// Which coordination contract a recording was taken under, and
-/// therefore which replay contract applies to it.
-///
-/// Stamped into `__cerulion/recorder.json` by every current recorder (see
-/// `graph_cmd::render_recorder_json`) and read back through
-/// [`RecorderInfo::coordination`].
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CoordinationMode {
-    /// Barrier-lockstep: every rank advances the SAME handed quantum per step,
-    /// so the per-rank STEP_BOUNDARY streams carry EQUAL targets on every
-    /// shared step and one first boundary anchors a mid-run resume. The
-    /// contract every recording that predates the stamp was taken under, and the
-    /// DEFAULT — an absent stamp resolves here.
-    #[default]
-    Lockstep,
-    /// Free-run: each rank keeps its OWN wall-faithful boundary stream sharing
-    /// only the GO epoch, so cross-rank boundary equality does not hold by
-    /// design and there is no single first boundary to anchor off.
-    FreeRun,
-}
+// Which coordination contract a recording was taken under, and therefore which
+// replay contract applies to it: stamped into `__cerulion/recorder.json` by
+// every current recorder (`graph_cmd::render_recorder_json`) and read back
+// through `RecorderInfo::coordination`.
+pub use cerulion_core::flashback::resim::CoordinationMode;
 
 /// Serde default for [`RecorderInfo::trace_format`] — an absent field
 /// (every bag older than the discard marker) means format version 1 (no discard markers).
@@ -2430,9 +2412,9 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the IDENTITY term and stamps 9, because
-///   [`recorder_stamps_consult_records`] and
-///   [`recorder_records_read_identity`] are unconditionally true and this
+///   this binary writes takes the ANCHOR STOPS term and stamps 10, because
+///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`]
+///   and [`recorder_states_anchor_stops`] are unconditionally true and this
 ///   function returns before the ladder is consulted. The ladder below (the
 ///   fold term at 6, the role term at 5, then the mode and stream arms) is the
 ///   `records_consults == false` fallback, i.e. the rules that produced the
@@ -2449,8 +2431,8 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// NEVER-UNDER-CLAIM: a bag carrying a record kind >= 7 must stamp >= 4. That
 /// is the (b) arm, and it holds independently of the mode — a LOCKSTEP bag with
-/// such a stream would stamp 4 too. Every term above those arms stamps 5, 6 or
-/// 7, each >= 4, so the claim survives all three.
+/// such a stream would stamp 4 too. Every term above those arms stamps 5 or
+/// more, so the claim survives each of them.
 pub fn stamp_trace_format(
     coordination: CoordinationMode,
     stream_needs_v4: bool,
@@ -2458,7 +2440,19 @@ pub fn stamp_trace_format(
     folds_runs: bool,
     records_consults: bool,
     records_identity: bool,
+    states_anchor_stops: bool,
 ) -> u32 {
+    if records_consults && records_identity && states_anchor_stops {
+        // Every complete checkpoint part of a node the scheduler had stopped
+        // carries the stopped flag in its framework section, so a part
+        // without it states a running node. A format 9 reader reads past
+        // the flag and judges a node stopped before the checkpoint as one
+        // that owed fires, so the stamp moves and that reader refuses the
+        // bag. The term claims nothing without the consult and identity
+        // terms under it, as the identity term claims nothing without the
+        // consult term.
+        return 10;
+    }
     if records_consults && records_identity {
         // Every edge carries producer annotations, one per writer run, so
         // the read log names the writer and the sequence of every frame a read
@@ -2573,6 +2567,18 @@ pub fn recorder_records_read_identity() -> bool {
     true
 }
 
+/// Does THIS binary's recorder state, in every complete checkpoint part, whether
+/// the scheduler had stopped the node at that boundary?
+///
+/// `true`, unconditionally: the anchor walk writes each node's framework
+/// section from the scheduler's own view of it, and a stopped node's section
+/// carries the stopped flag
+/// (`cerulion_core::state_restore::NodeFrameworkState::stopped`), so a
+/// complete part without the flag states a running node.
+pub fn recorder_states_anchor_stops() -> bool {
+    true
+}
+
 /// The lowest `trace_format` whose read log names the identity of every read:
 /// the bags a `--verify` replay feeds read by read through private per-input
 /// feeds, refusing by name what it cannot feed, instead of re-creating each
@@ -2586,6 +2592,25 @@ const _: () = assert!(READ_IDENTITY_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
 /// Does this bag's read log name the identity of every read?
 pub fn recorder_records_read_identity_at(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= READ_IDENTITY_MIN_TRACE_FORMAT)
+}
+
+/// The lowest `trace_format` at which every complete checkpoint part of a stopped node carries the stopped flag,
+/// so a complete part without it states a running node. Below it a part
+/// without the flag says nothing about the node's stop.
+///
+/// The flag itself is a positive claim at every format: a bag below this one
+/// that carries it states the stop.
+pub const ANCHOR_STOPS_MIN_TRACE_FORMAT: u32 = 10;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(ANCHOR_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does this bag's format say that every complete checkpoint part of a stopped node carries the stopped flag, so
+/// that a complete part without the flag states a running node?
+///
+/// An ABSENT `recorder.json` answers `false`.
+pub fn recorder_states_anchor_stops_at(recorder: Option<&RecorderInfo>) -> bool {
+    recorder.is_some_and(|r| r.trace_format >= ANCHOR_STOPS_MIN_TRACE_FORMAT)
 }
 
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
@@ -2751,17 +2776,31 @@ pub fn replay_stages_batch_frames(
 /// replay of it stages no `BatchFrame` record
 /// ([`BATCH_FRAME_MIN_TRACE_FORMAT`]).
 ///
+/// Bumped to 10 by checkpoint stops: every complete checkpoint part of a node
+/// the scheduler had stopped carries the stopped flag in its framework section
+/// ([`ANCHOR_STOPS_MIN_TRACE_FORMAT`]), so a resumed replay keeps such a node
+/// stopped and expects no fire of it, and a complete part without the flag
+/// states a running node. A format 9 reader reads past the flag and judges a
+/// node stopped before the checkpoint as one that owed fires, so it must
+/// refuse the bag. Formats 1 to 9 stay readable: a part that carries the flag
+/// states the stop at any format, and below 10 a part without it states
+/// nothing about the node's stop. A section version above 5 may define more
+/// flag bits, and this binary reads past them, so a later claim that changes
+/// what a resumed replay concludes needs its own `trace_format` bump, which
+/// this binary refuses.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 9,
-/// because every one records every consult and every frame each read
-/// consumed when its batch fits the read stage's window), but the two remain
+/// them to zero for the bags this binary writes (every one of them stamps 10,
+/// because every one records every consult, every frame each read
+/// consumed when its batch fits the read stage's window, and the stopped flag
+/// in every complete checkpoint part of a stopped node), but the two remain
 /// separate functions serving separate
-/// questions, and the READ gate still admits 1 to 8
+/// questions, and the READ gate still admits 1 to 9
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 9;
+pub const SUPPORTED_TRACE_FORMAT: u32 = 10;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -5037,6 +5076,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // frames its recorded read consumed. Everything else keeps the queue
     // re-creation path, and the verdict says so.
     let identity_recorded = recorder_records_read_identity_at(recorder.as_ref());
+    // CHECKPOINT STOPS: does every complete checkpoint part of a stopped node
+    // carry the stopped flag, so that a part without it states a running node?
+    let every_stop_flagged = recorder_states_anchor_stops_at(recorder.as_ref());
     let fed = purpose == ReplayPurpose::Verify
         && coordination == CoordinationMode::FreeRun
         && identity_recorded;
@@ -5164,6 +5206,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             &record_health,
             duration_bound_ns,
             coordination,
+            every_stop_flagged,
         )
     })?;
     let skipped_prefix = resume
@@ -5490,16 +5533,6 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // `RankBoundarySummary::first_target_ns`'s own doc says the
     // epochs share a DOMAIN, not a VALUE.
     let run_epoch_ns = crate::replay_rank::run_epoch_ns(&boundary_summaries);
-    // `--record-out`: the sink every rank's captures write into. Opened once,
-    // before any pass, so a path that cannot be created fails the run up front.
-    // An unfinalized sink removes its file when dropped (an abort, an error).
-    let record_out = match record_out {
-        Some(plan) => Some(Arc::new(crate::resim_record_out::RecordOut::open(
-            plan,
-            &classes.produced,
-        )?)),
-        None => None,
-    };
 
     // The loop has NO `?`. Each of its fallible seams
     // `break`s out with the failing rank and its error instead, so the
@@ -5549,6 +5582,18 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 e.detail
             ),
         })?;
+    // `--record-out`: the sink every rank's captures write into. Opened once,
+    // after the whole-run checks above and before any pass, so a bag those
+    // checks refuse creates no file, and a path that cannot be created fails
+    // the run before rank 0 runs a step. An unfinalized sink abandons its
+    // writer and removes its file when dropped (an abort, an error).
+    let record_out = match record_out {
+        Some(plan) => Some(Arc::new(crate::resim_record_out::RecordOut::open(
+            plan,
+            &classes.produced,
+        )?)),
+        None => None,
+    };
 
     let aborted: Option<(u32, ReplayError)> = 'passes: {
         for (pass_idx, plan) in plans.iter().enumerate() {
@@ -5570,6 +5615,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 stages_batch_frames,
                 identity: edge_identity,
                 kind_width,
+                trace_format: recorder.as_ref().map(|r| r.trace_format),
                 catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
@@ -5643,6 +5689,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 Ok(runtime) => runtime,
                 Err(e) => break 'passes Some((rank, e)),
             };
+            // The resim owns its run and builds every pass in this one process
+            // from the same environment, so it reports what the first pass's
+            // build left out of the nodes' environment, once.
+            if pass_idx == 0 {
+                runtime.node_env_left_out().warn();
+            }
             if let Some(onset) = catchup_onset {
                 runtime.attach_replay_catchup_arm(onset);
             }
@@ -7065,6 +7117,9 @@ struct ResumePlan {
     /// See [`scan_suffix_fires`] for why this is not simply "every node in the
     /// graph" and what the reading costs.
     executed_nodes: BTreeSet<String>,
+    /// Per graph node, what the checkpoint states about its stop
+    /// ([`resolve_anchor_stops`]).
+    stops: AnchorStops,
 }
 
 /// What a Flashback capture's `resimmable` claim covered, and what the
@@ -7184,6 +7239,13 @@ pub struct ResumeReport {
     /// read against it rather than blamed on the candidate.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub anchor_pending_fires: BTreeMap<String, u64>,
+    /// Nodes the checkpoint states as stopped at the anchor step, in id
+    /// order: the resumed graph keeps each stopped and expects no fire of it.
+    ///
+    /// Additive: absent from an existing report, and empty for every bag
+    /// whose checkpoint states no stop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stopped_at_anchor: Vec<String>,
 }
 
 /// One re-executed topic's seeded starting sequence.
@@ -7238,9 +7300,10 @@ fn replayed_frame_count(
 
 /// The graph-produced topics, in graph order, deduplicated.
 ///
-/// Shared by [`classify_topics`] and the resume resolver so the two cannot
-/// disagree about which topics a replay RE-EXECUTES — the set the lossy
-/// refusal and the sequence-seed ladder are both scoped to. `graph run
+/// Shared by [`classify_topics`] and the resume resolver, which both read
+/// every produced topic. The resume resolver narrows it with
+/// [`reexecuted_topics`] for the lossy refusal and the sequence-seed ladder,
+/// which skip a topic only stopped nodes produce. `graph run
 /// --record` classifies a recording's outside topics by it too
 /// (`graph_cmd::external_consumers`), so the recording and the replay agree on
 /// which topics come from outside the graph.
@@ -7256,6 +7319,29 @@ pub(crate) fn graph_produced_topics(config: &GraphConfig) -> Vec<String> {
         }
     }
     produced
+}
+
+/// The graph-produced topics a resumed replay re-executes: every topic of
+/// `produced` except one whose every in-graph producer the checkpoint states
+/// as stopped, since its publishers never publish again in the replay.
+fn reexecuted_topics(
+    config: &GraphConfig,
+    produced: &[String],
+    stops: &AnchorStops,
+) -> Vec<String> {
+    produced
+        .iter()
+        .filter(|topic| {
+            let mut producers = config.nodes.iter().filter(|node| {
+                node.outputs.iter().any(|output| {
+                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
+                        == **topic
+                })
+            });
+            producers.any(|node| !stops.is_stopped(&node.id))
+        })
+        .cloned()
+        .collect()
 }
 
 /// The first `STEP_BOUNDARY` on rank 0's stream, if any.
@@ -8256,13 +8342,19 @@ struct SuffixFireScan {
     /// this narrows WHICH nodes a missing anchor refuses for, and never makes a
     /// divergence quieter.
     executed: BTreeSet<String>,
+    /// Per node id in [`Self::executed`], the lowest step at which the
+    /// recording holds a FIRE record of it, discarded fires included (a
+    /// discarded fire still ran the node's tick).
+    first_fire: BTreeMap<String, u64>,
     /// Per node id, FIRE records at the steps sharing the FIRST boundary's
     /// target that COMMITTED (the discard bit clear).
     tie_commits: BTreeMap<String, usize>,
     /// Set when a FIRE record in either window could not be resolved to a node
     /// id (an out-of-range rank or `node_idx`). The recording is corrupt and
-    /// the validators refuse it a moment later; until then every count derived
-    /// here is unusable, so the caller falls back to the timestamp-only split.
+    /// the validators refuse it a moment later; until then the tie-band
+    /// counts are unusable, so the caller falls back to the timestamp-only
+    /// split. [`Self::executed`] and [`Self::first_fire`] stay exact for every
+    /// FIRE record that does resolve.
     unresolved_fire: bool,
 }
 
@@ -8298,6 +8390,10 @@ fn scan_suffix_fires(
         };
         if in_executed {
             out.executed.insert(node.to_string());
+            out.first_fire
+                .entry(node.to_string())
+                .and_modify(|step| *step = (*step).min(rec.step))
+                .or_insert(rec.step);
         }
         if in_tie && !rec.is_discarded() {
             *out.tie_commits.entry(node.to_string()).or_insert(0) += 1;
@@ -8414,6 +8510,7 @@ fn resolve_resume(
     record_health: &RecordHealthReport,
     duration_bound_ns: Option<u64>,
     coordination: CoordinationMode,
+    every_stop_flagged: bool,
 ) -> Result<Option<ResumePlan>, ReplayError> {
     let Some(first) = first_recorded_boundary(trace)? else {
         return Ok(None); // no boundaries at all — the existing refusal owns it.
@@ -8515,12 +8612,34 @@ fn resolve_resume(
         return Ok(None);
     };
 
+    // The anchor's complete parts and their framework sections (the
+    // scheduler's own view of each node at `S`, which every consumer below
+    // reads; a bag without framework sections states none), and what they
+    // state about each graph node's stop. A node the checkpoint states
+    // as stopped fires no more, so a fire of it in the steps this replay
+    // executes is a recording that contradicts itself, even when the scan
+    // also met a fire record it could not resolve to a node.
+    let blobs = anchors.blobs_at(anchor.run_id, anchor.step);
+    let framework = decode_framework_sections(&blobs)?;
+    let stops = resolve_anchor_stops(
+        config.nodes.iter().map(|node| node.id.as_str()),
+        &blobs,
+        &framework,
+        every_stop_flagged,
+    );
+    if let Some(refusal) = stopped_fire_refusal(&stops, &fires.first_fire, anchor.step) {
+        return Err(refusal);
+    }
+
     // A re-executed topic whose recording is lossy cannot have its
     // sequence derived, and a seed off by one is a byte mismatch on EVERY
-    // subsequent frame that reads to an operator as "my node changed".
+    // subsequent frame that reads to an operator as "my node changed". A
+    // topic only stopped nodes produce is not re-executed: its publishers
+    // never publish again, so it is neither refused for a loss nor seeded.
     let produced = graph_produced_topics(config);
+    let reexecuted = reexecuted_topics(config, &produced, &stops);
     let losses = collect_topic_losses(record_health, coverage);
-    refuse_lossy_reexecuted_topics(&produced, &losses).map_err(|refusal| {
+    refuse_lossy_reexecuted_topics(&reexecuted, &losses).map_err(|refusal| {
         ReplayError::StateRestore {
             reason: refusal.to_string(),
         }
@@ -8587,7 +8706,7 @@ fn resolve_resume(
 
     let mut seeds = BTreeMap::new();
     let mut seed_rungs = Vec::new();
-    for topic in &produced {
+    for topic in &reexecuted {
         let evidence = scan
             .get(topic)
             .map(|s| {
@@ -8691,8 +8810,6 @@ fn resolve_resume(
     // The framework section — the SCHEDULER's own view of
     // each node at `S`, which every consumer below reads and a bag without
     // framework sections states none of.
-    let blobs = anchors.blobs_at(anchor.run_id, anchor.step);
-    let framework = decode_framework_sections(&blobs)?;
     let period_baselines: BTreeMap<String, u64> = framework
         .iter()
         .filter_map(|(node, state)| state.next_fire_ns.map(|ns| (node.clone(), ns)))
@@ -8706,6 +8823,7 @@ fn resolve_resume(
         config,
         recorded_messages,
         &framework,
+        &stops,
         &produced,
         anchor_clock_ns,
     )?;
@@ -8725,9 +8843,12 @@ fn resolve_resume(
     // out loud, because it is the one piece of evidence in the bag that the
     // first replayed fires may differ for a reason the replayed code did not
     // cause.
+    //
+    // A node the checkpoint states as stopped is left out: it fires no more,
+    // so its count is arrivals it will never consume, not fires it owes.
     let anchor_pending_fires: BTreeMap<String, u64> = framework
         .iter()
-        .filter(|(_, state)| state.pending_data_count > 0)
+        .filter(|(node, state)| state.pending_data_count > 0 && !stops.is_stopped(node))
         .map(|(node, state)| (node.clone(), state.pending_data_count))
         .collect();
     for (node, pending) in &anchor_pending_fires {
@@ -8748,6 +8869,7 @@ fn resolve_resume(
         config,
         recorded_messages,
         &framework,
+        &stops,
         &produced,
         anchor_clock_ns,
     )?;
@@ -8800,6 +8922,7 @@ fn resolve_resume(
         seeds,
         seed_rungs,
         executed_nodes: fires.executed,
+        stops,
     }))
 }
 
@@ -8828,6 +8951,137 @@ fn decode_framework_sections(
         }
     }
     Ok(out)
+}
+
+/// What a mid-run bag's checkpoint states about ONE graph node's stop at the
+/// anchor step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorStop {
+    /// The node's framework section carries the stopped flag: the scheduler
+    /// had stopped it by the anchor step, and nothing in a graph run restarts
+    /// a stopped node. A positive claim, so it is read at every `trace_format`.
+    /// Carries what the same section states about the stopped node's trigger
+    /// queue ([`StoppedAtAnchor::from_section`]).
+    Stopped(StoppedAtAnchor),
+    /// The bag is at [`ANCHOR_STOPS_MIN_TRACE_FORMAT`] or later and holds a
+    /// complete part for the node without the flag: the node was running.
+    Running,
+    /// The checkpoint says nothing about the node's stop: it holds no complete
+    /// part for the node (a node that saves no state, or a skipped or torn
+    /// part), or the bag is below [`ANCHOR_STOPS_MIN_TRACE_FORMAT`] and the
+    /// part carries no flag.
+    Unstated,
+}
+
+/// Per graph node, what the checkpoint states about its stop
+/// ([`AnchorStop`]), in id order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AnchorStops {
+    by_node: BTreeMap<String, AnchorStop>,
+}
+
+impl AnchorStops {
+    /// The nodes the checkpoint states as stopped, in id order.
+    fn stopped(&self) -> impl Iterator<Item = &str> {
+        self.stops_at_anchor().map(|(node, _)| node)
+    }
+
+    /// The nodes the checkpoint states as stopped, each with what its section
+    /// states about its trigger queue, in id order: the input a stop restore
+    /// (`GraphRuntime::restore_stopped_nodes`) takes.
+    fn stops_at_anchor(&self) -> impl Iterator<Item = (&str, StoppedAtAnchor)> {
+        self.by_node.iter().filter_map(|(node, stop)| match stop {
+            AnchorStop::Stopped(at_anchor) => Some((node.as_str(), *at_anchor)),
+            AnchorStop::Running | AnchorStop::Unstated => None,
+        })
+    }
+
+    /// Does the checkpoint state `node` as stopped? Such a node owes no fire
+    /// in the replay, so its pending count, its backlog claim and its
+    /// service cursors describe a consumer that will never read again.
+    fn is_stopped(&self, node: &str) -> bool {
+        matches!(self.by_node.get(node), Some(AnchorStop::Stopped(_)))
+    }
+
+    /// The nodes whose stop the checkpoint states, stopped or running, in id
+    /// order: every node but the [`AnchorStop::Unstated`] ones.
+    fn stated(&self) -> BTreeSet<String> {
+        self.by_node
+            .iter()
+            .filter(|(_, stop)| **stop != AnchorStop::Unstated)
+            .map(|(node, _)| node.clone())
+            .collect()
+    }
+}
+
+/// The refusal for a stop restore the runtime declined. The stopped set is
+/// built from the graph's own nodes and the runtime is freshly built, so a
+/// refusal here is an engine bug (exit 5), never a bag fault.
+fn stop_restore_failure(error: &cerulion_core::TransportError) -> ReplayError {
+    ReplayError::Internal {
+        reason: format!(
+            "the resume could not keep the nodes its checkpoint states as stopped from firing: \
+             {error}; this is a bug in the replay engine, please report"
+        ),
+    }
+}
+
+/// Classify every node of the graph by what the checkpoint at the anchor step
+/// states about its stop ([`AnchorStop`]).
+///
+/// `blobs` holds only COMPLETE parts (`BagAnchors::blobs_at`), so a torn or
+/// skipped part is absent from it, and `framework` holds the sections decoded
+/// from those parts. A part for a node the graph does not run is not a stop:
+/// it is not in `graph_nodes`, the runtime lists it under `anchors_unused`,
+/// and nothing applies it. `every_stop_flagged` is
+/// [`recorder_states_anchor_stops_at`] for the bag: whether every complete part
+/// of a stopped node carries the flag.
+fn resolve_anchor_stops<'a>(
+    graph_nodes: impl IntoIterator<Item = &'a str>,
+    blobs: &BTreeMap<String, Vec<u8>>,
+    framework: &BTreeMap<String, NodeFrameworkState>,
+    every_stop_flagged: bool,
+) -> AnchorStops {
+    let by_node = graph_nodes
+        .into_iter()
+        .map(|node| {
+            let stopped = framework.get(node).and_then(StoppedAtAnchor::from_section);
+            let stop = if let Some(at_anchor) = stopped {
+                AnchorStop::Stopped(at_anchor)
+            } else if every_stop_flagged && blobs.contains_key(node) {
+                AnchorStop::Running
+            } else {
+                AnchorStop::Unstated
+            };
+            (node.to_string(), stop)
+        })
+        .collect();
+    AnchorStops { by_node }
+}
+
+/// The refusal for a recording that fires a node its checkpoint states as
+/// stopped, in the steps this replay executes: nothing in a graph run
+/// restarts a stopped node, so the bag contradicts itself
+/// ([`ReplayError::RecordingInconsistent`], exit 2, before the first replayed
+/// step).
+///
+/// `first_fire` is [`SuffixFireScan::first_fire`]. The first stopped node in
+/// id order that the recording fires is named, with its first fire.
+fn stopped_fire_refusal(
+    stops: &AnchorStops,
+    first_fire: &BTreeMap<String, u64>,
+    anchor_step: u64,
+) -> Option<ReplayError> {
+    stops.stopped().find_map(|node| {
+        let step = *first_fire.get(node)?;
+        Some(ReplayError::RecordingInconsistent {
+            detail: format!(
+                "the checkpoint at step {anchor_step} states that node '{node}' had stopped, and \
+                 the recording holds a fire of it at step {step}; nothing restarts a stopped \
+                 node in a run"
+            ),
+        })
+    })
 }
 
 /// Judge the undrained backlogs the framework sections
@@ -8882,11 +9136,17 @@ fn resolve_backlog_admission(
     config: &GraphConfig,
     recorded_messages: &RecordedMessages,
     framework: &BTreeMap<String, NodeFrameworkState>,
+    stops: &AnchorStops,
     produced: &[String],
     anchor_clock_ns: u64,
 ) -> Result<BacklogAdmission, ReplayError> {
     let mut claims: Vec<BacklogClaim> = Vec::new();
     for node in &config.nodes {
+        // A stopped node's count is arrivals it will never consume, so it
+        // claims no backlog a replay must re-feed.
+        if stops.is_stopped(&node.id) {
+            continue;
+        }
         let Some(state) = framework.get(&node.id) else {
             continue;
         };
@@ -9108,12 +9368,19 @@ fn resolve_pre_anchor_service(
     config: &GraphConfig,
     recorded_messages: &RecordedMessages,
     framework: &BTreeMap<String, NodeFrameworkState>,
+    stops: &AnchorStops,
     produced: &[String],
     anchor_clock_ns: u64,
 ) -> Result<PreAnchorService, ReplayError> {
     // Per EXTERNAL topic, what each of its in-graph consumers says about it.
     let mut consumers: BTreeMap<String, Vec<(String, String, ConsumerKind)>> = BTreeMap::new();
     for node in &config.nodes {
+        // A node the checkpoint states as stopped reads none of the band, so
+        // its cursor neither caps a running consumer's skip nor keeps the band
+        // whole.
+        if stops.is_stopped(&node.id) {
+            continue;
+        }
         for input in &node.inputs {
             let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
             if produced.contains(&topic) {
@@ -9808,6 +10075,10 @@ struct PassInputs<'a> {
     /// because they answer different questions and disagree on exactly the bag
     /// that has no recorder attachment — see [`KindFieldWidth`].
     kind_width: KindFieldWidth,
+    /// The bag's stamped `trace_format`, `None` with no recorder attachment.
+    /// Named on the warnings a resumed pass's stand-downs print, since the
+    /// format decides whether the checkpoint can state a node's stop.
+    trace_format: Option<u32>,
     /// The armed capture plane the recording ran under, if any: the
     /// SAME onset `attach_replay_catchup_arm` hands this pass's scheduler, so
     /// the re-derivation verifier runs the one clamp the replay runs.
@@ -10375,6 +10646,32 @@ fn apply_resume(
         .filter_map(|(node, state)| Some((node.clone(), state.sync_epoch_floor?)))
         .collect();
     runtime.restore_sync_epoch_floor(&epoch_floors);
+    // A node the checkpoint states as stopped stays stopped: the recorded run
+    // stopped it before the anchor, and nothing in the resumed steps re-runs
+    // that stop. The runtime disables it and releases each `block` slot it
+    // holds as a consumer, as its live stop did, so a producer it paced is not
+    // held by a consumer that will never drain. A stopped node whose section
+    // states an unconsumed arrival resumes with its per-message trigger input
+    // drained through its own subscriber (`drop_oldest`) holding the frame its
+    // drain had popped, so that drain reads nothing in the resumed steps, as
+    // the recorded one did.
+    let stopped: BTreeMap<String, StoppedAtAnchor> = plan
+        .stops
+        .stops_at_anchor()
+        .map(|(node, at_anchor)| (node.to_string(), at_anchor))
+        .collect();
+    let held = runtime
+        .restore_stopped_nodes(&stopped)
+        .map_err(|e| stop_restore_failure(&e))?;
+    for node in stopped.keys() {
+        tracing::info!(
+            node_id = %node,
+            anchor_step = plan.anchor.step,
+            holds_trigger_head = held.contains(node),
+            "replay resume: the checkpoint states this node had stopped, so the resumed graph \
+             keeps it stopped and releases its block slots"
+        );
+    }
     // `--strict-state` is judged HERE and not at the gate, because whether a
     // node has state is a property of its compiled TYPE (node metadata
     // lives in the source, never in the YAML), so the entries have to be loaded
@@ -10429,6 +10726,7 @@ fn apply_resume(
         pre_anchor_frames_already_read: plan.service_skip.clone(),
         service_cursor_notes: plan.service_notes.clone(),
         anchor_pending_fires: plan.anchor_pending_fires.clone(),
+        stopped_at_anchor: stopped.into_keys().collect(),
     })
 }
 
@@ -15986,12 +16284,17 @@ fn run_rank_pass(
     // never silently truncated into a "compared clean" over a slice the
     // verifier stopped reading.
     let mut rederive_steps: Vec<replay_rederive::RecordedStep> = Vec::new();
-    // Where a re-executed node was STOPPED (fatal error or panic breaker),
-    // read after each step: no rule may predict its fires past that step,
-    // because the recording correctly holds none. The stop carries how many
-    // fires of the node the stopping step performed, so a recording that
-    // stopped at another fire of the same burst is still a finding.
-    let mut rederive_stops = replay_rederive::PassStops::none();
+    // Where each node was STOPPED: seeded with the nodes the checkpoint a
+    // resumed pass began from states as stopped, then read after each step
+    // for a re-executed stop (fatal error or panic breaker). No rule may
+    // predict a node's fires past its stop, because the recording correctly
+    // holds none. An in-pass stop carries how many fires of the node the
+    // stopping step performed, so a recording that stopped at another fire of
+    // the same burst is still a finding. A seeded node is never noted again:
+    // its restored stop reads as stopped after the first resumed step too.
+    let mut rederive_stops = resume.map_or_else(replay_rederive::PassStops::none, |r| {
+        replay_rederive::PassStops::at_anchor(r.anchor.step, r.stops.stopped())
+    });
     // Per step, the FIFO `Data` nodes whose recorded burst ended on a trailing
     // refill (`fifo_trailing_refills`), derived from the recording alone in a
     // walk of this rank's boundaries and fires before step 0, so a fed pass
@@ -16886,24 +17189,35 @@ fn run_rank_pass(
                 // and its Sync heads are UNBACKED (real stamps with no kind-6
                 // record), so the verifier must start from them or it convicts
                 // the first resumed step. A from-start pass restores nothing.
+                // The nodes whose stop the checkpoint states ride with it, so a
+                // node it states as running is judged in full, and only a node
+                // whose stop the checkpoint does not state can stand down as
+                // unfired since the anchor.
                 &resume.map_or_else(replay_rederive::PassRestore::none, |r| {
                     replay_rederive::PassRestore::from_sync_heads(restored_sync_heads_by_input(
                         pass.config,
                         &r.sync_input_timestamps,
                     ))
+                    .with_stops_stated(r.stops.stated())
                 }),
                 &rederive_stops,
             );
+            // The checkpoint step a resumed pass began from, named on the
+            // unfired-since-anchor warnings, which only a resumed pass raises.
+            let anchor_step = resume.map(|r| r.anchor.step);
             for sd in &report.stand_downs {
-                // Two arms here are `warn!`, so they survive the default
+                // Four arms here are `warn!`, so they survive the default
                 // filter an operator actually runs under. The corrupt-recording
                 // stand-down is not "we declined to judge" but "this bag cannot
-                // have been written by any recorder". The unfired-since-anchor
-                // one leaves a whole node's unread-frame rule unjudged with no
-                // change to the verdict or the exit code, and a node the
-                // scheduler never fired records the same resumed slice as a
-                // stopped one; it is raised at most once per node per pass, and
-                // only on a resumed pass, which has one rank. The generic loop
+                // have been written by any recorder". Each unfired-since-anchor
+                // one leaves a rule that owed a node a fire unjudged with no
+                // change to the exit code, and a node the scheduler never fired
+                // records the same resumed slice as a stopped one; each is
+                // raised at most once per node per pass, and only on a resumed
+                // pass, which has one rank. A `--report` needs `--verify`, and
+                // a fed `--verify` can refuse such a bag before its first step,
+                // so their text says the note lands where a `--verify` replay
+                // reaches the rule. The generic loop
                 // stays `debug!` because a healthy multi-rank replay
                 // legitimately declines several deciders per rank and a warn
                 // per decline is the flood class.
@@ -16917,15 +17231,47 @@ fn run_rank_pass(
                          (corrupt recording — re-record the bag; report-only, the verdict is \
                          unchanged. See `detail`)"
                     );
+                } else if sd.reason == replay_rederive::StandDownReason::FifoUnfiredSinceAnchor {
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        node_id = %sd.node_id,
+                        code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
+                        detail = %sd,
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its FIFO pop rule was not verified. The exit code is \
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
+                    );
                 } else if sd.reason == replay_rederive::StandDownReason::LatestUnfiredSinceAnchor {
                     tracing::warn!(
                         rank = plan.rank(),
                         node_id = %sd.node_id,
                         code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
                         detail = %sd,
-                        "replay: the resumed pass holds no fire and no body read of this \
-                         consume = latest node, so its unread-frame rule was not verified \
-                         (report-only, the verdict is unchanged. See `detail`)"
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its consume = latest fire rule was not verified. The exit \
+                         code is unchanged; where a --verify replay reaches this rule, its \
+                         --report carries a stand_down note (see `code` and `detail`)"
+                    );
+                } else if sd.reason == replay_rederive::StandDownReason::SyncUnfiredSinceAnchor {
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        node_id = %sd.node_id,
+                        code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
+                        detail = %sd,
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its Sync owed-fire rule was not verified. The exit code is \
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
                     );
                 } else {
                     tracing::debug!(
@@ -32827,11 +33173,13 @@ mod recorder_info_version_tests {
         // EVERY gated consult wrote a record (an empty drain's `NoFrame`
         // included, which a v6 reader convicts as an impossible shape and
         // plans no position for), and v8 marks a stream in which every edge
-        // names its frames' writers by run (read identity). A recorder.json
-        // stamped v8 is NOT newer than this binary, and the absent-field
-        // back-compat default stays v1 (`trace_format_v1`). A bump must move
-        // this pin DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 9);
+        // names its frames' writers by run (read identity), v9 names every
+        // frame of a batch that fits its read stage, and v10 states every
+        // stopped node in its checkpoints. A recorder.json stamped v9 is NOT
+        // newer than this binary, and the absent-field back-compat default
+        // stays v1 (`trace_format_v1`). A bump must move this pin
+        // DELIBERATELY.
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 10);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -32842,6 +33190,7 @@ mod recorder_info_version_tests {
         assert_eq!(EVERY_CONSULT_MIN_TRACE_FORMAT, 7);
         assert_eq!(READ_IDENTITY_MIN_TRACE_FORMAT, 8);
         assert_eq!(BATCH_FRAME_MIN_TRACE_FORMAT, 9);
+        assert_eq!(ANCHOR_STOPS_MIN_TRACE_FORMAT, 10);
     }
 
     /// The decoupling pin.
@@ -32849,7 +33198,8 @@ mod recorder_info_version_tests {
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
     /// its consults and the frames of every batch that fits its read stage's
-    /// window, and therefore stamps 9, so the write
+    /// window, and flags every complete checkpoint part of a stopped node, and
+    /// therefore stamps 10, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -32858,9 +33208,9 @@ mod recorder_info_version_tests {
     /// What holds, and is what this pins: the two are separate
     /// FUNCTIONS answering separate questions; the write stamp never EXCEEDS
     /// the read gate (a bag this binary writes must be one it can read); and
-    /// the gate still admits formats 1 to 6, which the write stamp never
+    /// the gate still admits formats 1 to 9, which the write stamp never
     /// emits. The decoupling is therefore alive in both directions, the READ
-    /// side reading six formats the WRITE side never produces.
+    /// side reading nine formats the WRITE side never produces.
     #[test]
     fn write_stamp_and_read_gate_stay_two_decisions() {
         let stamp = stamp_trace_format(
@@ -32870,21 +33220,24 @@ mod recorder_info_version_tests {
             true,
             recorder_stamps_consult_records(),
             recorder_records_read_identity(),
+            recorder_states_anchor_stops(),
         );
         assert_eq!(
-            stamp, 9,
-            "a recorder that records every consult AND the frames of every batch \
-             that fits its read stage stamps 9: a format-7 reader would replay its \
-             reads by queue re-creation and call the result clean, and a format-8 \
-             reader does not know the batch frame record"
+            stamp, 10,
+            "a recorder that records every consult, the frames of every batch \
+             that fits its read stage AND flags every complete checkpoint part of a \
+             stopped node stamps 10: a format-7 reader would replay its reads by queue \
+             re-creation and call the result clean, a format-8 reader does not \
+             know the batch frame record, and a format-9 reader reads past the \
+             stopped flag"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: seven formats this binary
+        // The gate is strictly WIDER than the stamp: nine formats this binary
         // reads and never writes.
-        for archived in [1u32, 2, 3, 4, 5, 6, 7] {
+        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -32900,9 +33253,10 @@ mod recorder_info_version_tests {
     /// The role term doubled it: EIGHT rows, one per `(mode, stream_needs_v4,
     /// stamps_roles)`, so the role term is pinned as an OVERRIDE above both
     /// pre-existing arms and the pre-roles table survives intact underneath it.
-    /// Every row then carries three more expected values: `folds_runs` alone is
-    /// 6, and `records_consults` is 7 with folding on or off, the consult term
-    /// being the strongest claim.
+    /// Every row then carries more expected values: `folds_runs` alone is 6,
+    /// `records_consults` is 7 with folding on or off, consults with identity
+    /// is 9, and consults with identity and checkpoint stops is 10, the
+    /// strongest claim.
     #[test]
     fn stamp_trace_format_answers_its_hand_table() {
         let cases = [
@@ -32922,7 +33276,7 @@ mod recorder_info_version_tests {
         ];
         for (mode, needs_v4, roles, expected) in cases {
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, false, false, false),
+                stamp_trace_format(mode, needs_v4, roles, false, false, false, false),
                 expected,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=false, consults=false)"
             );
@@ -32930,7 +33284,7 @@ mod recorder_info_version_tests {
             // unreadable to anything below 6 whatever the coordination mode or
             // the role bits say.
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, true, false, false),
+                stamp_trace_format(mode, needs_v4, roles, true, false, false, false),
                 6,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=true, consults=false)"
             );
@@ -32939,7 +33293,7 @@ mod recorder_info_version_tests {
             // else is true of it, folding included.
             for folds in [false, true] {
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, false),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, false),
                     7,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, consults=true)"
                 );
@@ -32947,13 +33301,33 @@ mod recorder_info_version_tests {
                 // plus per-frame batch identity), and it claims nothing without
                 // the consult records under it.
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, true),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, false),
                     9,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, identity)"
                 );
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, true) < 8,
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, false) < 8,
                     "identity without the consult records is not format 8 or 9"
+                );
+                // Checkpoint stops ride both: 10 over every axis, and the term
+                // claims nothing without the consult and identity terms under it.
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, true),
+                    10,
+                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, stops)"
+                );
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, true),
+                    7,
+                    "stops without identity stay at the consult term's 7"
+                );
+                assert!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, true) < 8,
+                    "stops without the consult records are not format 8, 9 or 10"
+                );
+                assert!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, false, true) < 7,
+                    "stops alone claim nothing above the ladder"
                 );
             }
         }
@@ -33040,6 +33414,7 @@ mod recorder_info_version_tests {
                         true,
                         false,
                         false,
+                        false,
                     );
                     assert!(
                         folded > PRE_FOLD_SUPPORTED,
@@ -33058,8 +33433,15 @@ mod recorder_info_version_tests {
         // format-5 reader's range, so the arm above is about folding rather than
         // about the bump having happened.
         assert!(
-            stamp_trace_format(CoordinationMode::Lockstep, false, true, false, false, false)
-                <= PRE_FOLD_SUPPORTED,
+            stamp_trace_format(
+                CoordinationMode::Lockstep,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+            ) <= PRE_FOLD_SUPPORTED,
             "a non-folding lockstep recorder that records no consult stamps 5, \
              inside a format-5 reader's range"
         );
@@ -33325,6 +33707,287 @@ mod recorder_info_version_tests {
         assert!(replay_stages_batch_frames(Some(&info(9)), false));
         assert!(replay_stages_batch_frames(None, true));
         assert!(!replay_stages_batch_frames(None, false));
+    }
+
+    /// A recorder.json stamped at `trace_format`.
+    fn recorder_info_at(trace_format: u32) -> RecorderInfo {
+        serde_json::from_str(&format!(
+            r#"{{"arch":"x86_64","os":"linux","cerulion_version":"0.0.1",
+                 "recorded_at_ns":7,"trace_format":{trace_format}}}"#
+        ))
+        .expect("valid recorder.json")
+    }
+
+    /// From format 10 every complete checkpoint part of a stopped node carries
+    /// the stopped flag, and a bag with no `recorder.json` makes no such claim.
+    #[test]
+    fn checkpoint_stops_are_stated_from_format_ten() {
+        for older in 1u32..=9 {
+            assert!(
+                !recorder_states_anchor_stops_at(Some(&recorder_info_at(older))),
+                "a format-{older} part without the flag states nothing"
+            );
+        }
+        assert!(recorder_states_anchor_stops_at(Some(&recorder_info_at(10))));
+        assert!(!recorder_states_anchor_stops_at(None));
+    }
+
+    /// One complete anchor part for a node saving a `u64`, carrying
+    /// `framework` when it is given and no framework section otherwise, built
+    /// by the encoder `cerulion_core`'s `state_restore_test` pins to its hand
+    /// vectors.
+    fn anchor_part(framework: Option<&NodeFrameworkState>) -> Vec<u8> {
+        let mut sink = cerulion_core::state::VecSink::new();
+        match framework {
+            Some(section) => cerulion_core::state_restore::capture_anchor_blob_with_framework(
+                &7u64, section, &mut sink,
+            ),
+            None => cerulion_core::state_restore::capture_anchor_blob(&7u64, &mut sink),
+        }
+        .expect("the part fits an unbounded sink");
+        sink.into_inner()
+    }
+
+    /// The classification of every node, as a HAND table over the part shapes
+    /// a checkpoint can hold for it, at format 9 and format 10, with a part
+    /// for a node the graph does not run.
+    ///
+    /// `stopped` carries a section with the stopped flag and nothing else;
+    /// `fifo_stopped` the flag beside a served cursor and one pending arrival;
+    /// `running` a section
+    /// without the flag; `v1` a part with no framework section (what a running
+    /// node with nothing to say writes); `absent` no complete part, which is
+    /// also every torn or skipped part (`BagAnchors::blobs_at` holds complete
+    /// parts only); `ghost` a stopped part for a node outside the graph.
+    #[test]
+    fn anchor_stops_answer_their_hand_table() {
+        let stopped_section = NodeFrameworkState {
+            stopped: true,
+            ..Default::default()
+        };
+        let fifo_stopped_section = NodeFrameworkState {
+            pending_data_count: 1,
+            input_service: Some([("inp".to_string(), Some(7u32))].into_iter().collect()),
+            stopped: true,
+            ..Default::default()
+        };
+        let running_section = NodeFrameworkState {
+            input_service: Some(BTreeMap::new()),
+            ..Default::default()
+        };
+        let blobs: BTreeMap<String, Vec<u8>> = [
+            ("stopped", anchor_part(Some(&stopped_section))),
+            ("fifo_stopped", anchor_part(Some(&fifo_stopped_section))),
+            ("running", anchor_part(Some(&running_section))),
+            ("v1", anchor_part(None)),
+            ("ghost", anchor_part(Some(&stopped_section))),
+        ]
+        .into_iter()
+        .map(|(node, part)| (node.to_string(), part))
+        .collect();
+        let framework = decode_framework_sections(&blobs).expect("every part decodes");
+        assert!(
+            !framework.contains_key("v1"),
+            "PRECONDITION: a part with no section decodes to no section"
+        );
+        // The FIFO consumer's section states one unconsumed arrival.
+        let held = StoppedAtAnchor {
+            unconsumed_arrival: true,
+        };
+        let graph = ["absent", "fifo_stopped", "running", "stopped", "v1"];
+        let table = |every_stop_flagged: bool| -> Vec<(String, AnchorStop)> {
+            resolve_anchor_stops(graph, &blobs, &framework, every_stop_flagged)
+                .by_node
+                .into_iter()
+                .collect()
+        };
+        let hand = |rows: &[(&str, AnchorStop)]| -> Vec<(String, AnchorStop)> {
+            rows.iter()
+                .map(|(node, stop)| ((*node).to_string(), *stop))
+                .collect()
+        };
+        assert_eq!(
+            table(recorder_states_anchor_stops_at(Some(&recorder_info_at(10)))),
+            hand(&[
+                ("absent", AnchorStop::Unstated),
+                ("fifo_stopped", AnchorStop::Stopped(held)),
+                ("running", AnchorStop::Running),
+                ("stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+                ("v1", AnchorStop::Running),
+            ]),
+            "format 10: a complete part without the flag states a running node"
+        );
+        assert_eq!(
+            table(recorder_states_anchor_stops_at(Some(&recorder_info_at(9)))),
+            hand(&[
+                ("absent", AnchorStop::Unstated),
+                ("fifo_stopped", AnchorStop::Stopped(held)),
+                ("running", AnchorStop::Unstated),
+                ("stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+                ("v1", AnchorStop::Unstated),
+            ]),
+            "format 9: the flag states the stop, and its absence states nothing"
+        );
+        let stops = resolve_anchor_stops(graph, &blobs, &framework, true);
+        assert_eq!(
+            stops.stopped().collect::<Vec<_>>(),
+            vec!["fifo_stopped", "stopped"],
+            "a stopped part for a node outside the graph is not a stop"
+        );
+        assert_eq!(
+            stops.stops_at_anchor().collect::<Vec<_>>(),
+            vec![
+                ("fifo_stopped", held),
+                ("stopped", StoppedAtAnchor::default())
+            ],
+            "each stop carries its section's unconsumed arrival"
+        );
+        for (node, stopped) in [
+            ("stopped", true),
+            ("fifo_stopped", true),
+            ("running", false),
+            ("v1", false),
+            ("absent", false),
+            ("ghost", false),
+        ] {
+            assert_eq!(stops.is_stopped(node), stopped, "{node}");
+        }
+        let names = |nodes: &[&str]| -> BTreeSet<String> {
+            nodes.iter().map(|node| (*node).to_string()).collect()
+        };
+        assert_eq!(
+            stops.stated(),
+            names(&["fifo_stopped", "running", "stopped", "v1"]),
+            "format 10: every node with a complete part has its stop stated"
+        );
+        assert_eq!(
+            resolve_anchor_stops(graph, &blobs, &framework, false).stated(),
+            names(&["fifo_stopped", "stopped"]),
+            "format 9: only a flagged part states anything"
+        );
+        // Determinism: the same inputs give the same classification.
+        assert_eq!(stops, resolve_anchor_stops(graph, &blobs, &framework, true));
+    }
+
+    /// A topic is re-executed while any in-graph producer of it runs: two
+    /// writers of one `multi_publisher_topics` topic and a sole writer of
+    /// another, against each set of stops, by hand.
+    #[test]
+    fn a_topic_only_stopped_nodes_produce_is_not_reexecuted() {
+        let config = cerulion_core::graph::parse_graph(
+            "name: sh\nprefix: mp\nmulti_publisher_topics:\n  - /mp/bus\nnodes:\n\
+             \x20 - id: alpha\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: geometry_msgs/Vector3\n        topic: /mp/bus\n\
+             \x20 - id: beta\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: geometry_msgs/Vector3\n        topic: /mp/bus\n\
+             \x20 - id: solo\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: geometry_msgs/Vector3\n",
+        )
+        .expect("the fixture graph parses");
+        let produced = graph_produced_topics(&config);
+        assert_eq!(
+            produced,
+            vec!["/mp/bus".to_string(), "/mp/solo/out".to_string()]
+        );
+        let stopped = |nodes: &[&str]| AnchorStops {
+            by_node: ["alpha", "beta", "solo"]
+                .into_iter()
+                .map(|node| {
+                    let stop = if nodes.contains(&node) {
+                        AnchorStop::Stopped(StoppedAtAnchor::default())
+                    } else {
+                        AnchorStop::Running
+                    };
+                    (node.to_string(), stop)
+                })
+                .collect(),
+        };
+        for (nodes, kept) in [
+            (&[][..], &["/mp/bus", "/mp/solo/out"][..]),
+            (&["alpha"][..], &["/mp/bus", "/mp/solo/out"][..]),
+            (&["alpha", "beta"][..], &["/mp/solo/out"][..]),
+            (&["solo"][..], &["/mp/bus"][..]),
+            (&["alpha", "beta", "solo"][..], &[][..]),
+        ] {
+            assert_eq!(
+                reexecuted_topics(&config, &produced, &stopped(nodes)),
+                kept.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                "stopped {nodes:?}"
+            );
+        }
+    }
+
+    /// The refusal for a fire of a node the checkpoint states as stopped, over
+    /// hand-written fire maps: only a node stated
+    /// stopped AND fired in the executed steps refuses, naming the checkpoint
+    /// step, the node and its first fire; the refusal is exit 2.
+    #[test]
+    fn a_fire_of_a_node_stated_stopped_is_refused_naming_the_node_and_both_steps() {
+        let stops = AnchorStops {
+            by_node: [
+                ("a_stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+                ("b_running", AnchorStop::Running),
+                ("c_unstated", AnchorStop::Unstated),
+                ("d_stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+            ]
+            .into_iter()
+            .map(|(node, stop)| (node.to_string(), stop))
+            .collect(),
+        };
+        let fires = |rows: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            rows.iter()
+                .map(|(node, step)| ((*node).to_string(), *step))
+                .collect()
+        };
+        assert!(stopped_fire_refusal(&stops, &BTreeMap::new(), 3).is_none());
+        assert!(
+            stopped_fire_refusal(&stops, &fires(&[("b_running", 4), ("c_unstated", 5)]), 3)
+                .is_none(),
+            "a running or unstated node may fire"
+        );
+        assert!(
+            stopped_fire_refusal(&AnchorStops::default(), &fires(&[("a_stopped", 4)]), 3).is_none(),
+            "no stop stated, nothing refused"
+        );
+        let refusal =
+            stopped_fire_refusal(&stops, &fires(&[("d_stopped", 5), ("b_running", 4)]), 3)
+                .expect("a fire of a stopped node is refused");
+        let ReplayError::RecordingInconsistent { detail } = &refusal else {
+            panic!("expected RecordingInconsistent, got {refusal:?}");
+        };
+        assert_eq!(
+            detail,
+            "the checkpoint at step 3 states that node 'd_stopped' had stopped, and the \
+             recording holds a fire of it at step 5; nothing restarts a stopped node in a run"
+        );
+        assert_eq!(refusal.exit_code(), 2, "a bag fault, not a divergence");
+        let both = stopped_fire_refusal(&stops, &fires(&[("d_stopped", 4), ("a_stopped", 9)]), 3)
+            .expect("refused");
+        assert!(
+            both.to_string().contains("node 'a_stopped' had stopped")
+                && both.to_string().contains("at step 9"),
+            "the first stopped node in id order is named, with its own first fire: {both}"
+        );
+    }
+
+    /// A stop restore the runtime declines is an engine bug: exit 5, naming
+    /// the runtime's own refusal.
+    #[test]
+    fn a_declined_stop_restore_is_an_internal_error() {
+        let refusal = stop_restore_failure(&cerulion_core::TransportError::NodeNotFound {
+            node_id: "ghost".to_string(),
+        });
+        assert_eq!(refusal.exit_code(), 5);
+        let ReplayError::Internal { reason } = &refusal else {
+            panic!("expected Internal, got {refusal:?}");
+        };
+        assert!(
+            reason.starts_with(
+                "the resume could not keep the nodes its checkpoint states as stopped from firing: "
+            ) && reason.contains("ghost")
+                && reason.ends_with("this is a bug in the replay engine, please report"),
+            "{reason}"
+        );
     }
 
     /// The kind-field width and the role trust are

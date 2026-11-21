@@ -182,7 +182,7 @@ CLI subcommand, or fixing a docs gap you hit during setup.
    ```bash
    git checkout -b fix/topic-hz-panic
    ```
-   CI checks this (`tools/scripts/check_pr_title.sh`, in the `lint` job). You can
+   CI checks this (`tools/scripts/check_pr_title.sh`, in the `Lint` check). You can
    run it yourself first:
    ```bash
    ./tools/scripts/check_pr_title.sh --title "fix(cli): stop topic hz panicking" \
@@ -314,7 +314,7 @@ and we'll help.
 - **PR titles must be [Conventional Commits](https://www.conventionalcommits.org/)**
   in the form `<type>(<scope>): <description>`, e.g. `fix(transport): handle empty payload`
   or `docs: clarify setup steps`. This is checked by
-  `tools/scripts/check_pr_title.sh` in CI's `lint` job, not by hand: we squash-merge,
+  `tools/scripts/check_pr_title.sh` in CI's `Lint` check, not by hand: we squash-merge,
   so the PR title becomes the commit message on `main`. The same script checks
   the branch name (step 2 of the flow above), and both are runnable locally.
   Individual commit titles inside the PR are not gated, only the PR title is.
@@ -324,21 +324,28 @@ and we'll help.
   editable; a branch name is permanent and quoted in every merge commit.
 - **Dependency versions move on their own weekly pull request.** The config in
   `.github/dependabot.yml` opens one grouped pull request a week for the GitHub
-  Actions the workflows run and one for the crates the root workspace resolves,
-  each labelled `dependencies` and each subject to the same required checks as
-  any other change; its head branch carries the `dependabot/` prefix the forge
-  mints, which `tools/scripts/check_pr_title.sh` accepts for that author alone.
+  Actions the workflows run and one for the compatible updates of the crates the
+  root workspace resolves, and a pull request of its own for each crate update
+  that can break a build, each labelled `dependencies` and each subject to the
+  same required checks as any other change. Cargo pull requests are not rebased
+  automatically: comment `@dependabot rebase` on one that conflicts with `main`.
+  Their head branches carry the `dependabot/` prefix the forge mints, which
+  `tools/scripts/check_pr_title.sh` accepts for that author alone.
   The standalone workspaces under `examples/` and `benches/` carry their
   versions by hand.
 - In your PR description, tell us **what** changed, **why**, and **how to test**
   it.
-- **Commit messages carry no attribution trailer.** The leak guard's message
-  scan refuses a line that starts with `Co-authored-by:` or `Coauthored-by:`
-  after optional indentation, matched without regard to case and followed by a
-  name, on every commit of the pull request and on its title and body. The
-  trailer stays on the pull request's own commits, which the forge keeps
-  publicly, and the identity policy in `docs/leak_guard.md` names who may
-  appear as an author. Amend such trailers out before you push:
+- **Commit messages carry no attribution trailer, with one exception.** The
+  leak guard's message scan refuses a line that starts with `Co-authored-by:`
+  or `Coauthored-by:` after optional indentation, matched without regard to
+  case and followed by a name, on every commit of the pull request and on its
+  title and body. The one trailer it lets through on a commit is the shape the
+  forge writes on a squash: in the trailer block, spelled exactly as the forge
+  spells it, naming, by its exact name and numbered noreply address, an
+  identity that already authors a commit on `main`, or an app, named by its
+  own login, that authors the commit itself. `docs/leak_guard.md` gives the
+  full rule, and its identity policy names who may appear as an author. Amend
+  any other trailer out before you push:
   `git commit --amend` for one commit, `git rebase -i <base>` with `reword`
   for several, then `git push --force-with-lease` to your branch.
 - Add tests for new behavior.

@@ -20,6 +20,13 @@
 //! The same harness carries the sibling of that class: the missing-toolchain
 //! message (`cargo` not on `PATH`) is a pure mapping in the engine, and only
 //! a spawned binary can show the spawn error still reaches it.
+//!
+//! Three success arms pin WHERE the library lands, one for each form of
+//! `CARGO_TARGET_DIR`: unset, absolute, and relative, run from below the
+//! workspace root. `graph run` looks for the library through
+//! `graph_cmd::cdylib_target_base`, so a build that put it anywhere else
+//! would leave `graph run` without it. Each expected path is written out in
+//! the arm, not computed by the CLI's resolver.
 
 #[cfg(unix)]
 mod fresh_executable;
@@ -571,5 +578,122 @@ fn a_successful_node_build_keeps_stdout_to_the_result_line() {
     assert!(
         stderr.contains("Building 'probe_node'."),
         "the progress line must be printed on the success path too: {stderr}"
+    );
+}
+
+/// Turn the stub `scaffold` writes into a crate that compiles to a library: no
+/// dependencies, no declaration, one `cdylib` target.
+fn make_probe_buildable(ws: &Path) {
+    let node = ws.join("nodes").join("probe_node");
+    std::fs::write(
+        node.join("Cargo.toml"),
+        "[package]\nname = \"probe_node\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+         [lib]\ncrate-type = [\"cdylib\"]\n",
+    )
+    .expect("rewrite the node manifest");
+    std::fs::write(node.join("src").join("lib.rs"), "pub fn ok() {}\n")
+        .expect("rewrite the node source");
+}
+
+/// The file cargo builds the `probe_node` cdylib to on this platform, spelled
+/// from the platform's library prefix and suffix rather than asked of the CLI.
+fn probe_library() -> String {
+    format!(
+        "{}probe_node{}",
+        std::env::consts::DLL_PREFIX,
+        std::env::consts::DLL_SUFFIX
+    )
+}
+
+/// Run `cerulion node build probe_node` from `cwd`, with the child's
+/// `CARGO_TARGET_DIR` set to `target_dir` or removed when it is `None`, and
+/// require it to succeed.
+///
+/// Cargo also takes a target directory and a target triple from
+/// `CARGO_BUILD_TARGET_DIR`, `CARGO_BUILD_TARGET` and its config files, and
+/// the CLI's resolver reads none of them. So both variables are removed and
+/// Cargo's home is an empty directory: the probe has no dependencies, so cargo
+/// needs nothing from it. A cargo config file in a parent directory of the
+/// temporary workspace is still read.
+fn build_probe_library(cwd: &Path, target_dir: Option<&Path>) {
+    let cargo_home = tempfile::tempdir().expect("an empty Cargo home");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    command
+        .args(["node", "build", "probe_node"])
+        .current_dir(cwd)
+        .env("CARGO_HOME", cargo_home.path())
+        .env_remove("CARGO_BUILD_TARGET_DIR")
+        .env_remove("CARGO_BUILD_TARGET");
+    match target_dir {
+        Some(dir) => command.env("CARGO_TARGET_DIR", dir),
+        None => command.env_remove("CARGO_TARGET_DIR"),
+    };
+    let out = command.output().expect("run the cerulion binary");
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// With no `CARGO_TARGET_DIR`, the library lands in `<ws>/target/debug`, where
+/// `graph run` looks for it.
+#[test]
+fn node_build_with_no_target_dir_puts_the_library_in_the_workspace_target() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = scaffold(tmp.path());
+    make_probe_buildable(&ws);
+
+    build_probe_library(&ws, None);
+
+    let lib = ws.join("target").join("debug").join(probe_library());
+    assert!(lib.is_file(), "the library must be at {}", lib.display());
+}
+
+/// An absolute `CARGO_TARGET_DIR` outside the workspace receives the library,
+/// and `<ws>/target` is never created.
+#[test]
+fn node_build_puts_the_library_in_an_absolute_cargo_target_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = scaffold(tmp.path());
+    make_probe_buildable(&ws);
+    let elsewhere = tempfile::tempdir().expect("a target dir outside the workspace");
+    assert!(elsewhere.path().is_absolute());
+
+    build_probe_library(&ws, Some(elsewhere.path()));
+
+    let lib = elsewhere.path().join("debug").join(probe_library());
+    assert!(lib.is_file(), "the library must be at {}", lib.display());
+    assert!(
+        !ws.join("target").exists(),
+        "nothing may be built into the workspace's own target directory"
+    );
+}
+
+/// A relative `CARGO_TARGET_DIR` resolves against the workspace root, not the
+/// directory `node build` is run from, which is the same anchor `graph run`
+/// resolves it against.
+#[test]
+fn node_build_resolves_a_relative_cargo_target_dir_against_the_workspace_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ws = scaffold(tmp.path());
+    make_probe_buildable(&ws);
+    let below_the_root = ws.join("graphs");
+
+    build_probe_library(&below_the_root, Some(Path::new("relative-target")));
+
+    let lib = ws
+        .join("relative-target")
+        .join("debug")
+        .join(probe_library());
+    assert!(lib.is_file(), "the library must be at {}", lib.display());
+    assert!(
+        !below_the_root.join("relative-target").exists(),
+        "the relative target directory must not resolve against the working directory"
+    );
+    assert!(
+        !ws.join("target").exists(),
+        "nothing may be built into the workspace's own target directory"
     );
 }

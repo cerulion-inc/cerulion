@@ -146,7 +146,10 @@ The inspection verbs and `schema info` also stay local under the network
 daemon's own `CERULION_NETD_NETWORK=off` (exactly `off`, the daemon's
 parse), opening no discovery session of their own. `cerulion viz --robot`
 refuses under `CERULION_NETWORK`, `CERULION_NETD_NETWORK=off` or
-`CERULION_VIZD_NETWORK=off`.
+`CERULION_VIZD_NETWORK=off`. `cerulion graph live` and `cerulion graph fires`
+refuse under `CERULION_NETWORK` or `CERULION_NETD_NETWORK=off` before they
+contact `cerulion-netd` or a `--connect` locator, so no runs or fires query
+reaches a robot and no robot starts recording fires.
 
 A command does not stop a gateway owned by another process or remove
 already mirrored topics. Listing reads mirror provenance locally and
@@ -1161,7 +1164,7 @@ netd writes its `Hello` banner first, so you get TWO lines (the banner, then the
 status reply):
 
 ```
-{"hello":"cerulion-netd","protocol":11,"wire_header":2}
+{"hello":"cerulion-netd","protocol":12,"wire_header":2}
 {"id":1,"demands":[],"active_connections":1,"idle":false,"connect_endpoints":[],"lan_access":"paired"}
 ```
 

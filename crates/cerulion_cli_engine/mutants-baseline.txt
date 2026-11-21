@@ -1,5 +1,129 @@
-# Mutation baseline for cerulion_cli_engine: the verifier budget's pure decision
-# functions.
+# Mutation baseline for cerulion_cli_engine: the delivery flag token of
+# `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
+# resumed replay make about a node a checkpoint states as stopped, the
+# stand-downs a resumed replay applies to a node whose stop the recording
+# does not state, and the verifier budget's pure decision functions.
+#
+# Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
+# argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
+# inline `=value`, matched on bytes so a value that is not UTF-8 is kept whole.
+# The rest of the file stages the child environment and execs `ros2`, which the
+# mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/ros2_cmd.rs \
+#            --re 'delivery_flag_token' --exclude-re 'tests::' \
+#            --timeout 300 --cap-lints true -- \
+#            --test ros2_delivery_flags_test --test ros2_cmd_test
+#          (run in place in a scratch checkout; the unmutated baseline passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  5 mutants: 5 caught, 0 unviable, 0 missed. Each replaces the
+#          body with None or a Some of an empty or made-up flag name, with and
+#          without a value. The tool generates no mutant inside the match on
+#          the bytes after the flag: it has no bare `_` arm to delete.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Second scope: the decisions the recorder and a resumed replay make about a
+# node a checkpoint states as stopped.
+#
+# Scope: the pure decision functions on the lines the anchor stop change added
+# or changed. In src/replay_engine.rs: the recorder's trace format stamp and
+# the reader's gate on it (`stamp_trace_format`,
+# `recorder_states_anchor_stops`, `recorder_states_anchor_stops_at`), the
+# stops the anchor states (`AnchorStops`, `resolve_anchor_stops`), the
+# refusals when the runtime declines a stop restore (`stop_restore_failure`)
+# or the recording fires a stopped node (`stopped_fire_refusal`), and the
+# topics the replay re-executes (`reexecuted_topics`). In
+# src/replay_rederive.rs: the pass's restore and stops (`PassRestore`,
+# `PassStops`, `StopPoint`, `is_stop_step_burst`), the pass entry that hands
+# them to each rule (`verify`), the four rules that read them
+# (`verify_period`, `verify_latest`, `verify_sync`, `verify_fifo`) and the
+# text of a stand down (`StandDownReason::label`). Every other line of the two
+# files is outside the change's diff, or, in replay_engine.rs, reads the bag
+# or drives the scheduler, which the mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re 'stamp_trace_format|recorder_states_anchor_stops|reexecuted_topics|AnchorStops::|stop_restore_failure|resolve_anchor_stops|stopped_fire_refusal|PassRestore::|StopPoint::|PassStops::|is_stop_step_burst|verify_period|verify_latest|verify_sync|verify_fifo|\bverify\b|StandDownReason::label' \
+#            --cap-lints true --in-place --timeout 600 \
+#            -- --lib -- replay_engine:: replay_rederive::
+#          (in 4 shards, the last two alternatives in a run of their own;
+#          the unmutated baseline passed)
+# Result:  74 mutants: 70 caught, 3 unviable, 1 missed, killed since:
+#          `PassRestore::with_stops_stated` replaced with
+#          `Default::default()`. Every test that stated a stop stated the
+#          judged node, where an empty restore reads the same. Killed by
+#          `replay_rederive::tests::stating_another_nodes_stop_leaves_a_latest_nodes_stop_unstated`
+#          (re-run with `--re 'PassRestore::with_stops_stated'` and the same
+#          test command: 1 mutant, 1 caught).
+#          The 3 unviable replace `stop_restore_failure` with
+#          `Default::default()` and `stopped_fire_refusal` with
+#          `Some(Default::default())` (`ReplayError` has no default), and the
+#          body of the const fn `PassRestore::none` with `Default::default()`
+#          (a const fn cannot call it).
+#
+# `scan_suffix_fires` collects, per node, the lowest step in the steps the
+# replay executes at which the recording fires it, which
+# `stopped_fire_refusal` reads. It walks the recorded bag, and no lib test
+# reaches `resolve_resume`, its one caller, so the replay engine's
+# integration test judges its changed lines:
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the same diff> --re 'scan_suffix_fires' \
+#            --cap-lints true --in-place --timeout 900 -- \
+#            --test replay_engine_test -- --test-threads=1 \
+#            a_recording_that_fires_a_stopped_node_after_the_anchor_is_refused_before_step_one
+#          (the unmutated baseline passed)
+# Result:  1 mutant: 1 caught (the body replaced with
+#          `Ok(Default::default())`).
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Third scope: the stand-downs a resumed replay applies to a node whose stop
+# the recording does not state.
+#
+# Scope: the pure decision functions on the lines the unstated-stop change
+# added or changed. In src/replay_rederive.rs: the predicate that a node
+# neither fired nor read in its body in the pass (`unfired_since_anchor`,
+# `OwedFire`, `node_ran_in_pass`), the three rules that stand down on it
+# (`verify_fifo`, `verify_latest`, `verify_sync`), the pass entry that hands it
+# to them (`verify`) and the text of a stand down (`StandDownReason`). Every
+# other line of the two files is outside the change's diff, or, in
+# src/replay_engine.rs, reads the bag or drives the scheduler, which the
+# mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re 'unfired_since_anchor|node_ran_in_pass|verify_fifo|verify_latest|verify_sync|\bverify\b|StandDownReason::|OwedFire::' \
+#            --cap-lints true --in-place --timeout 600 \
+#            -- --lib -- replay_engine:: replay_rederive::
+#          (in 4 shards; the unmutated baseline passed)
+# Result:  29 mutants: 28 caught, 1 unviable, 0 missed. The unviable one
+#          replaces `unfired_since_anchor` with `Default::default()`:
+#          `OwedFire` has no default.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Fourth scope: the verifier budget's pure decision functions.
 #
 # Scope: the functions in src/replay_engine.rs that count one rank's reads
 # against the verifier's record budget, place the step the count ran past it,

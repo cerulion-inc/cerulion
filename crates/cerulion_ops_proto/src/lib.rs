@@ -9,6 +9,8 @@
 //!   ([`Request`], [`Response`]).
 //! - [`client`]: [`OpsClient`], a blocking client that performs the handshake
 //!   and issues verb calls over any `Read + Write` byte stream.
+//! - [`exec_client`]: [`ExecClient`], a transport-independent exec state machine
+//!   with bounded output capture and recording witness consistency checks.
 //! - [`inventory`]: [`Inventory`], the result the `inventory` verb returns.
 //! - [`session`]: bounded shell and exec frame codecs, with separate limits on
 //!   JSON envelopes and binary chunks. These codecs require session negotiation
@@ -33,6 +35,7 @@
 
 pub mod client;
 pub mod error;
+pub mod exec_client;
 pub mod inventory;
 pub mod protocol;
 pub mod recording;
@@ -40,10 +43,12 @@ pub mod session;
 
 pub use client::OpsClient;
 pub use error::{ErrorKind, OpsProtoError, OpsProtoResult};
+pub use exec_client::{ExecCaptureLimits, ExecClient, ExecEvent, ExecPartial, ExecResult};
 pub use inventory::Inventory;
 pub use protocol::{
     decode, encode, negotiate_version, read_frame, write_frame, HandshakeReply, Hello, Request,
-    Response, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, PROTOCOL_VERSION,
+    Response, MAX_FRAME_BYTES, MIN_PROTOCOL_VERSION, MIN_SESSION_PROTOCOL_VERSION,
+    PROTOCOL_VERSION,
 };
 pub use recording::{
     verify_recording, verify_recording_prefix, RecordingChain, RecordingEvent, RecordingPayload,
