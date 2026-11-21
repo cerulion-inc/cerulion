@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 //! Clap CLI definitions.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use cerulion_cli_engine::graph_cmd::PeerLossPolicy as EnginePeerLossPolicy;
@@ -883,7 +884,7 @@ pub enum Ros2Action {
             allow_hyphen_values = true,
             value_name = "ARGS"
         )]
-        args: Vec<String>,
+        args: Vec<OsString>,
     },
     /// Launch a ROS 2 launch file on Cerulion transport. Arguments go to
     /// `ros2 launch` verbatim, except a leading `--adopt-take`, refused here for
@@ -917,7 +918,7 @@ pub enum Ros2Action {
             allow_hyphen_values = true,
             value_name = "ARGS"
         )]
-        args: Vec<String>,
+        args: Vec<OsString>,
     },
     /// Migrate a colcon workspace's C++ publish sites to the loaned-message API.
     ///
@@ -1304,8 +1305,8 @@ pub enum NodeAction {
         /// Hard opt-out from the live-loop monitor-wait park, on every target;
         /// no environment variable can re-enable it. Without this flag the park
         /// is on by default everywhere.
-        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
-        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// AMD MWAITX, Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost; elsewhere it is a bounded
         /// park that never busy-spins. This flag restores the blocking wait on
@@ -1443,8 +1444,8 @@ pub enum GraphAction {
         /// Hard opt-out from the live-loop monitor-wait park, on every target;
         /// no environment variable can re-enable it. Without this flag, on the
         /// live (real or external) clock the park is on by default everywhere.
-        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG,
-        /// Linux aarch64 WFE) it replaces the blocking wait with a shallow
+        /// Where the CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// AMD MWAITX, Linux aarch64 WFE) it replaces the blocking wait with a shallow
         /// per-core park (no deep idle state), cutting the wake latency after an
         /// idle period at a small per-core power cost; elsewhere it is a bounded
         /// park that never busy-spins. This flag restores the blocking wait on
@@ -5281,7 +5282,11 @@ mod ros2_run_dispatch_tests {
     /// This pins the clap FALLBACK path only — the primary dispatch is
     /// `main`'s raw-argv intercept, which never parses at all (that is what
     /// makes a LEADING hyphenated token forwardable; the e2e pins it).
-    fn parse_ros2(argv: &[&str]) -> (bool, Vec<String>) {
+    fn parse_ros2(argv: &[&str]) -> (bool, Vec<OsString>) {
+        parse_ros2_os(&argv.iter().map(OsString::from).collect::<Vec<_>>())
+    }
+
+    fn parse_ros2_os(argv: &[OsString]) -> (bool, Vec<OsString>) {
         let cli = Cli::try_parse_from(argv).expect("argv must parse");
         match cli.command {
             Commands::Ros2 {
@@ -5351,6 +5356,31 @@ mod ros2_run_dispatch_tests {
             "--show-args",
         ]);
         assert_eq!(args, ["demo.launch.py", "--show-args"]);
+    }
+
+    /// The clap path (a global `-v` after `ros2` skips `main`'s raw-argv
+    /// intercept) forwards an argument that is not valid UTF-8 with its bytes
+    /// as given, as the intercept does.
+    #[cfg(unix)]
+    #[test]
+    fn ros2_run_collects_an_argument_that_is_not_utf8_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let raw = std::ffi::OsStr::from_bytes(b"caf\xE9.yaml");
+        let argv: Vec<OsString> = ["cerulion", "ros2", "-v", "run", "pkg", "exe"]
+            .into_iter()
+            .map(OsString::from)
+            .chain([raw.to_os_string()])
+            .collect();
+        let (is_launch, args) = parse_ros2_os(&argv);
+        assert!(!is_launch);
+        assert_eq!(
+            args,
+            [
+                OsString::from("pkg"),
+                OsString::from("exe"),
+                raw.to_os_string()
+            ]
+        );
     }
 
     /// Bare `cerulion ros2` requires a subcommand (clap's exit-2 usage error

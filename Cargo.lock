@@ -1738,6 +1738,7 @@ dependencies = [
  "libc",
  "native_ros2_messages",
  "postcard",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "serial_test",
@@ -5625,6 +5626,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
 
 [[package]]
+name = "node_macro_ui"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+ "serde",
+ "trybuild",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9477,6 +9488,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_links_host_app"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "test_node_links_timer",
+]
+
+[[package]]
+name = "test_node_links_timer"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_macro_accumulate_cdylib"
 version = "0.1.0"
 dependencies = [
@@ -9718,6 +9745,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_modified_raw_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_nondeterministic_cdylib"
 version = "0.1.0"
 dependencies = [
@@ -9737,7 +9772,6 @@ name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
- "native_ros2_messages",
 ]
 
 [[package]]
@@ -9755,6 +9789,22 @@ dependencies = [
  "cerulion_core",
  "native_ros2_messages",
  "stabby",
+]
+
+[[package]]
+name = "test_node_start_order_cons_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_start_order_prod_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]

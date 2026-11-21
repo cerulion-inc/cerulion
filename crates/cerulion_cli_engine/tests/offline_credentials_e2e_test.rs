@@ -5,13 +5,21 @@
 //! without waiting. A pass-through proxy in front of the router counts requests
 //! and can answer a chosen route itself, the shape of a service without it.
 //!
+//! Device-certificate renewal: a certificate inside its renewal window is renewed
+//! with the same device key and the same device row; one outside it is left
+//! untouched with no request; a refused renewal changes nothing and logs one
+//! line; two concurrent renewals make exactly one registration request; no
+//! renewal creates a key. Each caller renews a due certificate: an account
+//! command through `require_session`, the automatic account step once per
+//! process, and the robot's revocation worker after its fetch.
+//!
 //! The robot's revocation fetch: it proves possession of the robot's transport
 //! key and needs no login session; it falls back to the session when the service
 //! has no robot access route; a 429 fails the run without the session; it never
 //! signs a challenge issued for another robot.
 //!
 //! `#[serial]`: the tests mutate the process env (`CERULION_ACCOUNT_SERVICE`,
-//! `CERULION_HOME`), which is global.
+//! `CERULION_HOME`, the renewal window), which is global.
 
 #![cfg(unix)]
 
@@ -26,8 +34,16 @@ use cerulion_accountd::{
     AppState, CapturingEmailSender, Clock, EmailSender, ServiceConfig, UnconfiguredResolver,
 };
 use cerulion_cli_engine::auth::AuthState;
-use cerulion_cli_engine::{account_cmd, auth, login_cmd, robot_bootstrap};
+use cerulion_cli_engine::device_cert_renewal::{
+    renew_device_cert_if_due, renew_if_due, renew_once_within, RenewalOutcome, RENEW_WINDOW_ENV,
+};
+use cerulion_cli_engine::{account_cmd, auth, login_cmd, owner_certificate, robot_bootstrap};
+use cerulion_pairing::format::SignedDeviceCert;
 use serial_test::serial;
+
+/// The stop flag of a revocation sync nothing stops.
+#[cfg(unix)]
+static NOT_STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 const DAY_NS: u64 = 86_400 * 1_000_000_000;
 
@@ -269,6 +285,74 @@ struct Desk {
     _env: Vec<EnvGuard>,
 }
 
+impl Desk {
+    fn cert_text(&self) -> String {
+        std::fs::read_to_string(self.home.join("device.cert"))
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+    fn cert(&self) -> SignedDeviceCert {
+        let bytes = URL_SAFE_NO_PAD.decode(self.cert_text()).unwrap();
+        postcard::from_bytes(&bytes).unwrap()
+    }
+    fn registrations(&self) -> usize {
+        self.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|l| l.starts_with("POST /v1/devices "))
+            .count()
+    }
+    /// Advance the service clock so `left_ns` of the cached certificate remains,
+    /// and return that instant for the client side.
+    fn age_to(&self, left_ns: u64) -> u64 {
+        let now = self.cert().cert.validity.not_after_ns - left_ns;
+        self.clock.store(now, Ordering::SeqCst);
+        now
+    }
+    /// Make the cached certificate due on this machine's own clock, for the
+    /// callers that read it: a window longer than the certificate's lifetime, and
+    /// the service clock moved up to now, in step with this one, so the reissued
+    /// certificate outlives the cached one and starts at or before this clock's
+    /// reading after the service answered.
+    fn due_on_the_wall_clock(&self) -> EnvGuard {
+        self.clock.store(wall_ns(), Ordering::SeqCst);
+        EnvGuard::set(RENEW_WINDOW_ENV, "2592000")
+    }
+    fn failure_recorded(&self) -> bool {
+        self.home.join(".device-renew.failed").exists()
+    }
+    /// The reissued certificate reached the CLI's copy and the owner chain.
+    fn assert_renewed_from(&self, before: &str) {
+        assert_ne!(
+            self.cert_text(),
+            before,
+            "device.cert holds a new certificate"
+        );
+        assert_eq!(
+            owner_certificate::load()
+                .expect("the renewed chain is consistent")
+                .device_cert,
+            self.cert()
+        );
+        assert_eq!(self.registrations(), 1);
+    }
+}
+
+/// A client clock that reads `first` once (the due decision) and `then` on every
+/// later read (after the service answered).
+fn stepping_clock(first: u64, then: u64) -> impl Fn() -> u64 {
+    let read = std::sync::atomic::AtomicBool::new(false);
+    move || {
+        if read.swap(true, Ordering::SeqCst) {
+            then
+        } else {
+            first
+        }
+    }
+}
+
 /// A signed-in desk whose account service is reached through the counting proxy.
 fn desk() -> Desk {
     let email = Arc::new(CapturingEmailSender::new());
@@ -283,6 +367,7 @@ fn desk() -> Desk {
             &format!("http://127.0.0.1:{proxy}"),
         ),
         EnvGuard::set("CERULION_HOME", home_path.to_str().unwrap()),
+        EnvGuard::unset(RENEW_WINDOW_ENV),
         EnvGuard::unset("CERULION_NETD_DEVICE_CERT"),
         EnvGuard::unset("CERULION_NETD_DESK_KEY"),
     ];
@@ -303,6 +388,170 @@ fn desk() -> Desk {
 // ===========================================================================
 // tests
 // ===========================================================================
+
+#[test]
+#[serial]
+fn a_certificate_inside_its_window_is_renewed_with_the_same_key_and_device_row() {
+    let desk = desk();
+    let before = desk.cert();
+    let devices = account_cmd::list_my_devices(&desk.state.session_token).unwrap();
+    assert_eq!(devices.len(), 1);
+    // One day left of seven: inside the default half-life window.
+    let now = desk.age_to(DAY_NS);
+    let outcome = renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap();
+    let after = desk.cert();
+    assert_eq!(
+        outcome,
+        RenewalOutcome::Renewed {
+            old_not_after_ns: before.cert.validity.not_after_ns,
+            new_not_after_ns: after.cert.validity.not_after_ns,
+        }
+    );
+    assert_eq!(after.cert.device_key, before.cert.device_key);
+    assert_eq!(after.cert.account, before.cert.account);
+    assert_eq!(after.cert.principal_kind, before.cert.principal_kind);
+    // The service clock is six days on: the new certificate runs seven from there.
+    assert_eq!(after.cert.validity.not_after_ns, now + 7 * DAY_NS);
+    assert_eq!(desk.registrations(), 1);
+    // The same device row, no second one.
+    let devices_after = account_cmd::list_my_devices(&desk.state.session_token).unwrap();
+    assert_eq!(devices_after.len(), 1);
+    assert_eq!(devices_after[0].device_id, devices[0].device_id);
+    assert_eq!(devices_after[0].public_key, devices[0].public_key);
+    // The owner chain reads the new leaf, and auth.json is unchanged.
+    let chain = owner_certificate::load().expect("the renewed chain is consistent");
+    assert_eq!(chain.device_cert, after);
+    assert!(
+        auth::load().state().cloned().unwrap() == desk.state,
+        "auth.json is not written by a renewal"
+    );
+    // Renewed once: the new certificate is outside its window, so no request.
+    assert_eq!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap(),
+        RenewalOutcome::NotDue {
+            not_after_ns: after.cert.validity.not_after_ns
+        }
+    );
+    assert_eq!(desk.registrations(), 1);
+}
+
+#[test]
+#[serial]
+fn a_certificate_outside_its_window_is_untouched_and_no_request_is_made() {
+    let desk = desk();
+    let text = desk.cert_text();
+    let not_after = desk.cert().cert.validity.not_after_ns;
+    // 3.5 days and one second left: just outside the default window.
+    let now = desk.age_to(7 * DAY_NS / 2 + 1_000_000_000);
+    let calls = desk.log.lock().unwrap().len();
+    assert_eq!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap(),
+        RenewalOutcome::NotDue {
+            not_after_ns: not_after
+        }
+    );
+    assert_eq!(desk.log.lock().unwrap().len(), calls, "no request at all");
+    assert_eq!(desk.cert_text(), text);
+    // The window setting moves the boundary: four days renews it.
+    let _window = EnvGuard::set(RENEW_WINDOW_ENV, "345600");
+    assert!(matches!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap(),
+        RenewalOutcome::Renewed { .. }
+    ));
+}
+
+#[tracing_test::traced_test]
+#[test]
+#[serial]
+fn a_refused_renewal_changes_nothing_and_says_so_once() {
+    let desk = desk();
+    let devices = account_cmd::list_my_devices(&desk.state.session_token).unwrap();
+    account_cmd::revoke_my_device(&desk.state.session_token, &devices[0].device_id).unwrap();
+    let text = desk.cert_text();
+    let chain = std::fs::read(desk.home.join("device-chain.json")).unwrap();
+    let now = desk.age_to(DAY_NS);
+    let err = renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap_err();
+    assert!(err.to_string().contains("409"), "{err}");
+    assert_eq!(desk.cert_text(), text);
+    assert_eq!(
+        std::fs::read(desk.home.join("device-chain.json")).unwrap(),
+        chain
+    );
+    // The logging entry, which reads the wall clock: a window longer than the
+    // certificate's lifetime makes it due now. The failure above was recorded at
+    // the service clock, six days ahead of this one, and a failure recorded after
+    // now holds nothing back, so this attempt runs. No error to the caller, one
+    // warning.
+    let _window = EnvGuard::set(RENEW_WINDOW_ENV, "2592000");
+    renew_if_due(&desk.state.session_token);
+    logs_assert(|lines: &[&str]| {
+        match lines
+            .iter()
+            .filter(|l| l.contains("could not be renewed") && l.contains("cerulion login"))
+            .count()
+        {
+            1 => Ok(()),
+            n => Err(format!("expected one warning line, got {n}")),
+        }
+    });
+}
+
+#[test]
+#[serial]
+fn two_concurrent_renewals_make_exactly_one_registration() {
+    let desk = desk();
+    let now = desk.age_to(DAY_NS);
+    let session = desk.state.session_token.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let renewers: Vec<_> = (0..2)
+        .map(|_| {
+            let (session, barrier) = (session.clone(), Arc::clone(&barrier));
+            std::thread::spawn(move || {
+                barrier.wait();
+                renew_device_cert_if_due(&session, &|| now).unwrap()
+            })
+        })
+        .collect();
+    let outcomes: Vec<RenewalOutcome> = renewers.into_iter().map(|t| t.join().unwrap()).collect();
+    assert_eq!(desk.registrations(), 1, "{outcomes:?}");
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, RenewalOutcome::Renewed { .. }))
+            .count(),
+        1,
+        "{outcomes:?}"
+    );
+    assert!(
+        outcomes.iter().all(|o| matches!(
+            o,
+            RenewalOutcome::Renewed { .. }
+                | RenewalOutcome::PeerRenewing
+                | RenewalOutcome::NotDue { .. }
+        )),
+        "{outcomes:?}"
+    );
+}
+
+#[test]
+#[serial]
+fn a_renewal_never_creates_a_device_key() {
+    let desk = desk();
+    let key = desk.home.join("identity").join("device.key");
+    let legacy = desk.home.join("desk.key");
+    for path in [&key, &legacy] {
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let text = desk.cert_text();
+    let now = desk.age_to(DAY_NS);
+    let err = renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap_err();
+    assert!(err.to_string().contains("no device key"), "{err}");
+    assert!(!key.exists() && !legacy.exists(), "no key was created");
+    assert_eq!(desk.cert_text(), text);
+    assert_eq!(desk.registrations(), 0);
+}
 
 /// A registered robot on `desk`'s login with one revoked device, so it has an
 /// epoch to fetch, and its remote-plane state directory provisioned.
@@ -361,7 +610,7 @@ fn the_robot_fetches_its_revocations_with_its_key_and_no_login_session() {
     let (root, robot_id, revoked) = registered_robot(&desk);
     lapse_the_session(&desk);
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -394,7 +643,7 @@ fn the_robot_falls_back_to_its_login_session_where_the_service_has_no_robot_rout
         false,
     ));
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -407,7 +656,7 @@ fn the_robot_falls_back_to_its_login_session_where_the_service_has_no_robot_rout
     // With the session lapsed as well, the sync fails and the last epoch stays.
     let before = std::fs::read(root.join("remoted").join("epoch.pending")).unwrap();
     lapse_the_session(&desk);
-    assert!(robot_bootstrap::sync_epoch(&root, &mut Vec::new()).is_err());
+    assert!(robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).is_err());
     assert_eq!(
         std::fs::read(root.join("remoted").join("epoch.pending")).unwrap(),
         before
@@ -428,7 +677,7 @@ fn a_rate_limited_robot_fails_its_run_without_using_its_login() {
         false,
     ));
     let mut out = Vec::new();
-    let err = robot_bootstrap::sync_epoch(&root, &mut out).unwrap_err();
+    let err = robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap_err();
     // A failed run, so the supervisor backs off and counts it.
     assert!(err.to_string().contains("429"), "{err}");
     assert!(out.is_empty(), "no worker result line");
@@ -458,7 +707,7 @@ fn a_refused_robot_proof_falls_back_to_the_login_session() {
         false,
     ));
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -482,9 +731,36 @@ fn a_challenge_naming_another_robot_is_never_signed() {
         format!(r#"{{"challenge":"issued-elsewhere","robot_id":"{other}","expires_in":300}}"#),
         false,
     ));
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
     // No signed read: the robot refused the challenge and used its session.
     assert_eq!(access_requests(&desk), (1, 0, 1));
+}
+
+#[test]
+#[serial]
+fn a_publication_cut_short_is_finished_by_the_next_renewal() {
+    let desk = desk();
+    let chain_path = desk.home.join("device-chain.json");
+    let login_chain = std::fs::read(&chain_path).unwrap();
+    let now = desk.age_to(DAY_NS);
+    assert!(matches!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap(),
+        RenewalOutcome::Renewed { .. }
+    ));
+    // A stop between renaming device.cert and the chain: the chain still holds
+    // the login's leaf, so the owner chain refuses and the renewal is due again.
+    std::fs::write(&chain_path, &login_chain).unwrap();
+    assert!(owner_certificate::load().is_err());
+    // A second later, so the reissued certificate outlives the one in place.
+    desk.clock.fetch_add(1_000_000_000, Ordering::SeqCst);
+    let outcome =
+        renew_device_cert_if_due(&desk.state.session_token, &|| now + 1_000_000_000).unwrap();
+    assert!(
+        matches!(outcome, RenewalOutcome::Renewed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(owner_certificate::load().unwrap().device_cert, desk.cert());
+    assert_eq!(desk.registrations(), 2);
 }
 
 #[test]
@@ -506,7 +782,7 @@ fn a_refused_request_time_is_retried_once_at_the_time_the_service_names() {
     ));
     lapse_the_session(&desk);
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -529,7 +805,7 @@ fn a_robot_whose_clock_is_far_behind_the_service_fetches_after_one_retry() {
         .store(wall_ns() + 600 * 1_000_000_000, Ordering::SeqCst);
     lapse_the_session(&desk);
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -539,8 +815,262 @@ fn a_robot_whose_clock_is_far_behind_the_service_fetches_after_one_retry() {
     // service's time, which is later than the one it accepted last.
     desk.clock.fetch_add(1_000_000_000, Ordering::SeqCst);
     desk.log.lock().unwrap().clear();
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
     assert_eq!(access_requests(&desk), (2, 1, 0));
+}
+
+#[test]
+#[serial]
+fn a_consumer_that_cannot_be_written_is_skipped_and_retried_at_most_hourly() {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+    // Root writes through a 0500 directory, so the unwritable shape needs a user.
+    let probe = tempfile::NamedTempFile::new().unwrap();
+    if probe.as_file().metadata().unwrap().uid() == 0 {
+        eprintln!("skipped: root writes through a read-only directory");
+        return;
+    }
+    let desk = desk();
+    let login_cert = desk.cert_text();
+    let now = desk.age_to(DAY_NS);
+    assert!(matches!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap(),
+        RenewalOutcome::Renewed { .. }
+    ));
+    // netd's relocated copy, in a directory this user cannot write, still on the
+    // login's certificate: a mismatch the renewal cannot repair.
+    let ro = desk.home.join("netd-ro");
+    std::fs::create_dir(&ro).unwrap();
+    let relocated = ro.join("device.cert");
+    std::fs::write(&relocated, &login_cert).unwrap();
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let _netd = EnvGuard::set("CERULION_NETD_DEVICE_CERT", relocated.to_str().unwrap());
+    desk.clock.fetch_add(1_000_000_000, Ordering::SeqCst);
+    let later = now + 1_000_000_000;
+    // The CLI's own copy and the chain still move to the new certificate; the
+    // unwritable copy is skipped and named.
+    let before = desk.cert_text();
+    assert!(matches!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| later).unwrap(),
+        RenewalOutcome::Renewed { .. }
+    ));
+    assert_eq!(desk.registrations(), 2);
+    assert_ne!(desk.cert_text(), before);
+    assert_eq!(std::fs::read_to_string(&relocated).unwrap(), login_cert);
+    assert_eq!(owner_certificate::load().unwrap().device_cert, desk.cert());
+    // Within the hour: not due, no request.
+    assert!(matches!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| later + 60 * 1_000_000_000)
+            .unwrap(),
+        RenewalOutcome::NotDue { .. }
+    ));
+    assert_eq!(desk.registrations(), 2);
+    assert!(desk.failure_recorded());
+    // Writable again an hour on: the mismatch is due, published everywhere, and
+    // the recorded failure cleared.
+    std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let hour_on = later + 3600 * 1_000_000_000;
+    desk.clock.store(hour_on, Ordering::SeqCst);
+    assert!(matches!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| hour_on).unwrap(),
+        RenewalOutcome::Renewed { .. }
+    ));
+    assert_eq!(desk.registrations(), 3);
+    assert_eq!(
+        std::fs::read_to_string(&relocated).unwrap().trim(),
+        desk.cert_text()
+    );
+    assert!(!desk.failure_recorded());
+}
+
+#[test]
+#[serial]
+fn an_account_command_renews_a_due_certificate_over_its_session() {
+    let desk = desk();
+    let before = desk.cert_text();
+    let _due = desk.due_on_the_wall_clock();
+    let session = account_cmd::require_session().unwrap();
+    assert_eq!(session, desk.state.session_token);
+    desk.assert_renewed_from(&before);
+}
+
+#[test]
+#[serial]
+fn the_robot_worker_renews_a_due_certificate_after_its_fetch() {
+    let desk = desk();
+    let (root, _robot_id, revoked) = registered_robot(&desk);
+    let before = desk.cert_text();
+    let _due = desk.due_on_the_wall_clock();
+    let mut out = Vec::new();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\"epoch\":1,\"version\":1}\n"
+    );
+    assert_eq!(
+        pending_epoch(&root).signed_epoch.epoch_data.revoked_devices,
+        vec![cerulion_pairing::format::PublicKey(revoked)]
+    );
+    // The fetch by the robot's key, then one registration over the login session.
+    assert_eq!(access_requests(&desk), (1, 1, 0));
+    desk.assert_renewed_from(&before);
+}
+
+#[test]
+#[serial]
+fn the_automatic_account_step_renews_a_due_certificate_once_per_process() {
+    let desk = desk();
+    let before = desk.cert_text();
+    let _due = desk.due_on_the_wall_clock();
+    renew_once_within(Duration::from_secs(20));
+    desk.assert_renewed_from(&before);
+    // Still due (the window outlasts the certificate), but this process has had
+    // its attempt.
+    let renewed = desk.cert_text();
+    renew_once_within(Duration::from_secs(20));
+    assert_eq!(desk.cert_text(), renewed);
+    assert_eq!(desk.registrations(), 1);
+}
+
+#[test]
+#[serial]
+fn a_robot_whose_login_has_lapsed_tries_a_renewal_at_most_once_an_hour() {
+    let desk = desk();
+    let (root, _robot_id, _revoked) = registered_robot(&desk);
+    let before = desk.cert_text();
+    let _due = desk.due_on_the_wall_clock();
+    lapse_the_session(&desk);
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
+    // Both runs fetch by the robot's key; only the first tries the session for
+    // the renewal, fails, and records it, so the second asks nothing.
+    assert_eq!(access_requests(&desk), (2, 2, 0));
+    let refreshes = desk
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("/v1/auth/refresh"))
+        .count();
+    assert_eq!(refreshes, 1);
+    assert!(desk.failure_recorded());
+    assert_eq!(desk.cert_text(), before);
+    assert_eq!(desk.registrations(), 0);
+}
+
+#[test]
+#[serial]
+fn a_service_without_device_certificates_is_asked_at_most_once_an_hour() {
+    let desk = desk();
+    let now = desk.age_to(DAY_NS);
+    desk.overrides.lock().unwrap().push((
+        "/v1/devices/challenge ".into(),
+        404,
+        r#"{"error":"not_found"}"#.into(),
+        false,
+    ));
+    assert_eq!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap(),
+        RenewalOutcome::IdentityOnly
+    );
+    assert!(desk.failure_recorded());
+    assert!(matches!(
+        renew_device_cert_if_due(&desk.state.session_token, &|| now + 60 * 1_000_000_000).unwrap(),
+        RenewalOutcome::NotDue { .. }
+    ));
+    let asked = desk
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|l| l.contains("/v1/devices/challenge"))
+        .count();
+    assert_eq!(asked, 1);
+}
+
+#[test]
+#[serial]
+fn a_publication_that_fails_after_replacing_a_copy_is_retried_at_once() {
+    let desk = desk();
+    // The chain path is a directory with an entry, so its rename fails after
+    // device.cert was already replaced.
+    let chain = desk.home.join("device-chain.json");
+    let login_chain = std::fs::read(&chain).unwrap();
+    std::fs::remove_file(&chain).unwrap();
+    std::fs::create_dir(&chain).unwrap();
+    std::fs::write(chain.join("entry"), "x").unwrap();
+    let before = desk.cert_text();
+    let now = desk.age_to(DAY_NS);
+    let err = renew_device_cert_if_due(&desk.state.session_token, &|| now).unwrap_err();
+    assert!(err.to_string().contains("device-chain.json"), "{err}");
+    assert_ne!(desk.cert_text(), before);
+    // A copy was already replaced, so no failure is recorded and nothing holds
+    // the next attempt back.
+    assert!(!desk.failure_recorded());
+    // The chain path fixed (back on the login's leaf): due again at the same
+    // `now`, and renewed. The service mints one second on, so the reissued
+    // certificate outlives the one already in device.cert, and this clock reads
+    // that second once the service answered.
+    std::fs::remove_dir_all(&chain).unwrap();
+    std::fs::write(&chain, &login_chain).unwrap();
+    desk.clock.store(now + 1_000_000_000, Ordering::SeqCst);
+    let outcome = renew_device_cert_if_due(
+        &desk.state.session_token,
+        &stepping_clock(now, now + 1_000_000_000),
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, RenewalOutcome::Renewed { .. }),
+        "{outcome:?}"
+    );
+    assert_eq!(owner_certificate::load().unwrap().device_cert, desk.cert());
+    assert_eq!(desk.registrations(), 2);
+}
+
+#[test]
+#[serial]
+fn the_reissued_certificate_is_checked_on_the_clock_read_after_the_service_answered() {
+    let desk = desk();
+    let now = desk.age_to(DAY_NS);
+    // The service mints one second after this clock's due reading, and this
+    // clock reads two seconds on once the service answered.
+    desk.clock.store(now + 1_000_000_000, Ordering::SeqCst);
+    let outcome = renew_device_cert_if_due(
+        &desk.state.session_token,
+        &stepping_clock(now, now + 2_000_000_000),
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome, RenewalOutcome::Renewed { .. }),
+        "{outcome:?}"
+    );
+    let renewed = desk.cert().cert.validity;
+    assert_eq!(renewed.not_before_ns, now + 1_000_000_000);
+    assert_eq!(renewed.not_after_ns, now + 1_000_000_000 + 7 * DAY_NS);
+}
+
+#[test]
+#[serial]
+fn a_reissued_certificate_starting_after_this_clock_reads_is_refused() {
+    let desk = desk();
+    let before = desk.cert_text();
+    let now = desk.age_to(DAY_NS);
+    // The service mints one second after the due reading, and this clock reads
+    // only 999 ms on once it answered: the certificate is not yet valid here,
+    // and peers would refuse it the same way.
+    desk.clock.store(now + 1_000_000_000, Ordering::SeqCst);
+    let err = renew_device_cert_if_due(
+        &desk.state.session_token,
+        &stepping_clock(now, now + 999_000_000),
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("not valid on this machine's clock"),
+        "{err}"
+    );
+    assert_eq!(desk.cert_text(), before);
+    assert_eq!(desk.registrations(), 1);
 }
 
 #[test]
@@ -554,7 +1084,7 @@ fn a_robot_whose_accepted_time_ran_ahead_and_whose_clock_then_fell_behind_fetche
     // the retry at the service's time is accepted, so the robot's accepted
     // request time is now that time.
     desk.clock.store(wall_ns() + 12 * minute, Ordering::SeqCst);
-    robot_bootstrap::sync_epoch(&root, &mut Vec::new()).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &NOT_STOPPING).unwrap();
     assert_eq!(access_requests(&desk), (2, 1, 0));
     // The service at ten minutes ahead: this machine is ten minutes behind it
     // (a skew refusal naming no next time), and the service's own time is
@@ -563,7 +1093,7 @@ fn a_robot_whose_accepted_time_ran_ahead_and_whose_clock_then_fell_behind_fetche
     desk.clock.store(wall_ns() + 10 * minute, Ordering::SeqCst);
     desk.log.lock().unwrap().clear();
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -592,7 +1122,7 @@ fn a_request_time_refused_three_times_falls_back_to_the_login_session() {
         false,
     ));
     let mut out = Vec::new();
-    robot_bootstrap::sync_epoch(&root, &mut out).unwrap();
+    robot_bootstrap::sync_epoch(&root, &mut out, &NOT_STOPPING).unwrap();
     assert_eq!(
         String::from_utf8(out).unwrap(),
         "{\"epoch\":1,\"version\":1}\n"
@@ -603,4 +1133,78 @@ fn a_request_time_refused_three_times_falls_back_to_the_login_session() {
     );
     // Three challenge requests, no signed read, then the session read.
     assert_eq!(access_requests(&desk), (3, 0, 1));
+}
+
+#[test]
+#[serial]
+fn a_sync_told_to_stop_tries_no_login_session_after_its_robot_proof_fails() {
+    let desk = desk();
+    let (root, _robot_id, _revoked) = registered_robot(&desk);
+    // A stale session with a live refresh token: the fallback would refresh it.
+    let mut stale = desk.state.clone();
+    stale.expires_at_ns = 1;
+    auth::write_to(&desk.home.join("auth.json"), &stale).unwrap();
+    desk.overrides.lock().unwrap().push((
+        "/access/challenge ".into(),
+        403,
+        r#"{"error":"proof_of_possession_failed","error_description":"refused"}"#.into(),
+        false,
+    ));
+    let stopping = std::sync::atomic::AtomicBool::new(true);
+    let err = robot_bootstrap::sync_epoch(&root, &mut Vec::new(), &stopping).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("the revocation sync was told to stop"),
+        "{err}"
+    );
+    // The proof fetch in flight ran; no refresh, no session read.
+    assert_eq!(access_requests(&desk), (1, 0, 0));
+    assert!(!desk
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("/v1/auth/refresh")));
+    assert_eq!(
+        auth::load_from(&desk.home.join("auth.json"))
+            .state()
+            .unwrap(),
+        &stale
+    );
+}
+
+#[test]
+#[serial]
+fn a_sync_told_to_stop_starts_no_certificate_renewal_after_its_fetch() {
+    let desk = desk();
+    let (root, _robot_id, revoked) = registered_robot(&desk);
+    let before = desk.cert_text();
+    let _due = desk.due_on_the_wall_clock();
+    // A stale session with a live refresh token: the renewal would refresh it.
+    let mut stale = desk.state.clone();
+    stale.expires_at_ns = 1;
+    auth::write_to(&desk.home.join("auth.json"), &stale).unwrap();
+    let stopping = std::sync::atomic::AtomicBool::new(true);
+    let mut out = Vec::new();
+    robot_bootstrap::sync_epoch(&root, &mut out, &stopping).unwrap();
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "{\"epoch\":1,\"version\":1}\n"
+    );
+    assert_eq!(
+        pending_epoch(&root).signed_epoch.epoch_data.revoked_devices,
+        vec![cerulion_pairing::format::PublicKey(revoked)]
+    );
+    assert_eq!(access_requests(&desk), (1, 1, 0));
+    // Due, but not refreshed, not renewed and not counted as a failure: the
+    // next sync renews.
+    assert!(!desk
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|l| l.contains("/v1/auth/refresh")));
+    assert_eq!(desk.registrations(), 0);
+    assert_eq!(desk.cert_text(), before);
+    assert!(!desk.failure_recorded());
 }

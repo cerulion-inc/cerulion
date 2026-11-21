@@ -43,7 +43,10 @@ pub fn logical_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> Vec<String
 ///   * `cargo nextest run …`, with the same package flags. Only `run` executes
 ///     tests: `cargo nextest list` and `cargo nextest archive` do not;
 ///   * `ci_test_shard.sh <pkg> …`, the sharded form, which takes the package
-///     name as its first argument so the name stays literally in the workflow.
+///     name as its first argument so the name stays literally in the workflow,
+///     and credits each `--with <extra>` on the same command too: the script
+///     runs that package's integration tests in the same nextest invocation. A
+///     `--list`, `--check` or `--selected` line runs nothing and credits nothing.
 ///
 /// A cargo command whose own flags carry `--doc` or `--no-run` credits nothing.
 /// `--doc` runs only the doctests, and `--no-run` runs no test at all, so a step
@@ -73,7 +76,14 @@ pub fn line_runs_tests_of(line: &str, pkg: &str) -> bool {
 /// [`line_runs_tests_of`] for one shell command, already split into tokens.
 fn command_runs_tests_of(command: &[&str], pkg: &str) -> bool {
     if let Some(at) = command.iter().position(|t| t.ends_with("ci_test_shard.sh")) {
-        if command.get(at + 1) == Some(&pkg) {
+        let args = &command[at + 1..];
+        let runs = args.first().is_some_and(|first| !first.starts_with('-'));
+        if runs
+            && (args.first() == Some(&pkg)
+                || args
+                    .windows(2)
+                    .any(|pair| pair[0] == "--with" && pair[1] == pkg))
+        {
             return true;
         }
     }

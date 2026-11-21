@@ -446,6 +446,120 @@ impl TraceGap {
     }
 }
 
+/// The coordination contract a recording was taken under, as the `coordination`
+/// key of its `__cerulion/recorder.json` stamps it: `"lockstep"` or
+/// `"free_run"`. A recorder writes the stamp through this type's `Serialize`
+/// and [`recorded_coordination`] reads it back through its `Deserialize`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationMode {
+    /// Barrier lockstep: every rank advances the SAME handed quantum per step,
+    /// so the per-rank STEP_BOUNDARY streams carry EQUAL targets on every
+    /// shared step and one first boundary anchors a mid-run resume. The
+    /// DEFAULT: a recording with no stamp is replayed under it.
+    #[default]
+    Lockstep,
+    /// Free run: each rank keeps its OWN wall-faithful boundary stream sharing
+    /// only the GO epoch, so cross-rank boundary equality does not hold and
+    /// there is no single first boundary to anchor off.
+    FreeRun,
+}
+
+/// The coordination contract a recording's `__cerulion/recorder.json` states,
+/// as one of three answers: see [`recorded_coordination`] and
+/// [`stated_coordination`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedCoordination {
+    /// [`CoordinationMode::Lockstep`].
+    Lockstep {
+        /// Whether the document stamps `"lockstep"` itself. `false` when there
+        /// is no document or it carries no `coordination` key: replay reads
+        /// such a recording as lockstep, the contract of a recording with no
+        /// stamp.
+        stamped: bool,
+    },
+    /// [`CoordinationMode::FreeRun`], stamped `"free_run"`.
+    FreeRun,
+    /// A document or stamp this build cannot read. Replay refuses it rather
+    /// than reading it as lockstep.
+    Unreadable(UnreadableCoordination),
+}
+
+/// Why a `recorder.json` states no coordination contract this build can read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnreadableCoordination {
+    /// The document does not parse as JSON.
+    NotJson,
+    /// The document parses, and its top level is not a JSON object.
+    NotAnObject,
+    /// The `coordination` key holds a value [`CoordinationMode`] does not
+    /// decode, as JSON text: a string keeps its quotes, so `"barrier"` and
+    /// `null` read apart.
+    UnknownStamp(String),
+}
+
+impl std::fmt::Display for UnreadableCoordination {
+    /// The stamp as a sentence can quote it: the value itself for an unknown
+    /// stamp, else what the document is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotJson => f.write_str("not JSON"),
+            Self::NotAnObject => f.write_str("not a JSON object"),
+            Self::UnknownStamp(value) => f.write_str(value),
+        }
+    }
+}
+
+/// PURE: the coordination contract `recorder_json`, the bytes of a recording's
+/// `__cerulion/recorder.json` (`None` when the recording carries none), states.
+///
+/// * no document: [`RecordedCoordination::Lockstep`] with `stamped: false`;
+/// * bytes that are not JSON, or a top level that is not an object:
+///   [`RecordedCoordination::Unreadable`], saying which;
+/// * a JSON object: [`stated_coordination`] of it.
+pub fn recorded_coordination(recorder_json: Option<&[u8]>) -> RecordedCoordination {
+    let Some(bytes) = recorder_json else {
+        return RecordedCoordination::Lockstep { stamped: false };
+    };
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return RecordedCoordination::Unreadable(UnreadableCoordination::NotJson);
+    };
+    let Some(obj) = doc.as_object() else {
+        return RecordedCoordination::Unreadable(UnreadableCoordination::NotAnObject);
+    };
+    stated_coordination(obj)
+}
+
+/// PURE: the coordination contract a parsed `recorder.json` object states.
+///
+/// * no `coordination` key: [`RecordedCoordination::Lockstep`] with
+///   `stamped: false`;
+/// * a value [`CoordinationMode`] decodes (`"lockstep"` or `"free_run"`, or
+///   serde's one-key map spelling such as `{"free_run": null}`): that
+///   contract, stamped;
+/// * any other value (`null`, a number, an unknown string):
+///   [`RecordedCoordination::Unreadable`] with
+///   [`UnreadableCoordination::UnknownStamp`].
+///
+/// Reads the `coordination` key and nothing else, so a malformed sibling key
+/// (an `arch` that is a number) does not make the contract unreadable.
+pub fn stated_coordination(
+    recorder: &serde_json::Map<String, serde_json::Value>,
+) -> RecordedCoordination {
+    let Some(value) = recorder.get("coordination") else {
+        return RecordedCoordination::Lockstep { stamped: false };
+    };
+    match <CoordinationMode as serde::Deserialize>::deserialize(value) {
+        Ok(CoordinationMode::Lockstep) => RecordedCoordination::Lockstep { stamped: true },
+        Ok(CoordinationMode::FreeRun) => RecordedCoordination::FreeRun,
+        Err(_) => RecordedCoordination::Unreadable(UnreadableCoordination::UnknownStamp(
+            value.to_string(),
+        )),
+    }
+}
+
 /// WHY a capture cannot be resimmed.
 ///
 /// Each variant names the resim refusal it corresponds to, because the operator
@@ -1296,6 +1410,104 @@ mod tests {
                 first_sequence: 43,
             }),
         }
+    }
+
+    /// Each stamp a recorder writes, `CoordinationMode`'s `Serialize`, reads
+    /// back as that contract, stamped.
+    #[test]
+    fn every_written_coordination_stamp_reads_back_as_its_contract() {
+        for (mode, text, want) in [
+            (
+                CoordinationMode::Lockstep,
+                "\"lockstep\"",
+                RecordedCoordination::Lockstep { stamped: true },
+            ),
+            (
+                CoordinationMode::FreeRun,
+                "\"free_run\"",
+                RecordedCoordination::FreeRun,
+            ),
+        ] {
+            // Exhaustive: a new contract stops this test compiling, which
+            // points at the rows above.
+            match mode {
+                CoordinationMode::Lockstep | CoordinationMode::FreeRun => {}
+            }
+            let stamp = serde_json::to_value(mode).expect("a unit variant serializes");
+            assert_eq!(stamp.to_string(), text, "{mode:?}");
+            let doc = serde_json::Map::from_iter([("coordination".to_string(), stamp)]);
+            assert_eq!(stated_coordination(&doc), want, "{mode:?}");
+        }
+        assert_eq!(CoordinationMode::default(), CoordinationMode::Lockstep);
+    }
+
+    /// Every arm of the coordination parse over hand-written documents, each
+    /// answer written out rather than derived.
+    #[test]
+    fn the_coordination_parse_reads_each_document_shape_one_way() {
+        use RecordedCoordination::{FreeRun, Lockstep, Unreadable};
+        use UnreadableCoordination::{NotAnObject, NotJson, UnknownStamp};
+        let unknown = |text: &str| Unreadable(UnknownStamp(text.to_string()));
+        let cases: [(Option<&[u8]>, RecordedCoordination); 19] = [
+            // No document, and a document without the key: lockstep, unstamped.
+            (None, Lockstep { stamped: false }),
+            (Some(b"{}"), Lockstep { stamped: false }),
+            (
+                Some(br#"{"arch":"aarch64","trace_format":10}"#),
+                Lockstep { stamped: false },
+            ),
+            // The two stamps a recorder writes.
+            (
+                Some(br#"{"coordination":"lockstep"}"#),
+                Lockstep { stamped: true },
+            ),
+            (Some(br#"{"coordination":"free_run"}"#), FreeRun),
+            // A malformed SIBLING costs the contract nothing.
+            (Some(br#"{"arch":42,"coordination":"free_run"}"#), FreeRun),
+            // serde's one-key map spelling of a unit variant.
+            (Some(br#"{"coordination":{"free_run":null}}"#), FreeRun),
+            (
+                Some(br#"{"coordination":{"lockstep":null}}"#),
+                Lockstep { stamped: true },
+            ),
+            // A duplicated key: the last one is the document's value.
+            (
+                Some(br#"{"coordination":"lockstep","coordination":"free_run"}"#),
+                FreeRun,
+            ),
+            // Every other value is unreadable, quoted as JSON text.
+            (
+                Some(br#"{"coordination":"quantum_entangled"}"#),
+                unknown("\"quantum_entangled\""),
+            ),
+            (
+                Some(br#"{"coordination":"FreeRun"}"#),
+                unknown("\"FreeRun\""),
+            ),
+            (Some(br#"{"coordination":null}"#), unknown("null")),
+            (Some(br#"{"coordination":7}"#), unknown("7")),
+            (
+                Some(br#"{"coordination":["free_run"]}"#),
+                unknown("[\"free_run\"]"),
+            ),
+            // A document that is not an object, or not JSON at all.
+            (Some(br#"["free_run"]"#), Unreadable(NotAnObject)),
+            (Some(br#""free_run""#), Unreadable(NotAnObject)),
+            (Some(b"null"), Unreadable(NotAnObject)),
+            (Some(b""), Unreadable(NotJson)),
+            (Some(b"{\"coordination\":\"free_run\""), Unreadable(NotJson)),
+        ];
+        for (bytes, want) in cases {
+            let shown = bytes.map(String::from_utf8_lossy);
+            assert_eq!(recorded_coordination(bytes), want, "{shown:?}");
+        }
+        // The text a refusal quotes.
+        assert_eq!(
+            UnknownStamp("\"barrier\"".to_string()).to_string(),
+            "\"barrier\""
+        );
+        assert_eq!(NotJson.to_string(), "not JSON");
+        assert_eq!(NotAnObject.to_string(), "not a JSON object");
     }
 
     /// The coverage rule over hand vectors: a held frame is no gap, and the

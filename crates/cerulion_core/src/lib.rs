@@ -1068,6 +1068,24 @@ fn build_env_filter(
 /// Also suppresses verbose iceoryx2 warnings (stale listener notifications).
 /// Override with: `IOX2_LOG_LEVEL=warn cargo run ...`
 pub fn init_logging(verbose: bool, quiet_default: bool) {
+    init_logging_with_colour(verbose, quiet_default, None);
+}
+
+/// [`init_logging`] for a worker process whose stderr another process passes
+/// through or records: log lines carry no colour codes unless stderr is a
+/// terminal, where the formatter's default applies (which honours `NO_COLOR`).
+pub fn init_worker_logging(verbose: bool, quiet_default: bool) {
+    use std::io::IsTerminal;
+    init_logging_with_colour(
+        verbose,
+        quiet_default,
+        (!std::io::stderr().is_terminal()).then_some(false),
+    );
+}
+
+/// [`init_logging`] with `colour`: `Some` sets whether log lines carry colour
+/// codes, `None` keeps the formatter's own default.
+fn init_logging_with_colour(verbose: bool, quiet_default: bool, colour: Option<bool>) {
     use tracing_subscriber::{fmt, prelude::*};
 
     // Suppress iceoryx2 verbose warnings about stale listeners
@@ -1085,29 +1103,35 @@ pub fn init_logging(verbose: bool, quiet_default: bool) {
     // names, breaking `topic list > file` and any downstream parsing. stdout is
     // for the command's result; stderr is for logs (standard Unix separation).
     if verbose {
+        let layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_file(true)
+            .with_line_number(true);
+        let layer = match colour {
+            Some(ansi) => layer.with_ansi(ansi),
+            None => layer,
+        };
         tracing_subscriber::registry()
             .with(filter)
-            .with(
-                fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_target(true)
-                    .with_thread_ids(true)
-                    .with_file(true)
-                    .with_line_number(true),
-            )
+            .with(layer)
             .init();
     } else {
+        let layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_file(false)
+            .with_line_number(false)
+            .compact();
+        let layer = match colour {
+            Some(ansi) => layer.with_ansi(ansi),
+            None => layer,
+        };
         tracing_subscriber::registry()
             .with(filter)
-            .with(
-                fmt::layer()
-                    .with_writer(std::io::stderr)
-                    .with_target(false)
-                    .with_thread_ids(false)
-                    .with_file(false)
-                    .with_line_number(false)
-                    .compact(),
-            )
+            .with(layer)
             .init();
     }
 }

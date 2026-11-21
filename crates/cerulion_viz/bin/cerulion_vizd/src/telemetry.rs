@@ -12,6 +12,8 @@
 //! payload data, only the platform and whole minutes of uptime.
 
 use std::sync::mpsc::{self, RecvTimeoutError};
+#[cfg(any(test, feature = "test-helpers"))]
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -104,6 +106,109 @@ pub fn heartbeat_props(uptime: Duration) -> Props {
     )]
 }
 
+/// Where a stop or a shutdown records the branch it took, for the tests.
+/// Readers only [`Recorded::get`]; the code that did the work sets it, once.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug)]
+pub struct Recorded<T>(Arc<OnceLock<T>>);
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl<T> Recorded<T> {
+    /// The recorded value, or `None` while nothing has been recorded.
+    pub fn get(&self) -> Option<&T> {
+        self.0.get()
+    }
+
+    /// Record `value`. Only the one call that does the work records, so a
+    /// second value is never offered.
+    fn set(&self, value: T) {
+        let _ = self.0.set(value);
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl<T> Clone for Recorded<T> {
+    fn clone(&self) -> Self {
+        Recorded(Arc::clone(&self.0))
+    }
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl<T> Default for Recorded<T> {
+    fn default() -> Self {
+        Recorded(Arc::default())
+    }
+}
+
+/// What the first [`Heartbeat::stop_within`] did.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatStop {
+    /// The budget it waited for the thread with.
+    pub budget: Duration,
+    /// `true` only when the stop joined the thread, which it does once the
+    /// thread has finished inside the budget; `false` when it left the thread
+    /// running.
+    pub joined: bool,
+}
+
+/// Which branch [`Starting::shutdown`] took.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartingShutdown {
+    /// The start handed its telemetry over inside the wait, and it was shut
+    /// down by the deadline.
+    ShutDown,
+    /// The start ended inside the wait with no telemetry to shut down.
+    NothingStarted,
+    /// The wait passed first and the start was abandoned. `waited` is the
+    /// wait it timed out on; `late` is whether a handover landed between the
+    /// timeout and the abandon (that telemetry is stopped with no budget).
+    Abandoned {
+        /// The wait for the start that timed out.
+        waited: Duration,
+        /// A handover found in the channel after the abandon.
+        late: bool,
+    },
+}
+
+/// How the starter thread behind a [`Starting`] went past its abandon check.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StarterEnd {
+    /// The start was already abandoned once its client and anonymous id were
+    /// ready, so it returned before `begin` and queued nothing.
+    AbandonedBeforeBegin,
+    /// The start was not abandoned then, and went on to `begin` (when it had
+    /// a client and an id) and the handover. Recorded once the handover is
+    /// decided, so a start that handed over is in the channel by then.
+    WentOn,
+}
+
+/// The records a [`Starting`] keeps; see [`Starting::records_for_test`].
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, Default)]
+pub struct StartingRecords {
+    /// The branch [`Starting::shutdown`] took.
+    pub shutdown: Recorded<StartingShutdown>,
+    /// How the starter thread went past its abandon check.
+    pub starter: Recorded<StarterEnd>,
+    /// What the shutdown of a start handed over inside the wait gave its
+    /// heartbeat and client; unset on every other branch.
+    pub handed_over: Recorded<TelemetryShutdown>,
+}
+
+/// What [`Telemetry::shutdown`] handed its two parts.
+#[cfg(any(test, feature = "test-helpers"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TelemetryShutdown {
+    /// The budget the heartbeat's stop was handed; `None` without a heartbeat.
+    pub heartbeat_budget: Option<Duration>,
+    /// The budget the client's flush was handed; `None` when no client was
+    /// there to take.
+    pub client_budget: Option<Duration>,
+}
+
 /// A thread that calls `tick(n)` every `interval` (n = 1, 2, ...) until
 /// dropped. Dropping it wakes the thread at once and waits at most
 /// [`DEFAULT_SHUTDOWN_BUDGET`] for it to finish; a tick stuck past that (a
@@ -112,6 +217,9 @@ pub struct Heartbeat {
     stop: Option<mpsc::Sender<()>>,
     finished: mpsc::Receiver<()>,
     thread: Option<JoinHandle<()>>,
+    /// See [`Heartbeat::stop_record_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    stop_record: Recorded<HeartbeatStop>,
 }
 
 impl Heartbeat {
@@ -137,7 +245,16 @@ impl Heartbeat {
             stop: Some(stop),
             finished,
             thread: Some(thread),
+            #[cfg(any(test, feature = "test-helpers"))]
+            stop_record: Recorded::default(),
         })
+    }
+
+    /// The record of this heartbeat's first stop, set by
+    /// [`Heartbeat::stop_within`] or the drop; read it after either.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn stop_record_for_test(&self) -> Recorded<HeartbeatStop> {
+        self.stop_record.clone()
     }
 }
 
@@ -153,9 +270,17 @@ impl Heartbeat {
             self.finished.recv_timeout(budget),
             Err(RecvTimeoutError::Disconnected)
         );
+        #[cfg(any(test, feature = "test-helpers"))]
+        let mut joined = false;
         if let (true, Some(thread)) = (finished, self.thread.take()) {
             let _ = thread.join();
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                joined = true;
+            }
         }
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.stop_record.set(HeartbeatStop { budget, joined });
     }
 }
 
@@ -171,6 +296,9 @@ impl Drop for Heartbeat {
 pub struct Telemetry {
     heartbeat: Option<Heartbeat>,
     client: Arc<Mutex<Option<Client>>>,
+    /// See [`Telemetry::shutdown_record_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    shut: Recorded<TelemetryShutdown>,
 }
 
 impl Telemetry {
@@ -281,7 +409,16 @@ impl Telemetry {
         Some(Telemetry {
             heartbeat: Some(heartbeat),
             client,
+            #[cfg(any(test, feature = "test-helpers"))]
+            shut: Recorded::default(),
         })
+    }
+
+    /// The record of what [`Telemetry::shutdown`] handed the heartbeat and the
+    /// client; read it after the shutdown.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn shutdown_record_for_test(&self) -> Recorded<TelemetryShutdown> {
+        self.shut.clone()
     }
 
     /// Run [`Telemetry::start`] on its own thread, so a consent file held
@@ -304,8 +441,15 @@ impl Telemetry {
     }
 
     fn shutdown_by(mut self, deadline: Instant) {
+        #[cfg(any(test, feature = "test-helpers"))]
+        let mut record = TelemetryShutdown::default();
         if let Some(mut heartbeat) = self.heartbeat.take() {
-            heartbeat.stop_within(deadline.saturating_duration_since(Instant::now()));
+            let budget = deadline.saturating_duration_since(Instant::now());
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                record.heartbeat_budget = Some(budget);
+            }
+            heartbeat.stop_within(budget);
         }
         let client = self
             .client
@@ -313,8 +457,15 @@ impl Telemetry {
             .ok()
             .and_then(|mut guard| guard.take());
         if let Some(mut client) = client {
-            client.shutdown(deadline.saturating_duration_since(Instant::now()));
+            let budget = deadline.saturating_duration_since(Instant::now());
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                record.client_budget = Some(budget);
+            }
+            client.shutdown(budget);
         }
+        #[cfg(any(test, feature = "test-helpers"))]
+        self.shut.set(record);
     }
 }
 
@@ -330,6 +481,9 @@ impl Telemetry {
 pub struct Starting {
     ready: mpsc::Receiver<Option<Telemetry>>,
     abandoned: Arc<Mutex<bool>>,
+    /// See [`Starting::records_for_test`].
+    #[cfg(any(test, feature = "test-helpers"))]
+    records: StartingRecords,
 }
 
 /// The abandon flag, poisoned or not: a starter that panicked while it held
@@ -349,6 +503,14 @@ impl Starting {
         Starting::spawn(client, interval)
     }
 
+    /// The records of which branch [`Starting::shutdown`] took and how the
+    /// starter thread went past its abandon check; read them after the
+    /// shutdown, and the starter's once that thread has got that far.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn records_for_test(&self) -> StartingRecords {
+        self.records.clone()
+    }
+
     fn spawn(
         client: impl FnOnce() -> Option<Client> + Send + 'static,
         interval: Duration,
@@ -356,6 +518,10 @@ impl Starting {
         let (ready, receiver) = mpsc::channel();
         let abandoned = Arc::new(Mutex::new(false));
         let flag = Arc::clone(&abandoned);
+        #[cfg(any(test, feature = "test-helpers"))]
+        let records = StartingRecords::default();
+        #[cfg(any(test, feature = "test-helpers"))]
+        let starter = records.starter.clone();
         let _ = thread::Builder::new()
             .name("vizd-telemetry-start".into())
             .spawn(move || {
@@ -365,6 +531,8 @@ impl Starting {
                 let prepared =
                     client().and_then(|c| Some((c, consent::event_anon_id().ok().flatten()?)));
                 if *lock(&flag) {
+                    #[cfg(any(test, feature = "test-helpers"))]
+                    starter.set(StarterEnd::AbandonedBeforeBegin);
                     return;
                 }
                 // `begin` queues the started event under the abandon lock, so
@@ -383,6 +551,8 @@ impl Starting {
                         ready.send(telemetry).map_err(|mpsc::SendError(late)| late)
                     }
                 };
+                #[cfg(any(test, feature = "test-helpers"))]
+                starter.set(StarterEnd::WentOn);
                 // Nothing waits for an abandoned start (or one whose
                 // `Starting` was dropped unshut): stop it here at once, with
                 // no budget. Its queue is dropped, and only a POST the worker
@@ -394,6 +564,8 @@ impl Starting {
         Starting {
             ready: receiver,
             abandoned,
+            #[cfg(any(test, feature = "test-helpers"))]
+            records,
         }
     }
 
@@ -401,10 +573,25 @@ impl Starting {
     /// [`DEFAULT_SHUTDOWN_BUDGET`]. A start still blocked at the deadline is
     /// abandoned and sends nothing.
     pub fn shutdown(self) {
-        let deadline = Instant::now() + DEFAULT_SHUTDOWN_BUDGET;
-        match self.ready.recv_timeout(DEFAULT_SHUTDOWN_BUDGET) {
-            Ok(Some(telemetry)) => telemetry.shutdown_by(deadline),
-            Ok(None) | Err(RecvTimeoutError::Disconnected) => {}
+        let wait = DEFAULT_SHUTDOWN_BUDGET;
+        let deadline = Instant::now() + wait;
+        match self.ready.recv_timeout(wait) {
+            Ok(Some(telemetry)) => {
+                #[cfg(any(test, feature = "test-helpers"))]
+                let shut = telemetry.shut.clone();
+                telemetry.shutdown_by(deadline);
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    self.records.shutdown.set(StartingShutdown::ShutDown);
+                    if let Some(handed_over) = shut.get() {
+                        self.records.handed_over.set(*handed_over);
+                    }
+                }
+            }
+            Ok(None) | Err(RecvTimeoutError::Disconnected) => {
+                #[cfg(any(test, feature = "test-helpers"))]
+                self.records.shutdown.set(StartingShutdown::NothingStarted);
+            }
             Err(RecvTimeoutError::Timeout) => {
                 // Set under the lock the starter holds only across the
                 // queueing and the handover, so this takes microseconds, not
@@ -417,6 +604,11 @@ impl Starting {
                     *abandoned = true;
                     self.ready.try_recv().ok().flatten()
                 };
+                #[cfg(any(test, feature = "test-helpers"))]
+                self.records.shutdown.set(StartingShutdown::Abandoned {
+                    waited: wait,
+                    late: late.is_some(),
+                });
                 if let Some(late) = late {
                     late.shutdown_by(Instant::now());
                 }
