@@ -1846,6 +1846,7 @@ dependencies = [
  "base64 0.22.1",
  "cerulion_core",
  "cerulion_link",
+ "cerulion_ops_proto",
  "cerulion_pairing",
  "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
