@@ -10260,8 +10260,8 @@ mod tests {
         steps
     }
 
-    /// A read of the sink's input `input` at step 1: `kind`, popping
-    /// `popped`, at `role`.
+    /// A read of the sink's input `input`: `kind`, popping `popped`, at
+    /// `role`.
     fn sink_read(
         input: &str,
         kind: ReadOutcomeKind,
@@ -10276,8 +10276,8 @@ mod tests {
     /// fire whose earlier input records a believed body `NoFrame` never
     /// reached the `block` input and drained nothing. On the collapse rows
     /// with the sink reading `a` ahead of `inp`, the step 1 fire ends at `a`,
-    /// so the slot keeps the relay's step 1 frame; the relay's first step 2
-    /// frame fills it, and the pop left unfired is the hold. A `NoFrame`
+    /// so the slot keeps the relay's step 1 frame; the relay's step 2 frame
+    /// fills it, and the pop left unfired is the hold. A `NoFrame`
     /// whose role is not believed says nothing of where the tick ended, and a
     /// consumer whose tick replay cannot know reads nothing off it: both
     /// leave the slot unknown at step 2, and the step is the finding.
@@ -10326,8 +10326,8 @@ mod tests {
         assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
     }
 
-    /// Each believed body `NoFrame` of an earlier input stands for one fire
-    /// that ended there, so a step whose fires outnumber them can hide a
+    /// Each believed body `NoFrame` of an earlier `block` input stands for one
+    /// fire that ended there, so a step whose fires outnumber them can hide a
     /// drain. The collapse rows with the sink firing twice at step 1: one tick
     /// ends at `a`, the other reads `a` and records no read of `inp`, so the
     /// slot is unknown at step 2 and the pop left unfired is the finding.

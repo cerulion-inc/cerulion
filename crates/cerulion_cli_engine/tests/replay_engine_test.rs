@@ -56073,9 +56073,10 @@ fn hc_reads(rec: &Recording, node: &str, input: &str) -> Vec<(u64, u16, ReadSite
 /// * step 2: the slot is full, so the relay pops sequence 2 and is held, and
 ///   the sink takes the step 1 frame;
 /// * each odd step from 3 on: the relay fires the frame its hold froze (`x` 3
-///   to 6) and its refill pops the next (sequences 3 to 6), which the slot,
-///   full again after the sink's tick ends at `a`, holds through the even
-///   step after, when the sink takes the frame.
+///   to 6) and its refill pops the next (sequences 3 to 6), which the hold
+///   freezes, since the sink's tick ends at `a` and leaves the slot full; at
+///   each even step from 4 on the relay stays held and the sink takes the
+///   frame.
 ///
 /// The bag records the sink a level after the relays, so the slot is counted,
 /// each odd step's fire that ended at `a` keeps the slot's count, and the
