@@ -11,21 +11,52 @@
 **Cerulion (YC S24) is the harness for physical AI: the tools and body knowledge a general model needs to work a robot it was never trained on. It is built on an open-source, zero-copy robot runtime that records runs, replays failures against new code, and reaches your robots from anywhere, and it is ROS 2 compatible.**
 
 [![License: AGPL-3.0-only](https://img.shields.io/badge/license-AGPL--3.0--only-blue.svg)](LICENSE)
-[![crates.io: cerulion_cli 2.0.0](https://img.shields.io/badge/crates.io-cerulion__cli%202.0.0-brightgreen.svg)](https://crates.io/crates/cerulion_cli)
+[![crates.io: cerulion_cli 2.1.0](https://img.shields.io/badge/crates.io-cerulion__cli%202.1.0-brightgreen.svg)](https://crates.io/crates/cerulion_cli)
 [![Rust 1.95+](https://img.shields.io/badge/rust-1.95%2B-orange.svg)](https://www.rust-lang.org/)
 [![Docs](https://img.shields.io/badge/docs-docs.cerulion.com-blue.svg)](https://docs.cerulion.com)
 
-**[Install](#install) · [Try the harness](#try-the-harness) · [Run the example](#quickstart-run-record-and-verify) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack) · [Architecture](#how-it-fits-together) · [Docs](https://docs.cerulion.com) · [Guides](https://docs.cerulion.com/cerulion/guides)**
+**[Quickstart](#quickstart) · [Harness results](#harness-results) · [Performance](#performance) · [ROS 2](#bring-your-ros-2-stack) · [Architecture](#how-it-fits-together) · [Docs](https://docs.cerulion.com) · [Guides](https://docs.cerulion.com/cerulion/guides)**
 
-![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
+**Same model, with and without Cerulion.** On LIBERO-PRO, simulated robot manipulation, each of 15 models ran the same 100 start states twice: once through a published three-tool interface and once through the harness's tools. The start states are new start states of 25 task rows the harness was developed on at other start states; the tasks themselves are not new to it, and task rows it never met exist in the benchmark and are on no list here. The result is on one benchmark family, the one the harness was built and checked on. The arm with Cerulion also reads the simulated robot's calibration record, which the other arm does not have, so the comparison is the whole package against the published interface; it cannot be split into tools, record and documents. One episode per start state in each arm, at temperature 1.0; provider model versions are known only by the model's name. Other groups publish higher rates on this benchmark under their own protocols, and nothing here ranks against them.
 
-## Install
+On the main test, as declared before the first episode, Gemini 3.8 Flash solved 73 against 25 of 100 start states, with Cerulion against without (2.9 times as many; exact two-sided sign test p = 1.10e-11). Over the 15 models, the arm with Cerulion solved more start states in 12 of 15, fewer in 3 and the same number in 0. Fewer, no difference shown for each: GPT-6 Astra (70 against 71, p = 1); Gemini 4 Carbon (76 against 82, p = 0.377); GPT-6.2 Astra (77 against 81, p = 0.541). [Every model, cost and episode](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/).
+
+![Success rate per model, without and with Cerulion, ordered by the success rate without it, with the factor, the success rate with Cerulion over the rate without, at the right of each row. Its footer names the 3 models that solved fewer start states with Cerulion, no difference shown for each after Holm's correction, and the one arm whose scored episodes ended on replies the provider's content filter stopped, with its counts; three other arms had one filtered reply each, ending no scored episode.](docs/media/harness-success-rate.svg)
+
+## Quickstart
+
+One install and one free Cerulion account give you both the robot runtime, which runs, records and verifies your robot software, and the harness, which gives a model the tools to work a simulated robot. Paste one prompt into your coding agent and it walks you through both on your machine, or run the same steps by commands.
+
+### With your coding agent
+
+Paste this prompt into Claude Code, or another coding agent that runs commands in its own terminal. It installs Cerulion itself when Cerulion is missing or older than 2.1.0.
+
+```text
+Walk me through Cerulion's runtime and its harness. Run every command in your own terminal, and run long commands in the background with their output in a file. If a step says a system package is missing, give me the command that installs it (the one it prints, if it prints one) and wait until I have run it. If your sandbox blocks a command's network access or a write outside this folder, ask me to approve running it outside the sandbox.
+1. If cerulion --version fails or prints a version older than 2.1.0, install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env" (if a later command cannot find cerulion, run . "$HOME/.cerulion/env" in it first). Then run cerulion --version again. If it still prints a version older than 2.1.0, run command -v cerulion, show me its output and stop.
+2. If cerulion doctor --check account.login fails, run cerulion login in the background, show me the URL and code it prints, and wait while I approve the sign-in in my browser.
+3. Star the repository: gh api -X PUT user/starred/cerulion-inc/cerulion. If that fails for any reason, print https://github.com/cerulion-inc/cerulion instead.
+4. Run cerulion workspace create safety_demo --starter obstacle_avoidance and cd safety_demo. Build both nodes with cerulion node build laser_scanner --release and cerulion node build safety_controller --release (the first build takes a few minutes), then run cerulion graph validate obstacle_avoidance.
+5. Record a run in the background with: echo $$ > run.pid && exec cerulion graph run obstacle_avoidance --release --record --network off > run.log 2>&1. After at least ten seconds, stop it as Ctrl+C would: kill -INT "$(cat run.pid)". The last line of run.log names the recording: "recording written to recordings/<name>.mcap".
+6. Run cerulion bag play "<recording>" --resim all --verify and confirm it prints replay PASS.
+7. In nodes/safety_controller/src/lib.rs, change 0.3 to 0.25 on the line that sets linear_velocity.x, run cerulion node build safety_controller --release and verify the same recording again. It now exits 1: show me its "differs at x" line and say what it means.
+8. Start the harness in the background, and keep this terminal open while you use it: nohup cerulion rcp --sim --http 127.0.0.1:8765 > rcp-sim.log 2>&1 & echo $! (that is its PID). Its first run installs the simulator and the benchmark scenes once, which takes minutes and about 4 GB of disk (it needs 5 GB free). Wait until curl -fsS http://127.0.0.1:8765/health answers; if the harness exits first, tell me why from rcp-sim.log.
+9. Add it as an MCP server named cerulion-sim, and note the folder you run this in. Claude Code: claude mcp add --scope local --transport http cerulion-sim http://127.0.0.1:8765/mcp. Another agent: add http://127.0.0.1:8765/mcp as a streamable HTTP server.
+10. If the cerulion-sim tools are already in your tool list, use them to put the bowl on the plate. Otherwise tell me to run, in a second terminal while this one stays open: cd <that folder> && claude "With cerulion-sim, put the bowl on the plate, and give me the link to watch the episode." Either way, tell me that I can watch each episode at http://127.0.0.1:8765/view/<episode id> (http://127.0.0.1:8765/episodes lists the episode ids), that kill -INT <the harness PID> stops the harness, and that cerulion rcp --sim --http 127.0.0.1:8765 starts it again.
+```
+
+On a new machine you approve one sign-in in your browser, and run any system install command your agent hands you, for a C toolchain or, on Linux, the simulator's renderer. Your agent stars this repository from your `gh` account (or gives you its link), reports `replay PASS`, then `differs at x: recorded 0.3, replayed 0.25` on the same recording, and starts the harness. It then works the task itself, or hands you the command for a second terminal, to run while the first stays open, where a new session works the bowl-on-plate task on the simulated arm and reports the benchmark's verdict; you watch the episode at `http://127.0.0.1:8765/view/<episode id>`.
+
+### With commands
+
+#### Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
+cerulion login
 ```
 
-The installer links `cerulion` into `~/.local/bin`, adds one line to your shell startup files and installs Rust when Rust 1.95 or newer is missing. Then sign in once with `cerulion login`, because every command runs under a free Cerulion account, which is used for robot pairing and works offline afterwards. To uninstall, run the same script with `sh -s -- --uninstall`.
+The installer links `cerulion` into `~/.local/bin`, adds one line to your shell startup files and installs Rust when Rust 1.95 or newer is missing. `cerulion login` signs this machine in once: every command runs under a free Cerulion account, which is used for robot pairing and works offline afterwards, and a robot or a headless box prints a short code to approve from a browser on any machine. To uninstall, run the same script with `sh -s -- --uninstall`.
 
 <details>
 <summary>Homebrew</summary>
@@ -64,7 +95,7 @@ Each step runs only if the one before it succeeded, and the [APT distribution pa
 cargo install --locked cerulion_cli cerulion_netd
 ```
 
-The release installer places `cerulion-connectd` (the desk side of a remote connection) and `cerulion-remoted` (the robot side) beside the CLI. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
+The release installer places `cerulion-connectd` (the desk side of a remote connection), `cerulion-remoted` (the robot side) and the agent harness beside the CLI; a `cerulion` built this way has no harness beside it, so [Run the harness on your own machine](#run-the-harness-on-your-own-machine) says how to point it at one. See the [installation guide](https://docs.cerulion.com/cerulion/installation) or [CONTRIBUTING](.github/CONTRIBUTING.md) for the complete source-build route.
 
 </details>
 
@@ -77,76 +108,26 @@ Homebrew and the Debian package do not provision Rust. To build your own nodes, 
 
 Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use. The macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs, which for Jazzy is Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64. Unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI.
 
-Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them. The compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. To bring a workspace from Cerulion 1.0, follow the migration steps in the [2.0.0 release notes](./CHANGELOG.md#200---2026-11-12). They move its `=1.0.0` pins to `=2.0.0` and finish with one `cerulion node build <node>` per node. The [installation details](docs/install.md) cover the toolchain setup.
+Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them. The compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. To bring a workspace from Cerulion 2.0, follow the migration steps in the [2.1.0 release notes](./CHANGELOG.md#210---2026-11-21); a workspace from Cerulion 1.0 takes the steps in the [2.0.0 release notes](./CHANGELOG.md#200---2026-11-12) first. They move its pins to `=2.1.0`, rebuild each node with `cerulion node build <node>` and restart `cerulion-netd`. The [installation details](docs/install.md) cover the toolchain setup.
 
 </details>
 
-## Try the harness
+#### Run, record and verify
 
-Give your own model the Cerulion harness's tools on a simulated robot, through Cerulion's MCP server. Experimental. The release packages install `cerulion` without the harness folder, so clone this repository once and name its `harness/` folder in `CERULION_HARNESS_DIR`:
+![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
 
-```bash
-git clone --depth 1 https://github.com/cerulion-inc/cerulion   # the harness folder, once
-export CERULION_HARNESS_DIR="$PWD/cerulion/harness"
-cerulion login                                   # once, on this machine
-cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
-claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
-```
-
-Then ask your model for a task, for example "Put the bowl on the plate." The first `cerulion rcp --sim` installs the simulator and the benchmark scenes once, which takes minutes. To rerun a task of the published benchmark with and without the harness against your own OpenAI-compatible endpoint, set `OPENAI_BASE_URL` and `OPENAI_API_KEY` and run:
-
-```bash
-cerulion rcp bench --model YOUR_MODEL
-```
-
-The [harness guide](docs/harness.md) covers what the harness is, what the benchmark measured and how `cerulion rcp bench --verify` proves the code is the measured code.
-
-## Quickstart: Run, record and verify
-
-**Using a coding agent?** Paste this prompt into Claude Code, Codex or another agent that runs commands in its own terminal:
-
-```text
-Install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
-Run cerulion login in the background, show me the URL and code it prints, and wait for it to finish while I approve the sign-in in my browser.
-Then run the quickstart at https://github.com/cerulion-inc/cerulion#quickstart-run-record-and-verify in your own terminal:
-cerulion workspace create safety_demo --starter obstacle_avoidance, then cd safety_demo.
-Build both nodes (cerulion node build laser_scanner --release, then cerulion node build safety_controller --release; the first build takes a few minutes).
-Run cerulion graph validate obstacle_avoidance, then cerulion graph run obstacle_avoidance --release --record for at least five seconds, and stop it with Ctrl+C.
-Verify the recording it printed: cerulion bag play "<recording>" --resim all --verify
-In nodes/safety_controller/src/lib.rs, change the forward speed from 0.3 to 0.25, run cerulion node build safety_controller --release, and verify the same recording again.
-Report what changed between the two verifications.
-Finally, ask me whether I want to star https://github.com/cerulion-inc/cerulion. Only if I say yes, star it with gh api -X PUT user/starred/cerulion-inc/cerulion, or give me the link if gh is not signed in.
-```
-
-This example connects a synthetic laser scanner to a safety controller. The controller publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter.
+For your robot software: a synthetic laser scanner feeds a safety controller that publishes a forward velocity of `0.3` when the path is clear and `0.0` when an obstacle is within half a meter. Create the workspace, build both nodes, check the graph and run it with recording on. The first node build also compiles the Cerulion runtime, so it takes a few minutes on a laptop; later builds take seconds.
 
 ```bash
 cerulion workspace create safety_demo --starter obstacle_avoidance
 cd safety_demo
-```
-
-To write nodes from scratch instead, follow the [getting-started tutorial](docs/tutorials/01-getting-started.md).
-
-Sign in once per machine. Cerulion commands run under an account, and the result is read locally from then on, so later commands keep working offline.
-
-```bash
-cerulion login
-```
-
-A robot or a headless box prints a short code to approve from a browser on any machine.
-
-Build both nodes, check the graph, then run it with recording on. The first node build also compiles the Cerulion runtime, so it takes a few minutes on a laptop. Later builds take seconds.
-
-```bash
 cerulion node build laser_scanner --release
 cerulion node build safety_controller --release
 cerulion graph validate obstacle_avoidance
 cerulion graph run obstacle_avoidance --release --record
 ```
 
-The run splits into one process per node without changing the graph file, as the [multi-process guide](https://docs.cerulion.com/cerulion/guides/run-multi-process) explains.
-
-By default the run is readable from any computer signed in to your account, with no addresses or flags. Add `--network off` to keep a run on this machine.
+The run splits into one process per node without changing the graph file, as the [multi-process guide](https://docs.cerulion.com/cerulion/guides/run-multi-process) explains, and any computer signed in to your account can read it with no addresses or flags; add `--network off` to keep a run on this machine. To write nodes from scratch instead, follow the [getting-started tutorial](docs/tutorials/01-getting-started.md).
 
 In a second terminal, watch the controller react:
 
@@ -154,13 +135,7 @@ In a second terminal, watch the controller react:
 cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity
 ```
 
-The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses the distance threshold. Let it run for at least five seconds, then stop it with **Ctrl+C**. Cerulion prints the completed recording's path:
-
-```text
-recordings/obstacle_avoidance_20260918T181449Z.mcap
-```
-
-Set `BAG` to that printed path, then verify the unchanged code first:
+The `x` field switches between `0.3` and `0.0` as the synthetic scan crosses the distance threshold. After at least five seconds, stop the run with **Ctrl+C**. Cerulion prints the completed recording's path, such as `recordings/obstacle_avoidance_20260918T181449Z.mcap`. Set `BAG` to it and verify the unchanged code first:
 
 ```bash
 BAG="recordings/obstacle_avoidance_<timestamp>.mcap"
@@ -176,9 +151,7 @@ cerulion node build safety_controller --release
 cerulion bag play "$BAG" --resim all --verify
 ```
 
-This time verification reports a divergence that names the topic, the field that changed and both values (`differs at x: recorded 0.3, replayed 0.25`), and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot. The animation at the top of this page shows this whole run.
-
-If Cerulion is useful to you, a star helps other robotics engineers find it.
+This time verification reports a divergence that names the topic, the field that changed and both values (`differs at x: recorded 0.3, replayed 0.25`), and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot.
 
 <details>
 <summary>What replay verification checks</summary>
@@ -196,6 +169,73 @@ Comparisons are byte-exact by default. Add `--tolerance` for acceptable per-fiel
 
 Guide: [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay)
 
+#### Run the harness on your own machine
+
+`cerulion rcp --sim` serves the harness's tools and its three scenes on your machine. It reaches no Cerulion service, so it spends no sim credits and the network kill switch (`CERULION_NETWORK=off`) does not refuse it; its first run downloads the simulator from the benchmark's and the Python packages' own hosts. Experimental: in this release the harness drives a simulated robot. It needs Cerulion 2.1.0 or later (`cerulion --version`). With a release package there is nothing to clone or set: every release package installs the harness folder beside `cerulion`. A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`. Then:
+
+```bash
+cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
+```
+
+In a second terminal, add it to Claude Code and ask for a task. Run both lines in one folder: the first adds the server for that folder only.
+
+```bash
+claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
+claude "With cerulion-sim, put the bowl on the plate, and give me the link to watch the episode."
+```
+
+Another MCP client takes the same URL. Each MCP connection gets its own episode, set up for one task: `bowl-on-plate` by default, or start the server with `--task open-drawer` or `--task soup-in-basket`. They are start states the harness was developed on, not the start states of the published results. Watch each episode, its camera pictures and the benchmark's verdict at `http://127.0.0.1:8765/view/<episode id>` (the server gives your model that link); `http://127.0.0.1:8765/episodes` lists every episode. Keep `--http` on a loopback address: anyone who can reach the server can start simulators on your machine and watch every episode.
+
+The first `cerulion rcp --sim` installs the simulator and the benchmark scenes once, which takes minutes and about 4 GB of disk (it refuses to start with less than 5 GB free). The harness runs on macOS on Apple Silicon and on Linux on x86_64 or ARM64, with `git` and `curl`; on Ubuntu, also run `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0` for the CPU renderer. The published results were measured on Linux x86_64. On macOS the pictures are rendered by Apple's OpenGL and differ slightly from the measured ones, so an episode there is a try of the harness, not a reproduction of a published row.
+
+To run a start state yourself, with and without the harness, against your own model, set `OPENAI_BASE_URL` to any OpenAI-compatible chat completions endpoint whose model takes tool calls and images, and `OPENAI_API_KEY` to its key. Pick a start state of the published benchmark from the results package's [cells.csv](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/cells.csv) and run:
+
+```bash
+cerulion rcp bench --model YOUR_MODEL --cell CELL_ID
+```
+
+It runs two episodes on your endpoint, one after the other (each up to 3 attempts when the endpoint fails), and prints the benchmark's verdict for each; you pay for the model calls. Without `--cell` it runs a start state the harness was developed on, not a published one. One episode at temperature 1.0 can go either way; the published rates come from 100 start states per model. `cerulion rcp bench --verify` checks every file of the harness's measured code against the provenance ledger that ties it to the code the benchmark measured. The [harness guide](docs/harness.md) covers what the harness is, what the benchmark measured, the flags and what `--verify` checks.
+
+### Give your model Cerulion
+
+Add the hosted Cerulion MCP to Claude Code once. This step needs no install, only your account: the first time, run `/mcp` in Claude Code, pick `cerulion` and sign in with your Cerulion account in the browser. In another MCP client, add the same URL as a connector.
+
+```bash
+claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
+```
+
+The hosted endpoints are in early access ([request access](https://docs.cerulion.com/cerulion/hindsight)).
+
+**The runtime side.** With an MCAP recording at a public or presigned `https://` URL, ask:
+
+```text
+Open the recording at https://<your host>/run.mcap. Summarize it and show me the worst anomaly, with its topic and time.
+```
+
+Your model opens and indexes the recording (`open_bag`; the first open of a large one can take a few minutes), reads its summary (`get_debrief`), lists the anomalies worst first (`find_anomalies`), looks at the window around the worst one (`scrub`) and cites each finding as `[topic @ t=<nanoseconds>]`, with a Foxglove link to that moment when the URL is public (`get_foxglove_link`). The hosted tools cannot read a file on your machine, run a graph, record or verify; those run in your terminal, as above. The same connector lists the robots on your account and whether each is online (`robot_list`), and starts and connects to your Cerulion Cloud instance (`cloud_instance_start`, `cloud_instance_connect`).
+
+**The harness side.** Ask for a task on a simulated arm:
+
+```text
+Start the simulated arm and put the bowl on the plate.
+```
+
+Your model starts a simulated robot arm for your account in Cerulion's cloud (`sim_start`), reads its task (`sim_read` on `robot://task`), looks through the robot's cameras (`look`) and has the harness's other tools for the arm; `sim_end` stops the simulator and reports the credits it charged. `bowl-on-plate` is the default scene; ask for `open-drawer` or `soup-in-basket` for the other two. These are start states the harness was developed on, not the start states of the published results. The simulator runs on your account's sim credits, one credit for each second it is held open.
+
+## Harness results
+
+The benchmark ran each LIBERO-PRO start state twice with the same model: once without Cerulion, through a published three-tool interface (arXiv:2610.30051), and once with Cerulion, through the harness's tools. Same simulator, same budget of 80 model replies and 900 control steps, and the benchmark's own success check. Fifteen models on the same 100 start states, one episode per start state in each arm, at temperature 1.0; provider model versions are known only by the model's name. The result is on one benchmark family, the one the harness was built and checked on. The start states are new start states of 25 task rows the harness was developed on at other start states; the tasks themselves are not new to it, and task rows it never met exist in the benchmark and are on no list here. The arm with Cerulion also reads the simulated robot's calibration record, which the other arm does not have, so the comparison is the whole package against the published interface; it cannot be split into tools, record and documents. Other groups publish higher rates on this benchmark under their own protocols, and nothing here ranks against them.
+
+On the main test, as declared before the first episode, Gemini 3.8 Flash solved 73 against 25 of 100 start states, with Cerulion against without (2.9 times as many; Wilson 95 percent intervals 63.6 to 80.7 and 17.5 to 34.3 percent; exact two-sided sign test p = 1.10e-11). Over the 15 models, the arm with Cerulion solved more start states in 12 of 15, fewer in 3 and the same number in 0. Fewer, no difference shown for each: GPT-6 Astra (70 against 71, p = 1); Gemini 4 Carbon (76 against 82, p = 0.377); GPT-6.2 Astra (77 against 81, p = 0.541). After Holm's correction over the 15 models, the gain on solved start states is established for 10 of 15; one of them, GPT-6.1 Terra, was added to the grid after its first rows had been seen. Claude Fable 5.2 without Cerulion ended 86 of its 100 episodes on 3 replies in a row with no tool call, which end an episode, and all 86 ended on replies the provider's content filter stopped, with no claim from the model (the filter stopped 337 of its 1,101 replies in scored episodes). 86 of the 90 start states it did not solve without Cerulion ended that way, so its gain on solved start states is mostly against an arm that the content filter stopped.
+
+Fewer episodes ended with a false success claim: pooled over the 15 models, a false claim without Cerulion only on 202 pairs of model and start state, and with Cerulion only on 138, p = 6.13e-04. That does not mean Cerulion stops false claims. Per unsolved episode the rate is higher with Cerulion: 184 false claims in 491 unsolved episodes (0.375) against 248 in 898 (0.276) without it, over all 15 models; as high or higher with Cerulion for 7 of the 15 (with against without): Gemini 3.8 Flash 0.593 against 0.400; Claude Opus 5.5 0.385 against 0.235; Claude Sonnet 5.5 0.510 against 0.190; Claude Haiku 5.5 0.339 against 0.042; Claude Fable 5.2 0.500 against 0.044 with the 86 episodes that ended on filtered replies counted, 0.500 against 1.000 with them left out (descriptive; no rule declared this reading), two readings that point opposite ways, so the comparison measures the filter as much as the model and is read neither way; GPT-6 Luna 0.197 against 0.120; Grok 4.7 0.319 against 0.062. The rule narrows the statement to "fewer because it solves more" if, per unsolved episode, the arm with Cerulion claims falsely as often or more for most models: it does for 7 of the 15, which is not most, so the statement stands as written. With Claude Fable 5.2 left out (both arms, so each pool holds the same 14 models), the pooled rate is 176 in 475 (0.371) with Cerulion against 244 in 808 (0.302) without (descriptive; no rule declared this reading). With each arm's unsolved episodes that ended on filtered replies left out of its count, the arm with Cerulion claims falsely as often or more for 6 of the 15 models (descriptive; no rule declared this reading), against 7 with them counted; not most, either way. In all, with Cerulion, 5 of the 15 models made more false claims: Claude Haiku 5.5 (19 against 4), Claude Sonnet 5.5 (25 against 16), Grok 4.7 (15 against 6), Claude Fable 5.2 (8 against 4, a comparison the content filter reading above says is read neither way) and GPT-6 Luna (14 against 12), each a descriptive count.
+
+Model cost per solved start state for Gemini 3.8 Flash, at list prices, model calls only (simulator compute is not included; nothing here is a billed amount): 6.67 USD without Cerulion, 0.48 with. Part of the gap is caching: the arm without Cerulion had the lower cached share of input tokens for 15 of the 15 models.
+
+![Model cost per successful episode, without and with Cerulion, in the same order, on a linear scale cut at 30 USD, with the factor, the cost per success without Cerulion over the cost with it, at the right of each row. Its footer says that for Claude Fable 5.2 without Cerulion the provider's content filter stopped 337 of its 1,101 replies and 86 of its 100 scored episodes ended on them, with no claim from the model, and that three other arms had one filtered reply each, ending no scored episode.](docs/media/harness-cost-per-success.svg)
+
+The [results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) holds every count, cost and episode, the reading rules, each frozen before the rows of its own lists, and a script that computes every figure again from the rows.
+
 ## Check a model change against a recording
 
 The [perception example](examples/perception/) records a synthetic camera and pixel-based detector, verifies the baseline, then tests a detector whose boxes move by eight pixels. Its bounding-box overlap tolerance catches the change and names the affected field.
@@ -212,6 +252,22 @@ RECORD_SECS=8 ./run_replay_demo.sh
 
 
 Choose tolerances that match the behavior you care about: bounding-box IoU, absolute or relative error, RMSE and set comparisons. Comparisons are byte-exact unless you set a field, topic or document-wide tolerance. The same checks can run on pull requests against recordings your team keeps as regression cases.
+
+## Capture the failure with Flashback
+
+Flashback keeps a memory-bounded window of recent activity in every running graph, so the moments before a problem are already there when you need them. It is event-based logging: nothing is written to disk until an event fires, and then the window around that event becomes a recording.
+
+**It captures on its own** when the runtime sees a fault, such as a dying worker process or a stalled topic, and [Flashback](docs/flashback.md) lists every trigger.
+
+**You can also ask for one by hand** from another shell on the robot:
+
+```bash
+cerulion flashback --note "controller stopped late"
+```
+
+Re-execution uses the capture's execution trace and any state anchors its starting point needs. `bag info` reports whether a capture can be re-executed or only played back. To record an already-running graph instead, use `cerulion bag record --run=obstacle_avoidance`.
+
+Guides: [Flashback](docs/flashback.md) · [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay) · [Bags and replay](docs/bag.md)
 
 ## Performance
 
@@ -235,7 +291,7 @@ Free run, the multi-process default, against barrier lockstep: [Free run against
 
 ### ROS 2 over Cerulion
 
-The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion's transport, measured in the same harness, posture and pacing as every other line: three ROS 2 nodes in three processes, with loaned publishing and loaned subscription takes. At 1 MiB that is **11.12 µs p50 / 37.21 µs p99**, beside **11.0 ms / 43.4 ms** for stock `rmw_fastrtps_cpp`, the chart's own stock ROS 2 line. The median stays between 10.43 and 10.65 µs from 64 B to 256 KiB and reaches 17.47 µs at 16 MiB. [Methodology](benches/latency/METHODOLOGY.md) · [Results and provenance](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/).
+The `rmw_cerulion` line in the chart above is ROS 2 Jazzy running over Cerulion's transport, measured with the same benchmark suite, posture and pacing as every other line: three ROS 2 nodes in three processes, with loaned publishing and loaned subscription takes. At 1 MiB that is **11.12 µs p50 / 37.21 µs p99**, beside **11.0 ms / 43.4 ms** for stock `rmw_fastrtps_cpp`, the chart's own stock ROS 2 line. The median stays between 10.43 and 10.65 µs from 64 B to 256 KiB and reaches 17.47 µs at 16 MiB. [Methodology](benches/latency/METHODOLOGY.md) · [Results and provenance](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/).
 
 ### Across platforms
 
@@ -368,29 +424,13 @@ cerulion topic echo /obstacle_avoidance/safety_controller/linear_velocity
 
 Guides: [Inspect topics](https://docs.cerulion.com/cerulion/guides/inspect-topics) · [Remote robots](https://docs.cerulion.com/cerulion/guides/network-and-remote-robots)
 
-## Capture the failure with Flashback
-
-Flashback keeps a memory-bounded window of recent activity in every running graph, so the moments before a problem are already there when you need them. It is event-based logging: nothing is written to disk until an event fires, and then the window around that event becomes a recording.
-
-**It captures on its own** when the runtime sees a fault, such as a dying worker process or a stalled topic, and [Flashback](docs/flashback.md) lists every trigger.
-
-**You can also ask for one by hand** from another shell on the robot:
-
-```bash
-cerulion flashback --note "controller stopped late"
-```
-
-Re-execution uses the capture's execution trace and any state anchors its starting point needs. `bag info` reports whether a capture can be re-executed or only played back. To record an already-running graph instead, use `cerulion bag record --run=obstacle_avoidance`.
-
-Guides: [Flashback](docs/flashback.md) · [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay) · [Bags and replay](docs/bag.md)
-
 ## Tools for your coding agent
 
-**Cerulion MCP** at `https://mcp.cerulion.com/mcp/cerulion` gives Claude Code, Codex and other MCP clients tools for your Cerulion Cloud instances, analysis of MCAP recordings served over `https://`, and a list of the robots on your account.
+**Cerulion MCP** at `https://mcp.cerulion.com/mcp/cerulion` gives Claude Code, Codex and other MCP clients tools for your Cerulion Cloud instances, analysis of MCAP recordings served over `https://`, a list of the robots on your account and a simulated robot arm with the harness's tools; [Give your model Cerulion](#give-your-model-cerulion) shows a prompt for each side.
 
 **Hindsight** at `https://mcp.cerulion.com/mcp/hindsight` serves the recording-analysis tools on their own, with answers grounded in specific topics and timestamps.
 
-Both sign in with OAuth using your Cerulion account. The hosted endpoints have no local workspace tools, so build, run and inspect nodes and topics with the `cerulion` CLI.
+Both sign in with OAuth using your Cerulion account. The hosted endpoints have no local workspace tools, so build, run, record, verify and inspect nodes and topics with the `cerulion` CLI.
 
 The hosted endpoints are in early access. Add each one to your client as its own connector:
 
@@ -453,7 +493,7 @@ Use GitHub's **Cite this repository** button or [CITATION.cff](CITATION.cff):
   author  = {Sharma, Lakshay and Kariyawasam, Raveen and {Cerulion Inc. and contributors}},
   title   = {Cerulion},
   year    = {2026},
-  version = {2.0.0},
+  version = {2.1.0},
   url     = {https://github.com/cerulion-inc/cerulion}
 }
 ```

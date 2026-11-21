@@ -18,6 +18,8 @@ You do **not** import `cerulion_core::graph::*`, `cerulion_core::transport::*`, 
 
 ## Quick start
 
+The guided first run, through the runtime and the harness with a coding-agent prompt or commands, is the [README quickstart](../README.md#quickstart); this section is the empty-workspace flow of the API.
+
 ```bash
 # 0. Sign in once per machine; later commands read the result locally.
 cerulion login
@@ -548,16 +550,18 @@ macOS on Apple silicon, Linux on x86-64 or arm64; Linux also needs the CPU rende
 |---|---|
 | `cerulion rcp --sim [--http ADDR] [--task NAME]` | Serve the harness's MCP tools with a simulated robot on this machine: over stdio, where stdout carries only MCP messages, or with `--http ADDR` over streamable HTTP at `http://ADDR/mcp`. Each MCP connection gets its own episode, which ends at the model's claim, at the episode's clock, when the client goes away or when no call arrives for the idle limit. `--task NAME` is the task an episode is set up for: `bowl-on-plate` (the default), `open-drawer` or `soup-in-basket`. The first run installs the simulator, the benchmark scenes and the episode server once, into the folder the harness runs from (below), with its progress on stderr; a later run checks the install and starts in seconds, and an install that stopped resumes. Ctrl+C, or a SIGTERM or SIGHUP sent to `cerulion`, stops the install and the programs it runs, and exits 130. `--sim` takes none of the robot flags (`ROBOT`, `--eid`, `--addr`, `--key-file`, `--relay-url`, `--relay-disabled`, `--network`), and `--http` and `--task` need `--sim`. It exits with the install's code when the install fails, else with the server's: 1 when it cannot start, 2 for a usage error. |
 | `cerulion rcp bench --model MODEL [--base-url URL] [--key-env NAME] [--cell ID] [--out DIR]` | Run one benchmark cell (one LIBERO-PRO task at one start state) twice against your model: once through the benchmark's published three-tool interface, once through the harness's tools, with the same budget and the benchmark's own success check, and print the verdict of each. `--base-url` is any OpenAI-compatible chat completions endpoint that takes tool calls and images (default `OPENAI_BASE_URL`); the key is read from the variable `--key-env` names (default `OPENAI_API_KEY`) and sent only to that endpoint. `--cell` names a cell as the results package's `cells.csv` does (default: the harness's development cell). `--out` is the results folder (default: a new `cerulion-bench-<UTC time>` folder in the current directory). With a Claude model the setup with the harness keeps every earlier picture in the conversation up to the context limit, so the endpoint's prompt cache is read; every other model and setup replaces each picture beyond the newest 4 with a text ([Pictures](harness.md#pictures) names both modes and how to pick one). With no endpoint or no key it exits 2 before anything is installed or started. The first run installs as `--sim` does. Exit 0 when both episodes ran and were scored, 1 when one was not scored, 2 when it refused to start. |
-| `cerulion rcp bench --verify` | Check every file of the harness's measured code against the manifests of the two measured code trees, and exit 0 only when every file matches. It installs nothing and needs `python3`. `--verify` takes no other flag. |
+| `cerulion rcp bench --verify` | Check every file of the harness's measured code against the provenance ledger that ties it to the manifests of the two measured code trees, and exit 0 only when both manifests have their snapshot ids and every file matches its ledger row. It installs nothing; it needs `python3` on the PATH or a finished install, and a signed-in Cerulion account. `--verify` takes no other flag. |
 
 The harness folder is found in this order: `CERULION_HARNESS_DIR` when it is set and not empty (a value that
 names a missing folder, or a folder without the harness's `rcp.sh` and `install.sh`, is an error and the search
 stops there); `harness/` beside the canonicalized `cerulion` binary; then `harness/` at the root of the Cerulion
 source checkout the binary sits in, the nearest folder above it that holds `crates/cerulion_cli/Cargo.toml`, so a
 `cerulion` built in a checkout (`cargo run`, `target/debug/cerulion`) finds that checkout's harness. The current
-directory is never searched, and the last two places take nothing from a folder other users can write to, such
-as `/tmp`: the search for a checkout stops at the first one. The release packages do not install the harness, so
-a `cerulion` of a release needs `CERULION_HARNESS_DIR` set to the `harness/` folder of a checkout. With none found
+directory is never searched. `CERULION_HARNESS_DIR` is taken as given, and the last two places are never taken
+from a folder that every user can write to, such as `/tmp`: the search for a checkout stops at the first one. Every release package installs the harness
+beside the `cerulion` binary (the install script's directory, `/usr/bin/harness` from the Debian package, the
+Homebrew keg's `bin`), so a release's `cerulion` finds it with no setting, and `CERULION_HARNESS_DIR` runs another
+harness folder in its place, such as a checkout's. A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`. With none found
 it exits 1 and the error names where it looked. Both forms run the folder's `rcp.sh` under `bash` with the
 terminal attached and exit with its code. The folder beside the binary is never written, however it is found:
 the first run copies it once to `harness/<version>` under the Cerulion config directory and installs and runs
@@ -940,7 +944,7 @@ One dependency, which is what `cargo add cerulion` writes:
 
 ```toml
 [dependencies]
-cerulion = "2.0.0"
+cerulion = "2.1.0"
 ```
 
 `cerulion` is an umbrella crate that re-exports the other three at a single
@@ -955,8 +959,8 @@ with `{ workspace = true }`:
 
 ```toml
 [workspace.dependencies]
-cerulion_core = "=2.0.0"
-native_ros2_messages = "=2.0.0"
+cerulion_core = "=2.1.0"
+native_ros2_messages = "=2.1.0"
 ```
 
 Either works. The macros read the package's own `Cargo.toml` at expansion
@@ -4190,7 +4194,7 @@ For `cerulion connect` / `login` and the WAN plane. See
 | `CERULION_RELAY_URL` | A self-hosted iroh relay URL, instead of the public n0 relays. Also the `--relay-url` flag on `connect` and `rcp`. |
 | `CERULION_EPOCH_DIR` | Where the desk's revocation-epoch cache lives. Deliberately not `CERULION_NETD_*`-prefixed: it is a desk-wide artifact location honored by `cerulion connect`, `cerulion-netd` and the account-page cache writer alike. Default: an `epochs/` directory next to the desk key file. |
 | `CERULION_CONNECTD_BIN` | Path to the `cerulion-connectd` sibling binary that `cerulion connect` spawns, for when it does not sit beside `cerulion`. The release archive, which the installer and the apt package unpack, puts it there; it is not published to crates.io, so a CLI installed with `cargo install` has none. In a source checkout `cargo build -p cerulion_connectd` builds it. |
-| `CERULION_HARNESS_DIR` | The harness folder `cerulion rcp --sim` and `cerulion rcp bench` run, in place of the one beside `cerulion` or in a source checkout. Set and not empty, it is final: a value that names a missing folder, or a folder without the harness's `rcp.sh` and `install.sh`, is an error. Unset or empty, the folder beside the canonicalized `cerulion` binary is used, then `harness/` at the root of the Cerulion source checkout the binary sits in; the current directory is never searched. The release packages do not install the harness, so a release's `cerulion` needs this set to the `harness/` folder of a checkout. |
+| `CERULION_HARNESS_DIR` | The harness folder `cerulion rcp --sim` and `cerulion rcp bench` run, in place of the one beside `cerulion` or in a source checkout. Set and not empty, it is final: a value that names a missing folder, or a folder without the harness's `rcp.sh` and `install.sh`, is an error. Unset or empty, the folder beside the canonicalized `cerulion` binary is used, then `harness/` at the root of the Cerulion source checkout the binary sits in; the current directory is never searched. A release's `cerulion` needs no setting: every release package installs the harness beside the binary. Set it to run another harness folder, such as a checkout's, and for a `cerulion` installed with `cargo install`, which has no harness beside it, set it to the `harness/` folder of a clone at `v<version>`, or of the checkout it was installed from with `cargo install --path`. |
 | `CERULION_ACCOUNT_SERVICE` | Base URL of the account service `cerulion login` talks to. For pointing a desk at a self-hosted or development issuer. |
 | `CERULION_NETD_DESK_KEY` | ABSOLUTE path to the desk's device key file: the desk's identity and the key a robot access-lists. Automatic account and saved pairing routes use the persisted machine identity without this setting. The manual WAN route uses an ephemeral key when this is unset, which a robot without that key in its access list refuses. WAN builds only. |
 | `CERULION_NETD_DEVICE_CERT` | Explicit ABSOLUTE path to the cached device cert `cerulion login` writes. Unset takes the sibling `device.cert` next to the desk key. A relative value in either variable makes `cerulion login` refuse rather than write a file `cerulion-netd`, which resolves it against its own working directory, may not read. WAN builds only. |
