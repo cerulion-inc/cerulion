@@ -39603,7 +39603,7 @@ mod trigger_input_capacity_tests {
             },
             RecordedStep {
                 step: 1,
-                clock_ns: 6_000,
+                clock_ns: 1_000 + 6_000_000,
                 fires: vec![],
                 reads: vec![pop],
             },

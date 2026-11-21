@@ -10048,36 +10048,49 @@ mod tests {
     /// A read of a latest-value input empties the slot, the frame its own step
     /// sent included, since a producer sends before its consumer reads; on a
     /// resumed pass that read is the one that makes the slot known. Depth 1:
-    /// the relay fires at step 0 and the sink's latest-value read takes the
-    /// frame, so the relay's step 1 pop left unfired is a finding.
+    /// the relay fires at step 0 and the sink fires and its latest-value read
+    /// takes the frame, so the relay's step 1 pop left unfired is a finding.
+    /// With the slot known from that read, a step 1 fire fills it, and the
+    /// relay's step 2 pop left unfired is the hold: that pass reads clean,
+    /// where a slot still unknown would convict it.
     #[test]
     fn a_latest_value_read_on_a_resumed_pass_empties_the_slot_of_its_steps_own_frame() {
-        let steps = vec![
-            fifo_step(0, 0, &[("relay", 0, 1, 0), ("sink", 0, 0, 1)]),
-            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
-        ];
-        let SlotRecord::Counted { frame_stamps, .. } = sent_by(&steps, &["relay"]) else {
-            unreachable!("sent_by counts")
+        let judge = |steps: &[RecordedStep]| {
+            let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+                unreachable!("sent_by counts")
+            };
+            let holds = BlockHoldEdges::new(vec![slot(
+                "sink",
+                1,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain: BodyDrain::ToEmpty,
+                },
+            )]);
+            let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+                .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
+            verify(
+                &relay(holds),
+                steps,
+                &[],
+                STAMPED,
+                &resumed,
+                &PassStops::none(),
+            )
         };
-        let holds = BlockHoldEdges::new(vec![slot(
-            "sink",
-            1,
-            SlotRecord::Counted {
-                frame_stamps,
-                drain: BodyDrain::ToEmpty,
-            },
-        )]);
-        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
-            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
-        let report = verify(
-            &relay(holds),
-            &steps,
-            &[],
-            STAMPED,
-            &resumed,
-            &PassStops::none(),
+        let read = fifo_step(0, 0, &[("relay", 0, 1, 0), ("sink", 1, 1, 1)]);
+        let emptied = vec![read.clone(), fifo_step(1, 5_000, &[("relay", 1, 0, 0)])];
+        assert_eq!(
+            findings_of(&judge(&emptied)),
+            vec![finding("relay", 1, 1, 0)]
         );
-        assert_eq!(findings_of(&report), vec![finding("relay", 1, 1, 0)]);
+        let known = vec![
+            read,
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 1, 0, 0)]),
+        ];
+        let report = judge(&known);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
     }
 
     /// A frame whose stamp no step's clock carries counts at the next step,

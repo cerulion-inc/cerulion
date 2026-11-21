@@ -167,7 +167,8 @@
 #          `declared_latest_drain`, `slot_record`, `BlockHoldEdges::none`,
 #          `BlockHoldEdges::edges`, `FifoCarry::step` and (twice)
 #          `local_block_holds` with a value their types do not have.
-#          Re-run over the second fix's changes, with
+#          Re-run over the change that excuses a held step only where the
+#          bag's record of the slot is whole, with
 #          `topic_recorded_whole` and `consumer_body_drain` added to `--re`
 #          (and `most_frames_at_one_stamp`, `consumer_drains_at_body` gone):
 #          51 mutants: 46 caught, 3 unviable, 2 missed, both killed since:
@@ -177,8 +178,8 @@
 #          `--re 'SlotBound::step'`: 25 mutants, 25 caught. The 3 unviable
 #          replace `slot_record`, `consumer_body_drain` and `FifoCarry::step`
 #          with a value their types do not have.
-#          Re-run over the third fix's changes, which keep the count at or
-#          below the slot's, in 2 shards, with
+#          Re-run over the change that keeps the count at or below the
+#          slot's, in 2 shards, with
 #          `--re 'SlotBound::|FifoDeferral::|FifoCarry::|verify_fifo|\bverify\b|topic_recorded_whole|fifo_trailing_refills|PassRestore::|PassStart::'`:
 #          47 mutants: 39 caught, 4 unviable, 4 missed, three killed since.
 #          `PassRestore::with_anchor_prev_target` replaced with
@@ -196,13 +197,17 @@
 #          replace `PassRestore::none`, `PassRestore::start`,
 #          `FifoDeferral::step` and `FifoCarry::step` with a value their types
 #          do not have.
-#          Re-run over the fourth fix's changes, which give a slot whose
-#          input sets `block_timeout_ms` no count and delete the resumed
-#          pass's anchor tie (where the one missed mutant sat, a tie that
-#          changed no verdict) with `PassRestore::with_anchor_prev_target`
-#          and `PassStart`, with
+#          Re-run over the change that gives a slot whose input sets
+#          `block_timeout_ms` no count and deletes the resumed pass's anchor
+#          tie (where the one missed mutant sat, a tie that changed no
+#          verdict) with `PassRestore::with_anchor_prev_target` and
+#          `PassStart`, with
 #          `--re 'local_block_holds|SlotBound::step|FifoDeferral::new|FifoCarry::new|\bverify\b|fifo_trailing_refills'`:
 #          14 mutants, 12 caught, 2 unviable, which replace
+#          `local_block_holds` with a map of an edge its type cannot default.
+#          Re-run over the change that gives a slot whose input does not
+#          trigger its consumer no count, with `--re 'local_block_holds'`:
+#          7 mutants, 5 caught, 2 unviable, which replace
 #          `local_block_holds` with a map of an edge its type cannot default.
 #
 # Every mutant that survives the test suite is listed below with the reason it
