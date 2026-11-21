@@ -10670,6 +10670,44 @@ mod tests {
         assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
     }
 
+    /// TODAY'S VERDICT, a false pass: a live consumer stop the bag does not
+    /// record. Depth 4, a latest-value input on a consumer throttled to one
+    /// fire per 50 ms, on a 20 ms step: the sink fires at steps 0, 3, 6 and
+    /// so on through 30, taking every frame, so the slot never reaches 4. It
+    /// stops at its step 30 fire (live, a `NodeError::Fatal`, which releases
+    /// its slot and records nothing), the relay fires one frame a step to step
+    /// 39, pops a frame at step 40 and fires nothing although nothing could
+    /// hold it, and fires the frame it kept and the next at step 41. With no
+    /// stop known, the slot counts nine frames at step 40 and the pop left
+    /// unfired reads as the hold: the pass reads clean. With the stop the
+    /// re-execution makes, the slot is released after step 30 and step 40 is
+    /// the finding. This pins the first verdict until the bag records a stop.
+    #[test]
+    fn a_consumer_stop_the_bag_does_not_record_leaves_the_slot_counting() {
+        let steps: Vec<RecordedStep> = (0..=41)
+            .map(|n| {
+                let relay = match n {
+                    40 => ("relay", 1, 0, 0),
+                    41 => ("relay", 1, 2, 0),
+                    _ => ("relay", 1, 1, 0),
+                };
+                if n <= 30 && n % 3 == 0 {
+                    fifo_step(n, n * 20_000, &[relay, ("sink", 0, 1, 1)])
+                } else {
+                    fifo_step(n, n * 20_000, &[relay])
+                }
+            })
+            .collect();
+        let decls = relay(sink_slot(4, &steps, BodyDrain::ToEmpty));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert!(report.is_clean(), "today: {:?}", report.findings);
+
+        let mut stops = PassStops::none();
+        stops.note("sink", 30, 1);
+        let report = verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops);
+        assert_eq!(findings_of(&report), vec![finding("relay", 40, 1, 0)]);
+    }
+
     /// An empty read leaves the slot empty: in a rank's step order the
     /// producer sends before its consumer reads, so a frame the step sent was
     /// taken before the read found nothing. Depth 2: after a hold the sink

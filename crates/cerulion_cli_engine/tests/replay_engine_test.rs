@@ -56756,6 +56756,142 @@ fn a_bag_that_does_not_state_its_queues_counts_only_a_graph_declared_block_edge(
     bh_assert_replays(&outcome, "a graph that declares the block queue");
 }
 
+/// A sink triggered on its one input, `consume = latest` and `block` at depth
+/// 4, read through two subscribers and throttled to one fire per 5 ms, which
+/// at the reference run's 5 ms step is every step. It publishes nothing, and
+/// it returns `NodeError::Fatal` on the frame `die_at` names.
+#[cerulion_node(throttle_ms = 5)]
+#[derive(Default)]
+struct DyingLatestSinkNode {
+    #[input(trigger, consume = latest, backpressure = block, depth = 4)]
+    x: Vector3,
+    /// The frame this build stops at, if any. Set by the factory.
+    #[cerulion(reconstruct)]
+    die_at: Option<f64>,
+}
+
+#[cerulion_node_impl]
+impl DyingLatestSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        if self.die_at == Some(self.x.x) {
+            return Err(NodeError::Fatal("the sink stops at this frame".to_string()));
+        }
+        Ok(())
+    }
+}
+
+/// `src` (5 ms) -> `relay` (FIFO) -> `sink`, a [`DyingLatestSinkNode`] built to
+/// stop at `die_at`.
+fn fp3_factories(die_at: Option<f64>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        ("relay", Box::new(RelayNodeEntry::new())),
+        (
+            "sink",
+            Box::new(DyingLatestSinkNodeEntry::with_state(DyingLatestSinkNode {
+                die_at,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+const FP3_YAML: &str = "name: fpgraph\nprefix: fp\nnodes:\n\
+     \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sink\n    type: dying_latest_sink_node\n    inputs:\n      - name: x\n        source: relay/out\n";
+
+/// Record the graph over `steps` steps with the sink stopping on its sixth
+/// frame and check the hand oracle at the reference run's 5 ms step: the sink
+/// fires and takes each step's frame at steps 0 to 5, and its step 5 fire
+/// (`x` 6) stops it, which releases its slot, so nothing ever holds the relay,
+/// which fires each step's frame. Then take out the relay's fire record at
+/// `drop_at`, its frame still in the bag, the shape of a relay that popped a
+/// frame there and fired nothing.
+fn fp3_recording(steps: usize, drop_at: u64) -> Recording {
+    let mut rec = record_uniform_with_read_log(FP3_YAML, || fp3_factories(Some(6.0)), &[], steps);
+    let last = steps as u64 - 1;
+    assert_eq!(bh_fire_steps(&rec, "relay"), (0..=last).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "sink"), (0..=5).collect::<Vec<_>>());
+    assert_eq!(
+        hc_reads(&rec, "sink", "x")
+            .into_iter()
+            .filter(|(_, _, role)| *role == ReadSiteRole::Body)
+            .collect::<Vec<_>>(),
+        (0..=5)
+            .map(|k| (k, READ_OUTCOME_SERVED, ReadSiteRole::Body))
+            .collect::<Vec<_>>(),
+        "the sink takes each frame until it stops"
+    );
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == drop_at)
+        .expect("the relay fires at the step");
+    rec.trace.remove(at);
+    rec
+}
+
+/// TODAY'S VERDICT, a false pass, on `rec` with the relay's fire at `drop_at`
+/// taken out: replayed with a build in which the sink does not stop, the
+/// re-execution notes no stop, the slot keeps counting the relay's frames,
+/// and the relay's pop left unfired reads as the hold, so the re-derivation
+/// reports nothing. Replayed with the build that recorded the bag, the sink
+/// stops again at step 5, its slot is released, and the step is the finding.
+/// The relay's frames still differ either way, since the replay fires it as
+/// the bag records.
+fn fp3_assert_today(rec: &Recording, drop_at: u64, name: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join(name);
+    ri_bag_labelled(rec, &bag, ri_free_run_recorder_json(), false);
+    let fixed = bh_replay_stamped(&bag, || fp3_factories(None), bh_clean_stamp(rec));
+    assert_eq!(
+        fixed.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        None,
+        "today the hold is excused although the live sink had stopped"
+    );
+    assert!(!fixed.passed);
+    let recorded = bh_replay_stamped(&bag, || fp3_factories(Some(6.0)), bh_clean_stamp(rec));
+    assert_eq!(
+        recorded.trace_divergence.as_ref().map(|d| d.detail.clone()),
+        Some(format!(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
+             step {drop_at} FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+        ))
+    );
+    assert!(!recorded.passed);
+}
+
+/// TODAY'S VERDICT (a false pass): one relay short step after a live sink stop
+/// the replayed build does not make, the relay producing after it, so the slot
+/// count passes the depth after the short step. Pins the first verdict until
+/// the bag records a stop.
+#[test]
+#[serial]
+fn today_a_short_step_after_a_live_stop_the_replay_does_not_make_reads_clean() {
+    fp3_assert_today(&fp3_recording(15, 9), 9, "fp3_short.mcap");
+}
+
+/// TODAY'S VERDICT (a false pass): the same live stop with the short step
+/// after the slot count has passed the depth. Pins the first verdict until
+/// the bag records a stop.
+#[test]
+#[serial]
+fn today_a_short_step_past_the_depth_after_a_live_stop_reads_clean() {
+    fp3_assert_today(&fp3_recording(15, 12), 12, "fp3_past_depth.mcap");
+}
+
+/// TODAY'S VERDICT (a false pass): the same live stop with the short step the
+/// last of the recording, the slot count at the depth there, so no step after
+/// it shows the count past the depth. Pins the first verdict until the bag
+/// records a stop.
+#[test]
+#[serial]
+fn today_a_short_last_step_after_a_live_stop_reads_clean() {
+    fp3_assert_today(&fp3_recording(10, 9), 9, "fp3_tail.mcap");
+}
+
 /// A relay nothing holds, on a bag that states its drain: its last fire is
 /// taken out, so its last step pops a frame and fires nothing. The finding is
 /// that step, and it carries no caveat.
