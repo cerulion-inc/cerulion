@@ -753,15 +753,15 @@ pub enum SlotRecord {
     /// topic, reports the topic lossy (frames lost, a wire-sequence anomaly or
     /// a reset sequence baseline) or written by several publishers (declared
     /// or observed), or any frame drained and never written; or the graph lists
-    /// the topic in
-    /// `multi_publisher_topics`. Or the consumer's input sets
+    /// the topic in `multi_publisher_topics`. Or the consumer's input sets
     /// `block_timeout_ms`, whose release forgives the slot's frames with no
     /// record; or the bag's fire records do not put the consumer on a later
-    /// level than the producer (the same level, an earlier one, more than one,
-    /// or no recorded fire), so its read can drain the slot before the
-    /// producer decides in the same step; or the consumer drains the slot
-    /// outside its body reads (a Sync node's trigger input, which its matcher
-    /// pops). Such a slot never explains a step.
+    /// level than the producer (the same level, an earlier one, either node at
+    /// more than one level, or either with no recorded fire), so its read can
+    /// drain the slot before the producer decides in the same step, or the bag
+    /// does not show the order; or the consumer drains the slot outside its
+    /// body reads (a Sync node's trigger input, which its matcher pops). Such
+    /// a slot never explains a step.
     Unaccounted,
 }
 

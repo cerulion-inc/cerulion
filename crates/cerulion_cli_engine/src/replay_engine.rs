@@ -13059,7 +13059,8 @@ fn fold_fire_level(levels: &mut BTreeMap<String, RecordedLevel>, node: &str, lev
 /// The level each node of `rank` fires at in the bag's trace: the
 /// `global_level` its FIRE records carry, which the recording's runtime
 /// stamped from the levels it ran the rank's nodes in. A node the trace holds
-/// no fire of is absent.
+/// no fire of is absent, and one whose fires carry more than one level is
+/// `Several`.
 ///
 /// # Errors
 ///
@@ -13085,9 +13086,9 @@ fn recorded_fire_levels(
 }
 
 /// PURE: do the bag's fire records put `consumer` on a later level than
-/// `producer`? Only then did every read of the consumer's run after the
+/// `producer`? Where they do, each of the consumer's reads ran after the
 /// producer decided in its step. A node with no recorded fire, or with fires
-/// at more than one level, puts neither.
+/// at more than one level, orders no edge (false).
 fn recorded_after(
     levels: &BTreeMap<String, RecordedLevel>,
     producer: &str,
@@ -13152,10 +13153,11 @@ fn block_hold_flows(
 /// counted only where the bag's fire records put its consumer on a later
 /// level than its producer (`levels`, [`recorded_after`]): otherwise the
 /// consumer's read can drain the slot before the producer decides in the same
-/// step, whatever the replayed build declares. Such an edge, and one whose
-/// input sets `block_timeout_ms`, whose release forgives the slot's frames and
-/// leaves no record, give [`replay_rederive::SlotRecord::Unaccounted`]
-/// whatever the bag records of the slot.
+/// step, or the bag does not show the order, whatever the replayed build
+/// declares. Such an edge, and one whose input sets `block_timeout_ms`, whose
+/// release forgives the slot's frames and leaves no record, give
+/// [`replay_rederive::SlotRecord::Unaccounted`] whatever the bag records of
+/// the slot.
 fn local_block_holds(
     flows: &[BlockHoldFlow],
     levels: &BTreeMap<String, RecordedLevel>,
@@ -39715,10 +39717,11 @@ mod trigger_input_capacity_tests {
         assert!(held.is_clean(), "unexpected: {:?}", held.findings);
     }
 
-    /// A `block` edge is counted only where the bag's fire records put its
-    /// consumer on a later level than its producer. Hand table over the
-    /// recorded levels of one edge, `relay` -> `sink.x`: above, Counted; at the
-    /// same level, below, never firing, or at two levels, Unaccounted.
+    /// The bag's fire records order an edge only where they put its consumer
+    /// on a later level than its producer. Hand table of `recorded_after` over
+    /// the recorded levels of `relay` and `sink`: above, true; at the same
+    /// level, below, either never firing, or either at two levels, false. And
+    /// a node's fires fold to one level, or to `Several` once they differ.
     #[test]
     fn a_block_edge_counts_only_where_its_consumer_fires_a_later_level_than_its_producer() {
         use RecordedLevel::{One, Several};
@@ -39754,13 +39757,82 @@ mod trigger_input_capacity_tests {
         );
     }
 
-    /// The recorded level, not the declaration, decides an edge, so two shapes
-    /// whose trigger wiring a declaration rule would misjudge come out right.
-    /// A data-trigger node whose trigger is another producer's topic and whose
-    /// non-trigger `block` input reads the relay fires at the relay's level:
-    /// Unaccounted. A node triggered on the relay's second output, whose
-    /// non-trigger `block` input reads the relay's first, fires a level after
-    /// the relay: Counted.
+    /// Each rank's levels come from that rank's FIRE records alone. Each rank
+    /// names its nodes by its own manifest index, so one index is a different
+    /// node on each: rank 0's `a` (index 0, level 0) and `b` (index 1, level
+    /// 1), rank 1's `x` (index 0, level 2), `y` (index 1, level 1) and `z`
+    /// (index 2, level 3). Rank 0's `c` (index 2) never fires, though rank 1's
+    /// `z` at that index does. Neither rank's map takes the other's fires or a
+    /// step boundary.
+    #[test]
+    fn each_rank_reads_its_fire_levels_off_its_own_fire_records() {
+        use cerulion_bag::{BagWriter, BagWriterConfig};
+        use cerulion_core::trace_ring::{
+            TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY,
+        };
+        use RecordedLevel::One;
+        let record =
+            |record_type: u32, step: u64, rank: u32, node_idx: u32, level: u32| TraceRingRecord {
+                step,
+                fire_time_ns: step,
+                duration_ns: 0,
+                node_idx,
+                global_level: level,
+                record_type,
+                reserved: rank,
+            };
+        let fire =
+            |step, rank, node_idx, level| record(RECORD_TYPE_FIRE, step, rank, node_idx, level);
+        let boundary = |step, rank| record(RECORD_TYPE_STEP_BOUNDARY, step, rank, 0, 0);
+        let records = [
+            boundary(0, 0),
+            boundary(0, 1),
+            fire(0, 0, 0, 0),
+            fire(0, 0, 1, 1),
+            fire(0, 1, 0, 2),
+            fire(0, 1, 1, 1),
+            fire(0, 1, 2, 3),
+            boundary(1, 0),
+            boundary(1, 1),
+            fire(1, 0, 0, 0),
+            fire(1, 1, 2, 3),
+        ];
+        let dir = tempfile::tempdir().expect("a bag directory");
+        let path = dir.path().join("two_rank_levels.mcap");
+        let mut w = BagWriter::create(&path, BagWriterConfig::default(), &[]).expect("a bag");
+        for (seq, r) in records.iter().enumerate() {
+            w.write_scheduler_trace(u32::try_from(seq).unwrap(), r.step, r.step, r)
+                .expect("a trace record");
+        }
+        w.finalize().expect("the bag finalizes");
+        let trace = RecordedTrace::new(Arc::new(
+            cerulion_bag::BagReader::open(&path).expect("the bag opens"),
+        ));
+        let tables: Vec<Vec<Arc<str>>> = vec![
+            vec!["a".into(), "b".into(), "c".into()],
+            vec!["x".into(), "y".into(), "z".into()],
+        ];
+        assert_eq!(
+            recorded_fire_levels(&trace, &tables, 0).expect("the trace walks"),
+            BTreeMap::from([("a".to_string(), One(0)), ("b".to_string(), One(1))])
+        );
+        assert_eq!(
+            recorded_fire_levels(&trace, &tables, 1).expect("the trace walks"),
+            BTreeMap::from([
+                ("x".to_string(), One(2)),
+                ("y".to_string(), One(1)),
+                ("z".to_string(), One(3)),
+            ])
+        );
+    }
+
+    /// The recorded level, not the declaration, decides an edge. A data-trigger
+    /// node whose trigger is another producer's topic, and whose non-trigger
+    /// `block` input reads the relay, fires at the relay's level: Unaccounted,
+    /// as a rule reading the declared trigger would also give. A node triggered
+    /// on the relay's second output, whose non-trigger `block` input reads the
+    /// relay's first, fires a level after the relay: Counted, where a rule
+    /// reading the declared trigger would leave it uncounted.
     #[test]
     fn a_non_trigger_block_input_counts_by_the_recorded_level_of_its_node() {
         use cerulion_core::graph::node::{
@@ -39822,9 +39894,10 @@ mod trigger_input_capacity_tests {
         let beside = format!(
             "name: bs\nprefix: bs\nnodes:\n\
              \x20 - id: other\n    type: w\n    outputs:\n{o}\
-             \x20 - id: relay\n    type: w\n    outputs:\n{o}\
+             \x20 - id: relay\n    type: w\n    inputs:\n{r}    outputs:\n{o}\
              \x20 - id: sink\n    type: w\n    inputs:\n{t}{x}",
             o = out("out"),
+            r = input("inp", "other/out"),
             t = input("t", "other/out"),
             x = input("x", "relay/out"),
         );

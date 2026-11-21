@@ -298,15 +298,16 @@ graph lists the topic in `multi_publisher_topics`, the input sets
 `block_timeout_ms`, whose release forgives the slot's frames with no record,
 the bag's fire records do not put the reading node on a later level than the
 producer (its read can then drain the slot before the producer decides in the
-same step), or the input is a Sync node's trigger input, which its matcher
-pops outside the node's body. A `block` edge is counted only where the bag's
-fire records put its consumer on a later level than its producer. From the
-step after a truncated read of the input, a drain whose site the read log does
-not say, or a consumer fire before any body read of the input is recorded, the slot
-allows for none; nor on a resumed pass until the consumer first reads its
-queue empty. A consumer's stop releases its slot from the next step on. As
-for a throttle, whose window the rule reads off the recorded clock, a step no
-such check could defer owes every popped frame a fire. Read through one
+same step, or the bag does not show the order, and such an edge leaves the
+slot uncounted), or the input is a Sync node's trigger input, which its
+matcher pops outside the node's body. A node the recording fired at more than
+one level, or never fired, orders no edge. From the step after a truncated
+read of the input, a drain whose site the read log does not say, or a consumer
+fire before any body read of the input is recorded, the slot allows for none;
+nor on a resumed pass until the consumer first reads its queue empty. A
+consumer's stop releases its slot from the next step on. As for a throttle,
+whose window the rule reads off the recorded clock, a step no such check could
+defer owes every popped frame a fire. Read through one
 subscriber, such a node may leave one popped frame unfired at a step a check
 could defer, or at a step that fired the scheduler's cap of 64, and the
 replay pops that frame after the step's last fire, as the live burst did, so
