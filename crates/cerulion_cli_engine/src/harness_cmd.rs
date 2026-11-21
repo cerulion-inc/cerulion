@@ -167,6 +167,21 @@ pub fn others_can_write(_dir: &Path) -> bool {
     false
 }
 
+/// Whether `dir` has the sticky bit (S_ISVTX), as a shared folder such as
+/// `/tmp` has: every user may create entries there, so its write bit for
+/// others is meant, and taking it off would lock every other user out.
+#[cfg(unix)]
+fn is_sticky(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o1000 != 0)
+}
+
+/// Whether `dir` has the sticky bit: never, on a platform without unix modes.
+#[cfg(not(unix))]
+fn is_sticky(_dir: &Path) -> bool {
+    false
+}
+
 /// What the walk up from the binary's directory found ([`checkout_root`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckoutRoot<'a> {
@@ -281,9 +296,11 @@ pub fn find_harness_dir(
         });
     }
     // The closing remedy: a harness beside the binary refused only for its
-    // mode is fixed by that folder's mode; otherwise no harness is anywhere.
+    // mode is fixed by that folder's mode, unless the folder is a sticky
+    // shared one such as /tmp, whose mode is meant; otherwise no harness is
+    // anywhere.
     let remedy = match (beside.as_deref(), beside_shared) {
-        (Some(dir), Some(shared)) if holds_harness(dir) => format!(
+        (Some(dir), Some(shared)) if holds_harness(dir) && !is_sticky(shared) => format!(
             "The harness beside cerulion is not used only because every user can write to \
              '{shared}'. Run `chmod o-w '{shared}'`, then run the command again.",
             shared = shared.display()
@@ -783,6 +800,13 @@ mod tests {
             )),
             "{said}"
         );
+        // A sticky shared folder's mode is meant, so the refusal offers the
+        // release package or a clone, never a chmod of that folder.
+        assert!(
+            said.contains("The current directory is never searched. A release package installs"),
+            "{said}"
+        );
+        assert!(!said.contains("chmod o-w"), "{said}");
     }
 
     #[cfg(unix)]
