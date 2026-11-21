@@ -15,8 +15,8 @@
 //!    never a fall through to the rungs below.
 //! 2. `harness/` in the directory of the canonicalized running binary.
 //!    Canonicalized, so a link to `cerulion` in a `bin` directory still
-//!    reaches the folder beside the real binary. The release packages do not
-//!    install a harness there.
+//!    reaches the folder beside the real binary. Every release package
+//!    installs the harness there.
 //! 3. `harness/` at the root of the Cerulion source checkout the
 //!    canonicalized binary sits in: the nearest of the binary's directory and
 //!    the folders above it that holds [`CHECKOUT_MARKER`] ([`checkout_root`]),
@@ -27,8 +27,8 @@
 //!
 //! A folder holds a harness when both [`LAUNCHER`] and [`INSTALL_SCRIPT`] are
 //! files in it. Rungs 2 and 3 take a folder only when no folder on the way to
-//! it from the binary's directory, both ends included, can be written by users
-//! other than its owner ([`others_can_write`]). The walk of rung 3 stops at the
+//! it from the binary's directory, both ends included, can be written by
+//! every user (o+w, [`others_can_write`]); group write is not read. The walk of rung 3 stops at the
 //! first such folder, so a `harness/` and a marker planted in a shared folder
 //! such as `/tmp` are never run.
 //!
@@ -149,7 +149,7 @@ fn holds_harness(dir: &Path) -> bool {
     dir.join(LAUNCHER).is_file() && dir.join(INSTALL_SCRIPT).is_file()
 }
 
-/// Whether users other than its owner can write to `dir`: its mode has the
+/// Whether every user can write to `dir` (o+w): its mode has the
 /// write bit for others, as `/tmp` and every folder of mode 1777 have, so any
 /// user of the machine can add files there. `false` for a folder whose mode
 /// cannot be read, such as one that does not exist, and on a platform without
@@ -160,10 +160,26 @@ pub fn others_can_write(dir: &Path) -> bool {
     std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o002 != 0)
 }
 
-/// Whether users other than its owner can write to `dir`: never, on a platform
+/// Whether every user can write to `dir` (o+w): never, on a platform
 /// without unix modes.
 #[cfg(not(unix))]
 pub fn others_can_write(_dir: &Path) -> bool {
+    false
+}
+
+/// Whether `dir` has the sticky bit (S_ISVTX), as a shared folder such as
+/// `/tmp` has: every user may create entries there, so its write bit for
+/// others is meant, and taking it off would lock every other user out.
+/// `false` for a folder whose mode cannot be read.
+#[cfg(unix)]
+fn is_sticky(dir: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(dir).is_ok_and(|meta| meta.permissions().mode() & 0o1000 != 0)
+}
+
+/// Whether `dir` has the sticky bit: never, on a platform without unix modes.
+#[cfg(not(unix))]
+fn is_sticky(_dir: &Path) -> bool {
     false
 }
 
@@ -171,10 +187,10 @@ pub fn others_can_write(_dir: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckoutRoot<'a> {
     /// The nearest folder that holds [`CHECKOUT_MARKER`]. Neither it nor any
-    /// folder below it on the way up can be written by other users.
+    /// folder below it on the way up can be written by every user (o+w).
     Found(&'a Path),
-    /// The walk stopped at this folder, which other users can write to
-    /// ([`others_can_write`]), whether or not it holds the marker; no folder
+    /// The walk stopped at this folder, which every user can write to
+    /// (o+w, [`others_can_write`]), whether or not it holds the marker; no folder
     /// below it on the way up does.
     StoppedAt(&'a Path),
     /// No folder up to the file system root holds the marker.
@@ -183,7 +199,7 @@ pub enum CheckoutRoot<'a> {
 
 /// The root of the Cerulion source checkout `exe_dir` sits in: the nearest of
 /// `exe_dir` and the folders above it that holds [`CHECKOUT_MARKER`]. The walk
-/// stops at the first folder other users can write to, whether or not it
+/// stops at the first folder every user can write to (o+w), whether or not it
 /// holds the marker, so a marker planted there, or in any folder above it, is
 /// never taken.
 pub fn checkout_root(exe_dir: &Path) -> CheckoutRoot<'_> {
@@ -247,7 +263,7 @@ pub fn find_harness_dir(
         return Ok(FoundHarness { dir, source });
     }
     // Rung 2: the folder beside the binary, when neither the binary's
-    // directory nor the folder itself is one other users can write to.
+    // directory nor the folder itself is one every user can write to (o+w).
     let beside_shared = exe_dir
         .zip(beside.as_deref())
         .and_then(|(exe_dir, beside)| {
@@ -264,8 +280,8 @@ pub fn find_harness_dir(
             source: HarnessSource::Packaged,
         });
     }
-    // Rung 3: the harness folder of the checkout root, when other users
-    // cannot write to it.
+    // Rung 3: the harness folder of the checkout root, when not every user
+    // can write to it (o+w).
     let root = exe_dir.map(checkout_root);
     let checkout_harness = match root {
         Some(CheckoutRoot::Found(root)) => Some(root.join(HARNESS_FOLDER)),
@@ -280,13 +296,32 @@ pub fn find_harness_dir(
             source: HarnessSource::Checkout,
         });
     }
+    // The closing remedy: a harness beside the binary refused only for its
+    // mode is fixed by that folder's mode, unless the folder is a sticky
+    // shared one such as /tmp, whose mode is meant; otherwise, and for a
+    // sticky folder, the release-package remedy.
+    let remedy = match (beside.as_deref(), beside_shared) {
+        (Some(dir), Some(shared)) if holds_harness(dir) && !is_sticky(shared) => format!(
+            "The harness beside cerulion is not used only because every user can write to \
+             '{shared}'. Run `chmod o-w '{shared}'`, then run the command again.",
+            shared = shared.display()
+        ),
+        _ => format!(
+            "A release package installs the harness beside cerulion: reinstall from one, or set \
+             {HARNESS_DIR_ENV} to the harness folder of a clone of \
+             https://github.com/cerulion-inc/cerulion at v{version} (`git clone --depth 1 \
+             --branch v{version} https://github.com/cerulion-inc/cerulion`), or run a cerulion \
+             built in a checkout.",
+            version = env!("CARGO_PKG_VERSION")
+        ),
+    };
     let beside = match (beside.as_deref(), beside_shared) {
         (Some(dir), Some(shared)) if shared == dir => format!(
-            "'{}', which is not taken because other users can write to it",
+            "'{}', which is not taken because every user can write to it",
             dir.display()
         ),
         (Some(dir), Some(shared)) => format!(
-            "'{}', which is not taken because other users can write to '{}'",
+            "'{}', which is not taken because every user can write to '{}'",
             dir.display(),
             shared.display()
         ),
@@ -296,7 +331,7 @@ pub fn find_harness_dir(
     let checkout = match (exe_dir, root, checkout_harness) {
         (_, Some(CheckoutRoot::Found(_)), Some(dir)) if others_can_write(&dir) => format!(
             "'{}', the harness folder of the Cerulion source checkout the binary sits in, which \
-             is not taken because other users can write to it",
+             is not taken because every user can write to it",
             dir.display()
         ),
         (_, Some(CheckoutRoot::Found(_)), Some(dir)) => format!(
@@ -306,7 +341,7 @@ pub fn find_harness_dir(
         ),
         (Some(exe_dir), Some(CheckoutRoot::StoppedAt(shared)), _) => format!(
             "a Cerulion source checkout around the binary, but the search up from '{}' stopped \
-             at '{}', which other users can write to, and no folder on the way there holds \
+             at '{}', which every user can write to, and no folder on the way there holds \
              {CHECKOUT_MARKER}",
             exe_dir.display(),
             shared.display()
@@ -322,9 +357,7 @@ pub fn find_harness_dir(
     };
     Err(CliError::Validation(format!(
         "no Cerulion harness found. Looked at (1) {HARNESS_DIR_ENV}, which is unset, (2) \
-         {beside}, and (3) {checkout}. The current directory is never searched. Set \
-         {HARNESS_DIR_ENV} to the harness folder of a checkout of \
-         https://github.com/cerulion-inc/cerulion, or run a cerulion built in one"
+         {beside}, and (3) {checkout}. The current directory is never searched. {remedy}"
     )))
 }
 
@@ -660,14 +693,18 @@ mod tests {
             format!(
                 "no Cerulion harness found. Looked at (1) CERULION_HARNESS_DIR, which is \
                  unset, (2) '{}', and (3) a Cerulion source checkout around the binary, but \
-                 the search up from '{}' stopped at '{}', which other users can write to, \
+                 the search up from '{}' stopped at '{}', which every user can write to, \
                  and no folder on the way there holds crates/cerulion_cli/Cargo.toml. The \
-                 current directory is never searched. Set CERULION_HARNESS_DIR to the harness \
-                 folder of a checkout of https://github.com/cerulion-inc/cerulion, or run a \
-                 cerulion built in one",
+                 current directory is never searched. A release package installs the harness \
+                 beside cerulion: reinstall from one, or set CERULION_HARNESS_DIR to the harness \
+                 folder of a clone of https://github.com/cerulion-inc/cerulion at v{version} \
+                 (`git clone --depth 1 --branch v{version} \
+                 https://github.com/cerulion-inc/cerulion`), or run a cerulion built in a \
+                 checkout.",
                 exe_dir.join("harness").display(),
                 exe_dir.display(),
-                root.fence().display()
+                root.fence().display(),
+                version = env!("CARGO_PKG_VERSION")
             )
         );
         // From the file system root, which only its owner can write to, the
@@ -710,7 +747,7 @@ mod tests {
         assert!(
             said.contains(&format!(
                 "(3) a Cerulion source checkout around the binary, but the search up from '{}' \
-                 stopped at '{}', which other users can write to, and no folder on the way there \
+                 stopped at '{}', which every user can write to, and no folder on the way there \
                  holds crates/cerulion_cli/Cargo.toml.",
                 exe_dir.display(),
                 root.fence().display()
@@ -740,7 +777,7 @@ mod tests {
         assert!(
             said.contains(&format!(
                 "(2) '{}', and (3) a Cerulion source checkout around the binary, but the search \
-                 up from '{}' stopped at '{}', which other users can write to, and no folder on \
+                 up from '{}' stopped at '{}', which every user can write to, and no folder on \
                  the way there holds crates/cerulion_cli/Cargo.toml.",
                 own.join("harness").display(),
                 own.display(),
@@ -754,9 +791,9 @@ mod tests {
         let said = message(find_harness_dir(None, Some(&shared)));
         assert!(
             said.contains(&format!(
-                "(2) '{}', which is not taken because other users can write to '{}', and (3) a \
+                "(2) '{}', which is not taken because every user can write to '{}', and (3) a \
                  Cerulion source checkout around the binary, but the search up from '{}' \
-                 stopped at '{}', which other users can write to",
+                 stopped at '{}', which every user can write to",
                 shared.join("harness").display(),
                 shared.display(),
                 shared.display(),
@@ -764,6 +801,13 @@ mod tests {
             )),
             "{said}"
         );
+        // A sticky shared folder's mode is meant, so the refusal offers the
+        // release package or a clone, never a chmod of that folder.
+        assert!(
+            said.contains("The current directory is never searched. A release package installs"),
+            "{said}"
+        );
+        assert!(!said.contains("chmod o-w"), "{said}");
     }
 
     #[cfg(unix)]
@@ -778,11 +822,44 @@ mod tests {
         let said = message(find_harness_dir(None, Some(&exe_dir)));
         assert!(
             said.contains(&format!(
-                "(2) '{}', which is not taken because other users can write to it, and (3)",
+                "(2) '{}', which is not taken because every user can write to it, and (3)",
                 beside.display()
             )),
             "{said}"
         );
+        // A harness refused only for its mode closes with the mode's remedy.
+        assert!(
+            said.ends_with(&format!(
+                "The current directory is never searched. The harness beside cerulion is not \
+                 used only because every user can write to '{shared}'. Run `chmod o-w \
+                 '{shared}'`, then run the command again.",
+                shared = beside.display()
+            )),
+            "{said}"
+        );
+        // So does one refused for the mode of the binary's folder, which the
+        // remedy names; the release-package remedy is not offered.
+        chmod(&beside, 0o755);
+        chmod(&exe_dir, 0o777);
+        let said = message(find_harness_dir(None, Some(&exe_dir)));
+        assert!(
+            said.ends_with(&format!(
+                "Run `chmod o-w '{}'`, then run the command again.",
+                exe_dir.display()
+            )),
+            "{said}"
+        );
+        assert!(!said.contains("A release package installs"), "{said}");
+        // A folder every user can write with no harness beside the binary has
+        // no mode to fix: the release-package remedy, and no chmod.
+        std::fs::remove_dir_all(&beside).expect("the harness beside the binary");
+        let said = message(find_harness_dir(None, Some(&exe_dir)));
+        assert!(
+            said.contains("The current directory is never searched. A release package installs"),
+            "{said}"
+        );
+        assert!(!said.contains("chmod o-w"), "{said}");
+        chmod(&exe_dir, 0o755);
         // At the root of the checkout the binary sits in.
         let root = scratch();
         checkout_at(root.path());
@@ -796,7 +873,7 @@ mod tests {
         assert!(
             said.contains(&format!(
                 "(3) '{}', the harness folder of the Cerulion source checkout the binary sits \
-                 in, which is not taken because other users can write to it.",
+                 in, which is not taken because every user can write to it.",
                 checkout_harness.display()
             )),
             "{said}"

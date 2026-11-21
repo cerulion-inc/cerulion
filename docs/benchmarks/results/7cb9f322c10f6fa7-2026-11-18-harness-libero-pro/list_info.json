@@ -1,13 +1,13 @@
 {
  "list": "grid",
  "cells": 100,
- "read": "2026-11-19T08:39:55Z",
+ "read": "2026-11-21T09:40:40Z",
  "frozen_file_sha256": "0d54681f0608794140a08b6ba680f60354b9f1fe83ed5e83455ba1047090f26e",
  "cell_lines_sha256": "d26e271ebea72d377f43cb8ef92940e6a4e0e6fb9c4c2a16dabc2ad3a1d2dcd6",
  "frozen": "2026-11-17T21:22:04Z",
  "confirmed": "2026-11-17T21:22:30Z",
- "scored": 2969,
- "unscored": 31,
+ "scored": 3172,
+ "unscored": 28,
  "not_finished": 0,
- "models": 15
+ "models": 16
 }

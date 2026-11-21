@@ -19,7 +19,9 @@
 #
 # `all` in the observed column means the walk
 # could not attribute the read to one package, so the observing package rides
-# every selection that names a package and no step of it may be gated.
+# every selection that names a package and no step of it may carry a
+# per-package gate. The `code` gate holds on every such selection, so a step
+# may carry that one.
 cerulion_android	test_node_failing_cdylib	dlopen	crates/cerulion_android/tests/embedded_component_failure_test.rs
 cerulion_android	test_node_hang_cdylib	dlopen	crates/cerulion_android/tests/embedded_runtime_test.rs
 cerulion_android	test_node_macro_external_cdylib	dlopen	crates/cerulion_android/tests/embedded_graph_launch_refusal_test.rs

@@ -119,6 +119,21 @@
 //! `job_is_gated` and pinned by
 //! `the_not_cancelled_guard_and_always_are_the_only_job_conditions_that_keep_a_job_pr_blocking`.
 //!
+//! A RUNNER THAT FOLLOWS THE CLASSIFIER. A job whose `runs-on:` reads another
+//! job's output spells exactly `${{ needs.changes.outputs.code == 'true' &&
+//! 'macos-latest' || 'ubuntu-latest' }}`, reads `code` and `pkgs` from a
+//! classifier that produces them, gates EVERY step so that it is false whenever
+//! the classifier selected no package (a top-level `&&` term that is the `code`
+//! gate or a per-package gate), and keeps at least one selection marker that
+//! only prints. When the classifier FAILED the empty output picks Linux, every
+//! `code` gate is false, and a leg reds only where some condition reaches
+//! `fromJSON('')`. A marker's condition carries no leg selector to
+//! short-circuit ahead of it, so with one marker every leg reaches it; without
+//! one, a leg whose per-package gates all sit behind another leg's selector
+//! skips every step and reports green. `routed_job_complaints` is the rule,
+//! pinned on synthetic jobs
+//! by `a_routed_job_is_named_for_an_ungated_step_a_missing_marker_or_another_route`.
+//!
 //! THE BASE, PROBED BEFORE THE DIFF READS IT. The classifier's step resolves a
 //! base, then diffs `$BASE...HEAD` for the changed paths. An empty base turns
 //! that range into `...HEAD`, which git reads as HEAD against HEAD: no path,
@@ -2554,8 +2569,9 @@ fn the_ci_shard_matrix_agrees_with_the_shard_count_argument() {
 
 /// The legs of `legs` a step runs on, read from its `if:`: no condition is
 /// every leg, `matrix.shard == K` is leg K and `matrix.shard != K` every leg
-/// but K, the terms joined by `&&`. Any other term is unreadable here, and so
-/// is a literal no leg carries.
+/// but K, the terms joined by `&&`. The `code` gate ([`SELECTION_CODE_IF`]) is
+/// true or false for every leg alike, so it selects no leg and is passed over.
+/// Any other term is unreadable here, and so is a literal no leg carries.
 fn shard_step_legs(cond: Option<&str>, legs: &[String]) -> Result<BTreeSet<String>, String> {
     let mut out: BTreeSet<String> = legs.iter().cloned().collect();
     let Some(cond) = cond else {
@@ -2568,6 +2584,9 @@ fn shard_step_legs(cond: Option<&str>, legs: &[String]) -> Result<BTreeSet<Strin
         .unwrap_or(cond);
     for term in cond.split("&&") {
         let term = term.trim();
+        if term == SELECTION_CODE_IF {
+            continue;
+        }
         let (literal, keep) = if let Some(rest) = term.strip_prefix("matrix.shard ==") {
             (rest, true)
         } else if let Some(rest) = term.strip_prefix("matrix.shard !=") {
@@ -2706,8 +2725,26 @@ fn a_shard_leg_run_twice_or_never_is_named() {
     let is2x = step("        if: ${{ matrix.shard == 2 }}\n", " --with x");
     let is3q = step("        if: matrix.shard == '3'\n", " --with x");
     let not3 = step("        if: matrix.shard != 3\n", "");
+    let not2_code = step(
+        &format!("        if: matrix.shard != 2 && {SELECTION_CODE_IF}\n"),
+        "",
+    );
+    let is2_code = step(
+        &format!("        if: matrix.shard == 2 && {SELECTION_CODE_IF}\n"),
+        " --with x",
+    );
     let rows: &[(String, &[&str])] = &[
         (job(&format!("{not2}{is2}")), &[]),
+        // The `code` gate beside a leg selector, as `test-macos` spells it,
+        // selects no leg; any other spelling of it is still unreadable.
+        (job(&format!("{not2_code}{is2_code}")), &[]),
+        (
+            job(&step(
+                "        if: matrix.shard != 2 && needs.changes.outputs.code != 'false'\n",
+                "",
+            )),
+            &["t: a shard step's condition: `needs.changes.outputs.code != 'false'` is not a `matrix.shard` leg selector"],
+        ),
         (job(&all), &[]),
         (
             job(&format!("{not2}{is3}")),
@@ -5250,6 +5287,403 @@ fn a_gating_job_without_the_guard_is_named_and_an_ungated_one_is_not() {
         Vec::<String>::new(),
         "a dependant whose own gate follows the call is guarded"
     );
+}
+
+/// The one `runs-on:` value that may read the classifier: macOS where `code` is
+/// `true`, Linux on every other value.
+///
+/// Spelled from [`SELECTION_CODE_IF`], so the runner choice and the step gate
+/// compare the same output the same way. The empty string a FAILED classifier
+/// leaves behind is not `'true'`, so it picks the Linux side, where every
+/// `code` gate is false and a marker's `fromJSON('')` reds the leg.
+fn routed_runs_on() -> String {
+    format!("${{{{ {SELECTION_CODE_IF} && 'macos-latest' || 'ubuntu-latest' }}}}")
+}
+
+/// The `runs-on:` value of one job block, read in every scalar form.
+fn job_runs_on_of(block: &str) -> Option<Result<String, String>> {
+    let lines: Vec<&str> = block.lines().collect();
+    let at = lines.iter().position(|l| l.starts_with("    runs-on:"))?;
+    let rest = &lines[at]["    runs-on:".len()..];
+    Some(read_scalar_value(
+        "runs-on",
+        rest,
+        &lines,
+        at,
+        JOB_KEY_INDENT.len(),
+    ))
+}
+
+/// Is this step condition false whenever the classifier selected no package?
+///
+/// Yes for an `&&` chain with no top-level `||` and one top-level term that is
+/// the `code` gate or a per-package gate: the classifier reports `pkgs=[]`
+/// whenever it reports `code=false`, so either term is false there and so is
+/// the chain. A status call beside it (`always()`, `failure()`) does not change
+/// that. A top-level `||` answers no, and so does a parenthesised disjunction
+/// holding the gate: either one can run the step on a change that reaches no
+/// package.
+fn condition_skips_an_empty_selection(cond: &str) -> bool {
+    let expr = condition_expression(cond);
+    if split_top_level(&expr, "||").len() != 1 {
+        return false;
+    }
+    split_top_level(&expr, "&&").iter().any(|term| {
+        let term = strip_outer_parens(term);
+        term == SELECTION_CODE_IF || selection_condition_package(term).is_some()
+    })
+}
+
+/// Is this step condition exactly a selection marker's, the negated
+/// per-package gate and nothing else?
+fn is_selection_marker_condition(cond: &str) -> bool {
+    marked_candidates(cond)
+        .iter()
+        .any(|package| cond.trim() == selection_marker_condition(package))
+}
+
+/// Does this marker step do nothing but print, so that running it on the Linux
+/// leg of a code-free change runs nothing written for another runner?
+///
+/// No `uses:`, and a `run:` script of exactly one `echo` command once a block
+/// scalar header is set aside: no command separator, pipe or substitution on
+/// that line. The marker rule elsewhere holds the line to its `selection:`
+/// text; this holds the step to that one command.
+fn marker_step_only_prints(step: &[&str]) -> bool {
+    if step_carries_key(step, "uses:") {
+        return false;
+    }
+    let script = run_script_of(step).unwrap_or_default();
+    let lines: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|line| !matches!(*line, "" | "|" | "|-" | "|+" | ">" | ">-" | ">+"))
+        .collect();
+    lines.len() == 1
+        && lines[0].starts_with("echo ")
+        && !lines[0].contains([';', '&', '|', '`'])
+        && !lines[0].contains("$(")
+}
+
+/// Every complaint about a job of `text` whose `runs-on:` reads another job's
+/// output, and how many such jobs `text` carries.
+///
+/// Such a job lands on Linux for a change that reaches no package, so a step
+/// left ungated there runs a step written for macOS on the wrong runner, or a
+/// test against a build that never ran. And when the classifier FAILED, a leg
+/// is red only where some condition reaches `fromJSON('')`: a marker reaches
+/// it on every leg, and without one a leg whose per-package gates all sit
+/// behind another leg's selector skips every step and reports green.
+fn routed_job_complaints(text: &str) -> (usize, Vec<String>) {
+    let jobs = jobs_of(text);
+    let declared = declared_selection_outputs(&jobs);
+    let mut routed = 0usize;
+    let mut out = Vec::new();
+    for (job, block) in &jobs {
+        let runs_on = match job_runs_on_of(block) {
+            None => continue,
+            Some(Ok(value)) => value,
+            Some(Err(why)) => {
+                out.push(format!("{job}: {why}"));
+                continue;
+            }
+        };
+        if !runs_on.contains("needs.") {
+            continue;
+        }
+        routed += 1;
+        if runs_on.trim() != routed_runs_on() {
+            out.push(format!(
+                "{job}: `runs-on: {runs_on}` reads another job's output, and the \
+                 one form this walk reads is `{}`",
+                routed_runs_on()
+            ));
+        }
+        let needs_classifier = job_needs_of(block).iter().any(|n| n == SELECTION_JOB);
+        for output in [SELECTION_CODE_OUTPUT, SELECTION_PKGS_OUTPUT] {
+            if !(needs_classifier && declared.contains(output)) {
+                out.push(format!(
+                    "{job}: routes its runner on the classifier and cannot read \
+                     `needs.{SELECTION_JOB}.outputs.{output}`: it does not need \
+                     `{SELECTION_JOB}`, or that job does not produce it"
+                ));
+            }
+        }
+        let mut markers = 0usize;
+        for step in step_blocks(block) {
+            let name = step_name_of(&step)
+                .or_else(|| step.first().map(|line| line.trim().to_string()))
+                .unwrap_or_default();
+            match step_if_of(&step) {
+                Ok(Some(cond)) if is_selection_marker_condition(&cond) => {
+                    if marker_step_only_prints(&step) {
+                        markers += 1;
+                    } else {
+                        out.push(format!(
+                            "{job} / `{name}`: a selection marker runs on the Linux \
+                             leg of a change that reaches no package, so it may do \
+                             nothing but print its one `echo` line"
+                        ));
+                    }
+                }
+                Ok(Some(cond)) if condition_skips_an_empty_selection(&cond) => {}
+                Ok(Some(cond)) => out.push(format!(
+                    "{job} / `{name}`: `if: {cond}` can run the step on the Linux \
+                     leg of a change that reaches no package; carry \
+                     `{SELECTION_CODE_IF}` as a top-level `&&` term"
+                )),
+                Ok(None) => out.push(format!(
+                    "{job} / `{name}`: carries no `if:`, so it runs on the Linux \
+                     leg of a change that reaches no package"
+                )),
+                Err(why) => out.push(format!("{job} / `{name}`: {why}")),
+            }
+        }
+        if markers == 0 {
+            out.push(format!(
+                "{job}: carries no selection marker, so when the classifier \
+                 FAILED a leg whose per-package gates sit behind another leg's \
+                 selector reaches no `fromJSON('')` and reports green"
+            ));
+        }
+    }
+    (routed, out)
+}
+
+/// The live workflows: every job routed on the classifier holds the rule.
+#[test]
+fn a_job_routed_on_the_code_class_gates_every_step_and_keeps_a_marker() {
+    let mut complaints = Vec::new();
+    let mut routed = 0usize;
+    for (file, text) in workflow_texts() {
+        let (jobs, found) = routed_job_complaints(&text);
+        routed += jobs;
+        complaints.extend(found.into_iter().map(|c| format!("  {file} / {c}")));
+    }
+    assert!(
+        complaints.is_empty(),
+        "a job whose runner follows the classifier breaks the routing rule:\n{}",
+        complaints.join("\n")
+    );
+    // The rule is satisfied by finding nothing, so the population is floored:
+    // `test-macos` routes on `code`.
+    assert!(
+        routed >= 1,
+        "no job's `runs-on:` reads the classifier, so the routing rule judged \
+         nothing; `test-macos` should carry `{}`",
+        routed_runs_on()
+    );
+}
+
+/// The routing rule, both sides, on synthetic workflows.
+#[test]
+fn a_routed_job_is_named_for_an_ungated_step_a_missing_marker_or_another_route() {
+    let route = "${{ needs.changes.outputs.code == 'true' && 'macos-latest' || 'ubuntu-latest' }}";
+    let classifier = "on:\n  pull_request:\njobs:\n  changes:\n    runs-on: ubuntu-latest\n    \
+                      outputs:\n      code: ${{ steps.c.outputs.code }}\n      \
+                      pkgs: ${{ steps.c.outputs.pkgs }}\n    steps:\n      - id: c\n        \
+                      run: |\n          echo \"code=true\" >> \"$GITHUB_OUTPUT\"\n          \
+                      echo \"pkgs=[]\" >> \"$GITHUB_OUTPUT\"\n";
+    let marker = "      - name: selection marker, beta\n        \
+                  if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'beta') }}\n        \
+                  run: echo \"selection: skipped beta (selected: x)\"\n";
+    let clean_steps = "      - uses: actions/checkout@v4\n        \
+                       if: needs.changes.outputs.code == 'true'\n      \
+                       - name: alpha tests\n        \
+                       if: matrix.shard == 0 && needs.changes.outputs.code == 'true'\n        \
+                       run: cargo test -p alpha\n      \
+                       - name: beta tests\n        \
+                       if: contains(fromJSON(needs.changes.outputs.pkgs), 'beta')\n        \
+                       run: cargo test -p beta\n      \
+                       - name: save\n        if: >-\n          matrix.shard == 0\n          \
+                       && (env.A == 'all' || contains(env.A, 'x'))\n          \
+                       && needs.changes.outputs.code == 'true'\n        run: true\n      \
+                       - name: upload\n        \
+                       if: always() && needs.changes.outputs.code == 'true'\n        run: true\n";
+    let workflow = |needs: &str, runs_on: &str, steps: &str| {
+        format!(
+            "{classifier}  j:\n{needs}    if: ${{{{ !cancelled() }}}}\n    runs-on: {runs_on}\n    \
+             strategy:\n      matrix:\n        shard: [0, 1]\n    steps:\n{steps}"
+        )
+    };
+    let needs = "    needs: [changes]\n";
+    let with_step = |extra: &str| workflow(needs, route, &format!("{clean_steps}{extra}{marker}"));
+
+    let (routed, found) =
+        routed_job_complaints(&workflow(needs, route, &format!("{clean_steps}{marker}")));
+    assert_eq!(routed, 1, "the routed job is judged");
+    assert_eq!(
+        found,
+        Vec::<String>::new(),
+        "a fully gated routed job passes"
+    );
+
+    // A job that does not route is not judged, whatever its steps carry.
+    let stray = "      - name: stray\n        run: true\n";
+    let (routed, found) = routed_job_complaints(&workflow(
+        needs,
+        "macos-latest",
+        &format!("{clean_steps}{stray}"),
+    ));
+    assert_eq!(
+        (routed, found.len()),
+        (0, 0),
+        "a fixed runner owes nothing: {found:?}"
+    );
+
+    // Every step shape that can run on the Linux leg of a code-free change.
+    for (label, extra) in [
+        ("no condition", stray.to_string()),
+        ("a status call alone", "      - name: stray\n        if: ${{ always() }}\n        run: true\n".to_string()),
+        (
+            "the gate behind a top-level `||`",
+            "      - name: stray\n        \
+             if: matrix.shard == 0 || needs.changes.outputs.code == 'true'\n        run: true\n"
+                .to_string(),
+        ),
+        (
+            "a near miss of the gate",
+            "      - name: stray\n        if: needs.changes.outputs.code != 'false'\n        run: true\n"
+                .to_string(),
+        ),
+        (
+            "the gate inside a parenthesised disjunction",
+            "      - name: stray\n        \
+             if: (needs.changes.outputs.code == 'true' || github.event_name == 'push')\n        \
+             run: true\n"
+                .to_string(),
+        ),
+        (
+            "a leg selector alone",
+            "      - name: stray\n        if: matrix.shard == 1\n        run: true\n".to_string(),
+        ),
+        (
+            "the gate ahead of a top-level `||`",
+            "      - name: stray\n        \
+             if: needs.changes.outputs.code == 'true' && matrix.shard == 0 || github.event_name == 'push'\n        \
+             run: true\n"
+                .to_string(),
+        ),
+        (
+            "a marker that also builds",
+            "      - name: stray\n        \
+             if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'gamma') }}\n        \
+             run: |\n          echo \"selection: skipped gamma (selected: x)\"\n          \
+             cargo build --workspace\n"
+                .to_string(),
+        ),
+        (
+            "a marker that is an action",
+            "      - name: stray\n        \
+             if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'gamma') }}\n        \
+             uses: actions/checkout@v4\n"
+                .to_string(),
+        ),
+        (
+            "a marker whose one line chains another command",
+            "      - name: stray\n        \
+             if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'gamma') }}\n        \
+             run: echo \"selection: skipped gamma (selected: x)\"; cargo build --workspace\n"
+                .to_string(),
+        ),
+        (
+            "an unreadable condition",
+            "      - name: stray\n        if: ''\n        run: true\n".to_string(),
+        ),
+    ] {
+        let (routed, found) = routed_job_complaints(&with_step(&extra));
+        assert_eq!(routed, 1, "{label}: the routed job is judged");
+        assert_eq!(found.len(), 1, "{label}: exactly the stray step is named: {found:?}");
+        assert!(found[0].contains("`stray`"), "{label}: the complaint names the step: {found:?}");
+    }
+
+    // No marker. This fixture's own `beta` gate carries no leg selector, so it
+    // would still red every leg; the rule asks for a marker regardless, because
+    // the next gate added behind a leg selector would leave the other legs
+    // with no `fromJSON('')` to reach.
+    let (_, found) = routed_job_complaints(&workflow(needs, route, clean_steps));
+    assert_eq!(
+        found.len(),
+        1,
+        "a routed job without a marker is named: {found:?}"
+    );
+    assert!(found[0].contains("no selection marker"), "{found:?}");
+
+    // Another spelling over the same output. This one routes every value the
+    // same way, and it is still refused: the walk reads one spelling, so a
+    // route it has not been taught fails here rather than passing unread.
+    let inverted =
+        "${{ needs.changes.outputs.code != 'true' && 'ubuntu-latest' || 'macos-latest' }}";
+    let (routed, found) = routed_job_complaints(&workflow(
+        needs,
+        inverted,
+        &format!("{clean_steps}{marker}"),
+    ));
+    assert_eq!(routed, 1, "an inverted route is still a route");
+    assert_eq!(found.len(), 1, "the inverted route is named: {found:?}");
+    assert!(found[0].contains("the one form"), "{found:?}");
+
+    // A route on outputs the job cannot read: no `needs:` on the classifier.
+    let (_, found) = routed_job_complaints(&workflow("", route, &format!("{clean_steps}{marker}")));
+    assert_eq!(
+        found.len(),
+        2,
+        "both unreadable outputs are named: {found:?}"
+    );
+    assert!(found.iter().all(|c| c.contains("cannot read")), "{found:?}");
+
+    // A `runs-on:` the scalar reader cannot read is named, never skipped as a
+    // job that does not route.
+    let (routed, found) =
+        routed_job_complaints(&workflow(needs, "''", &format!("{clean_steps}{marker}")));
+    assert_eq!(routed, 0, "an unread runner is not counted as a route");
+    assert_eq!(found.len(), 1, "the unreadable runner is named: {found:?}");
+    assert!(found[0].contains("runs-on"), "{found:?}");
+}
+
+/// The classifier reports `pkgs=[]` beside `code=false`, which is what lets a
+/// per-package gate stand in for the `code` gate in a routed job.
+///
+/// Run on the code-free changes the routing exists for, written out by hand: a
+/// root markdown file no doc-pin marker names, a guide under `.github/`, and
+/// the empty change. Each one stays below the selector, so no cargo resolve is
+/// involved.
+#[test]
+fn a_code_free_change_selects_no_package() {
+    let script = repo_root().join("tools/scripts/ci_changed_paths.sh");
+    for paths in ["AGENTS.md\n", ".github/CONTRIBUTING.md\n", ""] {
+        let mut child = std::process::Command::new(&script)
+            .current_dir(repo_root())
+            .env("GITHUB_EVENT_NAME", "pull_request")
+            .env("CI_SELECTION", "on")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("running tools/scripts/ci_changed_paths.sh");
+        {
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("the classifier's stdin is piped")
+                .write_all(paths.as_bytes())
+                .expect("writing the changed paths");
+        }
+        let out = child.wait_with_output().expect("the classifier exits");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "the classifier failed on {paths:?}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert!(
+            lines.contains(&"code=false") && lines.contains(&"pkgs=[]"),
+            "{paths:?} reaches no package, so the classifier must report `code=false` \
+             beside `pkgs=[]`; it reported:\n{stdout}"
+        );
+    }
 }
 
 /// A job carrying exactly `!cancelled()` or `always()` still credits its

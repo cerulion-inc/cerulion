@@ -11054,23 +11054,51 @@ fn fifo_trailing_refills(
     out
 }
 
-/// How many kind-6 records ONE free-run pass will materialise before it
-/// DECLINES both the steered injection and the re-derivation verdict.
+/// The verifier's record budget: how many records one rank, or one pass, may
+/// hold in memory at each site [`verifier_record_budget`] is read at.
 ///
-/// Both pure modules take SLICES — `plan_topic_injection` needs an edge's whole
-/// recorded read stream before it can place the first frame, and `verify` takes
-/// `&[RecordedStep]` — so driving them for real means holding a rank's read log
-/// in memory, which the rest of this engine deliberately never does (the
-/// `TraceDiffStream` window, the advise-behind). The budget is what
-/// keeps that bounded, and blowing it is REPORTED rather than silently absorbed:
-/// a verifier that quietly stopped verifying would report "compared clean" over
-/// a bag it stopped reading.
+/// One count bounds five sites, three of them whole-recording:
 ///
-/// Sized against the shape it is for, not against a wish: a 10-node rank at one
-/// read per input per step reaches it at ~20k recorded steps, which is a long
-/// recording; past that the pass keeps its PRIMARY gates (the frame diff, the
-/// unconsumed-fire report, the read-log verifier — all streaming) and loses
-/// only the two additive ones.
+/// * the read-log census ([`collect_rank_read_log`]): the reads of ONE rank's
+///   kind-6 stream, cumulative over the whole recording, a folded record of N
+///   counting N ([`BudgetTally`]);
+/// * the frame index ([`collect_topic_frame_index`]): the recorded frames with
+///   a wire header on the topics one rank consumes;
+/// * the schedule: the fires and reads one pass accumulates for the
+///   re-derivation verdict, checked step by step inside the pass loop;
+///
+/// and two per step, a bound against a hostile run count that does not grow
+/// with the recording ([`expand_run`]): the per-step pull of the per-edge
+/// verifier, which counts one step's expansion, and its replayed half, which
+/// counts one edge's within one step.
+///
+/// A LOCKSTEP pass plans no read from the recording
+/// ([`PassVerification::inert`]): it takes no census, builds no frame index of
+/// the frames its ranks consume and accumulates no schedule, so none of the
+/// three whole-recording budgets refuses a lockstep replay or stands its
+/// verdict down. The two per-step sites run in every mode, lockstep included,
+/// and past one of them the per-edge verifier stands the edge down by name.
+/// The frame index of a co-located `multi_publisher_topics` capture diff reads
+/// the frame-index site in every mode too, and past it that diff falls back to
+/// one stream and refuses nothing ([`build_capture_partitionings`]). The rest
+/// is a FREE-RUN pass's.
+///
+/// Past the census budget, a rank that consumes a topic refuses a fed replay
+/// (a `--verify` of a free-run bag that records read identity) in the pre-pass
+/// ([`plan_bag_side_admissions`]), before any rank's first step
+/// (`read_identity_unplanned`), so a fed pass never reaches a census refusal
+/// of its own. Past the frame-index budget, and past the census on a pass that
+/// is not fed, a pass that gates a topic over a read log (every topic a fed
+/// pass consumes, and otherwise a topic its rank both produces and consumes
+/// and no other rank writes, [`rank_enforce_topics`]) is refused at its
+/// prepare (`read_log_budget_declined`), past the frame index only when its
+/// rank recorded a read. Any other pass stands down its read-log-steered
+/// injection and its re-derivation verdict ([`VerifierDecline`]) and runs.
+/// Past the schedule budget the re-derivation verdict stands down with a note.
+/// A census refusal names the reads the rank holds, the budget, the step of
+/// the first read past it and that step's time in the rank's recording
+/// ([`ReadLogOverrun`]); a frame-index refusal names the frames and the budget
+/// ([`FrameIndexOverrun`]).
 const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
 
 /// WHICH of the verifier's three record budgets a call site is asking for.
@@ -11088,7 +11116,9 @@ const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
 /// production value.
 #[derive(Clone, Copy)]
 enum BudgetSite {
-    /// [`collect_rank_read_log`] — this rank's kind-6 records.
+    /// [`collect_rank_read_log`]: this rank's kind-6 records. The per-step
+    /// pull and the replayed half of the per-edge verifier read this site too,
+    /// each against its own per-step count ([`expand_run`]).
     ReadLog,
     /// [`collect_topic_frame_index`] — recorded frames on the topics this
     /// rank consumes.
@@ -11334,13 +11364,57 @@ enum ReadLogCensus {
     Declined(VerifierDecline),
 }
 
+/// The read-log census's count against the verifier's budget.
+///
+/// The census holds every read up to the budget and none past it, and keeps
+/// COUNTING past it, so a decline names how many reads the rank's log holds
+/// and the step at which it ran past the budget, not only the budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BudgetTally {
+    /// Every read counted so far, a folded record counted by its run.
+    total: u64,
+    /// The step of the first record whose reads went past the budget; `None`
+    /// while every read counted fits.
+    over_at_step: Option<u64>,
+}
+
+impl BudgetTally {
+    /// Count one record of `occurrences` reads at `step` against `budget`.
+    ///
+    /// `true` when the record fits: every read counted so far, this record's
+    /// included, is within the budget, so the caller holds it. `false` from the
+    /// first record past the budget on: the tally counts it and the caller
+    /// holds none of it. The fit is [`expand_run`]'s rule (exactly at the
+    /// budget fits), with the reads already held as its `already`.
+    fn add(&mut self, step: u64, occurrences: u32, budget: usize) -> bool {
+        let fits = self.over_at_step.is_none()
+            && !expand_run(
+                occurrences,
+                usize::try_from(self.total).unwrap_or(usize::MAX),
+                budget,
+            )
+            .over_budget;
+        self.total = self.total.saturating_add(u64::from(occurrences));
+        if !fits && self.over_at_step.is_none() {
+            self.over_at_step = Some(step);
+        }
+        fits
+    }
+}
+
 /// Walk ONE rank's kind-6 stream front to back, resolving each record's node
 /// and input name through the rank manifest tables.
 ///
-/// `Ok(None)` = the budget was blown; the caller declines both additive gates
-/// and says so. A record whose `input_idx` the manifest cannot resolve is
-/// SKIPPED (its edge simply has no coverage, which both pure halves already
-/// model as a first-class answer) rather than given an invented name.
+/// [`ReadLogCensus::Declined`] names why the census was declined: over the
+/// budget, or records the rank's manifest cannot place. Over the budget the
+/// walk holds no read past it and counts the rest of the stream, then walks the
+/// rank's step boundaries once, so [`VerifierDecline::ReadLogBudget`] carries
+/// every read the rank holds, the step of the first read past the budget and
+/// that step's time. Whether the caller then refuses or stands down is the
+/// pass's gating ([`REPLAY_VERIFIER_RECORD_BUDGET`]). A record whose node or
+/// `input_idx` the manifest cannot resolve is skipped rather than given an
+/// invented name, and is not counted against the budget; a census within the
+/// budget that skipped one is declined as [`VerifierDecline::ReadLogUnplaceable`].
 ///
 /// # The KIND field is as wide as the bag's format says it is
 ///
@@ -11385,6 +11459,7 @@ fn collect_rank_read_log(
     // shipped build this is the constant itself (see `verifier_record_budget`).
     let budget = verifier_record_budget(BudgetSite::ReadLog);
     let mut out: Vec<CollectedRead> = Vec::new();
+    let mut tally = BudgetTally::default();
     // Read records this rank's own tables cannot place.
     let mut unresolvable: usize = 0;
     while let Some(r) = cursor.consume_next()? {
@@ -11421,14 +11496,17 @@ fn collect_rank_read_log(
         // annotation carries a TOKEN in its aux, never a count, so it expands
         // once (its pair's count rides the READ half).
         let runs = recorded_run_occurrences(kind, r.duration_ns);
-        let plan = expand_run(runs, out.len(), budget);
-        if plan.over_budget {
-            // The census is whole-bag and advisory: over budget it reports
-            // NOTHING rather than a truncated census that would read as a
-            // complete one.
-            return Ok(ReadLogCensus::Declined(VerifierDecline::ReadLogBudget));
+        if !tally.add(r.step, runs, budget) {
+            // Over budget the census reports NOTHING rather than a truncated
+            // census that would read as a complete one: what it held is
+            // released, and the rest of the stream is only counted, so the
+            // decline names the whole log's size. This tail runs on a declined
+            // census only, at prepare, before the pass's first step, and
+            // allocates nothing.
+            out = Vec::new();
+            continue;
         }
-        for _ in 0..plan.take {
+        for _ in 0..runs {
             out.push(CollectedRead {
                 step: r.step,
                 node_id: node_id.clone(),
@@ -11440,6 +11518,19 @@ fn collect_rank_read_log(
                 role,
             });
         }
+    }
+    // The budget cause takes precedence over unplaceable records: a log over
+    // the budget is declined for its size whether or not it also holds a
+    // record the manifest cannot place.
+    if let Some(step) = tally.over_at_step {
+        return Ok(ReadLogCensus::Declined(VerifierDecline::ReadLogBudget(
+            ReadLogOverrun {
+                reads: tally.total,
+                budget: budget as u64,
+                step,
+                time: rank_step_time(trace, rank, step)?,
+            },
+        )));
     }
     // An empty-but-clean census is the wrong answer when the
     // rank plainly HAD read records this bag cannot place.
@@ -11470,6 +11561,35 @@ fn collect_rank_read_log(
         return Ok(ReadLogCensus::Declined(VerifierDecline::ReadLogUnplaceable));
     }
     Ok(ReadLogCensus::Collected(out))
+}
+
+/// Where `step` sits in `rank`'s recording: its boundary target and the
+/// rank's last one, each measured from the rank's first boundary target.
+/// `None` when the rank holds no boundary record of `step`.
+///
+/// One walk of the rank's boundary stream, run only on a declined census.
+/// Every time is the rank's own clock: on a bag that begins mid-run it is time
+/// into the bag, not into the run.
+fn rank_step_time(
+    trace: &RecordedTrace,
+    rank: u32,
+    step: u64,
+) -> Result<Option<RunOutTime>, ReplayError> {
+    let mut cursor = BoundaryCursor::for_rank(trace, rank)?;
+    let mut first: Option<u64> = None;
+    let mut last = 0;
+    let mut at: Option<u64> = None;
+    while let Some(b) = cursor.next()? {
+        first.get_or_insert(b.target_ns);
+        last = b.target_ns;
+        if at.is_none() && b.step == step {
+            at = Some(b.target_ns);
+        }
+    }
+    Ok(match (first, at) {
+        (Some(first), Some(at)) => Some(RunOutTime::from_targets(first, at, last)),
+        _ => None,
+    })
 }
 
 /// One topic's recorded frames, in FILE order.
@@ -11532,15 +11652,26 @@ struct TopicFrameIndex {
     headerless: usize,
 }
 
+/// What [`collect_topic_frame_index`] came back as.
+enum FrameIndexCensus {
+    /// Every topic's index, within the budget.
+    Indexed(BTreeMap<String, TopicFrameIndex>),
+    /// The topics hold more recorded frames with a wire header than the
+    /// budget: no index is returned, and every such frame is counted.
+    OverBudget(FrameIndexOverrun),
+}
+
 /// Walk the recorded frames of `topics` once, collecting each topic's ordered
 /// sequences and wire timestamps and its `sequence -> wire stamp` join table.
 ///
-/// `Ok(None)` = the budget was blown (same contract as
-/// [`collect_rank_read_log`]).
+/// Every recorded frame with a wire header on `topics` counts against the
+/// budget. Past it the walk indexes no further frame and keeps counting, and
+/// the answer is [`FrameIndexCensus::OverBudget`] with the whole count, which
+/// the caller declines or refuses with ([`VerifierDecline::FrameIndexBudget`]).
 fn collect_topic_frame_index(
     rm: &RecordedMessages,
     topics: &BTreeSet<String>,
-) -> Result<Option<BTreeMap<String, TopicFrameIndex>>, ReplayError> {
+) -> Result<FrameIndexCensus, ReplayError> {
     let mut out: BTreeMap<String, TopicFrameIndex> = topics
         .iter()
         .map(|t| {
@@ -11557,10 +11688,10 @@ fn collect_topic_frame_index(
             )
         })
         .collect();
-    let mut total = 0usize;
+    // Recorded frames with a wire header on `topics`, counted past the budget.
+    let mut total: u64 = 0;
     // Same hoist, same reason as the read-log walk above.
-    let budget = verifier_record_budget(BudgetSite::FrameIndex);
-    let mut over_budget = false;
+    let budget = verifier_record_budget(BudgetSite::FrameIndex) as u64;
     rm.for_each_frame(&mut |topic: &str, frame: &[u8]| {
         let Some(idx) = out.get_mut(topic) else {
             return;
@@ -11581,7 +11712,6 @@ fn collect_topic_frame_index(
         };
         total += 1;
         if total > budget {
-            over_budget = true;
             return;
         }
         // Pushed TOGETHER — `TopicFrameIndex::ordinals`' length invariant.
@@ -11600,10 +11730,13 @@ fn collect_topic_frame_index(
             }
         }
     })?;
-    if over_budget {
-        return Ok(None);
+    if total > budget {
+        return Ok(FrameIndexCensus::OverBudget(FrameIndexOverrun {
+            frames: total,
+            budget,
+        }));
     }
-    Ok(Some(out))
+    Ok(FrameIndexCensus::Indexed(out))
 }
 
 // ===========================================================================
@@ -12610,6 +12743,95 @@ struct PassVerification {
     declined_detail: Option<String>,
 }
 
+/// How far one rank's read log ran past the verifier's budget: what a
+/// [`VerifierDecline::ReadLogBudget`] refusal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadLogOverrun {
+    /// Every read the rank's log holds, a folded record counted by its run.
+    reads: u64,
+    /// The budget the census read.
+    budget: u64,
+    /// The step of the first read past the budget.
+    step: u64,
+    /// Where [`Self::step`] sits in the rank's recording; `None` when the rank
+    /// holds no boundary record of that step.
+    time: Option<RunOutTime>,
+}
+
+impl ReadLogOverrun {
+    /// The cause's sentence: the reads, the budget, the step and, when the
+    /// rank recorded that step's boundary, its time.
+    fn sentence(self) -> String {
+        let head = format!(
+            "it holds {} reads, more than the verifier's budget of {} reads per rank, and \
+             reaches the budget at step {}",
+            self.reads, self.budget, self.step
+        );
+        match self.time {
+            Some(time) => format!(
+                "{head}, {} into the rank's {} of recording",
+                seconds_text(time.at_ns),
+                seconds_text(time.span_ns)
+            ),
+            None => head,
+        }
+    }
+}
+
+/// A step's place in its rank's recording, on the rank's own clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunOutTime {
+    /// The step's boundary target, measured from the rank's first one.
+    at_ns: u64,
+    /// The rank's last boundary target, measured from its first one.
+    span_ns: u64,
+}
+
+impl RunOutTime {
+    /// From three boundary targets on one rank's clock: the rank's first, the
+    /// step's and the rank's last.
+    fn from_targets(first_ns: u64, at_ns: u64, last_ns: u64) -> Self {
+        Self {
+            at_ns: at_ns.saturating_sub(first_ns),
+            span_ns: last_ns.saturating_sub(first_ns),
+        }
+    }
+}
+
+/// How far the frames one rank consumes ran past the verifier's budget: what
+/// a [`VerifierDecline::FrameIndexBudget`] refusal names.
+///
+/// It names no time: the frames carry stamps from their producers' clocks,
+/// which no one number line orders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameIndexOverrun {
+    /// Every recorded frame with a wire header on the topics the rank consumes.
+    frames: u64,
+    /// The budget the frame index read.
+    budget: u64,
+}
+
+impl FrameIndexOverrun {
+    /// The cause's sentence: the frames and the budget.
+    fn sentence(self) -> String {
+        format!(
+            "it consumes {} recorded frames, more than the verifier's budget of {} frames per \
+             rank",
+            self.frames, self.budget
+        )
+    }
+}
+
+/// `ns` as seconds with millisecond precision, `"0.055 s"`, truncated toward
+/// zero. Integer arithmetic only, so one count always prints one string.
+fn seconds_text(ns: u64) -> String {
+    format!(
+        "{}.{:03} s",
+        ns / 1_000_000_000,
+        ns % 1_000_000_000 / 1_000_000
+    )
+}
+
 /// WHY one free-run pass declined the two additive gates.
 ///
 /// SIX causes, five of them found at PREPARE time (before the step loop) and
@@ -12630,10 +12852,12 @@ enum VerifierDecline {
     /// The bag's rank manifests carry no readable input tables, so no read
     /// record can be resolved to a `(node, input)` at all.
     InputTables,
-    /// This rank's recorded read log is larger than the record budget.
-    ReadLogBudget,
-    /// This rank consumes more recorded frames than the record budget.
-    FrameIndexBudget,
+    /// This rank's recorded read log is larger than the record budget,
+    /// carrying the count the census took past it.
+    ReadLogBudget(ReadLogOverrun),
+    /// This rank consumes more recorded frames than the record budget,
+    /// carrying the count the frame index took past it.
+    FrameIndexBudget(FrameIndexOverrun),
     /// The per-step accumulation blew the budget MID-PASS (fires + reads).
     ScheduleBudget,
     /// This rank carries read records its own manifest cannot
@@ -12641,11 +12865,11 @@ enum VerifierDecline {
     ///
     /// Its own cause, not a budget one, and that distinction is the whole reason
     /// the variant exists: reported on the budget's channel, the headline
-    /// would tell an operator "the read log is larger
-    /// than the verifier's N-record budget" about a bag whose read log is SMALL
-    /// and whose INPUT TABLE is missing. Raising the budget would do nothing. It
-    /// is also the shape the degrade ladder produces, so the remedy is a
-    /// re-record, which the budget sentence does not say.
+    /// would tell an operator the read log holds more reads than the
+    /// verifier's budget about a bag whose read log is SMALL and whose INPUT
+    /// TABLE is missing. A shorter recording would do nothing. It is also the
+    /// shape the degrade ladder produces, so the remedy is a re-record, which
+    /// the budget sentence does not say.
     ReadLogUnplaceable,
     /// The bag's STAGING declaration could not
     /// be used. TEN conditions route here; among them, ILLUSTRATIVELY and not as
@@ -12682,8 +12906,8 @@ impl VerifierDecline {
     fn code(self) -> &'static str {
         match self {
             Self::InputTables => "verifier_declined_input_tables",
-            Self::ReadLogBudget => "verifier_declined_read_log_budget",
-            Self::FrameIndexBudget => "verifier_declined_frame_index_budget",
+            Self::ReadLogBudget(_) => "verifier_declined_read_log_budget",
+            Self::FrameIndexBudget(_) => "verifier_declined_frame_index_budget",
             Self::ScheduleBudget => "verifier_declined_schedule_budget",
             Self::ReadLogUnplaceable => "verifier_declined_read_log_unplaceable",
             Self::StagingRegime => "verifier_declined_staging_regime",
@@ -12699,20 +12923,8 @@ impl VerifierDecline {
             // Each names the budget the SITE actually read rather than the
             // constant, so the sentence stays true of the run that produced it.
             // In a shipped build the two are the same value.
-            Self::ReadLogBudget => {
-                let budget = verifier_record_budget(BudgetSite::ReadLog);
-                format!(
-                    "its recorded read log is larger than the verifier's \
-                     {budget}-record budget"
-                )
-            }
-            Self::FrameIndexBudget => {
-                let budget = verifier_record_budget(BudgetSite::FrameIndex);
-                format!(
-                    "it consumes more recorded frames than the verifier's \
-                     {budget}-record budget"
-                )
-            }
+            Self::ReadLogBudget(overrun) => overrun.sentence(),
+            Self::FrameIndexBudget(overrun) => overrun.sentence(),
             Self::ScheduleBudget => {
                 let budget = verifier_record_budget(BudgetSite::Schedule);
                 format!(
@@ -12738,6 +12950,36 @@ impl VerifierDecline {
                                     recorded and replayed read logs cannot be truncated \
                                     identically — re-record the bag with this binary"
                 .to_string(),
+        }
+    }
+
+    /// The remedy a refusal on this cause names, for the causes a shorter
+    /// recording cures: each budget counts what the refused free-run replay
+    /// holds in memory, so a recording that holds less is what fits. `None`
+    /// for a cause in the recording's manifest, whose refusal names a
+    /// re-record instead.
+    ///
+    /// Two refusals print it: a fed replay's census refusal
+    /// ([`declined_census_detail`]) and a gated rank's
+    /// ([`enforcement_blocked_by_decline`]), which a resim without `--verify`
+    /// reaches too, so the sentence speaks of this replay rather than of a
+    /// verifying one. The schedule budget declines mid-pass with a note and
+    /// refuses nothing, so no refusal prints its remedy.
+    fn remedy(self) -> Option<&'static str> {
+        match self {
+            Self::ReadLogBudget(_) => Some(
+                "This replay holds each rank's read log in memory up to this budget, so \
+                 replay a recording of this graph no longer than that",
+            ),
+            Self::FrameIndexBudget(_) => Some(
+                "This replay holds the frames each rank consumes in memory up to this budget, \
+                 so replay a shorter recording of this graph",
+            ),
+            Self::ScheduleBudget => Some(
+                "This replay holds each pass's recorded schedule in memory up to this budget, \
+                 so replay a shorter recording of this graph",
+            ),
+            Self::InputTables | Self::ReadLogUnplaceable | Self::StagingRegime => None,
         }
     }
 }
@@ -13273,25 +13515,31 @@ fn rank_has_read_records(trace: &RecordedTrace, rank: u32) -> Result<bool, Repla
 /// ran anyway would serve that edge whatever its queue happened to hold, which is
 /// the coincidence the enforcement removes. `None` when the rank gates nothing,
 /// which keeps every shipped rank split and every lockstep bag on today's path.
+///
+/// The refusal ends with the cause's own remedy ([`VerifierDecline::remedy`]):
+/// a shorter recording for a budget cause, a re-record for any other.
 fn enforcement_blocked_by_decline(
     enforce_topics: &[String],
-    cause: &str,
+    cause: VerifierDecline,
     sentence: &str,
 ) -> Option<ReplayError> {
     if enforce_topics.is_empty() {
         return None;
     }
+    let remedy = cause.remedy().unwrap_or(
+        "Re-record the bag with this binary, or replay it under CERULION_EXECUTION_MODE=lockstep, \
+         whose one gating clock orders every publish against every step",
+    );
     Some(ReplayError::ReadLogNotEnforceable {
         edge: None,
         cause: "read_log_budget_declined".to_string(),
         detail: format!(
             "this rank consumes {} topic(s) it also produces ({}), whose recorded reads the \
              replay must admit at their recorded steps, and the read log they would be built \
-             from was declined before the first step ({cause}): {sentence}. Re-record the bag \
-             with this binary, or replay it under CERULION_EXECUTION_MODE=lockstep, whose one \
-             gating clock orders every publish against every step",
+             from was declined before the first step ({}): {sentence}. {remedy}",
             enforce_topics.len(),
-            enforce_topics.join(", ")
+            enforce_topics.join(", "),
+            cause.code()
         ),
     })
 }
@@ -13414,6 +13662,21 @@ struct RankBagSide {
     /// On a FED replay, the frames every admission that pops consumed, by
     /// recorded identity: what the rank's private feeds publish.
     feed: Option<Arc<crate::replay_feed::FeedPlan>>,
+}
+
+/// The detail of a fed replay's refusal of `rank`, whose read-log census was
+/// declined for `cause`: the cause's token and sentence, then its remedy when
+/// a shorter recording cures it ([`VerifierDecline::remedy`]).
+fn declined_census_detail(rank: u32, cause: VerifierDecline) -> String {
+    let detail = format!(
+        "rank {rank}'s read log was declined ({}): {}",
+        cause.code(),
+        cause.reason()
+    );
+    match cause.remedy() {
+        Some(remedy) => format!("{detail}. {remedy}."),
+        None => detail,
+    }
 }
 
 /// The exit-2 refusal a FED replay answers for a read it cannot feed.
@@ -13756,12 +14019,7 @@ fn plan_bag_side_admissions(
                 return Err(read_identity_refusal(
                     None,
                     "read_identity_unplanned",
-                    format!(
-                        "rank {}'s read log was declined ({}): {}",
-                        plan.rank(),
-                        cause.code(),
-                        cause.reason()
-                    ),
+                    declined_census_detail(plan.rank(), cause),
                 ))
             }
             ReadLogCensus::Declined(_) => continue,
@@ -14216,7 +14474,7 @@ fn prepare_pass_verification(
             // and an unreadable one looked alike from here.
             if !enforce_topics.is_empty() && rank_has_read_records(trace, plan.rank())? {
                 if let Some(refusal) =
-                    enforcement_blocked_by_decline(enforce_topics, cause.code(), &reason)
+                    enforcement_blocked_by_decline(enforce_topics, cause, &reason)
                 {
                     return Err(refusal);
                 }
@@ -14252,9 +14510,19 @@ fn prepare_pass_verification(
         // sentence that is false about the bag and points at a knob that cannot
         // help. Both causes land here; each keeps its own headline and code.
         ReadLogCensus::Declined(cause) => {
+            // The count and the budget ride the line on a budget cause; an
+            // unplaceable-records decline has neither.
+            let (reads, budget) = match cause {
+                VerifierDecline::ReadLogBudget(overrun) => {
+                    (Some(overrun.reads), Some(overrun.budget))
+                }
+                _ => (None, None),
+            };
             tracing::warn!(
                 rank = plan.rank(),
                 cause = cause.code(),
+                reads,
+                budget,
                 declines = whole_rank_decline_note(inject_topics),
                 "replay: this rank's read log cannot be censused, so the rank-local \
                  re-derivation verdict is DECLINED for this rank and any read-log-steered \
@@ -14269,7 +14537,7 @@ fn prepare_pass_verification(
             // cannot be built from it, and falling back would replay that edge
             // on whatever its queue held.
             if let Some(refusal) =
-                enforcement_blocked_by_decline(enforce_topics, cause.code(), &cause.reason())
+                enforcement_blocked_by_decline(enforce_topics, cause, &cause.reason())
             {
                 return Err(refusal);
             }
@@ -14292,37 +14560,38 @@ fn prepare_pass_verification(
     for (topic, _, _) in &consumed {
         consumed_topics.insert(topic.clone());
     }
-    let Some(frame_index) = collect_topic_frame_index(recorded_messages, &consumed_topics)? else {
-        tracing::warn!(
-            rank = plan.rank(),
-            budget = verifier_record_budget(BudgetSite::FrameIndex),
-            declines = whole_rank_decline_note(inject_topics),
-            "replay: this rank consumes more recorded frames than the verifier's record \
-             budget, so the rank-local re-derivation verdict is DECLINED for this rank \
-             and any read-log-steered injection it had falls back to the recorded-clock \
-             window — `declines` says what that costs this rank's topics"
-        );
-        if !reads.is_empty() {
-            if let Some(refusal) = enforcement_blocked_by_decline(
-                enforce_topics,
-                VerifierDecline::FrameIndexBudget.code(),
-                &VerifierDecline::FrameIndexBudget.reason(),
-            ) {
-                return Err(refusal);
+    let frame_index = match collect_topic_frame_index(recorded_messages, &consumed_topics)? {
+        FrameIndexCensus::Indexed(index) => index,
+        FrameIndexCensus::OverBudget(overrun) => {
+            tracing::warn!(
+                rank = plan.rank(),
+                frames = overrun.frames,
+                budget = overrun.budget,
+                declines = whole_rank_decline_note(inject_topics),
+                "replay: this rank consumes more recorded frames than the verifier's record \
+                 budget, so the rank-local re-derivation verdict is DECLINED for this rank \
+                 and any read-log-steered injection it had falls back to the recorded-clock \
+                 window; `declines` says what that costs this rank's topics"
+            );
+            let cause = VerifierDecline::FrameIndexBudget(overrun);
+            if !reads.is_empty() {
+                if let Some(refusal) =
+                    enforcement_blocked_by_decline(enforce_topics, cause, &cause.reason())
+                {
+                    return Err(refusal);
+                }
             }
+            return Ok(
+                PassVerification::declined_at_prepare(cause, plan.rank(), inject_topics)
+                    .with_enforcement_skipped(
+                        enforce_topics.len(),
+                        format!(
+                            "this rank's frame index was declined at prepare ({})",
+                            cause.code()
+                        ),
+                    ),
+            );
         }
-        return Ok(PassVerification::declined_at_prepare(
-            VerifierDecline::FrameIndexBudget,
-            plan.rank(),
-            inject_topics,
-        )
-        .with_enforcement_skipped(
-            enforce_topics.len(),
-            format!(
-                "this rank's frame index was declined at prepare ({})",
-                VerifierDecline::FrameIndexBudget.code()
-            ),
-        ));
     };
 
     // ── plan each injected topic ─────────────────────────────────────────────
@@ -20340,14 +20609,19 @@ fn build_capture_partitionings(
     let tokens = load_recorded_publisher_tokens(trace);
     let topics: BTreeSet<String> = candidates.keys().cloned().collect();
     let sidecar = read_producer_sidecar(&trace.reader, &topics);
-    let Some(frame_index) = collect_topic_frame_index(recorded_messages, &topics)? else {
-        tracing::warn!(
-            budget = verifier_record_budget(BudgetSite::FrameIndex),
-            "replay: this pass's co-located multi-publisher topics carry more recorded frames \
-             than the verifier's record budget, so their capture diff falls back to the \
-             single-stream path (which cannot tell two writers' sequence streams apart)"
-        );
-        return Ok(out);
+    let frame_index = match collect_topic_frame_index(recorded_messages, &topics)? {
+        FrameIndexCensus::Indexed(index) => index,
+        FrameIndexCensus::OverBudget(overrun) => {
+            tracing::warn!(
+                frames = overrun.frames,
+                budget = overrun.budget,
+                "replay: this pass's co-located multi-publisher topics carry more recorded \
+                 frames than the verifier's record budget, so their capture diff falls back \
+                 to the single-stream path (which cannot tell two writers' sequence streams \
+                 apart)"
+            );
+            return Ok(out);
+        }
     };
 
     for topic in candidates.keys() {
@@ -28094,8 +28368,8 @@ struct RunExpansion {
 /// which is the hostile-count class `trace_ring`'s own decoder states as a rule
 /// and `arm_at_recorded_capacity`'s doc states as a law ("a bag must never
 /// dictate an allocation"). The expansion happens at THREE sites (the replayed
-/// half included) and all
-/// three sit behind this.
+/// half included) and all three sit behind this, the census by way of
+/// [`BudgetTally::add`].
 ///
 /// # What is shared, stated precisely
 ///
@@ -28108,9 +28382,10 @@ struct RunExpansion {
 /// anything should compare against. What the sites must not do is disagree about
 /// the rule itself, and that is what this function is for.
 ///
-/// They also react differently once it is hit: the census reports nothing at all
-/// (an advisory whole-bag count, so a truncated one would read as complete), and
-/// both compare halves stand the affected EDGE down by name.
+/// They also react differently once it is hit: the census holds nothing past it
+/// and counts the rest of the rank's log, so its decline names the whole count
+/// (a truncated census would read as a complete one), and both compare halves
+/// stand the affected EDGE down by name.
 fn expand_run(occurrences: u32, already: usize, budget: usize) -> RunExpansion {
     let room = budget.saturating_sub(already);
     let want = occurrences as usize;
@@ -30689,6 +30964,104 @@ mod env_divergence_tests {
                 ("SHLVL".to_string(), "HashChanged".to_string()),
             ]
         );
+    }
+
+    /// The `env.json` the recorder writes for one variable given as raw bytes.
+    fn recorded(
+        mode: crate::graph_cmd::RecordEnvMode,
+        name: &str,
+        value: &[u8],
+    ) -> serde_json::Value {
+        use std::os::unix::ffi::OsStrExt as _;
+        let render = crate::graph_cmd::render_env_json(
+            mode,
+            [(
+                name.into(),
+                std::ffi::OsStr::from_bytes(value).to_os_string(),
+            )],
+        );
+        serde_json::from_slice(&render.bytes).expect("env.json parses")
+    }
+
+    #[test]
+    fn a_recorded_non_utf8_value_matches_its_raw_bytes_at_replay_and_a_change_is_reported() {
+        // FNV-1a 64 of \xff\xfe is 0a99c807b6f645b0 and of \xff\xfd
+        // 0a99cb07b6f64ac9, both computed outside the tree.
+        let env = br#"{"CER_X": {"fnv64": "0a99c807b6f645b0", "redacted": true, "utf8": false}}"#;
+        assert_eq!(
+            recorded(crate::graph_cmd::RecordEnvMode::All, "CER_X", b"\xff\xfe"),
+            serde_json::from_slice::<serde_json::Value>(env).unwrap(),
+            "the recorder writes this entry for the value"
+        );
+        assert!(compare_env_against(Some(env), &current(&[("CER_X", b"\xff\xfe")])).is_empty());
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("CER_X", b"\xff\xfd")])
+            )),
+            vec![row(
+                "CER_X",
+                "HashChanged",
+                "redacted variable 'CER_X' hash changed since recording (recorded \
+                 0a99c807b6f645b0, now 0a99cb07b6f64ac9)",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn a_names_only_entry_for_a_value_that_is_not_utf8_is_not_missing_while_it_is_set() {
+        let env = br#"{"CER_X": null}"#;
+        assert_eq!(
+            recorded(crate::graph_cmd::RecordEnvMode::None, "CER_X", b"\xff"),
+            serde_json::from_slice::<serde_json::Value>(env).unwrap(),
+            "the recorder writes this entry for the value"
+        );
+        assert!(compare_env_against(Some(env), &current(&[("CER_X", b"\xff")])).is_empty());
+        assert_eq!(
+            project(&compare_env_against(Some(env), &current(&[]))),
+            vec![row(
+                "CER_X",
+                "Missing",
+                "recorded (names-only) variable 'CER_X' is absent at replay",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn an_entry_marked_utf8_false_compares_like_the_same_hash_without_the_mark() {
+        // FNV-1a 64 of caf\xe9 (Latin-1 "café") is b538f990e85962dc, and of
+        // caf\xc3\xa9 (UTF-8 "café") 48e8823acfa40d89.
+        let marked =
+            br#"{"CER_X": {"fnv64": "b538f990e85962dc", "redacted": true, "utf8": false}}"#;
+        let unmarked = br#"{"CER_X": {"fnv64": "b538f990e85962dc", "redacted": true}}"#;
+        assert_eq!(
+            recorded(
+                crate::graph_cmd::RecordEnvMode::Allowlist,
+                "CER_X",
+                b"caf\xe9"
+            ),
+            serde_json::from_slice::<serde_json::Value>(marked).unwrap(),
+            "the recorder writes the marked entry for the value"
+        );
+        let changed = vec![row(
+            "CER_X",
+            "HashChanged",
+            "redacted variable 'CER_X' hash changed since recording (recorded \
+             b538f990e85962dc, now 48e8823acfa40d89)",
+            None,
+        )];
+        for env in [&marked[..], &unmarked[..]] {
+            assert!(compare_env_against(Some(env), &current(&[("CER_X", b"caf\xe9")])).is_empty());
+            assert_eq!(
+                project(&compare_env_against(
+                    Some(env),
+                    &current(&[("CER_X", b"caf\xc3\xa9")])
+                )),
+                changed
+            );
+        }
     }
 
     #[test]
@@ -36365,9 +36738,11 @@ mod frame_ordinal_collection_tests {
         .collect();
         let rm = RecordedMessages::from_owned_frames(frames);
         let topics: BTreeSet<String> = [topic.to_string()].into_iter().collect();
-        let index = collect_topic_frame_index(&rm, &topics)
-            .expect("the walk succeeds")
-            .expect("and stays inside the budget");
+        let FrameIndexCensus::Indexed(index) =
+            collect_topic_frame_index(&rm, &topics).expect("the walk succeeds")
+        else {
+            panic!("and stays inside the budget");
+        };
         let idx = &index[topic];
 
         assert_eq!(
@@ -36402,9 +36777,12 @@ mod frame_ordinal_collection_tests {
                 .collect();
         let rm = RecordedMessages::from_owned_frames(frames);
         let topics: BTreeSet<String> = [topic.to_string()].into_iter().collect();
-        let idx = &collect_topic_frame_index(&rm, &topics)
-            .expect("the walk succeeds")
-            .expect("and stays inside the budget")[topic];
+        let FrameIndexCensus::Indexed(index) =
+            collect_topic_frame_index(&rm, &topics).expect("the walk succeeds")
+        else {
+            panic!("and stays inside the budget");
+        };
+        let idx = &index[topic];
         assert_eq!(idx.ordinals, vec![0, 1, 2]);
         assert_eq!(idx.headerless, 0);
         assert_eq!(idx.recorded, 3);
@@ -39486,7 +39864,12 @@ mod trailing_refill_tests {
             vec![(0, vec![])]
         );
         let mut declined = verification(&[(0, CAP + 1)], false);
-        declined.declined = Some(VerifierDecline::ReadLogBudget);
+        declined.declined = Some(VerifierDecline::ReadLogBudget(ReadLogOverrun {
+            reads: 2,
+            budget: 1,
+            step: 0,
+            time: None,
+        }));
         assert_eq!(
             derive(&declined, &[(0, CAP)], false, true),
             vec![(0, vec![])]
@@ -40565,5 +40948,264 @@ mod resim_namespace_tests {
         assert_eq!(reclaimed.nodes_left, Ok(0));
         assert_eq!(reclaimed.refusal(), None);
         assert_eq!(namespace_files(&root, slot), BTreeSet::new());
+    }
+}
+
+#[cfg(test)]
+mod verifier_budget_overrun_tests {
+    use super::*;
+
+    /// Feed `records` (`(step, occurrences)`) to a fresh tally against
+    /// `budget`: what each `add` answered, every read counted, and the run-out
+    /// step.
+    fn tally_of(records: &[(u64, u32)], budget: usize) -> (Vec<bool>, u64, Option<u64>) {
+        let mut tally = BudgetTally::default();
+        let fits = records
+            .iter()
+            .map(|&(step, occurrences)| tally.add(step, occurrences, budget))
+            .collect();
+        (fits, tally.total, tally.over_at_step)
+    }
+
+    /// The tally holds reads up to the budget, counts every read past it, and
+    /// names the step of the first record that went past it, against a hand
+    /// oracle at three budgets over one four-read stream.
+    #[test]
+    fn a_budget_tally_counts_every_read_past_the_budget_and_names_the_step_it_ran_out() {
+        let stream = [(0, 1), (0, 1), (1, 1), (2, 1)];
+        // Exactly at the budget fits: `expand_run`'s strict `>`.
+        assert_eq!(tally_of(&stream, 4), (vec![true; 4], 4, None));
+        // One read over: the record at step 2 is the first past it, and it is
+        // still counted.
+        assert_eq!(
+            tally_of(&stream, 3),
+            (vec![true, true, true, false], 4, Some(2))
+        );
+        // A zero budget holds nothing and runs out at the first record.
+        assert_eq!(tally_of(&stream, 0), (vec![false; 4], 4, Some(0)));
+        // Once over, a record small enough to fit what was HELD is still not
+        // held, and the run-out step stays the first one.
+        assert_eq!(
+            tally_of(&[(0, 1), (1, 3), (2, 1)], 3),
+            (vec![true, false, false], 5, Some(1))
+        );
+        // Determinism: the same stream answers the same tally twice.
+        assert_eq!(tally_of(&stream, 3), tally_of(&stream, 3));
+    }
+
+    /// A folded run is counted by every read it stands for, the one that
+    /// straddles the budget included, and the largest runs a record can state
+    /// are counted without overflow and without holding anything.
+    #[test]
+    fn a_folded_run_that_straddles_the_budget_is_counted_whole() {
+        assert_eq!(
+            tally_of(&[(0, 2), (1, 5), (2, 1)], 4),
+            (vec![true, false, false], 8, Some(1))
+        );
+        // 2 x 4,294,967,295 = 8,589,934,590 reads, counted in a u64.
+        assert_eq!(
+            tally_of(&[(0, u32::MAX), (1, u32::MAX)], 200_000),
+            (vec![false, false], 8_589_934_590, Some(0))
+        );
+        // A count at the top of u64 saturates rather than wrapping to a small
+        // number that would read as a log within the budget.
+        let mut tally = BudgetTally {
+            total: u64::MAX - 1,
+            over_at_step: Some(0),
+        };
+        assert!(!tally.add(5, u32::MAX, 200_000));
+        assert_eq!((tally.total, tally.over_at_step), (u64::MAX, Some(0)));
+    }
+
+    /// The reads past the budget, the budget, the step and the time, as the
+    /// census decline renders them, and the same sentence with no time when the
+    /// rank recorded no boundary of that step.
+    #[test]
+    fn the_read_log_budget_sentence_names_the_reads_the_budget_the_step_and_the_time() {
+        let time = RunOutTime::from_targets(1_000_000_000, 1_055_000_000, 1_055_000_000);
+        assert_eq!((time.at_ns, time.span_ns), (55_000_000, 55_000_000));
+        let timed = ReadLogOverrun {
+            reads: 26,
+            budget: 25,
+            step: 11,
+            time: Some(time),
+        };
+        assert_eq!(
+            VerifierDecline::ReadLogBudget(timed).reason(),
+            "it holds 26 reads, more than the verifier's budget of 25 reads per rank, and \
+             reaches the budget at step 11, 0.055 s into the rank's 0.055 s of recording"
+        );
+        assert_eq!(
+            declined_census_detail(0, VerifierDecline::ReadLogBudget(timed)),
+            "rank 0's read log was declined (verifier_declined_read_log_budget): it holds 26 \
+             reads, more than the verifier's budget of 25 reads per rank, and reaches the \
+             budget at step 11, 0.055 s into the rank's 0.055 s of recording. This replay \
+             holds each rank's read log in memory up to this budget, so replay a recording of \
+             this graph no longer than that."
+        );
+        let untimed = ReadLogOverrun {
+            time: None,
+            ..timed
+        };
+        assert_eq!(
+            VerifierDecline::ReadLogBudget(untimed).reason(),
+            "it holds 26 reads, more than the verifier's budget of 25 reads per rank, and \
+             reaches the budget at step 11"
+        );
+        // A step whose target precedes the rank's first saturates to zero.
+        let early = RunOutTime::from_targets(10, 4, 30);
+        assert_eq!((early.at_ns, early.span_ns), (0, 20));
+        // A cause with no shorter-recording remedy keeps its sentence alone.
+        assert_eq!(
+            declined_census_detail(3, VerifierDecline::ReadLogUnplaceable),
+            format!(
+                "rank 3's read log was declined (verifier_declined_read_log_unplaceable): {}",
+                VerifierDecline::ReadLogUnplaceable.reason()
+            )
+        );
+    }
+
+    /// A Vector3-shaped frame carrying `sequence`.
+    fn framed(sequence: u32) -> Vec<u8> {
+        let mut out = vec![0u8; WireHeader::SIZE + 24];
+        WireHeader {
+            schema_hash: 0,
+            total_size: (WireHeader::SIZE + 24) as u32,
+            offset_table_offset: 0,
+            offset_table_count: 0,
+            sequence,
+            timestamp_ns: u64::from(sequence) + 1,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut out);
+        out
+    }
+
+    /// The frames past the budget and the budget, as the frame-index decline
+    /// renders them, and the frame index's own count: every frame with a wire
+    /// header on the consumed topics, past the budget too, and no headerless
+    /// one.
+    #[test]
+    fn the_frame_index_budget_sentence_names_the_frames_and_the_budget() {
+        let overrun = FrameIndexOverrun {
+            frames: 12,
+            budget: 11,
+        };
+        assert_eq!(
+            VerifierDecline::FrameIndexBudget(overrun).reason(),
+            "it consumes 12 recorded frames, more than the verifier's budget of 11 frames per \
+             rank"
+        );
+        // Four headered frames on the two consumed topics: three on `/a`
+        // beside its headerless one, one on `/b`; `/unread` is not consumed.
+        let frames: IndexMap<String, Vec<Vec<u8>>> = [
+            ("/a", vec![framed(0), vec![0u8; 4], framed(1), framed(2)]),
+            ("/b", vec![framed(0)]),
+            ("/unread", vec![framed(0), framed(1)]),
+        ]
+        .into_iter()
+        .map(|(t, f)| (t.to_string(), f))
+        .collect();
+        let rm = RecordedMessages::from_owned_frames(frames);
+        let topics: BTreeSet<String> = ["/a", "/b"].into_iter().map(str::to_string).collect();
+        let census = |budget: usize| {
+            let _guard = override_frame_index_record_budget(budget);
+            match collect_topic_frame_index(&rm, &topics).expect("the walk succeeds") {
+                FrameIndexCensus::OverBudget(o) => Err((o.frames, o.budget)),
+                FrameIndexCensus::Indexed(index) => Ok(index),
+            }
+        };
+        assert_eq!(census(2).err(), Some((4, 2)), "the two past it counted too");
+        assert_eq!(census(3).err(), Some((4, 3)));
+        let index = census(4).expect("exactly at the budget fits");
+        assert_eq!(index["/a"].sequences, vec![0, 1, 2]);
+        assert_eq!(index["/b"].sequences, vec![0]);
+    }
+
+    /// Every decline cause, the remedy a refusal on it ends with: a shorter
+    /// recording for each budget, and the re-record sentence verbatim for every
+    /// cause in the recording's manifest.
+    #[test]
+    fn each_decline_cause_names_its_own_remedy() {
+        const RE_RECORD: &str = "Re-record the bag with this binary, or replay it under \
+                                 CERULION_EXECUTION_MODE=lockstep, whose one gating clock \
+                                 orders every publish against every step";
+        const READ_LOG: &str = "This replay holds each rank's read log in memory up to this \
+                                budget, so replay a recording of this graph no longer than \
+                                that";
+        const FRAMES: &str = "This replay holds the frames each rank consumes in memory up to \
+                              this budget, so replay a shorter recording of this graph";
+        const SCHEDULE: &str = "This replay holds each pass's recorded schedule in memory up \
+                                to this budget, so replay a shorter recording of this graph";
+        let read_log = ReadLogOverrun {
+            reads: 26,
+            budget: 25,
+            step: 11,
+            time: None,
+        };
+        let frames = FrameIndexOverrun {
+            frames: 12,
+            budget: 11,
+        };
+        let topics = ["/t".to_string()];
+        for cause in [
+            VerifierDecline::InputTables,
+            VerifierDecline::ReadLogBudget(read_log),
+            VerifierDecline::FrameIndexBudget(frames),
+            VerifierDecline::ScheduleBudget,
+            VerifierDecline::ReadLogUnplaceable,
+            VerifierDecline::StagingRegime,
+        ] {
+            // Exhaustive, so a seventh cause does not compile until it is
+            // given its remedy here.
+            let (remedy, ends_with) = match cause {
+                VerifierDecline::ReadLogBudget(_) => (Some(READ_LOG), READ_LOG),
+                VerifierDecline::FrameIndexBudget(_) => (Some(FRAMES), FRAMES),
+                VerifierDecline::ScheduleBudget => (Some(SCHEDULE), SCHEDULE),
+                VerifierDecline::InputTables
+                | VerifierDecline::ReadLogUnplaceable
+                | VerifierDecline::StagingRegime => (None, RE_RECORD),
+            };
+            assert_eq!(cause.remedy(), remedy, "{cause:?}");
+            let Some(ReplayError::ReadLogNotEnforceable {
+                edge,
+                cause: token,
+                detail,
+            }) = enforcement_blocked_by_decline(&topics, cause, "SENTENCE")
+            else {
+                panic!("a rank that gates a topic is refused: {cause:?}");
+            };
+            assert_eq!((edge, token.as_str()), (None, "read_log_budget_declined"));
+            assert_eq!(
+                detail,
+                format!(
+                    "this rank consumes 1 topic(s) it also produces (/t), whose recorded reads \
+                     the replay must admit at their recorded steps, and the read log they would \
+                     be built from was declined before the first step ({}): SENTENCE. \
+                     {ends_with}",
+                    cause.code()
+                ),
+            );
+            // A rank that gates nothing is not refused, whatever the cause.
+            assert!(enforcement_blocked_by_decline(&[], cause, "SENTENCE").is_none());
+        }
+    }
+
+    /// Seconds with millisecond precision, in integer arithmetic: truncated
+    /// toward zero, three digits always, and total over `u64`.
+    #[test]
+    fn seconds_text_renders_milliseconds_with_integer_arithmetic() {
+        for (ns, want) in [
+            (0, "0.000 s"),
+            (999_999, "0.000 s"),
+            (1_000_000, "0.001 s"),
+            (55_000_000, "0.055 s"),
+            (1_000_000_000, "1.000 s"),
+            (838_123_456_789, "838.123 s"),
+            (u64::MAX, "18446744073.709 s"),
+        ] {
+            assert_eq!(seconds_text(ns), want, "{ns} ns");
+            assert_eq!(seconds_text(ns), seconds_text(ns), "two calls agree");
+        }
     }
 }

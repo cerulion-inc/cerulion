@@ -206,6 +206,13 @@ Load-bearing boundary contracts:
   session token is metadata for account actions, not a new prior-login or
   durable-pairing prerequisite; the public identity stamp excludes token bytes.
 
+- **Owner presentation**: the wireclient owner-pair exchange offers ordinary ops
+  versions 1 through 2. Its checked entry point runs the caller's identity check
+  once after a supported acknowledgement and before writing the certificate.
+  A failed check sends no pairing request. The caller owns the account/key/epoch
+  comparison and the transport deadline, and must discard a failed stream.
+  The original entry point remains available to callers with a fixed identity.
+
 - **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
   process enumeration, readiness and signal syscalls before spawn. Native pidfds
   bind each signal to its captured process. Only an unavailable pidfd syscall permits the

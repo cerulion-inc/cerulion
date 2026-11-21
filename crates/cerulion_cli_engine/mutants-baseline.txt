@@ -1,8 +1,8 @@
 # Mutation baseline for cerulion_cli_engine: the delivery flag token of
 # `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
-# resumed replay make about a node a checkpoint states as stopped, and the
+# resumed replay make about a node a checkpoint states as stopped, the
 # stand-downs a resumed replay applies to a node whose stop the recording
-# does not state.
+# does not state, and the verifier budget's pure decision functions.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -122,3 +122,40 @@
 # it with a test, or list it here with a reason.
 
 (none)
+
+# Fourth scope: the verifier budget's pure decision functions.
+#
+# Scope: the functions in src/replay_engine.rs that count one rank's reads
+# against the verifier's record budget, place the step the count ran past it,
+# and pick and render what a refusal over the budget says and which remedy it
+# names. The rest of the file walks bags and drives the replay loop over the
+# transport, which the mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --re 'BudgetTally::add|RunOutTime::from_targets|ReadLogOverrun::sentence|FrameIndexOverrun::sentence|seconds_text|VerifierDecline::remedy|declined_census_detail|enforcement_blocked_by_decline' \
+#            --timeout 300 --cap-lints true -- --lib
+#          (run in 5 shards, --shard k/5, in place in a scratch checkout, with
+#          the lib tests' fixture cdylibs built first; the unmutated baseline
+#          passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  22 mutants: 19 caught, 2 unviable, 1 missed. The unviable ones
+#          replace a body with Default::default() on a type that has no
+#          Default (RunOutTime, ReplayError), so they do not compile. Two of
+#          the 22 are field deletions the tool generated in functions outside
+#          the list (InjectionWindow::cross_rank, caught, and
+#          prepare_pass_verification, listed below).
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+replay_engine.rs: delete field channel from struct SidecarReading expression
+in prepare_pass_verification
+  Equivalent. The field is set only when no injected topic is listed in
+  multi_publisher_topics, and with the field deleted the reading falls back to
+  its default channel, Unreadable. Every reader of that reading in
+  prepare_pass_verification (the label join, describe_label_reading and
+  classify_label_reading) runs only for a topic in that empty set, so no
+  output changes.

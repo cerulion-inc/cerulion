@@ -10,6 +10,10 @@ The scanner generates a synthetic 180-beam scan. The controller publishes
 teaching example; a physical robot also needs sensor validity checks,
 stale-input handling and an actuator shutdown path.
 
+The [Cerulion quickstart](https://github.com/cerulion-inc/cerulion#quickstart)
+runs this workspace end to end: record, verify, change the controller and
+verify again.
+
 ## Build and run
 
 ```bash

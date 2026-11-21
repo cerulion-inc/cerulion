@@ -134,10 +134,10 @@ class Bench(unittest.TestCase):
         os.chdir(self.base)
         self.addCleanup(os.chdir, self.cwd)
 
-    def run_cell(self, *extra, out="out"):
+    def run_cell(self, *extra, out="out", model=MODEL):
         self.stdout, self.stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(self.stdout), contextlib.redirect_stderr(self.stderr):
-            return cli.main(["run-cell", "--model", MODEL, "--base-url", self.url, "--key-env", "TEST_KEY",
+            return cli.main(["run-cell", "--model", model, "--base-url", self.url, "--key-env", "TEST_KEY",
                              "--out", out, "--no-endpoint-check", *extra])
 
     def summary(self, out="out"):
@@ -173,16 +173,17 @@ class GoogleEndpoint(Bench):
     def test_it_prints_the_route_the_expectation_one_line_per_reply_and_the_summary_path(self):
         self.run_cell()
         lines = self.stdout.getvalue().splitlines()
-        self.assertEqual(lines[:3], [
+        self.assertEqual(lines[:4], [
             f"{T} start: {CELL} with {MODEL}, setup plain then rcp; results in out",
             '  route aiplatform.googleapis.com: every request body adds {"reasoning_effort": "high"} (the default '
             'for this route); reasoning blocks a reply carries are sent back on the assistant message whose tool '
             "calls they came with, outside the operator's context estimate",
+            "  pictures: plain swap, rcp swap (the default for this model; --image-mode names another)",
             "  expected from the measured runs of gemini-3.8-flash: plain 846.644 operator seconds, 55.87 replies, "
             "1.6665 USD at list price (mean of 100 scored episodes); rcp 258.659 operator seconds, 25.55 replies, "
             "0.3479 USD at list price (mean of 100 scored episodes); an episode stops at 80 replies, 900 control "
             "steps or 5400 s"])
-        self.assertTrue(lines[3].endswith(" (removed at the end)"), lines[3])
+        self.assertTrue(lines[4].endswith(" (removed at the end)"), lines[4])
         # gemini-3.8-flash: 1,000 x 0.75 + 200 x 3.75 = 0.0015; then 1,000 x 0.75 + 1,000 x 0.075 + 100 x 3.75
         # = 0.0012, so far 0.0027. Google's endpoint reports no cost of its own.
         per_reply = [
@@ -198,7 +199,7 @@ class GoogleEndpoint(Bench):
         for arm in ("plain", "rcp"):
             want += [f"{T} running {arm} on {CELL} with {MODEL} ..."] + [x.format(arm=arm) for x in per_reply]
             want += [x.format(arm=f"{arm:5s}") for x in verdict]
-        self.assertEqual(lines[4:], want + ["summary: out/summary.json"])
+        self.assertEqual(lines[5:], want + ["summary: out/summary.json"])
         self.assertEqual(self.stderr.getvalue(), "")
 
     def test_summary_json_records_the_route_and_the_relay(self):
@@ -236,6 +237,59 @@ class GoogleEndpoint(Bench):
         second = (list(self.end.seen), [x.replace("results in b", "results in a").replace("b/summary", "a/summary")
                                         for x in self.stdout.getvalue().splitlines() if "scratch" not in x])
         self.assertEqual(first, second)
+
+
+class Pictures(Bench):
+    """The operator flags each setup's episode driver is handed, and what the start line and summary.json say of
+    them."""
+
+    FLAGS = ("--context-tokens 200000 --max-tokens 32000 --http-timeout 600 --temperature 1.0 --retry-wait 20 "
+             "--seed 1 --extra-body '{\"reasoning_effort\": \"high\"}'")
+
+    def setUp(self):
+        super().setUp()
+        self.seen = os.path.join(self.base, "op_args.jsonl")
+        os.environ["FAKE_DRIVER_OP_ARGS"] = self.seen
+
+    def handed(self):
+        with open(self.seen, encoding="utf-8") as f:
+            return [json.loads(line) for line in f]
+
+    def test_a_claude_model_appends_with_the_harness_tools_only(self):
+        self.assertEqual(self.run_cell(model="claude-sonnet-5-5"), 0)
+        self.assertEqual(self.handed(), [
+            {"arm": "without", "op_args": self.FLAGS},
+            {"arm": "with", "op_args": self.FLAGS + " --image-mode append --cache-prefix-mark"}])
+        self.assertEqual(self.stdout.getvalue().splitlines()[2],
+                         "  pictures: plain swap, rcp append with the opening marked for the prompt cache (the "
+                         "default for this model; --image-mode names another)")
+        self.assertEqual(self.summary()["pictures"], {
+            "from": "the default for this model",
+            "arms": {"plain": {"image_mode": "swap", "operator_flags": []},
+                     "rcp": {"image_mode": "append",
+                             "operator_flags": ["--image-mode", "append", "--cache-prefix-mark"]}}})
+
+    def test_another_model_runs_the_flags_it_ran_before(self):
+        self.assertEqual(self.run_cell(), 0)
+        self.assertEqual(self.handed(), [{"arm": "without", "op_args": self.FLAGS},
+                                         {"arm": "with", "op_args": self.FLAGS}])
+        self.assertEqual(self.summary()["pictures"], {
+            "from": "the default for this model",
+            "arms": {"plain": {"image_mode": "swap", "operator_flags": []},
+                     "rcp": {"image_mode": "swap", "operator_flags": []}}})
+
+    def test_the_option_names_the_mode_of_every_setup(self):
+        self.assertEqual(self.run_cell("--image-mode", "swap", model="claude-sonnet-5-5"), 0)
+        self.assertEqual(self.handed(), [{"arm": "without", "op_args": self.FLAGS},
+                                         {"arm": "with", "op_args": self.FLAGS}])
+        self.assertEqual(self.stdout.getvalue().splitlines()[2],
+                         "  pictures: plain swap, rcp swap (named by --image-mode)")
+        os.remove(self.seen)
+        self.assertEqual(self.run_cell("--image-mode", "append", "--arm", "plain", out="again"), 0)
+        self.assertEqual(self.handed(), [{"arm": "without", "op_args": self.FLAGS + " --image-mode append"}])
+        self.assertEqual(self.summary("again")["pictures"], {
+            "from": "--image-mode", "arms": {"plain": {"image_mode": "append",
+                                                       "operator_flags": ["--image-mode", "append"]}}})
 
 
 class OpenRouter(Bench):

@@ -22,6 +22,7 @@ class ModelNames(unittest.TestCase):
         self.assertEqual(prices.key_of("claude-opus-5-5"), "claude-opus-5.5")
         self.assertEqual(prices.key_of("gpt-6.2-sol-2026-10-01"), "gpt-6.2-sol")
         self.assertEqual(prices.key_of("gpt-6-luna"), "gpt-6-luna")
+        self.assertEqual(prices.key_of("google/gemini-4-neon"), "gemini-4-neon")
 
     def test_a_name_the_table_lacks_has_no_key_and_no_cost(self):
         self.assertIsNone(prices.key_of("some-local-model"))
@@ -32,6 +33,23 @@ class ModelNames(unittest.TestCase):
         for word, key in prices.NAMES:
             self.assertIn(key, prices.PRICES, word)
             self.assertIn(prices.PRICES[key][8], prices.SOURCES, key)
+
+
+class ReadDates(unittest.TestCase):
+    def test_each_row_carries_the_date_it_was_read(self):
+        # The read_on column of the package's prices.csv.
+        self.assertEqual(prices.date_of("gemini-3.8-flash"), "2026-11-17")
+        self.assertEqual(prices.date_of("gpt-6.1-terra"), "2026-11-18")
+        self.assertEqual(prices.date_of("gemini-4-neon"), "2026-11-21")
+
+    def test_a_key_the_table_lacks_reads_as_the_tables_date(self):
+        self.assertEqual(prices.date_of(None), "2026-11-17")
+        self.assertEqual(prices.date_of("no-such-row"), "2026-11-17")
+
+    def test_every_later_date_is_a_row_of_the_table_read_after_it(self):
+        for key, date in prices.READ_LATER.items():
+            self.assertIn(key, prices.PRICES, key)
+            self.assertGreater(date, prices.DATE, key)
 
 
 class Costs(unittest.TestCase):

@@ -2764,8 +2764,9 @@ pub struct BagdConfig {
     /// (each `(name, bytes)` → one MCAP Attachment record, `media_type` inferred
     /// from the name's extension). The graph-integrated recorder passes
     /// `graph.yaml` (the raw graph source) and `env.json` (a sorted snapshot of
-    /// `std::env::vars()`) so a replayer can reconstruct the run
-    /// context. Written with `log_time = create_time = 0` (metadata, off the
+    /// the environment, read with `std::env::vars_os()`) so a replayer can
+    /// compare the run's environment with its own. Written with
+    /// `log_time = create_time = 0` (metadata, off the
     /// wall clock — a determinism requirement of the bag writer). Empty for the
     /// standalone attach-mode binary.
     pub attachments: Vec<(String, Vec<u8>)>,

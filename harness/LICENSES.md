@@ -12,15 +12,15 @@ the same packages, whose bundled libraries can differ; those were not read.
 Copyright (c) 2025-2026 Cerulion Inc. and the Cerulion Contributors
 
 This folder is part of Cerulion. In the words of the Cerulion repository's own notice (its `docs/legal/NOTICE`,
-[NOTICE](../docs/legal/NOTICE)): "This product is licensed under the GNU Affero General Public
+[NOTICE](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/docs/legal/NOTICE)): "This product is licensed under the GNU Affero General Public
 License v3.0 only (AGPL-3.0-only). See the LICENSE file for the full text. A separate commercial license is also
-available from Cerulion." The commercial license: [COMMERCIAL.md](../docs/legal/COMMERCIAL.md); commercial
+available from Cerulion." The commercial license: [COMMERCIAL.md](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/docs/legal/COMMERCIAL.md); commercial
 questions: licensing@cerulion.com. Contributions are accepted under the repository's Contributor License
-Agreement ([Individual CLA](../.github/CLA/individual.md), [Corporate CLA](../.github/CLA/corporate.md)),
+Agreement ([Individual CLA](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/.github/CLA/individual.md), [Corporate CLA](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/.github/CLA/corporate.md)),
 which its contributing guide describes as "a license *grant*, not a copyright *assignment*".
 
 The harness's code is under the GNU Affero General Public License, version 3 only (`AGPL-3.0-only`). The
-full text is in [LICENSE](../LICENSE). Every Python and shell file of ours and `container/Dockerfile` carry the
+full text is in [LICENSE](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/LICENSE). Every Python and shell file of ours and `container/Dockerfile` carry the
 line `SPDX-License-Identifier: AGPL-3.0-only`. One file of the measured code,
 `measured/rcp/bench/ext/libero/native.py`, which the plain setup's tree runs too, also holds the prompt and tool texts of a paper under CC BY 4.0 and is marked
 `AGPL-3.0-only AND CC-BY-4.0`. Files that are not code (this page, the README, the practice and brief texts, the
