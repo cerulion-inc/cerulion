@@ -188,12 +188,12 @@ class Expected(unittest.TestCase):
 
     def test_one_setup_names_only_that_setup(self):
         self.assertEqual(expected.expected_line("claude-opus-5-5", ["rcp"], BUDGET, 1800.0),
-                         "expected from the measured runs of claude-opus-5.5: rcp 278.0592 operator seconds, "
-                         "15.5102 replies, 2.762 USD at list price (mean of 98 scored episodes); an episode stops at "
+                         "expected from the measured runs of claude-opus-5.5: rcp 242.899 operator seconds, "
+                         "15.79 replies, 0.6144 USD at list price (mean of 100 scored episodes); an episode stops at "
                          "80 replies, 900 control steps or 1800 s")
 
     def test_a_model_without_a_measured_run(self):
-        for model in ("a-local-model", "claude-haiku-5-5"):
+        for model in ("a-local-model", "claude-opus-4-8"):
             self.assertEqual(expected.expected_line(model, ["plain"], BUDGET, 5400.0),
                              "expected: no measured run of this model; an episode stops at 80 replies, 900 control "
                              "steps or 5400 s", model)
@@ -204,7 +204,10 @@ class Expected(unittest.TestCase):
                          {"plain": ("100", "51.16", "983.089", "1.89"), "rcp": ("100", "28.76", "340.556", "1.1284")})
         self.assertEqual(expected.MEASURED["grok-4.7"], {"plain": ("99", "74.5758", "2257.498", "2.5703"),
                                                          "rcp": ("100", "29.85", "816.231", "1.347")})
-        self.assertEqual(len(expected.MEASURED), 14)
+        self.assertEqual(expected.MEASURED["claude-haiku-5.5"], {"plain": ("100", "65.36", "1102.673", "0.2558"),
+                                                                 "rcp": ("100", "17.08", "189.998", "0.0233")})
+        self.assertEqual(expected.MEASURED["claude-fable-5.2"]["rcp"], ("99", "14.8586", "485.8212", "1.822"))
+        self.assertEqual(len(expected.MEASURED), 15)  # the package's 15 models, every column complete
 
     def test_every_row_is_a_price_key_with_both_setups(self):
         from cerulion_harness import prices

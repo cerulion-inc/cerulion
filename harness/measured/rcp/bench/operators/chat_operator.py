@@ -5,6 +5,7 @@
         [--max-turns 120] [--keep-images 6] [--temperature 0.2] [--seed N] [--context-tokens 32000]
         [--max-tokens 4096] [--http-timeout 600] [--socket-timeout 900] [--retry-wait 8] [--api-key-env NAME]
         [--extra-body JSON] [--plain-schema] [--one-call-per-reply] [--reply-budget N]
+        [--image-mode swap|append] [--image-high-water N] [--cache-prefix-mark]
 
 Run from ROOT. URL is the endpoint's API root, for example http://127.0.0.1:8000/v1 (vLLM); /chat/completions is
 added. The episode server must already answer on EPDIR/rcp.sock (rcpx/server.py; same protocol as rcpx/cli.py).
@@ -107,7 +108,8 @@ FORCED_CLAIM_RESENDS = 8   # resends of the harness's own closing claim while a 
 class ChatOperator(StrictEndpointMixin):
     def __init__(self, ep_dir, endpoint, model, *, max_turns=120, keep_images=6, temperature=0.2, seed=None,
                  context_tokens=32000, max_tokens=4096, retry_wait_s=8.0, socket_timeout_s=900.0, sleep=time.sleep,
-                 run_info=None, extra_body=None, plain_schema=False, one_call=False, reply_budget=None):
+                 run_info=None, extra_body=None, plain_schema=False, one_call=False, reply_budget=None,
+                 image_mode="swap", image_high_water=0, mark_prefix=False):
         self.ep_dir = os.path.abspath(ep_dir)
         self.body_extra = {**DEFAULT_BODY, **dict(extra_body or {})}  # a None value drops the key from the body
         self.plain = bool(plain_schema)
@@ -120,6 +122,7 @@ class ChatOperator(StrictEndpointMixin):
         self.reply_budget, self.one_call = reply_budget, bool(one_call)
         self.max_turns = int(max_turns if reply_budget is None else reply_budget)
         self.keep_images = int(keep_images)
+        self.image_mode, self.image_high_water, self.mark_prefix = image_mode, int(image_high_water), bool(mark_prefix)
         self.temperature, self.seed, self.max_tokens = temperature, seed, int(max_tokens)
         self.limit_tokens = max(int(context_tokens) // 4, int(context_tokens) - self.max_tokens - REPLY_RESERVE)
         self.retry_wait_s, self.sleep = float(retry_wait_s), sleep
@@ -218,7 +221,8 @@ class ChatOperator(StrictEndpointMixin):
             content = parts
         else:
             content = first
-        self.history = History(system, content, self.keep_images)
+        self.history = History(system, content, self.keep_images, self.image_mode, self.image_high_water,
+                               self.mark_prefix)
         self._log("start", run=self.run_info, surface=listing.get("surface"), task=task, practices_source=source,
                   tools=[t["function"]["name"] for t in self.tools], tools_taken_by_operator=taken,
                   system=system, first_user=first, first_message=first_message, own_tools=self.own_tools,
@@ -533,6 +537,17 @@ def build_parser():
     p.add_argument("--one-call-per-reply", action="store_true",
                    help="run only the first tool call of each reply; the others are answered as not run")
     p.add_argument("--keep-images", type=int, default=6, help="images kept in the history (default 6)")
+    p.add_argument("--image-mode", choices=("swap", "append"), default="swap",
+                   help="swap (default, the published rule): each image beyond the newest --keep-images is replaced "
+                        "by a text inside its older turn on every request; append: older turns are never edited "
+                        "for a picture, so the request prefix stays byte for byte and a prefix cache is read, not "
+                        "written again; pictures then go only at --image-high-water or when the context is tight")
+    p.add_argument("--image-high-water", type=int, default=0,
+                   help="with --image-mode append: when more than this many images are attached, every image "
+                        "beyond the newest --keep-images goes in one request (0, the default: no count limit)")
+    p.add_argument("--cache-prefix-mark", action="store_true",
+                   help="send the first user message as parts with a cache mark on its fixed text, so the tools, "
+                        "the system text and that message are read from the cache after any later edit")
     p.add_argument("--temperature", type=float, default=0.2)
     p.add_argument("--seed", type=int, default=None, help="sampling seed sent with every request")
     p.add_argument("--context-tokens", type=int, default=32000, help="the model's context length (default 32000)")
@@ -564,6 +579,9 @@ def main(argv=None):
          "--max-turns and --reply-budget differ (give one, or the same number)"),
         (ns.max_turns is not None and ns.max_turns < 1, "--max-turns must be at least 1"),
         (ns.keep_images < 0, "--keep-images must be >= 0"),
+        (ns.image_high_water < 0, "--image-high-water must be >= 0"),
+        (0 < ns.image_high_water <= ns.keep_images, "--image-high-water must be above --keep-images (or 0)"),
+        (ns.image_high_water > 0 and ns.image_mode != "append", "--image-high-water needs --image-mode append"),
         (ns.context_tokens < 1000, "--context-tokens must be at least 1000"),
         (not 1 <= ns.max_tokens < ns.context_tokens, "--max-tokens must be from 1 to below --context-tokens"),
         (ns.retry_wait < 0, "--retry-wait must be >= 0"), (not os.path.isdir(ns.ep), "--ep must be a directory"))
@@ -587,12 +605,15 @@ def main(argv=None):
             "temperature": ns.temperature, "seed": ns.seed, "context_tokens": ns.context_tokens,
             "max_tokens": ns.max_tokens, "api_key_env": ns.api_key_env,
             "body_extra": {**DEFAULT_BODY, **extra_body}, "plain_schema": ns.plain_schema,
-            "reply_budget": ns.reply_budget, "one_call_per_reply": ns.one_call_per_reply}
+            "reply_budget": ns.reply_budget, "one_call_per_reply": ns.one_call_per_reply,
+            "image_mode": ns.image_mode, "image_high_water": ns.image_high_water,
+            "cache_prefix_mark": ns.cache_prefix_mark}
     op = ChatOperator(ns.ep, endpoint, ns.model, max_turns=max_turns, keep_images=ns.keep_images,
                       temperature=ns.temperature, seed=ns.seed, context_tokens=ns.context_tokens,
                       max_tokens=ns.max_tokens, retry_wait_s=ns.retry_wait, socket_timeout_s=ns.socket_timeout,
                       run_info=info, extra_body=extra_body, plain_schema=ns.plain_schema,
-                      reply_budget=ns.reply_budget, one_call=ns.one_call_per_reply)
+                      reply_budget=ns.reply_budget, one_call=ns.one_call_per_reply, image_mode=ns.image_mode,
+                      image_high_water=ns.image_high_water, mark_prefix=ns.cache_prefix_mark)
     return op.run()
 
 
