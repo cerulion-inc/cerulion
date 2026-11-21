@@ -296,8 +296,11 @@ keeps no entry for the topic, reports the topic lossy or written by several
 publishers (declared or observed), or any frame drained and never written, the
 graph lists the topic in `multi_publisher_topics`, the input sets
 `block_timeout_ms`, whose release forgives the slot's frames with no record,
-or the input is a Sync node's trigger input, which its matcher pops outside
-the node's body. From the
+the input does not trigger its node (a non-trigger input orders the node
+after nothing, so its read can drain the slot before the producer decides in
+the same step), or the input is a Sync node's trigger input, which its
+matcher pops outside the node's body. Only a data-trigger node's trigger
+input is counted. From the
 step after a truncated read of the input, a drain whose site the read log does
 not say, or a consumer fire before any body read of the input is recorded, the slot
 allows for none; nor on a resumed pass until the consumer first reads its

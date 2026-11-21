@@ -13026,14 +13026,20 @@ struct BlockHoldFlow {
 }
 
 /// One `block` consumer of a [`BlockHoldFlow`]: the node and input that hold
-/// the slot, its depth, and whether the input sets `block_timeout_ms`, whose
-/// release forgives the slot's frames and leaves no record.
+/// the slot, its depth, whether the input sets `block_timeout_ms`, whose
+/// release forgives the slot's frames and leaves no record, and whether the
+/// input triggers the consumer (`build_trigger_edges`, the classification
+/// the runtime levels the graph by). Only a triggering input places the
+/// consumer on a later level than its producer; a non-trigger input adds no
+/// level edge, so its read can drain the slot before the producer decides in
+/// the same step.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockHoldConsumer {
     node: String,
     input: String,
     depth: u64,
     released_on_timeout: bool,
+    triggers_consumer: bool,
 }
 
 /// The topics of the rank whose `block` consumers hold their producers.
@@ -13061,6 +13067,7 @@ fn block_hold_flows(
                 "failed to build rank {rank}'s graph topology for the fire re-derivation: {e}"
             ),
         })?;
+    let trigger_edges = cerulion_core::graph::build_trigger_edges(subgraph, node_infos);
     Ok(topology
         .topics()
         .filter(|flow| flow.holds_its_producers())
@@ -13076,6 +13083,7 @@ fn block_hold_flows(
                     input: c.input.clone(),
                     depth: u64::try_from(c.depth).unwrap_or(u64::MAX),
                     released_on_timeout: c.block_timeout_ms.is_some(),
+                    triggers_consumer: trigger_edges.is_triggering(&c.node_id, &flow.topic),
                 })
                 .collect(),
         })
@@ -13085,10 +13093,14 @@ fn block_hold_flows(
 /// PURE: per node of the rank, the `block` edges that can hold its fire, for
 /// [`replay_rederive::NodeDecl::may_be_held_by`]: per producer, one edge per
 /// `block` consumer of each topic it produces, each with what the bag records
-/// of its slot (`record_of(topic, consumer, input)`). A consumer whose input
-/// sets `block_timeout_ms` gives [`replay_rederive::SlotRecord::Unaccounted`]:
-/// its release forgives the slot's frames and leaves no record, so the bag
-/// cannot account for the slot.
+/// of its slot (`record_of(topic, consumer, input)`). Two consumer inputs give
+/// [`replay_rederive::SlotRecord::Unaccounted`] whatever the bag records: one
+/// that sets `block_timeout_ms`, whose release forgives the slot's frames and
+/// leaves no record, and one that does not trigger its consumer, whose read
+/// the rank's step order does not place after the producer's decide. With a
+/// Sync node's trigger inputs, which [`consumer_body_drain`] leaves
+/// unaccounted since its matcher pops them, only a data-trigger node's trigger
+/// input is counted.
 fn local_block_holds(
     flows: &[BlockHoldFlow],
     record_of: &dyn Fn(&str, &str, &str) -> replay_rederive::SlotRecord,
@@ -13102,7 +13114,7 @@ fn local_block_holds(
                 consumer_node: c.node.clone(),
                 consumer_input: c.input.clone(),
                 depth: c.depth,
-                record: if c.released_on_timeout {
+                record: if c.released_on_timeout || !c.triggers_consumer {
                     replay_rederive::SlotRecord::Unaccounted
                 } else {
                     record_of(&flow.topic, &c.node, &c.input)
@@ -39411,6 +39423,7 @@ mod trigger_input_capacity_tests {
             input: "x".to_string(),
             depth,
             released_on_timeout: false,
+            triggers_consumer: true,
         };
         let mut expected = BTreeMap::from([
             (
@@ -39618,6 +39631,74 @@ mod trigger_input_capacity_tests {
         );
         let held = judge(relay(""));
         assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+    }
+
+    /// A `block` input that does not trigger its consumer leaves its slot
+    /// unaccounted: it adds no level edge, so the consumer can read, and
+    /// drain, the slot before the producer decides in the same step. The same
+    /// graph with the input as the consumer's data trigger keeps the slot the
+    /// bag records.
+    #[test]
+    fn a_block_input_that_does_not_trigger_its_consumer_leaves_its_slot_unaccounted() {
+        use cerulion_core::graph::node::{
+            BackpressurePolicy, InputConsume, InputMeta, MacroPolicy, NodeInfo,
+        };
+        use replay_rederive::{BlockHoldEdge, BodyDrain, SlotRecord};
+        let yaml = "name: bn\nprefix: bn\nnodes:\n\
+                    \x20 - id: relay\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+                    \x20 - id: sink\n    type: w\n    inputs:\n      - name: x\n        source: relay/out\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
+        let counted = SlotRecord::Counted {
+            frame_stamps: vec![1_000],
+            drain: BodyDrain::PerFrame,
+        };
+        let edges = |trigger: bool, policy: MacroPolicy| {
+            let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+            infos.insert(
+                "sink".to_string(),
+                NodeInfo::with_meta(
+                    vec![InputMeta {
+                        name: "x".to_string(),
+                        schema_hash: 0,
+                        trigger,
+                        depth: 1,
+                        backpressure: BackpressurePolicy::Block,
+                        expect_within_ms: None,
+                        consume: InputConsume::Latest,
+                        accumulate: false,
+                    }],
+                    vec![],
+                )
+                .with_policy(policy),
+            );
+            local_block_holds(
+                &block_hold_flows(&config, &infos, 0).expect("builds"),
+                &|_, _, _| counted.clone(),
+            )
+            .remove("relay")
+            .unwrap_or_default()
+        };
+        let edge = |record| BlockHoldEdge {
+            consumer_node: "sink".to_string(),
+            consumer_input: "x".to_string(),
+            depth: 1,
+            record,
+        };
+        assert_eq!(
+            edges(false, MacroPolicy::Period { period_ms: 10 }),
+            vec![edge(SlotRecord::Unaccounted)],
+            "a Period consumer: its input triggers nothing"
+        );
+        assert_eq!(
+            edges(
+                true,
+                MacroPolicy::DataTrigger {
+                    input_name: "x".to_string()
+                }
+            ),
+            vec![edge(counted.clone())],
+            "the consumer's data trigger"
+        );
     }
 
     /// Only a present record-health stamp says a topic's frames are whole: it

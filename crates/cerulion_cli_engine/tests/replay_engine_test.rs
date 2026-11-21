@@ -54556,6 +54556,179 @@ fn a_held_relay_step_with_a_dropped_fire_is_the_finding() {
     assert!(!outcome.passed);
 }
 
+/// A `block` reader of the relay's topic through a NON-trigger input (depth
+/// 2), on a 10 ms period: nothing triggers it, so it sits at level 0, and
+/// each fire reads the input's newest frame, draining its queue. Each fire
+/// publishes the frame it read.
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct PacedBlockReaderNode {
+    #[input(backpressure = block, depth = 2)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl PacedBlockReaderNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// The steps every non-trigger reader recording runs: 0 to 9, so the last
+/// step is one the reader fires at.
+const NT_STEPS: usize = 10;
+
+/// `reader` reads `/nt/<producer>/out` through its non-trigger `block`
+/// input; `producer_type`, with `producer_keys` (its `inputs:` and every key
+/// before `outputs:`), produces it.
+fn nt_yaml(producer: &str, producer_type: &str, producer_keys: &str) -> String {
+    format!(
+        "name: ntgraph\nprefix: nt\nnodes:\n\
+         \x20 - id: reader\n    type: paced_block_reader_node\n    inputs:\n      - name: inp\n        source: {producer}/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: {producer}\n    type: {producer_type}\n{producer_keys}    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+    )
+}
+
+/// Per step, in trace order: each FIRE of `nodes` and each read of
+/// `reader`'s input, as `kind role popped seq`. The order log the reader's
+/// frames are checked against.
+fn nt_order_log(rec: &Recording, nodes: &[&str]) -> Vec<String> {
+    let name = |idx: u32| rec.node_ids[idx as usize].as_str();
+    rec.trace
+        .iter()
+        .filter_map(|r| {
+            if r.record_type == RECORD_TYPE_FIRE && nodes.contains(&name(r.node_idx)) {
+                return Some(format!(
+                    "step {} fire {} level {}",
+                    r.step,
+                    name(r.node_idx),
+                    r.global_level
+                ));
+            }
+            if is_read_record(r) && name(r.node_idx) == "reader" {
+                let (_, kind) = unpack_read_outcome_meta(r.global_level);
+                let seq = if r.fire_time_ns == u64::MAX {
+                    "none".to_string()
+                } else {
+                    r.fire_time_ns.to_string()
+                };
+                return Some(format!(
+                    "step {} read reader kind {} role {:?} popped {} seq {}",
+                    r.step,
+                    kind,
+                    read_site_role(r.global_level),
+                    unpack_read_outcome_popped(r.duration_ns),
+                    seq
+                ));
+            }
+            None
+        })
+        .collect()
+}
+
+/// The reader's served reads, as `(step, served sequence)`.
+fn nt_reader_served(rec: &Recording) -> Vec<(u64, u64)> {
+    let reader = rec.node_ids.iter().position(|n| n == "reader").unwrap() as u32;
+    rec.trace
+        .iter()
+        .filter(|r| {
+            r.node_idx == reader
+                && is_read_record(r)
+                && unpack_read_outcome_meta(r.global_level).1 == READ_OUTCOME_SERVED
+        })
+        .map(|r| (r.step, r.fire_time_ns))
+        .collect()
+}
+
+/// A FIFO relay whose topic a NON-trigger `block` input reads: `src` (5 ms)
+/// -> `relay` (FIFO) -> `reader` (10 ms period, non-trigger `block` input,
+/// depth 2). A non-trigger input adds no DAG edge, so the reader sits at
+/// level 0 and drains the relay's topic before the relay (level 1) decides in
+/// the same step. The hand oracle, from the declared schedule at the
+/// reference run's 5 ms step (step `k` runs at `(k + 1) * 5` ms):
+///
+/// * `src` fires at every step, `x = k + 1` at step `k`, and the relay fires
+///   each frame at its step (`x` 1 to 10), its frame at step `k` carrying
+///   sequence `k`: the reader empties the queue before the relay decides, so
+///   the slot holds at most one frame at a decide and nothing holds the relay;
+/// * the reader fires at the 10 ms steps 1, 3, 5, 7 and 9, first in its step:
+///   at step `2j + 1` it reads the relay's frames up to the step `2j` one
+///   (`x = 2j + 1`), not the step `2j + 1` one, which the relay publishes
+///   after it.
+///
+/// Then the relay's step 9 fire record is taken out, its frame still
+/// recorded, so the clean stamp still states the bag's frames. The relay had
+/// room at step 9, since the reader drained the queue before it decided, so
+/// the pop it left unfired is the finding: re-derived 1 fire, recorded 0. A
+/// slot whose input does not trigger its consumer is unaccounted, so the
+/// relay is judged as if nothing held it, and the recording as it ran still
+/// replays clean.
+#[test]
+#[serial]
+fn a_relay_fire_dropped_at_a_step_its_non_trigger_block_reader_drained_first_is_the_finding() {
+    let yaml = nt_yaml(
+        "relay",
+        "relay_node",
+        "    inputs:\n      - name: inp\n        source: src/out\n",
+    );
+    let make = || {
+        factories(vec![
+            ("reader", Box::new(PacedBlockReaderNodeEntry::new())),
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(RelayNodeEntry::new())),
+        ])
+    };
+    let mut rec = record_uniform_with_read_log(&yaml, make, &[], NT_STEPS);
+    for line in nt_order_log(&rec, &["reader", "relay"]) {
+        eprintln!("nt order: {line}");
+    }
+    assert_eq!(
+        bh_xs(&rec, "/nt/relay/out"),
+        (1..=10).map(f64::from).collect::<Vec<_>>(),
+        "the relay fires every frame: nothing holds it"
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "reader"), vec![1, 3, 5, 7, 9]);
+    assert_eq!(
+        bh_xs(&rec, "/nt/reader/out"),
+        vec![1.0, 3.0, 5.0, 7.0, 9.0],
+        "the reader reads before the relay fires in its step"
+    );
+    assert_eq!(
+        nt_reader_served(&rec),
+        vec![(1, 0), (3, 2), (5, 4), (7, 6), (9, 8)],
+        "at step 2j + 1 the reader serves the relay's step 2j frame"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let whole = dir.path().join("nt_whole.mcap");
+    ri_bag_labelled(&rec, &whole, ri_free_run_recorder_json(), false);
+    let clean = bh_replay_stamped(&whole, make, bh_clean_stamp(&rec));
+    bh_assert_replays(&clean, "the recording as it ran");
+
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == 9)
+        .expect("the relay fires at step 9");
+    rec.trace.remove(at);
+    let fed = dir.path().join("nt_dropped_fire.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
+             step 9 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+        )
+    );
+    assert!(!outcome.passed);
+}
+
 /// A relay nothing holds, on a bag that states its drain: its last fire is
 /// taken out, so its last step pops a frame and fires nothing. The finding is
 /// that step, and it carries no caveat.
