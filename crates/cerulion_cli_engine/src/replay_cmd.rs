@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
 //! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
-//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge the bag splits across ranks on a topic with two or more in-graph producers or with `block_timeout_ms`) |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks on a topic with two or more in-graph producers or with `block_timeout_ms`) |
 //! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
 //! | 4 | none | tolerance-YAML validation error |
 //! | 5 | none | internal error (panic, transport, scheduler) |
@@ -803,8 +803,8 @@ pub enum ReplayError {
         detail: String,
     },
 
-    /// A bag with more than one worker rank whose rank manifests split a
-    /// `block` edge from a topic that two or more in-graph producers write, one
+    /// A free-run bag with more than one worker rank whose rank manifests split
+    /// a `block` edge from a topic that two or more in-graph producers write, one
     /// or more of them in another rank than the consumer. A `block` edge
     /// crosses ranks only on a credit word, which counts one producer's
     /// frames. Exit 2, the not-replay-grade class: it is refused before the
@@ -817,8 +817,8 @@ pub enum ReplayError {
         edge: crate::replay_rank::UncreditableSplitEdge,
     },
 
-    /// A bag with more than one worker rank whose rank manifests split a
-    /// one-producer `block` edge whose input sets `block_timeout_ms`: a
+    /// A free-run bag with more than one worker rank whose rank manifests split
+    /// a one-producer `block` edge whose input sets `block_timeout_ms`: a
     /// timeout release keeps a credit word's count exact only when the
     /// producer and the consumer fire one at a time on one thread. Exit 2,
     /// refused before the first pass, as [`Self::SplitBlockEdgeUncreditable`]
