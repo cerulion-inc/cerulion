@@ -756,11 +756,12 @@ pub enum SlotRecord {
     /// the topic in
     /// `multi_publisher_topics`. Or the consumer's input sets
     /// `block_timeout_ms`, whose release forgives the slot's frames with no
-    /// record; or it does not trigger the consumer, so it adds no level edge
-    /// and its read can drain the slot before the producer decides in the
-    /// same step; or the consumer drains the slot outside its body reads (a
-    /// Sync node's trigger input, which its matcher pops). Only a data-trigger
-    /// node's trigger input is counted. Such a slot never explains a step.
+    /// record; or the bag's fire records do not put the consumer on a later
+    /// level than the producer (the same level, an earlier one, more than one,
+    /// or no recorded fire), so its read can drain the slot before the
+    /// producer decides in the same step; or the consumer drains the slot
+    /// outside its body reads (a Sync node's trigger input, which its matcher
+    /// pops). Such a slot never explains a step.
     Unaccounted,
 }
 
@@ -3990,8 +3991,8 @@ impl SlotBound {
             // to its newest frame, resyncs the slot's queued count and backlog
             // to zero (`credit::CreditWord::record_drained_to_empty`). In a
             // rank's step order a producer sends before its consumer reads (a
-            // counted edge's input triggers its consumer, which puts the
-            // consumer on a later level), so nothing the step sent is left,
+            // counted edge's consumer fires on a later level than its producer
+            // by the bag's fire records), so nothing the step sent is left,
             // and inside a shared clock none
             // of the clock's frames can be placed after the read.
             self.queued = Some(0);
@@ -4042,10 +4043,9 @@ pub(crate) struct StepDeferral {
 ///   under-count only convicts. The count after the step before, plus every
 ///   frame the bag records on the topic at the step ([`SlotRecord::Counted`]),
 ///   with none of the step's drains: in a rank's step order a producer sends
-///   before its consumer reads, since a counted edge is one whose input
-///   triggers its consumer, and a trigger edge places the consumer on a later
-///   level than its producer (an edge whose input does not is
-///   [`SlotRecord::Unaccounted`]). A frame whose stamp several steps share counts
+///   before its consumer reads, since a `block` edge is counted only where the
+///   bag's fire records put its consumer on a later level than its producer
+///   (any other is [`SlotRecord::Unaccounted`]). A frame whose stamp several steps share counts
 ///   at the last of them, and a drain at an earlier one is owed against it
 ///   there. Each send counts one frame (`CerulionPublisher::record_block_published`),
 ///   and each frame the consumer's body subscriber drains takes one off

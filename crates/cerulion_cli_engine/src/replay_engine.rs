@@ -13026,20 +13026,77 @@ struct BlockHoldFlow {
 }
 
 /// One `block` consumer of a [`BlockHoldFlow`]: the node and input that hold
-/// the slot, its depth, whether the input sets `block_timeout_ms`, whose
-/// release forgives the slot's frames and leaves no record, and whether the
-/// input triggers the consumer (`build_trigger_edges`, the classification
-/// the runtime levels the graph by). Only a triggering input places the
-/// consumer on a later level than its producer; a non-trigger input adds no
-/// level edge, so its read can drain the slot before the producer decides in
-/// the same step.
+/// the slot, its depth, and whether the input sets `block_timeout_ms`, whose
+/// release forgives the slot's frames and leaves no record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockHoldConsumer {
     node: String,
     input: String,
     depth: u64,
     released_on_timeout: bool,
-    triggers_consumer: bool,
+}
+
+/// The level one node's recorded fires carry on a rank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordedLevel {
+    /// Every recorded fire of the node carries this level.
+    One(u32),
+    /// The node's recorded fires carry more than one level.
+    Several,
+}
+
+/// PURE: fold one recorded fire of `node` at `level` into `levels`.
+fn fold_fire_level(levels: &mut BTreeMap<String, RecordedLevel>, node: &str, level: u32) {
+    match levels.get_mut(node) {
+        None => {
+            levels.insert(node.to_string(), RecordedLevel::One(level));
+        }
+        Some(RecordedLevel::One(seen)) if *seen == level => {}
+        Some(slot) => *slot = RecordedLevel::Several,
+    }
+}
+
+/// The level each node of `rank` fires at in the bag's trace: the
+/// `global_level` its FIRE records carry, which the recording's runtime
+/// stamped from the levels it ran the rank's nodes in. A node the trace holds
+/// no fire of is absent.
+///
+/// # Errors
+///
+/// A trace the walk cannot read.
+fn recorded_fire_levels(
+    trace: &RecordedTrace,
+    rank_tables: &[Vec<Arc<str>>],
+    rank: u32,
+) -> Result<BTreeMap<String, RecordedLevel>, ReplayError> {
+    let mut levels = BTreeMap::new();
+    let Some(table) = rank_tables.get(rank as usize) else {
+        return Ok(levels);
+    };
+    trace.for_each(|rec| {
+        if rec.record_type == RECORD_TYPE_FIRE && rec.rank() == rank {
+            if let Some(node) = table.get(rec.node_idx as usize) {
+                fold_fire_level(&mut levels, node, rec.global_level);
+            }
+        }
+        Ok(())
+    })?;
+    Ok(levels)
+}
+
+/// PURE: do the bag's fire records put `consumer` on a later level than
+/// `producer`? Only then did every read of the consumer's run after the
+/// producer decided in its step. A node with no recorded fire, or with fires
+/// at more than one level, puts neither.
+fn recorded_after(
+    levels: &BTreeMap<String, RecordedLevel>,
+    producer: &str,
+    consumer: &str,
+) -> bool {
+    matches!(
+        (levels.get(producer), levels.get(consumer)),
+        (Some(RecordedLevel::One(p)), Some(RecordedLevel::One(c))) if c > p
+    )
 }
 
 /// The topics of the rank whose `block` consumers hold their producers.
@@ -13067,7 +13124,6 @@ fn block_hold_flows(
                 "failed to build rank {rank}'s graph topology for the fire re-derivation: {e}"
             ),
         })?;
-    let trigger_edges = cerulion_core::graph::build_trigger_edges(subgraph, node_infos);
     Ok(topology
         .topics()
         .filter(|flow| flow.holds_its_producers())
@@ -13083,7 +13139,6 @@ fn block_hold_flows(
                     input: c.input.clone(),
                     depth: u64::try_from(c.depth).unwrap_or(u64::MAX),
                     released_on_timeout: c.block_timeout_ms.is_some(),
-                    triggers_consumer: trigger_edges.is_triggering(&c.node_id, &flow.topic),
                 })
                 .collect(),
         })
@@ -13093,39 +13148,36 @@ fn block_hold_flows(
 /// PURE: per node of the rank, the `block` edges that can hold its fire, for
 /// [`replay_rederive::NodeDecl::may_be_held_by`]: per producer, one edge per
 /// `block` consumer of each topic it produces, each with what the bag records
-/// of its slot (`record_of(topic, consumer, input)`). Two consumer inputs give
-/// [`replay_rederive::SlotRecord::Unaccounted`] whatever the bag records: one
-/// that sets `block_timeout_ms`, whose release forgives the slot's frames and
-/// leaves no record, and one that does not trigger its consumer, whose read
-/// the rank's step order does not place after the producer's decide. With a
-/// Sync node's trigger inputs, which [`consumer_body_drain`] leaves
-/// unaccounted since its matcher pops them, only a data-trigger node's trigger
-/// input is counted.
+/// of its slot (`record_of(topic, consumer, input)`). A `block` edge is
+/// counted only where the bag's fire records put its consumer on a later
+/// level than its producer (`levels`, [`recorded_after`]): otherwise the
+/// consumer's read can drain the slot before the producer decides in the same
+/// step, whatever the replayed build declares. Such an edge, and one whose
+/// input sets `block_timeout_ms`, whose release forgives the slot's frames and
+/// leaves no record, give [`replay_rederive::SlotRecord::Unaccounted`]
+/// whatever the bag records of the slot.
 fn local_block_holds(
     flows: &[BlockHoldFlow],
+    levels: &BTreeMap<String, RecordedLevel>,
     record_of: &dyn Fn(&str, &str, &str) -> replay_rederive::SlotRecord,
 ) -> BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> {
     let mut holds: BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> = BTreeMap::new();
     for flow in flows {
-        let edges: Vec<replay_rederive::BlockHoldEdge> = flow
-            .consumers
-            .iter()
-            .map(|c| replay_rederive::BlockHoldEdge {
-                consumer_node: c.node.clone(),
-                consumer_input: c.input.clone(),
-                depth: c.depth,
-                record: if c.released_on_timeout || !c.triggers_consumer {
-                    replay_rederive::SlotRecord::Unaccounted
-                } else {
-                    record_of(&flow.topic, &c.node, &c.input)
-                },
-            })
-            .collect();
         for producer in &flow.producers {
-            holds
-                .entry(producer.clone())
-                .or_default()
-                .extend(edges.iter().cloned());
+            let edges = flow
+                .consumers
+                .iter()
+                .map(|c| replay_rederive::BlockHoldEdge {
+                    consumer_node: c.node.clone(),
+                    consumer_input: c.input.clone(),
+                    depth: c.depth,
+                    record: if c.released_on_timeout || !recorded_after(levels, producer, &c.node) {
+                        replay_rederive::SlotRecord::Unaccounted
+                    } else {
+                        record_of(&flow.topic, &c.node, &c.input)
+                    },
+                });
+            holds.entry(producer.clone()).or_default().extend(edges);
         }
     }
     holds
@@ -15192,15 +15244,21 @@ fn prepare_pass_verification(
     let hold_flows = block_hold_flows(plan.subgraph(), node_infos, plan.rank())?;
     let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
     let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
-    let mut block_holds = local_block_holds(&hold_flows, &|topic, consumer, input| {
-        slot_record(
-            hold_stamps.get(topic).and_then(Option::as_ref),
-            topic_recorded_whole(record_health, topic, config.is_multi_publisher(topic)),
-            node_infos
-                .get(consumer)
-                .and_then(|info| consumer_body_drain(info, input)),
-        )
-    });
+    let fire_levels = if hold_flows.is_empty() {
+        BTreeMap::new()
+    } else {
+        recorded_fire_levels(trace, rank_tables, plan.rank())?
+    };
+    let mut block_holds =
+        local_block_holds(&hold_flows, &fire_levels, &|topic, consumer, input| {
+            slot_record(
+                hold_stamps.get(topic).and_then(Option::as_ref),
+                topic_recorded_whole(record_health, topic, config.is_multi_publisher(topic)),
+                node_infos
+                    .get(consumer)
+                    .and_then(|info| consumer_body_drain(info, input)),
+            )
+        });
     let decls: Vec<replay_rederive::NodeDecl> = plan
         .members()
         .iter()
@@ -39423,7 +39481,6 @@ mod trigger_input_capacity_tests {
             input: "x".to_string(),
             depth,
             released_on_timeout: false,
-            triggers_consumer: true,
         };
         let mut expected = BTreeMap::from([
             (
@@ -39462,8 +39519,27 @@ mod trigger_input_capacity_tests {
             depth,
             record: record_of(topic, node, "x"),
         };
+        // The recorded levels: each consumer fires a level after its producer.
+        let levels: BTreeMap<String, RecordedLevel> = [
+            ("p", 0),
+            ("c", 1),
+            ("d", 2),
+            ("e", 0),
+            ("f", 1),
+            ("g", 1),
+            ("h", 0),
+            ("i", 1),
+            ("k", 1),
+            ("l", 0),
+            ("m", 0),
+            ("n", 1),
+        ]
+        .into_iter()
+        .map(|(n, l)| (n.to_string(), RecordedLevel::One(l)))
+        .collect();
         let held = local_block_holds(
             &block_hold_flows(&config, &infos, 0).expect("builds"),
+            &levels,
             &record_of,
         );
         assert_eq!(
@@ -39562,8 +39638,14 @@ mod trigger_input_capacity_tests {
                  \x20 - id: sink\n    type: w\n    inputs:\n      - name: x\n        source: relay/out\n{timeout}"
             );
             let config = cerulion_core::graph::parse_graph(&yaml).expect("parses");
+            // The sink fires a level after the relay in the recording.
+            let levels = BTreeMap::from([
+                ("relay".to_string(), RecordedLevel::One(0)),
+                ("sink".to_string(), RecordedLevel::One(1)),
+            ]);
             let mut holds = local_block_holds(
                 &block_hold_flows(&config, &infos, 0).expect("builds"),
+                &levels,
                 &|_, _, _| SlotRecord::Counted {
                     frame_stamps: vec![1_000],
                     drain: BodyDrain::PerFrame,
@@ -39633,46 +39715,99 @@ mod trigger_input_capacity_tests {
         assert!(held.is_clean(), "unexpected: {:?}", held.findings);
     }
 
-    /// A `block` input that does not trigger its consumer leaves its slot
-    /// unaccounted: it adds no level edge, so the consumer can read, and
-    /// drain, the slot before the producer decides in the same step. The same
-    /// graph with the input as the consumer's data trigger keeps the slot the
-    /// bag records.
+    /// A `block` edge is counted only where the bag's fire records put its
+    /// consumer on a later level than its producer. Hand table over the
+    /// recorded levels of one edge, `relay` -> `sink.x`: above, Counted; at the
+    /// same level, below, never firing, or at two levels, Unaccounted.
     #[test]
-    fn a_block_input_that_does_not_trigger_its_consumer_leaves_its_slot_unaccounted() {
+    fn a_block_edge_counts_only_where_its_consumer_fires_a_later_level_than_its_producer() {
+        use RecordedLevel::{One, Several};
+        let levels = |relay: Option<RecordedLevel>, sink: Option<RecordedLevel>| {
+            [("relay", relay), ("sink", sink)]
+                .into_iter()
+                .filter_map(|(n, l)| Some((n.to_string(), l?)))
+                .collect::<BTreeMap<String, RecordedLevel>>()
+        };
+        for (label, relay, sink, after) in [
+            ("consumer above", Some(One(1)), Some(One(2)), true),
+            ("same level", Some(One(1)), Some(One(1)), false),
+            ("consumer below", Some(One(1)), Some(One(0)), false),
+            ("consumer never fires", Some(One(1)), None, false),
+            ("producer never fires", None, Some(One(2)), false),
+            ("consumer at two levels", Some(One(0)), Some(Several), false),
+            ("producer at two levels", Some(Several), Some(One(2)), false),
+        ] {
+            assert_eq!(
+                recorded_after(&levels(relay, sink), "relay", "sink"),
+                after,
+                "{label}"
+            );
+        }
+        // A node's fires fold to one level, or to several once they differ.
+        let mut folded = BTreeMap::new();
+        for (node, level) in [("a", 1), ("b", 2), ("a", 1), ("b", 3), ("b", 2)] {
+            fold_fire_level(&mut folded, node, level);
+        }
+        assert_eq!(
+            folded,
+            BTreeMap::from([("a".to_string(), One(1)), ("b".to_string(), Several)])
+        );
+    }
+
+    /// The recorded level, not the declaration, decides an edge, so two shapes
+    /// whose trigger wiring a declaration rule would misjudge come out right.
+    /// A data-trigger node whose trigger is another producer's topic and whose
+    /// non-trigger `block` input reads the relay fires at the relay's level:
+    /// Unaccounted. A node triggered on the relay's second output, whose
+    /// non-trigger `block` input reads the relay's first, fires a level after
+    /// the relay: Counted.
+    #[test]
+    fn a_non_trigger_block_input_counts_by_the_recorded_level_of_its_node() {
         use cerulion_core::graph::node::{
             BackpressurePolicy, InputConsume, InputMeta, MacroPolicy, NodeInfo,
         };
         use replay_rederive::{BlockHoldEdge, BodyDrain, SlotRecord};
-        let yaml = "name: bn\nprefix: bn\nnodes:\n\
-                    \x20 - id: relay\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
-                    \x20 - id: sink\n    type: w\n    inputs:\n      - name: x\n        source: relay/out\n";
-        let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
+        let out =
+            |name: &str| format!("      - name: {name}\n        schema: geometry_msgs/Vector3\n");
+        let input =
+            |name: &str, source: &str| format!("      - name: {name}\n        source: {source}\n");
+        let meta = |name: &str, trigger: bool, backpressure| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger,
+            depth: 1,
+            backpressure,
+            expect_within_ms: None,
+            consume: InputConsume::Latest,
+            accumulate: false,
+        };
+        let sink_info = || {
+            NodeInfo::with_meta(
+                vec![
+                    meta("t", true, BackpressurePolicy::DropOldest),
+                    meta("x", false, BackpressurePolicy::Block),
+                ],
+                vec![],
+            )
+            .with_policy(MacroPolicy::DataTrigger {
+                input_name: "t".to_string(),
+            })
+        };
         let counted = SlotRecord::Counted {
             frame_stamps: vec![1_000],
-            drain: BodyDrain::PerFrame,
+            drain: BodyDrain::ToEmpty,
         };
-        let edges = |trigger: bool, policy: MacroPolicy| {
+        let relay_edges = |yaml: &str, levels: &[(&str, u32)]| {
+            let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
             let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
-            infos.insert(
-                "sink".to_string(),
-                NodeInfo::with_meta(
-                    vec![InputMeta {
-                        name: "x".to_string(),
-                        schema_hash: 0,
-                        trigger,
-                        depth: 1,
-                        backpressure: BackpressurePolicy::Block,
-                        expect_within_ms: None,
-                        consume: InputConsume::Latest,
-                        accumulate: false,
-                    }],
-                    vec![],
-                )
-                .with_policy(policy),
-            );
+            infos.insert("sink".to_string(), sink_info());
+            let levels: BTreeMap<String, RecordedLevel> = levels
+                .iter()
+                .map(|&(n, l)| (n.to_string(), RecordedLevel::One(l)))
+                .collect();
             local_block_holds(
                 &block_hold_flows(&config, &infos, 0).expect("builds"),
+                &levels,
                 &|_, _, _| counted.clone(),
             )
             .remove("relay")
@@ -39684,20 +39819,33 @@ mod trigger_input_capacity_tests {
             depth: 1,
             record,
         };
-        assert_eq!(
-            edges(false, MacroPolicy::Period { period_ms: 10 }),
-            vec![edge(SlotRecord::Unaccounted)],
-            "a Period consumer: its input triggers nothing"
+        let beside = format!(
+            "name: bs\nprefix: bs\nnodes:\n\
+             \x20 - id: other\n    type: w\n    outputs:\n{o}\
+             \x20 - id: relay\n    type: w\n    outputs:\n{o}\
+             \x20 - id: sink\n    type: w\n    inputs:\n{t}{x}",
+            o = out("out"),
+            t = input("t", "other/out"),
+            x = input("x", "relay/out"),
         );
         assert_eq!(
-            edges(
-                true,
-                MacroPolicy::DataTrigger {
-                    input_name: "x".to_string()
-                }
-            ),
+            relay_edges(&beside, &[("other", 0), ("relay", 1), ("sink", 1)]),
+            vec![edge(SlotRecord::Unaccounted)],
+            "triggered by another producer, at the relay's level"
+        );
+        let after = format!(
+            "name: af\nprefix: af\nnodes:\n\
+             \x20 - id: relay\n    type: w\n    outputs:\n{o}{o2}\
+             \x20 - id: sink\n    type: w\n    inputs:\n{t}{x}",
+            o = out("out"),
+            o2 = out("out2"),
+            t = input("t", "relay/out2"),
+            x = input("x", "relay/out"),
+        );
+        assert_eq!(
+            relay_edges(&after, &[("relay", 1), ("sink", 2)]),
             vec![edge(counted.clone())],
-            "the consumer's data trigger"
+            "triggered on the relay's other output, a level after it"
         );
     }
 

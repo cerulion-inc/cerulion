@@ -296,11 +296,11 @@ keeps no entry for the topic, reports the topic lossy or written by several
 publishers (declared or observed), or any frame drained and never written, the
 graph lists the topic in `multi_publisher_topics`, the input sets
 `block_timeout_ms`, whose release forgives the slot's frames with no record,
-the input does not trigger its node (a non-trigger input orders the node
-after nothing, so its read can drain the slot before the producer decides in
-the same step), or the input is a Sync node's trigger input, which its
-matcher pops outside the node's body. Only a data-trigger node's trigger
-input is counted. From the
+the bag's fire records do not put the reading node on a later level than the
+producer (its read can then drain the slot before the producer decides in the
+same step), or the input is a Sync node's trigger input, which its matcher
+pops outside the node's body. A `block` edge is counted only where the bag's
+fire records put its consumer on a later level than its producer. From the
 step after a truncated read of the input, a drain whose site the read log does
 not say, or a consumer fire before any body read of the input is recorded, the slot
 allows for none; nor on a resumed pass until the consumer first reads its

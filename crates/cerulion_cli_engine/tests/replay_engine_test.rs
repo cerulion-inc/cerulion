@@ -54663,10 +54663,10 @@ fn nt_reader_served(rec: &Recording) -> Vec<(u64, u64)> {
 /// Then the relay's step 9 fire record is taken out, its frame still
 /// recorded, so the clean stamp still states the bag's frames. The relay had
 /// room at step 9, since the reader drained the queue before it decided, so
-/// the pop it left unfired is the finding: re-derived 1 fire, recorded 0. A
-/// slot whose input does not trigger its consumer is unaccounted, so the
-/// relay is judged as if nothing held it, and the recording as it ran still
-/// replays clean.
+/// the pop it left unfired is the finding: re-derived 1 fire, recorded 0. The
+/// bag records the reader at level 0 and the relay at level 1, so the slot is
+/// unaccounted, the relay is judged as if nothing held it, and the recording
+/// as it ran still replays clean.
 #[test]
 #[serial]
 fn a_relay_fire_dropped_at_a_step_its_non_trigger_block_reader_drained_first_is_the_finding() {
@@ -54727,6 +54727,87 @@ fn a_relay_fire_dropped_at_a_step_its_non_trigger_block_reader_drained_first_is_
         )
     );
     assert!(!outcome.passed);
+}
+
+/// The reader of the non-trigger vectors redeclared as a throttled
+/// latest-value data trigger on the same input: what a replayed build can
+/// declare for `reader` when the bag pins no trigger set.
+#[cerulion_node(throttle_ms = 10)]
+#[derive(Default)]
+struct ThrottledLatestReaderNode {
+    #[input(trigger, consume = latest, backpressure = block, depth = 2)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl ThrottledLatestReaderNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// The recording of the non-trigger FIFO vector, its relay's step 9 fire
+/// record taken out, replayed by a build that declares `reader` a data
+/// trigger on the relay's topic. A `block` trigger input is read through a
+/// drain subscriber and a body one, where the recording staged the reader's
+/// input on its body alone, so the replay refuses the bag before it judges a
+/// fire (`read_log_stage_set_skew`, exit 2) and excuses no hold.
+#[test]
+#[serial]
+fn a_replayed_build_that_makes_the_reader_a_trigger_is_refused_before_any_hold_is_excused() {
+    let yaml = nt_yaml(
+        "relay",
+        "relay_node",
+        "    inputs:\n      - name: inp\n        source: src/out\n",
+    );
+    let recorded = || {
+        factories(vec![
+            ("reader", Box::new(PacedBlockReaderNodeEntry::new())),
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(RelayNodeEntry::new())),
+        ])
+    };
+    let replayed = || {
+        factories(vec![
+            ("reader", Box::new(ThrottledLatestReaderNodeEntry::new())),
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(RelayNodeEntry::new())),
+        ])
+    };
+    let mut rec = record_uniform_with_read_log(&yaml, recorded, &[], NT_STEPS);
+    assert_eq!(bh_fire_steps(&rec, "relay"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "reader"), vec![1, 3, 5, 7, 9]);
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == 9)
+        .expect("the relay fires at step 9");
+    rec.trace.remove(at);
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("nt_drift_dropped_fire.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let refused = ri_replay_stamped(
+        &fed,
+        replayed,
+        replay_engine::ReplayPurpose::Verify,
+        None,
+        None,
+        None,
+        bh_clean_stamp(&rec),
+        None,
+    )
+    .0;
+    match refused {
+        Err(ReplayError::ReadLogNotEnforceable { edge, cause, .. }) => {
+            assert_eq!(edge.as_deref(), Some("reader.inp"));
+            assert_eq!(cause, "read_log_stage_set_skew");
+        }
+        other => panic!("the replay refuses the redeclared reader's stage set: {other:?}"),
+    }
 }
 
 /// A relay nothing holds, on a bag that states its drain: its last fire is
