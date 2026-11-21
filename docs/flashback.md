@@ -404,8 +404,8 @@ checkpoint keeps its trace from step 0, while a rank that kept one begins at
 its checkpoint. Re-executing ranks that begin apart is not supported, so the
 capture is stamped not resimmable, and `anchor.resimmable_reason` names each
 rank and the step it begins at. Record the run with
-`cerulion graph run --record`. A capture of that shape written by 2.0.0 can
-claim `anchor.resimmable: true`.
+`cerulion graph run --record`. A capture of that shape written by 2.1.0 or
+earlier can claim `anchor.resimmable: true`.
 
 **A topic that first publishes mid-recording gets no channel.** A
 bag's channel set is fixed when the bag is created, so a producer that appears
