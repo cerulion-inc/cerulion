@@ -29,7 +29,7 @@ A `cerulion` installed with `cargo install` has no harness beside it: clone this
 | `install.sh` | the one-time install: the simulator, the benchmark scenes at their pinned revisions, the episode server's environment and this machine's robot calibration record. `install.sh --check` reports what is missing and writes nothing |
 | `playground/` | the sim server: the harness's MCP tools on a simulated robot, one episode per connection, over stdio or HTTP |
 | `src/cerulion_harness/` | the benchmark run (`run-cell`, the engine behind `cerulion rcp bench`), the calibration records, the price table and `verify` |
-| `measured/` | the code the published benchmark ran, file for file: `measured/rcp/` for the setup with the harness, and `measured/plain-overlay/` for the files the setup without it has in their place |
+| `measured/` | the code the benchmark measured, file for file: `measured/rcp/` for the setup with the harness, and `measured/plain-overlay/` for the files the setup without it has in their place |
 | `provenance/` | the manifests of the two measured code trees and the ledger of every shipped file; `verify` checks them |
 | `body_records/` | the robot calibration records measured on Linux x86-64 |
 | `benchmarks/` | the pinned revisions of LIBERO and LIBERO-PRO and the SHA-256 of every data file the install fetches |

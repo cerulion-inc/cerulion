@@ -9,7 +9,7 @@ Three models, both arms each, on one start state a model. The start state for a 
 | GPT-6 Astra | pro_goal_swap_t04_i06 | without Cerulion | no | [gpt-6-astra_without_pro_goal_swap_t04_i06](gpt-6-astra_without_pro_goal_swap_t04_i06/transcript.md) | 68 |
 | GPT-6 Astra | pro_goal_swap_t04_i06 | with Cerulion | yes | [gpt-6-astra_with_pro_goal_swap_t04_i06](gpt-6-astra_with_pro_goal_swap_t04_i06/transcript.md) | 3 |
 | Claude Opus 5.5 | pro_goal_swap_t01_i06 | without Cerulion | no | [claude-opus-5-5_without_pro_goal_swap_t01_i06](claude-opus-5-5_without_pro_goal_swap_t01_i06/transcript.md) | 152 |
-| Claude Opus 5.5 | pro_goal_swap_t01_i06 | with Cerulion | yes | [claude-opus-5-5_with_pro_goal_swap_t01_i06](claude-opus-5-5_with_pro_goal_swap_t01_i06/transcript.md) | 14 |
+| Claude Opus 5.5 | pro_goal_swap_t01_i06 | with Cerulion | yes | [claude-opus-5-5_with_pro_goal_swap_t01_i06](claude-opus-5-5_with_pro_goal_swap_t01_i06/transcript.md) | 15 |
 
 Each folder holds transcript.md (readable), transcript.jsonl (the operator's log, one record a line: start, request, strict_endpoint, reply, tool_call, frames, http_error, notice, end; a strict_endpoint record says the endpoint refused a request field, which was dropped before the request was sent again). The camera images are not in this package: each is named by its file name where the model received it.
 
