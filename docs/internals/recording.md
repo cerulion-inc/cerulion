@@ -478,6 +478,7 @@ still reports its zero count).
 | `bag_crash_recovery_test.rs` | Torn tail recovers all complete chunks; corrupted chunk body detected, never returned | no | none |
 | `bag_validation_test.rs` | Reserved-prefix / unknown-topic / duplicate-topic rejections; empty finalize still yields a valid bag; descriptor byte oracle | no | none |
 | `bag_writer_syscall_test.rs` | `writev` batching (IOV_MAX), partial-write resume at adversarial boundaries, EINTR retry, no-progress hard error | no | none |
+| `bag_writer_abandon_test.rs` | `BagWriter::abandon` logs nothing and writes no byte, leaving the file for its caller to remove; a writer dropped without `finalize` warns once | no | none |
 | `bag_channel_provisioning_test.rs` | Per-channel provisioning metadata round-trip through a real file, read by both readers | no | none |
 | `bag_schema_catalog_test.rs` | The schema-provenance attachment's file-level contract | no | none |
 | `advise_completeness_test.rs` | The completeness pre-scan's batched advise-behind memory bound | no | none |

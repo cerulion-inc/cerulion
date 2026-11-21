@@ -29352,6 +29352,309 @@ mod frame_coverage_judge_tests {
     }
 }
 
+#[cfg(test)]
+mod ranks_begin_apart_judge_tests {
+    //! The capture judge on two-rank captures whose ranks begin at different
+    //! steps, through the adapter, over hand-built traces trimmed the way a
+    //! capture trims them and the `recorder.json` the capture carries. Every
+    //! verdict is written out by hand. No shared memory, no race.
+    use super::*;
+    use cerulion_core::flashback::resim::ResimGap;
+    use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
+    use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY};
+
+    const MS: u64 = 1_000_000;
+    const RUN: u64 = 0xC1E5;
+    /// The one node on each rank: `src_a` on rank 0, `src_b` on rank 1.
+    const NODES: [&str; 2] = ["src_a", "src_b"];
+
+    /// A `recorder.json` as `graph run --record` writes it, with `coordination`
+    /// holding the JSON value `coordination`, or no such key for `None`.
+    fn recorder_json(coordination: Option<&str>) -> (String, Vec<u8>) {
+        let key = coordination.map_or(String::new(), |v| format!(r#""coordination":{v},"#));
+        (
+            RECORDER_JSON_ATTACHMENT.to_string(),
+            format!(
+                r#"{{"arch":"aarch64","os":"linux","cerulion_version":"2.0.0","recorded_at_ns":7,"trace_format":10,{key}"node_external":{{"src_a":false,"src_b":false}}}}"#
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// The documents a capture can carry about its contract. `--recorder-json`
+    /// attaches the file's bytes as they are, so each of these can reach a
+    /// capture: a free-run or a lockstep stamp, a document with no
+    /// `coordination` key, a stamp with no contract (`"barrier"`), bytes that
+    /// are not JSON, and no document at all (a standalone recorder handed no
+    /// `--recorder-json`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Stamp {
+        FreeRun,
+        Lockstep,
+        Unstamped,
+        Unknown,
+        NotJson,
+        Absent,
+    }
+    const STAMPS: [Stamp; 6] = [
+        Stamp::FreeRun,
+        Stamp::Lockstep,
+        Stamp::Unstamped,
+        Stamp::Unknown,
+        Stamp::NotJson,
+        Stamp::Absent,
+    ];
+
+    /// Rank `rank`'s records over `steps`: a STEP_BOUNDARY at (k + 1) x 50 ms,
+    /// then one FIRE of its node, stamped with the rank.
+    fn rank_steps(rank: u32, steps: std::ops::RangeInclusive<u64>) -> Vec<TraceRingRecord> {
+        steps
+            .flat_map(|k| {
+                let boundary = TraceRingRecord {
+                    step: k,
+                    fire_time_ns: (k + 1) * 50 * MS,
+                    duration_ns: 0,
+                    node_idx: 0,
+                    global_level: 0,
+                    record_type: RECORD_TYPE_STEP_BOUNDARY,
+                    reserved: rank,
+                };
+                let fire = TraceRingRecord {
+                    duration_ns: 7,
+                    record_type: RECORD_TYPE_FIRE,
+                    ..boundary
+                };
+                [boundary, fire]
+            })
+            .collect()
+    }
+
+    /// A capture's trace and the one rank whose checkpoint it embeds, at step 5;
+    /// every other rank kept no checkpoint and is kept whole.
+    struct Shape {
+        records: Vec<TraceRingRecord>,
+        /// The rank whose anchor the capture embeds, or `None` for none.
+        anchored: Option<u32>,
+        /// The worker trace manifests the capture attaches.
+        worker_ranks: &'static [u32],
+    }
+
+    /// The anchor step every shape's anchored rank resumes from.
+    const ANCHOR_STEP: u64 = 5;
+
+    /// Rank 0 kept no checkpoint, so the capture keeps its retention from step
+    /// 0, while rank 1 resumes from its anchor (first kept step 6).
+    fn rank_1_begins_later() -> Shape {
+        Shape {
+            records: [rank_steps(0, 0..=8), rank_steps(1, 0..=8)].concat(),
+            anchored: Some(1),
+            worker_ranks: &[0, 1],
+        }
+    }
+
+    /// The reverse: rank 0 resumes from its anchor (first kept step 6) while
+    /// rank 1 kept no checkpoint and keeps its retention from step 0.
+    fn rank_0_begins_later() -> Shape {
+        Shape {
+            anchored: Some(0),
+            ..rank_1_begins_later()
+        }
+    }
+
+    /// A capture taken after the first window: rank 0 resumes from its anchor
+    /// (first kept step 6), and rank 1, which kept no checkpoint, keeps a
+    /// retention that no longer reaches step 0 (first kept step 2).
+    fn both_begin_past_step_0() -> Shape {
+        Shape {
+            records: [rank_steps(0, 3..=8), rank_steps(1, 2..=8)].concat(),
+            anchored: Some(0),
+            worker_ranks: &[0, 1],
+        }
+    }
+
+    /// The controls: two ranks that both begin at step 0 with no checkpoint,
+    /// and one rank resuming from its anchor.
+    fn both_begin_at_step_0() -> Shape {
+        Shape {
+            anchored: None,
+            ..rank_1_begins_later()
+        }
+    }
+    fn one_rank_from_its_anchor() -> Shape {
+        Shape {
+            records: rank_steps(0, 0..=8),
+            anchored: Some(0),
+            worker_ranks: &[0],
+        }
+    }
+
+    fn manifests(worker_ranks: &[u32]) -> BTreeMap<u32, Vec<String>> {
+        worker_ranks
+            .iter()
+            .map(|&r| (r, vec![NODES[r as usize].to_string()]))
+            .collect()
+    }
+
+    /// The trim a capture of `shape` makes: one cut, at the anchored rank.
+    fn trim(shape: &Shape) -> trace_window::TrimmedTrace {
+        let manifests = manifests(shape.worker_ranks);
+        match shape.anchored {
+            Some(rank) => trace_window::trim_to_anchor(
+                shape.records.iter().copied(),
+                &BTreeMap::from([(rank, ANCHOR_STEP)]),
+                &manifests,
+            ),
+            None => trace_window::keep_all(shape.records.iter().copied(), &manifests),
+        }
+    }
+
+    /// The verdict a capture of `shape` stamped `stamp` reports.
+    fn verdict(shape: &Shape, stamp: Stamp) -> Result<(), ResimGap> {
+        let trimmed = trim(shape);
+        let (report, anchors) = match shape.anchored {
+            Some(rank) => {
+                let rank_anchor = flashback_plane::RankAnchor {
+                    capture_seq: 0,
+                    step: ANCHOR_STEP,
+                    taken_at_ns: 0,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: anchor_window::AnchorFit::CoversTheClaimedWindow,
+                    frames_before_anchor_ms: 0,
+                    frames_missing_after_anchor_ms: 0,
+                };
+                (
+                    flashback_plane::AnchorReport::Embedded {
+                        run_id: RUN,
+                        step: ANCHOR_STEP,
+                        nodes: 1,
+                        complete: 1,
+                        records: 1,
+                        fit: anchor_window::AnchorFit::CoversTheClaimedWindow,
+                        taken_at_ns: 0,
+                        frames_before_anchor_ms: 0,
+                        frames_missing_after_anchor_ms: 0,
+                        per_rank: BTreeMap::from([(rank, rank_anchor)]),
+                        missing_ranks: Vec::new(),
+                    },
+                    vec![AnchorFact {
+                        run_id: RUN,
+                        step: ANCHOR_STEP,
+                        node: NODES[rank as usize].to_string(),
+                        outcome: AnchorOutcome::Complete,
+                    }],
+                )
+            }
+            None => (
+                flashback_plane::AnchorReport::Absent(
+                    anchor_window::NoAnchorReason::NothingRetained,
+                ),
+                Vec::new(),
+            ),
+        };
+        let mut attachments = vec![(
+            GRAPH_ATTACHMENT.to_string(),
+            b"prefix: mp\nnodes:\n  - id: src_a\n    type: t\n  - id: src_b\n    type: t\n"
+                .to_vec(),
+        )];
+        match stamp {
+            Stamp::FreeRun => attachments.push(recorder_json(Some(r#""free_run""#))),
+            Stamp::Lockstep => attachments.push(recorder_json(Some(r#""lockstep""#))),
+            Stamp::Unstamped => attachments.push(recorder_json(None)),
+            Stamp::Unknown => attachments.push(recorder_json(Some(r#""barrier""#))),
+            Stamp::NotJson => {
+                attachments.push((RECORDER_JSON_ATTACHMENT.to_string(), b"{\"arch\":".to_vec()))
+            }
+            Stamp::Absent => {}
+        }
+        let node_counts = vec![1usize; shape.worker_ranks.len()];
+        judge_capture_resimmable(
+            &trimmed,
+            &report,
+            &anchors,
+            // The checkpoint's anchors come from the one anchored rank's ring.
+            usize::from(shape.anchored.is_some()),
+            &attachments,
+            // The production rule: the node map is known iff one worker ring.
+            shape.worker_ranks.len() == 1,
+            shape.worker_ranks,
+            cerulion_core::trace_ring::first_trace_record_refusal(
+                trimmed.records.iter(),
+                &node_counts,
+            ),
+            None,
+            TraceRingCoverage {
+                declared: shape.worker_ranks.len(),
+                unreadable: 0,
+            },
+            &[],
+            true,
+            None,
+        )
+    }
+
+    /// The first step each rank keeps, so a verdict below is about the shape
+    /// it names.
+    #[test]
+    fn the_shapes_keep_the_first_steps_they_are_named_for() {
+        let firsts = |shape: Shape| {
+            trim(&shape)
+                .per_rank
+                .iter()
+                .map(|(rank, per)| (*rank, per.first_recorded_step))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(firsts(rank_1_begins_later()), [(0, Some(0)), (1, Some(6))]);
+        assert_eq!(firsts(rank_0_begins_later()), [(0, Some(6)), (1, Some(0))]);
+        assert_eq!(
+            firsts(both_begin_past_step_0()),
+            [(0, Some(6)), (1, Some(2))]
+        );
+        assert_eq!(firsts(both_begin_at_step_0()), [(0, Some(0)), (1, Some(0))]);
+        assert_eq!(firsts(one_rank_from_its_anchor()), [(0, Some(6))]);
+    }
+
+    /// What the judge says about each shape, whatever the capture's stamp: rank
+    /// 1 beginning later reads resimmable (rank 0's first kept step is 0), and
+    /// both shapes whose rank 0 resumes mid-run read the unknown node map of a
+    /// recorder holding two trace rings.
+    #[test]
+    fn a_capture_whose_ranks_begin_apart_is_judged_on_rank_0_alone() {
+        for stamp in STAMPS {
+            assert_eq!(verdict(&rank_1_begins_later(), stamp), Ok(()), "{stamp:?}");
+            assert_eq!(
+                verdict(&rank_0_begins_later(), stamp),
+                Err(ResimGap::AmbiguousNodeMap),
+                "{stamp:?}"
+            );
+            assert_eq!(
+                verdict(&both_begin_past_step_0(), stamp),
+                Err(ResimGap::AmbiguousNodeMap),
+                "{stamp:?}"
+            );
+        }
+    }
+
+    /// The controls: two ranks that both begin at step 0, and one rank resuming
+    /// from its anchor, are resimmable under every stamp.
+    #[test]
+    fn ranks_that_begin_together_and_a_lone_rank_are_resimmable() {
+        for stamp in STAMPS {
+            assert_eq!(
+                verdict(&both_begin_at_step_0(), stamp),
+                Ok(()),
+                "{stamp:?}: both from step 0"
+            );
+            assert_eq!(
+                verdict(&one_rank_from_its_anchor(), stamp),
+                Ok(()),
+                "{stamp:?}: one rank from its anchor"
+            );
+        }
+    }
+}
+
 /// Flashback producer 3: the `--run-id` reader.
 ///
 /// PURE — no transport, no clock, no filesystem — so every refusal branch a

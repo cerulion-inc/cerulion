@@ -33,7 +33,7 @@ use cerulion_rcpd::eye::verify::{verify_bag, EyeTopics};
 use cerulion_rcpd::eye::{EYE_CALLER, JEV_VERB};
 use cerulion_rcpd::manifest::RcpManifest;
 use cerulion_rcpd::tools::ReceiptSink;
-use eye_common::{good_body, holds_key, Reply, Stub, ANSWERED_MODEL};
+use eye_common::{good_body, holds_key, Reply, Stub, ANSWERED_MODEL, EYE_WAIT};
 use native_ros2_messages::sensor_msgs::CompressedImage;
 use native_ros2_messages::std_msgs::String as RosString;
 use serde_json::{json, Value};
@@ -183,6 +183,22 @@ fn next_frame(ask: &str) -> String {
     moved.to_string()
 }
 
+/// Wait until the receipt log at `receipts` holds the `late` receipt of a
+/// reply that came after its ask's deadline, reading it once more after
+/// [`EYE_WAIT`].
+fn wait_for_late_receipt(receipts: &Path) {
+    let deadline = Instant::now() + EYE_WAIT;
+    loop {
+        let last = Instant::now() >= deadline;
+        let text = std::fs::read_to_string(receipts).unwrap_or_default();
+        if text.contains("\"late\"") {
+            return;
+        }
+        assert!(!last, "no late receipt");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 struct Gate {
     frames: cerulion_core::CerulionPublisher,
     asks: cerulion_core::CerulionPublisher,
@@ -215,11 +231,14 @@ impl Gate {
         proxy.set_data(&ask.to_string()).expect("set");
     }
 
-    /// The answer to `ask_id`, waiting at most `within`.
-    fn answer(&self, ask_id: &Value, within: Duration) -> String {
-        let deadline = Instant::now() + within;
+    /// The answer to `ask_id`, waiting at most [`EYE_WAIT`]. The topic is
+    /// read once more after the deadline has passed, so a thread that was not
+    /// scheduled until after it still sees an answer that arrived meanwhile.
+    fn answer(&self, ask_id: &Value) -> String {
+        let deadline = Instant::now() + EYE_WAIT;
         let mut found = None;
-        while found.is_none() && Instant::now() < deadline {
+        loop {
+            let last = Instant::now() >= deadline;
             self.answers
                 .try_receive(|m| {
                     let text = RosString::build_reader(m.payload())
@@ -232,6 +251,9 @@ impl Gate {
                     }
                 })
                 .expect("receive");
+            if found.is_some() || last {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
         found.unwrap_or_else(|| panic!("no answer to ask {ask_id} on {}", self.answers_topic))
@@ -295,6 +317,7 @@ async fn the_eye_records_answers_that_serve_back_and_verify_byte_for_byte() {
     let gate_mgr = mgr.clone();
     let gate_jev = jev.clone();
     let gate_state = state_dir.clone();
+    let gate_receipts = receipts.clone();
     let gate_thread = std::thread::spawn(move || {
         let mut gate = Gate {
             frames: gate_mgr
@@ -311,36 +334,32 @@ async fn the_eye_records_answers_that_serve_back_and_verify_byte_for_byte() {
         };
         let good = jpeg_header_for_test(640, 480, 30_000);
         let mut out = Vec::new();
-        // One ask at a time.
+        // One ask at a time. Ask 5's reply comes after its deadline, and the
+        // eye writes its `late` receipt, a synced write, before it takes the
+        // next reply, so ask 6 waits for that receipt: on a loaded machine
+        // the reply to an ask in flight beside it could be taken past that
+        // ask's deadline.
         for (id, case) in [(0u64, 0u64), (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6)] {
             let seq = gate.publish_frame(&good);
             let deadline = if case == 5 { 200 } else { 1_500 };
             let ask = gate.ask_for(id, case, seq, deadline);
-            out.push((
-                ask.to_string(),
-                gate.answer(&ask["ask_id"], Duration::from_secs(5)),
-            ));
+            out.push((ask.to_string(), gate.answer(&ask["ask_id"])));
+            if case == 5 {
+                // The late reply to ask 5 is receipted, not published.
+                wait_for_late_receipt(&gate_receipts);
+            }
         }
         // A frame never published, then one larger than 640 x 480.
         let ask = gate.ask_for(7, 0, 9_999, 1_500);
-        out.push((
-            ask.to_string(),
-            gate.answer(&ask["ask_id"], Duration::from_secs(5)),
-        ));
+        out.push((ask.to_string(), gate.answer(&ask["ask_id"])));
         let seq = gate.publish_frame(&jpeg_header_for_test(800, 600, 1_000));
         let ask = gate.ask_for(8, 0, seq, 1_500);
-        out.push((
-            ask.to_string(),
-            gate.answer(&ask["ask_id"], Duration::from_secs(5)),
-        ));
+        out.push((ask.to_string(), gate.answer(&ask["ask_id"])));
         // The owner turns Jev off: the next ask is disabled at once.
         write_switch(&gate_state, false).expect("off");
         let seq = gate.publish_frame(&good);
         let ask = gate.ask_for(9, 0, seq, 1_500);
-        out.push((
-            ask.to_string(),
-            gate.answer(&ask["ask_id"], Duration::from_secs(5)),
-        ));
+        out.push((ask.to_string(), gate.answer(&ask["ask_id"])));
         write_switch(&gate_state, true).expect("on");
         out
     });
@@ -382,16 +401,6 @@ async fn the_eye_records_answers_that_serve_back_and_verify_byte_for_byte() {
         assert!(d.contains("Absent"), "{d}");
     }
 
-    // The late reply to ask 5 is receipted, not published.
-    let late_deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        let text = std::fs::read_to_string(&receipts).unwrap_or_default();
-        if text.contains("\"late\"") {
-            break;
-        }
-        assert!(Instant::now() < late_deadline, "no late receipt");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
     tokio::time::sleep(Duration::from_millis(100)).await;
     stop.store(true, Ordering::SeqCst);
     let recorded = tap.join().expect("tap");

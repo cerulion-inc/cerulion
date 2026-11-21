@@ -83,6 +83,11 @@ fn membership_refresh_preserves_unchanged_readers_and_retires_changed_peers() {
             std::thread::sleep(Duration::from_millis(5));
         }
     });
+    wait_for_one_producer(
+        &replacement_a.fixture.manager,
+        &topic_a,
+        &producer_replacement,
+    );
     plane.ensure_mirror(&key_a, ORACLE_SCHEMA_HASH).unwrap();
     let frames = collect_frames(&desk, &topic_a, 3);
     assert!(frames[0].0 >= 100_000);

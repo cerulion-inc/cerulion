@@ -1,0 +1,14 @@
+# What install.sh builds and fetches, and what a run writes: never committed
+# (tests/test_tracked_files.py).
+/bx/
+/venv/
+/out/
+__pycache__/
+# The measured code writes its derived robot models inside its own tree.
+/measured/*/runs/derived_mjcf/
+# Body records: the three shipped ones are tracked; one measured on this machine,
+# and the note of which start states were checked here, are not.
+/body_records/*
+!/body_records/60ea8887142e00f9336bcb46319d0b6a605f5780.json
+!/body_records/726d4e8cc7d8227186ce25893edfbeb2d71458ce.json
+!/body_records/91cdd2f0a4eed53d722840fad5741e8c3eb2500f.json

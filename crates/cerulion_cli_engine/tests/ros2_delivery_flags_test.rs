@@ -20,12 +20,14 @@ use cerulion_cli_engine::ros2_cmd::{
 };
 use serial_test::serial;
 
-fn args(list: &[&str]) -> Vec<String> {
-    list.iter().map(|s| s.to_string()).collect()
+fn args(list: &[&str]) -> Vec<std::ffi::OsString> {
+    list.iter().map(std::ffi::OsString::from).collect()
 }
 
-fn env_value<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
-    env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+fn env_value<'a, V: AsRef<std::ffi::OsStr>>(env: &'a [(String, V)], key: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_ref().to_str().expect("a test-staged value is UTF-8"))
 }
 
 /// Panic-safe env override.
@@ -282,4 +284,101 @@ fn adopt_take_after_a_delivery_flag_is_still_refused() {
     )
     .unwrap_err();
     assert_eq!(classify(&e), EXIT_UNAVAILABLE, "{e}");
+}
+
+/// `OsString`s from raw bytes, for arguments that are not valid UTF-8.
+fn raw_args(list: &[&[u8]]) -> Vec<std::ffi::OsString> {
+    use std::os::unix::ffi::OsStringExt as _;
+    list.iter()
+        .map(|a| std::ffi::OsString::from_vec(a.to_vec()))
+        .collect()
+}
+
+/// A path that is not valid UTF-8 is a path: both spellings keep its bytes,
+/// and every forwarded token keeps its own.
+#[test]
+fn a_path_that_is_not_utf8_keeps_its_bytes_in_both_spellings() {
+    for (spelled, verb) in [
+        (
+            raw_args(&[b"--record-deliveries", b"logs/caf\xE9", b"pkg", b"exe\xFF"]),
+            Ros2NativeVerb::Launch,
+        ),
+        (
+            raw_args(&[b"--record-deliveries=logs/caf\xE9", b"pkg", b"exe\xFF"]),
+            Ros2NativeVerb::Run,
+        ),
+    ] {
+        let (req, rest) = split_delivery_flags(verb, &spelled).unwrap();
+        let dir = raw_args(&[b"logs/caf\xE9"]).remove(0);
+        assert_eq!(
+            req,
+            Some(DeliveryRequest::Record(dir.into())),
+            "{spelled:?}"
+        );
+        assert_eq!(rest, raw_args(&[b"pkg", b"exe\xFF"]), "{spelled:?}");
+    }
+    let (req, _) = split_delivery_flags(
+        Ros2NativeVerb::Run,
+        &raw_args(&[b"--replay-deliveries=\xFE.rdl.mcap", b"pkg"]),
+    )
+    .unwrap();
+    assert_eq!(
+        req,
+        Some(DeliveryRequest::Replay(
+            raw_args(&[b"\xFE.rdl.mcap"]).remove(0).into()
+        ))
+    );
+}
+
+/// The edges of the byte match: a value that starts with `-` is still the next
+/// flag, and a token that only starts like a flag is forwarded.
+#[test]
+fn a_value_or_token_that_is_not_utf8_meets_the_same_rules_as_text() {
+    let e = split_delivery_flags(
+        Ros2NativeVerb::Run,
+        &raw_args(&[b"--record-deliveries", b"-\xFF", b"pkg"]),
+    )
+    .unwrap_err();
+    assert!(usage_err(e).contains("needs a value"));
+    let spelled = raw_args(&[b"--record-deliveries\xFF=d", b"pkg"]);
+    let (req, rest) = split_delivery_flags(Ros2NativeVerb::Run, &spelled).unwrap();
+    assert_eq!(req, None);
+    assert_eq!(rest, spelled, "not a delivery flag, so forwarded whole");
+}
+
+/// The plan forwards an argument that is not UTF-8 to `ros2` byte for byte and
+/// stages the record directory for the child with its bytes, made absolute.
+#[test]
+#[serial]
+fn the_plan_forwards_and_stages_bytes_that_are_not_utf8_as_given() {
+    let f = fixture();
+    let _p = EnvVarGuard::unset(ROS2_PRELOAD_ENV);
+    let _r = EnvVarGuard::unset(REPLAY_CHILD_ENV);
+    let dir = f.root.path().join(raw_args(&[b"caf\xE9"]).remove(0));
+    let mut spelled = raw_args(&[b"--record-deliveries"]);
+    spelled.push(dir.clone().into_os_string());
+    spelled.extend(raw_args(&[
+        b"demo_nodes_cpp",
+        b"talker",
+        b"--ros-args",
+        b"\xFF",
+    ]));
+    let plan = build_ros2_passthrough_plan_for_host(
+        Ros2NativeVerb::Run,
+        &spelled,
+        &f.lib_dir,
+        &f.ament_prefix,
+        HostAbi::LINUX_GNU,
+    )
+    .expect("plan builds");
+    assert_eq!(
+        plan.args,
+        raw_args(&[b"run", b"demo_nodes_cpp", b"talker", b"--ros-args", b"\xFF"])
+    );
+    let staged = plan
+        .env
+        .iter()
+        .find(|(k, _)| k == DELIVERY_LOG_CHILD_ENV)
+        .map(|(_, v)| v.clone());
+    assert_eq!(staged, Some(dir.into_os_string()));
 }

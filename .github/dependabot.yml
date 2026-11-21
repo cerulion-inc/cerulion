@@ -1,7 +1,19 @@
 # Dependency updates arrive as pull requests on a weekly cadence: one grouped
 # pull request for the actions the workflows run, one for the crates the root
 # cargo workspace resolves. Each group opens at most one pull request at a time,
-# so a week with twenty upstream releases produces two pull requests.
+# so a week with twenty upstream releases produces two grouped pull requests.
+#
+# THE CARGO GROUP TAKES COMPATIBLE UPDATES ONLY. Dependabot classifies a cargo
+# update by Cargo's own compatibility rule: below 1.0 a minor move (0.5 to 0.6)
+# and any move of a 0.0.z version are `major`, like 1.x to 2.0. The group takes
+# `minor` and `patch`, so an update that can break a build is not in it and a
+# failing one no longer holds back the rest; it arrives as a pull request of its
+# own, which Dependabot may hold back while the group's pull request is open.
+# The limit of three leaves room for the group and two of those.
+#
+# NO AUTOMATIC REBASE for cargo pull requests. Each automatic rebase started
+# another full CI run. A cargo pull request is rebased when someone comments
+# `@dependabot rebase` on it, so one that conflicts with `main` waits for that.
 #
 # SHA PINS SURVIVE. All 110 `uses:` entries in .github/workflows name a 40
 # character commit. The trailing comment is the version on 88 of them; on the
@@ -57,10 +69,13 @@ updates:
       day: monday
       time: "09:00"
       timezone: Etc/UTC
-    open-pull-requests-limit: 1
+    # Room for the group plus two updates that can break a build.
+    open-pull-requests-limit: 3
+    rebase-strategy: disabled
     groups:
       cargo:
         patterns: ["*"]
+        update-types: ["minor", "patch"]
     commit-message:
       prefix: build
       include: scope

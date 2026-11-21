@@ -121,7 +121,7 @@ pub enum CpuDmaLockMode {
 
 /// How the live-loop CPU monitor-wait park is selected. Auto-ON for a
 /// LIVE graph on every target: a real shallow CPU monitor-wait where the CPU
-/// has a primitive (Linux x86_64 WAITPKG / Linux aarch64 WFE), the degraded
+/// has a primitive (Linux x86_64 WAITPKG or MWAITX / Linux aarch64 WFE), the degraded
 /// sleep-recheck park elsewhere; `--no-monitor-wait` is the hard opt-out. Env
 /// overrides `CERULION_MONITOR_WAIT` / `CERULION_DOORBELL` (`"1"` force-on /
 /// `"0"` disable) resolve through `Auto`; an explicit `CERULION_MONITOR_WAIT=0`
@@ -536,7 +536,7 @@ struct MonitorWaitInputs<'a> {
     /// parks).
     is_live: bool,
     /// `cerulion_core::monitor_wait::monitor_wait_available()` — false off
-    /// Linux-WAITPKG / Linux-aarch64, where the real CPU monitor-wait park is
+    /// Linux x86_64 with WAITPKG or MWAITX / Linux aarch64, where the real CPU monitor-wait park is
     /// unavailable and arm 2 substitutes the degraded sleep-recheck park.
     primitive_available: bool,
     /// `cerulion_core::doorbell::wake_word_block_primitive_available()`: can a
@@ -573,7 +573,7 @@ struct MonitorWaitInputs<'a> {
 ///    the flag won, because a request that cannot be honoured is never dropped in
 ///    silence.
 /// 2. `!primitive_available` (no real CPU monitor-wait on this target, e.g.
-///    macOS or x86 without WAITPKG) → the DEGRADED park tier (default-ON
+///    macOS or x86 with neither WAITPKG nor MWAITX) → the DEGRADED park tier (default-ON
 ///    after the wake-latency sweep: base epoll-block
 ///    p50 was unstable 15-54µs on macOS; the degraded park held a
 ///    stable ~8.5-11.5µs p50 / 16.4µs p99 with zero busy-spin).
@@ -7221,8 +7221,8 @@ pub fn graph_run(
             // building the runtime (the policy is threaded into the
             // policy-aware live builder). The env reads are bound to owned
             // locals first so the `.as_deref()` borrows outlive the struct
-            // (mirrors `env_lock`/`env_us` above). On a non-WAITPKG / non-Linux
-            // host (e.g. aarch64 macOS) `monitor_wait_available()` is
+            // (mirrors `env_lock`/`env_us` above). On a host with no CPU
+            // monitor-wait primitive (e.g. aarch64 macOS) `monitor_wait_available()` is
             // false and the resolver arms the DEGRADED park,
             // default-ON for live: monitor_wait per the arm-3 flag ladder, and
             // the doorbell where a consumer can kernel-block on one. The
@@ -17779,9 +17779,11 @@ pub fn render_recorder_json(
         // words carry a RUN COUNT; v7 marks a stream in which every gated
         // consult a replay also makes wrote a record, which is every bag this
         // binary writes; v8 marks a stream in which every edge names its frames'
-        // writers by run, and v9 one in which every multi-frame read whose batch
-        // fits its read stage's window names each frame it consumed, both also
-        // every bag this binary writes.
+        // writers by run, v9 one in which every multi-frame read whose batch
+        // fits its read stage's window names each frame it consumed, and v10
+        // one in which every complete checkpoint part of a stopped node
+        // carries the stopped flag, all three also every bag this binary
+        // writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17791,9 +17793,10 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stream_needs_v4(),
             crate::replay_engine::recorder_stamps_read_site_roles(),
             // Whether THIS run folds identical runs, read from the one switch.
-            // `stamp_trace_format` tests the consult term first, so the stamp
-            // is 7 with folding on or off; this term decides the stamp on the
-            // ladder below 7, which is the arm an older recorder's bag took.
+            // `stamp_trace_format` tests the stops, identity and consult terms
+            // first, so the stamp is 10 with folding on or off; this term
+            // decides the stamp on the ladder below 7, which is the arm an
+            // older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
             // Whether THIS binary records every gated consult a replay also
             // makes: it does, at every consult that found its queue empty but
@@ -17803,9 +17806,12 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stamps_consult_records(),
             // Whether every edge carries its frames' writers, one annotation per
             // writer run, and every multi-frame read whose batch fits its read
-            // stage's window names each frame it consumed: it does, so every bag
-            // this binary writes stamps 9.
+            // stage's window names each frame it consumed: it does.
             crate::replay_engine::recorder_records_read_identity(),
+            // Whether every complete checkpoint part of a stopped node carries
+            // the stopped flag: it does, so every bag this binary writes
+            // stamps 10.
+            crate::replay_engine::recorder_states_anchor_stops(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -31337,16 +31343,18 @@ nodes:
                 crate::replay_engine::recorder_stamps_read_site_roles(),
                 cerulion_core::read_outcome::fold_enabled(),
                 crate::replay_engine::recorder_stamps_consult_records(),
-                crate::replay_engine::recorder_records_read_identity()
+                crate::replay_engine::recorder_records_read_identity(),
+                crate::replay_engine::recorder_states_anchor_stops()
             )
         );
         assert_eq!(
-            v["trace_format"], 9,
+            v["trace_format"], 10,
             "every bag this binary writes carries read-site roles, folds runs, \
-             records an empty consult a replay also makes AND names the writer and \
+             records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
-             read stage's window: a reader below 9 does not know the per-frame \
-             record, so the stamp makes it refuse the bag"
+             read stage's window AND flags every complete checkpoint part of a stopped node: \
+             a reader below 10 reads past the stopped flag, so the stamp makes it \
+             refuse the bag"
         );
     }
 
@@ -31356,13 +31364,14 @@ nodes:
     /// contract to a stream built to violate it).
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
-    /// it to 5, folding to 6, the consult record to 7, read identity to 8 and
-    /// per-frame batch identity to the 9 asserted here.
+    /// it to 5, folding to 6, the consult record to 7, read identity to 8,
+    /// per-frame batch identity to 9 and checkpoint stops to the 10 asserted
+    /// here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_nine() {
+    fn a_free_run_recorder_json_stamps_free_run_and_format_ten() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
@@ -31376,9 +31385,10 @@ nodes:
         // 5, not 4: the role term overrides the free-run arm. 6, not 5:
         // folding overrides both. 7, not 6: the consult record overrides
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
-        // every consumed frame of a batch is named (`stamp_trace_format`'s
-        // hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 9);
+        // every consumed frame of a batch is named. 10, not 9: every complete
+        // checkpoint part of a stopped node carries the stopped flag
+        // (`stamp_trace_format`'s hand table pins the whole matrix).
+        assert_eq!(v["trace_format"], 10);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -31412,7 +31422,7 @@ nodes:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":9}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":10}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,
@@ -44642,12 +44652,13 @@ struct ProducerNode { #[output] data: u32, tick_count: u32 }
     /// facts, named so a table row reads as a host rather than two bools.
     #[derive(Clone, Copy, Debug)]
     enum MwHost {
-        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG, Linux
-        /// aarch64): arm 3. The wake-word fact is run both ways for every row,
+        /// The CPU has a monitor-wait primitive (Linux x86_64 WAITPKG or
+        /// MWAITX, Linux aarch64): arm 3. The wake-word fact is run both ways for every row,
         /// because arm 3 must not read it.
         Primitive,
         /// No primitive, but a consumer can kernel-block on a doorbell wake
-        /// word (Linux without WAITPKG, macOS 14.4 and later): arm 2.
+        /// word (Linux with no CPU monitor-wait primitive, macOS 14.4 and
+        /// later): arm 2.
         WakeWord,
         /// Neither (macOS before 14.4, other targets): arm 2, doorbell inert.
         Neither,

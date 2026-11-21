@@ -281,6 +281,76 @@ impl AccountWanController {
         first_error.map_or(Ok(()), Err)
     }
 
+    /// Restore the handed-over readers once the owned endpoint admits work. A state
+    /// held by another operation is waited for at most `grace`; past it, every live
+    /// WAN pin is cancelled and named instead.
+    pub(super) fn serving_ready_within(&self, grace: Duration) -> Result<(), String> {
+        let deadline = Instant::now() + RESTORATION_BUDGET;
+        match self.lock_for_restoration(grace)? {
+            Some(mut state) => self.restore_readers(&mut state, deadline),
+            None => self.cancel_busy_restoration(),
+        }
+    }
+
+    /// The state for a serving start, or `None` while another operation still
+    /// holds it after `grace`. Without a live WAN pin there is nothing to restore,
+    /// so a held state ends the wait at once.
+    fn lock_for_restoration(
+        &self,
+        grace: Duration,
+    ) -> Result<Option<MutexGuard<'_, State>>, String> {
+        let until = Instant::now() + grace;
+        let mut pause = RESTORATION_LOCK_FIRST_PAUSE;
+        let mut contended = false;
+        loop {
+            match self.state.try_lock() {
+                Ok(state) => return Ok(Some(state)),
+                Err(TryLockError::Poisoned(_)) => {
+                    return Err("account robot controller state is poisoned".into());
+                }
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if !contended {
+                contended = true;
+                self.restoration_contentions.fetch_add(1, Ordering::Relaxed);
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            let restorable = self
+                .pins()?
+                .values()
+                .any(|pin| pin.route == Route::Wan && pin.live);
+            if left.is_zero() || !restorable {
+                return Ok(None);
+            }
+            std::thread::sleep(pause.min(left));
+            pause = (pause * 2).min(RESTORATION_LOCK_MAX_PAUSE);
+        }
+    }
+
+    /// Cancel every live WAN pin of a serving start that could not take the
+    /// state, and return an error naming the first. begin_serving already retired
+    /// the previous endpoint; registry retirement then reports each loss to its
+    /// holders.
+    fn cancel_busy_restoration(&self) -> Result<(), String> {
+        let mut first = None;
+        for (key, pin) in self.pins()?.iter_mut() {
+            if pin.route == Route::Wan && pin.live {
+                pin.live = false;
+                first.get_or_insert_with(|| {
+                    format!(
+                        "remote mirror lost for robot '{}' topic '{}': controller busy during restoration",
+                        key.robot, key.topic
+                    )
+                });
+            }
+        }
+        if first.is_some() {
+            self.restoration_busy_cancellations
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        first.map_or(Ok(()), Err)
+    }
+
     fn failed_robot(&self, state: &mut State, robot: &str) -> Result<(), String> {
         state.pending_robots.insert(robot.into());
         if let Some(plane) = state.plane.as_ref() {
@@ -325,30 +395,7 @@ impl MirrorPlane for AccountWanController {
     }
 
     fn serving_ready(&self) -> Result<(), String> {
-        let deadline = Instant::now() + RESTORATION_BUDGET;
-        let mut state = match self.state.try_lock() {
-            Ok(state) => state,
-            Err(TryLockError::Poisoned(_)) => {
-                return Err("account robot controller state is poisoned".into());
-            }
-            Err(TryLockError::WouldBlock) => {
-                // begin_serving already retired the previous endpoint. Do not
-                // wait for unrelated metadata I/O before supervising the child.
-                // Registry retirement observes these canceled pins independently.
-                let mut first = None;
-                for (key, pin) in self.pins()?.iter_mut() {
-                    if pin.route == Route::Wan && pin.live {
-                        pin.live = false;
-                        first.get_or_insert_with(|| format!(
-                            "remote mirror lost for robot '{}' topic '{}': controller busy during restoration",
-                            key.robot, key.topic
-                        ));
-                    }
-                }
-                return first.map_or(Ok(()), Err);
-            }
-        };
-        self.restore_readers(&mut state, deadline)
+        self.serving_ready_within(RESTORATION_LOCK_GRACE)
     }
 
     fn holds_outbound_readers(&self) -> bool {

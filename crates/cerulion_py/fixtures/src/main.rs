@@ -207,7 +207,16 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
 }
 
 fn run() -> Result<ExitCode, String> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                let position = index + 1;
+                format!("argument {position} is not valid UTF-8: {arg:?}")
+            })
+        })
+        .collect::<Result<_, _>>()?;
     let (mode, args) = parse_cli(&argv)?;
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)

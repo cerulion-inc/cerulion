@@ -22,6 +22,84 @@ pytestmark = pytest.mark.skipif(
     reason="set CERULION_CLI_BIN to run the CLI Python-node e2e",
 )
 
+# Every workspace in this module builds into ONE cargo build directory, so the
+# runtime closure (cerulion_core, iceoryx2, zenoh, pyo3) compiles once per
+# module run instead of once per test. `<ws>/target` stays each workspace's own
+# target directory: the final `lib<node>` artifacts land there, and the CLI
+# finds them on its default lookup, exactly as in a user's workspace.
+BUILD_DIR_ENV = "CARGO_BUILD_BUILD_DIR"
+
+# The message crate's build script generates the vendored types plus the
+# `schemas/` of the workspace named by this variable (the scaffold sets it in
+# `.cargo/config.toml`).
+WORKSPACE_MSGS_ENV = "CERULION_WORKSPACE_MSGS"
+
+# Cargo identifies a workspace member by its path inside the workspace
+# (`nodes/<name>`), so two workspaces building one node name into the shared
+# build directory would share that unit's fingerprint, build-script dir and
+# hashless `lib<name>` cdylib. Each node type is built once per build dir.
+_BUILT_NODE_TYPES = {}
+
+
+@pytest.fixture(scope="module")
+def build_dir(tmp_path_factory):
+    path = tmp_path_factory.mktemp("cargo-build-dir")
+    _BUILT_NODE_TYPES[str(path)] = set()
+    return path
+
+
+def _message_crate_dirs(build_dir):
+    """Every build-script and fingerprint directory of the message crate."""
+    return [
+        path
+        for pattern in (
+            "*/build/native_ros2_messages-*",
+            "*/.fingerprint/native_ros2_messages-*",
+        )
+        for path in build_dir.glob(pattern)
+    ]
+
+
+def _assert_message_crate_ran_for(workspace, build_dir):
+    """The build that just finished ran the message crate's build script for
+    THIS workspace: its one recorded output names the workspace variable and
+    watches this workspace's `schemas/` (or, with no `schemas/`, its cargo
+    config)."""
+    outputs = list(build_dir.glob("*/build/native_ros2_messages-*/output"))
+    assert len(outputs) == 1, f"expected one message-crate build script run, found {outputs}"
+    lines = outputs[0].read_text().splitlines()
+    assert f"cargo:rerun-if-env-changed={WORKSPACE_MSGS_ENV}" in lines, lines
+    schemas = workspace / "schemas"
+    watched = schemas if schemas.is_dir() else workspace / ".cargo" / "config.toml"
+    prefix = "cargo:rerun-if-changed="
+    watched_paths = [
+        os.path.realpath(line[len(prefix):]) for line in lines if line.startswith(prefix)
+    ]
+    assert os.path.realpath(watched) in watched_paths, (
+        f"the message crate did not run for {workspace}: it watched {watched_paths}"
+    )
+
+
+def _node_build(node_type, *, cwd, env, check=True):
+    """`cerulion node build node_type` in the workspace at `cwd`, into the
+    module's shared build dir.
+
+    The message crate's build-script and fingerprint dirs are deleted first,
+    so its build script runs into an empty out dir for this workspace and
+    nothing a previous workspace generated can satisfy this build."""
+    build_dir = Path(env[BUILD_DIR_ENV])
+    built = _BUILT_NODE_TYPES[str(build_dir)]
+    assert node_type not in built, (
+        f"node type {node_type!r} is already built in this build dir"
+    )
+    built.add(node_type)
+    for path in _message_crate_dirs(build_dir):
+        shutil.rmtree(path)
+    result = _run(CLI, "node", "build", node_type, cwd=cwd, env=env, check=check)
+    if result.returncode == 0:
+        _assert_message_crate_ran_for(cwd, build_dir)
+    return result
+
 
 def _run(cli, *args, cwd, env, check=True):
     return subprocess.run(
@@ -72,8 +150,9 @@ def _echo_topic(topic, graph, *, cwd, env):
     return out
 
 
-def test_cli_python_node_build_info_and_graph_run(tmp_path):
+def test_cli_python_node_build_info_and_graph_run(tmp_path, build_dir):
     env = os.environ.copy()
+    env[BUILD_DIR_ENV] = str(build_dir)
     env.pop("CERULION_PYTHON", None)
     env.pop("CERULION_PY_PATH", None)
     env.pop("LD_LIBRARY_PATH", None)
@@ -137,7 +216,7 @@ def test_cli_python_node_build_info_and_graph_run(tmp_path):
     )
     node_py.write_text(source)
 
-    built = _run(CLI, "node", "build", "echo", cwd=workspace, env=env)
+    built = _node_build("echo", cwd=workspace, env=env)
     assert built.returncode == 0
     lib_source = (workspace / "nodes" / "echo" / "src" / "lib.rs").read_text()
     assert r'\"schema_hash\":15293913555552287199' in lib_source
@@ -323,8 +402,9 @@ def test_cli_python_sync_node_takes_repeated_inputs_and_rejects_one(tmp_path):
         assert line in source, source
 
 
-def test_cli_python_node_builds_builtin_schema_without_workspace_schema(tmp_path):
+def test_cli_python_node_builds_builtin_schema_without_workspace_schema(tmp_path, build_dir):
     env = os.environ.copy()
+    env[BUILD_DIR_ENV] = str(build_dir)
     env.pop("CERULION_PYTHON", None)
     env.pop("CERULION_PY_PATH", None)
     env.pop("LD_LIBRARY_PATH", None)
@@ -342,7 +422,7 @@ def test_cli_python_node_builds_builtin_schema_without_workspace_schema(tmp_path
         "new",
         "--lang",
         "python",
-        "echo",
+        "bare_echo",
         "-T",
         "geometry_msgs/Vector3",
         "inp",
@@ -354,13 +434,13 @@ def test_cli_python_node_builds_builtin_schema_without_workspace_schema(tmp_path
     )
     assert created.returncode == 0
 
-    built = _run(CLI, "node", "build", "echo", cwd=workspace, env=env)
+    built = _node_build("bare_echo", cwd=workspace, env=env)
     assert built.returncode == 0, built.stderr
-    lib_source = (workspace / "nodes" / "echo" / "src" / "lib.rs").read_text()
+    lib_source = (workspace / "nodes" / "bare_echo" / "src" / "lib.rs").read_text()
     assert r'\"schema_hash\":15293913555552287199' in lib_source
 
 
-def test_cli_one_msg_file_types_a_rust_and_a_python_port(tmp_path):
+def test_cli_one_msg_file_types_a_rust_and_a_python_port(tmp_path, build_dir):
     # One `.msg` file in the workspace store is the only definition of
     # `demo_pkg/Reading`: the Rust producer imports the type the message crate
     # generated from it, the Python node the class `cerulion.msgs` built from
@@ -372,6 +452,7 @@ def test_cli_one_msg_file_types_a_rust_and_a_python_port(tmp_path):
     env.pop("DYLD_LIBRARY_PATH", None)
     env["PATH"] = f"{Path(PYTHON).parent}{os.pathsep}{env.get('PATH', '')}"
     env["CERULION_LOGIN_GATE"] = "off"
+    env[BUILD_DIR_ENV] = str(build_dir)
     _run(CLI, "workspace", "create", "ws", cwd=tmp_path, env=env)
     workspace = tmp_path / "ws"
     store = workspace / "schemas" / "demo_pkg" / "msg"
@@ -416,7 +497,7 @@ impl ProducerNode {
 }
 """
     )
-    built = _run(CLI, "node", "build", "producer", cwd=workspace, env=env, check=False)
+    built = _node_build("producer", cwd=workspace, env=env, check=False)
     assert built.returncode == 0, built.stdout + built.stderr
 
     _run(
@@ -435,7 +516,7 @@ impl ProducerNode {
             "        out.position.x = msg.position.x * 3",
         )
     )
-    built = _run(CLI, "node", "build", "relay", cwd=workspace, env=env, check=False)
+    built = _node_build("relay", cwd=workspace, env=env, check=False)
     assert built.returncode == 0, built.stdout + built.stderr
     stub = workspace / ".cerulion" / "python" / "cerulion-stubs" / "msgs" / "demo_pkg.pyi"
     assert "class Reading(_Message):" in stub.read_text()
