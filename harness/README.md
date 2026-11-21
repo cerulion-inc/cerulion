@@ -2,7 +2,7 @@
 
 This folder is the Cerulion harness: the tools and body knowledge a general model needs to work a robot it was
 never trained on, the simulated robot it runs on in this release, and the benchmark that measured it. You run it
-through the `cerulion` command; the guide is [docs/harness.md](../docs/harness.md).
+through the `cerulion` command; the guide is [docs/harness.md](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/docs/harness.md).
 
 ```bash
 cerulion login                                   # once, on this machine
@@ -44,7 +44,7 @@ when it runs in place, its copy when it sits beside the binary. Git ignores all 
 scenes is committed here: they are fetched and checked against their pins.
 
 The measured code keeps the package names it ran under, `rcpx` and `bench`, as the measured manifests name them;
-the provenance ledger lists how each shipped file differs from the measured one. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](../docs/rcp.md).
+the provenance ledger lists how each shipped file differs from the measured one. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/docs/rcp.md).
 
 ## Licence
 

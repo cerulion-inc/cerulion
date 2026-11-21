@@ -86,7 +86,7 @@ Homebrew and the Debian package do not provision Rust. To build your own nodes, 
 
 Release binaries support Linux x86_64 and ARM64 (glibc 2.31+, Ubuntu 20.04 and later) and macOS Intel and Apple Silicon. The Linux packages also carry the ROS 2 Jazzy rmw and heap hook that `cerulion ros2 run` and `cerulion ros2 launch` use. The macOS packages do not, because ROS 2 Jazzy has no macOS binaries. The rmw libraries run where their ROS 2 distro runs, which for Jazzy is Ubuntu 24.04. For ROS 2 Lyrical, each release also publishes `cerulion-rmw-lyrical-<version>-<target>.tar.gz` for Linux x86_64 and ARM64. Unpack it and set `CERULION_LIB_DIR` to the unpacked directory so `cerulion ros2 run` and `cerulion ros2 launch` load the Lyrical rmw. That library is built and tested in CI.
 
-Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them. The compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. To bring a workspace from Cerulion 2.0, follow the migration steps in the [2.1.0 release notes](./CHANGELOG.md#210---2026-11-21); a workspace from Cerulion 1.0 takes the steps in the [2.0.0 release notes](./CHANGELOG.md#200---2026-11-12) first. They move its pins to `=2.1.0` and finish with one `cerulion node build <node>` per node. The [installation details](docs/install.md) cover the toolchain setup.
+Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xcode-select --install` on macOS) and Rust 1.95 or newer. Nodes load through a compiler-independent interface, so any Rust 1.95 or newer can build them. The compiler does not have to match the one that built the `cerulion` CLI, and a new workspace pins no compiler. To bring a workspace from Cerulion 2.0, follow the migration steps in the [2.1.0 release notes](./CHANGELOG.md#210---2026-11-21); a workspace from Cerulion 1.0 takes the steps in the [2.0.0 release notes](./CHANGELOG.md#200---2026-11-12) first. They move its pins to `=2.1.0`, rebuild each node with `cerulion node build <node>` and restart `cerulion-netd`. The [installation details](docs/install.md) cover the toolchain setup.
 
 </details>
 
@@ -402,7 +402,7 @@ Guides: [Inspect topics](https://docs.cerulion.com/cerulion/guides/inspect-topic
 
 ## Tools for your coding agent
 
-**Cerulion MCP** at `https://mcp.cerulion.com/mcp/cerulion` gives Claude Code, Codex and other MCP clients tools for your Cerulion Cloud instances, analysis of MCAP recordings served over `https://`, a list of the robots on your account and a simulated robot arm to drive with the harness's tools; [Give your model Cerulion](#give-your-model-cerulion) shows a prompt for each side.
+**Cerulion MCP** at `https://mcp.cerulion.com/mcp/cerulion` gives Claude Code, Codex and other MCP clients tools for your Cerulion Cloud instances, analysis of MCAP recordings served over `https://`, a list of the robots on your account and a simulated robot arm with the harness's tools; [Give your model Cerulion](#give-your-model-cerulion) shows a prompt for each side.
 
 **Hindsight** at `https://mcp.cerulion.com/mcp/hindsight` serves the recording-analysis tools on their own, with answers grounded in specific topics and timestamps.
 

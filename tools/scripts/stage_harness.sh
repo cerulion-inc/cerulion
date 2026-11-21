@@ -84,7 +84,9 @@ self_test() {
 
     dest="$work/stage/harness"
     mkdir -p "$work/stage"
-    stage "$tree" "$dest"
+    # Under umask 000 the copy keeps every write bit, so only the stage's own
+    # chmod can take them off.
+    (umask 000 && stage "$tree" "$dest") || die "self-test: the stage of a plain tree failed"
     for gone in AGENTS.md CLAUDE.md measured/AGENTS.md measured/rcp/CLAUDE.md \
         tests .gitignore; do
         if [ -e "$dest/$gone" ] || [ -L "$dest/$gone" ]; then
