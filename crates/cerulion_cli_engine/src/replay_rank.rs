@@ -61,11 +61,17 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use cerulion_core::graph::config::InputBackpressure;
 use cerulion_core::graph::{
-    resolve_output_topic, resolve_source, GraphConfig, SiblingProducedTopics,
+    block_colocation_seeds, resolve_output_topic, resolve_source, GraphConfig, GraphTopology,
+    NodeInfo, SiblingProducedTopics,
 };
+use indexmap::IndexMap;
 
-use crate::multiprocess::{sibling_topics_for, subgraph_for};
+use crate::multiprocess::{
+    credit_edges_for, sibling_topics_for, split_edge_timeout_producers, subgraph_for,
+    CreditEdgePlan,
+};
 
 /// One rank's recorded node table — the `node_ids` of its
 /// `__cerulion/trace_manifest_rank{N}.json` attachment, plus the rank the
@@ -747,6 +753,287 @@ pub fn plan_ranks(
 }
 
 // ===========================================================================
+// Split `block` edges a several-rank replay can and cannot re-execute
+// ===========================================================================
+
+/// Where the `block` on a split input comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockDeclaredBy {
+    /// The graph the bag embeds sets `backpressure: block` on the input.
+    Graph,
+    /// The consumer node's declaration in the build being replayed, with no
+    /// graph key over it.
+    Node,
+}
+
+/// A `block` input the bag's rank manifests split from a topic that two or
+/// more in-graph producers write, one or more of them in another rank. A
+/// `block` edge crosses ranks only on a credit word, and a credit word counts
+/// one producer's outstanding frames, so a several-rank replay refuses the
+/// bag before its first pass.
+///
+/// The text is a draft of the operator-facing sentence, kept in one `format!`
+/// per sentence so a reworded approval is a one-line change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UncreditableSplitEdge {
+    /// The resolved absolute topic.
+    pub topic: String,
+    /// The consuming node.
+    pub consumer_node: String,
+    /// The consuming input.
+    pub consumer_input: String,
+    /// The consumer's rank.
+    pub consumer_rank: usize,
+    /// Every in-graph producer of the topic with its rank, in topic order.
+    pub producers: Vec<(String, usize)>,
+    /// Where the input's `block` comes from.
+    pub block_from: BlockDeclaredBy,
+}
+
+impl std::fmt::Display for UncreditableSplitEdge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (node, input, topic) = (&self.consumer_node, &self.consumer_input, &self.topic);
+        let placed: Vec<String> = self
+            .producers
+            .iter()
+            .map(|(producer, rank)| format!("'{producer}' in rank {rank}"))
+            .collect();
+        let placed = match placed.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+            _ => placed.join(""),
+        };
+        write!(
+            f,
+            "block input '{node}.{input}' reads topic '{topic}', which has {n} in-graph \
+             producers, and this bag's rank manifests put '{node}' in rank {rank}, {placed}. A \
+             `block` edge can cross ranks only on a topic with exactly one in-graph producer \
+             (its credit word counts one producer's outstanding frames), so this bag cannot be \
+             re-executed with `block` on that input. ",
+            n = self.producers.len(),
+            rank = self.consumer_rank,
+        )?;
+        match self.block_from {
+            BlockDeclaredBy::Graph => write!(
+                f,
+                "`block` comes from the graph this bag embeds (`backpressure: block` on \
+                 '{node}.{input}'), so the bag was changed after it was recorded. Re-execute an \
+                 unchanged copy of the bag, or record the run again."
+            ),
+            BlockDeclaredBy::Node => write!(
+                f,
+                "`block` comes from the declaration of input '{input}' on node '{node}' in the \
+                 build you replay. If '{node}' did not declare `block` on '{input}' when the run \
+                 was recorded, check out the recording-era node sources, build them and replay \
+                 with that build; otherwise record the run again with every producer of \
+                 '{topic}' and '{node}' in one process group."
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UncreditableSplitEdge {}
+
+/// A one-producer `block` edge the bag's rank manifests split across ranks
+/// whose input sets `block_timeout_ms`. Across ranks the edge counts on a
+/// shared credit word, which a timeout release keeps exact only when the
+/// producer and the consumer fire one at a time on one thread, so a
+/// several-rank replay refuses the bag before its first pass.
+///
+/// The text is a draft, kept in one `format!`, as
+/// [`UncreditableSplitEdge`]'s is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitEdgeTimeout {
+    /// The resolved absolute topic.
+    pub topic: String,
+    /// The consuming node.
+    pub consumer_node: String,
+    /// The consuming input.
+    pub consumer_input: String,
+    /// The consumer's rank.
+    pub consumer_rank: usize,
+    /// The topic's one in-graph producer.
+    pub producer: String,
+    /// The producer's rank.
+    pub producer_rank: usize,
+}
+
+impl std::fmt::Display for SplitEdgeTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            topic,
+            consumer_node: node,
+            consumer_input: input,
+            consumer_rank: rank,
+            producer,
+            producer_rank,
+        } = self;
+        write!(
+            f,
+            "this bag's rank manifests split the `block` edge '{topic}' -> '{node}.{input}' \
+             across ranks ('{node}' in rank {rank}, its producer '{producer}' in rank \
+             {producer_rank}), and the input sets `block_timeout_ms`. Across ranks the edge \
+             counts on a shared credit word, and a timeout release keeps that count exact only \
+             when the producer and the consumer fire one at a time on one thread, so `cerulion \
+             graph run` refuses `block_timeout_ms` on a split edge before any worker starts. \
+             `block_timeout_ms` comes from the graph this bag embeds, so the bag was changed \
+             after it was recorded. Re-execute an unchanged copy of the bag, or record the run \
+             again."
+        )
+    }
+}
+
+impl std::error::Error for SplitEdgeTimeout {}
+
+/// Why [`classify_split_block_edges`] refuses a bag.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SplitBlockEdgeError {
+    /// The whole graph the bag embeds, with the build's node declarations,
+    /// does not build into a valid topology ([`GraphTopology::build`] or
+    /// [`GraphTopology::validate`]); `reason` is that check's own text.
+    #[error("{reason}")]
+    Topology {
+        /// The topology check's refusal.
+        reason: String,
+    },
+    /// A split `block` edge whose topic two or more in-graph producers write.
+    #[error(transparent)]
+    Uncreditable(#[from] UncreditableSplitEdge),
+    /// A split one-producer `block` edge whose input sets `block_timeout_ms`.
+    #[error(transparent)]
+    Timeout(#[from] SplitEdgeTimeout),
+}
+
+/// Classify every `block` edge the manifests' `node_rank` map splits across
+/// ranks: the creditable ones (`Ok`, the edges a live run mints a cross-process
+/// credit word for, in [`credit_edges_for`]'s order), or the first edge a
+/// several-rank replay refuses (`Err`).
+///
+/// PURE: the whole graph the bag embeds, the build's own node declarations
+/// (`infos`, read before any pass) and the map in, a verdict out. Over ranks
+/// in place of process groups, the order is:
+///
+/// 1. the whole-graph topology is built; a build refusal is
+///    [`SplitBlockEdgeError::Topology`];
+/// 2. every flow [`block_colocation_seeds`] seeds whose
+///    [`BlockColocationSeed::credit_bar`](cerulion_core::graph::BlockColocationSeed::credit_bar)
+///    is set (two or more in-graph producers: a seed always has a producer and
+///    a `block` consumer) is refused at its first `block` consumer with a
+///    producer in another rank, as [`UncreditableSplitEdge`]. A producer in
+///    the consumer's rank is not split from it, as the live partition check
+///    skips a producer in the consumer's group (which covers a node that
+///    produces the topic it consumes), and a node the map does not place is
+///    skipped. Asked before validation, so a refusal that validation makes on
+///    the same flow (a `block_timeout_ms` on a shared topic, a `block` ring)
+///    does not stand in front of this one;
+/// 3. the topology is validated ([`GraphTopology::validate`]); a refusal is
+///    [`SplitBlockEdgeError::Topology`]. Past it every depth is in
+///    `1..=MAX_CONSUMER_DEPTH`, the range [`credit_edges_for`]'s own depth
+///    refusals guard;
+/// 4. the creditable split edges are [`credit_edges_for`]'s, the live mint,
+///    and the first whose input sets `block_timeout_ms`
+///    (`multiprocess::split_edge_timeout_producers`, the live check) is
+///    refused as [`SplitEdgeTimeout`].
+///
+/// Deterministic: topology order, then graph order within a flow; two calls
+/// over one input return equal values.
+pub fn classify_split_block_edges(
+    config: &GraphConfig,
+    infos: &IndexMap<String, NodeInfo>,
+    node_rank: &HashMap<&str, usize>,
+) -> Result<Vec<CreditEdgePlan>, SplitBlockEdgeError> {
+    let topology_err = |reason: String| SplitBlockEdgeError::Topology { reason };
+    let topology = GraphTopology::build(config, infos).map_err(|e| topology_err(e.to_string()))?;
+
+    for seed in block_colocation_seeds(&topology) {
+        if seed.credit_bar().is_none() {
+            continue;
+        }
+        for (consumer, input) in &seed.block_consumers {
+            let Some(&consumer_rank) = node_rank.get(consumer.as_str()) else {
+                continue;
+            };
+            let split = seed.producers.iter().any(|p| {
+                node_rank
+                    .get(p.as_str())
+                    .is_some_and(|&rank| rank != consumer_rank)
+            });
+            if !split {
+                continue;
+            }
+            return Err(UncreditableSplitEdge {
+                topic: seed.topic.clone(),
+                consumer_node: consumer.clone(),
+                consumer_input: input.clone(),
+                consumer_rank,
+                producers: seed
+                    .producers
+                    .iter()
+                    .filter_map(|p| Some((p.clone(), *node_rank.get(p.as_str())?)))
+                    .collect(),
+                block_from: block_declared_by(config, consumer, input),
+            }
+            .into());
+        }
+    }
+
+    topology
+        .validate()
+        .map_err(|e| topology_err(e.to_string()))?;
+    let credited = credit_edges_for(&topology, node_rank).map_err(topology_err)?;
+    for edge in &credited {
+        let producers = split_edge_timeout_producers(
+            &topology,
+            &edge.topic,
+            &edge.consumer_node,
+            &edge.consumer_input,
+        );
+        // A minted edge has one producer and one producer rank, so the
+        // singular patterns are the only ones that can match.
+        if let (Some([producer]), [producer_rank]) = (producers, edge.producer_ranks.as_slice()) {
+            return Err(SplitEdgeTimeout {
+                topic: edge.topic.clone(),
+                consumer_node: edge.consumer_node.clone(),
+                consumer_input: edge.consumer_input.clone(),
+                consumer_rank: edge.consumer_rank,
+                producer: producer.clone(),
+                producer_rank: *producer_rank,
+            }
+            .into());
+        }
+    }
+    Ok(credited)
+}
+
+/// Whether `node.input`'s `block` is the graph's `backpressure: block` key or
+/// the node's own declaration (the key is absent, so the declaration stands).
+fn block_declared_by(config: &GraphConfig, node: &str, input: &str) -> BlockDeclaredBy {
+    let graph_key = config
+        .nodes
+        .iter()
+        .find(|n| n.id == node)
+        .and_then(|n| n.inputs.iter().find(|i| i.name == input))
+        .and_then(|i| i.backpressure);
+    match graph_key {
+        Some(InputBackpressure::Block) => BlockDeclaredBy::Graph,
+        _ => BlockDeclaredBy::Node,
+    }
+}
+
+/// Each plan's members mapped to its rank: the manifests' node to rank map,
+/// in the shape [`classify_split_block_edges`] and [`credit_edges_for`] take.
+#[must_use]
+pub fn plan_node_ranks(plans: &[RankPlan]) -> HashMap<&str, usize> {
+    plans
+        .iter()
+        .flat_map(|plan| {
+            plan.members()
+                .iter()
+                .map(move |m| (m.as_str(), plan.rank() as usize))
+        })
+        .collect()
+}
+
+// ===========================================================================
 // The BAG-TIME window, in ONE place
 // ===========================================================================
 
@@ -848,5 +1135,693 @@ mod bag_time_window_tests {
         // rule is the same at the extremes.
         assert!(!beyond_duration_bound(u64::MAX - 1, u64::MAX));
         assert!(beyond_duration_bound(u64::MAX, u64::MAX));
+    }
+}
+
+#[cfg(test)]
+mod split_block_edge_tests {
+    //! Oracle vectors for [`classify_split_block_edges`]: a hand-written graph,
+    //! hand-built node declarations and a hand-built node to rank map in, a
+    //! hand-written verdict out.
+
+    use super::*;
+    use cerulion_core::graph::node::{BackpressurePolicy, InputMeta};
+
+    /// One input of a test graph: `(name, source, extra YAML keys, one per
+    /// line)`.
+    type In<'a> = (&'a str, &'a str, &'a str);
+
+    /// A test graph under prefix `g`. Each node is `(id, its one output's
+    /// topic override, its inputs)`: `None` declares no output, `Some("")`
+    /// one `out` on the default topic `/g/<id>/out`, `Some(t)` one `out` on
+    /// `t`.
+    fn graph(listed: &[&str], nodes: &[(&str, Option<&str>, &[In<'_>])]) -> GraphConfig {
+        let mut y = String::from("name: split\nprefix: g\n");
+        if !listed.is_empty() {
+            y.push_str("multi_publisher_topics:\n");
+            for t in listed {
+                y.push_str(&format!("  - {t}\n"));
+            }
+        }
+        y.push_str("nodes:\n");
+        for (id, out, inputs) in nodes {
+            y.push_str(&format!("  - id: {id}\n    type: t\n"));
+            if !inputs.is_empty() {
+                y.push_str("    inputs:\n");
+                for (name, source, extra) in *inputs {
+                    y.push_str(&format!("      - name: {name}\n        source: {source}\n"));
+                    for key in extra.lines() {
+                        y.push_str(&format!("        {key}\n"));
+                    }
+                }
+            }
+            if let Some(topic) = out {
+                y.push_str(
+                    "    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n",
+                );
+                if !topic.is_empty() {
+                    y.push_str(&format!("        topic: {topic}\n"));
+                }
+            }
+        }
+        cerulion_core::graph::parse_graph(&y).expect("the test graph parses")
+    }
+
+    /// One declared input at depth 4.
+    fn meta(name: &str, backpressure: BackpressurePolicy, trigger: bool) -> InputMeta {
+        InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger,
+            depth: 4,
+            backpressure,
+            expect_within_ms: None,
+            accumulate: false,
+            consume: Default::default(),
+        }
+    }
+
+    /// Every node of `config` with no input metadata, then `declared` over
+    /// it: `(node, its declared inputs)`.
+    fn infos(
+        config: &GraphConfig,
+        declared: &[(&str, Vec<InputMeta>)],
+    ) -> IndexMap<String, NodeInfo> {
+        let mut out: IndexMap<String, NodeInfo> = config
+            .nodes
+            .iter()
+            .map(|n| (n.id.clone(), NodeInfo::with_meta(vec![], vec![])))
+            .collect();
+        for (node, metas) in declared {
+            out.insert(
+                (*node).to_string(),
+                NodeInfo::with_meta(metas.clone(), vec![]),
+            );
+        }
+        out
+    }
+
+    fn ranks<'a>(pairs: &[(&'a str, usize)]) -> HashMap<&'a str, usize> {
+        pairs.iter().copied().collect()
+    }
+
+    const BLOCK: BackpressurePolicy = BackpressurePolicy::Block;
+    const DROP: BackpressurePolicy = BackpressurePolicy::DropOldest;
+
+    /// `prod -> sink.gate`, with `key` on `sink.gate`.
+    fn one_writer(key: &str) -> GraphConfig {
+        graph(
+            &[],
+            &[
+                ("prod", Some(""), &[]),
+                ("sink", None, &[("gate", "prod/out", key)]),
+            ],
+        )
+    }
+
+    /// `p1` and `p2` both write the listed `/g/bus`, and `sink.inp` reads it
+    /// with `key`.
+    fn shared_bus(key: &str) -> GraphConfig {
+        graph(
+            &["/g/bus"],
+            &[
+                ("p1", Some("/g/bus"), &[]),
+                ("p2", Some("/g/bus"), &[]),
+                ("sink", None, &[("inp", "/g/bus", key)]),
+            ],
+        )
+    }
+
+    fn sink_gate_plan(consumer: &str, consumer_rank: usize) -> CreditEdgePlan {
+        CreditEdgePlan {
+            topic: "/g/prod/out".to_string(),
+            consumer_node: consumer.to_string(),
+            consumer_input: "gate".to_string(),
+            depth: 4,
+            producer_ranks: vec![0],
+            consumer_rank,
+            producer_nodes: vec!["prod".to_string()],
+        }
+    }
+
+    /// The refusal of `consumer.inp` on `/g/bus`, `p1` and `p2` at `p1` and
+    /// `p2`.
+    fn bus_refusal(
+        consumer: &str,
+        consumer_rank: usize,
+        (p1, p2): (usize, usize),
+        block_from: BlockDeclaredBy,
+    ) -> SplitBlockEdgeError {
+        SplitBlockEdgeError::Uncreditable(UncreditableSplitEdge {
+            topic: "/g/bus".to_string(),
+            consumer_node: consumer.to_string(),
+            consumer_input: "inp".to_string(),
+            consumer_rank,
+            producers: vec![("p1".to_string(), p1), ("p2".to_string(), p2)],
+            block_from,
+        })
+    }
+
+    #[test]
+    fn a_creditable_split_edge_is_credited_and_nothing_is_refused() {
+        let config = one_writer("");
+        let infos = infos(&config, &[("sink", vec![meta("gate", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &infos, &ranks(&[("prod", 0), ("sink", 1)])),
+            Ok(vec![sink_gate_plan("sink", 1)])
+        );
+    }
+
+    /// A split `block` input that is not a trigger is credited exactly as a
+    /// trigger is: the live mint does not ask whether the input fires its node.
+    #[test]
+    fn a_split_block_input_that_is_not_a_trigger_is_credited_like_a_trigger() {
+        let config = one_writer("");
+        let infos = infos(&config, &[("sink", vec![meta("gate", BLOCK, false)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &infos, &ranks(&[("prod", 0), ("sink", 1)])),
+            Ok(vec![sink_gate_plan("sink", 1)])
+        );
+    }
+
+    #[test]
+    fn a_co_located_block_edge_is_neither_credited_nor_refused() {
+        let config = one_writer("");
+        let infos_one = infos(&config, &[("sink", vec![meta("gate", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &infos_one, &ranks(&[("prod", 1), ("sink", 1)])),
+            Ok(vec![])
+        );
+        // Two writers and their `block` reader in one rank: nothing is split.
+        let bus = shared_bus("");
+        let infos_bus = infos(&bus, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(
+                &bus,
+                &infos_bus,
+                &ranks(&[("p1", 0), ("p2", 0), ("sink", 0)])
+            ),
+            Ok(vec![])
+        );
+    }
+
+    #[test]
+    fn a_split_edge_that_is_not_block_is_neither_credited_nor_refused() {
+        let config = one_writer("");
+        let infos_one = infos(&config, &[("sink", vec![meta("gate", DROP, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &infos_one, &ranks(&[("prod", 0), ("sink", 1)])),
+            Ok(vec![])
+        );
+        let bus = shared_bus("");
+        let infos_bus = infos(&bus, &[("sink", vec![meta("inp", DROP, true)])]);
+        assert_eq!(
+            classify_split_block_edges(
+                &bus,
+                &infos_bus,
+                &ranks(&[("p1", 0), ("p2", 0), ("sink", 1)])
+            ),
+            Ok(vec![])
+        );
+    }
+
+    /// A topic `multi_publisher_topics:` lists but one in-graph node writes is
+    /// creditable, as the live mint credits it.
+    #[test]
+    fn a_listed_topic_with_one_writer_is_credited() {
+        let config = graph(
+            &["/g/bus"],
+            &[
+                ("p1", Some("/g/bus"), &[]),
+                ("sink", None, &[("inp", "/g/bus", "")]),
+            ],
+        );
+        let infos = infos(&config, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &infos, &ranks(&[("p1", 0), ("sink", 1)])),
+            Ok(vec![CreditEdgePlan {
+                topic: "/g/bus".to_string(),
+                consumer_node: "sink".to_string(),
+                consumer_input: "inp".to_string(),
+                depth: 4,
+                producer_ranks: vec![0],
+                consumer_rank: 1,
+                producer_nodes: vec!["p1".to_string()],
+            }])
+        );
+    }
+
+    #[test]
+    fn two_foreign_writers_on_a_block_edge_the_graph_sets_are_refused_naming_both() {
+        let config = shared_bus("backpressure: block");
+        // The node declares `drop_oldest`; the graph's key is what makes it
+        // `block`.
+        let infos = infos(&config, &[("sink", vec![meta("inp", DROP, true)])]);
+        let verdict = classify_split_block_edges(
+            &config,
+            &infos,
+            &ranks(&[("p1", 0), ("p2", 2), ("sink", 1)]),
+        );
+        assert_eq!(
+            verdict,
+            Err(bus_refusal("sink", 1, (0, 2), BlockDeclaredBy::Graph))
+        );
+        assert_eq!(
+            verdict.unwrap_err().to_string(),
+            "block input 'sink.inp' reads topic '/g/bus', which has 2 in-graph producers, and \
+             this bag's rank manifests put 'sink' in rank 1, 'p1' in rank 0 and 'p2' in rank 2. \
+             A `block` edge can cross ranks only on a topic with exactly one in-graph producer \
+             (its credit word counts one producer's outstanding frames), so this bag cannot be \
+             re-executed with `block` on that input. `block` comes from the graph this bag embeds \
+             (`backpressure: block` on 'sink.inp'), so the bag was changed after it was recorded. \
+             Re-execute an unchanged copy of the bag, or record the run again."
+        );
+    }
+
+    /// The mixed shape: one writer in the consumer's rank, one in another.
+    /// The build replayed declares `block`, where the recording's sources may
+    /// have declared `drop_oldest` (a stale build records this split live), so
+    /// the refusal names what replay knows: the declaration in this build.
+    #[test]
+    fn a_split_with_one_local_writer_whose_block_the_build_declares_is_refused() {
+        let config = shared_bus("");
+        let infos = infos(&config, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        let verdict = classify_split_block_edges(
+            &config,
+            &infos,
+            &ranks(&[("p1", 0), ("p2", 1), ("sink", 1)]),
+        );
+        assert_eq!(
+            verdict,
+            Err(bus_refusal("sink", 1, (0, 1), BlockDeclaredBy::Node))
+        );
+        assert_eq!(
+            verdict.unwrap_err().to_string(),
+            "block input 'sink.inp' reads topic '/g/bus', which has 2 in-graph producers, and \
+             this bag's rank manifests put 'sink' in rank 1, 'p1' in rank 0 and 'p2' in rank 1. \
+             A `block` edge can cross ranks only on a topic with exactly one in-graph producer \
+             (its credit word counts one producer's outstanding frames), so this bag cannot be \
+             re-executed with `block` on that input. `block` comes from the declaration of input \
+             'inp' on node 'sink' in the build you replay. If 'sink' did not declare `block` on \
+             'inp' when the run was recorded, check out the recording-era node sources, build \
+             them and replay with that build; otherwise record the run again with every \
+             producer of '/g/bus' and 'sink' in one process group."
+        );
+    }
+
+    /// Three writers are named in topic order, the last after "and".
+    #[test]
+    fn three_writers_are_named_in_topic_order() {
+        let config = graph(
+            &["/g/bus"],
+            &[
+                ("p1", Some("/g/bus"), &[]),
+                ("p2", Some("/g/bus"), &[]),
+                ("p3", Some("/g/bus"), &[]),
+                ("sink", None, &[("inp", "/g/bus", "")]),
+            ],
+        );
+        let infos = infos(&config, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        let verdict = classify_split_block_edges(
+            &config,
+            &infos,
+            &ranks(&[("p1", 2), ("p2", 0), ("p3", 0), ("sink", 0)]),
+        );
+        let text = verdict.unwrap_err().to_string();
+        assert!(
+            text.starts_with(
+                "block input 'sink.inp' reads topic '/g/bus', which has 3 in-graph producers, \
+                 and this bag's rank manifests put 'sink' in rank 0, 'p1' in rank 2, 'p2' in \
+                 rank 0 and 'p3' in rank 0. "
+            ),
+            "{text}"
+        );
+    }
+
+    /// The same graph and ranks classify by the build's declaration, and a
+    /// graph key over it wins.
+    #[test]
+    fn the_candidate_build_decides_a_split_edge_the_graph_leaves_to_it() {
+        let split = ranks(&[("p1", 0), ("p2", 1), ("sink", 1)]);
+        let config = shared_bus("");
+        let dropping = infos(&config, &[("sink", vec![meta("inp", DROP, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &dropping, &split),
+            Ok(vec![])
+        );
+        let keyed = shared_bus("backpressure: drop_oldest");
+        let blocking = infos(&keyed, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&keyed, &blocking, &split),
+            Ok(vec![])
+        );
+    }
+
+    #[test]
+    fn of_two_block_readers_of_a_topic_only_the_split_one_is_refused() {
+        let bus = graph(
+            &["/g/bus"],
+            &[
+                ("p1", Some("/g/bus"), &[]),
+                ("p2", Some("/g/bus"), &[]),
+                ("near", None, &[("inp", "/g/bus", "")]),
+                ("far", None, &[("inp", "/g/bus", "")]),
+            ],
+        );
+        let declared = infos(
+            &bus,
+            &[
+                ("near", vec![meta("inp", BLOCK, true)]),
+                ("far", vec![meta("inp", BLOCK, true)]),
+            ],
+        );
+        assert_eq!(
+            classify_split_block_edges(
+                &bus,
+                &declared,
+                &ranks(&[("p1", 0), ("p2", 0), ("near", 0), ("far", 1)])
+            ),
+            Err(bus_refusal("far", 1, (0, 0), BlockDeclaredBy::Node))
+        );
+        // One writer: only the split reader is credited.
+        let one = graph(
+            &[],
+            &[
+                ("prod", Some(""), &[]),
+                ("near", None, &[("gate", "prod/out", "")]),
+                ("far", None, &[("gate", "prod/out", "")]),
+            ],
+        );
+        let declared_one = infos(
+            &one,
+            &[
+                ("near", vec![meta("gate", BLOCK, true)]),
+                ("far", vec![meta("gate", BLOCK, true)]),
+            ],
+        );
+        assert_eq!(
+            classify_split_block_edges(
+                &one,
+                &declared_one,
+                &ranks(&[("prod", 0), ("near", 0), ("far", 1)])
+            ),
+            Ok(vec![sink_gate_plan("far", 1)])
+        );
+    }
+
+    /// A node that writes the topic it reads with `block` is refused as a
+    /// split edge when the topic's other writer runs in another rank, before
+    /// the validation that refuses the `block` ring the self edge makes; with
+    /// both writers in its rank the ring is the validation's refusal.
+    #[test]
+    fn a_block_reader_that_writes_its_own_topic_is_judged_split_first() {
+        let config = graph(
+            &["/g/bus"],
+            &[
+                ("p1", Some("/g/bus"), &[("inp", "/g/bus", "")]),
+                ("p2", Some("/g/bus"), &[]),
+            ],
+        );
+        let declared = infos(&config, &[("p1", vec![meta("inp", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &declared, &ranks(&[("p1", 0), ("p2", 1)])),
+            Err(bus_refusal("p1", 0, (0, 1), BlockDeclaredBy::Node))
+        );
+        let verdict =
+            classify_split_block_edges(&config, &declared, &ranks(&[("p1", 0), ("p2", 0)]));
+        let Err(SplitBlockEdgeError::Topology { reason }) = &verdict else {
+            panic!("the validation refuses the ring: {verdict:?}");
+        };
+        assert!(
+            reason.starts_with(
+                "Graph validation error: a ring of `block` edges: p1 -> p1.inp (topic \
+                 '/g/bus'). "
+            ),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn a_split_edge_with_a_block_timeout_is_refused_naming_both_ranks() {
+        let config = one_writer("block_timeout_ms: 100");
+        let declared = infos(&config, &[("sink", vec![meta("gate", BLOCK, true)])]);
+        let verdict =
+            classify_split_block_edges(&config, &declared, &ranks(&[("prod", 0), ("sink", 1)]));
+        assert_eq!(
+            verdict,
+            Err(SplitBlockEdgeError::Timeout(SplitEdgeTimeout {
+                topic: "/g/prod/out".to_string(),
+                consumer_node: "sink".to_string(),
+                consumer_input: "gate".to_string(),
+                consumer_rank: 1,
+                producer: "prod".to_string(),
+                producer_rank: 0,
+            }))
+        );
+        assert_eq!(
+            verdict.unwrap_err().to_string(),
+            "this bag's rank manifests split the `block` edge '/g/prod/out' -> 'sink.gate' \
+             across ranks ('sink' in rank 1, its producer 'prod' in rank 0), and the input sets \
+             `block_timeout_ms`. Across ranks the edge counts on a shared credit word, and a \
+             timeout release keeps that count exact only when the producer and the consumer \
+             fire one at a time on one thread, so `cerulion graph run` refuses \
+             `block_timeout_ms` on a split edge before any worker starts. `block_timeout_ms` \
+             comes from the graph this bag embeds, so the bag was changed after it was \
+             recorded. Re-execute an unchanged copy of the bag, or record the run again."
+        );
+        // The same key on the edge kept in one rank is legal there.
+        assert_eq!(
+            classify_split_block_edges(&config, &declared, &ranks(&[("prod", 1), ("sink", 1)])),
+            Ok(vec![])
+        );
+    }
+
+    /// `block_timeout_ms` on a topic two nodes write: split, it is the split
+    /// refusal, asked before the validation; kept in one rank, it is the
+    /// validation's shared-topic refusal.
+    #[test]
+    fn a_block_timeout_on_a_shared_topic_is_refused_as_split_before_validation() {
+        let config = shared_bus("block_timeout_ms: 100");
+        let declared = infos(&config, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(
+                &config,
+                &declared,
+                &ranks(&[("p1", 0), ("p2", 0), ("sink", 1)])
+            ),
+            Err(bus_refusal("sink", 1, (0, 0), BlockDeclaredBy::Node))
+        );
+        let verdict = classify_split_block_edges(
+            &config,
+            &declared,
+            &ranks(&[("p1", 1), ("p2", 1), ("sink", 1)]),
+        );
+        let Err(SplitBlockEdgeError::Topology { reason }) = &verdict else {
+            panic!("the shared-topic timeout is the validation's refusal: {verdict:?}");
+        };
+        assert!(
+            reason.starts_with(
+                "Graph validation error: input 'sink.inp' on topic '/g/bus' sets \
+                 `block_timeout_ms`, but the topic has 2 in-graph producers ('p1', 'p2') and is \
+                 listed in `multi_publisher_topics:`"
+            ),
+            "{reason}"
+        );
+    }
+
+    /// A topic two nodes write that `multi_publisher_topics:` does not list is
+    /// refused by the topology build, in its own words, before any edge is
+    /// classified.
+    #[test]
+    fn an_unlisted_topic_two_nodes_write_is_the_topology_build_s_refusal() {
+        let config = graph(
+            &[],
+            &[
+                ("p1", Some("/g/bus"), &[]),
+                ("p2", Some("/g/bus"), &[]),
+                ("sink", None, &[("inp", "/g/bus", "")]),
+            ],
+        );
+        let declared = infos(&config, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(
+                &config,
+                &declared,
+                &ranks(&[("p1", 0), ("p2", 0), ("sink", 1)])
+            ),
+            Err(SplitBlockEdgeError::Topology {
+                reason: "Graph validation error: topic '/g/bus' is published by two in-graph \
+                         nodes ('p1' and 'p2'); each topic must have a single producer (if \
+                         multiple publishers are intentional, list the topic in \
+                         `multi_publisher_topics:`)"
+                    .to_string()
+            })
+        );
+    }
+
+    /// A depth out of range on a creditable SPLIT edge is the validation's
+    /// refusal in its own words. The mint's depth refusals, which name a
+    /// planning bug, are never reached.
+    #[test]
+    fn a_depth_out_of_range_is_the_topology_validation_s_refusal() {
+        let split = ranks(&[("prod", 0), ("sink", 1)]);
+        let zero = one_writer("depth: 0");
+        let declared = infos(&zero, &[("sink", vec![meta("gate", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&zero, &declared, &split),
+            Err(SplitBlockEdgeError::Topology {
+                reason: "Graph validation error: input 'sink.gate' on topic '/g/prod/out' \
+                         declares depth = 0; queue depth must be >= 1"
+                    .to_string()
+            })
+        );
+        let deep = one_writer("depth: 65");
+        let verdict = classify_split_block_edges(&deep, &declared, &split);
+        let Err(SplitBlockEdgeError::Topology { reason }) = &verdict else {
+            panic!("depth 65 is the validation's refusal: {verdict:?}");
+        };
+        assert!(
+            reason.starts_with(
+                "Graph validation error: input 'sink.gate' on topic '/g/prod/out' declares \
+                 depth = 65; the maximum queue depth is 64 "
+            ),
+            "{reason}"
+        );
+    }
+
+    /// A node the map does not place is skipped, as the live mint skips it.
+    #[test]
+    fn a_node_the_map_does_not_place_is_skipped() {
+        let config = one_writer("");
+        let declared = infos(&config, &[("sink", vec![meta("gate", BLOCK, true)])]);
+        assert_eq!(
+            classify_split_block_edges(&config, &declared, &ranks(&[("prod", 0)])),
+            Ok(vec![])
+        );
+        let bus = shared_bus("");
+        let declared_bus = infos(&bus, &[("sink", vec![meta("inp", BLOCK, true)])]);
+        // The reader unplaced, then the one writer in another rank unplaced.
+        assert_eq!(
+            classify_split_block_edges(&bus, &declared_bus, &ranks(&[("p1", 0), ("p2", 0)])),
+            Ok(vec![])
+        );
+        assert_eq!(
+            classify_split_block_edges(&bus, &declared_bus, &ranks(&[("p2", 1), ("sink", 1)])),
+            Ok(vec![])
+        );
+    }
+
+    /// Two refusable edges: the one on the topic the topology lists first is
+    /// named, whatever the node order of the readers, and two calls agree.
+    #[test]
+    fn the_first_refusable_edge_in_topology_order_is_named_on_every_call() {
+        let config = graph(
+            &["/g/a", "/g/b"],
+            &[
+                ("p1", Some("/g/a"), &[]),
+                ("p2", Some("/g/a"), &[]),
+                ("p3", Some("/g/b"), &[]),
+                ("p4", Some("/g/b"), &[]),
+                ("sink_b", None, &[("inp", "/g/b", "")]),
+                ("sink_a", None, &[("inp", "/g/a", "")]),
+            ],
+        );
+        let declared = infos(
+            &config,
+            &[
+                ("sink_a", vec![meta("inp", BLOCK, true)]),
+                ("sink_b", vec![meta("inp", BLOCK, true)]),
+            ],
+        );
+        let map = ranks(&[
+            ("p1", 0),
+            ("p2", 0),
+            ("p3", 0),
+            ("p4", 0),
+            ("sink_a", 1),
+            ("sink_b", 1),
+        ]);
+        let first = classify_split_block_edges(&config, &declared, &map);
+        let second = classify_split_block_edges(&config, &declared, &map);
+        let want = SplitBlockEdgeError::Uncreditable(UncreditableSplitEdge {
+            topic: "/g/a".to_string(),
+            consumer_node: "sink_a".to_string(),
+            consumer_input: "inp".to_string(),
+            consumer_rank: 1,
+            producers: vec![("p1".to_string(), 0), ("p2".to_string(), 0)],
+            block_from: BlockDeclaredBy::Node,
+        });
+        assert_eq!(first, Err(want.clone()));
+        assert_eq!(second, Err(want));
+        assert_eq!(
+            first.unwrap_err().to_string(),
+            second.unwrap_err().to_string()
+        );
+    }
+
+    /// A split edge two writers write is named before a split edge whose
+    /// input sets `block_timeout_ms`, even when the timeout's topic comes first:
+    /// the live run refuses the partition before it mints a word.
+    #[test]
+    fn a_split_edge_two_writers_write_is_named_before_a_timeout() {
+        let config = graph(
+            &["/g/bus"],
+            &[
+                ("prod", Some(""), &[]),
+                (
+                    "sink",
+                    None,
+                    &[("gate", "prod/out", "block_timeout_ms: 100")],
+                ),
+                ("p1", Some("/g/bus"), &[]),
+                ("p2", Some("/g/bus"), &[]),
+                ("reader", None, &[("inp", "/g/bus", "")]),
+            ],
+        );
+        let declared = infos(
+            &config,
+            &[
+                ("sink", vec![meta("gate", BLOCK, true)]),
+                ("reader", vec![meta("inp", BLOCK, true)]),
+            ],
+        );
+        assert_eq!(
+            classify_split_block_edges(
+                &config,
+                &declared,
+                &ranks(&[
+                    ("prod", 0),
+                    ("sink", 1),
+                    ("p1", 0),
+                    ("p2", 0),
+                    ("reader", 1)
+                ])
+            ),
+            Err(bus_refusal("reader", 1, (0, 0), BlockDeclaredBy::Node))
+        );
+    }
+
+    #[test]
+    fn plan_node_ranks_maps_each_member_to_its_plan_s_rank() {
+        let config = one_writer("");
+        let plans = plan_ranks(
+            &config,
+            &[
+                RankManifest {
+                    rank: 1,
+                    node_ids: vec!["sink".to_string()],
+                },
+                RankManifest {
+                    rank: 0,
+                    node_ids: vec!["prod".to_string()],
+                },
+            ],
+            &[
+                RankBoundarySummary::new(0, 0, 3, 10),
+                RankBoundarySummary::new(1, 0, 3, 20),
+            ],
+        )
+        .expect("two ranks plan");
+        assert_eq!(plan_node_ranks(&plans), ranks(&[("prod", 0), ("sink", 1)]));
     }
 }
