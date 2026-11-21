@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
 //! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
-//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks whose topic has two or more in-graph producers, or whose input sets `block_timeout_ms` on a topic with one producer that `multi_publisher_topics:` does not list) |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge a free-run bag splits across ranks whose topic has two or more in-graph producers, or whose topic has one in-graph producer and is not listed in `multi_publisher_topics:` and whose input sets `block_timeout_ms`) |
 //! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
 //! | 4 | none | tolerance-YAML validation error |
 //! | 5 | none | internal error (panic, transport, scheduler) |

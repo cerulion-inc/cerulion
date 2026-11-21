@@ -41877,8 +41877,8 @@ fn fk_bag(
 }
 
 /// A data-triggered node with a latest-value feedback input `fb`. Its tick
-/// body runs once `fb` holds a message, so in a ring nothing outside the ring
-/// feeds (the fk_a ring) it never publishes.
+/// body runs once `fb` holds a message, so in a ring whose topics no node
+/// outside the ring writes (the fk_a ring), it never publishes.
 #[cerulion_node]
 #[derive(Default)]
 struct FkRingMidNode {
@@ -42157,9 +42157,10 @@ fn fk_d_a_ring_with_a_split_two_writer_edge_is_refused_by_name() {
     fk_assert_is_a_block_ring(&rec.graph_yaml, fk_ring2_factories);
     // Hand count over `sb_deltas()`: `other` and `src` each fire 14 times, one
     // frame per fire. `mid` fires on every `src` frame and writes the bus once
-    // `fb` holds a message, which `tail` first relays in step 0 from `other`'s
-    // frame, so `mid` writes on 13 fires. The bus carries both writers' frames,
-    // so the bag states no producer labels: the refusal reads none.
+    // `fb` holds a message: `tail` first relays `other`'s step 0 frame after
+    // `mid`'s step 0 fire, so `mid` writes on its 13 later fires. Both writers'
+    // frames lie above `CO_SPLIT`, so no frame says which wrote it, and the bag
+    // states no producer labels or publisher table; the refusal reads neither.
     let other_idx = rec
         .node_ids
         .iter()

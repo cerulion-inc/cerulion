@@ -4858,6 +4858,9 @@ pub struct CompiledTolerance {
 /// [`crate::replay_cmd::run_replay`] assembles this after its entry gates pass.
 pub struct ReplayInputs {
     /// The parsed graph (topic-name truth comes from its resolved `prefix`).
+    /// `cerulion bag play --resim` passes one `validate_graph` accepted; the
+    /// split `block` edge check's account of which rank build fails relies on
+    /// it.
     pub config: GraphConfig,
     /// The recorded scheduler trace (rank 0 — gate-checked), streamed from the
     /// mapped bag per pass instead of materialized (see [`RecordedTrace`]).
@@ -5544,9 +5547,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // ── 4a'. Every rank's unlisted `#[cerulion_node]` output, BEFORE the
     //         first pass ─────────────────────────────────────────────────
     //
-    // A refusal that is a fact about the recording is whole-RUN: a later rank's
-    // node with an unlisted output is a fact about the recording, so it refuses
-    // the replay before rank 0 has run a step.
+    // A refusal that is a fact about the recording is whole-RUN. A later rank's
+    // node with an unlisted output is one, so it refuses the replay before rank
+    // 0 has run a step.
     refuse_unlisted_macro_output_in_every_pass(&plans, &factories)?;
     // ── 4a''. Every `block` edge the rank manifests split, BEFORE the first
     //          pass ───────────────────────────────────────────────────────
@@ -5562,9 +5565,8 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
     //        the first pass ────────────────────────────────────────────────
     //
-    // A refusal that is a fact about the RECORDING is whole-RUN, so it must not
-    // wait for a rank's turn to execute: this plans every rank's gated edges from
-    // the bag's own staging rows and refuses here, before rank 0 has run a step.
+    // The same whole-RUN rule: this plans every rank's gated edges from the
+    // bag's own staging rows and refuses here, before rank 0 has run a step.
     // What stays per rank is the pair that needs a built runtime (see
     // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
     let bag_side = plan_bag_side_admissions(
