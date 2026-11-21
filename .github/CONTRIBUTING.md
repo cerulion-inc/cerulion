@@ -87,8 +87,8 @@ cargo test -p cerulion_core --tests --lib -- --test-threads=1
 > matches CI exactly.
 
 If the build and core tests succeed, your environment is healthy. To see
-Cerulion run end to end, install the CLI and follow the quickstart in the
-[README](../README.md):
+Cerulion run end to end, install the CLI and follow the
+[quickstart](../README.md#quickstart):
 
 ```bash
 cargo build --release --locked -p cerulion_cli -p cerulion_netd -p cerulion_connectd \

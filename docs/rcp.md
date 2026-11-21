@@ -20,6 +20,8 @@ Runs started with `--local`, `--network off` or `CERULION_NETWORK=off` keep thei
 
 ## Try it in simulation
 
+The [README quickstart](../README.md#quickstart) walks through this simulated robot and the runtime, from one coding-agent prompt or by commands.
+
 `cerulion rcp --sim` serves the tools of the [Cerulion harness](harness.md) with a simulated robot on your
 machine, to any MCP client. It needs no robot, and with a release package no source build: every release package
 installs the harness folder beside `cerulion`, which finds it there with no clone and no setting. A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`. Sign in once, start it,

@@ -4,6 +4,8 @@ Build a complete obstacle-avoidance safety controller from scratch with the
 `cerulion` CLI: create a workspace, write three nodes, wire them in a graph file,
 run it, record it, and verify a code change against the recording.
 
+New to Cerulion? Run the [README quickstart](../../README.md#quickstart) first: it records and verifies a ready-made version of this controller and tries the harness, and this tutorial then builds one from scratch.
+
 **What you'll build:**
 
 ```

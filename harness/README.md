@@ -4,6 +4,8 @@ This folder is the Cerulion harness: the tools and body knowledge a general mode
 never trained on, the simulated robot it runs on in this release, and the benchmark that measured it. You run it
 through the `cerulion` command; the guide is [docs/harness.md](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/docs/harness.md).
 
+The [quickstart](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/README.md#quickstart) walks a new user through these commands and the runtime, from one coding-agent prompt or by hand.
+
 ```bash
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # the harness's MCP tools with a simulated robot

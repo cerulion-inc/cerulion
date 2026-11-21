@@ -18,6 +18,8 @@ You do **not** import `cerulion_core::graph::*`, `cerulion_core::transport::*`, 
 
 ## Quick start
 
+The guided first run, through the runtime and the harness with a coding-agent prompt or commands, is the [README quickstart](../README.md#quickstart); this section is the empty-workspace flow of the API.
+
 ```bash
 # 0. Sign in once per machine; later commands read the result locally.
 cerulion login

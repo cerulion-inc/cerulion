@@ -46,7 +46,7 @@ directory. See [Build and run from inside the example](../README.md#build-and-ru
 
 ## Run it
 
-The same sequence as the quickstart in the top-level `README.md`:
+The same sequence as the [quickstart](../../README.md#quickstart), run from this directory:
 
 ```bash
 cd examples/obstacle_avoidance

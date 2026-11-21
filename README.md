@@ -25,9 +25,31 @@ On the main test, as declared before the first episode, Gemini 3.8 Flash solved 
 
 ## Quickstart
 
-One install and one Cerulion account give you two things: the robot runtime, which runs, records and verifies your robot software, and the harness, which gives a model the tools to work a simulated robot. Through the hosted Cerulion MCP your model reaches the harness and your recordings, and lists your robots; your terminal runs both on your machine.
+One install and one free Cerulion account give you both the robot runtime, which runs, records and verifies your robot software, and the harness, which gives a model the tools to work a simulated robot. Paste one prompt into your coding agent and it walks you through both on your machine, or run the same steps by commands.
 
-### Install
+### With your coding agent
+
+Paste this prompt into Claude Code, or another coding agent that runs commands in its own terminal. It installs Cerulion itself when Cerulion is missing or older than 2.1.0.
+
+```text
+Walk me through Cerulion's runtime and its harness. Run every command in your own terminal, and run long commands in the background with their output in a file. If a step says a system package is missing, give me the command that installs it (the one it prints, if it prints one) and wait until I have run it. If your sandbox blocks a command's network access or a write outside this folder, ask me to approve running it outside the sandbox.
+1. If cerulion --version fails or prints a version older than 2.1.0, install Cerulion: curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env" (if a later command cannot find cerulion, run . "$HOME/.cerulion/env" in it first). Then run cerulion --version again. If it still prints a version older than 2.1.0, run command -v cerulion, show me its output and stop.
+2. If cerulion doctor --check account.login fails, run cerulion login in the background, show me the URL and code it prints, and wait while I approve the sign-in in my browser.
+3. Star the repository: gh api -X PUT user/starred/cerulion-inc/cerulion. If that fails for any reason, print https://github.com/cerulion-inc/cerulion instead.
+4. Run cerulion workspace create safety_demo --starter obstacle_avoidance and cd safety_demo. Build both nodes with cerulion node build laser_scanner --release and cerulion node build safety_controller --release (the first build takes a few minutes), then run cerulion graph validate obstacle_avoidance.
+5. Record a run in the background with: echo $$ > run.pid && exec cerulion graph run obstacle_avoidance --release --record --network off > run.log 2>&1. After at least ten seconds, stop it as Ctrl+C would: kill -INT "$(cat run.pid)". The last line of run.log names the recording: "recording written to recordings/<name>.mcap".
+6. Run cerulion bag play "<recording>" --resim all --verify and confirm it prints replay PASS.
+7. In nodes/safety_controller/src/lib.rs, change 0.3 to 0.25 on the line that sets linear_velocity.x, run cerulion node build safety_controller --release and verify the same recording again. It now exits 1: show me its "differs at x" line and say what it means.
+8. Start the harness so it keeps running after this session ends: nohup cerulion rcp --sim --http 127.0.0.1:8765 > rcp-sim.log 2>&1 & echo $! (that is its PID). Its first run installs the simulator and the benchmark scenes once, which takes minutes and about 4 GB of disk (it needs 5 GB free). Wait until curl -fsS http://127.0.0.1:8765/health answers; if the harness exits first, tell me why from rcp-sim.log.
+9. Add it as an MCP server named cerulion-sim, and note the folder you run this in. Claude Code: claude mcp add --scope local --transport http cerulion-sim http://127.0.0.1:8765/mcp. Another agent: add http://127.0.0.1:8765/mcp as a streamable HTTP server.
+10. If the cerulion-sim tools are already in your tool list, use them to put the bowl on the plate. Otherwise tell me to run, in a second terminal: cd <that folder> && claude "With cerulion-sim, put the bowl on the plate, and give me the link to watch the episode." Either way, tell me that I can watch each episode at http://127.0.0.1:8765/view/<episode id> (http://127.0.0.1:8765/episodes lists the episode ids), that kill -INT <the harness PID> stops the harness, and that cerulion rcp --sim --http 127.0.0.1:8765 starts it again.
+```
+
+On a new machine you approve one sign-in in your browser, and run any system install command your agent hands you, for a C toolchain or, on Linux, the simulator's renderer. Your agent stars this repository from your `gh` account (or gives you its link), reports `replay PASS`, then `differs at x: recorded 0.3, replayed 0.25` on the same recording, and starts the harness. It then hands you the command for a second terminal, where a new session works the bowl-on-plate task on the simulated arm and reports the benchmark's verdict; you watch the episode at `http://127.0.0.1:8765/view/<episode id>`.
+
+### With commands
+
+#### Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
@@ -90,35 +112,7 @@ Building nodes needs a C toolchain (`build-essential` on Debian and Ubuntu, `xco
 
 </details>
 
-### Give your model Cerulion
-
-Add the hosted Cerulion MCP to Claude Code once. This step needs no install, only your account: the first time, run `/mcp` in Claude Code, pick `cerulion` and sign in with your Cerulion account in the browser. In another MCP client, add the same URL as a connector.
-
-```bash
-claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
-```
-
-The hosted endpoints are in early access ([request access](https://docs.cerulion.com/cerulion/hindsight)).
-
-**The runtime side.** With an MCAP recording at a public or presigned `https://` URL, ask:
-
-```text
-Open the recording at https://<your host>/run.mcap. Summarize it and show me the worst anomaly, with its topic and time.
-```
-
-Your model opens and indexes the recording (`open_bag`; the first open of a large one can take a few minutes), reads its summary (`get_debrief`), lists the anomalies worst first (`find_anomalies`), looks at the window around the worst one (`scrub`) and cites each finding as `[topic @ t=<nanoseconds>]`, with a Foxglove link to that moment when the URL is public (`get_foxglove_link`). The hosted tools cannot read a file on your machine. The same connector lists the robots on your account and whether each is online (`robot_list`), and starts and connects to your Cerulion Cloud instance (`cloud_instance_start`, `cloud_instance_connect`).
-
-**The harness side.** Ask for a task on a simulated arm:
-
-```text
-Start the simulated arm and put the bowl on the plate.
-```
-
-Your model starts a simulated robot arm for your account in Cerulion's cloud (`sim_start`), reads its task (`sim_read` on `robot://task`), looks through the robot's cameras (`look`) and has the harness's other tools for the arm; `sim_end` stops the simulator and reports the credits it charged. `bowl-on-plate` is the default scene; ask for `open-drawer` or `soup-in-basket` for the other two. These are start states the harness was developed on, not the start states of the published results. The simulator runs on your account's sim credits, one credit for each second it is held open.
-
-The hosted tools cannot run a graph, record or verify. Those run in your terminal:
-
-### Run, record and verify
+#### Run, record and verify
 
 ![Record a run, verify it passes, change the controller, and watch the same recording fail verification.](docs/media/quickstart-record-verify.gif)
 
@@ -157,7 +151,7 @@ cerulion node build safety_controller --release
 cerulion bag play "$BAG" --resim all --verify
 ```
 
-This time verification reports a divergence that names the topic, the field that changed and both values (`differs at x: recorded 0.3, replayed 0.25`), and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot. The animation above shows this whole run.
+This time verification reports a divergence that names the topic, the field that changed and both values (`differs at x: recorded 0.3, replayed 0.25`), and returns a nonzero exit code. On the same sensor inputs, the changed controller would command a different speed. In CI, that verdict flags the changed behavior for review before the code reaches a robot.
 
 <details>
 <summary>What replay verification checks</summary>
@@ -175,16 +169,22 @@ Comparisons are byte-exact by default. Add `--tolerance` for acceptable per-fiel
 
 Guide: [Record and replay](https://docs.cerulion.com/cerulion/guides/record-and-replay)
 
-### Run the harness on your own machine
+#### Run the harness on your own machine
 
 `cerulion rcp --sim` serves the harness's tools and its three scenes on your machine. It reaches no Cerulion service, so it spends no sim credits and the network kill switch (`CERULION_NETWORK=off`) does not refuse it; its first run downloads the simulator from the benchmark's and the Python packages' own hosts. Experimental: in this release the harness drives a simulated robot. It needs Cerulion 2.1.0 or later (`cerulion --version`). With a release package there is nothing to clone or set: every release package installs the harness folder beside `cerulion`. A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`. Then:
 
 ```bash
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
-claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
 ```
 
-Then ask your model: "With cerulion-sim, put the bowl on the plate." Each MCP connection gets its own episode, set up for one task: `bowl-on-plate` by default, or start the server with `--task open-drawer` or `--task soup-in-basket`. They are start states the harness was developed on, not the start states of the published results. Watch each episode, its camera pictures and the benchmark's verdict at `http://127.0.0.1:8765/view/<episode id>` (the server gives your model that link); `http://127.0.0.1:8765/episodes` lists every episode. Keep `--http` on a loopback address: anyone who can reach the server can start simulators on your machine and watch every episode.
+In a second terminal, add it to Claude Code and ask for a task. Run both lines in one folder: the first adds the server for that folder only.
+
+```bash
+claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
+claude "With cerulion-sim, put the bowl on the plate, and give me the link to watch the episode."
+```
+
+Another MCP client takes the same URL. Each MCP connection gets its own episode, set up for one task: `bowl-on-plate` by default, or start the server with `--task open-drawer` or `--task soup-in-basket`. They are start states the harness was developed on, not the start states of the published results. Watch each episode, its camera pictures and the benchmark's verdict at `http://127.0.0.1:8765/view/<episode id>` (the server gives your model that link); `http://127.0.0.1:8765/episodes` lists every episode. Keep `--http` on a loopback address: anyone who can reach the server can start simulators on your machine and watch every episode.
 
 The first `cerulion rcp --sim` installs the simulator and the benchmark scenes once, which takes minutes and about 4 GB of disk (it refuses to start with less than 5 GB free). The harness runs on macOS on Apple Silicon and on Linux on x86_64 or ARM64, with `git` and `curl`; on Ubuntu, also run `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0` for the CPU renderer. The published results were measured on Linux x86_64. On macOS the pictures are rendered by Apple's OpenGL and differ slightly from the measured ones, so an episode there is a try of the harness, not a reproduction of a published row.
 
@@ -196,7 +196,31 @@ cerulion rcp bench --model YOUR_MODEL --cell CELL_ID
 
 It runs two episodes on your endpoint, one after the other (each up to 3 attempts when the endpoint fails), and prints the benchmark's verdict for each; you pay for the model calls. Without `--cell` it runs a start state the harness was developed on, not a published one. One episode at temperature 1.0 can go either way; the published rates come from 100 start states per model. `cerulion rcp bench --verify` checks every file of the harness's measured code against the provenance ledger that ties it to the code the benchmark measured. The [harness guide](docs/harness.md) covers what the harness is, what the benchmark measured, the flags and what `--verify` checks.
 
-If Cerulion is useful to you, a star helps other robotics engineers find it.
+### Give your model Cerulion
+
+Add the hosted Cerulion MCP to Claude Code once. This step needs no install, only your account: the first time, run `/mcp` in Claude Code, pick `cerulion` and sign in with your Cerulion account in the browser. In another MCP client, add the same URL as a connector.
+
+```bash
+claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion
+```
+
+The hosted endpoints are in early access ([request access](https://docs.cerulion.com/cerulion/hindsight)).
+
+**The runtime side.** With an MCAP recording at a public or presigned `https://` URL, ask:
+
+```text
+Open the recording at https://<your host>/run.mcap. Summarize it and show me the worst anomaly, with its topic and time.
+```
+
+Your model opens and indexes the recording (`open_bag`; the first open of a large one can take a few minutes), reads its summary (`get_debrief`), lists the anomalies worst first (`find_anomalies`), looks at the window around the worst one (`scrub`) and cites each finding as `[topic @ t=<nanoseconds>]`, with a Foxglove link to that moment when the URL is public (`get_foxglove_link`). The hosted tools cannot read a file on your machine, run a graph, record or verify; those run in your terminal, as above. The same connector lists the robots on your account and whether each is online (`robot_list`), and starts and connects to your Cerulion Cloud instance (`cloud_instance_start`, `cloud_instance_connect`).
+
+**The harness side.** Ask for a task on a simulated arm:
+
+```text
+Start the simulated arm and put the bowl on the plate.
+```
+
+Your model starts a simulated robot arm for your account in Cerulion's cloud (`sim_start`), reads its task (`sim_read` on `robot://task`), looks through the robot's cameras (`look`) and has the harness's other tools for the arm; `sim_end` stops the simulator and reports the credits it charged. `bowl-on-plate` is the default scene; ask for `open-drawer` or `soup-in-basket` for the other two. These are start states the harness was developed on, not the start states of the published results. The simulator runs on your account's sim credits, one credit for each second it is held open.
 
 ## Harness results
 

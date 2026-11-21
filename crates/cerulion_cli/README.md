@@ -48,8 +48,9 @@ processes by default and asks before it writes that layout into the graph file;
 `librmw_cerulion.so` sits beside the `cerulion` binary. Install the ROS 2
 release package, or build `rmw_cerulion` against your ROS 2 headers and set
 `CERULION_LIB_DIR` to the directory holding `librmw_cerulion.so`. The
-[quickstart](https://docs.cerulion.com/cerulion/quickstart) adds
-recording and replay verification, and the
+[quickstart](https://github.com/cerulion-inc/cerulion#quickstart) adds
+recording, replay verification and the harness, from one coding-agent prompt
+or by commands, and the
 [API reference](https://github.com/cerulion-inc/cerulion/blob/main/docs/user-api.md)
 documents every verb.
 

@@ -20,6 +20,8 @@ Both run under the free Cerulion account, as the other `cerulion` commands do: r
 
 ## Try it
 
+The [README quickstart](../README.md#quickstart) runs these steps from one coding-agent prompt, together with the runtime's record and verify.
+
 Every release package installs the harness folder beside `cerulion`: the install script, the release archives,
 the Debian package (`/usr/bin/harness`) and the Homebrew formula. A release's `cerulion` finds it there with no
 clone and no setting, and a `cerulion` built in a checkout of this repository finds that checkout's own
