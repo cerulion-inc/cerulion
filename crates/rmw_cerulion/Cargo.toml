@@ -60,7 +60,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 libc = "0.2"
 
 [build-dependencies]
-bindgen = "0.70"
+bindgen = "0.72"
 # Compiles the std::string ABI shim (shim/cppstring_shim.cpp) for the
 # introspection_cpp bridge — see build.rs.
 cc = "1"
