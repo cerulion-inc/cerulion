@@ -169,7 +169,9 @@ in prepare_pass_verification
 # (`BlockHoldEdges`), the counted carry, the supply and the carry dispatcher
 # (`fifo_step_backlog`, `fifo_supply`, `fifo_carry_out`), the deferral
 # predicate and the per-step walk that feeds it, with the slot bound it folds
-# (`fifo_carry_deferrable`, `FifoDeferral`, `SlotBound`), the carry walk the
+# and its count of a consumer's fires that ended before the input
+# (`fifo_carry_deferrable`, `FifoDeferral`, `SlotBound`,
+# `fires_ended_before`), the carry walk the
 # verdict and the refill plan share (`FifoCarry`), the caveat a finding on a
 # node whose drain the bag does not record carries and its text
 # (`FindingCaveat`, `ScheduleFinding`), the rules that read them
@@ -178,8 +180,9 @@ in prepare_pass_verification
 # trailing refill plan (`fifo_trailing_refills`), the drain a FIFO input's
 # recording or declaration settles (`node_trigger_decl`,
 # `declared_latest_drain`, `never_unifies`), and the edges that can hold a
-# node with what the bag records of each slot (`local_block_holds`,
-# `slot_record`, `topic_recorded_whole`, `consumer_body_drain`), with the
+# node with what the bag records of each slot and the inputs its consumer
+# reads before it (`local_block_holds`, `slot_record`, `topic_recorded_whole`,
+# `consumer_body_drain`, `consumer_reads_before`), with the
 # recorded order of its consumer and producer (`fold_fire_level`,
 # `recorded_after`). The rank's topology read (`block_hold_flows`), the walk
 # of the bag's frames (`recorded_frame_stamps`), the walk of its fire levels
@@ -191,7 +194,7 @@ in prepare_pass_verification
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --in-diff <the change's diff of the two files> \
-#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain' \
+#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|FifoDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain|fires_ended_before|consumer_reads_before' \
 #            --cap-lints true --in-place --timeout 600 \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (in 4 shards; the unmutated baseline passed)
@@ -259,6 +262,12 @@ in prepare_pass_verification
 #          from a consumer fire with no read of it recorded until the
 #          consumer next reads it, with `--re 'SlotBound::step'`: 11 mutants,
 #          11 caught.
+#          Re-run over the change that starts that unknown at the step after
+#          the fire and keeps the count where the bag shows the fire's tick
+#          ended at an input it reads earlier, with
+#          `--re 'SlotBound::step|fires_ended_before|consumer_reads_before'`:
+#          29 mutants, 28 caught, 1 unviable, which replaces
+#          `consumer_reads_before` with a value its type does not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

@@ -728,6 +728,8 @@ pub struct BlockHoldEdge {
     pub depth: u64,
     /// The frames sent to the slot, as far as the bag accounts for them.
     pub record: SlotRecord,
+    /// The inputs the consumer's tick reads before this one at every fire.
+    pub reads_before: ReadsBefore,
 }
 
 /// What a bag records of the frames sent to one `block` slot.
@@ -773,8 +775,25 @@ pub enum BodyDrain {
     PerFrame,
     /// To empty: a latest-value input (`consume = latest`, or any input that
     /// is not a FIFO trigger), whose read drains the queue to its newest frame
-    /// and resyncs the slot (`CerulionSubscriber::snapshot_latest`).
+    /// and resyncs the slot: the tick's live read of a `block` input
+    /// (`CerulionSubscriber::try_view`).
     ToEmpty,
+}
+
+/// The inputs a `block` consumer's tick reads before the edge's input at every
+/// fire ([`BlockHoldEdge::reads_before`]): they say whether a consumer fire
+/// with no read of the input recorded reached it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadsBefore {
+    /// The inputs a `#[cerulion_node]` consumer views before the edge's
+    /// input. Its generated tick views each input once per fire, in
+    /// declaration order (an accumulate port is served from the node's own
+    /// buffer, not viewed), and the first that serves nothing ends the tick
+    /// before any later input is read.
+    Known(Vec<String>),
+    /// Replay cannot know which inputs the consumer's tick reads, or in what
+    /// order: a hand-written `NodeEntry`, or a raw FFI, Python or plugin node.
+    Unknown,
 }
 
 /// The `block` edges that MAY hold a node's fire after its trigger drain
@@ -3855,19 +3874,20 @@ struct SlotBound {
     consumer_input: String,
     depth: u64,
     /// The recorded frames' stamps, ascending, and how the consumer's body
-    /// reads drain them; `None` once nothing bounds the slot. From the step
+    /// reads drain them; `None` once nothing bounds the slot: from the step
     /// after a truncated read of the input, a drain whose site the read log
     /// does not say, or a consumer fire before any body read of the input is
-    /// recorded, the slot allows for none; nor on a resumed pass until the
-    /// consumer first reads its queue empty, nor, on a latest-value input,
-    /// from a consumer fire with no read of it recorded until its next read.
+    /// recorded, the slot allows for none. A resumed pass before the consumer
+    /// first reads its queue empty, and a latest-value input after a consumer
+    /// fire that can hide a drain of it, leave `frames` set and `queued`
+    /// unknown.
     frames: Option<(Vec<u64>, BodyDrain)>,
     /// The first stamp not yet folded in.
     next_frame: usize,
     /// The fewest frames the slot can count at the start of the next step:
     /// `None` while it is unknown (a resumed pass, before the consumer first
     /// reads its queue empty, or a latest-value input after a consumer fire
-    /// with no read of it recorded, until the consumer next reads it).
+    /// that can hide a drain of it, until the consumer next reads it).
     queued: Option<u64>,
     /// Drains inside the current shared clock past what the bound has
     /// counted: they took frames stamped at that clock, which count only at
@@ -3884,6 +3904,8 @@ struct SlotBound {
     /// Where the consumer stopped: a stopped consumer releases its slot for
     /// good (`release_held_block_slots`).
     consumer_stop: Option<StopPoint>,
+    /// The inputs the consumer's tick reads before this one.
+    reads_before: ReadsBefore,
 }
 
 impl SlotBound {
@@ -3933,6 +3955,12 @@ impl SlotBound {
             older + at_clock
         };
         let sent = u64::try_from(counted).unwrap_or(u64::MAX);
+        let released = self.consumer_stop.is_some_and(|s| s.is_after(step));
+        let owed_now = if clock_continues { 0 } else { self.owed };
+        let hold = !released
+            && self
+                .queued
+                .is_some_and(|q| q.saturating_add(sent).saturating_sub(owed_now) >= self.depth);
         let mut removed = 0u64;
         let mut emptied = false;
         let mut lost = false;
@@ -3971,20 +3999,27 @@ impl SlotBound {
             }
         }
         self.read_seen |= body_read;
-        let consumer_fired = fires.iter().any(|(id, _)| *id == self.consumer_node);
-        // A latest-value input records a read at every fire of its consumer,
-        // so a fire with none is a drain the bag lost (a snapshot drain that
-        // failed after it popped): the slot is unknown from this step until
-        // the consumer next reads it empty. A FIFO input drains only at the
-        // reads its consumer's body makes, so no read there is no drain.
-        let drain_unrecorded = drain == BodyDrain::ToEmpty && consumer_fired && !body_read;
-        let released = self.consumer_stop.is_some_and(|s| s.is_after(step));
-        let owed_now = if clock_continues { 0 } else { self.owed };
-        let hold = !released
-            && !drain_unrecorded
-            && self
-                .queued
-                .is_some_and(|q| q.saturating_add(sent).saturating_sub(owed_now) >= self.depth);
+        let consumer_fires = fires
+            .iter()
+            .filter(|(id, _)| *id == self.consumer_node)
+            .count();
+        let consumer_fired = consumer_fires > 0;
+        // A latest-value `block` input is read only by its consumer's tick,
+        // which records the read unless it errors, and an erroring read can
+        // have popped first. So a consumer fire with no read of it recorded
+        // either ended before the input or hid a drain the bag lost. A fire
+        // the bag shows ended at an input the tick reads earlier drained
+        // nothing (`fires_ended_before`); every other one leaves the slot
+        // unknown. Such a drain follows the producer's checks of this step,
+        // so the step keeps its count, and the slot is unknown from the next
+        // step until the consumer next reads it. A body read of the input
+        // empties the slot whatever such a drain took, and a FIFO input
+        // drains only at the reads its consumer's body makes, so no read of
+        // it there is no drain.
+        let drain_unrecorded = drain == BodyDrain::ToEmpty
+            && !body_read
+            && consumer_fires
+                > fires_ended_before(&self.reads_before, &self.consumer_node, reads, trust);
         if let Some(q) = self.queued {
             let available = q.saturating_add(sent);
             if clock_continues {
@@ -4019,6 +4054,36 @@ impl SlotBound {
         }
         hold
     }
+}
+
+/// PURE: how many of a `block` consumer's fires at a step the bag shows ended
+/// before its tick reached the input: one per believed body `NoFrame` the
+/// step records of an input `before` names. Each such input is read once per
+/// fire through a read that records each call, so its `NoFrame` is a fire that
+/// ended there, unless the input is frozen at the step's boundary: then its
+/// one record is served to every fire of the step, and all of them end there.
+/// So where the count reaches the step's fires, none of them read the input.
+/// A consumer whose tick replay cannot know shows none. `reads` holds one
+/// entry per read, a folded run expanded.
+fn fires_ended_before(
+    before: &ReadsBefore,
+    consumer: &str,
+    reads: &[RecordedRead],
+    trust: RoleTrust,
+) -> usize {
+    let ReadsBefore::Known(inputs) = before else {
+        return 0;
+    };
+    reads
+        .iter()
+        .filter(|r| {
+            r.node_id == consumer
+                && r.kind == ReadOutcomeKind::NoFrame
+                && believed_role(r, trust)
+                && r.role == ReadSiteRole::Body
+                && inputs.contains(&r.input)
+        })
+        .count()
 }
 
 /// What a node's pre-fire check can have done at a step ([`FifoDeferral::step`]).
@@ -4078,9 +4143,13 @@ pub(crate) struct StepDeferral {
 ///   frames with no record); on the consumer's input, from the step
 ///   after a truncated read stream's marker, a drain whose site the read log
 ///   does not say, or a consumer fire before any body read of the input is
-///   recorded; and on a latest-value input, which records a read at every
-///   fire of its consumer, from a consumer fire with no read of it recorded
-///   until the consumer next reads it, the step of that fire included. A
+///   recorded; and on a latest-value input, from the step after a consumer
+///   fire that can hide a drain of it through the step at which the consumer
+///   next reads it. Such an input is read only by its consumer's tick, which
+///   records the read unless it errors, and a read that errors can have
+///   popped first, so a fire with no read of it recorded can hide a drain
+///   unless the bag shows the tick ended at an input it reads earlier
+///   ([`ReadsBefore`]). A
 ///   resumed pass does not know what the slot held at its anchor,
 ///   so the edge explains no step until the consumer first reads its queue
 ///   empty. Frames stamped before the pass's first step are not its sends.
@@ -4121,6 +4190,7 @@ impl FifoDeferral {
                 read_seen: false,
                 first: true,
                 consumer_stop: stops.stop_point(&edge.consumer_node),
+                reads_before: edge.reads_before.clone(),
             })
             .collect();
         Self {
@@ -8628,13 +8698,15 @@ mod tests {
         }
     }
 
-    /// One `block` input, `consumer.inp` at `depth`, with `record`.
+    /// One `block` input, `consumer.inp` at `depth`, with `record`, on a
+    /// consumer whose tick replay cannot know.
     fn slot(consumer: &str, depth: u64, record: SlotRecord) -> BlockHoldEdge {
         BlockHoldEdge {
             consumer_node: consumer.to_string(),
             consumer_input: "inp".to_string(),
             depth,
             record,
+            reads_before: ReadsBefore::Unknown,
         }
     }
 
@@ -10044,37 +10116,33 @@ mod tests {
         )])
     }
 
-    /// A latest-value input records a read at every fire of its consumer, so
-    /// a consumer fire with no read recorded is a drain the bag lost: the slot
-    /// is unknown from that step. Depth 2: the sink reads the queue empty at
-    /// step 0, the relay fires one frame at each of steps 1 and 2, and at step
-    /// 3 the sink fires with no read while the relay pops two and fires one.
-    /// Counted with no drain the slot is full there; unknown, the pop left
-    /// unfired is the finding. With the step 3 read present and believed
-    /// empty, the slot was full at the relay's check and the step reads clean.
+    /// A latest-value consumer fire with no read recorded can hide a drain,
+    /// which follows the relay's checks of that step: the step keeps its
+    /// count and the slot is unknown from the next. Depth 2: the relay fires
+    /// one frame at each of steps 0 to 2, the sink's step 0 read draining the
+    /// first, and at step 3 the sink fires with no read while the relay pops
+    /// two and fires one: the slot counts three at the relay's step 3 check,
+    /// so the pop left unfired is the hold. At step 4 the relay pops two and
+    /// fires two, the first fire taking the frame it held, and holds the
+    /// second: the slot is unknown, so the step is the finding. With the step
+    /// 3 read present and believed empty, the slot is empty after step 3, the
+    /// relay's two step 4 frames fill it, and the step reads clean.
     #[test]
     fn a_latest_value_consumer_fire_with_no_read_leaves_the_slot_unknown() {
-        let lead = |last: Vec<RecordedStep>| {
-            let mut steps = vec![
-                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
-                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
-                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
-            ];
-            steps.extend(last);
-            steps
-        };
-        let unread = lead(vec![fifo_step(
-            3,
-            15_000,
-            &[("relay", 2, 1, 0), ("sink", 0, 1, 0)],
-        )]);
+        let unread = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 15_000, &[("relay", 2, 1, 0), ("sink", 0, 1, 0)]),
+            fifo_step(4, 20_000, &[("relay", 2, 2, 0)]),
+        ];
         let report = verify_unrestored(
             &relay(sink_slot(2, &unread, BodyDrain::ToEmpty)),
             &unread,
             &[],
             STAMPED,
         );
-        assert_eq!(findings_of(&report), vec![finding("relay", 3, 2, 1)]);
+        assert_eq!(findings_of(&report), vec![finding("relay", 4, 3, 2)]);
 
         let read_empty = with_read(
             unread.clone(),
@@ -10097,12 +10165,13 @@ mod tests {
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
     }
 
-    /// The slot a consumer fire with no read left unknown is known again at
-    /// the consumer's next read, which empties a latest-value input. Depth 2,
-    /// after the rows above with the relay firing once at step 3: a step 4
-    /// that pops two and fires one, before any read, is the finding; with the
-    /// sink reading at step 4 instead, two frames fill the slot by step 6 and
-    /// the step 7 pop left unfired is the hold.
+    /// The slot a consumer fire with no read left unknown is known again from
+    /// the step after the consumer's next read, which empties a latest-value
+    /// input. Depth 2, on the rows of the vector above with the relay popping
+    /// one frame and firing once at step 3: a step 4 that pops two and fires
+    /// one, before any read, is the finding; with the sink reading at step 4
+    /// instead, two frames fill the slot by step 6 and the step 7 pop left
+    /// unfired is the hold.
     #[test]
     fn a_slot_left_unknown_by_an_unread_fire_is_known_at_the_next_read() {
         let lead = |rest: Vec<RecordedStep>| {
@@ -10140,7 +10209,7 @@ mod tests {
 
     /// A FIFO input drains only at the reads its consumer's body makes, so a
     /// consumer fire that reads it not at all drains nothing and the slot
-    /// keeps its count: the same rows as the latest-value vector, on a
+    /// keeps its count: the latest-value vector's rows through step 3, on a
     /// frame-by-frame input, read clean at step 3.
     #[test]
     fn a_fifo_input_its_consumer_fires_without_reading_keeps_its_count() {
@@ -10157,6 +10226,161 @@ mod tests {
             STAMPED,
         );
         assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// The relay's frames as the slot `sink.inp` at `depth` counts them,
+    /// drained to empty, on a consumer whose tick reads `before` ahead of
+    /// `inp`.
+    fn sink_slot_reading(depth: u64, steps: &[RecordedStep], before: &[&str]) -> BlockHoldEdges {
+        let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+            unreachable!("sent_by counts")
+        };
+        let counted = SlotRecord::Counted {
+            frame_stamps,
+            drain: BodyDrain::ToEmpty,
+        };
+        BlockHoldEdges::new(vec![BlockHoldEdge {
+            reads_before: ReadsBefore::Known(inputs(before)),
+            ..slot("sink", depth, counted)
+        }])
+    }
+
+    /// The rows of the healthy-collapse vectors: depth 2, the relay firing
+    /// one frame at each of steps 0 and 1, the sink's step 0 read draining the
+    /// first, then the sink firing `fires` times at step 1 with `reads` and no
+    /// read of `inp`, and at step 2 the relay popping two and firing one
+    /// before the sink reads `inp`.
+    fn collapse_rows(fires: u32, reads: Vec<RecordedRead>) -> Vec<RecordedStep> {
+        let mut steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0), ("sink", 0, fires, 0)]),
+            fifo_step(2, 10_000, &[("relay", 2, 1, 0), ("sink", 0, 1, 1)]),
+        ];
+        steps[1].reads.extend(reads);
+        steps
+    }
+
+    /// A read of the sink's input `input` at step 1: `kind`, popping
+    /// `popped`, at `role`.
+    fn sink_read(
+        input: &str,
+        kind: ReadOutcomeKind,
+        popped: u32,
+        role: ReadSiteRole,
+    ) -> RecordedRead {
+        read_with_role("sink", input, kind, popped, None, role)
+    }
+
+    /// The generated tick reads each input it views once per fire, in
+    /// declaration order, and ends at the first that serves nothing, so a
+    /// fire whose earlier input records a believed body `NoFrame` never
+    /// reached the `block` input and drained nothing. On the collapse rows
+    /// with the sink reading `a` ahead of `inp`, the step 1 fire ends at `a`,
+    /// so the slot keeps the relay's step 1 frame; the relay's first step 2
+    /// frame fills it, and the pop left unfired is the hold. A `NoFrame`
+    /// whose role is not believed says nothing of where the tick ended, and a
+    /// consumer whose tick replay cannot know reads nothing off it: both
+    /// leave the slot unknown at step 2, and the step is the finding.
+    #[test]
+    fn a_fire_that_ends_before_a_latest_value_input_keeps_its_count() {
+        let ended = collapse_rows(
+            1,
+            vec![sink_read(
+                "a",
+                ReadOutcomeKind::NoFrame,
+                0,
+                ReadSiteRole::Body,
+            )],
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot_reading(2, &ended, &["a"])),
+            &ended,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let unbelieved = collapse_rows(
+            1,
+            vec![sink_read(
+                "a",
+                ReadOutcomeKind::NoFrame,
+                0,
+                ReadSiteRole::Unstamped,
+            )],
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot_reading(2, &unbelieved, &["a"])),
+            &unbelieved,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
+
+        let report = verify_unrestored(
+            &relay(sink_slot(2, &ended, BodyDrain::ToEmpty)),
+            &ended,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
+    }
+
+    /// Each believed body `NoFrame` of an earlier input stands for one fire
+    /// that ended there, so a step whose fires outnumber them can hide a
+    /// drain. The collapse rows with the sink firing twice at step 1: one tick
+    /// ends at `a`, the other reads `a` and records no read of `inp`, so the
+    /// slot is unknown at step 2 and the pop left unfired is the finding.
+    #[test]
+    fn fires_past_the_ones_that_ended_early_leave_the_slot_unknown() {
+        let steps = collapse_rows(
+            2,
+            vec![
+                sink_read("a", ReadOutcomeKind::NoFrame, 0, ReadSiteRole::Body),
+                sink_read("a", ReadOutcomeKind::Served, 1, ReadSiteRole::Body),
+            ],
+        );
+        let report = verify_unrestored(
+            &relay(sink_slot_reading(2, &steps, &["a"])),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
+    }
+
+    /// Only an input the tick reads before the `block` input can end it
+    /// there: an input read after it records its `NoFrame` on a fire that
+    /// read the `block` input first, and the trigger drain's empty consult of
+    /// an earlier input is not the tick's read. On the collapse rows with the
+    /// step 1 `NoFrame` on `b`, which the sink reads after `inp`, or on `a` at
+    /// the drain site, the slot is unknown at step 2 and the pop left unfired
+    /// is the finding.
+    #[test]
+    fn a_no_frame_after_the_input_or_at_the_drain_ends_no_fire_before_it() {
+        for (label, read) in [
+            (
+                "read after the input",
+                sink_read("b", ReadOutcomeKind::NoFrame, 0, ReadSiteRole::Body),
+            ),
+            (
+                "the trigger drain's consult",
+                sink_read("a", ReadOutcomeKind::NoFrame, 0, ReadSiteRole::Drain),
+            ),
+        ] {
+            let steps = collapse_rows(1, vec![read]);
+            let report = verify_unrestored(
+                &relay(sink_slot_reading(2, &steps, &["a"])),
+                &steps,
+                &[],
+                STAMPED,
+            );
+            assert_eq!(
+                findings_of(&report),
+                vec![finding("relay", 2, 2, 1)],
+                "{label}"
+            );
+        }
     }
 
     /// An empty read leaves the slot empty: in a rank's step order the

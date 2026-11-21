@@ -305,10 +305,15 @@ one level, or never fired, orders no edge. From the step after a truncated
 read of the input, a drain whose site the read log does not say, or a consumer
 fire before any body read of the input is recorded, the slot allows for none;
 nor on a resumed pass until the consumer first reads its queue empty; nor, on
-a latest-value input, which records a read at every fire of its consumer,
-from a consumer fire with no read of it recorded until the consumer next reads
-it. A
-consumer's stop releases its slot from the next step on. As for a throttle,
+a latest-value input, from the step after a consumer fire with no read of it
+recorded, which can hide a drain, through the step at which the consumer next
+reads it. Such an input is read only by its consumer's tick, which records the
+read unless it errors, and a read that errors can have popped first. A fire the
+recording shows ended at an input the tick reads earlier drained nothing: a
+`#[cerulion_node]` node's tick reads its inputs, `accumulate` ones aside, in
+declaration order and ends at the first that serves nothing, which records an
+empty read. For any other node, every such fire can hide a drain.
+A consumer's stop releases its slot from the next step on. As for a throttle,
 whose window the rule reads off the recorded clock, a step no such check could
 defer owes every popped frame a fire. Read through one
 subscriber, such a node may leave one popped frame unfired at a step a check

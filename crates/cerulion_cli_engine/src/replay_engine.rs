@@ -13250,14 +13250,16 @@ struct BlockHoldFlow {
 }
 
 /// One `block` consumer of a [`BlockHoldFlow`]: the node and input that hold
-/// the slot, its depth, and whether the input sets `block_timeout_ms`, whose
-/// release forgives the slot's frames and leaves no record.
+/// the slot, its depth, whether the input sets `block_timeout_ms`, whose
+/// release forgives the slot's frames and leaves no record, and the inputs
+/// the node's tick reads before it ([`consumer_reads_before`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockHoldConsumer {
     node: String,
     input: String,
     depth: u64,
     released_on_timeout: bool,
+    reads_before: replay_rederive::ReadsBefore,
 }
 
 /// The level one node's recorded fires carry on a rank.
@@ -13364,6 +13366,7 @@ fn block_hold_flows(
                     input: c.input.clone(),
                     depth: u64::try_from(c.depth).unwrap_or(u64::MAX),
                     released_on_timeout: c.block_timeout_ms.is_some(),
+                    reads_before: consumer_reads_before(node_infos.get(&c.node_id), &c.input),
                 })
                 .collect(),
         })
@@ -13402,6 +13405,7 @@ fn local_block_holds(
                     } else {
                         record_of(&flow.topic, &c.node, &c.input)
                     },
+                    reads_before: c.reads_before.clone(),
                 });
             holds.entry(producer.clone()).or_default().extend(edges);
         }
@@ -13447,6 +13451,35 @@ fn topic_recorded_whole(report: &RecordHealthReport, topic: &str, listed: bool) 
                     == crate::bag_cmd::LossReading::Clean
         }
         RecordHealthReport::Absent | RecordHealthReport::Malformed => false,
+    }
+}
+
+/// PURE: the inputs `input`'s consumer reads before it at every fire
+/// ([`replay_rederive::ReadsBefore`]). A node that needs a publisher for every
+/// output it declares is a `#[cerulion_node]` node
+/// ([`cerulion_core::graph::node::NodeInfo::publisher_for_every_output`]),
+/// whose generated tick views its inputs in the order its input metadata
+/// declares them, accumulate ports aside: the ones before `input`. Any other
+/// node, a node whose info replay does not hold, and an input the node does
+/// not view are [`replay_rederive::ReadsBefore::Unknown`].
+fn consumer_reads_before(
+    info: Option<&cerulion_core::graph::NodeInfo>,
+    input: &str,
+) -> replay_rederive::ReadsBefore {
+    let Some(info) = info.filter(|info| info.publisher_for_every_output()) else {
+        return replay_rederive::ReadsBefore::Unknown;
+    };
+    let viewed: Vec<&str> = info
+        .input_meta()
+        .iter()
+        .filter(|m| !m.accumulate)
+        .map(|m| m.name.as_str())
+        .collect();
+    match viewed.iter().position(|name| *name == input) {
+        Some(at) => replay_rederive::ReadsBefore::Known(
+            viewed[..at].iter().map(|name| name.to_string()).collect(),
+        ),
+        None => replay_rederive::ReadsBefore::Unknown,
     }
 }
 
@@ -39843,6 +39876,7 @@ mod trigger_input_capacity_tests {
             input: "x".to_string(),
             depth,
             released_on_timeout: false,
+            reads_before: replay_rederive::ReadsBefore::Unknown,
         };
         let mut expected = BTreeMap::from([
             (
@@ -39880,6 +39914,7 @@ mod trigger_input_capacity_tests {
             consumer_input: "x".to_string(),
             depth,
             record: record_of(topic, node, "x"),
+            reads_before: replay_rederive::ReadsBefore::Unknown,
         };
         // The recorded levels: each consumer fires a level after its producer.
         let levels: BTreeMap<String, RecordedLevel> = [
@@ -39925,6 +39960,57 @@ mod trigger_input_capacity_tests {
             expected,
             "no block input reads e's topic once f reads it drop_oldest"
         );
+    }
+
+    /// A `#[cerulion_node]` consumer, one that needs a publisher for every
+    /// output it declares, reads the inputs it declares before a `block`
+    /// input ahead of it, an accumulate port aside; replay knows nothing of
+    /// any other consumer's reads: hand table.
+    #[test]
+    fn a_macro_consumer_reads_the_inputs_it_declares_before_a_block_input() {
+        use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
+        use replay_rederive::ReadsBefore;
+        let meta = |name: &str, accumulate: bool| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger: name == "t",
+            depth: 1,
+            backpressure: BackpressurePolicy::Block,
+            expect_within_ms: None,
+            consume: InputConsume::Fifo,
+            accumulate,
+        };
+        let declared = vec![
+            meta("t", false),
+            meta("acc", true),
+            meta("a", false),
+            meta("x", false),
+            meta("b", false),
+        ];
+        let macro_node =
+            NodeInfo::with_meta(declared.clone(), vec![]).with_publisher_for_every_output();
+        let entry = NodeInfo::with_meta(declared, vec![]);
+        let known =
+            |names: &[&str]| ReadsBefore::Known(names.iter().map(|n| n.to_string()).collect());
+        assert_eq!(
+            consumer_reads_before(Some(&macro_node), "x"),
+            known(&["t", "a"])
+        );
+        assert_eq!(consumer_reads_before(Some(&macro_node), "t"), known(&[]));
+        assert_eq!(
+            consumer_reads_before(Some(&macro_node), "acc"),
+            ReadsBefore::Unknown,
+            "an accumulate port is not viewed"
+        );
+        assert_eq!(
+            consumer_reads_before(Some(&macro_node), "y"),
+            ReadsBefore::Unknown
+        );
+        assert_eq!(
+            consumer_reads_before(Some(&entry), "x"),
+            ReadsBefore::Unknown
+        );
+        assert_eq!(consumer_reads_before(None, "x"), ReadsBefore::Unknown);
     }
 
     /// A slot is counted only where the bag holds a stamp for every frame of
@@ -40250,6 +40336,7 @@ mod trigger_input_capacity_tests {
             consumer_input: "x".to_string(),
             depth: 1,
             record,
+            reads_before: replay_rederive::ReadsBefore::Unknown,
         };
         let beside = format!(
             "name: bs\nprefix: bs\nnodes:\n\
@@ -40677,6 +40764,7 @@ mod trailing_refill_tests {
                 frame_stamps,
                 drain: replay_rederive::BodyDrain::PerFrame,
             },
+            reads_before: replay_rederive::ReadsBefore::Unknown,
         }])
     }
 
