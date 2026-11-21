@@ -56119,7 +56119,7 @@ fn a_tick_that_ends_before_a_block_input_leaves_its_hold_allowed_for() {
         vec![(0, 0), (1, 1), (2, 2), (3, 3), (5, 4), (7, 5), (9, 6)],
         "the relay pops sequence 2 at step 2 and fires nothing: the hold engaged"
     );
-    let even = |k: u64| k % 2 == 0;
+    let even = |k: u64| k.is_multiple_of(2);
     assert_eq!(
         hc_reads(&rec, "sink", "a"),
         (0..10)
