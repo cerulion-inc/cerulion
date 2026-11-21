@@ -3164,19 +3164,20 @@ jobs:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4
-      - name: cerulion_core tests and the diagnostics suite (shard ${{ matrix.shard }} of 4, nextest)
+      - name: cerulion_core tests and the macro suites (shard ${{ matrix.shard }} of 4, nextest)
         # The same shard step, with the `#[cerulion_node]` diagnostics suite
-        # (`node_macro_ui`) in the same nextest invocation (`--with`): its
-        # trybuild test runs beside the core tests and builds in the same cargo
-        # invocation. The script reads the selection for each package on its
+        # (`node_macro_ui`) and the node context helper suite
+        # (`test_node_macro_cdylib`) in the same nextest invocation (`--with`):
+        # their trybuild tests run beside the core tests and build in the same
+        # cargo invocation. The script reads the selection for each package on its
         # own and prints a `selection:` line for each one it leaves out. A leg
         # selector of its own, so the coverage walk sees which leg credits the
-        # suite.
+        # suites.
         if: matrix.shard == 2
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
-        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with node_macro_ui
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with node_macro_ui --with test_node_macro_cdylib
 
       # The modified raw node fixture once more, built ALONE, the way a user's node
       # builds: `-p` with no sibling package resolves the node's dependency tree
@@ -3323,7 +3324,7 @@ jobs:
           case "${{ matrix.shard }}" in
             0) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_bagd ;;
             1) python3 -B tools/scripts/ci_built_tests.py build --group packages +cerulion_cli cerulion_cli_tui ;;
-            2) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_heaphook cerulion_macros test_node_macro_cdylib +cerulion_cli_engine cerulion_android cerulion_discovery cerulion_msgio ;;
+            2) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_heaphook cerulion_macros +cerulion_cli_engine cerulion_android cerulion_discovery cerulion_msgio ;;
             3) python3 -B tools/scripts/ci_built_tests.py build --group packages rmw_cerulion native_ros2_messages cerulion_bag cerulion_wireclient cerulion_connectd cerulion_netd --features cerulion_netd/wan ;;
           esac
           df -h / || true
@@ -3537,16 +3538,6 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
-
-      - name: node context helper compile tests
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p test_node_macro_cdylib --lib
-      - name: selection marker, test_node_macro_cdylib
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
 
       # The CLI crates are named here too. Their 160+ tests
       # are pure-logic / filesystem and safe to run with default threading.
@@ -3811,7 +3802,7 @@ jobs:
           case "${{ matrix.shard }}" in
             0) set -- --floor 27 ;;
             1) set -- --floor 67 ;;
-            2) set -- --floor 121 --not-run cerulion_android:mdns_beacon_test \
+            2) set -- --floor 120 --not-run cerulion_android:mdns_beacon_test \
                  --not-run cerulion_android:embedded_remote_plane_test --not-run cerulion_android:jni_java_test ;;
             3) set -- --floor 114 ;;
           esac
@@ -4239,7 +4230,7 @@ jobs:
           case "${{ matrix.shard }}" in
             0) python3 -B tools/scripts/ci_built_tests.py build --group packages +cerulion_cli rmw_cerulion cerulion_bagd ;;
             1) python3 -B tools/scripts/ci_built_tests.py build --group packages cerulion_bag +cerulion_cli_engine cerulion_cli_tui cerulion_wireclient cerulion_connectd cerulion_netd --features cerulion_netd/wan ;;
-            2) python3 -B tools/scripts/ci_built_tests.py build --group packages native_ros2_messages cerulion_macros test_node_macro_cdylib cerulion_discovery cerulion_msgio cerulion_viz go2_tf
+            2) python3 -B tools/scripts/ci_built_tests.py build --group packages native_ros2_messages cerulion_macros cerulion_discovery cerulion_msgio cerulion_viz go2_tf
                python3 -B tools/scripts/ci_built_tests.py build --group vizd cerulion_vizd ;;
           esac
 
@@ -4506,14 +4497,15 @@ jobs:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
         run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3
-      - name: cerulion_core tests and the diagnostics suite (shard ${{ matrix.shard }} of 3, nextest)
-        # Shard 2's shard step, with the `#[cerulion_node]` diagnostics suite in
-        # the same nextest invocation, as in `test-linux`.
+      - name: cerulion_core tests and the macro suites (shard ${{ matrix.shard }} of 3, nextest)
+        # Shard 2's shard step, with the `#[cerulion_node]` diagnostics suite and
+        # the node context helper suite in the same nextest invocation, as in
+        # `test-linux`.
         if: matrix.shard == 2 && needs.changes.outputs.code == 'true'
         env:
           CI_SELECTED_PACKAGES: ${{ needs.changes.outputs.pkgs }}
           CI_TEST_SHARD_EXTRA: --timings
-        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 --with node_macro_ui
+        run: python3 -B tools/scripts/ci_built_tests.py phase cerulion_core -- ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 3 --with node_macro_ui --with test_node_macro_cdylib
 
       # cerulion_core's DOCTESTS — still `cargo test`, because NEXTEST DOES NOT
       # RUN DOCTESTS AT ALL (upstream limitation, not a configuration choice).
@@ -4536,7 +4528,8 @@ jobs:
       #   shard 0  `--lib` + doctests, rmw, bagd (serial), CLI binary
       #   shard 1  installer self-test, bag, CLI engine, CLI TUI, and the iroh
       #            tree kept together (wireclient, connectd, netd-wan)
-      #   shard 2  the cerulion_node diagnostics suite (in the core shard step),
+      #   shard 2  the cerulion_node diagnostics and node context helper
+      #            suites (in the core shard step),
       #            native_ros2_messages, macros,
       #            discovery, and the folded viz suites
       #
@@ -4602,16 +4595,6 @@ jobs:
           SELECTED: ${{ needs.changes.outputs.pkgs }}
         run: |
           echo "selection: skipped cerulion_macros (selected: $SELECTED)"
-
-      - name: node context helper compile tests
-        if: matrix.shard == 2 && contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib')
-        run: python3 -B tools/scripts/ci_built_tests.py run -- cargo test -p test_node_macro_cdylib --lib
-      - name: selection marker, test_node_macro_cdylib
-        if: ${{ !contains(fromJSON(needs.changes.outputs.pkgs), 'test_node_macro_cdylib') }}
-        env:
-          SELECTED: ${{ needs.changes.outputs.pkgs }}
-        run: |
-          echo "selection: skipped test_node_macro_cdylib (selected: $SELECTED)"
 
       # `cli_engine` and `cli` are split (as on `test-linux`); here the engine
       # rides shard 1 and the binary rides shard 0, because the binary's suite
@@ -4791,7 +4774,7 @@ jobs:
           case "${{ matrix.shard }}" in
             0) set -- --floor 139 ;;
             1) set -- --floor 138 ;;
-            2) set -- --floor 69 ;;
+            2) set -- --floor 68 ;;
           esac
           python3 -B tools/scripts/ci_built_tests.py audit "$@"
 

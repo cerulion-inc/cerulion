@@ -711,12 +711,6 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
     ),
     (
         "cerulion_cli_engine/src/replay_engine.rs",
-        "CoordinationMode",
-        Classification::ExemptWithReason,
-        "NO NAMED FIELDS to deny: a unit/newtype-variant enum, so serde's variant matcher already rejects an unknown VALUE loudly",
-    ),
-    (
-        "cerulion_cli_engine/src/replay_engine.rs",
         "CoveredRangeReport",
         Classification::ExemptWithReason,
         "not user-authored: a manifest/report this build WRITES into a bag (or beside one) and reads back. Leniency is deliberate and already load-bearing elsewhere — `read_record_coverage` WARNS and READS a manifest from a newer recorder rather than refusing — so denying here would make an old build refuse a new bag (the `--report` JSON)",

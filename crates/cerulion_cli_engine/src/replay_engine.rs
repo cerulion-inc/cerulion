@@ -2320,29 +2320,11 @@ impl RecorderInfo {
     }
 }
 
-/// Which coordination contract a recording was taken under, and
-/// therefore which replay contract applies to it.
-///
-/// Stamped into `__cerulion/recorder.json` by every current recorder (see
-/// `graph_cmd::render_recorder_json`) and read back through
-/// [`RecorderInfo::coordination`].
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CoordinationMode {
-    /// Barrier-lockstep: every rank advances the SAME handed quantum per step,
-    /// so the per-rank STEP_BOUNDARY streams carry EQUAL targets on every
-    /// shared step and one first boundary anchors a mid-run resume. The
-    /// contract every recording that predates the stamp was taken under, and the
-    /// DEFAULT — an absent stamp resolves here.
-    #[default]
-    Lockstep,
-    /// Free-run: each rank keeps its OWN wall-faithful boundary stream sharing
-    /// only the GO epoch, so cross-rank boundary equality does not hold by
-    /// design and there is no single first boundary to anchor off.
-    FreeRun,
-}
+// Which coordination contract a recording was taken under, and therefore which
+// replay contract applies to it: stamped into `__cerulion/recorder.json` by
+// every current recorder (`graph_cmd::render_recorder_json`) and read back
+// through `RecorderInfo::coordination`.
+pub use cerulion_core::flashback::resim::CoordinationMode;
 
 /// Serde default for [`RecorderInfo::trace_format`] — an absent field
 /// (every bag older than the discard marker) means format version 1 (no discard markers).

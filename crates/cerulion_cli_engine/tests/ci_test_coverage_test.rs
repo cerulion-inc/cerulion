@@ -2435,8 +2435,14 @@ fn every_workflow_with_line_brings_every_test_file_of_its_packages() {
         }
     }
     let expected: BTreeMap<String, Vec<String>> = [
-        ("test-linux", &["node_macro_ui"][..]),
-        ("test-macos", &["node_macro_ui"][..]),
+        (
+            "test-linux",
+            &["node_macro_ui", "test_node_macro_cdylib"][..],
+        ),
+        (
+            "test-macos",
+            &["node_macro_ui", "test_node_macro_cdylib"][..],
+        ),
     ]
     .into_iter()
     .map(|(job, extras)| {
@@ -2933,10 +2939,11 @@ fn test_fixture_cdylibs_carry_no_tests_of_their_own() {
         .map(|(name, _)| name)
         .collect();
     // The cdylib feature is required to compile the node context migration
-    // cases; required Linux and macOS shards run this fixture's lib harness.
-    // node_macro_ui is the #[cerulion_node] diagnostics suite (trybuild plus
-    // the compile-pass binaries), run in the cerulion_core shard step on shard
-    // 2 of the same jobs (`ci_test_shard.sh --with`).
+    // cases: this fixture's integration test checks the refused shape and runs
+    // the binaries built from the accepted ones. node_macro_ui is the
+    // #[cerulion_node] diagnostics suite (trybuild plus the compile-pass
+    // binaries). Both run in the cerulion_core shard step on shard 2 of the
+    // required Linux and macOS jobs (`ci_test_shard.sh --with`).
     let allowed = BTreeSet::from(["test_node_macro_cdylib", "node_macro_ui"]);
     let unexpected: Vec<_> = fixtures
         .iter()
@@ -7033,6 +7040,159 @@ fn the_lint_aggregator_fails_unless_every_part_succeeded() {
             "`{part}` with no result variable set must red `Lint`"
         );
     }
+}
+
+/// The parts list the merge-queue watchdog reads beside
+/// [`REQUIRED_CONTEXTS_FILE`]: `<part job name>|<required context>` per row.
+const REQUIRED_PARTS_FILE: &str = "tools/ci/required_parts.txt";
+
+/// The rows of one parts text as `(part, context)`, empty and `#` rows
+/// skipped, as the watchdog skips them; or the first row that is not
+/// `<name>|<name>` with bare names, a row carrying a carriage return, or a part
+/// listed twice.
+///
+/// The watchdog matches each name exactly against a job's name, so a name with
+/// a blank at an end, a `\r` a CRLF file leaves, or a second `|` is a row no job
+/// can match, and the watchdog refuses each of them.
+fn required_parts_of(where_from: &str, raw: &str) -> Result<Vec<(String, String)>, String> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (n, line) in raw.split('\n').enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let row = n + 1;
+        if line.contains('\r') {
+            return Err(format!(
+                "{where_from}:{row}: `{line:?}` carries a carriage return"
+            ));
+        }
+        let (part, context) = line
+            .split_once('|')
+            .ok_or_else(|| format!("{where_from}:{row}: `{line}` carries no `|`"))?;
+        if context.contains('|') {
+            return Err(format!("{where_from}:{row}: `{line}` carries a second `|`"));
+        }
+        for name in [part, context] {
+            if name.is_empty() || name != name.trim() {
+                return Err(format!(
+                    "{where_from}:{row}: `{line}` has an empty name or a name with a blank at an end"
+                ));
+            }
+        }
+        if out.iter().any(|(seen, _)| seen == part) {
+            return Err(format!(
+                "{where_from}:{row}: the part `{part}` is listed twice"
+            ));
+        }
+        out.push((part.to_string(), context.to_string()));
+    }
+    Ok(out)
+}
+
+/// The parts reader takes the committed shape and refuses every row the
+/// watchdog refuses for its form.
+#[test]
+fn a_required_parts_row_is_read_strictly() {
+    assert_eq!(
+        required_parts_of("t", "# a comment\n\nA (x)|A\nA (y)|A\n"),
+        Ok(vec![
+            ("A (x)".to_string(), "A".to_string()),
+            ("A (y)".to_string(), "A".to_string())
+        ])
+    );
+    for (bad, why) in [
+        ("A (x)", "carries no `|`"),
+        ("A (x)|A|A", "carries a second `|`"),
+        ("|A", "an empty name"),
+        ("A (x)|", "an empty name"),
+        ("A (x) |A", "a blank at an end"),
+        ("A (x)| A", "a blank at an end"),
+        ("A (x)|A\nA (x)|B", "is listed twice"),
+        ("   ", "carries no `|`"),
+        ("A (x)|A\r\n", "carries a carriage return"),
+    ] {
+        match required_parts_of("t", bad) {
+            Err(message) => assert!(
+                message.contains(why),
+                "{bad:?} must be refused for {why:?}, not: {message}"
+            ),
+            Ok(rows) => panic!("the parts reader must refuse {bad:?}, read {rows:?}"),
+        }
+    }
+}
+
+/// The parts list is exactly the jobs every required aggregate needs, both
+/// ways.
+///
+/// A `ci.yml` job that reports a required context under a job-level `always()`
+/// is an aggregate, and its check fails unless every job it needs succeeded
+/// (`the_lint_aggregator_fails_unless_every_part_succeeded` runs `Lint`'s over
+/// every shape). The merge-queue watchdog cancels a batch on a failed part
+/// minutes before the aggregate reports, so a part added to `needs` without a
+/// row is a part whose failure waits for the aggregate, and a row naming no
+/// part cancels a batch on a job its context never reads. Only `ci.yml` is
+/// read: the watchdog reads that workflow's run alone.
+#[test]
+fn the_required_parts_list_is_every_need_of_a_required_aggregate() {
+    let texts = workflow_texts();
+    let text = texts.get("ci.yml").expect("ci.yml is readable");
+    let required: BTreeSet<String> = required_contexts().into_iter().collect();
+    let jobs = jobs_of(text);
+    let mut want: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut aggregates = 0usize;
+    for (id, block) in &jobs {
+        let context = job_reported_name(id, block);
+        let aggregate = required.contains(&context)
+            && matches!(job_if_of(block), Some(Ok(cond)) if condition_expression(&cond) == ALWAYS_CALL);
+        if !aggregate {
+            continue;
+        }
+        aggregates += 1;
+        for need in job_needs_of(block) {
+            let (_, need_block) = jobs
+                .iter()
+                .find(|(job, _)| *job == need)
+                .unwrap_or_else(|| panic!("`{id}` needs `{need}`, which ci.yml does not define"));
+            let part = job_reported_name(&need, need_block);
+            assert!(
+                !part.contains("${{")
+                    && !need_block.lines().any(|l| l.starts_with("    strategy:")),
+                "`{need}` is a matrix job or reports a name built from an expression \
+                 ({part}): GitHub renders its name per run, and this walk cannot derive \
+                 the names the parts list would have to carry"
+            );
+            // A part that can skip reds its aggregate (the check reads `skipped`
+            // as a failure), while the watchdog reads a skipped part as no
+            // failure, so its cancel waits for the aggregate to report.
+            assert!(
+                job_if_of(need_block).is_none() && job_needs_of(need_block).is_empty(),
+                "`{need}`, a part of `{context}`, carries a job condition or `needs:`, so \
+                 it can skip and red `{context}` with no part failure, and the cancel \
+                 waits for `{context}` to report"
+            );
+            want.insert((part, context.clone()));
+        }
+    }
+    assert!(
+        aggregates >= 1,
+        "no job of ci.yml reports a required context under a job-level `{ALWAYS_CALL}`: \
+         `Lint` does, so the walk is no longer finding it"
+    );
+    let path = repo_root().join(REQUIRED_PARTS_FILE);
+    let raw = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let got: BTreeSet<(String, String)> = required_parts_of(&path.display().to_string(), &raw)
+        .unwrap_or_else(|why| panic!("{why}"))
+        .into_iter()
+        .collect();
+    let missing: Vec<_> = want.difference(&got).collect();
+    let extra: Vec<_> = got.difference(&want).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "{REQUIRED_PARTS_FILE} must list exactly the jobs each required aggregate \
+         needs, as `<part job name>|<required context>`: missing {missing:?}, \
+         naming no part {extra:?}"
+    );
 }
 
 /// The longest `timeout-minutes` a job-level `always()` job may carry.
