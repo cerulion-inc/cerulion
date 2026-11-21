@@ -37,7 +37,7 @@ impl CheckedNodeLibrary {
         // SAFETY: caller authorizes native initialization and guarantees the
         // library obeys the loader and bootstrap protocol. Owner retained below.
         let library = unsafe { libloading::Library::new(path) }.map_err(|e| AbiError::Library {
-            reason: e.to_string(),
+            reason: library_error_text(&e),
         })?;
         // SAFETY: the versioned report symbol has this permanently frozen Stabby
         // signature; its immutable report storage remains live with the library.
@@ -47,7 +47,7 @@ impl CheckedNodeLibrary {
             )
         }
         .map_err(|e| AbiError::Bootstrap {
-            reason: e.to_string(),
+            reason: library_error_text(&e),
         })?;
         if !bootstrap_matches(report()) {
             return Err(AbiError::Layout);
@@ -59,7 +59,7 @@ impl CheckedNodeLibrary {
             library.get_stabbied::<BootstrapFn>(&BOOTSTRAP_SYMBOL[..BOOTSTRAP_SYMBOL.len() - 1])
         }
         .map_err(|e| AbiError::Bootstrap {
-            reason: e.to_string(),
+            reason: boxed_error_text(e.as_ref()),
         })?;
         // SAFETY: the bootstrap contract guarantees initialized immutable table
         // storage of the advertised size; all scalar/callback checks precede the
@@ -81,6 +81,33 @@ impl CheckedNodeLibrary {
     }
 }
 
+/// The reason text a loader refusal carries: the platform loader's own message
+/// where it gave one, so a refusal names the file or symbol it could not use.
+/// libloading prints a fixed summary (`dlopen failed`) for these failures and
+/// keeps the loader's message as the error's source, so the source is taken.
+/// For a path with an interior NUL byte and no trailing one, the text is the
+/// one libloading 0.8 printed for it.
+fn library_error_text(error: &libloading::Error) -> String {
+    match error {
+        libloading::Error::DlOpen { source }
+        | libloading::Error::DlSym { source }
+        | libloading::Error::DlClose { source } => source.to_string(),
+        libloading::Error::InteriorZeroElements => {
+            "could not create a C string from bytes".to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// [`library_error_text`] for an error a Stabby lookup boxed: the libloading
+/// error inside it when there is one, else the boxed error's own text.
+fn boxed_error_text(error: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    match error.downcast_ref::<libloading::Error>() {
+        Some(library) => library_error_text(library),
+        None => error.to_string(),
+    }
+}
+
 /// Native libraries use the supported POSIX loaders, including Android bionic.
 fn native_platform_supported(os: &str) -> bool {
     matches!(os, "linux" | "macos" | "android")
@@ -89,6 +116,27 @@ fn native_platform_supported(os: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_boxed_loader_error_reads_as_its_unboxed_text() {
+        // The texts libloading 0.8 printed for these two errors (0.8 called
+        // the first one `CreateCString`).
+        let nul: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(libloading::Error::InteriorZeroElements);
+        assert_eq!(
+            boxed_error_text(nul.as_ref()),
+            "could not create a C string from bytes"
+        );
+        let size: Box<dyn std::error::Error + Send + Sync> =
+            Box::new(libloading::Error::IncompatibleSize);
+        assert_eq!(
+            boxed_error_text(size.as_ref()),
+            "requested type cannot possibly work"
+        );
+        // An error Stabby makes itself passes through as its own text.
+        let other: Box<dyn std::error::Error + Send + Sync> = "Report mismatch".into();
+        assert_eq!(boxed_error_text(other.as_ref()), "Report mismatch");
+    }
 
     #[test]
     fn supported_native_platforms_are_frozen() {
@@ -106,10 +154,17 @@ mod tests {
         let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
         // SAFETY: the crate's actual text manifest is not native code. The OS
         // loader refuses its format before any constructor can execute.
-        assert!(matches!(
-            unsafe { CheckedNodeLibrary::load(&manifest, 0) },
-            Err(AbiError::Library { .. })
-        ));
+        let reason = match unsafe { CheckedNodeLibrary::load(&manifest, 0) } {
+            Err(AbiError::Library { reason }) => reason,
+            Err(other) => panic!("expected a native open refusal, got {other}"),
+            Ok(_) => panic!("a text manifest must not load as a native library"),
+        };
+        // The platform loader's own message names the file; a fixed summary
+        // such as `dlopen failed` would not.
+        assert!(
+            reason.contains("Cargo.toml"),
+            "the refusal must carry the loader's message naming the file: {reason}"
+        );
     }
 
     #[test]
@@ -123,7 +178,15 @@ mod tests {
         let path = Path::new("/usr/lib/libSystem.B.dylib");
         // SAFETY: this is the process's trusted C runtime, whose constructors
         // obey the native loader. Missing discovery refuses before any node call.
-        let result = unsafe { CheckedNodeLibrary::load(path, 0) };
-        assert!(matches!(result, Err(AbiError::Bootstrap { .. })));
+        let reason = match unsafe { CheckedNodeLibrary::load(path, 0) } {
+            Err(AbiError::Bootstrap { reason }) => reason,
+            Err(other) => panic!("expected a missing-export refusal, got {other}"),
+            Ok(_) => panic!("the C runtime exports no node interface"),
+        };
+        // The platform loader's own message names the missing symbol.
+        assert!(
+            reason.contains("cerulion_node_api_v1_stabbied_v3_report"),
+            "the refusal must carry the loader's message naming the symbol: {reason}"
+        );
     }
 }

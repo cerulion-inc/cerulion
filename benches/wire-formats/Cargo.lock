@@ -298,7 +298,7 @@ dependencies = [
  "iceoryx2-pal-print",
  "indexmap 2.14.0",
  "libc",
- "libloading",
+ "libloading 0.9.1",
  "once_cell",
  "rayon",
  "serde",
@@ -329,7 +329,7 @@ dependencies = [
 name = "cerulion_node_abi"
 version = "2.0.0"
 dependencies = [
- "libloading",
+ "libloading 0.9.1",
  "stabby",
  "thiserror",
 ]
@@ -454,7 +454,7 @@ checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
 dependencies = [
  "glob",
  "libc",
- "libloading",
+ "libloading 0.8.9",
 ]
 
 [[package]]
@@ -1834,6 +1834,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3084,7 +3094,7 @@ version = "72.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d53d2428934c46277fafd2d41e39357595aa1e47954c75db2b14ed90632f3cc"
 dependencies = [
- "libloading",
+ "libloading 0.9.1",
  "rustversion",
  "stabby-abi",
 ]
@@ -4285,7 +4295,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d57f491f63afa7413d68ee68e4de2bc9ce361c4ac89a76d5a0a0e3ca0624e21"
 dependencies = [
  "git-version",
- "libloading",
+ "libloading 0.8.9",
  "serde",
  "stabby",
  "tracing",
@@ -4412,7 +4422,7 @@ dependencies = [
  "humantime",
  "lazy_static",
  "libc",
- "libloading",
+ "libloading 0.8.9",
  "pnet_datalink",
  "schemars 1.2.1",
  "serde",

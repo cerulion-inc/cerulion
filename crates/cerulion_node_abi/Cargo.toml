@@ -17,8 +17,9 @@ workspace = true
 loader = ["dep:libloading", "stabby/libloading"]
 
 [dependencies]
-# Match Stabby's integration range exactly so fresh resolves select one Library
-# type for its extension trait and this owner; no indirect pin is required.
-libloading = { version = ">=0.7.3, <0.10", optional = true }
+# 0.9 exactly as a major: the loader reads 0.9's error variants. Stabby's
+# integration accepts 0.7.3 up to 0.10, so a resolve gives its extension trait
+# and this owner one Library type, 0.9.
+libloading = { version = "0.9", optional = true }
 stabby = { version = "=72.1.16", default-features = false, features = ["std"] }
 thiserror = "2"
