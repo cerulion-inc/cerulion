@@ -826,9 +826,11 @@ impl std::fmt::Display for UncreditableSplitEdge {
             .iter()
             .map(|(producer, rank)| format!("'{producer}' in rank {rank}"))
             .collect();
+        // `new` holds two or more producers, so the last one always follows
+        // "and".
         let placed = match placed.split_last() {
-            Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
-            _ => placed.join(""),
+            Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+            None => String::new(),
         };
         write!(
             f,
