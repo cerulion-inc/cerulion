@@ -54593,41 +54593,20 @@ fn nt_yaml(producer: &str, producer_type: &str, producer_keys: &str) -> String {
     )
 }
 
-/// Per step, in trace order: each FIRE of `nodes` and each read of
-/// `reader`'s input, as `kind role popped seq`. The order log the reader's
-/// frames are checked against.
-fn nt_order_log(rec: &Recording, nodes: &[&str]) -> Vec<String> {
-    let name = |idx: u32| rec.node_ids[idx as usize].as_str();
-    rec.trace
+/// The levels each node's recorded fires carry, per node.
+fn nt_fire_levels(rec: &Recording) -> BTreeMap<String, std::collections::BTreeSet<u32>> {
+    let mut levels: BTreeMap<String, std::collections::BTreeSet<u32>> = BTreeMap::new();
+    for r in rec
+        .trace
         .iter()
-        .filter_map(|r| {
-            if r.record_type == RECORD_TYPE_FIRE && nodes.contains(&name(r.node_idx)) {
-                return Some(format!(
-                    "step {} fire {} level {}",
-                    r.step,
-                    name(r.node_idx),
-                    r.global_level
-                ));
-            }
-            if is_read_record(r) && name(r.node_idx) == "reader" {
-                let (_, kind) = unpack_read_outcome_meta(r.global_level);
-                let seq = if r.fire_time_ns == u64::MAX {
-                    "none".to_string()
-                } else {
-                    r.fire_time_ns.to_string()
-                };
-                return Some(format!(
-                    "step {} read reader kind {} role {:?} popped {} seq {}",
-                    r.step,
-                    kind,
-                    read_site_role(r.global_level),
-                    unpack_read_outcome_popped(r.duration_ns),
-                    seq
-                ));
-            }
-            None
-        })
-        .collect()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE)
+    {
+        levels
+            .entry(rec.node_ids[r.node_idx as usize].clone())
+            .or_default()
+            .insert(r.global_level);
+    }
+    levels
 }
 
 /// The reader's served reads, as `(step, served sequence)`.
@@ -54683,9 +54662,15 @@ fn a_relay_fire_dropped_at_a_step_its_non_trigger_block_reader_drained_first_is_
         ])
     };
     let mut rec = record_uniform_with_read_log(&yaml, make, &[], NT_STEPS);
-    for line in nt_order_log(&rec, &["reader", "relay"]) {
-        eprintln!("nt order: {line}");
-    }
+    assert_eq!(
+        nt_fire_levels(&rec),
+        BTreeMap::from([
+            ("reader".to_string(), std::collections::BTreeSet::from([0])),
+            ("relay".to_string(), std::collections::BTreeSet::from([1])),
+            ("src".to_string(), std::collections::BTreeSet::from([0])),
+        ]),
+        "the reader and src fire at level 0, the relay src triggers at level 1"
+    );
     assert_eq!(
         bh_xs(&rec, "/nt/relay/out"),
         (1..=10).map(f64::from).collect::<Vec<_>>(),
@@ -54808,6 +54793,107 @@ fn a_replayed_build_that_makes_the_reader_a_trigger_is_refused_before_any_hold_i
         }
         other => panic!("the replay refuses the redeclared reader's stage set: {other:?}"),
     }
+}
+
+/// A FIFO relay that publishes each frame on two outputs.
+#[cerulion_node]
+#[derive(Default)]
+struct TwinRelayNode {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+    #[output]
+    out2: Vector3,
+}
+
+#[cerulion_node_impl]
+impl TwinRelayNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x;
+        self.out2.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// A sink triggered on one topic that reads another through a NON-trigger
+/// `block` input (depth 1), throttled to one fire per 50 ms. Each fire
+/// publishes the frame its `block` input read.
+#[cerulion_node(throttle_ms = 50)]
+#[derive(Default)]
+struct LaterBlockSinkNode {
+    #[input(trigger)]
+    t: Vector3,
+    #[input(backpressure = block, depth = 1)]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl LaterBlockSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.x.x;
+        Ok(())
+    }
+}
+
+/// A non-trigger `block` reader that fires a level after its producer holds
+/// it as a trigger reader does: `src` (5 ms) -> `relay` (FIFO, depth 11,
+/// outputs `out` and `out2`) -> `sink`, triggered on `relay/out2` and reading
+/// `relay/out` through a non-trigger `block` input of depth 1, throttled to
+/// 50 ms. The sink's trigger puts it at level 2, after the relay. The hand
+/// oracle, at the reference run's 5 ms step (step `k` runs at `(k + 1) * 5`
+/// ms):
+///
+/// * step 0: the relay fires sequence 0 (`x` 1) on both outputs and the sink
+///   fires, taking it; step 1: the relay fires sequence 1 (`x` 2), which the
+///   slot keeps, and the sink's throttle holds it;
+/// * step 2: the slot is full, so the relay pops sequence 2 and is held;
+/// * step 10 (55 ms): the sink fires and takes the step 1 frame; step 11: the
+///   relay fires sequence 2 (`x` 3) and its refill pops sequence 3, which the
+///   hold freezes;
+/// * steps 20, 30, 40: the sink takes one frame; steps 21, 31, 41: the relay
+///   fires the frozen frame and its refill pops the oldest frame its depth-11
+///   queue kept (sequences 11, 21 and 31).
+///
+/// The bag records the sink a level after the relay, so the slot is counted,
+/// the holds are allowed for, and the stamped replay reproduces every frame.
+#[test]
+#[serial]
+fn a_non_trigger_block_reader_a_level_after_its_producer_holds_it_and_replays_clean() {
+    let yaml = "name: lcgraph\nprefix: lc\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: twin_relay_node\n    inputs:\n      - name: inp\n        source: src/out\n        depth: 11\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n      - name: out2\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: later_block_sink_node\n    inputs:\n      - name: t\n        source: relay/out2\n      - name: x\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("relay", Box::new(TwinRelayNodeEntry::new())),
+            ("sink", Box::new(LaterBlockSinkNodeEntry::new())),
+        ])
+    };
+    let rec = record_uniform_with_read_log(yaml, make, &[], BH_STEPS);
+    assert_eq!(
+        nt_fire_levels(&rec),
+        BTreeMap::from([
+            ("relay".to_string(), std::collections::BTreeSet::from([1])),
+            ("sink".to_string(), std::collections::BTreeSet::from([2])),
+            ("src".to_string(), std::collections::BTreeSet::from([0])),
+        ])
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), vec![0, 1, 11, 21, 31, 41]);
+    assert_eq!(bh_fire_steps(&rec, "sink"), vec![0, 10, 20, 30, 40]);
+    assert_eq!(
+        bh_xs(&rec, "/lc/relay/out"),
+        vec![1.0, 2.0, 3.0, 4.0, 12.0, 22.0]
+    );
+    assert_eq!(bh_xs(&rec, "/lc/sink/out"), vec![1.0, 2.0, 3.0, 4.0, 12.0]);
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("lc_held.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    bh_assert_replays(&outcome, "a non-trigger reader a level after the relay");
 }
 
 /// A relay nothing holds, on a bag that states its drain: its last fire is

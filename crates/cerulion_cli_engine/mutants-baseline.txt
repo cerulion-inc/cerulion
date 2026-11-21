@@ -141,9 +141,11 @@
 # recording or declaration settles (`node_trigger_decl`,
 # `declared_latest_drain`, `never_unifies`), and the edges that can hold a
 # node with what the bag records of each slot (`local_block_holds`,
-# `slot_record`, `topic_recorded_whole`, `consumer_body_drain`). The rank's
-# topology read (`block_hold_flows`), the walk of the bag's frames
-# (`recorded_frame_stamps`) and the walk of the trace that drives the refill
+# `slot_record`, `topic_recorded_whole`, `consumer_body_drain`), with the
+# recorded order of its consumer and producer (`fold_fire_level`,
+# `recorded_after`). The rank's topology read (`block_hold_flows`), the walk
+# of the bag's frames (`recorded_frame_stamps`), the walk of its fire levels
+# (`recorded_fire_levels`) and the walk of the trace that drives the refill
 # plan (`derive_trailing_refills`) read the bag or build a graph, which the
 # mutation rule does not cover.
 #
@@ -208,6 +210,11 @@
 #          Re-run over the change that gives a slot whose input does not
 #          trigger its consumer no count, with `--re 'local_block_holds'`:
 #          7 mutants, 5 caught, 2 unviable, which replace
+#          `local_block_holds` with a map of an edge its type cannot default.
+#          Re-run over the change that counts a slot only where the bag's
+#          fire records put its consumer on a later level than its producer,
+#          with `--re 'fold_fire_level|recorded_after|local_block_holds'`:
+#          13 mutants, 11 caught, 2 unviable, which replace
 #          `local_block_holds` with a map of an edge its type cannot default.
 #
 # Every mutant that survives the test suite is listed below with the reason it
