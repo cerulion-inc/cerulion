@@ -15,6 +15,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Every archive build_deb.sh packages carries harness/, the agent harness
+# tree. Each fixture below writes the same one: a plain file at its top, and
+# a plain file and an executable file one directory down.
+write_harness() {
+    mkdir -p "$1/harness/sim"
+    printf '%s\n' 'harness readme' > "$1/harness/README.md"
+    printf '%s\n' 'sim server' > "$1/harness/sim/server.py"
+    printf '%s\n' '#!/bin/sh' > "$1/harness/sim/run.sh"
+    chmod 0644 "$1/harness/README.md" "$1/harness/sim/server.py"
+    chmod 0755 "$1/harness/sim/run.sh"
+}
+
 archive_root="$workdir/cerulion-0.1.0-x86_64-unknown-linux-gnu"
 mkdir -p "$archive_root"
 ln -s /etc/hostname "$archive_root/cerulion"
@@ -25,6 +37,7 @@ printf '%s\n' 'license' > "$archive_root/LICENSE"
 printf '%s\n' 'notice' > "$archive_root/NOTICE"
 printf '%s\n' 'bsd' > "$archive_root/LICENSE-BSD-3-CLAUSE"
 printf '%s\n' 'third-party' > "$archive_root/THIRD-PARTY-LICENSES.md"
+write_harness "$archive_root"
 archive="$workdir/cerulion-0.1.0-x86_64-unknown-linux-gnu.tar.gz"
 tar -czf "$archive" -C "$workdir" \
     cerulion-0.1.0-x86_64-unknown-linux-gnu
@@ -245,6 +258,78 @@ for binary in cerulion cerulion-netd cerulion-connectd cerulion-remoted; do
 done
 printf '%s\n' 'build_deb binary requirement passed'
 
+# The agent harness. The valid package above carries the fixture's tree under
+# /usr/bin/harness, beside the binaries: its directories at 0755, the plain
+# files at 0644 and the executable file at 0755, each named, the restrictive
+# umask build included, and the bytes of a nested file unchanged.
+for harness_entry in \
+    'drwxr-xr-x|./usr/bin/harness/' \
+    'drwxr-xr-x|./usr/bin/harness/sim/' \
+    '-rw-r--r--|./usr/bin/harness/README.md' \
+    '-rw-r--r--|./usr/bin/harness/sim/server.py' \
+    '-rwxr-xr-x|./usr/bin/harness/sim/run.sh'; do
+    harness_mode=${harness_entry%%|*}
+    harness_path=${harness_entry#*|}
+    harness_pattern=$(printf '%s' "$harness_path" | sed 's/\./\\./g')
+    for harness_listing in "$valid_contents" "$restrictive_contents"; do
+        printf '%s\n' "$harness_listing" |
+            grep -Eq "^$harness_mode .* $harness_pattern\$" || {
+            printf '%s\n' "$harness_listing" >&2
+            printf 'error: the package does not carry %s at %s\n' \
+                "$harness_path" "$harness_mode" >&2
+            exit 1
+        }
+    done
+done
+[ "$(dpkg-deb --fsys-tarfile "$valid_deb" | tar -xOf - ./usr/bin/harness/sim/server.py)" = \
+    'sim server' ] || {
+    printf '%s\n' 'error: the packaged harness file has the wrong contents' >&2
+    exit 1
+}
+dpkg-deb -f "$valid_deb" Description | grep -Fq '/usr/bin/harness' || {
+    printf '%s\n' 'error: Debian description does not mention /usr/bin/harness' >&2
+    exit 1
+}
+# An archive without harness/, and one with a regular file in its place, is
+# refused naming it; a symbolic link inside the tree is refused by the archive
+# listing check. None of the three leaves a package behind.
+rm -rf "$archive_root/harness"
+for harness_shape in missing file link; do
+    case "$harness_shape" in
+        file) printf '%s\n' 'not a tree' > "$archive_root/harness" ;;
+        link)
+            rm -f "$archive_root/harness"
+            write_harness "$archive_root"
+            ln -s README.md "$archive_root/harness/link"
+            ;;
+    esac
+    rm -f "$archive"
+    tar -czf "$archive" -C "$workdir" \
+        cerulion-0.1.0-x86_64-unknown-linux-gnu
+    if "$script_dir/build_deb.sh" "$archive" amd64 "$workdir/harness-debs" \
+        >"$workdir/harness-output" 2>"$workdir/harness-error"; then
+        printf 'error: archive with harness %s was packaged\n' "$harness_shape" >&2
+        exit 1
+    fi
+    if [ "$harness_shape" = link ]; then
+        harness_refusal='non-regular archive entry.*harness/link'
+    else
+        harness_refusal='^error: archive is missing harness$'
+    fi
+    grep -Eq "$harness_refusal" "$workdir/harness-error" || {
+        cat "$workdir/harness-error" >&2
+        printf 'error: archive with harness %s had the wrong diagnostic\n' "$harness_shape" >&2
+        exit 1
+    }
+    if find "$workdir/harness-debs" -type f -name '*.deb' -print 2>/dev/null |
+        grep -q .; then
+        printf 'error: refused harness %s archive left a Debian package behind\n' "$harness_shape" >&2
+        exit 1
+    fi
+done
+rm "$archive_root/harness/link"
+printf '%s\n' 'build_deb harness packaging passed'
+
 # The two shared objects. A Linux archive without the rmw, or with the rmw
 # but without the heap hook, is refused unless the synthetic opt-out is set
 # (the variable is exported at the top of this file, so the refusals are
@@ -260,6 +345,7 @@ printf '%s\n' 'license' > "$no_rmw_root/LICENSE"
 printf '%s\n' 'notice' > "$no_rmw_root/NOTICE"
 printf '%s\n' 'bsd' > "$no_rmw_root/LICENSE-BSD-3-CLAUSE"
 printf '%s\n' 'third-party' > "$no_rmw_root/THIRD-PARTY-LICENSES.md"
+write_harness "$no_rmw_root"
 no_rmw_archive="$workdir/cerulion-0.1.1-x86_64-unknown-linux-gnu.tar.gz"
 tar -czf "$no_rmw_archive" -C "$workdir" \
     cerulion-0.1.1-x86_64-unknown-linux-gnu
@@ -374,6 +460,7 @@ printf '%s\n' 'license' > "$bootstrap_root/LICENSE"
 printf '%s\n' 'notice' > "$bootstrap_root/NOTICE"
 printf '%s\n' 'bsd' > "$bootstrap_root/LICENSE-BSD-3-CLAUSE"
 printf '%s\n' 'third-party' > "$bootstrap_root/THIRD-PARTY-LICENSES.md"
+write_harness "$bootstrap_root"
 printf '%s\n' 'not a real shared object' > "$bootstrap_root/librmw_cerulion.so"
 printf '%s\n' 'not a real hook either' > "$bootstrap_root/libcerulion_heaphook.so"
 # A 1.x archive pairs its helper with rustc-version.txt, an argument the
@@ -634,6 +721,7 @@ do
     printf '%s\n' 'notice' > "$mapping_root/NOTICE"
     printf '%s\n' 'bsd' > "$mapping_root/LICENSE-BSD-3-CLAUSE"
     printf '%s\n' 'third-party' > "$mapping_root/THIRD-PARTY-LICENSES.md"
+    write_harness "$mapping_root"
     mapping_archive="$workdir/cerulion-$version-x86_64-unknown-linux-gnu.tar.gz"
     tar -czf "$mapping_archive" -C "$workdir" \
         "cerulion-$version-x86_64-unknown-linux-gnu"
@@ -711,6 +799,7 @@ printf '%s\n' 'license' > "$prerelease_root/LICENSE"
 printf '%s\n' 'notice' > "$prerelease_root/NOTICE"
 printf '%s\n' 'bsd' > "$prerelease_root/LICENSE-BSD-3-CLAUSE"
 printf '%s\n' 'third-party' > "$prerelease_root/THIRD-PARTY-LICENSES.md"
+write_harness "$prerelease_root"
 prerelease_archive="$workdir/cerulion-0.1.0-rc.1-x86_64-unknown-linux-gnu.tar.gz"
 tar -czf "$prerelease_archive" -C "$workdir" \
     cerulion-0.1.0-rc.1-x86_64-unknown-linux-gnu
@@ -726,6 +815,7 @@ printf '%s\n' 'license' > "$plus_root/LICENSE"
 printf '%s\n' 'notice' > "$plus_root/NOTICE"
 printf '%s\n' 'bsd' > "$plus_root/LICENSE-BSD-3-CLAUSE"
 printf '%s\n' 'third-party' > "$plus_root/THIRD-PARTY-LICENSES.md"
+write_harness "$plus_root"
 plus_archive="$workdir/cerulion-0.1.0+build.1-x86_64-unknown-linux-gnu.tar.gz"
 tar -czf "$plus_archive" -C "$workdir" \
     cerulion-0.1.0+build.1-x86_64-unknown-linux-gnu
@@ -819,6 +909,7 @@ printf '%s\n' 'license' > "$prerelease_plus_root/LICENSE"
 printf '%s\n' 'notice' > "$prerelease_plus_root/NOTICE"
 printf '%s\n' 'bsd' > "$prerelease_plus_root/LICENSE-BSD-3-CLAUSE"
 printf '%s\n' 'third-party' > "$prerelease_plus_root/THIRD-PARTY-LICENSES.md"
+write_harness "$prerelease_plus_root"
 prerelease_plus_archive="$workdir/cerulion-0.1.0-rc.1+build.1-x86_64-unknown-linux-gnu.tar.gz"
 tar -czf "$prerelease_plus_archive" -C "$workdir" \
     cerulion-0.1.0-rc.1+build.1-x86_64-unknown-linux-gnu

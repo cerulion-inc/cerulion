@@ -29,6 +29,10 @@ make_archive() {
     printf '%s\n' 'notice' > "$root/NOTICE"
     printf '%s\n' 'bsd' > "$root/LICENSE-BSD-3-CLAUSE"
     printf '%s\n' 'third-party' > "$root/THIRD-PARTY-LICENSES.md"
+    # The same holds for the agent harness tree, which build_deb.sh also
+    # requires.
+    mkdir -p "$root/harness"
+    printf '%s\n' 'harness' > "$root/harness/README.md"
     tar -czf "$workdir/cerulion-${version}-x86_64-unknown-linux-gnu.tar.gz" \
         -C "$workdir" "cerulion-${version}-x86_64-unknown-linux-gnu"
 }

@@ -224,6 +224,13 @@ const HAND_SCANNED_DOC_PINS: &[(&str, &str, &[&str], &[&str])] = &[
         &["docs"],
         &[],
     ),
+    // The release installer, joined onto the crate manifest directory.
+    (
+        "cerulion_cli",
+        "packaged_harness_install_test",
+        &["tools"],
+        &[],
+    ),
     // The bag reference page, reached from the crate manifest directory.
     (
         "cerulion_cli_engine",

@@ -35,7 +35,7 @@ impl SafetyControllerNode {
 
 The node is built with `cerulion node build`, wired in a graph YAML file and run
 with `cerulion graph run`. Node code never creates the runtime, a publisher or a
-subscriber itself; the [quickstart](https://docs.cerulion.com/cerulion/quickstart)
+subscriber itself; the [quickstart](https://github.com/cerulion-inc/cerulion#quickstart)
 and the [node guide](https://docs.cerulion.com/cerulion/guides/define-a-node)
 walk through the whole loop.
 

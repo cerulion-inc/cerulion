@@ -13,21 +13,21 @@ You reach the harness through `cerulion rcp`, Cerulion's MCP server command:
 | Command | What it does |
 |---|---|
 | `cerulion rcp --sim` | Serves the harness's tools with a simulated robot on this machine, to any MCP client. |
-| `cerulion rcp bench` | Reruns one task of the published benchmark with and without the harness, against your own model. |
-| `cerulion rcp bench --verify` | Checks that the harness code on disk is the code the benchmark measured. |
+| `cerulion rcp bench` | Reruns one start state with and without the harness, against your own model: one of the published benchmark with `--cell`, otherwise one the harness was developed on. |
+| `cerulion rcp bench --verify` | Checks every file of the harness's measured code against the provenance ledger that ties it to the code the benchmark measured. |
 
 Both run under the free Cerulion account, as the other `cerulion` commands do: run `cerulion login` once.
 
 ## Try it
 
-The release packages install `cerulion` without the harness folder. Clone this repository once and name its
-`harness/` folder in `CERULION_HARNESS_DIR`, or run a `cerulion` built in the checkout, which finds it on its own
-([Where the harness lives](#where-the-harness-lives)). To run the harness your `cerulion` was released with, add
-`--branch` and the release's tag to the clone: `v` and the version `cerulion --version` prints.
+The [README quickstart](../README.md#quickstart) starts the local `cerulion rcp --sim --http` server and runs one task on it from one coding-agent prompt, together with the runtime's record and verify.
+
+Every release package installs the harness folder beside `cerulion`: the install script, the release archives,
+the Debian package (`/usr/bin/harness`) and the Homebrew formula. A release's `cerulion` finds it there with no
+clone and no setting, and a `cerulion` built in a checkout of this repository finds that checkout's own
+([Where the harness lives](#where-the-harness-lives)). A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`.
 
 ```bash
-git clone --depth 1 https://github.com/cerulion-inc/cerulion   # the harness folder, once
-export CERULION_HARNESS_DIR="$PWD/cerulion/harness"
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # leave it running
 ```
@@ -36,7 +36,7 @@ In a second terminal, add it to your MCP client and ask for a task:
 
 ```bash
 claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
-claude "Put the bowl on the plate."
+claude "With cerulion-sim, put the bowl on the plate."
 ```
 
 Any MCP client works the same way: point it at `http://127.0.0.1:8765/mcp`. Each connection gets its own episode
@@ -49,6 +49,13 @@ when no call arrives for a while; connect again for a new one.
 Without `--http`, `cerulion rcp --sim` serves MCP over stdio, so a client can start it itself:
 
 ```bash
+claude mcp add cerulion-sim -- cerulion rcp --sim
+```
+
+For a `cerulion` installed with `cargo install`, pass the variable to the server the client starts. Give it an
+absolute path: the value is captured when the server is added, and the client starts it from its own directory.
+
+```bash
 claude mcp add cerulion-sim -e CERULION_HARNESS_DIR="$CERULION_HARNESS_DIR" -- cerulion rcp --sim
 ```
 
@@ -56,13 +63,21 @@ Run `cerulion rcp --sim` once in a terminal before you add it this way: the firs
 and the benchmark scenes, which takes minutes, and a client that starts a stdio server waits only seconds for
 its first answer.
 
-Then rerun a task of the benchmark against your own model:
+Then run a start state yourself against your own model. Pick a published one from the results package's
+`cells.csv`; without `--cell` the run uses a start state the harness was developed on, not a published one.
 
 ```bash
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
 export OPENAI_API_KEY=your-key
-cerulion rcp bench --model YOUR_MODEL
+cerulion rcp bench --model YOUR_MODEL --cell CELL_ID
 ```
+
+The hosted Cerulion MCP also serves the harness's tools on a simulated arm, with nothing to install: run
+`claude mcp add --transport http cerulion https://mcp.cerulion.com/mcp/cerulion` and sign in with your Cerulion
+account from `/mcp` in Claude Code. Your model starts the arm in Cerulion's cloud with `sim_start` and stops it
+with `sim_end`, and the simulator runs on your account's sim credits, one credit for each second it is held
+open. The hosted endpoints are in early access; [Give your model Cerulion](../README.md#give-your-model-cerulion)
+shows a prompt.
 
 ## What the first run installs
 
@@ -102,14 +117,15 @@ models, 100 start states each, one episode a start state an arm. The start state
 rows the harness was developed on at other start states, so the tasks themselves are not new to it.
 
 Every count, cost and episode is in the [results package](https://github.com/cerulion-inc/cerulion/tree/main/docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro),
-with the reading rules frozen before the first row and a script that computes every figure again from the rows.
+with the reading rules, each frozen before the rows of its own lists, and a script that computes every figure
+again from the rows.
 
 ## How `cerulion rcp bench` reproduces it
 
 `cerulion rcp bench --model YOUR_MODEL` runs one cell (one task at one start state) twice, once in each setup the
 benchmark compared, with the same budget, temperature and scorer, and prints the benchmark's own verdict for
-each. The code that runs is the code the benchmark measured: the harness folder carries it unchanged, and
-`--verify` proves it.
+each. The code that runs is the harness's measured code, and `--verify` checks every file of it against the
+provenance ledger that ties it to the code the benchmark measured.
 
 | Flag | Meaning |
 |---|---|
@@ -163,34 +179,41 @@ the prompt cache mark still goes only to a Claude model with the harness; `swap`
 
 ## What `--verify` checks
 
-`cerulion rcp bench --verify` hashes every file of the measured code in the harness folder and compares it with
-the manifests of the two measured code trees, one for each setup. The SHA-256 of a manifest is that tree's
-snapshot id: `sha256:4f8bbe79fdf38df1770c068ec470fd3d5a629fd371f7288887cb3d275f9f747e` with the harness and
+`cerulion rcp bench --verify` hashes every file of the measured code in the harness folder and checks it against
+the provenance ledger. For each shipped file the ledger holds the hash of the measured file it came from and
+whether it is that file byte for byte or differs in comments and docstrings, prose, strings or code, with each
+changed string and code edit listed. The measured files are those of the manifests of the two measured code
+trees, one for each setup. The SHA-256 of a manifest is that tree's snapshot id:
+`sha256:4f8bbe79fdf38df1770c068ec470fd3d5a629fd371f7288887cb3d275f9f747e` with the harness and
 `sha256:6f040ca78bae0efd437005afc04ead78c4295e1e471d854b3e7ff0f9ea01f2a4` without. They are the trees
 `sha256:7cb9f322c10f6fa7e64a3f8da7c22c67d67280eca436a03d2d87683496b4d5b8` and
 `sha256:b73c548a1f0436f52ce41cffc7d4a4a2784e5d6170e2dd2c757c9cabdf146637` with the `append` mode added to two
 operator files, `bench/operators/chat_support.py` and `bench/operators/chat_operator.py`; in `swap` mode they send
-what those trees sent. It exits 0 only when every file matches. It installs nothing and needs only `python3`.
+what those trees sent. It exits 0 only when both manifests have their snapshot ids and every file matches its
+ledger row. It installs nothing; it needs `python3` on your PATH or a finished install, and, as every
+`cerulion rcp` command does, a signed-in Cerulion account.
 
 ## Where the harness lives
 
 The harness is the `harness/` folder of the Cerulion repository (see [harness/README.md](../harness/README.md)).
-The release packages do not install it: a `cerulion` of a release runs it through `CERULION_HARNESS_DIR`, and a
+Every release package installs it beside the `cerulion` binary, without its tests and development files, and a
 `cerulion` built in a checkout finds that checkout's own. `cerulion rcp --sim` and `cerulion rcp bench` find it
 in this order:
 
-1. `CERULION_HARNESS_DIR`, when set and not empty. A value that names a missing folder, or a folder that holds no
-   harness, is an error; the search never falls through to the places below.
-2. `harness/` beside the `cerulion` binary. A link to `cerulion` in a `bin` directory still reaches the folder
-   beside the real binary.
+1. `CERULION_HARNESS_DIR`, when set and not empty, to run another harness folder, such as a checkout's. A value
+   that names a missing folder, or a folder that holds no harness, is an error; the search never falls through to
+   the places below.
+2. `harness/` beside the canonicalized `cerulion` binary, where the release packages install it. A link to
+   `cerulion` in a `bin` directory still reaches the folder beside the real binary.
 3. `harness/` at the root of the Cerulion source checkout the `cerulion` binary sits in: the nearest folder above
    the binary that holds `crates/cerulion_cli/Cargo.toml`. So a `cerulion` that `cargo run` or `cargo build` made
    in a checkout finds that checkout's harness; one built into a target folder outside the checkout
    (`CARGO_TARGET_DIR`) does not, and needs `CERULION_HARNESS_DIR`.
 
 The current directory is never searched, so a folder you run `cerulion` in, such as a repository you downloaded,
-cannot supply a harness. Places 2 and 3 never take a folder that other users of the machine can write to, such
-as `/tmp`: the search for a checkout stops at the first one, so a `harness/` someone else put there never runs.
+cannot supply a harness. `CERULION_HARNESS_DIR` is taken as given. Places 2 and 3 never take a folder that every
+user of the machine can write to, such as `/tmp`: the search for a checkout stops at the first one, so a
+`harness/` someone else put there never runs.
 When none of the three holds a harness, the error names where it looked.
 
 The install writes inside the folder the harness runs from. Nothing writes into the folder beside the `cerulion`

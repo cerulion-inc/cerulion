@@ -1,7 +1,8 @@
 # Cerulion Debian and APT distribution
 
 The Debian package is named `cerulion` and installs the CLI, the three daemon
-binaries, the ROS 2 Jazzy rmw and the heap hook into `/usr/bin`:
+binaries, the ROS 2 Jazzy rmw, the heap hook and the agent harness tree into
+`/usr/bin`:
 
 * `cerulion`
 * `cerulion-netd`
@@ -9,9 +10,11 @@ binaries, the ROS 2 Jazzy rmw and the heap hook into `/usr/bin`:
 * `cerulion-remoted`
 * `librmw_cerulion.so`
 * `libcerulion_heaphook.so`
+* `harness/`, from 2.1.0
 
 Keeping the files together is required because the CLI resolves its siblings
-by its own directory: `cerulion connect` finds `cerulion-connectd` there, and
+by its own directory: `cerulion connect` finds `cerulion-connectd` there, the
+agent harness is read from `harness/` there, and
 `cerulion ros2 run` and `cerulion ros2 launch` find `librmw_cerulion.so` there
 and stage a minimal ament prefix that links it, so ROS 2's rmw discovery never
 sees `/usr/bin` in a path. The same verbs prepend `libcerulion_heaphook.so` to

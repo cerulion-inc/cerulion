@@ -2,23 +2,26 @@
 
 This folder is the Cerulion harness: the tools and body knowledge a general model needs to work a robot it was
 never trained on, the simulated robot it runs on in this release, and the benchmark that measured it. You run it
-through the `cerulion` command; the guide is [docs/harness.md](../docs/harness.md).
+through the `cerulion` command; the guide is [docs/harness.md](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/docs/harness.md).
+
+The [quickstart](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/README.md#quickstart) starts the local `cerulion rcp --sim --http` server and runs one task on it, together with the runtime, from one coding-agent prompt or by hand.
 
 ```bash
 cerulion login                                   # once, on this machine
 cerulion rcp --sim --http 127.0.0.1:8765         # the harness's MCP tools with a simulated robot
 claude mcp add --transport http cerulion-sim http://127.0.0.1:8765/mcp
-cerulion rcp bench --model YOUR_MODEL            # one benchmark task, with and without the harness
-cerulion rcp bench --verify                      # the code here is the code the benchmark measured
+cerulion rcp bench --model YOUR_MODEL            # one start state, with and without the harness
+cerulion rcp bench --verify                      # check the measured code against its provenance ledger
 ```
 
-The release packages do not install this folder. A `cerulion` built in this checkout
-(`cargo run -p cerulion_cli -- rcp --sim`, or `target/debug/cerulion`) finds it from any directory; for any other
-`cerulion`, a release's included, point `CERULION_HARNESS_DIR` at it. Both run it in place while your user can
-write to it. A copy of this folder beside the `cerulion` binary is found too, and nothing writes into it there:
-the first run copies it once to `harness/<version>` under the Cerulion config directory and runs from the copy.
-The current directory is never searched for a harness, and the search takes nothing from a folder other users
-can write to.
+Every release package installs this folder beside the `cerulion` binary, without `tests/` and the development
+files, and nothing writes into it there: the first run copies it once to `harness/<version>` under the Cerulion
+config directory and runs from the copy. A `cerulion` built in this checkout (`cargo run -p cerulion_cli -- rcp
+--sim`, or `target/debug/cerulion`) finds this folder from any directory, and `CERULION_HARNESS_DIR` points any
+`cerulion` at it; both run it in place while your user can write to it.
+The current directory is never searched for a harness. `CERULION_HARNESS_DIR` is taken as given; this folder
+beside the binary, or in a checkout, is never taken from a folder that every user can write to, such as `/tmp`.
+A `cerulion` installed with `cargo install` has no harness beside it: clone this repository at the tag of its version (`git clone --depth 1 --branch v<version> https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version` prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder, or, for one installed from a checkout (`cargo install --path`), to that checkout's `harness/`.
 
 ## What is in it
 
@@ -35,15 +38,15 @@ can write to.
 | `requirements/` | every Python package of both environments, pinned |
 | `macos/` | the simulator host for macOS, which renders through Apple's OpenGL |
 | `container/` | a container recipe; no image is published |
-| `tests/` | standard-library tests that need no simulator and no network |
+| `tests/` | standard-library tests that need no simulator and no network; the release packages leave them out |
 
 The install writes `bx/` (the simulator environment and the benchmark trees), `venv/` (the episode server's
 environment) and `out/` (what the sim server keeps of each episode) inside the folder it runs from: this folder
 when it runs in place, its copy when it sits beside the binary. Git ignores all three. Nothing of the benchmark's
 scenes is committed here: they are fetched and checked against their pins.
 
-The measured code keeps the package names it ran under, `rcpx` and `bench`, so that it stays byte for byte the
-code the benchmark measured. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](../docs/rcp.md).
+The measured code keeps the package names it ran under, `rcpx` and `bench`, as the measured manifests name them;
+the provenance ledger lists how each shipped file differs from the measured one. RCP, the Robot Context Protocol, is the protocol's name in [docs/rcp.md](https://github.com/cerulion-inc/cerulion/blob/v2.1.0/docs/rcp.md).
 
 ## Licence
 
