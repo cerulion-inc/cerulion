@@ -18,7 +18,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ALPHA = 0.05
 MAIN_MODEL = "Gemini 3.8 Flash"
 CLEAN_MODEL = "GPT-6 Astra"
-ADDED_LATE = ["GPT-6.1 Terra"]          # a column added after the grid's first rows had been seen
+ADDED_LATE = {                          # a column added after grid rows had been seen: model -> when, as printed
+    "GPT-6.1 Terra": "after the grid's first rows had been seen",
+    "Gemini 4 Neon": "after every other column had finished and been read",
+}
 CROSS_WITHOUT = ["GPT-6 Astra", "GPT-6.2 Astra"]   # RULES.md section 3: MAIN_MODEL with against these without
 CLOCK_REASON = "the 90 minute episode clock ran out"   # the unscored.csv reason of an episode the clock ended
 CLOCK_S = 5400                           # the episode clock, seconds
@@ -823,12 +826,12 @@ def grid_first(cols, name, fam, N, cells, uns, lost):
                          + (f" (an episode the 90 minute clock ended at its {CLOCK_S} seconds)" if walls else "")
                          + ", with each arm's attempts in lost_attempts.csv at their cost: " + joined(figs) + ".")
             L.append(line)
-    # the column added late, and the passes that do not hold with the task row as the unit
+    # the columns added late, and the passes that do not hold with the task row as the unit
     for m in ADDED_LATE:
         c = next((x for x in cols if x.model == m), None)
         t = fam["solved"].get(m)
         if c and t:
-            L.append(f"- {m} was added to the grid after its first rows had been seen. It "
+            L.append(f"- {m} was added {ADDED_LATE[m]}. It "
                      f"{'passes' if t[1] else 'does not pass'} SOLVED at p = {fp(c.paired('solved')['p'])} against its "
                      f"Holm threshold {fp(t[0])}.")
     weak = []
@@ -873,8 +876,8 @@ def grid_first(cols, name, fam, N, cells, uns, lost):
           "- How the run went, and where it differed from the protocol (the pause of the Claude models, the other "
           "models' start states whose two arms started more than an hour apart, two machines that stopped and a "
           "third whose waiting episodes were moved, a network outage, one model answered from two provider "
-          "deployments, the machines shared with other work), is in README.md under \"Things to know before quoting "
-          "a number\".", ""]
+          "deployments, the column that ran on one machine on 2026-11-21, the machines shared with other work), is "
+          "in README.md under \"Things to know before quoting a number\".", ""]
     return L
 
 
@@ -1049,7 +1052,7 @@ def grid(name, check, changed):
             pr, t = c.paired(key), fam[key].get(c.model)
             v = verdict(pr, t, key) if c.complete else f"incomplete at the read of {info['read']}: {pr['pairs']} of {N}"
             if c.model in ADDED_LATE:
-                v += " (column added after the first rows were seen)"
+                v += f" (column added {ADDED_LATE[c.model]})"
             d = "" if pr["diff"] is None else f"{100 * pr['diff']:+.1f} ({pct(pr['newcombe'])})"
             L.append(f"| {c.model}{'' if c.complete else '*'} | {pr['pairs']} | {pr['with_only']} | "
                      f"{pr['without_only']} | {pr['both']} | {pr['neither']} | {d} | {fp(pr['p'])} | "

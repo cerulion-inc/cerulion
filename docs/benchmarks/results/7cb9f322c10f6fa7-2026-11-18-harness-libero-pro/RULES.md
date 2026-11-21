@@ -13,9 +13,10 @@ What this public text changes against the frozen files: file names, folder names
 names of the people and stages that wrote them are removed; Cerulion is the product's name; sections that
 report earlier measurements on other lists and other benchmarks, and the tables of numbers published by other
 groups, are left out because none of that data is in this package; the wording of some sentences is shortened;
-nine lines are reworded: section 4 (b) to (f) and (h), section 5 items 4 and 5, and the last sentence of section
-7's paragraph on unscored and lost start states. No other rule was added, dropped or weakened. The two hashes are
-of the frozen files, so a later release of them can be checked against this table.
+ten lines are reworded: section 3's sentence on the first threshold (the frozen file gives it for ten models,
+this text for the number that ran), section 4 (b) to (f) and (h), section 5 items 4 and 5, and the last sentence
+of section 7's paragraph on unscored and lost start states. No other rule was added, dropped or weakened. The two
+hashes are of the frozen files, so a later release of them can be checked against this table.
 
 ## 1. Words
 
@@ -69,8 +70,8 @@ TWO SECONDARY TESTS, declared, each at alpha 0.05, apart from the per-model fami
 EVERY OTHER MODEL (the per-model family): Holm's step-down correction over the per-model SOLVED tests of all
 the models that ran, however they came out. A model that passes is "established". A model at or under 0.05 that
 does not pass Holm is "points up, not established" (or "points down"). Otherwise "no difference shown". The same
-family rule, separately, for CLEAN. The rule was written for ten models (first threshold 0.005); fifteen ran,
-so the first threshold is 0.05 / 15. SUMMARY.md counts the main test's model inside the family as well, which is
+family rule, separately, for CLEAN. The rule was written for ten models (first threshold 0.005); sixteen ran,
+so the first threshold is 0.05 / 16. SUMMARY.md counts the main test's model inside the family as well, which is
 the stricter reading; the main test itself is read alone.
 
 ACROSS MODELS, descriptive only: the gain against the model's rate without Cerulion. No significance is claimed

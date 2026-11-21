@@ -17,8 +17,8 @@ solved start state"). Standard library only: the same package gives the same byt
 The form of both charts:
   - one row per model, ordered by the share of finished episodes solved WITHOUT Cerulion, lowest
     first, ties by name; the same order in both charts; no model is marked for its results; a model
-    whose column was added after the grid's first rows had been seen (the package's ADDED_LATE)
-    carries a dagger, and a footnote says so;
+    whose column was added after grid rows had been seen (the package's ADDED_LATE) carries a
+    dagger, and a footnote says when, in the package's words;
   - the first line under the title is the scope: new start states of task rows Cerulion was developed
     on at other start states, one episode each, the same model in both arms;
   - linear scales; success rate in percent;
@@ -135,7 +135,7 @@ def rows_of(rc):
     for c in cols:
         wo, wi = c.stats("without"), c.stats("with")
         pr = c.paired("solved")
-        out.append({"model": c.model, "complete": c.complete, "late": c.model in rc.ADDED_LATE, "without": wo,
+        out.append({"model": c.model, "complete": c.complete, "late": rc.ADDED_LATE.get(c.model), "without": wo,
                     "with": wi, "p": None if pr["p"] is None else rc.fp(pr["p"]),
                     "verdict": rc.verdict(pr, family.get(c.model), "solved") if c.complete else None})
     for r in out:
@@ -180,9 +180,12 @@ def star_footer(rows, when, cells):
         if not r["complete"]:
             out.append(f"* Still running at the read of {when}: {r['model']}, {r['without']['finished']} of {cells} "
                        f"start states finished without {NAME} and {r['with']['finished']} with.")
-    late = [r["model"] for r in rows if r["late"]]
+    late = {}
+    for r in rows:
+        if r["late"]:
+            late.setdefault(r["late"], []).append(r["model"])
     if late:
-        out.append(f"\u2020 {', '.join(late)}: added after the grid's first rows had been seen.")
+        out.append("\u2020 " + " ".join(f"{', '.join(ms)}: added {after}." for after, ms in late.items()))
     return out
 
 

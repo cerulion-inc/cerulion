@@ -1,6 +1,6 @@
-# Summary of the grid: 100 start states, 15 models, both arms
+# Summary of the grid: 100 start states, 16 models, both arms
 
-Computed by recompute.py from episodes.csv, unscored.csv and not_finished.csv as read at 2026-11-19T20:35:04Z. recompute.py computes this file again from the CSV files; with --check it writes nothing and says whether this file still matches them.
+Computed by recompute.py from episodes.csv, unscored.csv and not_finished.csv as read at 2026-11-21T09:40:40Z. recompute.py computes this file again from the CSV files; with --check it writes nothing and says whether this file still matches them.
 
 Said before any number (RULES.md section 2):
 
@@ -18,25 +18,26 @@ Arms: `without` is the same model on a published three-tool interface; `with` is
 
 ## Read these first
 
-- With Cerulion, 3 of the 15 models solved fewer start states than without it, the 3 with the highest rates without it: Gemini 4 Carbon (76 against 82 of 100; with only 13, without only 19; p = 0.377); GPT-6.2 Astra (77 against 81 of 100; with only 10, without only 14; p = 0.541); GPT-6 Astra (70 against 71 of 100; with only 13, without only 14; p = 1). None of them is significant at 0.05, so each reads "no difference shown" (RULES.md section 5 (3)).
-- On CLEAN, 1 of the 15 models had fewer with Cerulion: Gemini 4 Carbon (58 against 71 of 100; with only 17, without only 30; p = 0.0789). It is not significant at 0.05, so it reads "no difference shown" (RULES.md section 5 (3)).
-- With Cerulion ahead, printed whole: on SOLVED in 12 of 15, and on CLEAN in 14 of 15 models.
-- Established after Holm's correction over the 15 models (RULES.md section 3): on SOLVED for 10 of 15, and on CLEAN for 13 of 15. Ahead with Cerulion but not established: GPT-6.2 Sol SOLVED (73 against 59 of 100; with only 26, without only 12; p = 0.0336 against its Holm threshold 0.0100): points up, not established; GPT-6.1 Sol SOLVED (68 against 59 of 100; with only 22, without only 13; p = 0.175 against its Holm threshold 0.0125): no difference shown; GPT-6.2 Astra CLEAN (58 against 54 of 100; with only 15, without only 11; p = 0.557 against its Holm threshold 0.0500): no difference shown. Only a model established on SOLVED may be read as "Cerulion lifts" it.
-- The provider's content filter stopped replies (finish reason content_filter) in 4 of the 30 arms: Claude Fable 5.2 without Cerulion (337 of its 1,101 replies in scored episodes, in 94 of its 100 scored episodes, 86 of which ended on filtered replies); Gemini 4 Argon without Cerulion (1 of the 155 replies of its 3 unscored episodes, in 1 of them); Gemini 4 Argon with Cerulion (1 of its 1,647 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it); Gemini 4 Hydrogen without Cerulion (1 of its 5,990 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it). No other arm had one. Every arm's replies by finish reason are in the table under "How the replies ended".
-- The pooled false-claim test (the second secondary test below) passes: fewer episodes ended with the model wrongly saying it had succeeded. Per unsolved episode the rate is higher with Cerulion: 184 false claims in 491 unsolved episodes (0.375) against 248 in 898 (0.276) without it, over all 15 models; as high or higher with Cerulion for 7 of the 15 (with against without): Gemini 3.8 Flash 0.593 against 0.400; Claude Opus 5.5 0.385 against 0.235; Claude Sonnet 5.5 0.510 against 0.190; Claude Haiku 5.5 0.339 against 0.042; Claude Fable 5.2 0.500 against 0.044; GPT-6 Luna 0.197 against 0.120; Grok 4.7 0.319 against 0.062.
-- With Cerulion the model made more false claims in all for 5 of the 15 models: Claude Haiku 5.5 (19 against 4; with only 18, without only 3; p = 0.00149); Claude Sonnet 5.5 (25 against 16; with only 22, without only 13; p = 0.175); Grok 4.7 (15 against 6; with only 15, without only 6; p = 0.0784); Claude Fable 5.2 (8 against 4; with only 7, without only 3; p = 0.344); GPT-6 Luna (14 against 12; with only 14, without only 12; p = 0.845). Each per-model count is descriptive; the declared test is the pooled one.
+- With Cerulion, 4 of the 16 models solved fewer start states than without it, the 4 with the highest rates without it: Gemini 4 Neon (90 against 93 of 100; with only 7, without only 10; p = 0.629); Gemini 4 Carbon (76 against 82 of 100; with only 13, without only 19; p = 0.377); GPT-6.2 Astra (77 against 81 of 100; with only 10, without only 14; p = 0.541); GPT-6 Astra (70 against 71 of 100; with only 13, without only 14; p = 1). None of them is significant at 0.05, so each reads "no difference shown" (RULES.md section 5 (3)).
+- On CLEAN, 1 of the 16 models had fewer with Cerulion: Gemini 4 Carbon (58 against 71 of 100; with only 17, without only 30; p = 0.0789). It is not significant at 0.05, so it reads "no difference shown" (RULES.md section 5 (3)).
+- With Cerulion ahead, printed whole: on SOLVED in 12 of 16, and on CLEAN in 15 of 16 models.
+- Established after Holm's correction over the 16 models (RULES.md section 3): on SOLVED for 9 of 16, and on CLEAN for 13 of 16. Ahead with Cerulion but not established: GPT-6.2 Sol SOLVED (73 against 59 of 100; with only 26, without only 12; p = 0.0336 against its Holm threshold 0.0083): points up, not established; GPT-6.1 Sol SOLVED (68 against 59 of 100; with only 22, without only 13; p = 0.175 against its Holm threshold 0.0100): no difference shown; GPT-6.1 Terra SOLVED (74 against 57 of 100; with only 27, without only 10; p = 0.00763 against its Holm threshold 0.0071): points up, not established; GPT-6.2 Astra CLEAN (58 against 54 of 100; with only 15, without only 11; p = 0.557 against its Holm threshold 0.0500): no difference shown; Gemini 4 Neon CLEAN (70 against 59 of 100; with only 25, without only 14; p = 0.108 against its Holm threshold 0.0250): no difference shown. Only a model established on SOLVED may be read as "Cerulion lifts" it.
+- The provider's content filter stopped replies (finish reason content_filter) in 4 of the 32 arms: Claude Fable 5.2 without Cerulion (337 of its 1,101 replies in scored episodes, in 94 of its 100 scored episodes, 86 of which ended on filtered replies); Gemini 4 Argon without Cerulion (1 of the 155 replies of its 3 unscored episodes, in 1 of them); Gemini 4 Argon with Cerulion (1 of its 1,647 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it); Gemini 4 Hydrogen without Cerulion (1 of its 5,990 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it). No other arm had one. Every arm's replies by finish reason are in the table under "How the replies ended".
+- The pooled false-claim test (the second secondary test below) passes: fewer episodes ended with the model wrongly saying it had succeeded. Per unsolved episode the rate is higher with Cerulion: 186 false claims in 501 unsolved episodes (0.371) against 255 in 905 (0.282) without it, over all 16 models; as high or higher with Cerulion for 7 of the 16 (with against without): Gemini 3.8 Flash 0.593 against 0.400; Claude Opus 5.5 0.385 against 0.235; Claude Sonnet 5.5 0.510 against 0.190; Claude Haiku 5.5 0.339 against 0.042; Claude Fable 5.2 0.500 against 0.044; GPT-6 Luna 0.197 against 0.120; Grok 4.7 0.319 against 0.062.
+- With Cerulion the model made more false claims in all for 5 of the 16 models: Claude Haiku 5.5 (19 against 4; with only 18, without only 3; p = 0.00149); Claude Sonnet 5.5 (25 against 16; with only 22, without only 13; p = 0.175); Grok 4.7 (15 against 6; with only 15, without only 6; p = 0.0784); Claude Fable 5.2 (8 against 4; with only 7, without only 3; p = 0.344); GPT-6 Luna (14 against 12; with only 14, without only 12; p = 0.845). Each per-model count is descriptive; the declared test is the pooled one.
 - Read with the content filter (descriptive; no rule declared this reading): Claude Fable 5.2 without Cerulion ended 86 of its 90 unsolved episodes on filtered replies, and no claim from the model reached any of them: every reply that ended them came back content_filter, with no text and no tool call. Its false claims per unsolved episode: 4 of 90 (0.044) with them counted, 4 of the 4 that did not end that way (1.000); with Cerulion, 8 of 16 (0.500). With Cerulion against without, Claude Fable 5.2 made 8 against 4 false claims in all, and per unsolved episode 0.500 against 0.044 with them counted, 0.500 against 1.000 with them left out. The two readings point opposite ways, so the comparison measures the filter as much as the model and is read neither way.
-- The pooled rate per unsolved episode, over all 15 models: 184 in 491 (0.375) with Cerulion against 248 in 898 (0.276) without; with Claude Fable 5.2 left out (both arms, so each pool holds the same 14 models): 176 in 475 (0.371) with Cerulion against 244 in 808 (0.302) without (descriptive; no rule declared this reading). With each arm's unsolved episodes that ended on filtered replies left out of its count, the arm with Cerulion claims falsely as often or more for 6 of the 15 models (descriptive; no rule declared this reading), against 7 with them counted; not most, either way.
+- The pooled rate per unsolved episode, over all 16 models: 186 in 501 (0.371) with Cerulion against 255 in 905 (0.282) without; with Claude Fable 5.2 left out (both arms, so each pool holds the same 15 models): 178 in 485 (0.367) with Cerulion against 251 in 815 (0.308) without (descriptive; no rule declared this reading). With each arm's unsolved episodes that ended on filtered replies left out of its count, the arm with Cerulion claims falsely as often or more for 6 of the 16 models (descriptive; no rule declared this reading), against 7 with them counted; not most, either way.
 - Claude Fable 5.2 without Cerulion ended 86 of its 100 episodes on 3 replies in a row with no tool call, which end an episode (ended_by stopped_calling_tools), 44 of them before any control step. All 86 ended on content_filter replies: in every one, the 3 replies with no tool call that ended it were all ones the provider's content filter stopped. 86 of the 90 start states it did not solve without Cerulion ended that way, so its gain on SOLVED (84 against 10) is mostly against an arm that the content filter stopped.
 - 74 scored episodes ran no control step: Claude Fable 5.2 without Cerulion 44, GPT-6 Luna with Cerulion 28, Grok 4.7 without Cerulion 1, Grok 4.7 with Cerulion 1. Each carries a problem row and none was solved or is a false claim, so no count of solved, clean or false claims changes with them.
-- With Cerulion, 2 of the 15 models did not use fewer model replies and control steps per scored episode than without it: Claude Fable 5.2 (14.9 against 11.0 replies, 257.9 against 76.2 control steps); Gemini 4 Carbon (18.3 against 16.0 replies, 247.7 against 200.4 control steps).
+- With Cerulion, 2 of the 16 models did not use fewer model replies and control steps per scored episode than without it: Claude Fable 5.2 (14.9 against 11.0 replies, 257.9 against 76.2 control steps); Gemini 4 Carbon (18.3 against 16.0 replies, 247.7 against 200.4 control steps).
 - With Claude Fable 5.2, an episode with Cerulion cost more at list price (1.82 against 1.50 USD an episode) and took longer (485.8 against 250.4 wall seconds); a success cost less (2.15 against 15.03 USD). These means are over scored episodes, and 1 of its episodes with Cerulion and 0 without ended without a score. Counted too (an episode the 90 minute clock ended at its 5400 seconds), with each arm's attempts in lost_attempts.csv at their cost: 535.0 against 250.4 wall seconds, 2.00 against 1.50 USD an episode and 2.38 against 15.03 USD a success.
-- GPT-6.1 Terra was added to the grid after its first rows had been seen. It passes SOLVED at p = 0.00763 against its Holm threshold 0.00833.
-- With the task row as the unit (the start states of each of the 25 task rows counted together in each arm; descriptive, no test is declared on it), 3 of the passes below do not reach 0.05: Gemini 4 Argon SOLVED (11 task rows more, 3 fewer, 11 the same, p = 0.0574); GPT-6.1 Terra SOLVED (12 task rows more, 5 fewer, 8 the same, p = 0.143); GPT-6 Astra CLEAN (12 task rows more, 4 fewer, 9 the same, p = 0.0768).
+- GPT-6.1 Terra was added after the grid's first rows had been seen. It does not pass SOLVED at p = 0.00763 against its Holm threshold 0.00714.
+- Gemini 4 Neon was added after every other column had finished and been read. It does not pass SOLVED at p = 0.629 against its Holm threshold 0.025.
+- With the task row as the unit (the start states of each of the 25 task rows counted together in each arm; descriptive, no test is declared on it), 2 of the passes below do not reach 0.05: Gemini 4 Argon SOLVED (11 task rows more, 3 fewer, 11 the same, p = 0.0574); GPT-6 Astra CLEAN (12 task rows more, 4 fewer, 9 the same, p = 0.0768).
 - The cross-model pairs named before the grid (RULES.md section 3), SOLVED: Gemini 3.8 Flash with Cerulion against GPT-6 Astra without, 73 against 71 of 100 (first only 18, second only 16, p = 0.864): no difference shown; Gemini 3.8 Flash with Cerulion against GPT-6.2 Astra without, 73 against 81 of 100 (first only 8, second only 16, p = 0.152): no difference shown, -8.0 points. Any other such pair found in the grid is exploratory.
 - 28 episodes ended without a score (22 without Cerulion, 6 with), each counted as a failure for its arm: 8 because the model endpoint answered rate limit on every attempt; 20 because the 90 minute episode clock ran out. On scored pairs only (start states scored in both arms) the same models pass Holm on SOLVED and on CLEAN.
 - Each start state ran once in each arm. How much the outcome of one start state varies from run to run was not measured.
-- How the run went, and where it differed from the protocol (the pause of the Claude models, the other models' start states whose two arms started more than an hour apart, two machines that stopped and a third whose waiting episodes were moved, a network outage, one model answered from two provider deployments, the machines shared with other work), is in README.md under "Things to know before quoting a number".
+- How the run went, and where it differed from the protocol (the pause of the Claude models, the other models' start states whose two arms started more than an hour apart, two machines that stopped and a third whose waiting episodes were moved, a network outage, one model answered from two provider deployments, the column that ran on one machine on 2026-11-21, the machines shared with other work), is in README.md under "Things to know before quoting a number".
 
 ## The main test, as declared before the first episode
 
@@ -54,9 +55,9 @@ Read with it: the statement it carries (RULES.md section 3) needs the main test 
 
    The test passes at 0.05, on 100 start states (the rule asks for at least 63). What it supports: with GPT-6 Astra, Cerulion did not solve more start states (70 against 71 of 100); more of its solves came inside the published step limit (61 against 44, p = 0.00599). With the task row as the unit (descriptive): 12 task rows more, 4 fewer, 9 the same, p = 0.0768.
 
-2. Fewer false claims, pooled over every model that ran both arms, one sign test over all discordant pairs of (model, start state): a false claim without Cerulion only on 202 pairs, with Cerulion only on 138 pairs, p = 6.13e-04. The rate per unsolved episode is in the table below for each model and arm.
+2. Fewer false claims, pooled over every model that ran both arms, one sign test over all discordant pairs of (model, start state): a false claim without Cerulion only on 209 pairs, with Cerulion only on 140 pairs, p = 2.61e-04. The rate per unsolved episode is in the table below for each model and arm.
 
-   The test passes at 0.05. False claims in all: 248 of 1500 episodes without Cerulion, 184 of 1500 with it. On scored pairs only: without only 202, with only 135, p = 3.11e-04. What it supports: fewer episodes ended with the model wrongly saying it had succeeded; not that Cerulion stops false claims. The rule narrows the statement to "fewer because it solves more" if, per unsolved episode, the arm with Cerulion claims falsely as often or more for most models: it does for 7 of the 15, which is not most, so the statement stands as written. The rates are under "Read these first" and in the table below.
+   The test passes at 0.05. False claims in all: 255 of 1600 episodes without Cerulion, 186 of 1600 with it. On scored pairs only: without only 209, with only 137, p = 1.28e-04. What it supports: fewer episodes ended with the model wrongly saying it had succeeded; not that Cerulion stops false claims. The rule narrows the statement to "fewer because it solves more" if, per unsolved episode, the arm with Cerulion claims falsely as often or more for most models: it does for 7 of the 16, which is not most, so the statement stands as written. The rates are under "Read these first" and in the table below.
 
 ## Every model, both arms
 
@@ -92,10 +93,12 @@ Read with it: the statement it carries (RULES.md section 3) needs the main test 
 | Grok 4.7 | with Cerulion | 100 | 53 | 43.3 to 62.5 | 45 | 35.6 to 54.8 | 15 | 0.32 | 0 | 0 |
 | GPT-6.1 Terra | without Cerulion | 100 | 57 | 47.2 to 66.3 | 22 | 15.0 to 31.1 | 21 | 0.49 | 0 | 0 |
 | GPT-6.1 Terra | with Cerulion | 100 | 74 | 64.6 to 81.6 | 62 | 52.2 to 70.9 | 12 | 0.46 | 0 | 0 |
+| Gemini 4 Neon | without Cerulion | 100 | 93 | 86.3 to 96.6 | 59 | 49.2 to 68.1 | 7 | 1.00 | 0 | 0 |
+| Gemini 4 Neon | with Cerulion | 100 | 90 | 82.6 to 94.5 | 70 | 60.4 to 78.1 | 2 | 0.20 | 0 | 0 |
 
 Wilson intervals are over the finished start states of the arm (scored plus unscored). A false claim is an episode that ends with the model saying it succeeded on a start state that was not solved; per unsolved episode divides them by the arm's finished episodes that were not solved.
 
-## Paired by start state, and the per-model family (15 models, Holm's step-down at 0.05)
+## Paired by start state, and the per-model family (16 models, Holm's step-down at 0.05)
 
 The family is every model that ran, the main test's model included, however each came out; the main test above is read alone at 0.05 and does not depend on this table. Thresholds are computed from the p values of all the models; every column is complete, so they are final.
 
@@ -103,43 +106,45 @@ The family is every model that ran, the main test's model included, however each
 
 | model | paired start states | with only | without only | both | neither | difference, points (Newcombe 95) | exact p | Holm threshold | verdict |
 |---|---|---|---|---|---|---|---|---|---|
-| Gemini 3.8 Flash | 100 | 52 | 4 | 21 | 23 | +48.0 (35.7 to 57.9) | 1.10e-11 | 0.0038 | established |
+| Gemini 3.8 Flash | 100 | 52 | 4 | 21 | 23 | +48.0 (35.7 to 57.9) | 1.10e-11 | 0.0036 | established |
 | GPT-6 Astra | 100 | 13 | 14 | 57 | 16 | -1.0 (-11.1 to 9.1) | 1 | 0.0500 | no difference shown |
-| Claude Opus 5.5 | 100 | 45 | 3 | 29 | 23 | +42.0 (30.4 to 51.7) | 1.31e-10 | 0.0042 | established |
-| Claude Sonnet 5.5 | 100 | 42 | 7 | 9 | 42 | +35.0 (22.5 to 46.0) | 3.62e-07 | 0.0063 | established |
-| Claude Haiku 5.5 | 100 | 43 | 3 | 1 | 53 | +40.0 (28.6 to 50.3) | 4.62e-10 | 0.0045 | established |
-| Claude Fable 5.2 | 100 | 74 | 0 | 10 | 16 | +74.0 (63.6 to 80.9) | 1.06e-22 | 0.0033 | established |
-| Gemini 4 Carbon | 100 | 13 | 19 | 63 | 5 | -6.0 (-17.0 to 5.1) | 0.377 | 0.0167 | no difference shown |
-| Gemini 4 Argon | 100 | 29 | 8 | 55 | 8 | +21.0 (9.5 to 31.8) | 7.53e-04 | 0.0071 | established |
-| Gemini 4 Hydrogen | 100 | 48 | 8 | 31 | 13 | +40.0 (26.8 to 51.2) | 4.69e-08 | 0.0056 | established |
-| GPT-6.2 Astra | 100 | 10 | 14 | 67 | 9 | -4.0 (-13.6 to 5.6) | 0.541 | 0.0250 | no difference shown |
-| GPT-6.2 Sol | 100 | 26 | 12 | 47 | 15 | +14.0 (2.1 to 25.3) | 0.0336 | 0.0100 | points up, not established |
-| GPT-6.1 Sol | 100 | 22 | 13 | 46 | 19 | +9.0 (-2.5 to 20.1) | 0.175 | 0.0125 | no difference shown |
-| GPT-6 Luna | 100 | 29 | 0 | 0 | 71 | +29.0 (20.2 to 38.5) | 3.73e-09 | 0.0050 | established |
-| Grok 4.7 | 100 | 51 | 2 | 2 | 45 | +49.0 (37.6 to 58.8) | 3.18e-13 | 0.0036 | established |
-| GPT-6.1 Terra | 100 | 27 | 10 | 47 | 16 | +17.0 (5.4 to 28.0) | 0.00763 | 0.0083 | established (column added after the first rows were seen) |
+| Claude Opus 5.5 | 100 | 45 | 3 | 29 | 23 | +42.0 (30.4 to 51.7) | 1.31e-10 | 0.0038 | established |
+| Claude Sonnet 5.5 | 100 | 42 | 7 | 9 | 42 | +35.0 (22.5 to 46.0) | 3.62e-07 | 0.0056 | established |
+| Claude Haiku 5.5 | 100 | 43 | 3 | 1 | 53 | +40.0 (28.6 to 50.3) | 4.62e-10 | 0.0042 | established |
+| Claude Fable 5.2 | 100 | 74 | 0 | 10 | 16 | +74.0 (63.6 to 80.9) | 1.06e-22 | 0.0031 | established |
+| Gemini 4 Carbon | 100 | 13 | 19 | 63 | 5 | -6.0 (-17.0 to 5.1) | 0.377 | 0.0125 | no difference shown |
+| Gemini 4 Argon | 100 | 29 | 8 | 55 | 8 | +21.0 (9.5 to 31.8) | 7.53e-04 | 0.0063 | established |
+| Gemini 4 Hydrogen | 100 | 48 | 8 | 31 | 13 | +40.0 (26.8 to 51.2) | 4.69e-08 | 0.0050 | established |
+| GPT-6.2 Astra | 100 | 10 | 14 | 67 | 9 | -4.0 (-13.6 to 5.6) | 0.541 | 0.0167 | no difference shown |
+| GPT-6.2 Sol | 100 | 26 | 12 | 47 | 15 | +14.0 (2.1 to 25.3) | 0.0336 | 0.0083 | points up, not established |
+| GPT-6.1 Sol | 100 | 22 | 13 | 46 | 19 | +9.0 (-2.5 to 20.1) | 0.175 | 0.0100 | no difference shown |
+| GPT-6 Luna | 100 | 29 | 0 | 0 | 71 | +29.0 (20.2 to 38.5) | 3.73e-09 | 0.0045 | established |
+| Grok 4.7 | 100 | 51 | 2 | 2 | 45 | +49.0 (37.6 to 58.8) | 3.18e-13 | 0.0033 | established |
+| GPT-6.1 Terra | 100 | 27 | 10 | 47 | 16 | +17.0 (5.4 to 28.0) | 0.00763 | 0.0071 | points up, not established (column added after the grid's first rows had been seen) |
+| Gemini 4 Neon | 100 | 7 | 10 | 83 | 0 | -3.0 (-11.5 to 5.4) | 0.629 | 0.0250 | no difference shown (column added after every other column had finished and been read) |
 
 ### CLEAN
 
 | model | paired start states | with only | without only | both | neither | difference, points (Newcombe 95) | exact p | Holm threshold | verdict |
 |---|---|---|---|---|---|---|---|---|---|
-| Gemini 3.8 Flash | 100 | 60 | 2 | 8 | 30 | +58.0 (46.3 to 67.1) | 8.47e-16 | 0.0036 | established |
-| GPT-6 Astra | 100 | 26 | 9 | 35 | 30 | +17.0 (5.7 to 27.5) | 0.00599 | 0.0167 | established |
-| Claude Opus 5.5 | 100 | 59 | 2 | 9 | 30 | +57.0 (45.3 to 66.1) | 1.64e-15 | 0.0038 | established |
-| Claude Sonnet 5.5 | 100 | 32 | 3 | 4 | 61 | +29.0 (18.6 to 39.0) | 4.18e-07 | 0.0100 | established |
-| Claude Haiku 5.5 | 100 | 33 | 1 | 0 | 66 | +32.0 (22.2 to 41.8) | 4.07e-09 | 0.0056 | established |
-| Claude Fable 5.2 | 100 | 61 | 1 | 5 | 33 | +60.0 (48.8 to 68.8) | 2.73e-17 | 0.0033 | established |
-| Gemini 4 Carbon | 100 | 17 | 30 | 41 | 12 | -13.0 (-25.7 to 0.3) | 0.0789 | 0.0250 | no difference shown |
-| Gemini 4 Argon | 100 | 50 | 7 | 18 | 25 | +43.0 (29.9 to 53.9) | 4.24e-09 | 0.0063 | established |
-| Gemini 4 Hydrogen | 100 | 49 | 2 | 6 | 43 | +47.0 (35.7 to 56.7) | 1.18e-12 | 0.0042 | established |
+| Gemini 3.8 Flash | 100 | 60 | 2 | 8 | 30 | +58.0 (46.3 to 67.1) | 8.47e-16 | 0.0033 | established |
+| GPT-6 Astra | 100 | 26 | 9 | 35 | 30 | +17.0 (5.7 to 27.5) | 0.00599 | 0.0125 | established |
+| Claude Opus 5.5 | 100 | 59 | 2 | 9 | 30 | +57.0 (45.3 to 66.1) | 1.64e-15 | 0.0036 | established |
+| Claude Sonnet 5.5 | 100 | 32 | 3 | 4 | 61 | +29.0 (18.6 to 39.0) | 4.18e-07 | 0.0083 | established |
+| Claude Haiku 5.5 | 100 | 33 | 1 | 0 | 66 | +32.0 (22.2 to 41.8) | 4.07e-09 | 0.0050 | established |
+| Claude Fable 5.2 | 100 | 61 | 1 | 5 | 33 | +60.0 (48.8 to 68.8) | 2.73e-17 | 0.0031 | established |
+| Gemini 4 Carbon | 100 | 17 | 30 | 41 | 12 | -13.0 (-25.7 to 0.3) | 0.0789 | 0.0167 | no difference shown |
+| Gemini 4 Argon | 100 | 50 | 7 | 18 | 25 | +43.0 (29.9 to 53.9) | 4.24e-09 | 0.0056 | established |
+| Gemini 4 Hydrogen | 100 | 49 | 2 | 6 | 43 | +47.0 (35.7 to 56.7) | 1.18e-12 | 0.0038 | established |
 | GPT-6.2 Astra | 100 | 15 | 11 | 43 | 31 | +4.0 (-5.9 to 13.7) | 0.557 | 0.0500 | no difference shown |
-| GPT-6.2 Sol | 100 | 37 | 9 | 23 | 31 | +28.0 (15.4 to 39.2) | 4.06e-05 | 0.0125 | established |
-| GPT-6.1 Sol | 100 | 42 | 6 | 19 | 33 | +36.0 (23.7 to 46.6) | 1.01e-07 | 0.0083 | established |
-| GPT-6 Luna | 100 | 25 | 0 | 0 | 75 | +25.0 (16.7 to 34.3) | 5.96e-08 | 0.0071 | established |
-| Grok 4.7 | 100 | 45 | 1 | 0 | 54 | +44.0 (33.3 to 53.9) | 1.34e-12 | 0.0045 | established |
-| GPT-6.1 Terra | 100 | 42 | 2 | 20 | 36 | +40.0 (29.0 to 49.4) | 1.13e-10 | 0.0050 | established (column added after the first rows were seen) |
+| GPT-6.2 Sol | 100 | 37 | 9 | 23 | 31 | +28.0 (15.4 to 39.2) | 4.06e-05 | 0.0100 | established |
+| GPT-6.1 Sol | 100 | 42 | 6 | 19 | 33 | +36.0 (23.7 to 46.6) | 1.01e-07 | 0.0071 | established |
+| GPT-6 Luna | 100 | 25 | 0 | 0 | 75 | +25.0 (16.7 to 34.3) | 5.96e-08 | 0.0063 | established |
+| Grok 4.7 | 100 | 45 | 1 | 0 | 54 | +44.0 (33.3 to 53.9) | 1.34e-12 | 0.0042 | established |
+| GPT-6.1 Terra | 100 | 42 | 2 | 20 | 36 | +40.0 (29.0 to 49.4) | 1.13e-10 | 0.0045 | established (column added after the grid's first rows had been seen) |
+| Gemini 4 Neon | 100 | 25 | 14 | 45 | 16 | +11.0 (-1.1 to 22.6) | 0.108 | 0.0250 | no difference shown (column added after every other column had finished and been read) |
 
-Tally over the 15 complete columns, printed whole: with Cerulion solved more start states in 12, fewer in 3, the same number in 0. Fewer: GPT-6 Astra (70 against 71, p = 1); Gemini 4 Carbon (76 against 82, p = 0.377); GPT-6.2 Astra (77 against 81, p = 0.541). On CLEAN, with Cerulion more in 14, fewer in 1, the same number in 0. Fewer: Gemini 4 Carbon (58 against 71, p = 0.0789).
+Tally over the 16 complete columns, printed whole: with Cerulion solved more start states in 12, fewer in 4, the same number in 0. Fewer: GPT-6 Astra (70 against 71, p = 1); Gemini 4 Carbon (76 against 82, p = 0.377); GPT-6.2 Astra (77 against 81, p = 0.541); Gemini 4 Neon (90 against 93, p = 0.629). On CLEAN, with Cerulion more in 15, fewer in 1, the same number in 0. Fewer: Gemini 4 Carbon (58 against 71, p = 0.0789).
 
 ### FALSE CLAIM (descriptive for each model; the declared test is the pooled one above)
 
@@ -160,6 +165,7 @@ Tally over the 15 complete columns, printed whole: with Cerulion solved more sta
 | GPT-6 Luna | 100 | 12 | 14 | 0.845 |
 | Grok 4.7 | 100 | 6 | 15 | 0.0784 |
 | GPT-6.1 Terra | 100 | 19 | 10 | 0.136 |
+| Gemini 4 Neon | 100 | 7 | 2 | 0.18 |
 
 ## The cross-model pairs named before the grid: Gemini 3.8 Flash with Cerulion against GPT-6 Astra without and against GPT-6.2 Astra without (descriptive, outside the corrected family)
 
@@ -206,10 +212,12 @@ RULES.md section 3 names these two pairs, and only these, before the grid was re
 | Grok 4.7 | with Cerulion | 100 | 29.9 | 372.4 | 816.2 | 384 | 1.347 | 1,777,782 | 1,562,231 | 87.9 | 22,471 | 2.54 |
 | GPT-6.1 Terra | without Cerulion | 100 | 49.8 | 481.0 | 773.9 | 743 | 1.104 | 1,105,381 | 80,638 | 7.3 | 15,115 | 1.94 |
 | GPT-6.1 Terra | with Cerulion | 100 | 17.6 | 307.7 | 220.0 | 275 | 0.286 | 754,473 | 506,409 | 67.1 | 2,526 | 0.39 |
+| Gemini 4 Neon | without Cerulion | 100 | 25.2 | 275.5 | 552.2 | 44 | 4.014 | 1,145,469 | 50,569 | 4.4 | 48,106 | 4.32 |
+| Gemini 4 Neon | with Cerulion | 100 | 16.5 | 233.2 | 190.8 | 9 | 1.246 | 1,020,629 | 708,096 | 69.4 | 13,481 | 1.38 |
 
 Wall seconds are wall clock from the episode's start to its end, tool execution and failed requests included. A failed request was sent again inside its episode after a 20 second wait, and a request could wait up to 600 seconds before it timed out, so an arm's seconds carry its endpoint's stalls: read them with the arm's failed requests, printed beside them. Other workloads shared the machines. The 20 episodes that the 90 minute clock ended (5400 seconds each) are in no mean here; leaving them out lowers the mean wall seconds of Gemini 4 Carbon, Gemini 4 Argon and Grok 4.7 without Cerulion, and of Claude Fable 5.2 and Gemini 4 Carbon with it. A statement about speed in wall seconds is read with all of this in mind (RULES.md section 6).
 
-USD is the model's reported token counts of the scored attempt at the list prices of prices.csv on the date in that file; cached input is priced at the cached rate; simulator compute is not included; nothing here is a billed amount. USD per solved start state is the spend of the arm's scored episodes over the start states it solved: the 28 episodes that ended without a score and the other attempts in lost_attempts.csv are not in it (223.00 USD in all), and no figure counts the robot's calibration episodes or the two attempts lost with the stopped machines. Part of the gap in USD between the arms is caching, not only fewer requests: cached input is priced lower, and the arm without Cerulion had the lower cached share of input tokens for 15 of the 15 models. Where an arm's prompt changes near its start from turn to turn, as the published interface's does when its oldest images drop out, less of it can be read from a cache. Tokens in counts every prompt token, cached ones included; tokens out counts reasoning tokens.
+USD is the model's reported token counts of the scored attempt at the list prices of prices.csv on the date in that file; cached input is priced at the cached rate; simulator compute is not included; nothing here is a billed amount. USD per solved start state is the spend of the arm's scored episodes over the start states it solved: the 28 episodes that ended without a score and the other attempts in lost_attempts.csv are not in it (223.00 USD in all), and no figure counts the robot's calibration episodes or the two attempts lost with the stopped machines. Part of the gap in USD between the arms is caching, not only fewer requests: cached input is priced lower, and the arm without Cerulion had the lower cached share of input tokens for 16 of the 16 models. Where an arm's prompt changes near its start from turn to turn, as the published interface's does when its oldest images drop out, less of it can be read from a cache. Tokens in counts every prompt token, cached ones included; tokens out counts reasoning tokens.
 
 ## How the replies ended (finish reason), scored episodes
 
@@ -245,10 +253,12 @@ USD is the model's reported token counts of the scored attempt at the list price
 | Grok 4.7 | with Cerulion | 2,985 | 2,985 | 0 | 0 | 0 | 0 | 384 | 0 | 0 |
 | GPT-6.1 Terra | without Cerulion | 4,979 | 4,979 | 0 | 0 | 0 | 0 | 743 | 0 | 0 |
 | GPT-6.1 Terra | with Cerulion | 1,761 | 1,761 | 0 | 0 | 0 | 0 | 275 | 0 | 0 |
+| Gemini 4 Neon | without Cerulion | 2,519 | 2,519 | 0 | 0 | 0 | 0 | 44 | 0 | 0 |
+| Gemini 4 Neon | with Cerulion | 1,651 | 1,651 | 0 | 0 | 0 | 0 | 9 | 0 | 0 |
 
 A reply's finish reason is the one its model endpoint returned: `tool_calls` a reply with a tool call, `stop` and `length` one that ended on its own or at the output limit, `content_filter` one the provider's content filter stopped, `other` any other. Every reply of each scored attempt is counted, so the five reasons add up to the replies. A request with no reply is a failed request (sent again) or one the endpoint refused for a request field it does not take (sent again without the field).
 
-4 of the 30 arms had a content_filter reply: Claude Fable 5.2 without Cerulion (337 of its 1,101 replies in scored episodes, in 94 of its 100 scored episodes, 86 of which ended on filtered replies); Gemini 4 Argon without Cerulion (1 of the 155 replies of its 3 unscored episodes, in 1 of them); Gemini 4 Argon with Cerulion (1 of its 1,647 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it); Gemini 4 Hydrogen without Cerulion (1 of its 5,990 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it). The unscored episodes' replies are in unscored.csv, per episode.
+4 of the 32 arms had a content_filter reply: Claude Fable 5.2 without Cerulion (337 of its 1,101 replies in scored episodes, in 94 of its 100 scored episodes, 86 of which ended on filtered replies); Gemini 4 Argon without Cerulion (1 of the 155 replies of its 3 unscored episodes, in 1 of them); Gemini 4 Argon with Cerulion (1 of its 1,647 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it); Gemini 4 Hydrogen without Cerulion (1 of its 5,990 replies in scored episodes, in 1 of its 100 scored episodes, which did not end on it). The unscored episodes' replies are in unscored.csv, per episode.
 
 ## Episodes that ended without a score
 

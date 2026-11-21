@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `cerulion rcp bench` with a model name that holds `gemini-4-neon` prints, before the run, what an episode of each setup took in the results package's measured run of Gemini 4 Neon, and prices each episode at that model's list price, read on 2026-11-21. 2.1.0 printed "no measured run of this model" and gave no list price for it.
+
+### Fixed
+- The cost line of `cerulion rcp bench`, and the `price_table` date that `summary.json` records, name the date the model's own price row was read. 2.1.0 gave the table's 2026-11-17 for every model, also for `gpt-6.1-terra`, whose row was read on 2026-11-18.
+
 ## [2.1.0] - 2026-11-21
 
 Semantic Versioning covers the graph YAML format, the `cerulion` command line and the node macros of `cerulion_macros`. The lower-level Rust API of `cerulion_core` is not covered by it yet, and neither are the library crates behind the command line, the daemons and the Android runtime; this release changes public items in `cerulion_core`, `cerulion_cli_engine` and `cerulion_android`, so Rust code that calls them directly may need edits.
