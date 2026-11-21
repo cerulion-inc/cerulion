@@ -41304,6 +41304,339 @@ fn a_crafted_cross_rank_block_edge_is_refused_at_the_rank_build_never_verified()
     // pins that surface.
 }
 
+// ---------------------------------------------------------------------------
+// Split `block` edges no credit word can count
+// ---------------------------------------------------------------------------
+//
+// A `block` edge split across ranks is counted live by one cross-process
+// credit word, minted only for a topic with ONE in-graph producer and an input
+// with no `block_timeout_ms`. The arms below split a `block` edge that falls
+// outside that rule: the shared bus, which `left` and `right` both write, and
+// `far.gate` with `block_timeout_ms`. Each bag is written by `write_sb_bag`
+// from a consistent reference run of the same graph in ONE process, so frames,
+// fires and reads agree; the rank split is what is crafted, plus, for the
+// invalid-graph arm, one key of the graph the bag embeds.
+
+/// [`sb_yaml`] with its one `from` replaced by `to`.
+fn sb_yaml_edit(from: &str, to: &str) -> String {
+    let base = sb_yaml();
+    assert_eq!(
+        base.matches(from).count(),
+        1,
+        "the fixture graph carries {from:?} exactly once"
+    );
+    base.replacen(from, to, 1)
+}
+
+/// The shared-bus graph with `backpressure: block` on `far.bus`: a `block`
+/// edge on the topic both `left` and `right` write, set by the graph.
+fn sb_bus_block_yaml() -> String {
+    sb_yaml_edit(
+        "        source: /sb/shared_bus\n      - name: gate\n",
+        "        source: /sb/shared_bus\n        backpressure: block\n      - name: gate\n",
+    )
+}
+
+/// The shared-bus graph with `key` added to `far.gate`, the `block` input
+/// `gate_src` alone writes.
+fn sb_gate_key_yaml(key: &str) -> String {
+    sb_yaml_edit(
+        "        source: gate_src/bus\n",
+        &format!("        source: gate_src/bus\n        {key}\n"),
+    )
+}
+
+/// [`SharedBusFarNode`] whose trigger port DECLARES `block`, so the `block`
+/// edge on the shared bus comes from the node and not from a graph key.
+#[cerulion_node]
+#[derive(Default)]
+struct SharedBusBlockFarNode {
+    #[input(trigger, backpressure = block)]
+    bus: Vector3,
+    #[input(backpressure = block)]
+    gate: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl SharedBusBlockFarNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.bus.x;
+        self.out.y = self.gate.x;
+        Ok(())
+    }
+}
+
+/// [`sb_factories`] with [`SharedBusBlockFarNode`] in `far`'s place.
+fn sb_block_far_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("left", Box::new(SharedBusLeftNodeEntry::new())),
+        ("right", Box::new(SharedBusRightNodeEntry::new())),
+        ("local", Box::new(RelayNodeEntry::new())),
+        ("gate_src", Box::new(SharedBusLeftNodeEntry::new())),
+        ("far", Box::new(SharedBusBlockFarNodeEntry::new())),
+    ])
+}
+
+/// `far` alone on rank 1: its `gate` input reads `gate_src` across ranks.
+fn sb_far_alone_rank_of(id: &str) -> u32 {
+    u32::from(id == "far")
+}
+
+/// The partial `--report` an aborted run writes, as `(failed_at_rank, the
+/// ranks it executed)`. The report leaves `rank_execution` out when no rank
+/// ran, which reads as no ranks here.
+fn sb_partial_report(path: &std::path::Path) -> (serde_json::Value, Vec<u64>) {
+    let json: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(path).expect("the aborted run wrote its partial report"),
+    )
+    .expect("the partial report is JSON");
+    let ranks = json["rank_execution"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .map(|r| r["rank"].as_u64().expect("each entry names its rank"))
+                .collect()
+        })
+        .unwrap_or_default();
+    (json["aborted"]["failed_at_rank"].clone(), ranks)
+}
+
+/// MEASURED on the base: `far.bus` set to `block` by the embedded graph,
+/// with BOTH shared-bus writers on rank 0 and `far` on rank 1. Rank 0 runs,
+/// and rank 1's build refuses `far.bus` as a `block` input with no in-graph
+/// producer: exit 5, after a partial report for rank 0.
+#[test]
+#[serial]
+fn a_split_block_edge_from_two_foreign_writers_exits_5_at_the_rank_build() {
+    let rec = record_reference_impl(
+        &sb_bus_block_yaml(),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_two_foreign.mcap");
+    let mp = write_sb_bag(rec, &bag, sb_rank_of, 2);
+    assert_eq!(
+        mp.tables[1],
+        ["gate_src".to_string(), "far".to_string()],
+        "rank 1 holds the consumer and no writer of the bus"
+    );
+    let report = dir.path().join("report.json");
+    let err =
+        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'far.bus' reads topic '/sb/shared_bus', which has no \
+             in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(
+        sb_partial_report(&report),
+        (serde_json::json!(1), vec![0]),
+        "rank 0 ran before rank 1 refused"
+    );
+}
+
+/// MEASURED on the base: the shared bus with ONE writer in `far`'s rank and
+/// one in another, `block` declared by `far`'s node. Rank 1 builds, because
+/// `right` is a local producer, so its credit word counts `right`'s frames
+/// only, and the run gets a judged verdict: exit 1, `far`'s first output
+/// frame differs. `far` reads the bus over two connections (`right` live,
+/// `left` from the bag), the drain-order residual
+/// `a_split_bus_verifies_per_writer_while_a_two_connection_consumer_cannot`
+/// pins for the `drop_oldest` twin of this shape.
+#[test]
+#[serial]
+fn a_split_block_edge_with_one_local_writer_builds_and_is_judged() {
+    let rec = record_reference_impl(
+        sb_yaml(),
+        sb_block_far_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_bus_block_mixed.mcap");
+    let mp = write_sb_bag(rec, &bag, sb_split_rank_of, 2);
+    assert_eq!(
+        mp.tables[1],
+        [
+            "right".to_string(),
+            "gate_src".to_string(),
+            "far".to_string()
+        ],
+        "rank 1 holds the consumer and one writer of the bus"
+    );
+    let outcome = replay(&bag, sb_block_far_factories, None, None)
+        .expect("the mixed shape builds and replays");
+    assert_eq!(resim_exit(&outcome, true), 1, "a frame-content divergence");
+    assert_eq!(
+        outcome
+            .violations
+            .iter()
+            .map(|v| format!("{}: {}", v.topic, v.detail))
+            .collect::<Vec<_>>(),
+        vec![
+            "/sb/far/out: frame 0 on '/sb/far/out' differs at x: recorded 1.0, replayed 1001.0 \
+             (recorded 64 B, replayed 64 B)"
+                .to_string()
+        ]
+    );
+    assert!(outcome.trace_divergence.is_none(), "the schedule matched");
+    assert!(outcome.read_log_verdict.is_none(), "no read-log verdict");
+    assert_eq!(
+        (outcome.topics_checked, outcome.topics_passed),
+        (4, 3),
+        "four topics checked, every one but `far`'s output passed"
+    );
+}
+
+/// MEASURED on the base: `far.gate`, which `gate_src` alone writes, set
+/// `block_timeout_ms` by the embedded graph, and split from `gate_src`. Rank
+/// 1's build refuses the input as a `block` input with no in-graph producer
+/// before it reads the timeout: exit 5, after a partial report for rank 0.
+#[test]
+#[serial]
+fn a_split_block_edge_with_a_block_timeout_exits_5_at_the_rank_build() {
+    let rec = record_reference_impl(
+        &sb_gate_key_yaml("block_timeout_ms: 100"),
+        sb_factories,
+        &[],
+        &sb_deltas(),
+        16,
+        true,
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_timeout_split.mcap");
+    let mp = write_sb_bag(rec, &bag, sb_far_alone_rank_of, 2);
+    assert_eq!(mp.tables[1], ["far".to_string()], "far alone on rank 1");
+    let report = dir.path().join("report.json");
+    let err =
+        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: block input 'far.gate' reads topic '/sb/gate_src/bus', which has \
+             no in-graph producer; "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(
+        sb_partial_report(&report),
+        (serde_json::json!(1), vec![0]),
+        "rank 0 ran before rank 1 refused"
+    );
+}
+
+/// MEASURED on the base: a two-rank bag whose embedded graph declares
+/// `depth: 65`, above the maximum of 64, on `far.gate`, an edge both of whose
+/// ends rank 1 holds. The reference run used the valid graph; only the
+/// embedded graph's key is changed. Rank 1's build refuses the depth: exit 5,
+/// after a partial report for rank 0.
+#[test]
+#[serial]
+fn a_several_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_the_rank_build() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = sb_gate_key_yaml("depth: 65");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_depth65.mcap");
+    write_sb_bag(rec, &bag, sb_rank_of, 2);
+    let report = dir.path().join("report.json");
+    let err =
+        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the rank build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
+             validation error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; \
+             the maximum queue depth is 64 "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(
+        sb_partial_report(&report),
+        (serde_json::json!(1), vec![0]),
+        "rank 0 ran before rank 1 refused"
+    );
+}
+
+/// The same `depth: 65` graph in a ONE-rank free-run bag: one pass builds the
+/// whole graph, and its build refuses the depth, exit 5. A one-rank bag has
+/// no rank split to classify.
+#[test]
+#[serial]
+fn a_one_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_its_build() {
+    let mut rec = sb_recording();
+    rec.graph_yaml = sb_gate_key_yaml("depth: 65");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("sb_gate_depth65_one_rank.mcap");
+    let labels = sb_labels(&rec);
+    write_multi_rank_bag_impl(
+        &rec,
+        |_| 0,
+        1,
+        MpLayout::PerStepBatches,
+        &bag,
+        |_| {},
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::FreeRun,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture {
+            publishers: Some(sb_publishers(&rec)),
+            labels: &labels,
+        },
+        None,
+        &[],
+    );
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, sb_factories, None, Some(report.clone()))
+        .expect_err("the one pass cannot be built");
+    assert!(
+        matches!(err, ReplayError::Internal { .. }),
+        "the build's refusal, exit 5: {err:?}"
+    );
+    assert!(
+        err.to_string().starts_with(
+            "internal replay error: failed to build the replay graph runtime for rank 0: Graph \
+             validation error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; \
+             the maximum queue depth is 64 "
+        ),
+        "{err}"
+    );
+    assert_eq!(err.exit_code(), 5);
+    assert_eq!(
+        sb_partial_report(&report),
+        (serde_json::json!(0), Vec::<u64>::new()),
+        "the one pass refused at its build, so no rank ran"
+    );
+}
+
 /// The fixture's recorded bus interleave, per step, as `(saw a `left` frame,
 /// saw a `right` frame AFTER it)` — the premise the slot path needs.
 ///
