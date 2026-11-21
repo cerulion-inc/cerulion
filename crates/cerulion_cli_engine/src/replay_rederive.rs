@@ -755,8 +755,12 @@ pub enum SlotRecord {
     /// topic, reports the topic lossy (frames lost, a wire-sequence anomaly or
     /// a reset sequence baseline) or written by several publishers (declared
     /// or observed), or any frame drained and never written; or the graph lists
-    /// the topic in `multi_publisher_topics`. Or the consumer's input sets
-    /// `block_timeout_ms`, whose release forgives the slot's frames with no
+    /// the topic in `multi_publisher_topics`. Or the bag does not pin the
+    /// input's `block` policy and depth: its `recorder.json` names the input's
+    /// queue with another policy or depth than the replayed build gives it, or,
+    /// on a bag that names no queues, its graph does not set both
+    /// `backpressure: block` and `depth:` for the input. Or the consumer's input
+    /// sets `block_timeout_ms`, whose release forgives the slot's frames with no
     /// record; or the bag's fire records do not put the consumer on a later
     /// level than the producer (the same level, an earlier one, either node at
     /// more than one level, or either with no recorded fire), so its read can
@@ -785,15 +789,35 @@ pub enum BodyDrain {
 /// with no read of the input recorded reached it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReadsBefore {
-    /// The inputs a `#[cerulion_node]` consumer views before the edge's
-    /// input. Its generated tick views each input once per fire, in
-    /// declaration order (an accumulate port is served from the node's own
-    /// buffer, not viewed), and the first that serves nothing ends the tick
-    /// before any later input is read.
-    Known(Vec<String>),
+    /// The inputs a consumer whose info says it needs a publisher for every
+    /// output it declares views before the edge's input, in declaration order.
+    /// The `#[cerulion_node]` macro sets that flag, and its generated tick
+    /// views each input once per fire in that order (an accumulate port is
+    /// served from the node's own buffer, not viewed), the first that serves
+    /// nothing ending the tick before any later input is read. A raw FFI info
+    /// block or a hand-written entry that sets the flag is read the same way.
+    Known(Vec<ViewedInput>),
     /// Replay cannot know which inputs the consumer's tick reads, or in what
-    /// order: a hand-written `NodeEntry`, or a raw FFI, Python or plugin node.
+    /// order: its info does not set the flag.
     Unknown,
+}
+
+/// One input a consumer's tick views before a `block` input
+/// ([`ReadsBefore::Known`]), and how the tick reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewedInput {
+    /// An input that wakes the node: its data trigger input, a Sync node's
+    /// trigger-marked inputs, or every input of a node with no trigger
+    /// policy. A fire can pass it with no body read recorded (the frame a
+    /// single-subscriber drain froze), and a body read of it that served
+    /// nothing ends that fire: a `NoFrame`, or a `Decimated` read, whose
+    /// `sample(N)` gate dropped the frame it popped.
+    Trigger(String),
+    /// Any other input, frozen at the step's boundary or read live. A fire
+    /// passes it only on a frame a body read of it at that step records, and a
+    /// `NoFrame` ends the fire. A `Decimated` read does not: a frozen input
+    /// still serves the frame it held.
+    Context(String),
 }
 
 /// The `block` edges that MAY hold a node's fire after its trigger drain
@@ -3876,8 +3900,9 @@ struct SlotBound {
     /// The recorded frames' stamps, ascending, and how the consumer's body
     /// reads drain them; `None` once nothing bounds the slot: from the step
     /// after a truncated read of the input, a drain whose site the read log
-    /// does not say, or a consumer fire before any body read of the input is
-    /// recorded, the slot allows for none. A resumed pass before the consumer
+    /// does not say, or, before any body read of the input is recorded, a
+    /// consumer fire the bag does not show ended before the input, the slot
+    /// allows for none. A resumed pass before the consumer
     /// first reads its queue empty, and a latest-value input after a consumer
     /// fire that can hide a drain of it, leave `frames` set and `queued`
     /// unknown.
@@ -4003,23 +4028,28 @@ impl SlotBound {
             .iter()
             .filter(|(id, _)| *id == self.consumer_node)
             .count();
-        let consumer_fired = consumer_fires > 0;
-        // A latest-value `block` input is read only by its consumer's tick,
-        // which records the read unless it errors, and an erroring read can
-        // have popped first. So a consumer fire with no read of it recorded
-        // either ended before the input or hid a drain the bag lost. A fire
-        // the bag shows ended at an input the tick reads earlier drained
-        // nothing (`fires_ended_before`); every other one leaves the slot
-        // unknown. Such a drain follows the producer's checks of this step,
-        // so the step keeps its count, and the slot is unknown from the next
-        // step until the consumer next reads it. A body read of the input
-        // empties the slot whatever such a drain took, and a FIFO input
-        // drains only at the reads its consumer's body makes, so no read of
-        // it there is no drain.
-        let drain_unrecorded = drain == BodyDrain::ToEmpty
-            && !body_read
+        // A `block` input is read only by its consumer's tick, which records
+        // the read unless it errors, and an erroring read can have popped
+        // first. So a consumer fire with no read of it recorded either ended
+        // before the input or hid a drain the bag lost. A fire the bag shows
+        // ended at an input the tick reads earlier drained nothing
+        // (`fires_ended_before`); any other one is unexplained.
+        let unexplained = !body_read
             && consumer_fires
-                > fires_ended_before(&self.reads_before, &self.consumer_node, reads, trust);
+                > fires_ended_before(
+                    &self.reads_before,
+                    &self.consumer_node,
+                    consumer_fires,
+                    reads,
+                    trust,
+                );
+        // On a latest-value input such a drain follows the producer's checks
+        // of this step, so the step keeps its count, and the slot is unknown
+        // from the next step until the consumer next reads it. A body read of
+        // the input empties the slot whatever such a drain took, and a FIFO
+        // input drains only at the reads its consumer's body makes, so no read
+        // of it there is no drain.
+        let drain_unrecorded = drain == BodyDrain::ToEmpty && unexplained;
         if let Some(q) = self.queued {
             let available = q.saturating_add(sent);
             if clock_continues {
@@ -4049,41 +4079,62 @@ impl SlotBound {
         } else if !clock_continues {
             self.clock_frames_void = false;
         }
-        if lost || (consumer_fired && !self.read_seen) {
+        // Before the bag records any body read of the input, an unexplained
+        // fire is one the read log may not record the input's reads of at
+        // all, so the slot allows for none.
+        if lost || (unexplained && !self.read_seen) {
             self.frames = None;
         }
         hold
     }
 }
 
-/// PURE: how many of a `block` consumer's fires at a step the bag shows ended
-/// before its tick reached the input: one per believed body `NoFrame` the
-/// step records of an input `before` names. Each such input is read once per
-/// fire through a read that records each call, so its `NoFrame` is a fire that
-/// ended there, unless the input is frozen at the step's boundary: then its
-/// one record is served to every fire of the step, and all of them end there.
-/// So where the count reaches the step's fires, none of them read the input.
-/// A consumer whose tick replay cannot know shows none. `reads` holds one
-/// entry per read, a folded run expanded.
+/// PURE: how many of a `block` consumer's `fires` at a step the bag shows
+/// ended before its tick reached the input, from the step's `reads` of the
+/// inputs `before` names ([`ViewedInput`]). A believed body read of one that
+/// served nothing ends the fire that made it: a `NoFrame`, and on a trigger
+/// input a `Decimated` read too. A fire reads each such input once, through a
+/// read that records each call, or a context input frozen at the step's
+/// boundary serves its one record to every fire of the step. So a context
+/// input whose only record at the step is a believed body `NoFrame` ended
+/// every fire there (all `fires`), and otherwise each empty read is one fire
+/// that ended there. Where the count reaches the step's fires, none of them
+/// read the input. A consumer whose tick replay cannot know shows none.
+/// `reads` holds one entry per read, a folded run expanded.
 fn fires_ended_before(
     before: &ReadsBefore,
     consumer: &str,
+    fires: usize,
     reads: &[RecordedRead],
     trust: RoleTrust,
 ) -> usize {
     let ReadsBefore::Known(inputs) = before else {
         return 0;
     };
-    reads
-        .iter()
-        .filter(|r| {
-            r.node_id == consumer
-                && r.kind == ReadOutcomeKind::NoFrame
-                && believed_role(r, trust)
-                && r.role == ReadSiteRole::Body
-                && inputs.contains(&r.input)
-        })
-        .count()
+    let mut ended = 0;
+    for viewed in inputs {
+        let (name, trigger) = match viewed {
+            ViewedInput::Trigger(name) => (name, true),
+            ViewedInput::Context(name) => (name, false),
+        };
+        let mut recorded = 0;
+        let mut empty = 0;
+        for read in reads.iter().filter(|r| {
+            r.node_id == consumer && r.input == *name && r.kind != ReadOutcomeKind::Producer
+        }) {
+            recorded += 1;
+            let served_nothing = read.kind == ReadOutcomeKind::NoFrame
+                || (trigger && read.kind == ReadOutcomeKind::Decimated);
+            if served_nothing && believed_role(read, trust) && read.role == ReadSiteRole::Body {
+                empty += 1;
+            }
+        }
+        if !trigger && recorded == 1 && empty == 1 {
+            return fires;
+        }
+        ended += empty;
+    }
+    ended
 }
 
 /// What a node's pre-fire check can have done at a step ([`FifoDeferral::step`]).
@@ -4140,10 +4191,12 @@ pub(crate) struct StepDeferral {
 ///   the edge explains no step: an unaccounted record
 ///   ([`SlotRecord::Unaccounted`], which an input that sets
 ///   `block_timeout_ms` always gives, since its release forgives the slot's
-///   frames with no record); on the consumer's input, from the step
+///   frames with no record, and one whose `block` policy and depth the bag does
+///   not pin); on the consumer's input, from the step
 ///   after a truncated read stream's marker, a drain whose site the read log
-///   does not say, or a consumer fire before any body read of the input is
-///   recorded; and on a latest-value input, from the step after a consumer
+///   does not say, or, before any body read of the input is recorded, a
+///   consumer fire the bag does not show ended before the input; and on a
+///   latest-value input, from the step after a consumer
 ///   fire that can hide a drain of it through the step at which the consumer
 ///   next reads it. Such an input is read only by its consumer's tick, which
 ///   records the read unless it errors, and a read that errors can have
@@ -10240,7 +10293,12 @@ mod tests {
             drain: BodyDrain::ToEmpty,
         };
         BlockHoldEdges::new(vec![BlockHoldEdge {
-            reads_before: ReadsBefore::Known(inputs(before)),
+            reads_before: ReadsBefore::Known(
+                before
+                    .iter()
+                    .map(|name| ViewedInput::Context((*name).to_string()))
+                    .collect(),
+            ),
             ..slot("sink", depth, counted)
         }])
     }
@@ -10381,6 +10439,235 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    /// The relay's frames as the slot `sink.inp` at `depth` counts them,
+    /// drained the way `drain` says, on a consumer whose tick views the
+    /// trigger inputs `triggers` and the other inputs `contexts` before `inp`.
+    fn sink_slot_viewing(
+        depth: u64,
+        steps: &[RecordedStep],
+        drain: BodyDrain,
+        triggers: &[&str],
+        contexts: &[&str],
+    ) -> BlockHoldEdges {
+        let SlotRecord::Counted { frame_stamps, .. } = sent_by(steps, &["relay"]) else {
+            unreachable!("sent_by counts")
+        };
+        let viewed = triggers
+            .iter()
+            .map(|name| ViewedInput::Trigger((*name).to_string()))
+            .chain(
+                contexts
+                    .iter()
+                    .map(|name| ViewedInput::Context((*name).to_string())),
+            )
+            .collect();
+        BlockHoldEdges::new(vec![BlockHoldEdge {
+            reads_before: ReadsBefore::Known(viewed),
+            ..slot(
+                "sink",
+                depth,
+                SlotRecord::Counted {
+                    frame_stamps,
+                    drain,
+                },
+            )
+        }])
+    }
+
+    /// One step on a 5 ms step of the startup vectors: the relay's `(pops,
+    /// fires)`, the sink's fires and body pops of `inp`, and the sink's other
+    /// reads.
+    fn startup_step(
+        n: u64,
+        relay: (u32, u32),
+        sink: (u32, u32),
+        reads: Vec<RecordedRead>,
+    ) -> RecordedStep {
+        let mut step = fifo_step(
+            n,
+            n * 5_000,
+            &[("relay", relay.0, relay.1, 0), ("sink", 0, sink.0, sink.1)],
+        );
+        step.reads.extend(reads);
+        step
+    }
+
+    /// The tick of a consumer whose context input has had no delivery yet
+    /// ends at that input, which a step-boundary snapshot records as one body
+    /// `NoFrame` served to every fire of the step, so a first fire that ends
+    /// there leaves the slot counted. Depth 1, the sink's tick viewing its
+    /// trigger `s` and its context `cfg` before `inp`: the relay fires one
+    /// frame at step 0 and is held from step 1, the sink fires at every step,
+    /// and its tick ends at `cfg` at steps 0 to 2 (`NoFrame`, one record a
+    /// step, two fires at step 1). At step 3 `cfg` serves and the sink takes
+    /// the frame, and at step 4 the relay fires the frame it held and holds
+    /// the next. Every pop left unfired is the hold and the pass reads clean.
+    /// A relay that pops at step 4 and fires nothing, with the slot empty,
+    /// is the finding; so is the step after a first fire whose `cfg` read
+    /// served and whose `inp` read is not recorded, a read log that never
+    /// records the input; and so is a step after two fires that read the
+    /// slot's input past a `block` input that was empty for one of them.
+    #[test]
+    fn a_first_fire_that_ends_at_a_context_input_before_its_first_delivery_keeps_the_slot() {
+        let cfg = |kind, popped| sink_read("cfg", kind, popped, ReadSiteRole::Body);
+        let rows = |cfg0: RecordedRead, last_relay: (u32, u32)| {
+            vec![
+                startup_step(0, (1, 1), (1, 0), vec![cfg0]),
+                startup_step(1, (1, 0), (2, 0), vec![cfg(ReadOutcomeKind::NoFrame, 0)]),
+                startup_step(2, (0, 0), (1, 0), vec![cfg(ReadOutcomeKind::NoFrame, 0)]),
+                startup_step(3, (0, 0), (1, 1), vec![cfg(ReadOutcomeKind::Served, 1)]),
+                startup_step(4, last_relay, (1, 1), vec![cfg(ReadOutcomeKind::Held, 0)]),
+            ]
+        };
+        let judge = |steps: &[RecordedStep], contexts: &[&str]| {
+            verify_unrestored(
+                &relay(sink_slot_viewing(
+                    1,
+                    steps,
+                    BodyDrain::ToEmpty,
+                    &["s"],
+                    contexts,
+                )),
+                steps,
+                &[],
+                STAMPED,
+            )
+        };
+        let healthy = rows(cfg(ReadOutcomeKind::NoFrame, 0), (1, 1));
+        let report = judge(&healthy, &["cfg"]);
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let dropped = rows(cfg(ReadOutcomeKind::NoFrame, 0), (1, 0));
+        assert_eq!(
+            findings_of(&judge(&dropped, &["cfg"])),
+            vec![finding("relay", 4, 2, 0)]
+        );
+        let unrecorded = rows(cfg(ReadOutcomeKind::Served, 1), (1, 1));
+        assert_eq!(
+            findings_of(&judge(&unrecorded, &["cfg"])),
+            vec![finding("relay", 1, 1, 0)]
+        );
+
+        let a = |kind, popped| sink_read("a", kind, popped, ReadSiteRole::Body);
+        let past_a = vec![
+            startup_step(0, (1, 1), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(
+                1,
+                (1, 0),
+                (2, 0),
+                vec![
+                    a(ReadOutcomeKind::NoFrame, 0),
+                    a(ReadOutcomeKind::Served, 1),
+                ],
+            ),
+            startup_step(2, (0, 0), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+        ];
+        assert_eq!(
+            findings_of(&judge(&past_a, &["a"])),
+            vec![finding("relay", 2, 1, 0)]
+        );
+    }
+
+    /// An earlier `block` input whose producer starts late ends the first
+    /// fire with a live `NoFrame`, its only record at the step, so the slot
+    /// stays counted. Depth 1, the sink viewing `t` and the `block` input `a`
+    /// before `inp`: `a` is empty at the even steps and serves at the odd
+    /// ones, where the sink takes the slot's frame; the relay fires at steps 0
+    /// and 2 and is held at steps 1 and 3, and the pass reads clean.
+    #[test]
+    fn a_first_fire_that_ends_at_a_block_input_whose_producer_starts_late_keeps_the_slot() {
+        let a = |kind, popped| sink_read("a", kind, popped, ReadSiteRole::Body);
+        let steps = vec![
+            startup_step(0, (1, 1), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(1, (1, 0), (1, 1), vec![a(ReadOutcomeKind::Served, 1)]),
+            startup_step(2, (0, 1), (1, 0), vec![a(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(3, (1, 0), (1, 1), vec![a(ReadOutcomeKind::Served, 1)]),
+        ];
+        let report = verify_unrestored(
+            &relay(sink_slot_viewing(
+                1,
+                &steps,
+                BodyDrain::ToEmpty,
+                &["t"],
+                &["a"],
+            )),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// On a resumed pass the slot is unknown until the consumer first reads
+    /// its queue empty, and a first fire that ends at an earlier input does
+    /// not lose it for the pass. Depth 2, the sink viewing `s` and `cfg`
+    /// before `inp`: at step 0 its tick ends at `cfg`, at step 1 it reads the
+    /// slot empty, the relay's frames at steps 2 and 3 fill it, and the step 3
+    /// pop left unfired is the hold.
+    #[test]
+    fn a_resumed_pass_whose_first_fire_ends_before_the_input_is_known_at_its_first_read() {
+        let cfg = |kind, popped| sink_read("cfg", kind, popped, ReadSiteRole::Body);
+        let steps = vec![
+            startup_step(0, (1, 1), (1, 0), vec![cfg(ReadOutcomeKind::NoFrame, 0)]),
+            startup_step(1, (1, 1), (1, 1), vec![cfg(ReadOutcomeKind::Served, 1)]),
+            startup_step(2, (1, 1), (0, 0), vec![]),
+            startup_step(3, (2, 1), (0, 0), vec![]),
+        ];
+        let resumed = PassRestore::from_sync_heads(BTreeMap::new())
+            .with_stops_stated(BTreeSet::from(["relay".to_string(), "sink".to_string()]));
+        let report = verify(
+            &relay(sink_slot_viewing(
+                2,
+                &steps,
+                BodyDrain::ToEmpty,
+                &["s"],
+                &["cfg"],
+            )),
+            &steps,
+            &[],
+            STAMPED,
+            &resumed,
+            &PassStops::none(),
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+    }
+
+    /// A `sample(N)` trigger input read before the `block` input ends the
+    /// fire whose frame its gate drops: the live read records `Decimated` and
+    /// serves nothing. On the collapse rows with the sink viewing the trigger
+    /// `s` ahead of `inp`, a `Decimated` read of `s` at step 1 keeps the
+    /// count, and the relay's step 2 pop left unfired is the hold. A context
+    /// input frozen at the step's boundary still serves the frame it held
+    /// after a decimated snapshot, so a `Decimated` read of one ends nothing:
+    /// the slot is unknown at step 2 and the pop left unfired is the finding.
+    #[test]
+    fn a_fire_whose_sample_gate_drops_the_trigger_frame_keeps_the_count() {
+        let decimated = |input| sink_read(input, ReadOutcomeKind::Decimated, 1, ReadSiteRole::Body);
+        let gated = collapse_rows(1, vec![decimated("s")]);
+        let report = verify_unrestored(
+            &relay(sink_slot_viewing(
+                2,
+                &gated,
+                BodyDrain::ToEmpty,
+                &["s"],
+                &[],
+            )),
+            &gated,
+            &[],
+            STAMPED,
+        );
+        assert!(report.is_clean(), "unexpected: {:?}", report.findings);
+
+        let held = collapse_rows(1, vec![decimated("c")]);
+        let report = verify_unrestored(
+            &relay(sink_slot_viewing(2, &held, BodyDrain::ToEmpty, &[], &["c"])),
+            &held,
+            &[],
+            STAMPED,
+        );
+        assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
     }
 
     /// An empty read leaves the slot empty: in a rank's step order the

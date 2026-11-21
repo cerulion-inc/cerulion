@@ -2342,6 +2342,7 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
         coordination,
         // Filled by the gate once the stamp is checked against the graph.
         driver_stamp: None,
+        input_queues: replay_engine::RecordedInputQueues::read(obj),
     };
     if !unreadable.is_empty() {
         tracing::warn!(
@@ -3025,6 +3026,7 @@ mod tests {
             // binary writes today carries.
             coordination: Some(crate::replay_engine::CoordinationMode::Lockstep),
             driver_stamp: None,
+            input_queues: None,
         }
     }
 

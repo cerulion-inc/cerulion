@@ -294,7 +294,11 @@ account for allows for no hold: the bag records no frames of the topic or a
 frame header it cannot parse, its record-health stamp is absent or malformed,
 keeps no entry for the topic, reports the topic lossy or written by several
 publishers (declared or observed), or any frame drained and never written, the
-graph lists the topic in `multi_publisher_topics`, the input sets
+graph lists the topic in `multi_publisher_topics`, the recording does not pin
+the input's `block` policy and depth (its `recorder.json` names the input's
+queue with another policy or depth than the replayed build gives it, or, on a
+bag recorded before that key, its graph does not set both `backpressure: block`
+and `depth:` for the input), the input sets
 `block_timeout_ms`, whose release forgives the slot's frames with no record,
 the bag's fire records do not put the reading node on a later level than the
 producer (its read can then drain the slot before the producer decides in the
@@ -302,8 +306,9 @@ same step, or the bag does not show the order, and such an edge leaves the
 slot uncounted), or the input is a Sync node's trigger input, which its
 matcher pops outside the node's body. A node the recording fired at more than
 one level, or never fired, orders no edge. From the step after a truncated
-read of the input, a drain whose site the read log does not say, or a consumer
-fire before any body read of the input is recorded, the slot allows for none;
+read of the input, a drain whose site the read log does not say, or, before
+any body read of the input is recorded, a consumer fire the recording does not
+show ended before the input, the slot allows for none;
 nor on a resumed pass until the consumer first reads its queue empty; nor, on
 a latest-value input, from the step after a consumer fire with no read of it
 recorded, which can hide a drain, through the step at which the consumer next
@@ -312,7 +317,10 @@ read unless it errors, and a read that errors can have popped first. A fire the
 recording shows ended at an input the tick reads earlier drained nothing: a
 `#[cerulion_node]` node's tick reads its inputs, `accumulate` ones aside, in
 declaration order and ends at the first that serves nothing, which records an
-empty read. For any other node, every such fire can hide a drain.
+empty read: a step-boundary input read empty ends every fire of its step, and
+a `sample(N)` trigger input whose gate dropped the frame ends that fire. For a
+node whose metadata does not say it needs a publisher for every output, which
+that macro sets, every such fire can hide a drain.
 A consumer's stop releases its slot from the next step on. As for a throttle,
 whose window the rule reads off the recorded clock, a step no such check could
 defer owes every popped frame a fire. Read through one

@@ -2179,6 +2179,14 @@ pub struct RecorderInfo {
     /// judge can only ever see a validated one.
     #[serde(skip)]
     pub driver_stamp: Option<DriverStamp>,
+    /// The queue the recording read each input through: the document's
+    /// `node_inputs` key ([`RecordedInputQueues::read`]). `None` is a
+    /// recording made before the key, or one whose value does not read.
+    ///
+    /// Never serialized, so the `--report` JSON's `recorder` object is
+    /// unchanged.
+    #[serde(skip)]
+    pub input_queues: Option<RecordedInputQueues>,
 }
 
 /// What a `__cerulion/recorder.json` document says about its nodes' driver
@@ -5636,6 +5644,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 node_info_notes,
                 config: &config,
                 driver_nodes: &classes.driver_nodes,
+                recorded_queues: recorder.as_ref().and_then(|r| r.input_queues.as_ref()),
                 record_out: record_out.clone(),
             };
             // A resume judges a param the recording names and this build no
@@ -10125,6 +10134,9 @@ struct PassInputs<'a> {
     /// The graph's `external` (driver) nodes ([`TopicClasses::driver_nodes`]):
     /// writers a shared topic's partitioned diff leaves out.
     driver_nodes: &'a BTreeSet<String>,
+    /// The queue the recording read each input through, where its
+    /// recorder.json states them ([`RecorderInfo::input_queues`]).
+    recorded_queues: Option<&'a RecordedInputQueues>,
     /// The `--record-out` sink, if one was asked for.
     record_out: Option<Arc<crate::resim_record_out::RecordOut>>,
 }
@@ -13251,14 +13263,16 @@ struct BlockHoldFlow {
 
 /// One `block` consumer of a [`BlockHoldFlow`]: the node and input that hold
 /// the slot, its depth, whether the input sets `block_timeout_ms`, whose
-/// release forgives the slot's frames and leaves no record, and the inputs
-/// the node's tick reads before it ([`consumer_reads_before`]).
+/// release forgives the slot's frames and leaves no record, whether the bag
+/// pins the input's `block` policy at that depth ([`block_queue_pinned`]), and
+/// the inputs the node's tick reads before it ([`consumer_reads_before`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockHoldConsumer {
     node: String,
     input: String,
     depth: u64,
     released_on_timeout: bool,
+    pinned: bool,
     reads_before: replay_rederive::ReadsBefore,
 }
 
@@ -13333,7 +13347,9 @@ fn recorded_after(
 /// topic that a `block` input reads, whatever the topic's other consumers
 /// declare (`TopicFlow::holds_its_producers`, the predicate its wiring reads),
 /// with one slot per `block` consumer at that input's depth. This is that set,
-/// read off the same build by the same predicate.
+/// read off the same build by the same predicate. Each consumer says whether
+/// the bag pins its `block` policy and depth (`recorded`, the queues the
+/// recording states, [`block_queue_pinned`]).
 ///
 /// # Errors
 ///
@@ -13343,6 +13359,7 @@ fn recorded_after(
 fn block_hold_flows(
     subgraph: &GraphConfig,
     node_infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+    recorded: Option<&RecordedInputQueues>,
     rank: u32,
 ) -> Result<Vec<BlockHoldFlow>, ReplayError> {
     let topology = cerulion_core::graph::topology::GraphTopology::build(subgraph, node_infos)
@@ -13361,12 +13378,22 @@ fn block_hold_flows(
                 .consumers
                 .iter()
                 .filter(|c| c.policy == cerulion_core::graph::node::BackpressurePolicy::Block)
-                .map(|c| BlockHoldConsumer {
-                    node: c.node_id.clone(),
-                    input: c.input.clone(),
-                    depth: u64::try_from(c.depth).unwrap_or(u64::MAX),
-                    released_on_timeout: c.block_timeout_ms.is_some(),
-                    reads_before: consumer_reads_before(node_infos.get(&c.node_id), &c.input),
+                .map(|c| {
+                    let depth = u64::try_from(c.depth).unwrap_or(u64::MAX);
+                    let in_graph = subgraph
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == c.node_id)
+                        .and_then(|n| n.inputs.iter().find(|i| i.name == c.input))
+                        .map_or((None, None), |i| (i.backpressure, i.depth));
+                    BlockHoldConsumer {
+                        node: c.node_id.clone(),
+                        input: c.input.clone(),
+                        depth,
+                        released_on_timeout: c.block_timeout_ms.is_some(),
+                        pinned: block_queue_pinned(recorded, in_graph, &c.node_id, &c.input, depth),
+                        reads_before: consumer_reads_before(node_infos.get(&c.node_id), &c.input),
+                    }
                 })
                 .collect(),
         })
@@ -13381,8 +13408,9 @@ fn block_hold_flows(
 /// level than its producer (`levels`, [`recorded_after`]): otherwise the
 /// consumer's read can drain the slot before the producer decides in the same
 /// step, or the bag does not show the order, whatever the replayed build
-/// declares. Such an edge, and one whose input sets `block_timeout_ms`, whose
-/// release forgives the slot's frames and leaves no record, give
+/// declares. Such an edge, one whose input sets `block_timeout_ms`, whose
+/// release forgives the slot's frames and leaves no record, and one whose
+/// `block` policy and depth the bag does not pin ([`block_queue_pinned`]) give
 /// [`replay_rederive::SlotRecord::Unaccounted`] whatever the bag records of
 /// the slot.
 fn local_block_holds(
@@ -13400,7 +13428,10 @@ fn local_block_holds(
                     consumer_node: c.node.clone(),
                     consumer_input: c.input.clone(),
                     depth: c.depth,
-                    record: if c.released_on_timeout || !recorded_after(levels, producer, &c.node) {
+                    record: if c.released_on_timeout
+                        || !c.pinned
+                        || !recorded_after(levels, producer, &c.node)
+                    {
                         replay_rederive::SlotRecord::Unaccounted
                     } else {
                         record_of(&flow.topic, &c.node, &c.input)
@@ -13455,29 +13486,49 @@ fn topic_recorded_whole(report: &RecordHealthReport, topic: &str, listed: bool) 
 }
 
 /// PURE: the inputs `input`'s consumer reads before it at every fire
-/// ([`replay_rederive::ReadsBefore`]). A node that needs a publisher for every
-/// output it declares is a `#[cerulion_node]` node
-/// ([`cerulion_core::graph::node::NodeInfo::publisher_for_every_output`]),
-/// whose generated tick views its inputs in the order its input metadata
-/// declares them, accumulate ports aside: the ones before `input`. Any other
-/// node, a node whose info replay does not hold, and an input the node does
-/// not view are [`replay_rederive::ReadsBefore::Unknown`].
+/// ([`replay_rederive::ReadsBefore`]). A node whose info says it needs a
+/// publisher for every output it declares
+/// ([`cerulion_core::graph::node::NodeInfo::publisher_for_every_output`]) is
+/// read as a `#[cerulion_node]` node, which sets that flag: its generated tick
+/// views its inputs in the order its input metadata declares them, accumulate
+/// ports aside, so it reads the ones before `input` first. A raw FFI info block
+/// or a hand-written entry that sets the flag is read the same way. Each input
+/// it reads first is a trigger input where the node's policy wakes it on that
+/// input, as the runtime partitions them (the `build_snapshot_input_names`
+/// table): none on a `period_ms` or `external` node, the trigger-marked ones on
+/// a Sync node, the named one on a data trigger node and every one on a node
+/// with no policy. A node whose info does not set the flag, a node whose info
+/// replay does not hold, and an input the node does not view are
+/// [`replay_rederive::ReadsBefore::Unknown`].
 fn consumer_reads_before(
     info: Option<&cerulion_core::graph::NodeInfo>,
     input: &str,
 ) -> replay_rederive::ReadsBefore {
+    use cerulion_core::graph::node::MacroPolicy;
     let Some(info) = info.filter(|info| info.publisher_for_every_output()) else {
         return replay_rederive::ReadsBefore::Unknown;
     };
-    let viewed: Vec<&str> = info
-        .input_meta()
-        .iter()
-        .filter(|m| !m.accumulate)
-        .map(|m| m.name.as_str())
-        .collect();
-    match viewed.iter().position(|name| *name == input) {
+    let policy = info.policy();
+    let wakes = |meta: &cerulion_core::graph::node::InputMeta| match &policy {
+        Some(MacroPolicy::Period { .. } | MacroPolicy::External) => false,
+        Some(MacroPolicy::Sync { .. } | MacroPolicy::UnboundedSync) => meta.trigger,
+        Some(MacroPolicy::DataTrigger { input_name }) => meta.name == *input_name,
+        None => true,
+    };
+    let viewed: Vec<&cerulion_core::graph::node::InputMeta> =
+        info.input_meta().iter().filter(|m| !m.accumulate).collect();
+    match viewed.iter().position(|meta| meta.name == input) {
         Some(at) => replay_rederive::ReadsBefore::Known(
-            viewed[..at].iter().map(|name| name.to_string()).collect(),
+            viewed[..at]
+                .iter()
+                .map(|meta| {
+                    if wakes(meta) {
+                        replay_rederive::ViewedInput::Trigger(meta.name.clone())
+                    } else {
+                        replay_rederive::ViewedInput::Context(meta.name.clone())
+                    }
+                })
+                .collect(),
         ),
         None => replay_rederive::ReadsBefore::Unknown,
     }
@@ -14666,6 +14717,9 @@ fn prepare_pass_verification(
     drivers: &BTreeSet<String>,
     // The bag's record-health stamp: whether its frames of a topic are whole.
     record_health: &RecordHealthReport,
+    // The queue the recording read each input through, where its
+    // recorder.json states them.
+    recorded_queues: Option<&RecordedInputQueues>,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -15527,7 +15581,7 @@ fn prepare_pass_verification(
     let local_nodes: BTreeSet<&str> = plan.members().iter().map(String::as_str).collect();
     // The `block` slots that can hold a node, each with what the bag records
     // of it: the frames sent to it, read off the recorded frame stream.
-    let hold_flows = block_hold_flows(plan.subgraph(), node_infos, plan.rank())?;
+    let hold_flows = block_hold_flows(plan.subgraph(), node_infos, recorded_queues, plan.rank())?;
     let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
     let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
     let fire_levels = if hold_flows.is_empty() {
@@ -16089,6 +16143,7 @@ fn plan_pass_verification(
         pass.identity,
         pass.driver_nodes,
         pass.record_health,
+        pass.recorded_queues,
     )?;
     Ok(verification)
 }
@@ -18373,6 +18428,137 @@ pub fn node_external_flags<'a>(
         .into_iter()
         .map(|(id, info)| (id.clone(), is_external_policy(info.policy().as_ref())))
         .collect()
+}
+
+/// One input's queue as the recording run read it: an entry of the
+/// `node_inputs` map a recording's `__cerulion/recorder.json` carries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InputQueue {
+    /// The input's backpressure: `block`, `drop_oldest` or `sample(N)`, N in
+    /// milliseconds.
+    pub backpressure: String,
+    /// The input's queue depth.
+    pub depth: u64,
+}
+
+/// Each native node's inputs, by node id and then input name, with the
+/// queue the run read each through ([`InputQueue`]): the `node_inputs` map.
+pub type NodeInputQueues = BTreeMap<String, BTreeMap<String, InputQueue>>;
+
+/// The `node_inputs` map of a run of `config` whose loaded nodes declare
+/// `infos`: one entry for every native node, holding one per input the graph
+/// wires it, each with the backpressure and depth the run's topology gives it
+/// (`GraphTopology::build`): the graph's `backpressure:` and `depth:` keys
+/// where present ([`cerulion_core::graph::topology::effective_input_policy`]),
+/// the node's declared values otherwise, and `drop_oldest` at the default
+/// depth for an input the node declares nothing for.
+///
+/// `BTreeMap`s, so the rendered attachment is byte-identical for the same
+/// graph and builds whatever order the nodes arrive in.
+pub fn node_input_queues(
+    config: &GraphConfig,
+    infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+) -> NodeInputQueues {
+    use cerulion_core::graph::node::BackpressurePolicy;
+    config
+        .native_nodes()
+        .map(|node| {
+            let declared = infos.get(&node.id).map(|info| info.input_meta());
+            let inputs = node
+                .inputs
+                .iter()
+                .map(|input| {
+                    let meta = declared
+                        .and_then(|metas| metas.iter().find(|m| m.name == input.name))
+                        .map(|m| (m.backpressure, m.depth))
+                        .unwrap_or((
+                            BackpressurePolicy::default(),
+                            cerulion_core::graph::topology::DEFAULT_CONSUMER_DEPTH,
+                        ));
+                    let (policy, depth) =
+                        cerulion_core::graph::topology::effective_input_policy(input, meta);
+                    let backpressure = match policy {
+                        BackpressurePolicy::Block => "block".to_string(),
+                        BackpressurePolicy::DropOldest => "drop_oldest".to_string(),
+                        BackpressurePolicy::Sample(ms) => format!("sample({ms})"),
+                    };
+                    let queue = InputQueue {
+                        backpressure,
+                        depth: u64::try_from(depth).unwrap_or(u64::MAX),
+                    };
+                    (input.name.clone(), queue)
+                })
+                .collect();
+            (node.id.clone(), inputs)
+        })
+        .collect()
+}
+
+/// The `node_inputs` map a recording's `recorder.json` carries, read: the
+/// queue the recording read each input through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedInputQueues {
+    queues: NodeInputQueues,
+}
+
+impl RecordedInputQueues {
+    /// Read the `node_inputs` key off a parsed recorder.json object. `None`
+    /// when the key is absent, a recording made before it, or when its value
+    /// is not a map of node ids to maps of input names to a backpressure and
+    /// a depth, which counts as absent.
+    pub fn read(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Self> {
+        let value = obj.get("node_inputs")?;
+        let queues = serde_json::from_value::<NodeInputQueues>(value.clone()).ok()?;
+        Some(Self { queues })
+    }
+
+    /// Did the recording read `node`'s `input` as `block` at `depth`?
+    fn pins_block(&self, node: &str, input: &str, depth: u64) -> bool {
+        self.queues
+            .get(node)
+            .and_then(|inputs| inputs.get(input))
+            .is_some_and(|queue| queue.backpressure == "block" && queue.depth == depth)
+    }
+}
+
+/// The queues a recording made by the build `infos` describe states for
+/// `config`: what its recorder writes.
+#[cfg(test)]
+fn queues_as_built(
+    config: &GraphConfig,
+    infos: &IndexMap<String, cerulion_core::graph::NodeInfo>,
+) -> RecordedInputQueues {
+    RecordedInputQueues {
+        queues: node_input_queues(config, infos),
+    }
+}
+
+/// PURE: does the bag pin a `block` input at the depth the replayed build's
+/// topology gives it? Where the recording states its input queues
+/// (`recorded`), only one it read as `block` at that same depth. Where it
+/// does not, only one whose graph sets both `backpressure: block` and
+/// `depth:` (`in_graph`, the input's two keys), since every other `block`
+/// policy or depth comes from the build being replayed.
+fn block_queue_pinned(
+    recorded: Option<&RecordedInputQueues>,
+    in_graph: (
+        Option<cerulion_core::graph::config::InputBackpressure>,
+        Option<usize>,
+    ),
+    node: &str,
+    input: &str,
+    depth: u64,
+) -> bool {
+    match recorded {
+        Some(queues) => queues.pins_block(node, input, depth),
+        None => matches!(
+            in_graph,
+            (
+                Some(cerulion_core::graph::config::InputBackpressure::Block),
+                Some(_)
+            )
+        ),
+    }
 }
 
 /// The ids of the replayed build's `external` (driver) nodes: every candidate
@@ -39864,7 +40050,7 @@ mod trigger_input_capacity_tests {
         /// Per topic, its producers and its `block` consumers.
         type Flows = BTreeMap<String, (Vec<String>, Vec<BlockHoldConsumer>)>;
         let flows = |infos: &IndexMap<String, NodeInfo>| -> Flows {
-            block_hold_flows(&config, infos, 0)
+            block_hold_flows(&config, infos, Some(&queues_as_built(&config, infos)), 0)
                 .expect("builds")
                 .into_iter()
                 .map(|f| (f.topic, (f.producers, f.consumers)))
@@ -39876,6 +40062,7 @@ mod trigger_input_capacity_tests {
             input: "x".to_string(),
             depth,
             released_on_timeout: false,
+            pinned: true,
             reads_before: replay_rederive::ReadsBefore::Unknown,
         };
         let mut expected = BTreeMap::from([
@@ -39935,7 +40122,8 @@ mod trigger_input_capacity_tests {
         .map(|(n, l)| (n.to_string(), RecordedLevel::One(l)))
         .collect();
         let held = local_block_holds(
-            &block_hold_flows(&config, &infos, 0).expect("builds"),
+            &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
+                .expect("builds"),
             &levels,
             &record_of,
         );
@@ -39962,14 +40150,17 @@ mod trigger_input_capacity_tests {
         );
     }
 
-    /// A `#[cerulion_node]` consumer, one that needs a publisher for every
-    /// output it declares, reads the inputs it declares before a `block`
-    /// input ahead of it, an accumulate port aside; replay knows nothing of
-    /// any other consumer's reads: hand table.
+    /// A consumer whose info says it needs a publisher for every output it
+    /// declares reads the inputs it declares before a `block` input ahead of
+    /// it, an accumulate port aside, each a trigger input where the node's
+    /// policy wakes it on that input; replay knows nothing of any other
+    /// consumer's reads: hand table.
     #[test]
-    fn a_macro_consumer_reads_the_inputs_it_declares_before_a_block_input() {
-        use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
-        use replay_rederive::ReadsBefore;
+    fn a_consumer_that_needs_every_publisher_reads_the_inputs_it_declares_before_a_block_input() {
+        use cerulion_core::graph::node::{
+            BackpressurePolicy, InputConsume, InputMeta, MacroPolicy, NodeInfo,
+        };
+        use replay_rederive::{ReadsBefore, ViewedInput};
         let meta = |name: &str, accumulate: bool| InputMeta {
             name: name.to_string(),
             schema_hash: 0,
@@ -39987,30 +40178,210 @@ mod trigger_input_capacity_tests {
             meta("x", false),
             meta("b", false),
         ];
-        let macro_node =
-            NodeInfo::with_meta(declared.clone(), vec![]).with_publisher_for_every_output();
-        let entry = NodeInfo::with_meta(declared, vec![]);
-        let known =
-            |names: &[&str]| ReadsBefore::Known(names.iter().map(|n| n.to_string()).collect());
+        let marked = |policy: Option<MacroPolicy>| {
+            let info = NodeInfo::with_meta(declared.clone(), vec![]);
+            match policy {
+                Some(policy) => info.with_policy(policy),
+                None => info,
+            }
+            .with_publisher_for_every_output()
+        };
+        let trigger = |name: &str| ViewedInput::Trigger(name.to_string());
+        let context = |name: &str| ViewedInput::Context(name.to_string());
+        let data = marked(Some(MacroPolicy::DataTrigger {
+            input_name: "t".to_string(),
+        }));
         assert_eq!(
-            consumer_reads_before(Some(&macro_node), "x"),
-            known(&["t", "a"])
+            consumer_reads_before(Some(&data), "x"),
+            ReadsBefore::Known(vec![trigger("t"), context("a")])
         );
-        assert_eq!(consumer_reads_before(Some(&macro_node), "t"), known(&[]));
         assert_eq!(
-            consumer_reads_before(Some(&macro_node), "acc"),
+            consumer_reads_before(Some(&data), "t"),
+            ReadsBefore::Known(vec![])
+        );
+        assert_eq!(
+            consumer_reads_before(Some(&marked(Some(MacroPolicy::Sync { window_ms: 5 }))), "x"),
+            ReadsBefore::Known(vec![trigger("t"), context("a")]),
+            "a Sync node is woken by its trigger-marked inputs"
+        );
+        for policy in [MacroPolicy::Period { period_ms: 5 }, MacroPolicy::External] {
+            assert_eq!(
+                consumer_reads_before(Some(&marked(Some(policy.clone()))), "x"),
+                ReadsBefore::Known(vec![context("t"), context("a")]),
+                "{policy:?} wakes on no input"
+            );
+        }
+        assert_eq!(
+            consumer_reads_before(Some(&marked(None)), "x"),
+            ReadsBefore::Known(vec![trigger("t"), trigger("a")]),
+            "a node with no policy is woken by every input"
+        );
+        assert_eq!(
+            consumer_reads_before(Some(&data), "acc"),
             ReadsBefore::Unknown,
             "an accumulate port is not viewed"
         );
         assert_eq!(
-            consumer_reads_before(Some(&macro_node), "y"),
+            consumer_reads_before(Some(&data), "y"),
             ReadsBefore::Unknown
         );
         assert_eq!(
-            consumer_reads_before(Some(&entry), "x"),
+            consumer_reads_before(Some(&NodeInfo::with_meta(declared.clone(), vec![])), "x"),
             ReadsBefore::Unknown
         );
         assert_eq!(consumer_reads_before(None, "x"), ReadsBefore::Unknown);
+    }
+
+    /// A raw FFI info block that sets `publisher_for_every_output` is read as
+    /// the macro's tick: its inputs before the `block` input are known, each a
+    /// trigger input on a node with no policy. The same block without the key
+    /// reads nothing.
+    #[test]
+    fn an_info_json_that_sets_publisher_for_every_output_reads_as_the_macros_tick() {
+        use cerulion_core::graph::node::DylibNodeEntry;
+        use replay_rederive::{ReadsBefore, ViewedInput};
+        let parse = |json: &str| {
+            DylibNodeEntry::parse_info_json_labeled(json, "raw").expect("the info block parses")
+        };
+        let marked = parse(
+            r#"{"inputs":[{"name":"a"},{"name":"x"}],"outputs":[],"publisher_for_every_output":true}"#,
+        );
+        assert_eq!(
+            consumer_reads_before(Some(&marked), "x"),
+            ReadsBefore::Known(vec![ViewedInput::Trigger("a".to_string())])
+        );
+        let unmarked = parse(r#"{"inputs":[{"name":"a"},{"name":"x"}],"outputs":[]}"#);
+        assert_eq!(
+            consumer_reads_before(Some(&unmarked), "x"),
+            ReadsBefore::Unknown
+        );
+    }
+
+    /// The bag pins a `block` queue only where the recording states it read
+    /// the input `block` at the replayed build's depth, or, on a bag that
+    /// states no queues, where the graph sets both keys: hand table.
+    #[test]
+    fn a_block_queue_is_pinned_only_by_the_recording_or_both_graph_keys() {
+        use cerulion_core::graph::config::InputBackpressure;
+        let read =
+            |doc: serde_json::Value| RecordedInputQueues::read(doc.as_object().expect("an object"));
+        let stated = read(serde_json::json!({"node_inputs": {
+            "sink": {
+                "x": {"backpressure": "block", "depth": 4},
+                "y": {"backpressure": "drop_oldest", "depth": 4},
+            },
+        }}))
+        .expect("a stated map reads");
+        let pinned = |recorded, in_graph, input, depth| {
+            block_queue_pinned(recorded, in_graph, "sink", input, depth)
+        };
+        let none = (None, None);
+        assert!(pinned(Some(&stated), none, "x", 4));
+        assert!(!pinned(Some(&stated), none, "x", 1), "another depth");
+        assert!(!pinned(Some(&stated), none, "y", 4), "recorded drop_oldest");
+        assert!(
+            !pinned(Some(&stated), none, "z", 4),
+            "an input the map leaves out"
+        );
+        assert!(
+            !pinned(
+                Some(&stated),
+                (Some(InputBackpressure::Block), Some(4)),
+                "y",
+                4
+            ),
+            "the recording decides where it states its queues"
+        );
+        assert!(pinned(
+            None,
+            (Some(InputBackpressure::Block), Some(4)),
+            "x",
+            4
+        ));
+        assert!(!pinned(
+            None,
+            (Some(InputBackpressure::Block), None),
+            "x",
+            4
+        ));
+        assert!(!pinned(None, (None, Some(4)), "x", 4));
+        assert!(!pinned(None, none, "x", 4));
+        assert!(!pinned(
+            None,
+            (Some(InputBackpressure::DropOldest), Some(4)),
+            "x",
+            4
+        ));
+
+        assert_eq!(read(serde_json::json!({})), None, "no key");
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!(["sink"]),
+            serde_json::json!({"sink": {"x": "block"}}),
+            serde_json::json!({"sink": {"x": {"backpressure": "block"}}}),
+            serde_json::json!({"sink": {"x": {"backpressure": 1, "depth": 4}}}),
+            serde_json::json!({"sink": {"x": {"backpressure": "block", "depth": -1}}}),
+        ] {
+            assert_eq!(
+                read(serde_json::json!({ "node_inputs": malformed.clone() })),
+                None,
+                "{malformed} counts as no key"
+            );
+        }
+    }
+
+    /// The recorder's `node_inputs` names every native node, each with every
+    /// input the graph wires it and the policy and depth its run reads it
+    /// with: a graph key over the declaration, the declaration over the
+    /// default, `sample(N)` spelled as the attribute spells it: hand table.
+    #[test]
+    fn the_recorded_input_queues_name_every_wired_input_as_its_run_reads_it() {
+        use cerulion_core::graph::node::{BackpressurePolicy, InputConsume, InputMeta, NodeInfo};
+        let yaml = "name: q\nprefix: q\nnodes:\n\
+             \x20 - id: src\n    type: w\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+             \x20 - id: sink\n    type: w\n    inputs:\n      - name: a\n        source: src/out\n        depth: 3\n      - name: b\n        source: src/out\n        backpressure: block\n      - name: c\n        source: src/out\n      - name: d\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+        let config = cerulion_core::graph::parse_graph(yaml).expect("parses");
+        let meta = |name: &str, backpressure, depth| InputMeta {
+            name: name.to_string(),
+            schema_hash: 0,
+            trigger: false,
+            depth,
+            backpressure,
+            expect_within_ms: None,
+            consume: InputConsume::Fifo,
+            accumulate: false,
+        };
+        let mut infos: IndexMap<String, NodeInfo> = IndexMap::new();
+        infos.insert(
+            "sink".to_string(),
+            NodeInfo::with_meta(
+                vec![
+                    meta("a", BackpressurePolicy::Block, 2),
+                    meta("b", BackpressurePolicy::DropOldest, 5),
+                    meta("c", BackpressurePolicy::Sample(8), 6),
+                ],
+                vec![],
+            ),
+        );
+        let queue = |backpressure: &str, depth| InputQueue {
+            backpressure: backpressure.to_string(),
+            depth,
+        };
+        assert_eq!(
+            node_input_queues(&config, &infos),
+            BTreeMap::from([
+                ("src".to_string(), BTreeMap::new()),
+                (
+                    "sink".to_string(),
+                    BTreeMap::from([
+                        ("a".to_string(), queue("block", 3)),
+                        ("b".to_string(), queue("block", 5)),
+                        ("c".to_string(), queue("sample(8)", 6)),
+                        ("d".to_string(), queue("drop_oldest", 10)),
+                    ])
+                ),
+            ])
+        );
     }
 
     /// A slot is counted only where the bag holds a stamp for every frame of
@@ -40092,7 +40463,8 @@ mod trigger_input_capacity_tests {
                 ("sink".to_string(), RecordedLevel::One(1)),
             ]);
             let mut holds = local_block_holds(
-                &block_hold_flows(&config, &infos, 0).expect("builds"),
+                &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
+                    .expect("builds"),
                 &levels,
                 &|_, _, _| SlotRecord::Counted {
                     frame_stamps: vec![1_000],
@@ -40324,7 +40696,8 @@ mod trigger_input_capacity_tests {
                 .map(|&(n, l)| (n.to_string(), RecordedLevel::One(l)))
                 .collect();
             local_block_holds(
-                &block_hold_flows(&config, &infos, 0).expect("builds"),
+                &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
+                    .expect("builds"),
                 &levels,
                 &|_, _, _| counted.clone(),
             )

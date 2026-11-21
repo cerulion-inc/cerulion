@@ -783,6 +783,13 @@ struct Recording {
     /// them into a manifest's `read_log_capacities`: `{node: [[input_idx, role
     /// byte, capacity], ...]}`.
     stage_rows: serde_json::Value,
+    /// Each node's inputs with the backpressure and depth the reference run
+    /// read them with, the `node_inputs` key the production recorder writes
+    /// into `recorder.json`. Every bag written from the recording with a
+    /// `recorder.json` carries it unless that document already does; `None`
+    /// writes a document without it, the shape a recording made before the key
+    /// takes.
+    node_inputs: Option<serde_json::Value>,
 }
 
 /// One external-topic driver for the reference run: the absolute topic + the
@@ -994,6 +1001,16 @@ fn record_reference_impl_fed(
 ) -> Recording {
     let config = cerulion_core::graph::parse_graph(graph_yaml).expect("reference graph parses");
     let node_ids: Vec<String> = config.nodes.iter().map(|n| n.id.clone()).collect();
+    let node_inputs = {
+        let infos: IndexMap<String, cerulion_core::graph::NodeInfo> = make_factories()
+            .iter()
+            .map(|(id, entry)| (id.clone(), entry.info().expect("a fixture's info reads")))
+            .collect();
+        Some(
+            serde_json::to_value(replay_engine::node_input_queues(&config, &infos))
+                .expect("the input queues render"),
+        )
+    };
 
     let clock = Arc::new(VirtualClock::new());
     let mut runtime = GraphRuntime::build_for_test(
@@ -1222,6 +1239,7 @@ fn record_reference_impl_fed(
         pending_after,
         publisher_ids,
         stage_rows,
+        node_inputs,
     }
 }
 
@@ -1401,13 +1419,17 @@ fn pre_stamp_recorder_json(coordination: replay_engine::CoordinationMode) -> Vec
             std::time::Duration::from_nanos(1_783_092_278_948_123_456),
             coordination,
             &std::collections::BTreeMap::new(),
+            &std::collections::BTreeMap::new(),
             0,
         ))
         .expect("the production recorder.json parses");
-    doc.as_object_mut()
-        .expect("an object")
-        .remove("node_external")
+    let obj = doc.as_object_mut().expect("an object");
+    obj.remove("node_external")
         .expect("the production writer stamps the driver flags");
+    // The bag writer adds the recording's own `node_inputs`, as the recorder
+    // that took it writes them (`Recording::node_inputs`).
+    obj.remove("node_inputs")
+        .expect("the production writer stamps the input queues");
     serde_json::to_vec(&doc).expect("re-render")
 }
 
@@ -1418,15 +1440,24 @@ fn stamped_recorder_json(
     coordination: replay_engine::CoordinationMode,
     stamp: &[(&str, bool)],
 ) -> Vec<u8> {
-    cerulion_cli_engine::graph_cmd::render_recorder_json(
+    let rendered = cerulion_cli_engine::graph_cmd::render_recorder_json(
         std::time::Duration::from_nanos(1_783_092_278_948_123_456),
         coordination,
         &stamp
             .iter()
             .map(|(id, external)| ((*id).to_string(), *external))
             .collect(),
+        &std::collections::BTreeMap::new(),
         0,
-    )
+    );
+    // The bag writer adds the recording's own `node_inputs`.
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(&rendered).expect("the production recorder.json parses");
+    doc.as_object_mut()
+        .expect("an object")
+        .remove("node_inputs")
+        .expect("the production writer stamps the input queues");
+    serde_json::to_vec(&doc).expect("re-render")
 }
 
 /// [`write_bag`] with an explicit manifest
@@ -1931,16 +1962,33 @@ fn write_bag_impl_encoded(
         .unwrap();
     }
     if let Some(recorder) = &recorder_json {
+        let recorder = with_node_inputs(recorder, rec.node_inputs.as_ref());
         w.write_attachment(
             "__cerulion/recorder.json",
             "application/json",
             0,
             0,
-            recorder,
+            &recorder,
         )
         .unwrap();
     }
     w.finalize().unwrap();
+}
+
+/// `recorder` with the recording's `node_inputs` added, as the production
+/// recorder writes it, where the document is an object that does not carry the
+/// key already; otherwise `recorder` as it is.
+fn with_node_inputs(recorder: &[u8], node_inputs: Option<&serde_json::Value>) -> Vec<u8> {
+    let Some(node_inputs) = node_inputs else {
+        return recorder.to_vec();
+    };
+    match serde_json::from_slice::<serde_json::Value>(recorder) {
+        Ok(serde_json::Value::Object(mut doc)) if !doc.contains_key("node_inputs") => {
+            doc.insert("node_inputs".to_string(), node_inputs.clone());
+            serde_json::to_vec(&doc).expect("re-render")
+        }
+        _ => recorder.to_vec(),
+    }
 }
 
 // ===========================================================================
@@ -2008,6 +2056,7 @@ fn load_inputs(path: &std::path::Path) -> LoadedInputs {
                 &config,
             )
             .expect("a fixture's driver stamp describes its graph");
+            info.input_queues = replay_engine::RecordedInputQueues::read(doc.as_object()?);
             Some(info)
         });
     // Zero-copy recorded index + streamed trace over the SAME mapped bag —
@@ -9306,12 +9355,13 @@ fn write_multi_rank_bag_impl(
         .unwrap();
     }
     if let Some(recorder) = &recorder_json {
+        let recorder = with_node_inputs(recorder, rec.node_inputs.as_ref());
         w.write_attachment(
             "__cerulion/recorder.json",
             "application/json",
             0,
             0,
-            recorder,
+            &recorder,
         )
         .unwrap();
     }
@@ -14904,6 +14954,7 @@ fn coverage_naming(node: &str, version: u32, rings: usize, node_idx: Option<u32>
 fn make_mid_run(rec: &Recording, first_step: u64) -> Recording {
     Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec
             .trace
@@ -15081,12 +15132,13 @@ fn write_checkpoint_bag_with_manifest_keys(
         .unwrap();
     }
     if let Some(recorder) = &recorder_json {
+        let recorder = with_node_inputs(recorder, rec.node_inputs.as_ref());
         w.write_attachment(
             "__cerulion/recorder.json",
             "application/json",
             0,
             0,
-            recorder,
+            &recorder,
         )
         .unwrap();
     }
@@ -16280,6 +16332,7 @@ fn make_mid_run_with_tap_attach(rec: &Recording, first_step: u64, attach_ns: u64
     }
     Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages,
         trace: rec
             .trace
@@ -25152,6 +25205,7 @@ fn write_free_run_skewed_bag_on(
 ) {
     let mut rec = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -25332,6 +25386,7 @@ fn write_free_run_ragged_head_bag(
 ) {
     let mut rec = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -25487,6 +25542,7 @@ fn free_run_per_rank_replay_is_deterministic() {
 fn write_free_run_silent_last_step_bag(rec: &Recording, path: &std::path::Path, silent_step: u64) {
     let mut rec = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -25604,6 +25660,7 @@ fn write_free_run_ragged_tail_bag(
 ) {
     let mut rec = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -25767,6 +25824,7 @@ fn the_same_ragged_tail_is_still_tolerated_on_a_lockstep_bag() {
     // same trimming with NO skew.
     let mut trimmed = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -25860,6 +25918,7 @@ fn write_free_run_unmanifested_producer_bag(
 ) {
     let mut rec = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -26032,6 +26091,7 @@ fn write_mid_run_bag(
 ) {
     let mut rec = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec
             .trace
@@ -30050,6 +30110,7 @@ fn write_trailing_rank_frame_bag(
 ) {
     let mut rec = Recording {
         stage_rows: serde_json::Value::Null,
+        node_inputs: rec.node_inputs.clone(),
         messages: rec.messages.clone(),
         trace: rec.trace.clone(),
         node_ids: rec.node_ids.clone(),
@@ -56164,6 +56225,535 @@ fn a_tick_that_ends_before_a_block_input_leaves_its_hold_allowed_for() {
         serde_json::to_string(&again).unwrap(),
         "two replays of one bag are byte-identical"
     );
+}
+
+/// A sink triggered on one topic that reads a context input, `cfg`, and then
+/// another topic through a NON-trigger `block` input of depth 1, `x`. A fire
+/// whose `cfg` has had no delivery yet ends its tick before `x` is read; one
+/// that reads `x` publishes the frame it read.
+#[cerulion_node]
+#[derive(Default)]
+struct CfgBlockSinkNode {
+    #[input(trigger)]
+    s: Vector3,
+    #[input]
+    cfg: Vector3,
+    #[input(backpressure = block, depth = 1)]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl CfgBlockSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.x.x;
+        Ok(())
+    }
+}
+
+/// A first fire that ends at a context input before its first delivery
+/// leaves the slot counted for the pass. `src` (5 ms) feeds `pace` and
+/// `relay` (depth 11), a level after it; `quiet` (10 ms) publishes on the odd
+/// steps only. `sink`, triggered on `pace/out`, reads `quiet/out` as its
+/// context `cfg` and then `relay/out` through `block` input `x` of depth 1,
+/// so it fires a level after the relays. The hand oracle at the reference
+/// run's 5 ms step:
+///
+/// * step 0: `quiet` has not published, so the step-boundary snapshot of
+///   `cfg` records `NoFrame` and the sink's tick ends there; the relay fires
+///   sequence 0 (`x` 1), which the slot keeps;
+/// * step 1: the slot is full, so the relay pops sequence 1 and is held;
+///   `cfg` serves its first frame and the sink takes the step 0 frame;
+/// * each step from 2 on: the relay fires the frame its hold froze (`x` 2 to
+///   9) and its refill pops the next (sequences 2 to 9), which the hold
+///   freezes; `cfg` serves its held or new frame and the sink takes the frame
+///   the relay just published.
+///
+/// The bag records the sink a level after the relays, so the slot is counted,
+/// the first fire that ended at `cfg` keeps its count, and the stamped replay
+/// reproduces every frame. Two replays are byte-identical. With the relay's
+/// last fire record taken out, its frame still in the bag, the step 9 pop of
+/// two frames with no fire is the finding, and the replay, which fires each
+/// node as the bag records, holds eight relay frames where the recording holds
+/// nine.
+#[test]
+#[serial]
+fn a_first_fire_that_ends_at_a_context_input_before_its_first_delivery_keeps_the_slot() {
+    let yaml = "name: fcgraph\nprefix: fc\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: quiet\n    type: quiet_source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: pace\n    type: relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: src/out\n        depth: 11\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: cfg_block_sink_node\n    inputs:\n      - name: s\n        source: pace/out\n      - name: cfg\n        source: quiet/out\n      - name: x\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("quiet", Box::new(QuietSourceNodeEntry::new())),
+            ("pace", Box::new(RelayNodeEntry::new())),
+            ("relay", Box::new(RelayNodeEntry::new())),
+            ("sink", Box::new(CfgBlockSinkNodeEntry::new())),
+        ])
+    };
+    let mut rec = record_uniform_with_read_log(yaml, make, &[], NT_STEPS);
+    let one = |l: u32| std::collections::BTreeSet::from([l]);
+    assert_eq!(
+        nt_fire_levels(&rec),
+        BTreeMap::from([
+            ("pace".to_string(), one(1)),
+            ("quiet".to_string(), one(0)),
+            ("relay".to_string(), one(1)),
+            ("sink".to_string(), one(2)),
+            ("src".to_string(), one(0)),
+        ])
+    );
+    assert_eq!(bh_fire_steps(&rec, "quiet"), vec![1, 3, 5, 7, 9]);
+    assert_eq!(bh_fire_steps(&rec, "sink"), (0..=9).collect::<Vec<_>>());
+    let (fires, pops) = bh_relay_trace(&rec);
+    assert_eq!(fires, vec![0, 2, 3, 4, 5, 6, 7, 8, 9], "the relay's fires");
+    assert_eq!(
+        pops,
+        (0..10).map(|k| (k, k)).collect::<Vec<_>>(),
+        "the relay pops sequence 1 at step 1 and fires nothing: the hold engaged"
+    );
+    assert_eq!(
+        hc_reads(&rec, "sink", "cfg"),
+        (0..10)
+            .map(|k| {
+                let kind = match k {
+                    0 => READ_OUTCOME_NONE,
+                    k if k % 2 == 1 => READ_OUTCOME_SERVED,
+                    _ => READ_OUTCOME_HELD,
+                };
+                (k, kind, ReadSiteRole::Body)
+            })
+            .collect::<Vec<_>>(),
+        "`cfg` is empty at step 0 and serves from step 1"
+    );
+    assert_eq!(
+        hc_reads(&rec, "sink", "x"),
+        (1..10)
+            .map(|k| (k, READ_OUTCOME_SERVED, ReadSiteRole::Body))
+            .collect::<Vec<_>>(),
+        "the tick reads `x` from step 1"
+    );
+    assert_eq!(
+        bh_xs(&rec, "/fc/relay/out"),
+        (1..=9).map(f64::from).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        bh_xs(&rec, "/fc/sink/out"),
+        (1..=9).map(f64::from).collect::<Vec<_>>()
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("fc_held.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        None,
+        "the hold after a first fire that ended at `cfg` is allowed for"
+    );
+    bh_assert_replays(&outcome, "a first fire that ends at a context input");
+    let again = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == 9)
+        .expect("the relay fires at step 9");
+    rec.trace.remove(at);
+    let dropped = dir.path().join("fc_dropped_fire.mcap");
+    ri_bag_labelled(&rec, &dropped, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&dropped, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
+             step 9 FIFO pop count \u{2014} re-derived 2 fire(s), recorded 0 fire(s)"
+        )
+    );
+    assert_eq!(
+        bh_violations(&outcome),
+        vec!["/fc/relay/out: recorded 9 frame(s), replay produced 8 on '/fc/relay/out'"]
+    );
+    assert!(!outcome.passed);
+}
+
+/// An earlier `block` input whose producer starts late ends the sink's first
+/// fire, and the slot of the later `block` input stays counted. The two-input
+/// sink with `a` fed by `quiet` (10 ms, odd steps): the hand oracle at the
+/// reference run's 5 ms step:
+///
+/// * the sink fires at every step; `a` is empty at the even steps, step 0
+///   included, so its live read records `NoFrame` and the tick ends there,
+///   and at the odd steps `a` serves and the tick reads `x`;
+/// * step 0: the relay fires sequence 0 (`x` 1), which the slot keeps; step
+///   1: the slot is full, so the relay pops sequence 1 and is held, and the
+///   sink takes the frame;
+/// * each even step from 2 on: the relay fires the frame its hold froze (`x`
+///   2 to 5) and its refill pops the next (sequences 2 to 5), which the hold
+///   freezes; at the odd step after, the relay stays held and the sink takes
+///   the frame.
+///
+/// The stamped replay reproduces every frame. Two replays are byte-identical.
+#[test]
+#[serial]
+fn a_first_fire_that_ends_at_a_block_input_whose_producer_starts_late_keeps_the_slot() {
+    let yaml = "name: lbgraph\nprefix: lb\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: quiet\n    type: quiet_source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: pace\n    type: relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: src/out\n        depth: 11\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: two_block_sink_node\n    inputs:\n      - name: t\n        source: pace/out\n      - name: a\n        source: quiet/out\n      - name: x\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+    let make = || {
+        factories(vec![
+            ("src", Box::new(SourceNodeEntry::new())),
+            ("quiet", Box::new(QuietSourceNodeEntry::new())),
+            ("pace", Box::new(RelayNodeEntry::new())),
+            ("relay", Box::new(RelayNodeEntry::new())),
+            ("sink", Box::new(TwoBlockSinkNodeEntry::new())),
+        ])
+    };
+    let rec = record_uniform_with_read_log(yaml, make, &[], NT_STEPS);
+    let (fires, pops) = bh_relay_trace(&rec);
+    assert_eq!(fires, vec![0, 2, 4, 6, 8], "the relay's fires");
+    assert_eq!(
+        pops,
+        vec![(0, 0), (1, 1), (2, 2), (4, 3), (6, 4), (8, 5)],
+        "the relay pops sequence 1 at step 1 and fires nothing: the hold engaged"
+    );
+    let odd = |k: u64| k % 2 == 1;
+    assert_eq!(
+        hc_reads(&rec, "sink", "a"),
+        (0..10)
+            .map(|k| {
+                let kind = if odd(k) {
+                    READ_OUTCOME_SERVED
+                } else {
+                    READ_OUTCOME_NONE
+                };
+                (k, kind, ReadSiteRole::Body)
+            })
+            .collect::<Vec<_>>(),
+        "`a` is empty on the even steps and serves on the odd ones"
+    );
+    assert_eq!(
+        hc_reads(&rec, "sink", "x"),
+        (0..10)
+            .filter(|&k| odd(k))
+            .map(|k| (k, READ_OUTCOME_SERVED, ReadSiteRole::Body))
+            .collect::<Vec<_>>(),
+        "the tick reads `x` only when `a` serves"
+    );
+    assert_eq!(bh_xs(&rec, "/lb/relay/out"), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    assert_eq!(bh_xs(&rec, "/lb/sink/out"), vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let dir = tempfile::tempdir().unwrap();
+    let fed = dir.path().join("lb_held.mcap");
+    ri_bag_labelled(&rec, &fed, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        None,
+        "the hold after a first fire that ended at `a` is allowed for"
+    );
+    bh_assert_replays(&outcome, "a first fire that ends at a late block input");
+    let again = bh_replay_stamped(&fed, make, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
+/// [`EagerBlockSinkNode`] reading `x` as a plain context input.
+#[cerulion_node]
+#[derive(Default)]
+struct EagerPlainSinkNode {
+    #[input(trigger)]
+    t: Vector3,
+    #[input]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl EagerPlainSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.x.x;
+        Ok(())
+    }
+}
+
+/// [`EagerBlockSinkNode`] with its `block` input at depth 1.
+#[cerulion_node]
+#[derive(Default)]
+struct EagerShallowBlockSinkNode {
+    #[input(trigger)]
+    t: Vector3,
+    #[input(backpressure = block, depth = 1)]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl EagerShallowBlockSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.x.x;
+        Ok(())
+    }
+}
+
+/// [`EagerBlockSinkNode`] with its `block` input at depth 4.
+#[cerulion_node]
+#[derive(Default)]
+struct EagerDeepBlockSinkNode {
+    #[input(trigger)]
+    t: Vector3,
+    #[input(backpressure = block, depth = 4)]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl EagerDeepBlockSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.x.x;
+        Ok(())
+    }
+}
+
+/// The relay -> eager sink graph of the lost-read vector, with the sink's node
+/// type `sink_type`.
+fn eager_yaml(sink_type: &str) -> String {
+    format!(
+        "name: ergraph\nprefix: er\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: twin_relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n      - name: out2\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: {sink_type}\n    inputs:\n      - name: t\n        source: relay/out2\n      - name: x\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+    )
+}
+
+/// The eager graph's factories with `sink` as the sink.
+fn eager_factories(sink: fn() -> Box<dyn NodeEntry>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        ("relay", Box::new(TwinRelayNodeEntry::new())),
+        ("sink", sink()),
+    ])
+}
+
+/// Record the eager graph with the sink `sink` builds, check the hand oracle
+/// (the relay and the sink fire each step, the sink takes each step's frame,
+/// so nothing holds the relay), and take out the relay's fire record at step
+/// 5, its frame still in the bag.
+fn eager_recording_with_a_dropped_fire(
+    sink_type: &str,
+    sink: fn() -> IndexMap<String, Box<dyn NodeEntry>>,
+) -> Recording {
+    let mut rec = record_uniform_with_read_log(&eager_yaml(sink_type), sink, &[], NT_STEPS);
+    let one = |l: u32| std::collections::BTreeSet::from([l]);
+    assert_eq!(
+        nt_fire_levels(&rec),
+        BTreeMap::from([
+            ("relay".to_string(), one(1)),
+            ("sink".to_string(), one(2)),
+            ("src".to_string(), one(0)),
+        ])
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "sink"), (0..=9).collect::<Vec<_>>());
+    assert_eq!(
+        bh_xs(&rec, "/er/sink/out"),
+        (1..=10).map(f64::from).collect::<Vec<_>>(),
+        "the sink takes each step's frame"
+    );
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == 5)
+        .expect("the relay fires at step 5");
+    rec.trace.remove(at);
+    rec
+}
+
+/// The verdict on the relay's step 5 when it pops a frame and records no fire.
+const ER_STEP_5: &str = "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node \
+                         'relay' step 5 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 \
+                         fire(s)";
+
+/// A replayed build that declares `block` on an input the recording read
+/// `drop_oldest` excuses no hold. The eager graph recorded with the sink's `x`
+/// a plain context input: nothing holds the relay, so the relay's step 5 pop
+/// left unfired, its fire record taken out, has nothing to explain it. A
+/// replayed sink that declares `x` `block` at depth 1 would count the slot
+/// full with the step's own frame, but the bag states that the recording read
+/// `x` `drop_oldest`, so the edge is not counted and the step is the finding.
+#[test]
+#[serial]
+fn a_replayed_build_that_redeclares_a_recorded_drop_oldest_input_block_excuses_no_hold() {
+    let rec = eager_recording_with_a_dropped_fire("eager_plain_sink_node", || {
+        eager_factories(|| -> Box<dyn NodeEntry> { Box::new(EagerPlainSinkNodeEntry::new()) })
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("er_plain.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(
+        &bag,
+        || {
+            eager_factories(|| -> Box<dyn NodeEntry> {
+                Box::new(EagerShallowBlockSinkNodeEntry::new())
+            })
+        },
+        bh_clean_stamp(&rec),
+    );
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(ER_STEP_5)
+    );
+    assert!(!outcome.passed);
+}
+
+/// A replayed build that lowers the depth of a recorded `block` input excuses
+/// no hold. The eager graph recorded with `x` `block` at depth 4: the sink
+/// drains each frame the step it arrives, so the relay's step 5 pop left
+/// unfired, its fire record taken out, is the finding at the recorded depth. A
+/// replayed sink that declares depth 1 would count the slot full with the
+/// step's own frame, but the bag states depth 4, so the edge is not counted
+/// and the step is still the finding.
+#[test]
+#[serial]
+fn a_replayed_build_that_lowers_a_recorded_block_depth_excuses_no_hold() {
+    let deep = || {
+        eager_factories(|| -> Box<dyn NodeEntry> { Box::new(EagerDeepBlockSinkNodeEntry::new()) })
+    };
+    let rec = eager_recording_with_a_dropped_fire("eager_deep_block_sink_node", deep);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("er_deep.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let shallow = bh_replay_stamped(
+        &bag,
+        || {
+            eager_factories(|| -> Box<dyn NodeEntry> {
+                Box::new(EagerShallowBlockSinkNodeEntry::new())
+            })
+        },
+        bh_clean_stamp(&rec),
+    );
+    assert_eq!(
+        shallow.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(ER_STEP_5)
+    );
+    assert!(!shallow.passed);
+    let recorded_depth = bh_replay_stamped(&bag, deep, bh_clean_stamp(&rec));
+    assert_eq!(
+        recorded_depth
+            .trace_divergence
+            .as_ref()
+            .map(|d| d.detail.as_str()),
+        Some(ER_STEP_5),
+        "at the recorded depth the slot holds one frame of four"
+    );
+}
+
+/// The level-after graph of the non-trigger reader vector, with the sink's `x`
+/// keys `x_keys` in the graph.
+fn lc_yaml(x_keys: &str) -> String {
+    format!(
+        "name: lcgraph\nprefix: lc\nnodes:\n\
+         \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: relay\n    type: twin_relay_node\n    inputs:\n      - name: inp\n        source: src/out\n        depth: 11\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n      - name: out2\n        schema: geometry_msgs/Vector3\n\
+         \x20 - id: sink\n    type: later_block_sink_node\n    inputs:\n      - name: t\n        source: relay/out2\n      - name: x\n        source: relay/out\n{x_keys}    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+    )
+}
+
+fn lc_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        ("relay", Box::new(TwinRelayNodeEntry::new())),
+        ("sink", Box::new(LaterBlockSinkNodeEntry::new())),
+    ])
+}
+
+/// The `node_inputs` key of the `recorder.json` a bag carries.
+fn bag_node_inputs(bag: &std::path::Path) -> Option<serde_json::Value> {
+    let reader = BagReader::open(bag).expect("the bag opens");
+    let att = reader
+        .attachment("__cerulion/recorder.json")
+        .expect("the bag reads")
+        .expect("the bag carries recorder.json");
+    let doc: serde_json::Value = serde_json::from_slice(&att.data).expect("recorder.json parses");
+    doc.get("node_inputs").cloned()
+}
+
+/// A recording states the backpressure and depth it read each input with, and
+/// a replay whose build gives a `block` input the same depth counts its slot.
+/// The level-after graph, whose `x` declares `block` at depth 1 in the node
+/// alone: the bag's `node_inputs` names every input of every node with the
+/// policy and depth the run read it with, and the stamped replay allows for
+/// the holds and reproduces every frame.
+#[test]
+#[serial]
+fn a_recording_that_states_its_block_queue_keeps_the_hold_allowed_for() {
+    let rec = record_uniform_with_read_log(&lc_yaml(""), lc_factories, &[], BH_STEPS);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("lc_stated.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let queue = |backpressure: &str, depth: u64| serde_json::json!({"backpressure": backpressure, "depth": depth});
+    assert_eq!(
+        bag_node_inputs(&bag),
+        Some(serde_json::json!({
+            "relay": {"inp": queue("drop_oldest", 11)},
+            "sink": {"t": queue("drop_oldest", 10), "x": queue("block", 1)},
+            "src": {},
+        }))
+    );
+    let outcome = bh_replay_stamped(&bag, lc_factories, bh_clean_stamp(&rec));
+    bh_assert_replays(&outcome, "a recording that states its block queue");
+}
+
+/// A bag that does not state its input queues, recorded before the key, has
+/// a `block` slot counted only where its graph sets both `backpressure: block`
+/// and `depth:` for the input. The level-after graph with `x` declared `block`
+/// in the node alone: its slot is not counted, so the relay's step 2 pop left
+/// unfired, the hold's onset, is the finding. The same graph with both keys
+/// set on `x` replays clean.
+#[test]
+#[serial]
+fn a_bag_that_does_not_state_its_queues_counts_only_a_graph_declared_block_edge() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut rec = record_uniform_with_read_log(&lc_yaml(""), lc_factories, &[], BH_STEPS);
+    rec.node_inputs = None;
+    let bag = dir.path().join("lc_unstated.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    assert_eq!(bag_node_inputs(&bag), None);
+    let outcome = bh_replay_stamped(&bag, lc_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
+             step 2 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+        )
+    );
+    assert!(!outcome.passed);
+
+    let keyed = lc_yaml("        backpressure: block\n        depth: 1\n");
+    let mut rec = record_uniform_with_read_log(&keyed, lc_factories, &[], BH_STEPS);
+    rec.node_inputs = None;
+    let bag = dir.path().join("lc_keyed.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&bag, lc_factories, bh_clean_stamp(&rec));
+    bh_assert_replays(&outcome, "a graph that declares the block queue");
 }
 
 /// A relay nothing holds, on a bag that states its drain: its last fire is
