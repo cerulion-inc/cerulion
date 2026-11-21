@@ -65,8 +65,9 @@ pub enum RecordEnv {
     /// re-execution can detect that it changed without the bag carrying your
     /// secrets. The default.
     Allowlist,
-    /// Record values verbatim. Full fidelity, but the bag embeds whatever
-    /// secrets were in your environment (warned loudly at record time).
+    /// Record values verbatim, except a value that is not valid UTF-8, which
+    /// is stored as its hash. The bag embeds whatever secrets were in your
+    /// environment (warned loudly at record time).
     All,
     /// Record names only. A re-execution cannot compare environment values.
     None,

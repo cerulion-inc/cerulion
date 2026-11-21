@@ -30613,6 +30613,104 @@ mod env_divergence_tests {
         );
     }
 
+    /// The `env.json` the recorder writes for one variable given as raw bytes.
+    fn recorded(
+        mode: crate::graph_cmd::RecordEnvMode,
+        name: &str,
+        value: &[u8],
+    ) -> serde_json::Value {
+        use std::os::unix::ffi::OsStrExt as _;
+        let render = crate::graph_cmd::render_env_json(
+            mode,
+            [(
+                name.into(),
+                std::ffi::OsStr::from_bytes(value).to_os_string(),
+            )],
+        );
+        serde_json::from_slice(&render.bytes).expect("env.json parses")
+    }
+
+    #[test]
+    fn a_recorded_non_utf8_value_matches_its_raw_bytes_at_replay_and_a_change_is_reported() {
+        // FNV-1a 64 of \xff\xfe is 0a99c807b6f645b0 and of \xff\xfd
+        // 0a99cb07b6f64ac9, both computed outside the tree.
+        let env = br#"{"CER_X": {"fnv64": "0a99c807b6f645b0", "redacted": true, "utf8": false}}"#;
+        assert_eq!(
+            recorded(crate::graph_cmd::RecordEnvMode::All, "CER_X", b"\xff\xfe"),
+            serde_json::from_slice::<serde_json::Value>(env).unwrap(),
+            "the recorder writes this entry for the value"
+        );
+        assert!(compare_env_against(Some(env), &current(&[("CER_X", b"\xff\xfe")])).is_empty());
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("CER_X", b"\xff\xfd")])
+            )),
+            vec![row(
+                "CER_X",
+                "HashChanged",
+                "redacted variable 'CER_X' hash changed since recording (recorded \
+                 0a99c807b6f645b0, now 0a99cb07b6f64ac9)",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn a_names_only_entry_for_a_value_that_is_not_utf8_is_not_missing_while_it_is_set() {
+        let env = br#"{"CER_X": null}"#;
+        assert_eq!(
+            recorded(crate::graph_cmd::RecordEnvMode::None, "CER_X", b"\xff"),
+            serde_json::from_slice::<serde_json::Value>(env).unwrap(),
+            "the recorder writes this entry for the value"
+        );
+        assert!(compare_env_against(Some(env), &current(&[("CER_X", b"\xff")])).is_empty());
+        assert_eq!(
+            project(&compare_env_against(Some(env), &current(&[]))),
+            vec![row(
+                "CER_X",
+                "Missing",
+                "recorded (names-only) variable 'CER_X' is absent at replay",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn an_entry_marked_utf8_false_compares_like_the_same_hash_without_the_mark() {
+        // FNV-1a 64 of caf\xe9 (Latin-1 "café") is b538f990e85962dc, and of
+        // caf\xc3\xa9 (UTF-8 "café") 48e8823acfa40d89.
+        let marked =
+            br#"{"CER_X": {"fnv64": "b538f990e85962dc", "redacted": true, "utf8": false}}"#;
+        let unmarked = br#"{"CER_X": {"fnv64": "b538f990e85962dc", "redacted": true}}"#;
+        assert_eq!(
+            recorded(
+                crate::graph_cmd::RecordEnvMode::Allowlist,
+                "CER_X",
+                b"caf\xe9"
+            ),
+            serde_json::from_slice::<serde_json::Value>(marked).unwrap(),
+            "the recorder writes the marked entry for the value"
+        );
+        let changed = vec![row(
+            "CER_X",
+            "HashChanged",
+            "redacted variable 'CER_X' hash changed since recording (recorded \
+             b538f990e85962dc, now 48e8823acfa40d89)",
+            None,
+        )];
+        for env in [&marked[..], &unmarked[..]] {
+            assert!(compare_env_against(Some(env), &current(&[("CER_X", b"caf\xe9")])).is_empty());
+            assert_eq!(
+                project(&compare_env_against(
+                    Some(env),
+                    &current(&[("CER_X", b"caf\xc3\xa9")])
+                )),
+                changed
+            );
+        }
+    }
+
     #[test]
     fn a_shape_the_gate_refuses_yields_no_divergence() {
         let now = current(&[("CERULION_A", b"1")]);
