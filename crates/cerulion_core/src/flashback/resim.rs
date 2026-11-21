@@ -46,6 +46,13 @@
 //! malformed record BEFORE a departure advertised fault replay while resim
 //! refused it at the earlier record under a different error entirely, which is
 //! precisely the drift a shared verdict exists to prevent.
+//!
+//! Two arms read the capture's coordination stamp and judge free run only:
+//! worker ranks that begin apart ([`ResimGap::MixedStart`]), asked right below
+//! the boundary arm because a rank that begins at step 0 never reaches an
+//! anchor arm, and several worker ranks whose rank 0 resumes mid-run
+//! ([`ResimGap::FreeRunResumeUnsupported`]), asked right below the state-ring
+//! arm, where `resolve_resume` refuses it.
 
 use crate::state_restore::{plan_restore, AnchorFact, RestoreRequest};
 
@@ -85,11 +92,24 @@ pub struct ResimFacts<'a> {
     /// on a capture whose peer carries no anchor that is the peer's step 0: a
     /// from-start claim the reader refuses.
     ///
+    /// Under free run every entry is read: a capture whose ranks begin apart,
+    /// one at step 0 and another past it, is [`ResimGap::MixedStart`].
+    ///
     /// No entry for rank 0 means rank 0 kept no boundary. That is NOT the same
     /// as an empty trace (a trace of FIRE records with no boundary is possible
     /// on a torn head) and resim refuses it separately, so the two are kept
     /// apart here too.
     pub rank_first_steps: &'a [(u32, u64)],
+    /// The coordination contract the capture's `__cerulion/recorder.json`
+    /// states, read through [`recorded_coordination`], the stamp `bag play
+    /// --resim` reads.
+    ///
+    /// Two arms read it, and only a free-run stamp takes either:
+    /// [`ResimGap::MixedStart`] and [`ResimGap::FreeRunResumeUnsupported`]. A
+    /// [`RecordedCoordination::Unreadable`] stamp is judged as an unstamped
+    /// recording is, as lockstep; the replay refuses such a recording when it
+    /// reads its `recorder.json`, which no arm here asks.
+    pub coordination: RecordedCoordination,
     /// Whether the bag carries a `graph.yaml` attachment `run_replay` can
     /// actually USE — present, UTF-8, and parsing as a graph (its gate 4,
     /// immediately after the trace-presence gate).
@@ -561,6 +581,116 @@ pub fn stated_coordination(
     }
 }
 
+/// The remedy every free-run refusal of where a recording begins gives: a
+/// recording taken from the run's first step needs no resume.
+const RECORD_FROM_THE_FIRST_STEP: &str =
+    "record the run from its first step with `cerulion graph run --record`";
+
+/// The worker ranks of a free-run recording that begin at step 0 and the ones
+/// that begin past it, when it holds both. Only [`mixed_start`] builds one, so
+/// neither side is empty and each is ascending by rank.
+///
+/// Each free-run rank keeps its own boundary stream, so where its recording
+/// begins is its own. A rank that begins past step 0 can only be re-executed
+/// from its own checkpoint, and a rank that begins at step 0 from its
+/// constructor state; re-executing the two kinds side by side is not
+/// supported, so a capture of such a recording is not resimmable
+/// ([`ResimGap::MixedStart`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedStart {
+    /// The ranks that begin past step 0, each with its first step.
+    past_zero: Vec<(u32, u64)>,
+    /// The ranks that begin at step 0.
+    at_zero: Vec<u32>,
+}
+
+/// PURE: which of `rank_first_steps` begin at step 0 and which past it, or
+/// `None` unless there is at least one of each.
+///
+/// `rank_first_steps` holds each worker rank's first recorded step boundary
+/// as `(rank, step)`, in any order, one entry per rank that has one. Both
+/// sides come out sorted by rank, so the order the ranks arrive in cannot
+/// change the sentence; a rank listed twice keeps its earlier step.
+pub fn mixed_start(rank_first_steps: &[(u32, u64)]) -> Option<MixedStart> {
+    let mut firsts = rank_first_steps.to_vec();
+    firsts.sort_unstable();
+    firsts.dedup_by_key(|&mut (rank, _)| rank);
+    let (at_zero, past_zero): (Vec<_>, Vec<_>) =
+        firsts.into_iter().partition(|&(_, step)| step == 0);
+    if at_zero.is_empty() || past_zero.is_empty() {
+        return None;
+    }
+    Some(MixedStart {
+        past_zero,
+        at_zero: at_zero.into_iter().map(|(rank, _)| rank).collect(),
+    })
+}
+
+impl MixedStart {
+    /// The sentence a refusal of this recording gives: every rank on each side,
+    /// each late rank's first step, and the remedy.
+    ///
+    /// `from_a_capture` picks the noun: "capture" for a Flashback capture,
+    /// "bag" for any other recording, the noun the free-run mid-run refusal
+    /// ([`free_run_resume_unsupported_reason`]) uses.
+    pub fn sentence(&self, from_a_capture: bool) -> String {
+        let noun = if from_a_capture { "capture" } else { "bag" };
+        let past = match self.past_zero.as_slice() {
+            [(rank, step)] => {
+                format!("worker rank {rank} of this free-run {noun} begins at step {step}")
+            }
+            ranks => format!(
+                "worker ranks {} of this free-run {noun} begin past step 0",
+                and_list(
+                    ranks
+                        .iter()
+                        .map(|(rank, step)| format!("{rank} (first step {step})"))
+                )
+            ),
+        };
+        let at = match self.at_zero.as_slice() {
+            [rank] => format!("rank {rank} begins at step 0"),
+            ranks => format!(
+                "ranks {} begin at step 0",
+                and_list(ranks.iter().map(u32::to_string))
+            ),
+        };
+        format!(
+            "{past} while {at}, and re-executing a rank that begins past step 0 beside one \
+             that begins at step 0 is not supported: {RECORD_FROM_THE_FIRST_STEP}"
+        )
+    }
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: impl Iterator<Item = String>) -> String {
+    let items: Vec<String> = items.collect();
+    match items.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => items.concat(),
+    }
+}
+
+/// The sentence `bag play --resim` refuses a free-run recording of several
+/// worker ranks that begins mid-run with, and the reason a capture of one
+/// carries ([`ResimGap::FreeRunResumeUnsupported`]).
+///
+/// `first_step` is rank 0's first recorded step boundary and `ranks` the
+/// worker trace manifests the recording holds.
+pub fn free_run_resume_unsupported_reason(first_step: u64, ranks: usize) -> String {
+    format!(
+        "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
+         first recorded STEP_BOUNDARY is step {first_step}, not step 0), and it holds \
+         {ranks} worker ranks. A mid-run resume anchors on the ONE first recorded boundary \
+         and places the clock off that single value, which holds for exactly one worker \
+         rank, and a free-run recording with several ranks abolishes it: each rank keeps \
+         its own boundary stream and its own clock, so there is no single first boundary, \
+         {ranks} clocks cannot be placed off one value, and a frame stamp compared against \
+         it crosses clock domains. Per-rank resume anchors are not supported yet; \
+         {RECORD_FROM_THE_FIRST_STEP}"
+    )
+}
+
 /// WHY a capture cannot be resimmed.
 ///
 /// Each variant names the resim refusal it corresponds to, because the operator
@@ -627,6 +757,9 @@ pub enum ResimGap {
     /// The trace carries records but no step boundary — resim's
     /// `BagNoStepBoundaries`.
     NoBoundary,
+    /// Free-run worker ranks that begin apart: one at step 0 and another past
+    /// it. See [`MixedStart`].
+    MixedStart(MixedStart),
     /// Some rank carried a step boundary into the capture and keeps none, while
     /// another rank keeps one. See [`ResimFacts::ranks_without_a_kept_step`].
     ///
@@ -677,6 +810,15 @@ pub enum ResimGap {
         /// invocation and it does not walk, so the stored sentence fell as
         /// silent as the refusal used to.
         rank_space_walked: bool,
+    },
+    /// A free-run capture of several worker ranks whose rank 0 begins past step
+    /// 0: resim's `FreeRunResumeUnsupported`, in its own sentence
+    /// ([`free_run_resume_unsupported_reason`]).
+    FreeRunResumeUnsupported {
+        /// Rank 0's first kept step.
+        first_step: u64,
+        /// The worker ranks the capture attaches manifests for.
+        ranks: usize,
     },
     /// Two runs' anchors at the resume step — resim's `AmbiguousRun`.
     AmbiguousRun {
@@ -964,6 +1106,10 @@ impl ResimGap {
                                  says which step a resume would begin at. The frames and the \
                                  state are in the bag and readable"
                 .to_string(),
+            Self::MixedStart(start) => start.sentence(true),
+            Self::FreeRunResumeUnsupported { first_step, ranks } => {
+                free_run_resume_unsupported_reason(*first_step, *ranks)
+            }
             Self::MultiRing {
                 rings,
                 ranks_missing,
@@ -1139,7 +1285,9 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 /// still takes there are a rank left with no complete step
 /// ([`ResimGap::RankWithoutCompleteStep`]) and a kept read whose frame the
 /// capture does not hold ([`ResimGap::FrameNotHeld`]), neither of which an
-/// anchor would repair.
+/// anchor would repair. Under free run the arm is reached only when every
+/// worker rank that kept a boundary begins at step 0: a peer that begins past
+/// it is [`ResimGap::MixedStart`], asked first.
 pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     // 1. `BagNoSchedulerTrace` — the first thing `run_replay` refuses on.
     if facts.trace_records == 0 {
@@ -1271,6 +1419,21 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     else {
         return Err(ResimGap::NoBoundary);
     };
+    // 4a. Free-run worker ranks that begin apart, the recording's own shape
+    //     rather than a fact about any one step, so it is asked before the
+    //     from-start arm, which a rank past step 0 must not take, and before
+    //     every anchor arm, which a rank at step 0 never reaches.
+    let free_run = match &facts.coordination {
+        RecordedCoordination::FreeRun => true,
+        RecordedCoordination::Lockstep { .. } => false,
+        // Judged as an unstamped recording: see `ResimFacts::coordination`.
+        RecordedCoordination::Unreadable(_) => false,
+    };
+    if free_run {
+        if let Some(start) = mixed_start(facts.rank_first_steps) {
+            return Err(ResimGap::MixedStart(start));
+        }
+    }
     // 4b. A rank with no complete step, the recorder's own observation (see
     //     the field). Asked after the boundary arm, so a capture whose
     //     authoritative rank kept no boundary still names `NoBoundary` as the
@@ -1312,6 +1475,16 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
             rings: facts.state_rings_declared,
             ranks_missing: facts.ranks_missing.to_vec(),
             rank_space_walked: facts.rank_space_walked,
+        });
+    }
+    // 5a. `FreeRunResumeUnsupported`: several free-run worker ranks whose rank
+    //     0 resumes mid-run (a peer at step 0 was refused at 4a). `resolve_resume`
+    //     refuses it right after its state-ring refusal, before it resolves a run
+    //     or plans a restore, in the sentence this gap renders.
+    if free_run && facts.worker_manifest_ranks.len() > 1 {
+        return Err(ResimGap::FreeRunResumeUnsupported {
+            first_step: first_recorded_step,
+            ranks: facts.worker_manifest_ranks.len(),
         });
     }
     // 5b. The node map, and it belongs BELOW the ring count — this is the
@@ -1700,6 +1873,9 @@ mod tests {
             trace_records: 12,
             departure_records: 0,
             rank_first_steps: &[(0, 41)],
+            // A recording with no stamp, judged as lockstep, so the two
+            // free-run arms are inert unless an arm says otherwise.
+            coordination: RecordedCoordination::Lockstep { stamped: false },
             // One declared ring, and this recorder is reading it — so
             // the partial-trace gate is inert unless an arm says otherwise.
             trace_rings_declared: 1,
@@ -1802,6 +1978,8 @@ mod tests {
             trace_records: 0,
             departure_records: 3,
             rank_first_steps: &[],
+            // Free run, which the two free-run arms read, hostile as well.
+            coordination: RecordedCoordination::FreeRun,
             // A ring nobody read, too — so this also pins that the
             // partial-trace gate does not preempt the no-trace one.
             trace_rings_declared: 2,
@@ -1871,6 +2049,7 @@ mod tests {
             first_record_refusal: Some(TraceRecordRefusal::Fault(TraceRecordFault::ZeroedRecord)),
             departure_records: 3,
             rank_first_steps: &[],
+            coordination: RecordedCoordination::FreeRun,
             // A rank left without a step, hostile as well.
             ranks_without_a_kept_step: &[1],
             state_rings_declared: 4,
@@ -2920,6 +3099,384 @@ mod tests {
         }
     }
 
+    /// The free-run stamp, two worker ranks and the given first steps, every
+    /// other fact `healthy`.
+    fn free_run<'a>(
+        nodes: &'a [String],
+        anchors: &'a [AnchorFact],
+        rank_first_steps: &'a [(u32, u64)],
+    ) -> ResimFacts<'a> {
+        ResimFacts {
+            coordination: RecordedCoordination::FreeRun,
+            worker_manifest_ranks: &[0, 1],
+            rank_first_steps,
+            ..healthy(nodes, anchors)
+        }
+    }
+
+    /// A start, written out by hand.
+    fn start(past_zero: &[(u32, u64)], at_zero: &[u32]) -> MixedStart {
+        MixedStart {
+            past_zero: past_zero.to_vec(),
+            at_zero: at_zero.to_vec(),
+        }
+    }
+
+    /// Every stamp that is not free run, the unreadable ones included.
+    fn not_free_run() -> [RecordedCoordination; 5] {
+        [
+            RecordedCoordination::Lockstep { stamped: true },
+            RecordedCoordination::Lockstep { stamped: false },
+            RecordedCoordination::Unreadable(UnreadableCoordination::NotJson),
+            RecordedCoordination::Unreadable(UnreadableCoordination::NotAnObject),
+            RecordedCoordination::Unreadable(UnreadableCoordination::UnknownStamp(
+                "\"barrier\"".to_string(),
+            )),
+        ]
+    }
+
+    /// `mixed_start` answers only when a rank begins at step 0 AND another past
+    /// it, each side sorted by rank whatever order the ranks arrive in.
+    #[test]
+    fn a_mixed_start_needs_a_rank_at_step_0_and_one_past_it() {
+        for firsts in [
+            &[][..],
+            &[(0, 0)][..],
+            &[(0, 6)][..],
+            &[(0, 0), (1, 0), (2, 0)][..],
+            &[(0, 3), (1, 6)][..],
+            // One rank listed twice is one rank, and its earlier step is 0.
+            &[(1, 6), (1, 0)][..],
+        ] {
+            assert_eq!(mixed_start(firsts), None, "{firsts:?}");
+        }
+        assert_eq!(mixed_start(&[(0, 0), (1, 1)]), Some(start(&[(1, 1)], &[0])));
+        assert_eq!(mixed_start(&[(0, 5), (1, 0)]), Some(start(&[(0, 5)], &[1])));
+        assert_eq!(
+            mixed_start(&[(0, 0), (1, u64::MAX)]),
+            Some(start(&[(1, u64::MAX)], &[0]))
+        );
+        let want = Some(start(&[(1, 6), (2, 9)], &[0, 3]));
+        for firsts in [
+            [(0, 0), (1, 6), (2, 9), (3, 0)],
+            [(3, 0), (2, 9), (1, 6), (0, 0)],
+            [(2, 9), (0, 0), (3, 0), (1, 6)],
+            [(1, 6), (3, 0), (0, 0), (2, 9)],
+        ] {
+            assert_eq!(mixed_start(&firsts), want, "{firsts:?}");
+        }
+        // A rank listed twice keeps its earlier step.
+        assert_eq!(
+            mixed_start(&[(1, 6), (0, 0), (1, 4)]),
+            Some(start(&[(1, 4)], &[0]))
+        );
+    }
+
+    /// The list joins one item alone, two with `and`, and three or more with
+    /// commas and a final `and`.
+    #[test]
+    fn a_list_reads_as_one_item_or_ends_with_and() {
+        let list = |items: &[&str]| and_list(items.iter().map(|s| s.to_string()));
+        assert_eq!(list(&[]), "");
+        assert_eq!(list(&["0"]), "0");
+        assert_eq!(list(&["0", "3"]), "0 and 3");
+        assert_eq!(list(&["0", "1", "2"]), "0, 1 and 2");
+    }
+
+    /// The sentence names each side in the one-rank and the several-rank form,
+    /// lists three as `a, b and c`, and calls a bag that is not a capture a bag.
+    #[test]
+    fn the_mixed_start_sentence_names_every_rank_on_each_side() {
+        let tail = "and re-executing a rank that begins past step 0 beside one that begins at \
+                    step 0 is not supported: record the run from its first step with `cerulion \
+                    graph run --record`";
+        assert_eq!(
+            start(&[(1, 2), (2, 4), (3, 8)], &[0]).sentence(false),
+            format!(
+                "worker ranks 1 (first step 2), 2 (first step 4) and 3 (first step 8) of this \
+                 free-run bag begin past step 0 while rank 0 begins at step 0, {tail}"
+            )
+        );
+        assert_eq!(
+            start(&[(3, 5)], &[0, 1, 2]).sentence(true),
+            format!(
+                "worker rank 3 of this free-run capture begins at step 5 while ranks 0, 1 and 2 \
+                 begin at step 0, {tail}"
+            )
+        );
+        assert_eq!(
+            start(&[(1, 6)], &[0]).sentence(false),
+            format!(
+                "worker rank 1 of this free-run bag begins at step 6 while rank 0 begins at step \
+                 0, {tail}"
+            )
+        );
+        // Every order of one set of ranks renders one sentence, twice alike.
+        let one = mixed_start(&[(0, 0), (1, 6), (2, 9), (3, 0)])
+            .expect("a mixed start")
+            .sentence(true);
+        for firsts in [
+            [(3, 0), (2, 9), (1, 6), (0, 0)],
+            [(2, 9), (0, 0), (3, 0), (1, 6)],
+        ] {
+            let start = mixed_start(&firsts).expect("a mixed start");
+            assert_eq!(start.sentence(true), one, "{firsts:?}");
+            assert_eq!(start.sentence(true), start.sentence(true));
+        }
+    }
+
+    /// The free-run mid-run refusal names the first step and the rank count,
+    /// and gives one remedy.
+    #[test]
+    fn the_free_run_resume_refusal_names_the_step_the_ranks_and_one_remedy() {
+        assert_eq!(
+            free_run_resume_unsupported_reason(12, 3),
+            "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
+             first recorded STEP_BOUNDARY is step 12, not step 0), and it holds 3 worker ranks. \
+             A mid-run resume anchors on the ONE first recorded boundary and places the clock \
+             off that single value, which holds for exactly one worker rank, and a free-run \
+             recording with several ranks abolishes it: each rank keeps its own boundary stream \
+             and its own clock, so there is no single first boundary, 3 clocks cannot be placed \
+             off one value, and a frame stamp compared against it crosses clock domains. \
+             Per-rank resume anchors are not supported yet; record the run from its first step \
+             with `cerulion graph run --record`"
+        );
+        assert_eq!(
+            ResimGap::FreeRunResumeUnsupported {
+                first_step: 12,
+                ranks: 3
+            }
+            .reason(),
+            free_run_resume_unsupported_reason(12, 3),
+            "the capture's reason is the replay's sentence"
+        );
+    }
+
+    /// Under free run, ranks that begin apart are refused by name in both
+    /// directions; under every other stamp the judge answers as it does for a
+    /// recording with no stamp.
+    #[test]
+    fn free_run_ranks_that_begin_apart_are_refused_by_name() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let later = [(0, 0), (1, 6)];
+        let reverse = [(1, 0), (0, 41)];
+        assert_eq!(
+            judge_resimmable(&free_run(&nodes, &anchors, &later)),
+            Err(ResimGap::MixedStart(start(&[(1, 6)], &[0])))
+        );
+        assert_eq!(
+            judge_resimmable(&free_run(&nodes, &anchors, &reverse)),
+            Err(ResimGap::MixedStart(start(&[(0, 41)], &[1])))
+        );
+        for coordination in not_free_run() {
+            for firsts in [&later[..], &reverse[..]] {
+                assert_eq!(
+                    judge_resimmable(&ResimFacts {
+                        coordination: coordination.clone(),
+                        ..free_run(&nodes, &anchors, firsts)
+                    }),
+                    Ok(()),
+                    "{coordination:?} {firsts:?}"
+                );
+            }
+        }
+        // Ranks that begin together, and a peer with no boundary, do not vote.
+        for firsts in [&[(0, 0), (1, 0)][..], &[(0, 0)][..]] {
+            assert_eq!(
+                judge_resimmable(&free_run(&nodes, &anchors, firsts)),
+                Ok(()),
+                "{firsts:?}"
+            );
+        }
+        // Two judgements of one capture are one verdict.
+        let facts = free_run(&nodes, &anchors, &later);
+        assert_eq!(judge_resimmable(&facts), judge_resimmable(&facts.clone()));
+    }
+
+    /// The arm sits right below the boundary arm: every gate above it names
+    /// itself first, and it names itself before every arm below it.
+    #[test]
+    fn the_mixed_start_arm_sits_below_the_boundary_arm_and_above_every_anchor_arm() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let firsts = [(0, 41), (1, 0)];
+        let mixed = free_run(&nodes, &anchors, &firsts);
+        let above = [
+            (
+                ResimFacts {
+                    trace_records: 0,
+                    ..mixed.clone()
+                },
+                ResimGap::NoTrace,
+            ),
+            (
+                ResimFacts {
+                    graph_attachment_present: false,
+                    ..mixed.clone()
+                },
+                ResimGap::NoGraph,
+            ),
+            (
+                ResimFacts {
+                    worker_manifest_ranks: &[0, 2],
+                    ..mixed.clone()
+                },
+                ResimGap::RankManifestGap { missing: 1 },
+            ),
+            (
+                ResimFacts {
+                    trace_gap: Some(TraceGap {
+                        last_step_before: 41,
+                        first_step_after: Some(44),
+                    }),
+                    ..mixed.clone()
+                },
+                ResimGap::TraceLapped {
+                    last_step_before: 41,
+                    first_step_after: Some(44),
+                },
+            ),
+            (
+                ResimFacts {
+                    trace_rings_unreadable: 1,
+                    ..mixed.clone()
+                },
+                ResimGap::TracePartial {
+                    declared: 1,
+                    unreadable: 1,
+                },
+            ),
+            (
+                ResimFacts {
+                    first_record_refusal: Some(TraceRecordRefusal::Departure),
+                    departure_records: 1,
+                    ..mixed.clone()
+                },
+                ResimGap::FaultReplay { departures: 1 },
+            ),
+            (
+                ResimFacts {
+                    rank_first_steps: &[(1, 0), (2, 41)],
+                    ..mixed.clone()
+                },
+                ResimGap::NoBoundary,
+            ),
+        ];
+        for (facts, want) in above {
+            assert_eq!(judge_resimmable(&facts), Err(want));
+        }
+        let missing = [1u32];
+        let below = [
+            ResimFacts {
+                state_rings_declared: 2,
+                ..mixed.clone()
+            },
+            ResimFacts {
+                required_nodes_known: false,
+                ..mixed.clone()
+            },
+            ResimFacts {
+                anchor_run_ids_at_anchor_step: 2,
+                ..mixed.clone()
+            },
+            free_run(&nodes, &[], &firsts),
+            ResimFacts {
+                ranks_without_a_kept_step: &missing,
+                ..mixed.clone()
+            },
+            ResimFacts {
+                frame_gap: Some(late_gap()),
+                ..mixed.clone()
+            },
+        ];
+        for facts in below {
+            assert_eq!(
+                judge_resimmable(&facts),
+                Err(ResimGap::MixedStart(start(&[(0, 41)], &[1])))
+            );
+        }
+    }
+
+    /// A free-run capture of several worker ranks whose rank 0 resumes mid-run
+    /// reads the replay's own refusal, after the state-ring arm and before the
+    /// node map and the anchor arms; one rank, or any other stamp, does not.
+    #[test]
+    fn a_free_run_capture_of_several_ranks_resuming_mid_run_reads_the_replays_refusal() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let refusal = |ranks| {
+            Err(ResimGap::FreeRunResumeUnsupported {
+                first_step: 41,
+                ranks,
+            })
+        };
+        // Both ranks past step 0, and a peer that kept no boundary.
+        for firsts in [&[(0, 41), (1, 38)][..], &[(0, 41)][..]] {
+            assert_eq!(
+                judge_resimmable(&free_run(&nodes, &anchors, firsts)),
+                refusal(2),
+                "{firsts:?}"
+            );
+        }
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                worker_manifest_ranks: &[0, 1, 2],
+                ..free_run(&nodes, &anchors, &[(0, 41), (2, 45)])
+            }),
+            refusal(3)
+        );
+        let firsts = [(0, 41), (1, 38)];
+        let both = free_run(&nodes, &anchors, &firsts);
+        assert!(matches!(
+            judge_resimmable(&ResimFacts {
+                state_rings_declared: 2,
+                ..both.clone()
+            }),
+            Err(ResimGap::MultiRing { .. })
+        ));
+        let missing = [1u32];
+        for facts in [
+            ResimFacts {
+                required_nodes_known: false,
+                ..both.clone()
+            },
+            ResimFacts {
+                anchor_run_ids_at_anchor_step: 2,
+                ..both.clone()
+            },
+            free_run(&nodes, &[], &firsts),
+            ResimFacts {
+                ranks_without_a_kept_step: &missing,
+                ..both.clone()
+            },
+            ResimFacts {
+                frame_gap: Some(late_gap()),
+                ..both.clone()
+            },
+        ] {
+            assert_eq!(judge_resimmable(&facts), refusal(2));
+        }
+        // One worker rank takes the ordinary resume.
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                worker_manifest_ranks: &[0],
+                ..free_run(&nodes, &anchors, &[(0, 41)])
+            }),
+            Ok(())
+        );
+        for coordination in not_free_run() {
+            assert_eq!(
+                judge_resimmable(&ResimFacts {
+                    coordination: coordination.clone(),
+                    ..both.clone()
+                }),
+                Ok(()),
+                "{coordination:?}"
+            );
+        }
+    }
+
     /// A rank the capture left with no complete step refuses, from start and
     /// resumed alike, once some boundary exists, and after the anchor gates on
     /// a resumed capture.
@@ -3003,6 +3560,13 @@ mod tests {
             },
             ResimGap::FaultReplay { departures: 1 },
             ResimGap::NoBoundary,
+            ResimGap::MixedStart(start(&[(1, 6)], &[0])),
+            ResimGap::MixedStart(start(&[(1, 6), (2, 9)], &[0, 3])),
+            ResimGap::MixedStart(start(&[(0, 3)], &[1])),
+            ResimGap::FreeRunResumeUnsupported {
+                first_step: 6,
+                ranks: 2,
+            },
             ResimGap::RankWithoutCompleteStep { ranks: vec![1] },
             ResimGap::MultiRing {
                 rings: 2,
@@ -3042,6 +3606,30 @@ mod tests {
                 },
             },
         ];
+        // The mixed start's three forms, written out: one rank on each side,
+        // several, and rank 0 the late one.
+        let tail = "and re-executing a rank that begins past step 0 beside one that begins at \
+                    step 0 is not supported: record the run from its first step with `cerulion \
+                    graph run --record`";
+        for (gap, lead) in [
+            (
+                &gaps[7],
+                "worker rank 1 of this free-run capture begins at step 6 while rank 0 begins at \
+                 step 0,",
+            ),
+            (
+                &gaps[8],
+                "worker ranks 1 (first step 6) and 2 (first step 9) of this free-run capture \
+                 begin past step 0 while ranks 0 and 3 begin at step 0,",
+            ),
+            (
+                &gaps[9],
+                "worker rank 0 of this free-run capture begins at step 3 while rank 1 begins at \
+                 step 0,",
+            ),
+        ] {
+            assert_eq!(gap.reason(), format!("{lead} {tail}"));
+        }
         let mut seen: Vec<String> = Vec::new();
         for gap in &gaps {
             let reason = gap.reason();

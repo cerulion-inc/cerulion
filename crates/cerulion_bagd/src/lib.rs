@@ -9891,6 +9891,15 @@ fn judge_capture_resimmable(
             trace_records: trimmed.records.len(),
             departure_records: trimmed.departures,
             rank_first_steps: &rank_first_steps,
+            // The contract the capture's own `recorder.json` states, the stamp
+            // `bag play --resim` reads off the same attachment. No document
+            // reads as an unstamped recording.
+            coordination: cerulion_core::flashback::resim::recorded_coordination(
+                attachments
+                    .iter()
+                    .find(|(name, _)| name == RECORDER_JSON_ATTACHMENT)
+                    .map(|(_, bytes)| bytes.as_slice()),
+            ),
             // The hole this recorder watched open in its own
             // read of the ring, and the edges of the record stream that has to
             // straddle it for this capture to be holding it. Measured HERE, over
@@ -29364,8 +29373,10 @@ mod frame_coverage_judge_tests {
 mod ranks_begin_apart_judge_tests {
     //! The capture judge on two-rank captures whose ranks begin at different
     //! steps, through the adapter, over hand-built traces trimmed the way a
-    //! capture trims them and the `recorder.json` the capture carries. Every
-    //! verdict is written out by hand. No shared memory, no race.
+    //! capture trims them and the `recorder.json` the capture carries: the
+    //! free-run stamp refuses them by name, and every other document keeps the
+    //! judgement of a recording with no stamp. Every verdict is written out by
+    //! hand. No shared memory, no race.
     use super::*;
     use cerulion_core::flashback::resim::ResimGap;
     use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
@@ -29623,13 +29634,56 @@ mod ranks_begin_apart_judge_tests {
         assert_eq!(firsts(one_rank_from_its_anchor()), [(0, Some(6))]);
     }
 
-    /// What the judge says about each shape, whatever the capture's stamp: rank
-    /// 1 beginning later reads resimmable (rank 0's first kept step is 0), and
-    /// both shapes whose rank 0 resumes mid-run read the unknown node map of a
-    /// recorder holding two trace rings.
+    /// The free-run stamp: ranks that begin apart, in either direction, are
+    /// refused by name, and a rank 0 that resumes mid-run beside a peer that
+    /// begins past step 0 reads the replay's own free-run mid-run refusal.
     #[test]
-    fn a_capture_whose_ranks_begin_apart_is_judged_on_rank_0_alone() {
-        for stamp in STAMPS {
+    fn a_free_run_capture_whose_ranks_begin_apart_is_refused_by_name() {
+        let reason = |shape: Shape| match verdict(&shape, Stamp::FreeRun) {
+            Err(gap @ ResimGap::MixedStart(_)) => gap.reason(),
+            other => panic!("expected MixedStart, got {other:?}"),
+        };
+        assert_eq!(
+            reason(rank_1_begins_later()),
+            "worker rank 1 of this free-run capture begins at step 6 while rank 0 begins at \
+             step 0, and re-executing a rank that begins past step 0 beside one that begins at \
+             step 0 is not supported: record the run from its first step with `cerulion graph \
+             run --record`"
+        );
+        assert_eq!(
+            reason(rank_0_begins_later()),
+            "worker rank 0 of this free-run capture begins at step 6 while rank 1 begins at \
+             step 0, and re-executing a rank that begins past step 0 beside one that begins at \
+             step 0 is not supported: record the run from its first step with `cerulion graph \
+             run --record`"
+        );
+        assert_eq!(
+            verdict(&both_begin_past_step_0(), Stamp::FreeRun),
+            Err(ResimGap::FreeRunResumeUnsupported {
+                first_step: 6,
+                ranks: 2
+            })
+        );
+        // One capture, judged twice, is one verdict.
+        for shape in [
+            rank_1_begins_later,
+            rank_0_begins_later,
+            both_begin_past_step_0,
+        ] {
+            assert_eq!(
+                verdict(&shape(), Stamp::FreeRun),
+                verdict(&shape(), Stamp::FreeRun)
+            );
+        }
+    }
+
+    /// Every other document a capture can carry keeps the judgement of a
+    /// recording with no stamp: rank 1 beginning later reads resimmable (rank
+    /// 0's first kept step is 0), and both shapes whose rank 0 resumes mid-run
+    /// read the unknown node map of a recorder holding two trace rings.
+    #[test]
+    fn under_any_other_stamp_ranks_that_begin_apart_are_judged_on_rank_0_alone() {
+        for stamp in STAMPS.into_iter().filter(|s| *s != Stamp::FreeRun) {
             assert_eq!(verdict(&rank_1_begins_later(), stamp), Ok(()), "{stamp:?}");
             assert_eq!(
                 verdict(&rank_0_begins_later(), stamp),

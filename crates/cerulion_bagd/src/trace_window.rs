@@ -485,7 +485,8 @@ pub(crate) struct RankTrim {
     /// The step of this rank's FIRST kept step-boundary record.
     ///
     /// The capture judge reads rank 0's as the step a resume begins at, since
-    /// the replay window is rank 0's boundary stream
+    /// the replay window is rank 0's boundary stream, and every worker rank's to
+    /// tell free-run ranks that begin apart from ranks that begin together
     /// (`cerulion_core::flashback::resim::ResimFacts::rank_first_steps`).
     pub first_recorded_step: Option<u64>,
     /// The gating-clock value at THIS rank's anchor step's own boundary.

@@ -29370,15 +29370,19 @@ fn a_multi_rank_free_run_mid_run_bag_is_refused_by_name() {
                 "free_run",
                 "2 worker ranks",
                 "not supported yet",
-                "ONE process group",
-                "from its start",
+                "record the run from its first step with `cerulion graph run --record`",
             ] {
                 assert!(
                     msg.contains(needle),
-                    "the refusal names the stamp, the count, the limitation and both remedies \
+                    "the refusal names the stamp, the count, the limitation and the remedy \
                      (missing {needle:?}): {msg}"
                 );
             }
+            assert_eq!(
+                msg,
+                cerulion_core::flashback::resim::free_run_resume_unsupported_reason(2, 2),
+                "the replay prints the sentence a capture of this shape carries"
+            );
         }
         other => panic!("expected FreeRunResumeUnsupported, got {other:?}"),
     }

@@ -1,11 +1,12 @@
 # Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
 # the live loop's wait sizing, its period-park decisions, the framework-section
-# codec and the capture judge's frame check.
+# codec, the capture judge's frame check and its start of each rank.
 #
 # Scope: the two pure parser files, the pure wait-sizing and period-park
 # functions named below, the framework-section codec in state_restore.rs (its
 # changed lines), the three frame-check functions in flashback/resim.rs named
-# below, and the oracle mutants listed below, each on one pure decision
+# below, the rank-start functions and judge lines in the same file named below,
+# and the oracle mutants listed below, each on one pure decision
 # function. The rest of the crate holds transport and scheduler paths that the
 # mutation rule does not cover.
 #
@@ -81,6 +82,25 @@
 # `new`. The unsorted sequences in
 # `flashback::resim::tests::the_first_named_frame_the_capture_does_not_hold_is_the_gap`
 # hold its sort; its dedup changes no answer `first_frame_gap` gives.
+#
+# Capture judge's start of each rank: `mixed_start` (free-run worker ranks
+# that begin at step 0 beside ranks that begin past it), `MixedStart::sentence`
+# and `and_list` (that refusal's sentence), `free_run_resume_unsupported_reason`
+# (the free-run mid-run refusal the replay and the judge both give) and the
+# changed lines of `judge_resimmable` and `ResimGap::reason`: rank 0's first
+# step read out of every rank's, and the two free-run arms.
+#
+# Run:     cargo mutants -p cerulion_core --in-place --cap-lints true \
+#            -f crates/cerulion_core/src/flashback/resim.rs \
+#            --in-diff <the change's diff of that file> -- --lib flashback
+# Result:  21 mutants: 19 caught, 1 unviable (do not compile), 1 missed. The
+#          unviable mutant returns `Some(Default::default())` from
+#          `mixed_start`, and `MixedStart` has no default. The missed mutant
+#          replaced the guard in `and_list` with `true`: `MixedStart::sentence`
+#          hands it two or more items only, so no sentence held its one-item
+#          case. `flashback::resim::tests::a_list_reads_as_one_item_or_ends_with_and`
+#          now holds it. Re-run over `and_list` (--re and_list) after that
+#          test: 5 mutants, 5 caught, 0 missed.
 #
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
