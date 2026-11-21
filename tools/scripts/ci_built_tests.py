@@ -37,6 +37,67 @@ SLACK_NS = 200_000_000
 KEPT_FILE = re.compile(r'\.(so|dylib|dll)(\.\d+)*$|\.(rlib|rmeta|d|a|lib)$')
 # libtest arguments that still run every test of a binary
 WHOLE_RUN_ARGS = {'--nocapture', '--show-output', '--include-ignored', '-q', '--quiet'}
+# The one condition an audit step may carry: the classifier's `code` output, in
+# a job whose runner follows that output and whose every step is skipped when
+# no package is reached, so a skipped audit audits a leg that built and ran
+# nothing.
+CODE_GATE = "needs.changes.outputs.code == 'true'"
+
+
+def step_condition(step):
+    """The `if:` of one step block, or None: the step's own key, as its first
+    key (`- if:`) or at the step's key indent, never a line inside a `run:`
+    script. A folded (`>-`, `>`) or literal (`|`) value is its lines joined
+    onto one, read up to the first line not indented under the key."""
+    m = re.search(r'^(?:      - |        )if:[ ]*(.*?)\r?$', step, re.M)
+    if not m:
+        return None
+    value = m.group(1).strip()
+    if value in ('>-', '>', '|', '>+', '|-', '|+'):
+        deeper = []
+        for line in step[m.end():].split('\n')[1:]:
+            if not line.startswith('          '):
+                break
+            deeper.append(line.strip())
+        value = ' '.join(deeper)
+    return value
+
+
+def top_level_terms(cond):
+    """`cond` split at each `&&` outside parentheses and quotes."""
+    terms, depth, quote, start, i = [], 0, None, 0, 0
+    while i < len(cond):
+        c = cond[i]
+        if quote:
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c == '(':
+            depth += 1
+        elif c == ')':
+            depth -= 1
+        elif depth == 0 and cond.startswith('&&', i):
+            terms.append(cond[start:i].strip())
+            start = i + 2
+            i += 1
+        i += 1
+    terms.append(cond[start:].strip())
+    return terms
+
+
+def holds_code_gate(cond):
+    """Whether `cond` is an `&&` chain with CODE_GATE as one of its terms outside
+    every parenthesis, so it is false whenever CODE_GATE is. Any `||` is
+    refused: `a && b || c` holds with `a` false. A gate inside a negation or
+    parentheses is no term of the chain."""
+    if cond is None:
+        return False
+    cond = cond.strip()
+    if cond.startswith('${{') and cond.endswith('}}'):
+        cond = cond[3:-2].strip()
+    if '||' in cond:
+        return False
+    return CODE_GATE in top_level_terms(cond)
 
 
 def die(msg):
@@ -278,8 +339,10 @@ def job_blocks(text):
 
 def workflow_complaints(text):
     """Each leg builds exactly the packages its steps run, `+` exactly where the
-    step has no selection condition, the build comes first, and every cargo
-    command that can compile is a `run` or a declared `phase`."""
+    step has no selection condition, the build comes first, every cargo command
+    that can compile is a `run` or a declared `phase`, and the audit carries no
+    condition but, at most, CODE_GATE, and that only in a job whose runner
+    follows `code` and whose every build step carries the gate too."""
     out = []
     for job, steps in sorted(job_blocks(text).items()):
         legs = re.search(r'shard: \[([\d, ]+)\]', '\n'.join(steps)) or re.search(
@@ -288,8 +351,20 @@ def workflow_complaints(text):
         built, ran, seen_build = {l: {} for l in legs}, {l: {} for l in legs}, False
         audits = [i for i, st in enumerate(steps) if 'ci_built_tests.py audit' in st]
         runs = [i for i, st in enumerate(steps) if 'ci_built_tests.py run --' in st]
-        if not audits or re.search(r'^\s+if:', steps[audits[-1]], re.M) or (runs and audits[-1] < runs[-1]):
-            out.append(f'{job}: needs an audit step with no condition after its last run step')
+        audit_if = step_condition(steps[audits[-1]]) if audits else None
+        code_gated = audit_if == CODE_GATE
+        if not audits or (audit_if is not None and not code_gated) or (runs and audits[-1] < runs[-1]):
+            out.append(f'{job}: needs an audit step after its last run step with no condition, or with '
+                       f'exactly `{CODE_GATE}`')
+        if code_gated:
+            head = re.search(rf'^  {re.escape(job)}:[ \t]*\r?$(.*?)^    steps:', text, re.M | re.S)
+            runner = head and re.search(r'^    runs-on:[ ]*(.*?)\r?$', head.group(1), re.M)
+            if not (runner and 'needs.changes.outputs.code' in runner.group(1)):
+                out.append(f'{job}: the audit is gated on `code`, but the runner does not follow `code`')
+            for st in steps:
+                if 'ci_built_tests.py build' in st and not holds_code_gate(step_condition(st)):
+                    out.append(f'{job}: the audit is gated on `code`, so the build step must carry that gate '
+                               f'as a whole `&&` term, with no `||`')
         for st in steps:
             if 'ci_built_tests.py build' in st:
                 seen_build = True
@@ -319,7 +394,7 @@ def workflow_complaints(text):
                 pkg = sel['package']
                 if not seen_build:
                     out.append(f'{job}: `{pkg}` runs before the build step')
-                cond = (re.search(r'^\s+if: (.*)$', st, re.M) or re.search('()', '')).group(1)
+                cond = step_condition(st) or ''
                 gate = re.findall(r"contains\(fromJSON\(needs\.changes\.outputs\.pkgs\), '([^']+)'\)", cond)
                 if gate and gate != [pkg]:
                     out.append(f'{job}: the `{pkg}` step is gated on {gate}')
@@ -690,6 +765,51 @@ def self_test():
                                                           'python3 ci_built_tests.py audit\n      - name: c\n')
              .split('      - name: Audit\n        run: python3 ci_built_tests.py audit --floor 3')[0], 1),
             ('a gated audit', good.replace('      - name: Audit\n', '      - name: Audit\n        if: always()\n'), 1)):
+        check(f'wiring: {name}', len(workflow_complaints(bad)), want)
+    # A job whose runner follows `code`, as `test-macos`'s does.
+    routed = good.replace('  t:\n', "  t:\n    runs-on: ${{ needs.changes.outputs.code == 'true' && 'macos-latest'"
+                                    " || 'ubuntu-latest' }}\n")
+    audit_on_code = '      - name: Audit\n        if: %s\n' % CODE_GATE
+
+    def build_on(cond):
+        return '      - name: Build\n        if: %s\n' % cond
+    check('wiring: an audit and a build both gated on code in a routed job', workflow_complaints(
+        routed.replace('      - name: Audit\n', audit_on_code).replace('      - name: Build\n', build_on(CODE_GATE))), [])
+    check('wiring: a build gated on code and a leg in a routed job', workflow_complaints(
+        routed.replace('      - name: Audit\n', audit_on_code)
+        .replace('      - name: Build\n', build_on('matrix.shard != 3 && ' + CODE_GATE))), [])
+    check('wiring: a build gated on code in an expression wrapper', workflow_complaints(
+        routed.replace('      - name: Audit\n', audit_on_code)
+        .replace('      - name: Build\n', build_on('${{ matrix.shard != 3 && %s }}' % CODE_GATE))), [])
+    check('wiring: an `if:` inside a run script is no step condition', workflow_complaints(
+        good.replace('python3 ci_built_tests.py audit --floor 3', '|\n          if: x\n          python3 '
+                     'ci_built_tests.py audit --floor 3')), [])
+    check('wiring: a build gated on code in a folded condition', workflow_complaints(
+        routed.replace('      - name: Audit\n', audit_on_code).replace(
+            '      - name: Build\n', '      - name: Build\n        if: >-\n          matrix.shard != 3\n'
+            '          && %s\n' % CODE_GATE)), [])
+    for name, bad, want in (
+            ('an audit gated on code beside another term', routed.replace(
+                '      - name: Audit\n', f'      - name: Audit\n        if: always() && {CODE_GATE}\n')
+             .replace('      - name: Build\n', build_on(CODE_GATE)), 1),
+            ('an audit gated on code after a build that is not', routed.replace('      - name: Audit\n', audit_on_code), 1),
+            ('an audit gated on another term after a build gated on code', routed.replace(
+                '      - name: Audit\n', '      - name: Audit\n        if: always()\n')
+             .replace('      - name: Build\n', build_on(CODE_GATE)), 1),
+            ('a build gated on code or a leg', routed.replace('      - name: Audit\n', audit_on_code)
+             .replace('      - name: Build\n', build_on('matrix.shard == 0 || ' + CODE_GATE)), 1),
+            ('a build gated on the code gate and then or', routed.replace('      - name: Audit\n', audit_on_code)
+             .replace('      - name: Build\n', build_on(CODE_GATE + ' && matrix.shard == 0 || matrix.shard == 1')), 1),
+            ('a build gated on the negated code gate', routed.replace('      - name: Audit\n', audit_on_code)
+             .replace('      - name: Build\n', build_on('!(%s)' % CODE_GATE)), 1),
+            ('a code-gated audit in a job whose runner does not follow code', good.replace(
+                '      - name: Audit\n', audit_on_code).replace('      - name: Build\n', build_on(CODE_GATE)), 1),
+            ('a code-gated audit in a job on a fixed runner', good.replace('  t:\n', '  t:\n    runs-on: macos-latest\n')
+             .replace('      - name: Audit\n', audit_on_code).replace('      - name: Build\n', build_on(CODE_GATE)), 1),
+            ('a build gated on code inside a negation', routed.replace('      - name: Audit\n', audit_on_code)
+             .replace('      - name: Build\n', build_on('!(matrix.shard != 3 && %s && matrix.shard != 4)' % CODE_GATE)), 1),
+            ('an audit whose condition is its first key', good.replace(
+                '      - name: Audit\n', '      - if: always()\n        name: Audit\n'), 1)):
         check(f'wiring: {name}', len(workflow_complaints(bad)), want)
     end_to_end(check, refused)
     for f in fails:

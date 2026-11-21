@@ -58,7 +58,8 @@ test that loads it.
 
 `all` in the observed column means the observer reached something this walk
 could not attribute to one package: it rides every selection that names a
-package, and no step of it may be gated.
+package, and no step of it may carry a per-package gate. The `code` gate holds
+on every such selection, so a step may carry that one.
 
 WITHOUT `--observation-edges` the answer is the cargo closure alone. That is what
 the flag's absence means, and it is what the self-test's live rows compare

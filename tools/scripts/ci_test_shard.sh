@@ -742,7 +742,7 @@ require_index "shard count" "$COUNT"
 # `--with` package rides on its own reading, so a selection that names it and
 # not this package runs it and none of this package's files.
 #
-# The workflow step that runs this shard is deliberately NOT gated on the selection:
+# The workflow step that runs this shard carries no per-package `if:`:
 # `cerulion_core` observes the whole repository tree (its whole-tree walks,
 # `serial_discipline_test` among them, read every `.rs` file in the source tree), and
 # `tools/ci/observation_edges.tsv` records it as observing `all`; a package
@@ -754,7 +754,9 @@ require_index "shard count" "$COUNT"
 # package's companion step prints its own `selection:` line; the steps of the packages
 # observing `all` carry no selection condition and still run, the `cerulion_core`
 # doctests step among them (gated on the shard index alone), and among those only
-# this sharded suite skips, by the runner's own reading of the selection. The
+# this sharded suite skips, by the runner's own reading of the selection. In
+# `test-macos` each of those steps carries the `code` gate as well, so there
+# none of them runs on that change, this one included. The
 # intersection below is the mechanism for any package whose shard step is added
 # later and whose observation edges the walk can attribute.
 RIDERS=$(shard_riders "$PACKAGE" "$EXTRAS" "${CI_SELECTED_PACKAGES:-}")

@@ -482,8 +482,10 @@ naming gate (pull requests only);
 deduplicates a symlink into a scanned subdirectory); and `actionlint` over every workflow.
 
 EVERY job runs on a GitHub-hosted runner, and the macOS jobs run on `pull_request` and
-`merge_group` events like everything else: there is no cost gate, no routing expression
-and no stub job standing in for a skipped required check.
+`merge_group` events like everything else: there is no cost gate and no stub job standing
+in for a skipped required check. There is ONE routing expression: `test-macos` takes its
+runner from the classifier's `code` class, described with that job below; the legs it
+routes to Linux are that job itself, under its own names.
 
 `lint` gates the four push-only jobs that depend on it (`fuzz`, `miri`, `test-latency` and
 `cli-e2e-latency`), which no pull request and no queued batch runs: their `if:` carries no
@@ -531,21 +533,43 @@ starting from shard 0's archive until it has one. Shards above 0 save only when 
 policy below names their namespaces, which the default does not. Each sharded job's `shard:` matrix is held to the count its shard step passes by
 `ci_test_coverage_test.rs`.
 
-`--with <package>` adds another package's integration tests to the same nextest
-invocation: `-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. Shard 2
-of both lanes runs its shard in a step of its own (`if: matrix.shard == 2`, so the coverage
-walk sees the leg) that passes `--with node_macro_ui --with test_node_macro_cdylib`, so the
-`#[cerulion_node]` diagnostics suite and the node context helper suite build in the
-shard's cargo invocation and their trybuild tests run beside the core tests. nextest starts
-tests by priority, then in binary order, and its queue does not start a test past the one
-at its head, where a test that claims every slot waits for every running test to end; so
-`.config/nextest.toml` gives the timing tests that claim every slot priority 100 and the
-two suites' test binaries 99 (at the default priority they sort after every
-`cerulion_core` binary and would start last), in a `trybuild` test group of one slot: the
-suites share `target/tests/trybuild`, and each re-checks its fixtures when the other has
-run there since, so at the same time they took several times as long as one after the
-other. On the other shards the timing tests run first, each alone, which costs no slot
-they would not have waited for anyway.
+`test-macos` takes its RUNNER from the classifier:
+`runs-on: ${{ needs.changes.outputs.code == 'true' && 'macos-latest' || 'ubuntu-latest' }}`.
+Where `code` is `true` every leg runs on macOS with every step its own conditions select: that
+is every run that selects every package (every `push` and `workflow_dispatch` run, every
+`merge_group` run that selects every package, every run under `CI_SELECTION=off`) and every
+narrowed run whose change reaches a package. A change that reaches no package (`code=false`, which the classifier only
+reports beside `pkgs=[]`) runs all three legs on `ubuntu-latest` with every step but the
+selection markers skipped: each step carries `needs.changes.outputs.code == 'true'` as a
+top-level `&&` term, or a per-package gate, so no toolchain install, cache restore, build,
+test run or build-once audit runs, and each leg still reports its own
+`Test (macOS) shard <n>` context. A FAILED classifier leaves every output empty: the
+expression picks Linux, every `code` gate is false, and the first condition that reaches
+`fromJSON('')` is an expression error that fails its step. Every leg reaches one: the
+selection markers carry no leg selector to short-circuit ahead of it, so every leg reds. `routed_job_complaints` in `ci_test_coverage_test.rs`
+holds the job to that shape: the one routing spelling, a gate on every step and at least one
+marker. The cache prune and save carry the `code` term too, because `runner.os` in their key
+would name the Linux namespace on a Linux leg, and `tools/scripts/ci_cache_policy_check.py`
+admits it as a conjunct of those two gates. `crate-tests` is NOT routed: its two legs share
+their steps, and four of them (the development-issuer check, `cerulion_node_abi`,
+`cerulion_hygiene` and the umbrella crate) run on every pull request on both legs, so a
+`code` gate on them would stop them on the Linux leg as well.
+
+`--with <package>` adds another package's integration tests to the same nextest invocation:
+`-p <package> --test <name>` for each of its `tests/*.rs` at depth 1. Shard 2 of both lanes
+runs its shard in a step of its own (`if: matrix.shard == 2`, beside the `code` gate in
+`test-macos`, so the coverage walk sees the leg) that passes
+`--with node_macro_ui --with test_node_macro_cdylib`, so the `#[cerulion_node]` diagnostics
+suite and the node context helper suite build in the shard's cargo invocation and their
+trybuild tests run beside the core tests. nextest starts tests by priority, then in binary
+order, and its queue does not start a test past the one at its head, where a test that claims
+every slot waits for every running test to end; so `.config/nextest.toml` gives the timing
+tests that claim every slot priority 100 and the two suites' test binaries 99 (at the default
+priority they sort after every `cerulion_core` binary and would start last), in a `trybuild`
+test group of one slot: the suites share `target/tests/trybuild`, and each re-checks its
+fixtures when the other has run there since, so at the same time they took several times as
+long as one after the other. On the other shards the timing tests run first, each alone, which
+costs no slot they would not have waited for anyway.
 Cargo applies `--lib` and each `--test` to every package one command selects, so the
 script refuses `--with` on shard 0, which carries `--lib`, and an extra package that holds
 a test attribute, a doctest source or a test target outside `tests/*.rs` (see `check_extra`
@@ -628,9 +652,14 @@ invocation and runs the prebuilt test binaries the way `cargo test` runs them.
 * **Wiring.** `check-workflow FILE` refuses a job whose legs do not build exactly the
   packages their steps run, a `+` anywhere but on a package whose step carries no selection
   condition, a run whose features the build lacks, a run before the build, a job with no
-  unconditioned audit step after its last run, and a `cargo test`, `build`, `nextest` or
-  `check` command outside `run` or `phase`. It reads the workflow only, so the phases a
-  test declares from inside a `run` step are not in its view.
+  audit step after its last run, an audit carrying any condition but
+  `needs.changes.outputs.code == 'true'`, that condition on an audit in a job whose
+  `runs-on:` does not read `code` or whose build step does not carry it as a term of an `&&`
+  chain outside every parenthesis, with no `||`, and a `cargo test`, `build`, `nextest` or
+  `check` command outside `run` or `phase`. The `code` gate is the one an audit may carry because `test-macos` skips every
+  step when no package is reached, so its skipped audit follows a leg that built and ran
+  nothing. It reads the workflow only, so the phases a test declares from inside a `run`
+  step are not in its view.
 * **Reclaim.** `reclaim` deletes the executables in `target/debug/deps` except the prebuilt
   binaries a later step still runs, libraries (`.so`, `.so.N`, `.dylib`, `.dll`, `.rlib`, `.a`)
   and cargo's `.rmeta` and `.d` files.
@@ -781,7 +810,9 @@ direction: they SKIP test steps. Five rules bound them.
   gated step carries the one condition the coverage walk credits,
   `contains(fromJSON(needs.changes.outputs.pkgs), '<package>')`, and a companion step
   under the exact negation of that condition prints one line beginning `selection:`, so
-  the log says what was skipped and why.
+  the log says what was skipped and why. A `test-macos` step gated on `code` carries no
+  marker of its own: it skips only on a change for which every per-package gate skips and
+  every marker prints.
 * THE SELECTION IS WIDER THAN CARGO. `pkgs` is the reverse cargo dependency closure over
   normal, build and dev edges UNIONED with the observation edges in
   `tools/ci/observation_edges.tsv`: a test that reads another package's tree, walks the
@@ -790,16 +821,19 @@ direction: they SKIP test steps. Five rules bound them.
   `crates/cerulion_cli_engine/tests/ci_doc_pin_walk_test.rs`, which fails on a missing row
   and on a stale one. A read the walk cannot place on one package, an unattributable literal or
   a walk over a tree holding more than one member, records the observing package as observing
-  `all`; such a package rides every selection that names a package, and no step of it is gated.
+  `all`; such a package rides every selection that names a package, and no step of it carries
+  a per-package gate (the `code` gate holds on every such selection).
   Four packages are in that state today, `cerulion_core` among them, which is why the
-  `cerulion_core` shard steps carry no condition of their own: the shard runner reads the
-  selection itself and prints the `selection:` line when it skips.
+  `cerulion_core` shard steps carry no per-package condition (each carries its leg selector, and
+  the `test-macos` ones the `code` gate too): the shard runner reads the selection itself and prints the `selection:`
+  line when it skips.
 
 The supported subset, stated plainly: the selection narrows PER-PACKAGE test steps on pull
-requests and on harness-only merge groups. It does NOT narrow the workspace build, it gates
-one job whole and no other, `android-check`, which reports no required status context, it
-does not apply to `push` or `workflow_dispatch`, and it never removes a required status
-context.
+requests and on harness-only merge groups, and a change that reaches no package also moves
+`test-macos` to Linux with every step skipped. It does NOT narrow the workspace build of a change
+that reaches a package, it gates one job whole and no other, `android-check`, which reports no
+required status context, it does not apply to `push` or `workflow_dispatch`, and it never removes
+a required status context.
 
 EVERY test step names its PACKAGES explicitly; there is no blanket `cargo test --workspace`
 on the root workspace, which makes coverage a hand list.
@@ -1163,7 +1197,8 @@ never race for one archive; any other key expression naming `matrix.shard` is re
 key with no lockfile hash is a tool cache or a violation (TOOL_CACHE);
 a job that passes `--timings` in a step carries `Collect the cargo timing reports` under
 `if: always()` with no `continue-on-error`, running the one script the checker holds, directly
-followed by `Upload the cargo timing reports` under `if: always()` with `continue-on-error: true`,
+followed by `Upload the cargo timing reports` under `if: always()` with `continue-on-error: true`
+(both conditions may add `&& needs.changes.outputs.code == 'true'` in a job routed by that class),
 both after its last `--timings` step and before its save, the collect list naming every target
 directory its cache steps archive, and a job with neither the flag nor the steps carries neither;
 no job- or workflow-level `env` passes the flag (TIMINGS_REPORTS); the
