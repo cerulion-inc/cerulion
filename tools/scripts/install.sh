@@ -1166,8 +1166,8 @@ $(system_bin_dir)"
 # a regular file and not a link, names install.sh and records that the install
 # placed the tree ("harness":true). A tree without that record is the user's:
 # the installer neither replaces nor removes it. The record names the folder,
-# not one tree: while it stands, whatever is at <dir>/harness is replaced or
-# removed as the installer's own. A rollback that cannot put the previous tree
+# not one tree: while it stands, any directory at <dir>/harness is replaced
+# or removed as the installer's own. A rollback that cannot put the previous tree
 # back drops the record. A marker that could not be written leaves the
 # previous one in place: a tree this install placed goes unrecorded, so the
 # next install refuses it, and a record an earlier install wrote can outlive
@@ -2691,10 +2691,18 @@ for harness_arg in "$@"; do
                 printf '%s\n' mine > "${harness_dest%/*}/harness/notes.txt"
             exit 0
             ;;
-        backuprace:*/backup/harness)
+        backuprace:*/backup/harness|backupracekeep:*/backup/harness)
             "$CERULION_SELF_TEST_REAL_MV" "$@" || exit 1
             mkdir "$1" && printf '%s\n' mine > "$1/notes.txt"
             exit 0
+            ;;
+        backupracekeep:*/.cerulion-provenance.json.*)
+            exit 1
+            ;;
+        vanish:*/staged/harness)
+            "$CERULION_SELF_TEST_REAL_MV" "$@" || exit 1
+            "$CERULION_SELF_TEST_REAL_MV" "$harness_dest" "${harness_dest%/*}/moved-away" || exit 1
+            exit 1
             ;;
     esac
 done
@@ -2806,6 +2814,37 @@ MV_EOF
         die "self-test: the install after the backup race had the wrong diagnostic: $(cat "$harness_root/race-backup-again-error")"
     [ "$(cat "$harness_race_dir/harness/notes.txt")" = mine ] ||
         die "self-test: the install after the backup race changed the harness/ that took the name"
+    # A staged tree moved away after it moved in cannot be found by its
+    # identity, but the previous tree still goes back, so the record stands.
+    harness_race_dir="$harness_root/race-vanish-install"
+    harness_install first "$harness_race_dir" race-vanish-first ||
+        die "self-test: the vanished harness setup failed"
+    harness_faulted_install vanish second "$harness_race_dir" race-vanish
+    [ "$harness_status" -ne 0 ] ||
+        die "self-test: a staged harness moved away after it moved in did not fail the install"
+    [ "$(cat "$harness_race_dir/harness/README.md")" = 'first readme' ] ||
+        die "self-test: the rollback did not put the previous harness tree back after the staged one moved away"
+    grep -Fq '"harness":true' "$harness_race_dir/.cerulion-provenance.json" ||
+        die "self-test: the rollback dropped the record of a harness tree it put back"
+    # When that rewrite of the marker fails too, the record stands and the
+    # rollback says so, with no temporary marker left behind.
+    harness_race_dir="$harness_root/race-backup-keep-install"
+    harness_install first "$harness_race_dir" race-backup-keep-first ||
+        die "self-test: the harness backup race (marker kept) setup failed"
+    harness_faulted_install backupracekeep second "$harness_race_dir" race-backup-keep
+    [ "$harness_status" -ne 0 ] ||
+        die "self-test: a harness/ that took the name after the backup did not fail the install (marker kept)"
+    grep -Fq "warning: the install marker still records a harness tree at $harness_race_dir/harness; move that folder away before the next install" \
+        "$harness_root/race-backup-keep-error" ||
+        die "self-test: a marker the rollback could not rewrite was not reported: $(cat "$harness_root/race-backup-keep-error")"
+    grep -Fq '"harness":true' "$harness_race_dir/.cerulion-provenance.json" ||
+        die "self-test: a marker the rollback could not rewrite changed anyway"
+    for harness_leftover in "$harness_race_dir"/.cerulion-provenance.json.*; do
+        [ -e "$harness_leftover" ] || continue
+        die "self-test: the failed marker rewrite left $harness_leftover behind"
+    done
+    [ "$(cat "$harness_race_dir/harness/notes.txt")" = mine ] ||
+        die "self-test: the rollback changed a harness/ that took the name after the backup (marker kept)"
 
     harness_install none "$harness_dir" none ||
         die "self-test: the harness-less downgrade failed: $(cat "$harness_root/none-error")"
@@ -4517,6 +4556,7 @@ cleanup_install() {
     # Only the tree this install moved in is removed, found by its identity:
     # a move onto a directory that appeared meanwhile put it inside that one.
     harness_not_restored=0
+    harness_backup_restored=0
     if [ "$status" -ne 0 ] && [ -n "$transaction_dir" ]; then
         if [ "$harness_activated" -eq 1 ] && [ ! -e "$transaction_dir/staged/harness" ]; then
             if harness_moved_in=$(harness_moved_tree); then
@@ -4529,6 +4569,8 @@ cleanup_install() {
             if [ -e "$install_dir/harness" ] || [ -L "$install_dir/harness" ] ||
                 ! mv "$transaction_dir/backup/harness" "$install_dir/harness"; then
                 harness_not_restored=1
+            else
+                harness_backup_restored=1
             fi
         fi
         if [ "$harness_not_restored" -eq 1 ]; then
@@ -4578,8 +4620,11 @@ cleanup_install() {
     fi
     # A harness tree that could not be put back leaves its name to whatever
     # holds it now, so the marker stops recording a tree there and the next
-    # install refuses that folder rather than replace it.
+    # install refuses that folder rather than replace it. A directory that
+    # took the marker's place before the move received the file inside it;
+    # it is taken back out and the warning says the record stands.
     if [ "$status" -ne 0 ] && [ "$harness_not_restored" -eq 1 ] &&
+        [ "$harness_backup_restored" -eq 0 ] &&
         [ -f "$install_dir/.cerulion-provenance.json" ] &&
         [ ! -L "$install_dir/.cerulion-provenance.json" ] &&
         grep -Fq '"harness":true' "$install_dir/.cerulion-provenance.json" 2>/dev/null; then
@@ -4587,7 +4632,13 @@ cleanup_install() {
         if [ -z "$unrecord_tmp" ] ||
             ! sed 's/,"harness":true//' "$install_dir/.cerulion-provenance.json" > "$unrecord_tmp" ||
             ! chmod 0644 "$unrecord_tmp" ||
-            ! mv -f "$unrecord_tmp" "$install_dir/.cerulion-provenance.json"; then
+            ! mv -f "$unrecord_tmp" "$install_dir/.cerulion-provenance.json" ||
+            [ -L "$install_dir/.cerulion-provenance.json" ] ||
+            [ ! -f "$install_dir/.cerulion-provenance.json" ]; then
+            if [ -n "$unrecord_tmp" ] && [ -d "$install_dir/.cerulion-provenance.json" ] &&
+                [ ! -L "$install_dir/.cerulion-provenance.json" ]; then
+                rm -f "$install_dir/.cerulion-provenance.json/${unrecord_tmp##*/}" || :
+            fi
             [ -z "$unrecord_tmp" ] || rm -f "$unrecord_tmp" || :
             printf 'warning: the install marker still records a harness tree at %s; move that folder away before the next install\n' \
                 "$install_dir/harness" >&2
