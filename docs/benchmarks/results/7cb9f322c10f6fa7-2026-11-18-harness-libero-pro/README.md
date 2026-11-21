@@ -144,8 +144,10 @@ recompute.py, so each figure on them is the figure SUMMARY.md prints.
   the harness's default picture mode for a Claude model with Cerulion).
 - The same request settings in both arms of a model, apart from the picture handling and the cache mark above.
   The Claude models carry the prompt cache flag in both arms.
-- Up to 3 attempts when the model endpoint fails; a clock stop is final. An episode with no score after that is
-  a failure for its arm in every count, and is listed in unscored.csv.
+- Up to 3 attempts when the model endpoint fails; a clock stop is final. An episode that the network outage, a
+  machine stop or a harness refusal before any model call left without a score was started again from attempt 1
+  (see below); any other episode with no score after its attempts is a failure for its arm in every count, and
+  is listed in unscored.csv.
 - The simulation ran on cloud machines with the CPU renderer (OSMesa); no GPU was used. Both arms of a model ran
   through the same endpoint.
 - The code of both arms is the measured code of the Cerulion harness, with these snapshot ids:

@@ -103,9 +103,10 @@ What must hold for each statement:
 (b) Every start state fresh: none that was developed on, none that any run before the list's freeze used; the
     source of the robot's calibration record named.
 (c) The list fixed before the first scored episode; the code snapshot of each arm of each model named.
-(d) Retries for infrastructure only, within an episode, by a rule set before (3 attempts; a clock stop is
-    final); the episode's attempts in no row counted and priced; an unscored start state is a failure for that
-    arm in every rate and is listed.
+(d) Retries for infrastructure only, by a rule set before, in both arms alike: up to attempt 3, a clock stop
+    final, and an episode that a network outage, a machine stop or a harness refusal before any model call left
+    without a score started again from attempt 1; every attempt with a token count and no scored row counted and
+    priced in lost_attempts.csv; an unscored start state is a failure for that arm in every rate and is listed.
 (e) Both arms of a model run through the same endpoint, with the provider's version string logged from the
     response.
 (f) The effort, cache setting and picture mode of each arm of each model printed; every other request setting
@@ -122,8 +123,10 @@ What must hold for each statement:
 3. Against Cerulion and not significant: "no difference shown for X (a of n with, b of n without, p)". It still
    counts in the tally "Cerulion ahead in k of m models", which is printed whole.
 4. The same snapshot, prompt and effort for every episode of an arm of that model.
-5. Retries only within an episode, and only where it did not run as declared (an endpoint failure, a crashed
-   tool, an unscored start state), by the rule written before, applied to both arms alike.
+5. Retries only where an episode did not run as declared (an endpoint failure, a crashed tool, a network
+   outage, a machine stop, a harness refusal before any model call), by the rule written before, applied to
+   both arms alike: up to attempt 3 within the episode, and an episode that a network outage, a machine stop or
+   a harness refusal left without a score started again from attempt 1.
 6. If the main test itself comes in against Cerulion or null: there is no solve statement.
 
 ## 6. Cost and time
