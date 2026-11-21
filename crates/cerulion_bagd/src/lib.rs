@@ -29374,11 +29374,12 @@ mod ranks_begin_apart_judge_tests {
     //! The capture judge on two-rank captures whose ranks begin at different
     //! steps, through the adapter, over hand-built traces trimmed the way a
     //! capture trims them and the `recorder.json` the capture carries: the
-    //! free-run stamp refuses them by name, and every other document keeps the
-    //! judgement of a recording with no stamp. Every verdict is written out by
-    //! hand. No shared memory, no race.
+    //! free-run stamp refuses them by name, a document that states no readable
+    //! contract refuses every capture, and the lockstep stamp, a document with
+    //! no stamp and no document keep the judgement of a recording with no
+    //! stamp. Every verdict is written out by hand. No shared memory, no race.
     use super::*;
-    use cerulion_core::flashback::resim::ResimGap;
+    use cerulion_core::flashback::resim::{ResimGap, UnreadableCoordination};
     use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
     use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY};
 
@@ -29705,13 +29706,20 @@ mod ranks_begin_apart_judge_tests {
         }
     }
 
-    /// Every other document a capture can carry keeps the judgement of a
-    /// recording with no stamp: rank 1 beginning later reads resimmable (rank
-    /// 0's first kept step is 0), and both shapes whose rank 0 resumes mid-run
-    /// read the unknown node map of a recorder holding two trace rings.
+    /// The documents that state no readable contract.
+    const UNREADABLE: [Stamp; 2] = [Stamp::Unknown, Stamp::NotJson];
+
+    /// The lockstep stamp, a document with no stamp and no document keep the
+    /// judgement of a recording with no stamp: rank 1 beginning later reads
+    /// resimmable (rank 0's first kept step is 0), and both shapes whose rank 0
+    /// resumes mid-run read the unknown node map of a recorder holding two
+    /// trace rings.
     #[test]
-    fn under_any_other_stamp_ranks_that_begin_apart_are_judged_on_rank_0_alone() {
-        for stamp in STAMPS.into_iter().filter(|s| *s != Stamp::FreeRun) {
+    fn under_a_lockstep_reading_ranks_that_begin_apart_are_judged_on_rank_0_alone() {
+        for stamp in STAMPS
+            .into_iter()
+            .filter(|s| *s != Stamp::FreeRun && !UNREADABLE.contains(s))
+        {
             assert_eq!(verdict(&rank_1_begins_later(), stamp), Ok(()), "{stamp:?}");
             assert_eq!(
                 verdict(&rank_0_begins_later(), stamp),
@@ -29726,11 +29734,39 @@ mod ranks_begin_apart_judge_tests {
         }
     }
 
+    /// A document that states no readable contract refuses every shape, the
+    /// controls included, naming what it states.
+    #[test]
+    fn a_capture_whose_recorder_json_states_no_readable_contract_is_refused_by_name() {
+        let unknown = ResimGap::CoordinationUnreadable(UnreadableCoordination::UnknownStamp(
+            "\"barrier\"".to_string(),
+        ));
+        let not_json = ResimGap::CoordinationUnreadable(UnreadableCoordination::NotJson);
+        for shape in [
+            rank_1_begins_later,
+            rank_0_begins_later,
+            rank_1_begins_later_of_three,
+            both_begin_past_step_0,
+            both_begin_at_step_0,
+            one_rank_from_its_anchor,
+        ] {
+            assert_eq!(verdict(&shape(), Stamp::Unknown), Err(unknown.clone()));
+            assert_eq!(verdict(&shape(), Stamp::NotJson), Err(not_json.clone()));
+        }
+        assert_eq!(
+            not_json.reason(),
+            "this capture's `__cerulion/recorder.json` is not JSON, so it states no \
+             coordination contract, and `cerulion bag play --resim` refuses a recording whose \
+             contract it cannot read before it re-executes anything. The frames, the state and \
+             the trace are in the bag and readable"
+        );
+    }
+
     /// The controls: two ranks that both begin at step 0, and one rank resuming
-    /// from its anchor, are resimmable under every stamp.
+    /// from its anchor, are resimmable under every readable stamp.
     #[test]
     fn ranks_that_begin_together_and_a_lone_rank_are_resimmable() {
-        for stamp in STAMPS {
+        for stamp in STAMPS.into_iter().filter(|s| !UNREADABLE.contains(s)) {
             assert_eq!(
                 verdict(&both_begin_at_step_0(), stamp),
                 Ok(()),

@@ -47,9 +47,11 @@
 //! refused it at the earlier record under a different error entirely, which is
 //! precisely the drift a shared verdict exists to prevent.
 //!
-//! Two arms read the capture's coordination stamp and judge free run only:
-//! worker ranks that begin apart ([`ResimGap::MixedStart`]), asked right below
-//! the boundary arm because a rank that begins at step 0 never reaches an
+//! Three arms read the capture's coordination stamp. A stamp this build cannot
+//! read ([`ResimGap::CoordinationUnreadable`]) is refused right after the
+//! record walk, where the replay reads `recorder.json`. Two judge free run
+//! only: worker ranks that begin apart ([`ResimGap::MixedStart`]), asked right
+//! below the boundary arm because a rank that begins at step 0 never reaches an
 //! anchor arm, and several worker ranks whose rank 0 resumes mid-run
 //! ([`ResimGap::FreeRunResumeUnsupported`]), asked right below the state-ring
 //! arm, where `resolve_resume` refuses it.
@@ -108,11 +110,11 @@ pub struct ResimFacts<'a> {
     /// states, read through [`recorded_coordination`], the stamp `bag play
     /// --resim` reads.
     ///
-    /// Two arms read it, and only a free-run stamp takes either:
-    /// [`ResimGap::MixedStart`] and [`ResimGap::FreeRunResumeUnsupported`]. A
-    /// [`RecordedCoordination::Unreadable`] stamp is judged as an unstamped
-    /// recording is, as lockstep; the replay refuses such a recording when it
-    /// reads its `recorder.json`, which no arm here asks.
+    /// A [`RecordedCoordination::Unreadable`] stamp is
+    /// [`ResimGap::CoordinationUnreadable`], since the replay refuses such a
+    /// recording when it reads its `recorder.json`. Two more arms read it, and
+    /// only a free-run stamp takes either: [`ResimGap::MixedStart`] and
+    /// [`ResimGap::FreeRunResumeUnsupported`].
     pub coordination: RecordedCoordination,
     /// Whether the bag carries a `graph.yaml` attachment `run_replay` can
     /// actually USE — present, UTF-8, and parsing as a graph (its gate 4,
@@ -756,6 +758,11 @@ pub enum ResimGap {
         /// How many departure records the trace carries.
         departures: usize,
     },
+    /// The capture's `__cerulion/recorder.json` states no coordination
+    /// contract this build can read: resim refuses such a bag when it reads
+    /// that attachment (`BagInvalidAttachment`, or `RecordingInconsistent` for
+    /// an unknown stamp).
+    CoordinationUnreadable(UnreadableCoordination),
     /// The trace carries records but no step boundary — resim's
     /// `BagNoStepBoundaries`.
     NoBoundary,
@@ -1094,6 +1101,22 @@ impl ResimGap {
                  — a peer worker was lost mid-run. Replaying a fault-degraded recording is not \
                  supported yet; the frames and the state are in the bag and readable"
             ),
+            Self::CoordinationUnreadable(why) => {
+                let stated = match why {
+                    UnreadableCoordination::UnknownStamp(stamp) => {
+                        format!(
+                            "stamps `coordination` {stamp}, a contract this Cerulion does not know"
+                        )
+                    }
+                    other => format!("is {other}, so it states no coordination contract"),
+                };
+                format!(
+                    "this capture's `__cerulion/recorder.json` {stated}, and `cerulion bag play \
+                     --resim` refuses a recording whose contract it cannot read before it \
+                     re-executes anything. The frames, the state and the trace are in the bag \
+                     and readable"
+                )
+            }
             Self::RankWithoutCompleteStep { ranks } => format!(
                 "this capture's trace holds no complete step for rank(s) {ranks:?}, though each \
                  carried a step boundary: the capture removed each such rank's last step because \
@@ -1411,6 +1434,16 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
             departures: facts.departure_records,
         });
     }
+    // 3c. The coordination contract `recorder.json` states. `run_replay` reads
+    //     that attachment after its record walk and before it resolves a
+    //     resume, and refuses a stamp it cannot read there.
+    let free_run = match &facts.coordination {
+        RecordedCoordination::FreeRun => true,
+        RecordedCoordination::Lockstep { .. } => false,
+        RecordedCoordination::Unreadable(why) => {
+            return Err(ResimGap::CoordinationUnreadable(why.clone()))
+        }
+    };
     // 4. Is there a resume point at all? The AUTHORITATIVE rank's own first
     //    kept boundary, the step `resolve_resume` resumes at (see the field).
     let Some(&first_recorded_step) = facts
@@ -1423,12 +1456,6 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     //     rather than a fact about any one step, so it is asked before the
     //     from-start arm, which a rank past step 0 must not take, and before
     //     every anchor arm, which a rank at step 0 never reaches.
-    let free_run = match &facts.coordination {
-        RecordedCoordination::FreeRun => true,
-        RecordedCoordination::Lockstep { .. } => false,
-        // Judged as an unstamped recording: see `ResimFacts::coordination`.
-        RecordedCoordination::Unreadable(_) => false,
-    };
     if free_run {
         if let Some(start) = mixed_start(facts.rank_first_steps) {
             return Err(ResimGap::MixedStart(start));
@@ -3136,16 +3163,20 @@ mod tests {
         }
     }
 
-    /// Every stamp that is not free run, the unreadable ones included.
-    fn not_free_run() -> [RecordedCoordination; 5] {
+    /// The two lockstep stamps: written, and read off a recording with none.
+    fn lockstep() -> [RecordedCoordination; 2] {
         [
             RecordedCoordination::Lockstep { stamped: true },
             RecordedCoordination::Lockstep { stamped: false },
-            RecordedCoordination::Unreadable(UnreadableCoordination::NotJson),
-            RecordedCoordination::Unreadable(UnreadableCoordination::NotAnObject),
-            RecordedCoordination::Unreadable(UnreadableCoordination::UnknownStamp(
-                "\"barrier\"".to_string(),
-            )),
+        ]
+    }
+
+    /// Every way a `recorder.json` can state no contract this build reads.
+    fn unreadable() -> [UnreadableCoordination; 3] {
+        [
+            UnreadableCoordination::NotJson,
+            UnreadableCoordination::NotAnObject,
+            UnreadableCoordination::UnknownStamp("\"barrier\"".to_string()),
         ]
     }
 
@@ -3277,7 +3308,7 @@ mod tests {
             judge_resimmable(&free_run(&nodes, &anchors, &reverse)),
             Err(ResimGap::MixedStart(start(&[(0, 41)], &[1])))
         );
-        for coordination in not_free_run() {
+        for coordination in lockstep() {
             for firsts in [&later, &reverse] {
                 assert_eq!(
                     judge_resimmable(&ResimFacts {
@@ -3286,6 +3317,18 @@ mod tests {
                     }),
                     Ok(()),
                     "{coordination:?} {firsts:?}"
+                );
+            }
+        }
+        for why in unreadable() {
+            for firsts in [&later, &reverse] {
+                assert_eq!(
+                    judge_resimmable(&ResimFacts {
+                        coordination: RecordedCoordination::Unreadable(why.clone()),
+                        ..free_run(&nodes, &anchors, firsts)
+                    }),
+                    Err(ResimGap::CoordinationUnreadable(why.clone())),
+                    "{why:?} {firsts:?}"
                 );
             }
         }
@@ -3510,7 +3553,7 @@ mod tests {
             }),
             Ok(())
         );
-        for coordination in not_free_run() {
+        for coordination in lockstep() {
             assert_eq!(
                 judge_resimmable(&ResimFacts {
                     coordination: coordination.clone(),
@@ -3518,6 +3561,102 @@ mod tests {
                 }),
                 Ok(()),
                 "{coordination:?}"
+            );
+        }
+        for why in unreadable() {
+            assert_eq!(
+                judge_resimmable(&ResimFacts {
+                    coordination: RecordedCoordination::Unreadable(why.clone()),
+                    ..both.clone()
+                }),
+                Err(ResimGap::CoordinationUnreadable(why.clone())),
+                "{why:?}"
+            );
+        }
+    }
+
+    /// A `recorder.json` that states no readable contract refuses the capture
+    /// in the replay's position: below every record-walk arm, above the
+    /// boundary arm and every arm below it, a from-start capture included.
+    #[test]
+    fn a_coordination_stamp_this_build_cannot_read_refuses_the_capture() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let at_zero = by_rank(&[(0, 0)]);
+        let mixed = by_rank(&[(0, 0), (1, 6)]);
+        for why in unreadable() {
+            let refused = |facts: ResimFacts<'_>| {
+                judge_resimmable(&ResimFacts {
+                    coordination: RecordedCoordination::Unreadable(why.clone()),
+                    ..facts
+                })
+            };
+            let gap = Err(ResimGap::CoordinationUnreadable(why.clone()));
+            // A from-start capture and a mixed start, each otherwise accepted
+            // or refused below this arm.
+            assert_eq!(refused(free_run(&nodes, &[], &at_zero)), gap, "{why:?}");
+            assert_eq!(refused(free_run(&nodes, &anchors, &mixed)), gap, "{why:?}");
+            // Below it: no boundary, several state rings, an unknown node map, an
+            // incomplete anchor.
+            for facts in [
+                free_run(&nodes, &anchors, &NO_FIRST_STEP),
+                ResimFacts {
+                    state_rings_declared: 2,
+                    ..healthy(&nodes, &anchors)
+                },
+                ResimFacts {
+                    required_nodes_known: false,
+                    ..healthy(&nodes, &anchors)
+                },
+                healthy(&nodes, &[]),
+            ] {
+                assert_eq!(refused(facts), gap, "{why:?}");
+            }
+            // Above it: the record walk and its backstop.
+            assert_eq!(
+                refused(ResimFacts {
+                    first_record_refusal: Some(TraceRecordRefusal::Departure),
+                    departure_records: 1,
+                    ..healthy(&nodes, &anchors)
+                }),
+                Err(ResimGap::FaultReplay { departures: 1 })
+            );
+            assert_eq!(
+                refused(ResimFacts {
+                    departure_records: 2,
+                    ..healthy(&nodes, &anchors)
+                }),
+                Err(ResimGap::FaultReplay { departures: 2 })
+            );
+            assert!(matches!(
+                refused(ResimFacts {
+                    first_record_refusal: fault(9),
+                    ..healthy(&nodes, &anchors)
+                }),
+                Err(ResimGap::TraceRecordRejected { .. })
+            ));
+        }
+        // The reason states the fact and the replay's refusal, in each form.
+        let refusal = "`cerulion bag play --resim` refuses a recording whose contract it cannot \
+                       read before it re-executes anything. The frames, the state and the trace \
+                       are in the bag and readable";
+        for (why, stated) in [
+            (
+                UnreadableCoordination::NotJson,
+                "is not JSON, so it states no coordination contract",
+            ),
+            (
+                UnreadableCoordination::NotAnObject,
+                "is not a JSON object, so it states no coordination contract",
+            ),
+            (
+                UnreadableCoordination::UnknownStamp("\"barrier\"".to_string()),
+                "stamps `coordination` \"barrier\", a contract this Cerulion does not know",
+            ),
+        ] {
+            assert_eq!(
+                ResimGap::CoordinationUnreadable(why).reason(),
+                format!("this capture's `__cerulion/recorder.json` {stated}, and {refusal}")
             );
         }
     }
@@ -3650,6 +3789,12 @@ mod tests {
                     ..late_gap()
                 },
             },
+            // A `recorder.json` that states no readable contract, each way.
+            ResimGap::CoordinationUnreadable(UnreadableCoordination::NotJson),
+            ResimGap::CoordinationUnreadable(UnreadableCoordination::NotAnObject),
+            ResimGap::CoordinationUnreadable(UnreadableCoordination::UnknownStamp(
+                "\"barrier\"".to_string(),
+            )),
         ];
         // The mixed start's three forms, written out: one rank on each side,
         // several, and rank 0 the late one.
