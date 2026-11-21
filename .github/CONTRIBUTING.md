@@ -100,7 +100,9 @@ install -m 0755 target/release/cerulion target/release/cerulion-netd \
 
 The quickstart's commands run under a Cerulion account: sign in once on that
 machine with `cerulion login` before the first one; later commands read the
-result locally and work offline.
+result locally and work offline. The copies in `$HOME/.cargo/bin` have no
+harness beside them and sit outside this checkout, so before the quickstart's
+harness steps set `CERULION_HARNESS_DIR` to this checkout's `harness/` folder.
 
 The `cerulion ros2 run` and `cerulion ros2 launch` verbs also need
 `librmw_cerulion.so` beside the CLI. The release packages carry it on Linux;

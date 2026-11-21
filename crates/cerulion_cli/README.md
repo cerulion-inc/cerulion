@@ -50,7 +50,11 @@ release package, or build `rmw_cerulion` against your ROS 2 headers and set
 `CERULION_LIB_DIR` to the directory holding `librmw_cerulion.so`. The
 [quickstart](https://github.com/cerulion-inc/cerulion#quickstart) adds
 recording, replay verification and the harness, from one coding-agent prompt
-or by commands, and the
+or by commands. A `cerulion` installed with `cargo install` has no harness
+beside it: before the harness steps, clone this repository at the tag of its
+version (`git clone --depth 1 --branch v<version>
+https://github.com/cerulion-inc/cerulion`, with the version `cerulion --version`
+prints) and set `CERULION_HARNESS_DIR` to the clone's `harness/` folder. The
 [API reference](https://github.com/cerulion-inc/cerulion/blob/main/docs/user-api.md)
 documents every verb.
 
