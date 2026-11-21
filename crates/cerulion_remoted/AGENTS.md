@@ -1,14 +1,17 @@
 # cerulion_remoted
 
-One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/2 + ops/1. Family: pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
+One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
 
 ## Invariants
-- Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
+- Linux: unreaped leader pins SID; capture identity before SID. Use pidfds.
+  Fallback rechecks SID/birth nonatomically. No containment.
+  Probe waits/readiness/signals before spawn.
+- Catalog/schema/demand/acts gate producer scope/origin before ports; acts order: e-stop, args, scope. Taps/mirrors keep leases; privacy wins over caps; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
   final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
-- `PairingAuthorizer` classifies accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
-  Shell/exec: owner + policy; missing file ON, invalid OFF; absent handle denies, immutable hard-off wins.
+- `PairingAuthorizer` gates accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
+  Shell/exec: owner+policy; no file ON/invalid OFF; no handle: deny; immutable hard-off wins.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
@@ -20,8 +23,7 @@ One robot endpoint: public key = EndpointId, 32-byte secret seeds pairing; wire/
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so no session starves it (`estop_starvation_test.rs`).
   TLS: docs/remote_plane.md; paired keys Retry first.
-  Trust persistence is fail-closed: store-BEFORE-index, the live binding published
-  only after the durable write succeeds. Never reorder (`trust.rs`).
+  Trust: fail closed; durable store before index/binding (`trust.rs`).
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.

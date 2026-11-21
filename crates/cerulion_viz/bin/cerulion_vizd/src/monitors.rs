@@ -260,6 +260,23 @@ impl MonitorPlane {
         WriteStamp(self.last_write_ns)
     }
 
+    /// Move the plane's ONE origin `by` into the past, so every later
+    /// [`Self::now_ns`] and [`Self::advance_to`] reads `by` further along the same
+    /// number line and every stamp already banked reads `by` older.
+    ///
+    /// `false`, changing nothing, when the monotonic clock cannot represent the
+    /// earlier origin.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub(crate) fn skew_by(&mut self, by: std::time::Duration) -> bool {
+        match self.origin.checked_sub(by) {
+            Some(earlier) => {
+                self.origin = earlier;
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Feed ONE ATTACHED-plane pass's samples through the engine, bank every
     /// transition in the ring, report the open regimes, and answer with the pass's
     /// deltas.
@@ -1123,6 +1140,31 @@ mod tests {
             next.as_ns() < far,
             "a READ at {far} ns must leave the write clock alone, so the next write \
              lands at its own instant: {next:?}"
+        );
+    }
+
+    /// A skewed origin dates one instant exactly the skew later on BOTH clocks, and a
+    /// skew the monotonic clock cannot represent changes nothing.
+    #[test]
+    fn a_skewed_origin_dates_an_instant_exactly_the_skew_later_on_both_clocks() {
+        let mut plane = MonitorPlane::default();
+        let at = Instant::now() + Duration::from_secs(1);
+        let before = plane.advance_to(at).as_ns();
+        assert!(plane.skew_by(Duration::from_secs(5)));
+        assert_eq!(plane.now_ns(at), before + 5_000_000_000, "the read clock");
+        assert_eq!(
+            plane.advance_to(at).as_ns(),
+            before + 5_000_000_000,
+            "the write clock"
+        );
+        assert!(
+            !plane.skew_by(Duration::MAX),
+            "an origin before the clock's own start is refused"
+        );
+        assert_eq!(
+            plane.now_ns(at),
+            before + 5_000_000_000,
+            "a refused skew moves nothing"
         );
     }
 

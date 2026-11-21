@@ -49,6 +49,7 @@ pub mod ingress_build;
 pub mod input_view;
 pub mod kind;
 pub mod liveness;
+pub(crate) mod marker_teardown;
 pub mod mirror_origin;
 pub mod mirror_registry;
 pub mod network;
@@ -72,6 +73,7 @@ pub mod uds_write;
 pub mod wire_header_attribute;
 
 pub use kind::{TransportKind, TRANSPORT_KIND};
+pub use marker_teardown::TeardownWait;
 #[doc(hidden)]
 pub use shm_guard::{shm_pool_advice_scans_run, shm_safety_checks_run};
 
@@ -4144,11 +4146,13 @@ impl TransportManager {
 
     /// Retain an existing producer exclusion for a dynamically created local port.
     /// Hold it after that port drops, including a detached producer's lifetime.
+    /// `wait` says whether a policy marker being torn down is waited out.
     pub fn retain_local_topic_scope(
         &self,
         topic: &str,
+        wait: TeardownWait,
     ) -> TransportResult<Option<egress_scope::LocalOnlyTopic>> {
-        if egress_scope::allowed(&self.node, topic)? {
+        if egress_scope::allowed(&self.node, topic, wait)? {
             Ok(None)
         } else {
             self.exclude_remote_topic(topic).map(Some)
@@ -4168,8 +4172,9 @@ impl TransportManager {
     }
 
     /// Read producer policy without creating a data service or subscriber.
-    pub fn remote_topic_allowed(&self, topic: &str) -> TransportResult<bool> {
-        let result = egress_scope::allowed(&self.node, topic);
+    /// `wait` says whether a policy marker being torn down is waited out.
+    pub fn remote_topic_allowed(&self, topic: &str, wait: TeardownWait) -> TransportResult<bool> {
+        let result = egress_scope::allowed(&self.node, topic, wait);
         if !matches!(result, Ok(true)) {
             egress_scope::REMOTE_ACCESS_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
@@ -4201,8 +4206,9 @@ impl TransportManager {
 
     /// Whether this topic has an active, authoritative network mirror marker.
     /// This open-only check never starts a network session or creates a service.
-    pub fn is_network_mirror(&self, topic: &str) -> TransportResult<bool> {
-        mirror_origin::is_network_mirror(&self.node, topic)
+    /// `wait` says whether a mirror marker being torn down is waited out.
+    pub fn is_network_mirror(&self, topic: &str, wait: TeardownWait) -> TransportResult<bool> {
+        mirror_origin::is_network_mirror(&self.node, topic, wait)
     }
 
     /// Hold an explicitly local observer's source local until its subscriber drops.
@@ -4218,8 +4224,9 @@ impl TransportManager {
     }
 
     /// Network mirror topics on this manager's namespace, independent of attribution.
-    pub fn network_mirror_topics(&self) -> TransportResult<Vec<String>> {
-        mirror_origin::topics(&self.node)
+    /// `wait` says whether each candidate marker being torn down is waited out.
+    pub fn network_mirror_topics(&self, wait: TeardownWait) -> TransportResult<Vec<String>> {
+        mirror_origin::topics(&self.node, wait)
     }
 
     /// Register a complete network→local INGRESS bridge for `topic`

@@ -17,9 +17,19 @@ User-facing recording docs live in `docs/bag.md`.
   `recorder.json` (host identity: arch/os/version, used by replay's
   cross-host advisory, plus the contract keys `trace_format`, `coordination`
   and `node_external`, each native node's driver flag from its loaded
-  metadata), `record_health.json` (per-topic drain health),
+  metadata, and `env_names_left_out`, the count of names `env.json` left out
+  for not being valid UTF-8), `record_health.json` (per-topic drain health),
   `record_coverage.json` (what was and was not recorded, and why), plus
   `graph.yaml` and `env.json` for replay.
+- The bag's `env.json` attachment and the run directory's `env.json` are
+  rendered by one pure function, `graph_cmd::render_env_json`, over
+  `std::env::vars_os()`. The function logs nothing: `graph_run`, which owns
+  the run, warns once from the run directory's render, and the bag's render
+  of the same environment under the same mode warns nothing. A name that is not valid UTF-8 is left out, and under `allowlist` and
+  `all` a value that is not valid UTF-8 is stored as
+  `{"fnv64": "<hex>", "redacted": true, "utf8": false}`, hashed over its raw
+  bytes; `replay_engine::compare_env_against` reads `fnv64` from any object,
+  so it compares that entry by bytes.
 - The bag's `graph.yaml` attachment is the **effective in-memory graph config
   the run executed**, rendered by `graph_cmd::render_effective_graph_yaml`,
   never a copy of the on-disk graph file. The same renderer writes the run
@@ -468,6 +478,7 @@ still reports its zero count).
 | `bag_crash_recovery_test.rs` | Torn tail recovers all complete chunks; corrupted chunk body detected, never returned | no | none |
 | `bag_validation_test.rs` | Reserved-prefix / unknown-topic / duplicate-topic rejections; empty finalize still yields a valid bag; descriptor byte oracle | no | none |
 | `bag_writer_syscall_test.rs` | `writev` batching (IOV_MAX), partial-write resume at adversarial boundaries, EINTR retry, no-progress hard error | no | none |
+| `bag_writer_abandon_test.rs` | `BagWriter::abandon` logs nothing and writes no byte, leaving the file for its caller to remove; a writer dropped without `finalize` warns once | no | none |
 | `bag_channel_provisioning_test.rs` | Per-channel provisioning metadata round-trip through a real file, read by both readers | no | none |
 | `bag_schema_catalog_test.rs` | The schema-provenance attachment's file-level contract | no | none |
 | `advise_completeness_test.rs` | The completeness pre-scan's batched advise-behind memory bound | no | none |

@@ -130,6 +130,72 @@ pub fn verify_pop(
     }
 }
 
+/// Domain-separation tag for a ROBOT's proof of possession of its registered
+/// transport key. Distinct from [`POP_DOMAIN`], so no device-registration or
+/// robot-registration signature is ever a robot proof, and the reverse.
+pub const ROBOT_POP_DOMAIN: &[u8] = b"cerulion/robot-pop/v1";
+
+/// The `purpose` of a robot proof that spends a challenge to read the robot's
+/// own access epoch (`POST /v1/robots/{robot_id}/access`).
+pub const PURPOSE_ROBOT_ACCESS: &str = "robot-access";
+
+/// The `purpose` of a robot proof that asks for a challenge (`POST
+/// /v1/robots/{robot_id}/access/challenge`). Its last field is the request
+/// time, Unix nanoseconds as decimal digits, in place of a challenge.
+pub const PURPOSE_ROBOT_ACCESS_CHALLENGE: &str = "robot-access-challenge";
+
+/// The signing message of a robot proof: the [`pop_signing_message`] layout
+/// under [`ROBOT_POP_DOMAIN`], with the robot id where a device proof has the
+/// account. Every field is length-prefixed (u32 little-endian); the challenge is
+/// its exact UTF-8 bytes as the service issued it.
+pub fn robot_pop_signing_message(
+    purpose: &str,
+    robot_id: &[u8; 32],
+    transport_key: &[u8; 32],
+    challenge: &str,
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(
+        ROBOT_POP_DOMAIN.len() + purpose.len() + 32 + 32 + challenge.len() + 5 * 4,
+    );
+    write_field(&mut msg, ROBOT_POP_DOMAIN);
+    write_field(&mut msg, purpose.as_bytes());
+    write_field(&mut msg, robot_id);
+    write_field(&mut msg, transport_key);
+    write_field(&mut msg, challenge.as_bytes());
+    msg
+}
+
+/// Robot half: sign a robot access challenge with the transport key whose
+/// public half is `transport_key`.
+pub fn sign_robot_pop(
+    signing_key: &SigningKey,
+    purpose: &str,
+    robot_id: &[u8; 32],
+    transport_key: &[u8; 32],
+    challenge: &str,
+) -> Signature {
+    ed25519_sign(
+        signing_key,
+        &robot_pop_signing_message(purpose, robot_id, transport_key, challenge),
+    )
+}
+
+/// Service half of a robot proof: strict ed25519 over the rebuilt message.
+pub fn verify_robot_pop(
+    transport_key: &PublicKey,
+    purpose: &str,
+    robot_id: &[u8; 32],
+    challenge: &str,
+    signature: &Signature,
+) -> PopVerification {
+    let msg = robot_pop_signing_message(purpose, robot_id, &transport_key.0, challenge);
+    match ed25519_verify(transport_key, &msg, signature) {
+        VerifyResult::Ok => PopVerification::Ok,
+        VerifyResult::BadKey => PopVerification::BadKey,
+        VerifyResult::BadSig => PopVerification::BadSignature,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,5 +421,122 @@ mod tests {
         let a = sign_pop(&sk, PURPOSE_ROBOT_REGISTRATION, &ACCOUNT, &pk, CHALLENGE);
         let b = sign_pop(&sk, PURPOSE_ROBOT_REGISTRATION, &ACCOUNT, &pk, CHALLENGE);
         assert_eq!(a.0, b.0);
+    }
+
+    /// The vector the hosted account service's own tests pin byte for byte: the
+    /// transport key is the RFC 8032 seed 00..1f, the robot id 0x44 x 32.
+    const ROBOT_VECTOR_SEED: [u8; 32] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
+        25, 26, 27, 28, 29, 30, 31,
+    ];
+    const ROBOT_VECTOR_KEY_HEX: &str =
+        "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8";
+    const ROBOT_VECTOR_CHALLENGE: &str = "cm9ib3QtcG9wLWdvbGRlbi12ZWN0b3ItY2hhbGxlbmdl";
+    const ROBOT_VECTOR_MESSAGE_HEX: &str = "15000000636572756c696f6e2f726f626f742d706f702f76310c000000726f626f742d6163636573732000000044444444444444444444444444444444444444444444444444444444444444442000000003a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b82c000000636d396962335174634739774c5764766247526c626931325a574e3062334974593268686247786c626d646c";
+    const ROBOT_VECTOR_SIGNATURE_HEX: &str = "08a47ebe0dbfadd6f1a96210ccfac013b0a92331181d01698548f2e3ff291fea89999715e87d3b896ec21cbf03ad7f0a8158d1e756c5bf568d4137a43a17250f";
+
+    const ROBOT_VECTOR_REQUEST_MESSAGE_HEX: &str = "15000000636572756c696f6e2f726f626f742d706f702f763116000000726f626f742d6163636573732d6368616c6c656e67652000000044444444444444444444444444444444444444444444444444444444444444442000000003a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b81300000031373932393732383030303030303030303030";
+    const ROBOT_VECTOR_REQUEST_SIGNATURE_HEX: &str = "80cc6d309cece71a44d589d3dcc3e6af14f41fe23d4cb4ba514e2d82dee28b7d46efb3e11b212013d060da15a8e382358384887a0acf127d49eeb11ddc096e02";
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn robot_pop_matches_the_shared_app_vector() {
+        let sk = SigningKey::from_bytes(&ROBOT_VECTOR_SEED);
+        let pk = sk.verifying_key().to_bytes();
+        assert_eq!(pk.to_vec(), unhex(ROBOT_VECTOR_KEY_HEX));
+        let robot = [0x44u8; 32];
+        // The domain and purpose spelled literally, not through the constants.
+        assert_eq!(ROBOT_POP_DOMAIN, b"cerulion/robot-pop/v1");
+        assert_eq!(PURPOSE_ROBOT_ACCESS, "robot-access");
+        let msg = robot_pop_signing_message("robot-access", &robot, &pk, ROBOT_VECTOR_CHALLENGE);
+        assert_eq!(msg, unhex(ROBOT_VECTOR_MESSAGE_HEX));
+        let sig = sign_robot_pop(
+            &sk,
+            PURPOSE_ROBOT_ACCESS,
+            &robot,
+            &pk,
+            ROBOT_VECTOR_CHALLENGE,
+        );
+        assert_eq!(sig.0.to_vec(), unhex(ROBOT_VECTOR_SIGNATURE_HEX));
+        assert_eq!(
+            verify_robot_pop(
+                &PublicKey(pk),
+                PURPOSE_ROBOT_ACCESS,
+                &robot,
+                ROBOT_VECTOR_CHALLENGE,
+                &sig
+            ),
+            PopVerification::Ok
+        );
+    }
+
+    #[test]
+    fn a_robot_challenge_request_matches_the_shared_app_vector() {
+        let sk = SigningKey::from_bytes(&ROBOT_VECTOR_SEED);
+        let pk = sk.verifying_key().to_bytes();
+        let robot = [0x44u8; 32];
+        assert_eq!(PURPOSE_ROBOT_ACCESS_CHALLENGE, "robot-access-challenge");
+        let requested = "1792972800000000000";
+        let msg = robot_pop_signing_message("robot-access-challenge", &robot, &pk, requested);
+        assert_eq!(msg, unhex(ROBOT_VECTOR_REQUEST_MESSAGE_HEX));
+        let sig = sign_robot_pop(&sk, PURPOSE_ROBOT_ACCESS_CHALLENGE, &robot, &pk, requested);
+        assert_eq!(sig.0.to_vec(), unhex(ROBOT_VECTOR_REQUEST_SIGNATURE_HEX));
+        // A request signature is never an access proof over the same text.
+        assert!(!verify_robot_pop(
+            &PublicKey(pk),
+            PURPOSE_ROBOT_ACCESS,
+            &robot,
+            requested,
+            &sig
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn robot_and_device_proofs_never_verify_as_each_other() {
+        let (sk, pk) = key(7);
+        let robot = [0x44u8; 32];
+        let robot_sig = sign_robot_pop(&sk, PURPOSE_ROBOT_ACCESS, &robot, &pk, CHALLENGE);
+        // The same 32 bytes as an account, the same purpose string: a device proof.
+        assert!(!verify_pop(
+            &PublicKey(pk),
+            PURPOSE_ROBOT_ACCESS,
+            &robot,
+            CHALLENGE,
+            &robot_sig
+        )
+        .is_ok());
+        let device_sig = sign_pop(&sk, PURPOSE_DEVICE_REGISTRATION, &robot, &pk, CHALLENGE);
+        assert!(!verify_robot_pop(
+            &PublicKey(pk),
+            PURPOSE_DEVICE_REGISTRATION,
+            &robot,
+            CHALLENGE,
+            &device_sig
+        )
+        .is_ok());
+        // Another robot id or challenge does not verify either.
+        assert!(!verify_robot_pop(
+            &PublicKey(pk),
+            PURPOSE_ROBOT_ACCESS,
+            &[0x55; 32],
+            CHALLENGE,
+            &robot_sig
+        )
+        .is_ok());
+        assert!(!verify_robot_pop(
+            &PublicKey(pk),
+            PURPOSE_ROBOT_ACCESS,
+            &robot,
+            "other",
+            &robot_sig
+        )
+        .is_ok());
     }
 }

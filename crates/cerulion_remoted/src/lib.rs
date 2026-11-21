@@ -115,6 +115,7 @@ pub mod pairing_verbs;
 mod private_file;
 pub mod provision;
 pub mod rcp;
+pub mod remote_session;
 pub mod robot_settings;
 pub mod serving_hold;
 pub mod shell_policy;

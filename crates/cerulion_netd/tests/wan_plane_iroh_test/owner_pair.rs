@@ -322,6 +322,11 @@ fn peer_catalog_demand_and_transport_errors_are_sanitized_before_surfacing() {
                 accepted
                     .connection
                     .close(0u32.into(), b"peer\x1b[2J\nclose");
+                // Dropping an endpoint that was never closed aborts its tasks before
+                // the queued close is sent, and the desk would only see its own read
+                // bound expire. Closing it sends the close, so the desk's pending
+                // read fails on the closed connection instead.
+                endpoint.close().await;
                 return;
             }
             if phase == "demand" {
@@ -373,7 +378,14 @@ fn peer_catalog_demand_and_transport_errors_are_sanitized_before_surfacing() {
         };
         assert!(!reason.contains('\u{1b}'), "{phase}: {reason:?}");
         assert!(!reason.contains('\n'), "{phase}: {reason:?}");
-        if phase != "transport" {
+        if phase == "transport" {
+            // The close arrives as a failed control read, not as the read bound
+            // expiring (that text starts "iroh control read timed out"). Today the
+            // surfaced reason is the stream error alone and the peer's close text
+            // stays in the error's source chain; the escape and newline checks
+            // above are what fail if a change renders that chain unsanitized.
+            assert!(reason.starts_with("control read: "), "{phase}: {reason:?}");
+        } else {
             assert!(reason.contains("peer"));
         }
         assert_eq!(plane.connection_count(), 0);

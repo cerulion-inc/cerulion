@@ -47,7 +47,10 @@ pub(super) fn run(manager: &TransportManager, path: &str) -> Result<ExitCode, St
         }
     }
     let native = loaded.context.take().ok_or("missing context")?;
-    let mut environment: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // Each variable whose name and value are valid UTF-8, as the runtime keeps.
+    let mut environment: std::collections::HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     environment.insert(
         "CERULION_WORKSPACE".into(),
         native

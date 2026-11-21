@@ -1,8 +1,13 @@
-# Mutation baseline for cerulion_core: the ROS IDL parser decision functions.
+# Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
+# the live loop's wait sizing, its period-park decisions, the framework-section
+# codec and the capture judge's frame check.
 #
-# Scope: the two pure parser files, and the oracle mutants listed below, each
-# on one pure decision function. The rest of the crate holds transport and
-# scheduler paths that the mutation rule does not cover.
+# Scope: the two pure parser files, the pure wait-sizing and period-park
+# functions named below, the framework-section codec in state_restore.rs (its
+# changed lines), the three frame-check functions in flashback/resim.rs named
+# below, and the oracle mutants listed below, each on one pure decision
+# function. The rest of the crate holds transport and scheduler paths that the
+# mutation rule does not cover.
 #
 # Run:     cargo mutants -p cerulion_core \
 #            -f crates/cerulion_core/src/codegen/rosmsg_parser.rs \
@@ -16,6 +21,66 @@
 #
 # First-`#` comment cut, re-run on the changed lines only (--in-diff): 7
 # mutants, 1 caught, 6 unviable, 0 missed.
+#
+# Live-loop wait sizing: `Scheduler::next_fire_split` (a Period deadline
+# still ahead is exact, every other pending fire is a poll), `NextFire::soonest`
+# and `live_wait_ns` (the wait from the two halves and the quantum boundary).
+#
+# Run:     cargo mutants -p cerulion_core --in-place \
+#            -f crates/cerulion_core/src/graph/runtime.rs \
+#            -f crates/cerulion_core/src/scheduler/mod.rs \
+#            --re "live_wait_ns|next_fire_split|NextFire::soonest" \
+#            -- --lib -- live_wait_tests next_fire_split_tests deferred_external
+# Result:  30 mutants: 26 caught, 3 unviable (do not compile), 1 missed. The
+#          missed mutant is outside the three functions: a struct-field
+#          deletion in `CrossProcessWiring::validation_options` that the run
+#          also tried. Every mutant inside the three functions is caught.
+#
+# Framework-section codec: the stopped node's flags byte (version 5) in
+# NodeFrameworkState::{is_empty, wire_version, encoded_len, encode, decode},
+# run on the changed lines only:
+#
+# Run:     cargo mutants -p cerulion_core \
+#            -f crates/cerulion_core/src/state_restore.rs \
+#            --in-diff <the change's diff of that file> -- --test state_restore_test
+# Result:  46 mutants: 43 caught, 3 unviable (do not compile), 0 missed.
+#
+# Live-loop period-park (`graph/period_park.rs`, `CERULION_PERIOD_PARK=1`):
+# `refusal` and `admits` (where it applies), `NotEngaged::as_str` (the
+# warning's reason), `announce` (the start line or the one warning),
+# `classify` (the switch), `Plan::phase` (nap or park), `KernelLead` (how late
+# a nap returns) and `ArrivalLearner` (a data input's period and phase).
+#
+# Run:     cargo mutants -p cerulion_core --in-place -C --lib \
+#            -f crates/cerulion_core/src/graph/period_park.rs \
+#            --re "admits|refusal|NotEngaged::as_str|announce|classify|Plan::phase|KernelLead::|ArrivalLearner::" \
+#            -- -- period_park
+# Result:  93 mutants: 61 caught, 18 unviable, 14 missed. Eleven missed
+#          mutants were boundaries no test held (the learner's shortest and
+#          longest gap, its tolerance, the instant a window closes), now
+#          pinned. Three were in code that changed nothing (two checks in
+#          `Plan::phase`, a cap in `ArrivalLearner::half_width_ns`), now gone.
+#          Re-run over `ArrivalLearner::` and `Plan::phase` after both fixes:
+#          60 mutants, 52 caught, 8 unviable, 0 missed.
+#
+# Capture judge's frame check: `HeldFrames::new` (a writer's held sequences,
+# sorted and distinct), `first_frame_gap` (the first frame a kept read names
+# that the capture does not hold) and `frame_not_held_reason` (the frames begin
+# late or the window lost a frame sentence).
+#
+# Run:     cargo mutants -p cerulion_core --in-place --cap-lints true \
+#            -f crates/cerulion_core/src/flashback/resim.rs \
+#            --re "HeldFrames::new|first_frame_gap|frame_not_held_reason" \
+#            -- --lib flashback
+# Result:  11 mutants: 9 caught, 1 unviable (do not compile), 1 missed. The
+#          unviable mutant returns `Some(Default::default())` from
+#          `first_frame_gap`, and `FrameGap` has no default. The missed mutant
+#          is listed below.
+#
+# `HeldFrames::new` yields no mutant: cargo-mutants skips every method named
+# `new`. The unsorted sequences in
+# `flashback::resim::tests::the_first_named_frame_the_capture_does_not_hold_is_the_gap`
+# hold its sort; its dedup changes no answer `first_frame_gap` gives.
 #
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
@@ -40,4 +105,8 @@
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
 # it with a test, or list it here with a reason.
 
-(none)
+src/flashback/resim.rs, frame_not_held_reason: `<` replaced with `<=` in the
+`sequence < first_sequence` guard. Equivalent for every gap a production path
+builds: each comes from `first_frame_gap`, which reports a frame only when its
+writer's held sequences do not contain it, and `first_sequence` is the lowest
+held sequence, so the two are never equal.

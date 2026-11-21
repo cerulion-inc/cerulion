@@ -225,6 +225,16 @@ Load-bearing boundary contracts:
   comparison and the transport deadline, and must discard a failed stream.
   The original entry point remains available to callers with a fixed identity.
 
+- **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
+  process enumeration, readiness and signal syscalls before spawn. Native pidfds
+  bind each signal to its captured process. Only an unavailable pidfd syscall permits the
+  ordinary fallback; its last SID/birth-time check cannot be atomic with the
+  numeric-PID signal. The caller retains the unreaped session leader until cleanup
+  returns, pinning its SID. Repeated scans include ordinary job-control groups;
+  unreadable session state is an error, not an empty-session success. The blocking
+  scan has a 250 ms deadline and requires two empty scans. It is lifecycle cleanup,
+  not containment of a process that escapes the session or continually forks.
+
 - **The AGPL/closed boundary for the connect worker is a PROCESS boundary**: the closed Studio spawns
   the AGPL `cerulion-connectd` binary exactly as it spawns the gateway/vizd
   (`crates/cerulion_connectd/src/lib.rs`; the CLI side is pure argv resolution in
@@ -582,6 +592,23 @@ refused when its subscriber wait plus its frames at the rate exceed 90 s, and
 is stopped if it is still running 100 s after it started (a frame that takes
 longer to send than its period delays the rest). A topic under
 `/__cerulion` is refused. `service-call` also returns `response_text`.
+
+Each verb answers in one order: `topic-publish` and `service-call` read the
+e-stop first; every verb then checks its arguments (required keys, numbers,
+limits and the type's resolution), and only then reads the topic's mirror
+marker and remote access policy (`servable`) and takes its remote lease; the
+`message` or `request` text is parsed and encoded after that, inside the
+`cerulion_msgio` publish or call. Such a malformed request is a usage error and
+an engaged e-stop is the refusal whatever state the topic's markers are in
+(`act_verbs_test.rs`:
+`a_malformed_request_on_an_excluded_topic_is_a_usage_error`,
+`an_engaged_estop_is_the_refusal_on_an_excluded_topic`). A policy or mirror
+marker whose last holder is dropping it is opened again within
+`cerulion_core::transport::marker_teardown`'s budget (20 opens 25 ms apart,
+`TeardownWait::Bounded`) and refuses naming that budget only once it outlasts
+it. The wire plane's demand and schema reads wait the same way; its catalog
+filter and catalog peek pass `TeardownWait::Never`, so a listing opens each
+marker once and leaves out a topic whose marker is being torn down.
 
 ## 6. The wire plane (robot side)
 
@@ -1062,6 +1089,15 @@ The full lifecycle is `docs/revocation.md`; the contributor invariants:
   a stolen desk. Session refreshes are serialized across processes by an
   exclusive lock beside `auth.json` (`.auth-refresh.lock`): a refresh token is
   single-use, and the loser of a race uses the session the winner wrote.
+  netd's shutdown, and the teardown before a robot server restart, send the
+  worker SIGTERM as they begin (`EpochSync::signal_stop`, before the robot
+  server stops), and the stop grace runs from that signal. The worker's handler only sets the `stopping` flag
+  `robot_bootstrap::sync_epoch` takes, after which it starts no session
+  fallback, refresh (`login_cmd::refresh_session_if_stale_unless_stopping`
+  reads the flag before the refresh lock and again before the exchange) or
+  certificate renewal, so the grace only has to cover one exchange in flight.
+  Requests that spend no token (the robot-proof fetch, an access read) may
+  still run and end at the grace.
 - **Desks also push.** Both desk dial paths carry the cached epoch
   unconditionally; there is deliberately NO knob to withhold it (by
   design: a withholding knob would be a footgun). The shared substrate is
@@ -1193,7 +1229,7 @@ platforms: most in the crate-tests job; `cerulion_connectd` and
 |---|---|
 | `crates/cerulion_remoted/tests/act_verbs_daemon_test.rs` | Every act verb is registered in the production `serve_endpoint` daemon: each answers `{}` with its own usage error over a real ops session |
 | `crates/cerulion_remoted/tests/act_verbs_cloud_test.rs` | The act verbs under the allow-from-cloud switch: a cloud device is refused publish and snapshot only while the switch is off |
-| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, live mirror refusal, reserved-topic usage errors, contextual producer exclusions and local oracle delivery |
+| `crates/cerulion_remoted/tests/act_verbs_test.rs` | The act verbs over real iceoryx2 (the process transport, a distinct topic or service per test): publish reaches a subscriber, echo-once and snapshot read a live publisher, service-call answered by core's `ServiceServer`, an e-stop engaged before the send sends no request and no frame, live mirror refusal, reserved-topic usage errors, contextual producer exclusions, usage errors and the e-stop refusal ahead of an excluded topic's policy, and local oracle delivery |
 | `crates/cerulion_pairing/tests/format_vectors_test.rs` | Byte-exact canonical signing vectors from independent hand-serializers; strict epoch-envelope decode |
 | `crates/cerulion_pairing/tests/chain_verify_test.rs` | Chain positive path + full negative matrix (M-of-N, peer binding, expiry, delegation cap, epoch, rollback) |
 | `crates/cerulion_pairing/tests/store_test.rs` | MAC tamper-evidence, atomic save/load, anti-rollback persistence, claim/reset lifecycle, epoch monotonicity |

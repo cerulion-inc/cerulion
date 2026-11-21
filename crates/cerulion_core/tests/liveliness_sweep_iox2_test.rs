@@ -800,9 +800,11 @@ fn cleanup_runs_on_its_own_thread_not_per_sweep_and_graceful_path_unbroken() {
     );
 
     // (2) PARK the thread, snapshot, drive K sweeps: the count must not move.
-    // Parking first makes the snapshot race-free: the counter is bumped at the
-    // START of a pass, so any pass in flight when we park has already counted,
-    // and none starts for an hour.
+    // The park returns only after a pass already under way has ended (the
+    // counter is bumped at the START of a pass, so it is counted), and the
+    // next pass waits the new hour even when the old 20 ms period ran out as
+    // the park landed, so the snapshot is the count every later read must
+    // match.
     runtime.set_liveliness_cleanup_period_for_test(3_600_000);
     let parked = runtime.liveliness_cleanup_call_count();
     const K: u64 = 7;

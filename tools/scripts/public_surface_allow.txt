@@ -10,6 +10,30 @@
 # Class work-state: an entry excuses the LINE before the file's count is taken,
 # so a legitimate line is never ledger debt, and `*` is refused: <match> names
 # the one line (a piece of the finding's quoted text).
+harness/measured/plain-overlay/rcpx/r2/epochs_book.py | work-state | "note": "not measured yet" | a value the epochs document of the measured code serves while the base give has no measurement
+harness/measured/rcp/bench/ext/libero/envhost.py | work-state | waits for one of the box's EGL slots | the help string of the measured code's renderer flag
+harness/measured/rcp/bench/ext/libero/native.py | work-state | The object is in the box | a worked example in the plain tool set's description; the box is an object in the benchmark scene
+harness/measured/rcp/bench/ext/libero/native.py | work-state | The box was closer | a worked example in the plain tool set's description; the box is an object in the benchmark scene
+harness/measured/rcp/bench/ext/published.py | work-state | skeptic correction 3 | a note field of a published-results row in the measured code
+harness/measured/rcp/bench/operators/chat_prompt.py | work-state | The budget is spent | an instruction the measured operator sends the model when its call budget is spent
+harness/measured/rcp/bench/operators/chat_prompt.py | work-state | This is your last turn | an instruction the measured operator sends the model on its last turn
+harness/measured/rcp/bench/operators/operator_brief.md | work-state | End by calling claim with an honest statement | the system text the measured operator sends the model
+harness/measured/rcp/rcpx/bounds_plan.py | work-state | ruled = sum(counts.values()) | a local variable of the measured code: the periods a bound governs
+harness/measured/rcp/rcpx/bounds_plan.py | work-state | free_count / ruled | a local variable of the measured code: the periods a bound governs
+harness/measured/rcp/rcpx/bounds_robot.py | work-state | np.full_like(r.q_home, math.inf) | the evidence text of a bound with no measurement, a runtime value of the measured code
+harness/measured/rcp/rcpx/bounds_robot.py | work-state | value, evidence = math.inf | the evidence text of a bound with no measurement, a runtime value of the measured code
+harness/measured/rcp/rcpx/bounds_robot.py | work-state | np.zeros_like(r.q_home) | the evidence text of a bound before the self-test runs, a runtime value of the measured code
+harness/measured/rcp/rcpx/bounds_robot.py | work-state | value, evidence = 0.0 | the evidence text of a bound before the self-test runs, a runtime value of the measured code
+harness/measured/rcp/rcpx/eyes_service/backends.py | work-state | nms_iou: the box overlap | a field description in the eyes service's status answer; the box is a bounding box of an image region
+harness/measured/rcp/rcpx/eyes_service/backends.py | work-state | text_detection | a score description in the eyes service's answer; the box is a bounding box of an image region
+harness/measured/rcp/rcpx/model_body.py | work-state | BASE_NOTE_UNKNOWN | the base note of robot://body while the base give has no measurement, a runtime value of the measured code
+harness/measured/rcp/rcpx/model_tool.py | work-state | the box around each body | text of the measured code's tool document; the box is a bounding box around a body of the tool
+harness/measured/rcp/rcpx/r2/epochs_book.py | work-state | "note": "not measured yet" | a value the epochs document of the measured code serves while the base give has no measurement
+harness/measured/rcp/rcpx/r2/frames.py | work-state | the box it was cut from | a tool description the model reads; the box is the image region a crop was cut from
+harness/measured/rcp/rcpx/r2/lean.py | work-state | "zero_check" | the reason text lean holds for a tool flag, a runtime value of the measured code
+harness/measured/rcp/rcpx/r2/lean.py | work-state | "apply_offset" | the reason text lean holds for a tool flag, a runtime value of the measured code
+harness/measured/rcp/rcpx/r2/mobile_bounds.py | work-state | odometry drift not measured yet | the evidence text of the odometry bound with no measurement, a runtime value of the measured code
+harness/measured/rcp/rcpx/r2/obstacles.py | work-state | part_hit_note | a result note of the measured code: two readings in a row ruled the tool out of a contact
 crates/cerulion_cli_engine/AGENTS.md | examples-shape | cargo ... --example | the line regenerates a test fixture from a crate example: a maintainer recipe, not a usage example
 docs/legal/LICENSE-HISTORY.md | examples-shape | cargo ... --example | the license history records how a fixture was regenerated; not a usage example
 examples/moveit_hero | examples-shape | * | a container gate for rmw_cerulion, not a workspace; whether it becomes one is a maintainer ruling still open

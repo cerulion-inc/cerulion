@@ -87,9 +87,27 @@ robots that are not registered to an account.
 
 **The robot's own fetch** (registered robots, account-first). `cerulion-netd`'s
 robot supervisor runs a hidden internal worker, `cerulion robot-sync-epoch`, that
-fetches `GET /v1/robots/{id}/access` with the robot's own login and leaves the
-signed epoch in `<state>/remoted/epoch.pending`; `cerulion-remoted` applies it
+fetches the robot's signed epoch and leaves it in `<state>/remoted/epoch.pending`.
+It first proves possession of the robot's registered transport key: it asks
+`POST /v1/robots/{id}/access/challenge` for a single-use challenge with a request
+signed by that key over the current time, signs the challenge, and presents it to
+`POST /v1/robots/{id}/access`, which answers the same signed epoch with no account
+session. A request time more than five minutes from the service's clock, or not later
+than the robot's previous request, is refused. Only requests signed by the key count
+against the robot's 900 challenges an hour, so no other caller can use them up; a 429
+there fails the run with nothing fetched and without trying the login, and the supervisor
+backs off as for any failed fetch. A refused request time (the robot's clock more than five
+minutes off, or behind its previous accepted request after the clock steps backwards)
+names the time the service accepts, and the robot retries at that time, at most twice
+(a clock that was ahead and then stepped far behind meets a skew refusal, then a replay
+refusal), so the robot's clock never decides whether it learns its revocations.
+When the service answers 404 there (no such route, or a service that does not know this
+robot), or that fetch fails otherwise, it fetches `GET /v1/robots/{id}/access` with the
+robot's own login instead. `cerulion-remoted` applies it
 through `SharedTrust::apply_epoch`, re-verifying it against the robot's own roots.
+The worker's warnings, such as a robot-key fetch that failed and fell back to the login or a
+device certificate renewal that failed, go to its stderr, which netd passes through to its own
+(`RUST_LOG` sets the level; the default is `warn`; colour codes only on a terminal).
 The worker runs at start, every `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (default 300 s), and early, at most every
 5 s, when an admitted key that has not connected in the last `CERULION_REMOTED_EPOCH_RECHECK_S`
 (default 60 s) connects; remoted applies a fetched epoch within `EPOCH_POLL_INTERVAL` (2 s),
@@ -111,9 +129,12 @@ fetches are succeeding.
 |---|---|---|
 | `CERULION_NETD_EPOCH_SYNC_PERIOD_S` (30 to 86400) | 300 | The revocation lag for a key that stays away, at one HTTPS request per robot per period to the account service (288 a day). 300 s keeps that load negligible while a stolen desk that holds a connection open is cut within minutes. |
 | `CERULION_REMOTED_EPOCH_RECHECK_S` (5 to 3600) | 60 | How soon a key that reconnects asks for another early fetch. Shorter cuts a quickly reconnecting revoked key sooner, at up to one extra request per key per interval. |
-| Fetch deadline | 120 s | Above the worker's own worst case (a 30 s refresh-lock wait, a 30 s session refresh, a 30 s access request), so it never stops a session refresh midway. |
-| `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` (5 to 120) | 35 | How long a netd shutdown waits for a running fetch: one 30 s account request plus 5 s, so a session refresh in flight publishes its rotated, single-use token pair instead of being stopped midway. A shutdown that lands during a fetch can take up to this long; one with no fetch running, or a fetch that ends sooner, does not wait. The robot server stops before this wait, and netd's `CERULION_NETD_HARD_EXIT_MS` deadline is extended by it. The fetch runs in its own process group, so a Ctrl-C to netd's process group does not end it early. Under systemd, set `KillMode=mixed` so a service stop signals only netd and this wait applies. |
+| Fetch deadline | 120 s | Above the worker's own bound (a robot-proof fetch bounded at 24 s, then a 30 s refresh-lock wait, a 30 s session refresh and its 1 s save, a 30 s access request: 115 s), so it never stops a session refresh midway. A device-certificate renewal starts only within the worker's first 15 s, and takes at most 62 s (a session refresh bounded to 30 s plus 1 s to save it, two 15 s requests, one 1 s store-lock wait), so it also ends by 77 s. |
+| Robot-proof request timeout | 8 s | Each robot-proof request: a challenge request, up to two retries at the times the service names, the access request, all within the fetch's 24 s, three requests' timeouts. With the login fallback's 91 s after them the worker ends by 115 s. |
+| Robot challenge budget | 900 an hour | The supervisor starts a fetch at most every 5 s (720 an hour); the rest covers a restarted supervisor, which fetches at once. Only requests signed by the robot's key count. A `cerulion-netd` that restarts every few seconds can use the budget up; its fetches then fail with a 429, counted by the supervisor's failure backoff, until the hour's window resets, while the robot keeps its last applied epoch. |
+| `CERULION_NETD_EPOCH_SYNC_STOP_GRACE_S` (5 to 120) | 35 | How long a netd shutdown waits for a running fetch: one 30 s account request plus 5 s, so a session refresh in flight publishes its rotated, single-use token pair instead of being stopped midway. The shutdown, like the teardown before a robot server restart, sends the fetch SIGTERM as it begins, after which the fetch starts no login session fallback, session refresh or certificate renewal, so only an exchange already in flight needs this wait, which runs from that signal. A shutdown that lands during a fetch can take up to this long; one with no fetch running, or a fetch that ends sooner, does not wait. The wait overlaps the robot server's own stop, and a fetch still running once both have ended is stopped; netd's `CERULION_NETD_HARD_EXIT_MS` deadline is extended by it. The fetch runs in its own process group, so a Ctrl-C to netd's process group does not end it early. Under systemd, set `KillMode=mixed` so a service stop signals only netd and this wait applies. |
 | Failure backoff | 5 s doubling to 300 s, never past the period | A short outage costs one short delay; a long one stops hammering the service. Fetching never stops, and recovery is no slower than the period. |
+| Epoch and response size | 1 MiB epoch file, 2 MiB access response | The robot's daemon applies an epoch file of at most 1 MiB (the epoch as hex), about 16,000 revoked accounts and keys. The access response lists each revoked id again beside the signed epoch, so the robot-key fetch reads a response up to twice that file. A fetched epoch above the file's bound is refused before it is written, and the robot keeps its last applied epoch. |
 | Apply poll | 2 s | The time from a fetched epoch to enforcement, at one file check per poll. |
 | Desk refresh bound (`EPOCH_SYNC_BUDGET`) | 1 s | The most a listing or `viz --robot` waits on the account service before dialing. |
 
@@ -121,8 +142,13 @@ Polling is the delivery mechanism because nothing can reach a robot from the acc
 service today. The planned replacement is a change notification pushed from the
 account service to the robot, which would make the lag a network round trip and drop
 the periodic requests; the periodic fetch would then remain only as the fallback.
-The fetch needs the robot's login to stay valid; a robot whose login lapses keeps
-its last applied epoch.
+The robot-proof fetch needs no valid login session, so a robot whose login has lapsed,
+after months offline for example, still learns its revocations once it is back online.
+The worker still checks locally that the machine's stored login names the
+registration's owner, so a robot signed out with `cerulion logout` keeps its last
+applied epoch. When the robot-proof fetch fails, the login fallback needs a valid or
+refreshable session, and a robot whose login has also lapsed then keeps its last
+applied epoch.
 
 **The desk push.** When a desk dials a robot, it hands over the latest epoch it has
 cached. Before `topic list` probes the account's robots and before `viz --robot`

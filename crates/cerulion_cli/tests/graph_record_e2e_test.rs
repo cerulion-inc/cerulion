@@ -15,6 +15,11 @@
 //!    mid-run makes `graph run` exit NONZERO naming the INCOMPLETE bag.
 //! 3. (Linux-only) **--record-cpu pin-proof** — the bagd grandchild's
 //!    `/proc/<pid>/status` `Cpus_allowed_list` equals the requested core.
+//! 4. **Variables that are not valid UTF-8**: every recording here is made
+//!    beside two names and three values that are not, set only in the child's
+//!    environment; one arm reads the `env.json` and the count of names left
+//!    out that they produce in the run directory and in the bag, and the
+//!    warnings that name them, and another reads a zero count without them.
 //!
 //! Prerequisite (repo pattern, mirrors `rayon_fire_cdylib_serial_test`):
 //! `cargo build -p test_node_macro_period_cdylib -p
@@ -28,7 +33,9 @@
 
 #![cfg(unix)]
 
+use std::ffi::OsStr;
 use std::io::Read as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -194,6 +201,37 @@ const PROBE_TOKEN_VALUE: &str = "cer-record-probe-token-value";
 /// same parameters as [`PROBE_SECRET_FNV64`].
 const PROBE_TOKEN_FNV64: &str = "5c2b3670b7a85a12";
 
+/// The probes whose value is not valid UTF-8, each `(name, value, FNV-1a 64
+/// of the value)`, the hash computed outside the tree with the same
+/// parameters as [`PROBE_SECRET_FNV64`]. Like the secret probes they are set
+/// in the harness, as raw bytes in the child's environment only, so every
+/// recording in this file is made beside them.
+const NOT_UTF8_VALUE_PROBES: [(&str, &[u8], &str); 3] = [
+    // Off the allowlist: hashed in any case.
+    ("CER_E2E_PROBE_NOT_UTF8", b"\xff\xfe", "0a99c807b6f645b0"),
+    // "café" in Latin-1 under an allowlisted name: the one value the default
+    // mode would have kept as text.
+    ("CERULION_E2E_PROBE_LATIN1", b"caf\xe9", "b538f990e85962dc"),
+    // Allowlisted by prefix, secret by its `TOKEN` segment: hashed in any case.
+    (
+        "CERULION_E2E_PROBE_NOT_UTF8_TOKEN",
+        b"\xffpw",
+        "f810bc1be32e8897",
+    ),
+];
+
+/// The probes whose NAME is not valid UTF-8, so no JSON key can hold them.
+/// Two, so the count of names left out is not a constant 1.
+const NOT_UTF8_NAME_PROBES: [&[u8]; 2] = [b"CER_E2E_PROBE_NAME_\xfe", b"CER_E2E_PROBE_NAME_\xff"];
+
+/// The value of each of [`NOT_UTF8_NAME_PROBES`]: long and distinctive, so its
+/// absence from the artifacts and the log is not a coincidence.
+const NOT_UTF8_NAME_PROBE_VALUE: &str = "cer-record-probe-name-value";
+
+/// The `CERULION_HOME` directory under each test's root, which holds the run
+/// directory (`<home>/runs/<run>/`) while the run is live.
+const HOME_DIR: &str = "cerhome";
+
 /// FNV-1a 64 over `bytes`, written out here rather than imported: the production
 /// renderer hashes with `cerulion_core::wire::fnv1a_hash`, and calling that same
 /// function to check its own output would assert nothing. Anchored on the
@@ -220,13 +258,35 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 /// deliberately tests the unpartitioned default; the mp recording contracts
 /// live in `mp_record_e2e_test.rs`.)
 fn spawn_graph_record(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf, PathBuf) {
+    spawn_graph_record_with_names(root, extra, &NOT_UTF8_NAME_PROBES)
+}
+
+/// [`spawn_graph_record`] with `not_utf8_names` as the names that are not
+/// valid UTF-8 in the child's environment, in place of
+/// [`NOT_UTF8_NAME_PROBES`].
+fn spawn_graph_record_with_names(
+    root: &Path,
+    extra: &[&str],
+    not_utf8_names: &[&[u8]],
+) -> (ChildGuard, PathBuf, PathBuf) {
     let stdout_path = root.join("run.stdout");
     let stderr_path = root.join("run.stderr");
+    let home = root.join(HOME_DIR);
+    std::fs::create_dir_all(&home).unwrap();
     // NO `--no-validate`: a recording made with the schema checks off is
     // refused at parse (by design, because such a bag cannot be reliably
     // replay-verified). The `demo` workspace validates, so the flag bought
     // this harness nothing.
-    let child = Command::new(env!("CARGO_BIN_EXE_cerulion"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    // A variable this process inherited whose name or value is not valid UTF-8
+    // is removed, so the probes below are the only such variables and the
+    // warnings that name them are exact on any host.
+    for (name, value) in std::env::vars_os() {
+        if name.to_str().is_none() || value.to_str().is_none() {
+            cmd.env_remove(name);
+        }
+    }
+    let child = cmd
         .args([
             "graph",
             "run",
@@ -252,6 +312,19 @@ fn spawn_graph_record(root: &Path, extra: &[&str]) -> (ChildGuard, PathBuf, Path
         // The secret-NAME probe: allowlisted by prefix, hashed by its `TOKEN`
         // segment (`PROBE_TOKEN_FNV64` in the happy-path arm).
         .env(PROBE_TOKEN_NAME, PROBE_TOKEN_VALUE)
+        // The probes that are not valid UTF-8 (`NOT_UTF8_VALUE_PROBES`).
+        .envs(
+            NOT_UTF8_VALUE_PROBES
+                .map(|(name, value, _)| (OsStr::new(name), OsStr::from_bytes(value))),
+        )
+        .envs(
+            not_utf8_names
+                .iter()
+                .map(|name| (OsStr::from_bytes(name), NOT_UTF8_NAME_PROBE_VALUE)),
+        )
+        // The run directory goes under this test's own root, where the arm
+        // that reads it finds it, and never into the developer's home.
+        .env("CERULION_HOME", &home)
         // Keep the captured log PLAIN. `cerulion_core::init_logging` builds a
         // `fmt::layer()` with tracing-subscriber's `ansi` feature on, which
         // italicises field NAMES and dims the `=`, so a field arrives as
@@ -529,6 +602,221 @@ fn record_e2e_ctrl_c_exits_zero_with_finalized_bag_and_ordered_lifecycle() {
         spawned < ready && ready < bagd_done && bagd_done < complete,
         "lifecycle order must be spawn({spawned}) < ready({ready}) < bagd-complete({bagd_done}) \
          < recording-complete({complete}); log was:\n{log}"
+    );
+}
+
+/// The bytes of `file` in the one run directory under `home`. A run directory
+/// exists only while its run is live, so this is read before the Ctrl-C.
+fn read_live_run_file(home: &Path, file: &str) -> Vec<u8> {
+    let runs = home.join("runs");
+    let dirs: Vec<PathBuf> = std::fs::read_dir(&runs)
+        .unwrap_or_else(|e| panic!("the run directory must exist under {}: {e}", runs.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(
+        dirs.len(),
+        1,
+        "one run directory under {}: {dirs:?}",
+        runs.display()
+    );
+    std::fs::read(dirs[0].join(file))
+        .unwrap_or_else(|e| panic!("the run directory carries {file}: {e}"))
+}
+
+/// The `env_names_left_out` count in `recorder.json` bytes, or `None` when
+/// the key is absent.
+fn env_names_left_out(recorder_json: &[u8]) -> Option<u64> {
+    let doc: serde_json::Value =
+        serde_json::from_slice(recorder_json).expect("recorder.json parses");
+    doc.get("env_names_left_out").map(|count| {
+        count
+            .as_u64()
+            .unwrap_or_else(|| panic!("a count, got {count}"))
+    })
+}
+
+/// A recording made beside two names and three values that are not
+/// valid UTF-8 starts, records frames and exits exactly 0 on Ctrl-C. The run
+/// directory and the bag carry the same `env.json`: each such value as its
+/// FNV-1a 64 hash over the raw bytes, marked `utf8: false`, and no key for
+/// either name; each `recorder.json` counts the two names left out. The run
+/// prints each warning once, naming the variables and never a value: the
+/// node-environment line for its graph build, and each `env.json` line for
+/// the run directory's render, though the bag's `env.json` is rendered too.
+#[test]
+#[serial]
+fn record_e2e_with_non_utf8_variables_writes_one_env_json_to_the_bag_and_the_run_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    build_workspace(tmp.path(), "rece2eu");
+    let (mut guard, _stdout_path, stderr_path) = spawn_graph_record(tmp.path(), &[]);
+    // Kill any orphaned bagd grandchild on ANY exit.
+    let _bagd_guard = BagdGuard;
+
+    let bag = wait_for_bag(&tmp.path().join("recordings"), Duration::from_secs(30))
+        .expect("bagd never created the bag (handshake failed?)");
+    wait_for_bag_state(
+        &bag,
+        "a recorded user topic carrying frames",
+        RECORDED_WINDOW_TIMEOUT,
+        |snap| snap.user_topics_with_frames(1) >= 1,
+    );
+    let run_env_json = read_live_run_file(&tmp.path().join(HOME_DIR), "env.json");
+    let run_recorder_json = read_live_run_file(&tmp.path().join(HOME_DIR), "recorder.json");
+
+    send_signal(guard.0.id(), libc::SIGINT);
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(40))
+        .expect("graph run did not exit after SIGINT");
+    assert_eq!(status.code(), Some(0), "Ctrl-C must exit 0, got {status:?}");
+
+    let reader = BagReader::open(&bag).expect("open bag");
+    let bag_env_json = reader
+        .attachment("env.json")
+        .expect("read")
+        .expect("env.json attachment present")
+        .data;
+    let text = String::from_utf8(bag_env_json.clone()).expect("env.json is UTF-8");
+    assert!(
+        !text.contains('\u{fffd}'),
+        "env.json holds no replacement character"
+    );
+    let env_json: serde_json::Value = serde_json::from_str(&text).expect("env.json parses");
+    for (name, value, fnv64) in NOT_UTF8_VALUE_PROBES {
+        assert_eq!(
+            format!("{:016x}", fnv1a_64(value)),
+            fnv64,
+            "the recorded constant must be the hash of the probe value it names"
+        );
+        assert_eq!(
+            env_json[name],
+            serde_json::json!({"fnv64": fnv64, "redacted": true, "utf8": false}),
+            "{name}"
+        );
+    }
+    let keys = env_json.as_object().expect("env.json is an object");
+    assert!(
+        keys.keys().all(|k| !k.starts_with("CER_E2E_PROBE_NAME_")),
+        "a name that is not valid UTF-8 has no key"
+    );
+    assert!(!text.contains(NOT_UTF8_NAME_PROBE_VALUE));
+    assert_eq!(
+        run_env_json, bag_env_json,
+        "the run directory and the bag carry the same env.json"
+    );
+    let bag_recorder_json = reader
+        .attachment("__cerulion/recorder.json")
+        .expect("read")
+        .expect("recorder.json attachment present")
+        .data;
+    assert_eq!(
+        env_names_left_out(&bag_recorder_json),
+        Some(2),
+        "the bag's count"
+    );
+    assert_eq!(
+        env_names_left_out(&run_recorder_json),
+        Some(2),
+        "the run directory's count"
+    );
+
+    let log = String::from_utf8_lossy(&std::fs::read(&stderr_path).expect("stderr")).into_owned();
+    let only_warn_line = |message: &str| -> String {
+        let lines: Vec<&str> = log.lines().filter(|l| l.contains(message)).collect();
+        match lines.as_slice() {
+            [line] if line.contains(" WARN ") => (*line).to_string(),
+            other => panic!("one WARN line for {message:?}: {other:#?}"),
+        }
+    };
+    let node_env = only_warn_line(
+        "node environment: variables whose name or value is not valid UTF-8 are left out, so \
+         ctx.env and ctx.env_str return the default for them",
+    );
+    assert!(
+        node_env.contains(
+            r#"names=["CERULION_E2E_PROBE_LATIN1", "CERULION_E2E_PROBE_NOT_UTF8_TOKEN", "CER_E2E_PROBE_NAME_\xFE", "CER_E2E_PROBE_NAME_\xFF", "CER_E2E_PROBE_NOT_UTF8"]"#
+        ),
+        "{node_env}"
+    );
+    let left_out = only_warn_line(
+        "env.json: variables whose name is not valid UTF-8 are left out; a replay cannot \
+         compare them",
+    );
+    assert!(
+        !left_out.contains("artifact")
+            && left_out.contains(r#"names=["CER_E2E_PROBE_NAME_\xFE", "CER_E2E_PROBE_NAME_\xFF"]"#),
+        "{left_out}"
+    );
+    let withheld = only_warn_line(
+        "env.json: values that are not valid UTF-8 are recorded as their FNV-1a 64 hash with \
+         utf8 false; a replay still detects a change",
+    );
+    assert!(
+        !withheld.contains("artifact")
+            && withheld.contains(r#"names=["CERULION_E2E_PROBE_LATIN1"]"#),
+        "{withheld}"
+    );
+    for absent in [
+        "panicked",
+        NOT_UTF8_NAME_PROBE_VALUE,
+        r"\xFFpw",
+        r"caf\xE9",
+        r"\xFF\xFE",
+        "\u{fffd}",
+    ] {
+        assert!(!log.contains(absent), "stderr must not carry {absent:?}");
+    }
+}
+
+/// A recording made with no name that is not valid UTF-8 still writes the
+/// count, as `0`, in the bag's `recorder.json` and the run directory's, so an
+/// absent key keeps meaning a recorder older than the count. The values that
+/// are not valid UTF-8 stay in the environment: they do not count.
+#[test]
+#[serial]
+fn record_e2e_without_a_non_utf8_name_counts_zero_names_left_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    build_workspace(tmp.path(), "rece2ez");
+    let (mut guard, _stdout_path, stderr_path) =
+        spawn_graph_record_with_names(tmp.path(), &[], &[]);
+    // Kill any orphaned bagd grandchild on ANY exit.
+    let _bagd_guard = BagdGuard;
+
+    let bag = wait_for_bag(&tmp.path().join("recordings"), Duration::from_secs(30))
+        .expect("bagd never created the bag (handshake failed?)");
+    wait_for_bag_state(
+        &bag,
+        "a recorded user topic carrying frames",
+        RECORDED_WINDOW_TIMEOUT,
+        |snap| snap.user_topics_with_frames(1) >= 1,
+    );
+    let run_recorder_json = read_live_run_file(&tmp.path().join(HOME_DIR), "recorder.json");
+
+    send_signal(guard.0.id(), libc::SIGINT);
+    let status = wait_bounded(&mut guard.0, Duration::from_secs(40))
+        .expect("graph run did not exit after SIGINT");
+    assert_eq!(status.code(), Some(0), "Ctrl-C must exit 0, got {status:?}");
+
+    let bag_recorder_json = BagReader::open(&bag)
+        .expect("open bag")
+        .attachment("__cerulion/recorder.json")
+        .expect("read")
+        .expect("recorder.json attachment present")
+        .data;
+    assert_eq!(
+        env_names_left_out(&bag_recorder_json),
+        Some(0),
+        "the bag's count"
+    );
+    assert_eq!(
+        env_names_left_out(&run_recorder_json),
+        Some(0),
+        "the run directory's count"
+    );
+    let log = read_file(&stderr_path);
+    assert!(
+        !log.contains("env.json: variables whose name is not valid UTF-8"),
+        "no name was left out, so no line says one was"
     );
 }
 
