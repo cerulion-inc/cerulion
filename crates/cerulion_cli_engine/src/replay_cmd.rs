@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | 0 | none | pass ([`EXIT_PASS`]): `outcome.passed` |
 //! | 1 | **frame-content divergence** | data violation ([`EXIT_VIOLATION`]): `!outcome.passed` |
-//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, and a read log that cannot be ENFORCED on a graph-produced edge) |
+//! | 2 | none | bag I/O or not-replay-grade (incl. bag/graph mismatch, a build whose external (driver) nodes differ from the recording's, a read log that cannot be ENFORCED on a graph-produced edge, and a `block` edge the bag splits across ranks on a topic with two or more in-graph producers or with `block_timeout_ms`) |
 //! | 3 | none | node failure: cdylib LOAD error, or panic-class EXECUTION failure during the replay (a later widening) |
 //! | 4 | none | tolerance-YAML validation error |
 //! | 5 | none | internal error (panic, transport, scheduler) |
@@ -803,6 +803,32 @@ pub enum ReplayError {
         detail: String,
     },
 
+    /// A bag with more than one worker rank whose rank manifests split a
+    /// `block` edge from a topic that two or more in-graph producers write, one
+    /// or more of them in another rank than the consumer. A `block` edge
+    /// crosses ranks only on a credit word, which counts one producer's
+    /// frames. Exit 2, the not-replay-grade class: it is refused before the
+    /// first pass, from the whole graph the bag embeds and the replayed
+    /// build's own declarations, and names where the input's `block` comes
+    /// from.
+    #[error("{edge}")]
+    SplitBlockEdgeUncreditable {
+        /// The refused edge and every producer's rank.
+        edge: crate::replay_rank::UncreditableSplitEdge,
+    },
+
+    /// A bag with more than one worker rank whose rank manifests split a
+    /// one-producer `block` edge whose input sets `block_timeout_ms`: a
+    /// timeout release keeps a credit word's count exact only when the
+    /// producer and the consumer fire one at a time on one thread. Exit 2,
+    /// refused before the first pass, as [`Self::SplitBlockEdgeUncreditable`]
+    /// is.
+    #[error("{edge}")]
+    SplitBlockEdgeTimeout {
+        /// The refused edge and both ends' ranks.
+        edge: crate::replay_rank::SplitEdgeTimeout,
+    },
+
     /// An unexpected internal failure (panic, transport, scheduler). Exit 5.
     #[error("internal replay error: {reason}")]
     Internal {
@@ -838,7 +864,12 @@ impl ReplayError {
             | ReplayError::FreeRunResumeUnsupported { .. }
             // A read log that cannot be ENFORCED on a graph-produced edge is
             // the same class: this bag is not replay-grade for this binary.
-            | ReplayError::ReadLogNotEnforceable { .. } => EXIT_NOT_REPLAY_GRADE,
+            | ReplayError::ReadLogNotEnforceable { .. }
+            // So is a `block` edge the bag splits across ranks that no credit
+            // word can count: the bag's rank split, or the build's `block`, is
+            // the fault.
+            | ReplayError::SplitBlockEdgeUncreditable { .. }
+            | ReplayError::SplitBlockEdgeTimeout { .. } => EXIT_NOT_REPLAY_GRADE,
             ReplayError::NodeLoad { .. } => EXIT_NODE_FAILURE,
             ReplayError::ToleranceInvalid { .. } => EXIT_TOLERANCE_INVALID,
             ReplayError::Internal { .. } => EXIT_INTERNAL,
@@ -2880,6 +2911,35 @@ mod tests {
             (
                 ReplayError::RecordOutExists {
                     path: PathBuf::from("/x.mcap"),
+                },
+                2,
+            ),
+            // A `block` edge the bag splits across ranks that no credit word
+            // can count: the bag (or the build's `block`) is not replay-grade,
+            // never an internal error.
+            (
+                ReplayError::SplitBlockEdgeUncreditable {
+                    edge: crate::replay_rank::UncreditableSplitEdge {
+                        topic: "/x/bus".to_string(),
+                        consumer_node: "sink".to_string(),
+                        consumer_input: "inp".to_string(),
+                        consumer_rank: 1,
+                        producers: vec![("a".to_string(), 0), ("b".to_string(), 1)],
+                        block_from: crate::replay_rank::BlockDeclaredBy::Node,
+                    },
+                },
+                2,
+            ),
+            (
+                ReplayError::SplitBlockEdgeTimeout {
+                    edge: crate::replay_rank::SplitEdgeTimeout {
+                        topic: "/x/a/out".to_string(),
+                        consumer_node: "sink".to_string(),
+                        consumer_input: "gate".to_string(),
+                        consumer_rank: 1,
+                        producer: "a".to_string(),
+                        producer_rank: 0,
+                    },
                 },
                 2,
             ),

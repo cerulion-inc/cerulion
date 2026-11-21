@@ -5556,6 +5556,15 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // is a fact about the recording, so it refuses the replay before rank 0
     // has run a step.
     refuse_unlisted_macro_output_in_every_pass(&plans, &factories)?;
+    // ── 4a''. Every `block` edge the rank manifests split, BEFORE the first
+    //          pass ───────────────────────────────────────────────────────
+    //
+    // The same whole-RUN rule, read off the whole graph: a split `block`
+    // edge no credit word can count refuses the replay before rank 0 has run
+    // a step. One plan holds every node, so it splits nothing.
+    if plans.len() > 1 {
+        refuse_uncreditable_split_block_edges(&config, &plans, &factories)?;
+    }
     let bag_side = plan_bag_side_admissions(
         &plans,
         &trace,
@@ -9913,6 +9922,46 @@ fn refuse_unlisted_macro_output_in_every_pass(
     plans
         .iter()
         .try_for_each(|plan| refuse_unlisted_macro_output(plan.subgraph(), entries))
+}
+
+/// Refuse a replay of more than one rank whose manifests split a `block` edge
+/// no cross-process credit word can count
+/// ([`replay_rank::classify_split_block_edges`]).
+///
+/// The classifier reads the WHOLE graph the bag embeds and each node's
+/// declaration in this build, before any pass takes its entry; a node whose
+/// metadata cannot be read is left out, as [`collect_pass_node_infos`] leaves
+/// it out, and its own pass build reports it. A whole-graph topology that does
+/// not build or validate is [`ReplayError::Internal`] (exit 5), as the rank
+/// build that would meet it reports it, but before the first pass. The
+/// creditable split edges the classifier returns are not read here: a pass
+/// build refuses a `block` input whose producer runs in another rank.
+fn refuse_uncreditable_split_block_edges(
+    config: &GraphConfig,
+    plans: &[RankPlan],
+    entries: &IndexMap<String, Box<dyn NodeEntry>>,
+) -> Result<(), ReplayError> {
+    let infos: IndexMap<String, cerulion_core::graph::NodeInfo> = config
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let info = entries.get(&node.id)?.info().ok()?;
+            Some((node.id.clone(), info))
+        })
+        .collect();
+    let node_rank = replay_rank::plan_node_ranks(plans);
+    match replay_rank::classify_split_block_edges(config, &infos, &node_rank) {
+        Ok(_) => Ok(()),
+        Err(replay_rank::SplitBlockEdgeError::Topology { reason }) => Err(ReplayError::Internal {
+            reason: format!("failed to build the replay graph topology: {reason}"),
+        }),
+        Err(replay_rank::SplitBlockEdgeError::Uncreditable(edge)) => {
+            Err(ReplayError::SplitBlockEdgeUncreditable { edge })
+        }
+        Err(replay_rank::SplitBlockEdgeError::Timeout(edge)) => {
+            Err(ReplayError::SplitBlockEdgeTimeout { edge })
+        }
+    }
 }
 
 /// Refuse a graph in which a `#[cerulion_node]` node declares an output that

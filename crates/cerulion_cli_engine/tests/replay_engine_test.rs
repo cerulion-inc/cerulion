@@ -41404,13 +41404,13 @@ fn sb_partial_report(path: &std::path::Path) -> (serde_json::Value, Vec<u64>) {
     (json["aborted"]["failed_at_rank"].clone(), ranks)
 }
 
-/// MEASURED on the base: `far.bus` set to `block` by the embedded graph,
-/// with BOTH shared-bus writers on rank 0 and `far` on rank 1. Rank 0 runs,
-/// and rank 1's build refuses `far.bus` as a `block` input with no in-graph
-/// producer: exit 5, after a partial report for rank 0.
+/// `far.bus` set to `block` by the embedded graph, with BOTH shared-bus
+/// writers on rank 0 and `far` on rank 1: refused by name before any pass
+/// (exit 2), so no rank runs and no report is written. Two replays render the
+/// same text.
 #[test]
 #[serial]
-fn a_split_block_edge_from_two_foreign_writers_exits_5_at_the_rank_build() {
+fn a_split_block_edge_from_two_foreign_writers_is_refused_by_name_before_any_pass() {
     let rec = record_reference_impl(
         &sb_bus_block_yaml(),
         sb_factories,
@@ -41428,39 +41428,53 @@ fn a_split_block_edge_from_two_foreign_writers_exits_5_at_the_rank_build() {
         "rank 1 holds the consumer and no writer of the bus"
     );
     let report = dir.path().join("report.json");
-    let err =
-        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
-    assert!(
-        matches!(err, ReplayError::Internal { .. }),
-        "the rank build's refusal, exit 5: {err:?}"
-    );
-    assert!(
-        err.to_string().starts_with(
-            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
-             validation error: block input 'far.bus' reads topic '/sb/shared_bus', which has no \
-             in-graph producer; "
-        ),
-        "{err}"
-    );
-    assert_eq!(err.exit_code(), 5);
+    let mut texts = Vec::new();
+    for run in 1..=2 {
+        let err = replay(&bag, sb_factories, None, Some(report.clone()))
+            .expect_err("the split two-writer `block` edge is refused");
+        let ReplayError::SplitBlockEdgeUncreditable { edge } = &err else {
+            panic!("run {run}: the split refusal, exit 2: {err:?}");
+        };
+        assert_eq!(
+            edge,
+            &cerulion_cli_engine::replay_rank::UncreditableSplitEdge {
+                topic: SB_TOPIC.to_string(),
+                consumer_node: "far".to_string(),
+                consumer_input: "bus".to_string(),
+                consumer_rank: 1,
+                producers: vec![("left".to_string(), 0), ("right".to_string(), 0)],
+                block_from: cerulion_cli_engine::replay_rank::BlockDeclaredBy::Graph,
+            },
+            "run {run}"
+        );
+        assert_eq!(err.exit_code(), 2, "run {run}");
+        assert!(
+            !report.exists(),
+            "run {run}: refused before any pass, so no rank ran and no report was written"
+        );
+        texts.push(err.to_string());
+    }
     assert_eq!(
-        sb_partial_report(&report),
-        (serde_json::json!(1), vec![0]),
-        "rank 0 ran before rank 1 refused"
+        texts[0],
+        "block input 'far.bus' reads topic '/sb/shared_bus', which has 2 in-graph producers, \
+         and this bag's rank manifests put 'far' in rank 1, 'left' in rank 0 and 'right' in rank \
+         0. A `block` edge can cross ranks only on a topic with exactly one in-graph producer \
+         (its credit word counts one producer's outstanding frames), so this bag cannot be \
+         re-executed with `block` on that input. `block` comes from the graph this bag embeds \
+         (`backpressure: block` on 'far.bus'), so the bag was changed after it was recorded. \
+         Re-execute an unchanged copy of the bag, or record the run again."
     );
+    assert_eq!(texts[0], texts[1], "two replays render the same refusal");
 }
 
-/// MEASURED on the base: the shared bus with ONE writer in `far`'s rank and
-/// one in another, `block` declared by `far`'s node. Rank 1 builds, because
-/// `right` is a local producer, so its credit word counts `right`'s frames
-/// only, and the run gets a judged verdict: exit 1, `far`'s first output
-/// frame differs. `far` reads the bus over two connections (`right` live,
-/// `left` from the bag), the drain-order residual
-/// `a_split_bus_verifies_per_writer_while_a_two_connection_consumer_cannot`
-/// pins for the `drop_oldest` twin of this shape.
+/// The shared bus with ONE writer in `far`'s rank and one in another,
+/// `block` declared by `far`'s node: refused by name before any pass (exit 2),
+/// naming the declaration. The same bag replayed with a build of `far` that
+/// declares `drop_oldest` on `bus` is not refused: the build's declaration
+/// decides.
 #[test]
 #[serial]
-fn a_split_block_edge_with_one_local_writer_builds_and_is_judged() {
+fn a_split_block_edge_with_one_local_writer_is_refused_by_name_before_any_pass() {
     let rec = record_reference_impl(
         sb_yaml(),
         sb_block_far_factories,
@@ -41481,37 +41495,44 @@ fn a_split_block_edge_with_one_local_writer_builds_and_is_judged() {
         ],
         "rank 1 holds the consumer and one writer of the bus"
     );
-    let outcome = replay(&bag, sb_block_far_factories, None, None)
-        .expect("the mixed shape builds and replays");
-    assert_eq!(resim_exit(&outcome, true), 1, "a frame-content divergence");
-    assert_eq!(
-        outcome
-            .violations
-            .iter()
-            .map(|v| format!("{}: {}", v.topic, v.detail))
-            .collect::<Vec<_>>(),
-        vec![
-            "/sb/far/out: frame 0 on '/sb/far/out' differs at x: recorded 1.0, replayed 1001.0 \
-             (recorded 64 B, replayed 64 B)"
-                .to_string()
-        ]
+    let report = dir.path().join("report.json");
+    let err = replay(&bag, sb_block_far_factories, None, Some(report.clone()))
+        .expect_err("the split two-writer `block` edge is refused");
+    assert!(
+        matches!(err, ReplayError::SplitBlockEdgeUncreditable { .. }),
+        "the split refusal, exit 2: {err:?}"
     );
-    assert!(outcome.trace_divergence.is_none(), "the schedule matched");
-    assert!(outcome.read_log_verdict.is_none(), "no read-log verdict");
+    assert_eq!(err.exit_code(), 2);
     assert_eq!(
-        (outcome.topics_checked, outcome.topics_passed),
-        (4, 3),
-        "four topics checked, every one but `far`'s output passed"
+        err.to_string(),
+        "block input 'far.bus' reads topic '/sb/shared_bus', which has 2 in-graph producers, \
+         and this bag's rank manifests put 'far' in rank 1, 'left' in rank 0 and 'right' in rank \
+         1. A `block` edge can cross ranks only on a topic with exactly one in-graph producer \
+         (its credit word counts one producer's outstanding frames), so this bag cannot be \
+         re-executed with `block` on that input. `block` comes from the declaration of input \
+         'bus' on node 'far' in the build you replay. If 'far' did not declare `block` on 'bus' \
+         when the run was recorded, check out the recording-era node sources, build them and \
+         replay with that build; otherwise record the run again with every producer of \
+         '/sb/shared_bus' and 'far' in one process group."
+    );
+    assert!(
+        !report.exists(),
+        "refused before any pass, so no report was written"
+    );
+    let candidate = replay(&bag, sb_factories, None, None);
+    assert!(
+        candidate.is_ok(),
+        "a build of `far` that declares `drop_oldest` on `bus` splits no `block` edge: {:?}",
+        candidate.err()
     );
 }
 
-/// MEASURED on the base: `far.gate`, which `gate_src` alone writes, set
-/// `block_timeout_ms` by the embedded graph, and split from `gate_src`. Rank
-/// 1's build refuses the input as a `block` input with no in-graph producer
-/// before it reads the timeout: exit 5, after a partial report for rank 0.
+/// `far.gate`, which `gate_src` alone writes, set `block_timeout_ms` by the
+/// embedded graph and split from `gate_src`: refused by name before any pass
+/// (exit 2), naming both ends' ranks.
 #[test]
 #[serial]
-fn a_split_block_edge_with_a_block_timeout_exits_5_at_the_rank_build() {
+fn a_split_block_edge_with_a_block_timeout_is_refused_by_name_before_any_pass() {
     let rec = record_reference_impl(
         &sb_gate_key_yaml("block_timeout_ms: 100"),
         sb_factories,
@@ -41525,61 +41546,72 @@ fn a_split_block_edge_with_a_block_timeout_exits_5_at_the_rank_build() {
     let mp = write_sb_bag(rec, &bag, sb_far_alone_rank_of, 2);
     assert_eq!(mp.tables[1], ["far".to_string()], "far alone on rank 1");
     let report = dir.path().join("report.json");
-    let err =
-        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
-    assert!(
-        matches!(err, ReplayError::Internal { .. }),
-        "the rank build's refusal, exit 5: {err:?}"
-    );
-    assert!(
-        err.to_string().starts_with(
-            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
-             validation error: block input 'far.gate' reads topic '/sb/gate_src/bus', which has \
-             no in-graph producer; "
-        ),
-        "{err}"
-    );
-    assert_eq!(err.exit_code(), 5);
+    let err = replay(&bag, sb_factories, None, Some(report.clone()))
+        .expect_err("the split edge with a timeout is refused");
+    let ReplayError::SplitBlockEdgeTimeout { edge } = &err else {
+        panic!("the split-timeout refusal, exit 2: {err:?}");
+    };
     assert_eq!(
-        sb_partial_report(&report),
-        (serde_json::json!(1), vec![0]),
-        "rank 0 ran before rank 1 refused"
+        edge,
+        &cerulion_cli_engine::replay_rank::SplitEdgeTimeout {
+            topic: SB_GATE_TOPIC.to_string(),
+            consumer_node: "far".to_string(),
+            consumer_input: "gate".to_string(),
+            consumer_rank: 1,
+            producer: "gate_src".to_string(),
+            producer_rank: 0,
+        }
+    );
+    assert_eq!(err.exit_code(), 2);
+    assert_eq!(
+        err.to_string(),
+        "this bag's rank manifests split the `block` edge '/sb/gate_src/bus' -> 'far.gate' \
+         across ranks ('far' in rank 1, its producer 'gate_src' in rank 0), and the input sets \
+         `block_timeout_ms`. Across ranks the edge counts on a shared credit word, and a timeout \
+         release keeps that count exact only when the producer and the consumer fire one at a \
+         time on one thread, so `cerulion graph run` refuses `block_timeout_ms` on a split edge \
+         before any worker starts. `block_timeout_ms` comes from the graph this bag embeds, so \
+         the bag was changed after it was recorded. Re-execute an unchanged copy of the bag, or \
+         record the run again."
+    );
+    assert!(
+        !report.exists(),
+        "refused before any pass, so no report was written"
     );
 }
 
-/// MEASURED on the base: a two-rank bag whose embedded graph declares
-/// `depth: 65`, above the maximum of 64, on `far.gate`, an edge both of whose
-/// ends rank 1 holds. The reference run used the valid graph; only the
-/// embedded graph's key is changed. Rank 1's build refuses the depth: exit 5,
-/// after a partial report for rank 0.
+/// A two-rank bag whose embedded graph declares `depth: 65`, above the
+/// maximum of 64, on `far.gate`, an edge both of whose ends rank 1 holds. The
+/// whole-graph topology check refuses it before any pass: exit 5, the
+/// internal error a rank build gives it, in the validation's own words, and no
+/// report, since no rank ran.
 #[test]
 #[serial]
-fn a_several_rank_bag_whose_graph_declares_a_depth_above_64_exits_5_at_the_rank_build() {
+fn a_several_rank_bag_whose_graph_declares_a_depth_above_64_stops_before_any_pass() {
     let mut rec = sb_recording();
     rec.graph_yaml = sb_gate_key_yaml("depth: 65");
     let dir = tempfile::tempdir().unwrap();
     let bag = dir.path().join("sb_gate_depth65.mcap");
     write_sb_bag(rec, &bag, sb_rank_of, 2);
     let report = dir.path().join("report.json");
-    let err =
-        replay(&bag, sb_factories, None, Some(report.clone())).expect_err("rank 1 cannot be built");
+    let err = replay(&bag, sb_factories, None, Some(report.clone()))
+        .expect_err("the whole-graph topology is refused");
     assert!(
         matches!(err, ReplayError::Internal { .. }),
-        "the rank build's refusal, exit 5: {err:?}"
+        "the topology check's refusal, exit 5: {err:?}"
     );
     assert!(
         err.to_string().starts_with(
-            "internal replay error: failed to build the replay graph runtime for rank 1: Graph \
-             validation error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; \
-             the maximum queue depth is 64 "
+            "internal replay error: failed to build the replay graph topology: Graph validation \
+             error: input 'far.gate' on topic '/sb/gate_src/bus' declares depth = 65; the maximum \
+             queue depth is 64 "
         ),
         "{err}"
     );
     assert_eq!(err.exit_code(), 5);
-    assert_eq!(
-        sb_partial_report(&report),
-        (serde_json::json!(1), vec![0]),
-        "rank 0 ran before rank 1 refused"
+    assert!(
+        !report.exists(),
+        "refused before any pass, so no report was written"
     );
 }
 
