@@ -61,8 +61,8 @@ Run `cerulion rcp --sim` once in a terminal before you add it this way: the firs
 and the benchmark scenes, which takes minutes, and a client that starts a stdio server waits only seconds for
 its first answer.
 
-Then run a start state yourself against your own model. Pick one of the published benchmark from the results
-package's `cells.csv`; without `--cell` the run uses a start state the harness was developed on, not a published one.
+Then run a start state yourself against your own model. Pick a published one from the results package's
+`cells.csv`; without `--cell` the run uses a start state the harness was developed on, not a published one.
 
 ```bash
 export OPENAI_BASE_URL=https://your-endpoint.example/v1
