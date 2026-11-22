@@ -41670,8 +41670,16 @@ mod boundary_flag_tests {
     /// reopen adds nothing to it; a per-set `Sync` burst's read log already
     /// differs, its reads being staged at the matcher's own site
     /// (`a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence`);
-    /// and a stage that pops one frame a step either fits the opening pair or
-    /// refuses it at every window, so a reopen moves no read past its rim.
+    /// a stage that pops one frame a step either fits the opening pair or
+    /// refuses it at every window, so a reopen moves no read past its rim; and
+    /// a read that pops several frames decides whether its batch frames fit
+    /// before its own run opens, so as its stage's first read in a window it
+    /// stages the same batch frames at a window head as mid-window, and the
+    /// annotation it adds there is stripped from both sides of the compare.
+    /// Only a batch read that another read of its stage precedes in a reopened
+    /// window can move with this arm (`cerulion_core`'s
+    /// `a_batch_at_a_reopen_window_stages_no_frames_when_only_the_openings_push_it_past_the_rim`),
+    /// and no engine fixture builds that shape.
     #[test]
     fn a_free_run_pass_hands_the_reopen_mirror_its_own_boundarys_flag_and_no_rank_map() {
         let (path, trace) = trace_of("flags_rank", &[boundary(0, 0, 0)]);
