@@ -46856,8 +46856,9 @@ fn a_window_head_read_that_pops_a_batch_names_its_writer_on_the_first_batch_fram
     ri_assert_window_head_bag_verifies(&live, "evict_window_head_batch.mcap");
 }
 
-/// A window head's annotation that names a writer other than the frame's
-/// refuses the feed under `--verify`, before the first step. The fast
+/// A rewritten window-head annotation that adds a second writer to an
+/// unlabeled topic's reads refuses the feed under `--verify`, before the first
+/// step. The fast
 /// consumer's annotation at the step-9 head is rewritten to a token no port of
 /// the graph hashes to; the head is only where that annotation sits, and the
 /// refusal is the topic's writer count, not a check of the head itself. The
