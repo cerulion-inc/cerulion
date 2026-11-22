@@ -58,7 +58,7 @@ pub use handle::{
 // Crate-internal: the shared per-node QoS-event store
 // between `ScheduledNode` (writer) and `NodeContext` (drainer).
 pub(crate) use handle::QosEventStore;
-pub use node_death::{NodeDeath, NodeDeathCause, NodeDeathLedger};
+pub use node_death::{NodeDeath, NodeDeathCause, NodeDeathLedger, NodeStopCause};
 // Cross-process deterministic trace merge.
 pub use trace_merge::{merge_partition_traces, ProcessTrace};
 pub use trigger::TriggerPolicy;
@@ -890,6 +890,12 @@ struct ScheduledNode {
     /// the rest of the step. The `block` predicate ignores the argument
     /// (it reads its outstanding-counter atomics).
     pre_fire_check: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// A replay build's mark: this node produces a `block` edge the replay
+    /// feeds from its recording, whose consumer runs in another pass (see
+    /// [`Scheduler::mark_held_by_bag_fed_block_edge`]). Read only by
+    /// [`Scheduler::set_replay_trailing_refills`]; `false` on every live
+    /// build.
+    held_by_bag_fed_block_edge: bool,
 
     // Circuit breaker state
     consecutive_panics: u32,
@@ -989,14 +995,21 @@ struct ScheduledNode {
     /// reads a comment block above a line, and a doc block quoting the marker
     /// verbatim registers as an annotation on the field declaration.)
     node_death: Arc<crate::scheduler::node_death::NodeDeathLedger>,
-    /// Set by the node's tick callback when the node returned
-    /// `NodeError::Fatal`. Read once after every fire that returns: the first
-    /// fire that sees it set disables the node, so the scheduler never fires it
-    /// again. A fresh unshared flag on a bare scheduler (nothing sets it); the
-    /// runtime installs the one its callback writes
-    /// (`set_node_fatal_stop`). Deterministic: it is set by the tick's own
-    /// return value, which a resim reproduces at the same step.
-    fatal_stop: Arc<std::sync::atomic::AtomicBool>,
+    /// The node's stop signal, set by its tick callback: `0` while the node
+    /// runs, else the [`NodeStopCause::code`] of the stop the callback saw
+    /// (`NodeError::Fatal`, or a poisoned entry). Read once after every fire
+    /// that returns, and after a fire that panicked: the first fire that sees
+    /// a fatal code disables the node, so the scheduler never fires it again,
+    /// and the first fire that sees the poisoned code marks its trace entry
+    /// stopped while the node keeps firing with its tick skipped. A fresh
+    /// unshared signal on a bare scheduler (nothing sets it); the runtime
+    /// installs the one its callback writes (`set_node_stop_signal`).
+    /// Deterministic: it is set by the tick's own outcome, which a resim
+    /// reproduces at the same fire.
+    stop_signal: Arc<std::sync::atomic::AtomicU8>,
+    /// A fire has already carried this node's poisoned-entry stop, so a later
+    /// fire that reads the same signal carries none.
+    poison_recorded: bool,
 }
 
 impl ScheduledNode {
@@ -1405,6 +1418,19 @@ impl TraceRingHook {
                 0
             },
         });
+        // The fire that stopped its node is followed, on the same ring, by
+        // its NODE-STOP record, so the stop sits directly after the fire that
+        // made it. Pushed only at a stop.
+        if let Some(cause) = entry.stop {
+            self.producer
+                .push(&crate::trace_ring::TraceRingRecord::node_stop(
+                    entry.step,
+                    entry.fire_time_ns,
+                    idx,
+                    entry.global_level as u32,
+                    cause,
+                ));
+        }
     }
 
     /// Push the per-step
@@ -2643,6 +2669,7 @@ impl Scheduler {
             output_discards,
             notify_undelivered,
             pre_fire_check: None,
+            held_by_bag_fed_block_edge: false,
             consecutive_panics: 0,
             disabled: false,
             external_triggered: false,
@@ -2664,7 +2691,8 @@ impl Scheduler {
             // edge below records nothing at all until a runtime installs the
             // shared one AND a live loop arms it.
             node_death: Arc::new(crate::scheduler::node_death::NodeDeathLedger::new()),
-            fatal_stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stop_signal: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            poison_recorded: false,
         };
 
         self.nodes.insert(config.id, node);
@@ -2743,9 +2771,9 @@ impl Scheduler {
             })?;
         node.disabled = false;
         node.consecutive_panics = 0;
-        // Without this the flag stays latched: the next fire would disable the
-        // node again even when that tick succeeds.
-        node.fatal_stop.store(false, Ordering::Release);
+        // Without this the signal stays latched: the next fire would disable
+        // the node again even when that tick succeeds.
+        node.stop_signal.store(0, Ordering::Release);
 
         // For Period nodes, skip ahead to avoid catch-up burst.
         //
@@ -2922,8 +2950,10 @@ impl Scheduler {
     /// [`TransportError::GraphError`] when no plan is installed for `step`, or
     /// a named node has no planned fire there, is not a `Data` node with a
     /// refill hook, or neither fires the cap at that step nor carries a
-    /// pre-fire check: a recording cannot hold a trailing refill on such a
-    /// node.
+    /// pre-fire check or the mark a replay build sets on the producer of a
+    /// `block` edge it feeds from its recording
+    /// (`mark_held_by_bag_fed_block_edge`): a recording cannot hold a
+    /// trailing refill on such a node.
     pub fn set_replay_trailing_refills(
         &mut self,
         step: u64,
@@ -2946,7 +2976,7 @@ impl Scheduler {
             if !matches!(node.policy, TriggerPolicy::Data) || node.trigger_refill.is_none() {
                 return Err(refuse(node_id, "it is not a Data node with a refill hook"));
             }
-            let deferrable = node.pre_fire_check.is_some();
+            let deferrable = node.pre_fire_check.is_some() || node.held_by_bag_fed_block_edge;
             let Some(plan) = self.replay_plan.as_mut().filter(|p| p.step == step) else {
                 return Err(refuse(node_id, "no fire plan is installed for this step"));
             };
@@ -2965,6 +2995,29 @@ impl Scheduler {
                 None => return Err(refuse(node_id, "it has no planned fire at this step")),
             }
         }
+        Ok(())
+    }
+
+    /// Mark `node_id` as a producer of a `block` edge a replay feeds from its
+    /// recording, whose consumer runs in another pass. Live, a credit word in
+    /// another process could defer the node between the fires of a burst, so
+    /// [`Self::set_replay_trailing_refills`] accepts a trailing refill on it
+    /// below the cap, as it does on a node with a pre-fire check. The mark
+    /// stands in for the pre-fire check there and nowhere else: it gives the
+    /// node no refill hook and defers no fire.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::NodeNotFound`] for an unknown node.
+    pub(crate) fn mark_held_by_bag_fed_block_edge(&mut self, node_id: &str) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                // hot-path-alloc-ok: cold: graph-build ERROR arm.
+                node_id: node_id.to_string(),
+            })?;
+        node.held_by_bag_fed_block_edge = true;
         Ok(())
     }
 
@@ -4876,14 +4929,14 @@ impl Scheduler {
         self.nodes.get(node_id).is_some_and(|n| n.disabled)
     }
 
-    /// Install the fatal-stop flag `node_id`'s tick callback sets when the node
-    /// returns `NodeError::Fatal` (see the field doc). Unknown node id = a
-    /// wiring desync: loud `Err`.
-    // hot-path-alloc-ok-fn: cold: installs a node's fatal-stop flag ONCE at graph BUILD
-    pub(crate) fn set_node_fatal_stop(
+    /// Install the stop signal `node_id`'s tick callback sets when the node
+    /// returns `NodeError::Fatal` or its entry is poisoned (see the field doc).
+    /// Unknown node id = a wiring desync: loud `Err`.
+    // hot-path-alloc-ok-fn: cold: installs a node's stop signal ONCE at graph BUILD
+    pub(crate) fn set_node_stop_signal(
         &mut self,
         node_id: &str,
-        flag: Arc<std::sync::atomic::AtomicBool>,
+        signal: Arc<std::sync::atomic::AtomicU8>,
     ) -> TransportResult<()> {
         let node = self
             .nodes
@@ -4891,7 +4944,7 @@ impl Scheduler {
             .ok_or_else(|| TransportError::NodeNotFound {
                 node_id: node_id.to_string(),
             })?;
-        node.fatal_stop = flag;
+        node.stop_signal = signal;
         Ok(())
     }
 
@@ -9294,14 +9347,23 @@ impl Scheduler {
             }
         }
 
+        // The stop this fire made, if any: carried on its trace entry, which a
+        // recording ring follows with a NODE-STOP record. Set only on the arms
+        // below that see a stop, so a running node's fire leaves it `None`.
+        let mut stop = None;
         match result {
             Ok(()) => {
                 node.consecutive_panics = 0;
                 // A node that returned `NodeError::Fatal` this fire is stopped:
                 // this fire stays in the trace (it ran), and no later fire
-                // happens. One atomic load per fire; no allocation.
-                if !node.disabled && node.fatal_stop.load(Ordering::Acquire) {
-                    node.disabled = true;
+                // happens. A poisoned entry's first fire carries its stop and
+                // the node keeps firing. One atomic load per fire; no
+                // allocation.
+                if !node.disabled {
+                    let signal = node.stop_signal.load(Ordering::Acquire);
+                    if signal != 0 {
+                        stop = Self::observe_stop_signal(node, signal);
+                    }
                 }
             }
             Err(panic_info) => {
@@ -9333,6 +9395,7 @@ impl Scheduler {
                 // doc gets wrong when it says "at most once per node per run").
                 if node.consecutive_panics >= Self::MAX_CONSECUTIVE_PANICS && !node.disabled {
                     node.disabled = true;
+                    stop = Some(NodeStopCause::DisabledAfterPanics);
                     tracing::error!(
                         node_id = %id,
                         consecutive_panics = node.consecutive_panics,
@@ -9344,6 +9407,14 @@ impl Scheduler {
                     // replay firewall.
                     node.node_death
                         .record(id, node_death::NodeDeathCause::DisabledAfterPanics);
+                } else if !node.disabled {
+                    // A tick that panicked inside the runtime's tick callback
+                    // poisoned the node's entry, and the callback signalled it
+                    // before resuming the unwind.
+                    let signal = node.stop_signal.load(Ordering::Acquire);
+                    if signal != 0 {
+                        stop = Self::observe_stop_signal(node, signal);
+                    }
                 }
             }
         }
@@ -9388,7 +9459,27 @@ impl Scheduler {
             // EXCLUDED from `TraceEntry::PartialEq` (a data-frame annotation),
             // folded into the ring record by `push_fire` as the discard bit.
             discarded,
+            stop,
         });
+    }
+
+    /// The stop a fire carries when it reads a non-zero stop `signal` on a
+    /// node the scheduler has not disabled: a fatal code disables the node
+    /// and is this fire's stop; the poisoned code is this fire's stop the
+    /// first time a fire reads it, and the node keeps firing. `None` for a
+    /// poisoned entry a fire already carried, and for a code no stop has.
+    fn observe_stop_signal(node: &mut ScheduledNode, signal: u8) -> Option<NodeStopCause> {
+        match NodeStopCause::from_code(u64::from(signal)) {
+            Some(NodeStopCause::FatalError) => {
+                node.disabled = true;
+                Some(NodeStopCause::FatalError)
+            }
+            Some(NodeStopCause::EntryPoisoned) if !node.poison_recorded => {
+                node.poison_recorded = true;
+                Some(NodeStopCause::EntryPoisoned)
+            }
+            Some(NodeStopCause::EntryPoisoned | NodeStopCause::DisabledAfterPanics) | None => None,
+        }
     }
 
     // `check_sync` is GONE. It answered ONE question — "are all
@@ -10699,6 +10790,7 @@ mod tests {
                 global_level: GLOBAL_LEVEL,
                 duration_ns: 0,
                 discarded: false,
+                stop: None,
             },
             TraceEntry {
                 node_id: Arc::from("id1"),
@@ -10707,6 +10799,7 @@ mod tests {
                 global_level: GLOBAL_LEVEL,
                 duration_ns: 0,
                 discarded: false,
+                stop: None,
             },
         ];
         assert_eq!(
@@ -11021,17 +11114,27 @@ mod tests {
         );
     }
 
-    /// A Period node with the fatal-stop flag installed, whose callback counts
-    /// its calls and sets the flag on every call (the runtime's callback sets it
-    /// when the tick returned `NodeError::Fatal`).
+    /// A Period node with the stop signal installed, whose callback counts its
+    /// calls and stores the fatal code on every call (the runtime's callback
+    /// stores it when the tick returned `NodeError::Fatal`).
     fn add_fatal_period(
         scheduler: &mut Scheduler,
         id: &str,
         sets_flag: Arc<std::sync::atomic::AtomicBool>,
-    ) -> (Arc<AtomicU64>, Arc<std::sync::atomic::AtomicBool>) {
+    ) -> (Arc<AtomicU64>, Arc<std::sync::atomic::AtomicU8>) {
+        add_signalling_period(scheduler, id, sets_flag, NodeStopCause::FatalError)
+    }
+
+    /// [`add_fatal_period`] storing `cause`'s code instead.
+    fn add_signalling_period(
+        scheduler: &mut Scheduler,
+        id: &str,
+        sets_flag: Arc<std::sync::atomic::AtomicBool>,
+        cause: NodeStopCause,
+    ) -> (Arc<AtomicU64>, Arc<std::sync::atomic::AtomicU8>) {
         let calls = Arc::new(AtomicU64::new(0));
         let calls_cb = Arc::clone(&calls);
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::new(std::sync::atomic::AtomicU8::new(0));
         let flag_cb = Arc::clone(&flag);
         scheduler
             .add_node(NodeConfig {
@@ -11043,13 +11146,13 @@ mod tests {
                 callback: Box::new(move || {
                     calls_cb.fetch_add(1, Ordering::Relaxed);
                     if sets_flag.load(Ordering::Relaxed) {
-                        flag_cb.store(true, Ordering::Release);
+                        flag_cb.store(cause.code(), Ordering::Release);
                     }
                 }),
             })
             .unwrap();
         scheduler
-            .set_node_fatal_stop(id, Arc::clone(&flag))
+            .set_node_stop_signal(id, Arc::clone(&flag))
             .expect("known node");
         (calls, flag)
     }
@@ -11165,10 +11268,150 @@ mod tests {
         }
     }
 
-    /// `reset_node` lifts a fatal stop: the flag is cleared, so a later fire
+    /// One Period burst of `fires` hand-built fires of `id` into a fresh
+    /// collect sink, every fire at a 10 ms interval.
+    fn burst_into_sink(scheduler: &mut Scheduler, id: &str, fires: u32) -> Vec<TraceEntry> {
+        const INTERVAL_NS: u64 = 10_000_000;
+        let mut sink: Vec<TraceEntry> = Vec::new();
+        let node = scheduler.nodes.get_mut(id).expect("node present");
+        Scheduler::tick_node_into(
+            id,
+            node,
+            FireKind::Period {
+                first_fire_ns: INTERVAL_NS,
+                fire_count: fires,
+                interval_ns: INTERVAL_NS,
+                current_time_ns: INTERVAL_NS * u64::from(fires),
+            },
+            0,
+            0,
+            &mut sink,
+        );
+        sink
+    }
+
+    /// Each entry's stop, in fire order.
+    fn stops(sink: &[TraceEntry]) -> Vec<Option<NodeStopCause>> {
+        sink.iter().map(|e| e.stop).collect()
+    }
+
+    /// The stop a trace entry carries fits the padding after `discarded`:
+    /// the entry every fire builds and the in-memory trace holds stays 56
+    /// bytes on a 64-bit target.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn the_stop_fits_the_trace_entry_padding() {
+        assert_eq!(std::mem::size_of::<Option<NodeStopCause>>(), 1);
+        assert_eq!(std::mem::size_of::<TraceEntry>(), 56);
+    }
+
+    /// The fire whose tick stored the fatal code carries the fatal stop, and
+    /// it is the burst's only fire.
+    #[test]
+    fn the_fatal_fire_carries_the_fatal_stop() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        add_fatal_period(&mut scheduler, "fatal", always);
+        let sink = burst_into_sink(&mut scheduler, "fatal", 4);
+        assert_eq!(stops(&sink), vec![Some(NodeStopCause::FatalError)]);
+    }
+
+    /// A poisoned entry's signal stops the node at the first fire that reads
+    /// it, and only that fire carries the stop: the node keeps firing, so a
+    /// burst of three runs three times and stays enabled.
+    #[test]
+    fn a_poisoned_signal_marks_only_the_first_fire_that_reads_it() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (calls, _signal) = add_signalling_period(
+            &mut scheduler,
+            "poisoned",
+            always,
+            NodeStopCause::EntryPoisoned,
+        );
+        let sink = burst_into_sink(&mut scheduler, "poisoned", 3);
+        assert_eq!(calls.load(Ordering::Relaxed), 3, "the node keeps firing");
+        assert_eq!(
+            stops(&sink),
+            vec![Some(NodeStopCause::EntryPoisoned), None, None]
+        );
+        assert!(!scheduler.nodes["poisoned"].disabled);
+        // A later burst reads the same signal and carries nothing.
+        let later = burst_into_sink(&mut scheduler, "poisoned", 2);
+        assert_eq!(stops(&later), vec![None, None]);
+    }
+
+    /// A tick that panicked after its callback signalled the poisoned entry
+    /// (the runtime's panic arm) carries the stop on that panicking fire; the
+    /// panic counts once and the node stays enabled.
+    #[test]
+    fn a_panicking_fire_that_signalled_its_poisoned_entry_carries_the_stop() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let signal = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let signal_cb = Arc::clone(&signal);
+        scheduler
+            .add_node(NodeConfig {
+                id: "panicker".to_string(),
+                policy: TriggerPolicy::Period {
+                    interval: Duration::from_millis(10),
+                    max_catchup: None,
+                },
+                callback: Box::new(move || {
+                    signal_cb.store(NodeStopCause::EntryPoisoned.code(), Ordering::Release);
+                    panic!("intentional test panic");
+                }),
+            })
+            .unwrap();
+        scheduler
+            .set_node_stop_signal("panicker", Arc::clone(&signal))
+            .expect("known node");
+        let sink = burst_into_sink(&mut scheduler, "panicker", 1);
+        assert_eq!(stops(&sink), vec![Some(NodeStopCause::EntryPoisoned)]);
+        let node = &scheduler.nodes["panicker"];
+        assert_eq!(node.consecutive_panics, 1);
+        assert!(!node.disabled);
+    }
+
+    /// The fire that opens the consecutive-panic breaker carries the
+    /// breaker's stop; the two panics before it carry none.
+    #[test]
+    fn the_fire_that_opens_the_panic_breaker_carries_its_stop() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        scheduler
+            .add_node(NodeConfig {
+                id: "panicker".to_string(),
+                policy: TriggerPolicy::Period {
+                    interval: Duration::from_millis(10),
+                    max_catchup: None,
+                },
+                callback: Box::new(|| panic!("intentional test panic")),
+            })
+            .unwrap();
+        let sink = burst_into_sink(&mut scheduler, "panicker", 10);
+        assert_eq!(
+            stops(&sink),
+            vec![None, None, Some(NodeStopCause::DisabledAfterPanics)]
+        );
+        assert!(scheduler.nodes["panicker"].disabled);
+    }
+
+    /// A stop signal that holds no cause's code stops nothing: a node whose
+    /// signal holds an unknown value fires on and carries no stop.
+    #[test]
+    fn a_signal_with_no_causes_code_stops_nothing() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let never = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_calls, signal) = add_fatal_period(&mut scheduler, "odd", never);
+        signal.store(9, Ordering::Release);
+        let sink = burst_into_sink(&mut scheduler, "odd", 2);
+        assert_eq!(stops(&sink), vec![None, None]);
+        assert!(!scheduler.nodes["odd"].disabled);
+    }
+
+    /// `reset_node` lifts a fatal stop: the signal is cleared, so a later fire
     /// whose tick does not set it again leaves the node enabled.
     #[test]
-    fn reset_node_clears_the_fatal_stop_flag() {
+    fn reset_node_clears_the_fatal_stop_signal() {
         let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
         let sets = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let (calls, flag) = add_fatal_period(&mut scheduler, "fatal", Arc::clone(&sets));
@@ -11198,7 +11441,7 @@ mod tests {
         // The tick is healthy from now on; the reset must not leave the flag latched.
         sets.store(false, Ordering::Relaxed);
         scheduler.reset_node("fatal").expect("known node");
-        assert!(!flag.load(Ordering::Acquire), "reset cleared the flag");
+        assert_eq!(flag.load(Ordering::Acquire), 0, "reset cleared the signal");
         assert!(!scheduler.nodes["fatal"].disabled);
         fire(&mut scheduler);
         assert_eq!(calls.load(Ordering::Relaxed), 2);
@@ -11208,12 +11451,26 @@ mod tests {
         );
     }
 
+    /// A reset re-arms the stop: a fatal return after `reset_node` carries a
+    /// second fatal stop.
+    #[test]
+    fn a_fatal_return_after_a_reset_carries_a_second_stop() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        let always = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        add_fatal_period(&mut scheduler, "fatal", always);
+        let first = burst_into_sink(&mut scheduler, "fatal", 1);
+        assert_eq!(stops(&first), vec![Some(NodeStopCause::FatalError)]);
+        scheduler.reset_node("fatal").expect("known node");
+        let second = burst_into_sink(&mut scheduler, "fatal", 1);
+        assert_eq!(stops(&second), vec![Some(NodeStopCause::FatalError)]);
+    }
+
     /// An unknown node id is a wiring desync: `NodeNotFound` naming the id.
     #[test]
-    fn set_node_fatal_stop_on_an_unknown_node_is_node_not_found() {
+    fn set_node_stop_signal_on_an_unknown_node_is_node_not_found() {
         let mut scheduler = Scheduler::new();
         let err = scheduler
-            .set_node_fatal_stop("nope", Arc::new(std::sync::atomic::AtomicBool::new(false)))
+            .set_node_stop_signal("nope", Arc::new(std::sync::atomic::AtomicU8::new(0)))
             .expect_err("no such node");
         assert!(
             matches!(&err, TransportError::NodeNotFound { node_id } if node_id == "nope"),
@@ -11431,12 +11688,21 @@ mod tests {
         add_data(&mut s, "sink");
         add_data(&mut s, "bare");
         add_period(&mut s, "tick", Duration::from_millis(1));
+        add_data(&mut s, "held");
         s.set_trigger_refill("sink", "inp", RefillOutcome::empty_queue)
+            .unwrap();
+        s.set_trigger_refill("held", "inp", RefillOutcome::empty_queue)
             .unwrap();
         let plan = |fires: u32| {
             [
                 ReplayFire {
                     node_id: "sink",
+                    first_fire_ns: 1_000_000,
+                    fire_count: fires,
+                    interval_ns: 0,
+                },
+                ReplayFire {
+                    node_id: "held",
                     first_fire_ns: 1_000_000,
                     fire_count: fires,
                     interval_ns: 0,
@@ -11475,6 +11741,86 @@ mod tests {
         // At the cap it is accepted.
         s.set_replay_fire_plan(0, &plan(cap)).unwrap();
         s.set_replay_trailing_refills(0, &["sink"]).unwrap();
+        // Below the cap, a node a fed `block` edge holds is refused until it
+        // is marked and accepted after; the unmarked `sink` stays refused.
+        s.set_replay_fire_plan(0, &plan(3)).unwrap();
+        let err = s.set_replay_trailing_refills(0, &["held"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Graph validation error: replay fire plan (step 0): node 'held' cannot carry a \
+             trailing refill: it fires 3 times, not the cap of 64, and has no pre-fire check"
+        );
+        s.mark_held_by_bag_fed_block_edge("held").unwrap();
+        s.set_replay_trailing_refills(0, &["held"]).unwrap();
+        let err = s.set_replay_trailing_refills(0, &["sink"]).unwrap_err();
+        assert!(err.to_string().contains("not the cap"), "{err}");
+        // The mark gives no refill hook: a marked Period node and a marked
+        // Data node with no hook are still refused.
+        for id in ["tick", "bare"] {
+            s.mark_held_by_bag_fed_block_edge(id).unwrap();
+            let err = s.set_replay_trailing_refills(0, &[id]).unwrap_err();
+            assert!(err.to_string().contains("refill hook"), "{id}: {err}");
+        }
+        // An unknown node cannot be marked.
+        assert!(matches!(
+            s.mark_held_by_bag_fed_block_edge("ghost"),
+            Err(TransportError::NodeNotFound { .. })
+        ));
+    }
+
+    /// A marked node below the cap DRIVES its trailing refill: three planned
+    /// fires ask the hook twice between fires, and a step planned with a
+    /// trailing refill once more after the last, the frame the next step's
+    /// first fire serves. The mark alone, with no trailing refill planned,
+    /// adds no call and defers no fire.
+    #[test]
+    fn a_marked_node_below_the_cap_drives_its_trailing_refill() {
+        for (marked, trailing, want) in [(false, false, 2), (true, false, 2), (true, true, 3)] {
+            let mut replay =
+                Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+            add_data(&mut replay, "relay");
+            let calls = Arc::new(AtomicU64::new(0));
+            let calls_hook = Arc::clone(&calls);
+            replay
+                .set_trigger_refill("relay", "inp", move || {
+                    calls_hook.fetch_add(1, Ordering::Relaxed);
+                    RefillOutcome::drained(1, Some(7), false)
+                })
+                .unwrap();
+            replay
+                .set_replay_fire_plan(
+                    0,
+                    &[ReplayFire {
+                        node_id: "relay",
+                        first_fire_ns: 1_000_000,
+                        fire_count: 3,
+                        interval_ns: 0,
+                    }],
+                )
+                .unwrap();
+            if marked {
+                replay.mark_held_by_bag_fed_block_edge("relay").unwrap();
+            }
+            if trailing {
+                replay.set_replay_trailing_refills(0, &["relay"]).unwrap();
+            }
+            replay.step(Duration::from_millis(10));
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                want,
+                "marked={marked} trailing={trailing}: the hook is asked between fires, and \
+                 once more after the last on a step planned with a trailing refill"
+            );
+            assert_eq!(replay.replay_refill_shortfalls("relay"), Some(0));
+            assert_eq!(
+                replay
+                    .nodes
+                    .get("relay")
+                    .map(|n| n.fire_count.load(Ordering::Relaxed)),
+                Some(3),
+                "marked={marked} trailing={trailing}: every planned fire ran"
+            );
+        }
     }
 
     fn add_external(scheduler: &mut Scheduler, id: &str, fires: &Arc<AtomicU64>) {

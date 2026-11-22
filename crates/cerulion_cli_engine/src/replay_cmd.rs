@@ -631,6 +631,20 @@ pub enum ReplayError {
         reason: String,
     },
 
+    /// A NODE-STOP record (kind 7, which this build reads) whose stop cause
+    /// this build does not define, in a bag stamped past the formats this
+    /// build reads: a newer or foreign writer added the cause. Exit 2. At or
+    /// below the formats this build reads, which define no other cause, the
+    /// same record is a corrupt bag ([`ReplayError::RecordingInconsistent`]);
+    /// `replay_engine::unknown_stop_cause_refusal` picks between the two.
+    #[error("scheduler-trace record {index}: {reason}")]
+    TraceStopCauseUnknown {
+        /// The offending record's index in the trace channel (write order).
+        index: usize,
+        /// What the record carries and the remedy.
+        reason: String,
+    },
+
     /// A recorded topic is neither produced nor consumed by the bag's embedded
     /// graph — the recording and its graph.yaml disagree (corrupt or
     /// hand-edited). Exit 2. (Fires at classification time.)
@@ -750,17 +764,19 @@ pub enum ReplayError {
     /// A one-rank free-run bag takes the ordinary resume; the multi-rank
     /// shape is refused rather than silently mis-anchored, and per-rank
     /// anchors are not implemented.
+    ///
+    /// The sentence is
+    /// [`cerulion_core::flashback::resim::free_run_resume_unsupported_reason`]'s,
+    /// the reason a Flashback capture of this shape carries too, about a
+    /// capture, when no worker rank begins at step 0 and it embeds one rank's
+    /// checkpoint.
     #[error(
-        "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
-         first recorded STEP_BOUNDARY is step {first_step}, not step 0), and it holds \
-         {ranks} worker ranks. A mid-run resume anchors on the ONE first recorded boundary \
-         and places the clock off that single value, which holds for exactly one worker \
-         rank, and a free-run recording with several ranks abolishes it: each rank keeps \
-         its own boundary stream and its own clock, so there is no single first boundary, \
-         {ranks} clocks cannot be placed off one value, and a frame stamp compared against \
-         it crosses clock domains. Per-rank resume anchors are not supported yet; until \
-         they land, re-execute this bag from its start, or capture a deployment whose \
-         graph runs in ONE process group (its mid-run captures resume)"
+        "{}",
+        cerulion_core::flashback::resim::free_run_resume_unsupported_reason(
+            *first_step,
+            *ranks,
+            false
+        )
     )]
     FreeRunResumeUnsupported {
         /// The recording's first recorded (rank-0) STEP_BOUNDARY step.
@@ -824,6 +840,7 @@ impl ReplayError {
             | ReplayError::MultiRankManifestGap { .. }
             | ReplayError::DegradedRecordingDeparture { .. }
             | ReplayError::TraceRecordUnsupported { .. }
+            | ReplayError::TraceStopCauseUnknown { .. }
             | ReplayError::BagGraphMismatch { .. }
             | ReplayError::BagNoStepBoundaries
             | ReplayError::RecordingInconsistent { .. }
@@ -1733,6 +1750,15 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
                         cerulion_core::trace_ring::trace_record_noun(record_type)
                     ),
                 },
+                TraceRecordFault::UnknownStopCause { rank, code } => {
+                    replay_engine::unknown_stop_cause_refusal(
+                        index,
+                        rank,
+                        code,
+                        stamped_trace_format(&reader),
+                        replay_engine::SUPPORTED_TRACE_FORMAT,
+                    )
+                }
                 TraceRecordFault::ZeroedRecord => ReplayError::TraceRecordUnsupported {
                     index,
                     record_type: 0,
@@ -2186,6 +2212,19 @@ struct RecorderRead {
     /// NEWER Cerulion is refused by the version gate first, which names the
     /// cause.
     driver_stamp: replay_engine::RecordedDriverStamp,
+}
+
+/// The `trace_format` a bag's `recorder.json` stamps, read on its own for the
+/// one record refusal whose remedy depends on it, which the record walk raises
+/// before [`read_recorder_info`] runs. `1` when the attachment is absent or
+/// carries no readable stamp, as an absent field reads. Read through
+/// `cerulion_core::flashback::resim::recorded_trace_format`, as the capture
+/// judge reads it.
+fn stamped_trace_format(reader: &BagReader) -> u32 {
+    let attachment = reader.attachment(RECORDER_ATTACHMENT).ok().flatten();
+    cerulion_core::flashback::resim::recorded_trace_format(
+        attachment.as_ref().map(|att| att.data.as_slice()),
+    )
 }
 
 /// Read the OPTIONAL
@@ -2826,6 +2865,13 @@ mod tests {
                     index: 7,
                     record_type: 2,
                     reason: "departure".to_string(),
+                },
+                2,
+            ),
+            (
+                ReplayError::TraceStopCauseUnknown {
+                    index: 7,
+                    reason: "cause".to_string(),
                 },
                 2,
             ),

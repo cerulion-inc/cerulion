@@ -57,8 +57,9 @@ pub const RECORD_TYPE_DEPARTURE: u32 = 2;
 pub const RECORD_TYPE_STEP_BOUNDARY: u32 = 3;
 // `record_type == 0` is INVALID (a zeroed slot). Kinds 4 (Keyframe)
 // and 5 (NonDeterminism) stay RESERVED and MUST
-// NOT be minted; kind 6 is minted below
-// ([`RECORD_TYPE_READ_OUTCOME`]); values 7+ are RESERVED.
+// NOT be minted; kinds 6 and 7 are minted below
+// ([`RECORD_TYPE_READ_OUTCOME`], [`RECORD_TYPE_NODE_STOP`]); values 8+ are
+// RESERVED.
 
 /// Record kind: a per-edge READ OUTCOME (`trace_format` 3) —
 /// which frame(s) a consumer's input read actually served. Reuses the one
@@ -90,6 +91,38 @@ pub const RECORD_TYPE_STEP_BOUNDARY: u32 = 3;
 /// - `reserved` — rank/discard exactly as for every other kind (0 on the
 ///   ring; `bagd` co-stamps the ring's header rank uniformly at drain time).
 pub const RECORD_TYPE_READ_OUTCOME: u32 = 6;
+
+/// Record kind: the fire that STOPPED a node (`trace_format` 12). Pushed on
+/// the node's ring directly after that fire's FIRE record, so the stop's
+/// position among the node's fires of the step is the number of the node's
+/// FIRE records of that step up to and including the one before it. The
+/// stopping fires are the scheduler's: a tick that returned
+/// `NodeError::Fatal`, a tick that panicked inside the runtime's tick
+/// callback or first found the node's entry poisoned, and the fire that
+/// opened the consecutive-panic breaker. Fields:
+///
+/// - `step`, `fire_time_ns`, `node_idx`, `global_level`: those of the
+///   stopping fire's FIRE record,
+/// - `duration_ns`: the stop's cause,
+///   [`NodeStopCause::code`](crate::scheduler::NodeStopCause::code)
+///   (`1` fatal error, `2` entry poisoned, `3` disabled after consecutive
+///   panics),
+/// - `reserved`: rank exactly as for every other kind (0 on the ring).
+///
+/// At most one per node per stop, so a ring sized for its fires holds them.
+pub const RECORD_TYPE_NODE_STOP: u32 = 7;
+
+/// The lowest `trace_format` whose trace follows every fire that stopped its
+/// node with a NODE-STOP record ([`RECORD_TYPE_NODE_STOP`]). The one place the
+/// number is written: the replay's constant of the same name in
+/// `cerulion_cli_engine::replay_engine` is this one.
+pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = 12;
+
+/// The highest `trace_format` this build reads. The replay's read gate of the
+/// same name in `cerulion_cli_engine::replay_engine` is this constant, and its
+/// doc names what each format adds. The capture judge words an unknown stop
+/// cause against it ([`TraceRecordFault::detail`]), as the replay does.
+pub const SUPPORTED_TRACE_FORMAT: u32 = NODE_STOPS_MIN_TRACE_FORMAT;
 
 /// Read-outcome kind: a fresh frame was served to the read (the low-16
 /// half of the kind-6 `global_level` packing). The wire constants are
@@ -574,9 +607,10 @@ pub enum TraceRecordFault {
     /// A manifest-indexed record's `node_idx` is beyond its OWN rank's manifest
     /// table.
     ///
-    /// TWO record kinds are manifest-indexed and both land here: a FIRE record
-    /// (the node that fired) and — since kind 6 was minted — a READ-OUTCOME record (the
-    /// CONSUMER node whose read was logged). They share ONE variant because they
+    /// THREE record kinds are manifest-indexed and all land here: a FIRE record
+    /// (the node that fired), since kind 6 was minted a READ-OUTCOME record (the
+    /// CONSUMER node whose read was logged), and since kind 7 a NODE-STOP
+    /// record (the node the fire stopped). They share ONE variant because they
     /// share one fault: an index the rank's table cannot resolve, which is
     /// corruption whichever kind carried it. The kind rides `record_type` so the
     /// message can NAME which one, because that is what tells an operator where
@@ -590,28 +624,69 @@ pub enum TraceRecordFault {
         node_idx: u32,
         /// How many node ids that rank's manifest lists.
         nodes: usize,
-        /// WHICH manifest-indexed kind carried the bad index —
-        /// [`RECORD_TYPE_FIRE`] or [`RECORD_TYPE_READ_OUTCOME`]. Render it with
-        /// [`trace_record_noun`].
+        /// WHICH manifest-indexed kind carried the bad index:
+        /// [`RECORD_TYPE_FIRE`], [`RECORD_TYPE_READ_OUTCOME`] or
+        /// [`RECORD_TYPE_NODE_STOP`]. Render it with [`trace_record_noun`].
         record_type: u32,
+    },
+    /// A NODE-STOP record whose cause code names no
+    /// [`NodeStopCause`](crate::scheduler::NodeStopCause) this build defines:
+    /// a cause a newer or foreign writer added, or a corrupt record. The
+    /// record walk runs before the version gate, so a newer writer's cause can
+    /// reach this check first. [`Self::detail`] and the replay's refusal both
+    /// word it from the bag's stamp through [`unknown_stop_cause_origin`].
+    UnknownStopCause {
+        /// The record's rank.
+        rank: u32,
+        /// The code the record carries in `duration_ns`.
+        code: u64,
     },
     /// `record_type` 0 — a zeroed slot, i.e. a corrupt recording.
     ZeroedRecord,
-    /// A reserved or unknown `record_type` (3 is STEP_BOUNDARY; 4+ are reserved
-    /// for future kinds).
+    /// A reserved or unknown `record_type` (4 and 5 are reserved, 8+ are
+    /// reserved for future kinds).
     UnsupportedRecordType {
         /// The unrecognised kind.
         record_type: u32,
     },
 }
 
+/// What a NODE-STOP record whose stop cause this build does not define says
+/// about its bag, read from the bag's `trace_format` stamp
+/// ([`unknown_stop_cause_origin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownStopCauseOrigin {
+    /// The bag is stamped past the formats the reading build reads: a newer or
+    /// foreign writer added the cause, and upgrading is the remedy.
+    NewerWriter,
+    /// The bag is stamped at or below them, and a format at or below the
+    /// reading build's defines no other stop cause: the record is corrupt.
+    Corrupt,
+}
+
+/// PURE: where an unknown stop cause in a bag stamped `stamp` (`1` when the
+/// bag carries no stamp) came from, for a build that reads up to `supported`.
+/// The replay's refusal (`unknown_stop_cause_refusal` in
+/// `cerulion_cli_engine::replay_engine`) and the capture judge's reason
+/// ([`TraceRecordFault::detail`]) both branch on this one answer.
+pub fn unknown_stop_cause_origin(stamp: u32, supported: u32) -> UnknownStopCauseOrigin {
+    if stamp > supported {
+        UnknownStopCauseOrigin::NewerWriter
+    } else {
+        UnknownStopCauseOrigin::Corrupt
+    }
+}
+
 impl TraceRecordFault {
-    /// One sentence naming the fault, for a capture manifest's refusal reason.
+    /// One sentence naming the fault, for a capture manifest's refusal reason,
+    /// in a bag stamped `trace_format` (`1` when it carries no stamp). The
+    /// stamp words an unknown stop cause ([`unknown_stop_cause_origin`] against
+    /// [`SUPPORTED_TRACE_FORMAT`]) and no other fault.
     ///
     /// `run_replay` renders its own wording into its own error variants (it has
     /// the record INDEX and the manifest NAME, which this type deliberately does
     /// not carry); this is the capture side's rendering of the same fact.
-    pub fn detail(&self) -> String {
+    pub fn detail(&self, trace_format: u32) -> String {
         match self {
             Self::ForeignRank { rank, ranks_known } => format!(
                 "a trace record is stamped with rank {rank}, but this capture carries worker \
@@ -628,6 +703,20 @@ impl TraceRecordFault {
                  manifest lists only {nodes} node id(s)",
                 trace_record_noun(*record_type)
             ),
+            Self::UnknownStopCause { rank, code } => {
+                match unknown_stop_cause_origin(trace_format, SUPPORTED_TRACE_FORMAT) {
+                    UnknownStopCauseOrigin::NewerWriter => format!(
+                        "a scheduler-trace NODE-STOP record of rank {rank} carries stop cause \
+                         {code}, which this Cerulion version does not define; the trace was \
+                         written by a newer or foreign writer, so upgrade cerulion to replay it"
+                    ),
+                    UnknownStopCauseOrigin::Corrupt => format!(
+                        "a scheduler-trace NODE-STOP record of rank {rank} carries stop cause \
+                         {code}, which trace format {trace_format} does not define; the trace is \
+                         corrupt"
+                    ),
+                }
+            }
             Self::ZeroedRecord => {
                 "a scheduler-trace record has record_type 0 — an invalid (zeroed) record, so \
                  the trace is corrupt"
@@ -671,7 +760,9 @@ pub fn classify_trace_record(
         // check — a stamp past the table is corruption whichever kind carried
         // it. Sharing the arm is what keeps a new index-bearing kind from
         // quietly skipping the check.
-        RECORD_TYPE_FIRE | RECORD_TYPE_READ_OUTCOME if rec.node_idx as usize >= nodes => {
+        RECORD_TYPE_FIRE | RECORD_TYPE_READ_OUTCOME | RECORD_TYPE_NODE_STOP
+            if rec.node_idx as usize >= nodes =>
+        {
             Some(TraceRecordFault::NodeIdxOutOfRange {
                 rank,
                 node_idx: rec.node_idx,
@@ -679,7 +770,18 @@ pub fn classify_trace_record(
                 record_type: rec.record_type,
             })
         }
-        RECORD_TYPE_FIRE | RECORD_TYPE_STEP_BOUNDARY | RECORD_TYPE_READ_OUTCOME => None,
+        RECORD_TYPE_NODE_STOP
+            if crate::scheduler::NodeStopCause::from_code(rec.duration_ns).is_none() =>
+        {
+            Some(TraceRecordFault::UnknownStopCause {
+                rank,
+                code: rec.duration_ns,
+            })
+        }
+        RECORD_TYPE_FIRE
+        | RECORD_TYPE_STEP_BOUNDARY
+        | RECORD_TYPE_READ_OUTCOME
+        | RECORD_TYPE_NODE_STOP => None,
         0 => Some(TraceRecordFault::ZeroedRecord),
         other => Some(TraceRecordFault::UnsupportedRecordType { record_type: other }),
     }
@@ -734,6 +836,7 @@ pub fn trace_record_noun(record_type: u32) -> String {
     match record_type {
         RECORD_TYPE_FIRE => "FIRE".to_string(),
         RECORD_TYPE_READ_OUTCOME => "READ-OUTCOME".to_string(),
+        RECORD_TYPE_NODE_STOP => "NODE-STOP".to_string(),
         other => format!("record_type {other}"),
     }
 }
@@ -820,8 +923,9 @@ pub struct TraceRingRecord {
     /// outcome_kind:14)` word ([`pack_read_outcome_meta`]).
     pub global_level: u32,
     /// One of [`RECORD_TYPE_FIRE`] / [`RECORD_TYPE_DEPARTURE`] /
-    /// [`RECORD_TYPE_STEP_BOUNDARY`] / [`RECORD_TYPE_READ_OUTCOME`]
-    /// (0 invalid; 4/5 reserved for keyframe/nondeterminism; 7+ reserved).
+    /// [`RECORD_TYPE_STEP_BOUNDARY`] / [`RECORD_TYPE_READ_OUTCOME`] /
+    /// [`RECORD_TYPE_NODE_STOP`] (0 invalid; 4/5 reserved for
+    /// keyframe/nondeterminism; 8+ reserved).
     pub record_type: u32,
     /// 0 at mint — except a discard-marked FIRE, whose bit 31 carries
     /// [`TRACE_DISCARD_BIT`]. bagd co-stamps the owning worker
@@ -906,6 +1010,37 @@ impl TraceRingRecord {
     #[inline]
     pub fn is_departure_boundary(&self) -> bool {
         self.record_type == RECORD_TYPE_DEPARTURE || self.reserved == DEPARTURE_RING_RANK
+    }
+
+    /// Build a [`RECORD_TYPE_NODE_STOP`] record for the fire at `step`,
+    /// `fire_time_ns` and `global_level` that stopped node `node_idx` with
+    /// `cause`: the ONE place its fields are assembled. `reserved` is written
+    /// 0 (bagd stamps the rank at drain time).
+    pub fn node_stop(
+        step: u64,
+        fire_time_ns: u64,
+        node_idx: u32,
+        global_level: u32,
+        cause: crate::scheduler::NodeStopCause,
+    ) -> Self {
+        Self {
+            step,
+            fire_time_ns,
+            duration_ns: u64::from(cause.code()),
+            node_idx,
+            global_level,
+            record_type: RECORD_TYPE_NODE_STOP,
+            reserved: 0,
+        }
+    }
+
+    /// The cause a [`RECORD_TYPE_NODE_STOP`] record carries; `None` for any
+    /// other kind, and for a stop record whose code names no cause.
+    pub fn stop_cause(&self) -> Option<crate::scheduler::NodeStopCause> {
+        if self.record_type != RECORD_TYPE_NODE_STOP {
+            return None;
+        }
+        crate::scheduler::NodeStopCause::from_code(self.duration_ns)
     }
 
     /// Build a [`RECORD_TYPE_READ_OUTCOME`] record — the ONE place
@@ -2608,6 +2743,183 @@ mod tests {
         assert_eq!(TRACE_RECORD_SIZE, 40);
     }
 
+    /// A NODE-STOP record's field map, against a hand-written record: the
+    /// stopping fire's step, instant, node and level, the cause code in
+    /// `duration_ns`, kind 7 and a zero `reserved`, through the byte codec
+    /// unchanged.
+    #[test]
+    fn a_node_stop_record_carries_its_fire_and_its_cause() {
+        use crate::scheduler::NodeStopCause;
+        let rec = TraceRingRecord::node_stop(7, 30_000_000, 2, 1, NodeStopCause::EntryPoisoned);
+        assert_eq!(
+            rec,
+            TraceRingRecord {
+                step: 7,
+                fire_time_ns: 30_000_000,
+                duration_ns: 2,
+                node_idx: 2,
+                global_level: 1,
+                record_type: 7,
+                reserved: 0,
+            }
+        );
+        assert_eq!(rec.stop_cause(), Some(NodeStopCause::EntryPoisoned));
+        assert_eq!(TraceRingRecord::from_bytes(&rec.as_bytes()), rec);
+    }
+
+    /// The stop cause codes, as a hand table in both directions, and the
+    /// codes no cause has.
+    #[test]
+    fn the_stop_cause_codes_answer_their_hand_table() {
+        use crate::scheduler::{NodeDeathCause, NodeStopCause};
+        let table = [
+            (
+                1u64,
+                NodeStopCause::FatalError,
+                NodeDeathCause::FatalError,
+                false,
+            ),
+            (
+                2,
+                NodeStopCause::EntryPoisoned,
+                NodeDeathCause::EntryPoisoned,
+                true,
+            ),
+            (
+                3,
+                NodeStopCause::DisabledAfterPanics,
+                NodeDeathCause::DisabledAfterPanics,
+                false,
+            ),
+        ];
+        for (code, cause, death, fires_again) in table {
+            assert_eq!(u64::from(cause.code()), code, "{cause:?}");
+            assert_eq!(NodeStopCause::from_code(code), Some(cause), "{code}");
+            assert_eq!(cause.death_cause(), death, "{cause:?}");
+            assert_eq!(cause.fires_again(), fires_again, "{cause:?}");
+        }
+        for code in [0u64, 4, 255, 256, u64::MAX] {
+            assert_eq!(NodeStopCause::from_code(code), None, "{code}");
+        }
+    }
+
+    /// Only a NODE-STOP record carries a stop cause: a FIRE record whose
+    /// duration happens to equal a cause code carries none, and a stop record
+    /// whose code names no cause carries none either.
+    #[test]
+    fn only_a_node_stop_record_carries_a_stop_cause() {
+        let fire = TraceRingRecord {
+            step: 1,
+            fire_time_ns: 10,
+            duration_ns: 1,
+            node_idx: 0,
+            global_level: 0,
+            record_type: RECORD_TYPE_FIRE,
+            reserved: 0,
+        };
+        assert_eq!(fire.stop_cause(), None);
+        let unknown = TraceRingRecord {
+            duration_ns: 9,
+            record_type: RECORD_TYPE_NODE_STOP,
+            ..fire
+        };
+        assert_eq!(unknown.stop_cause(), None);
+    }
+
+    /// An unknown stop cause's origin against a hand table: past the formats
+    /// the build reads, a newer writer's; at or below them, a corrupt record.
+    /// The rows move `supported` too, so the answer is read from both.
+    #[test]
+    fn an_unknown_stop_causes_origin_is_read_from_the_stamp() {
+        use UnknownStopCauseOrigin::{Corrupt, NewerWriter};
+        for (stamp, supported, want) in [
+            (1u32, 12u32, Corrupt),
+            (11, 12, Corrupt),
+            (12, 12, Corrupt),
+            (13, 12, NewerWriter),
+            (u32::MAX, 12, NewerWriter),
+            (13, 13, Corrupt),
+            (14, 13, NewerWriter),
+            (0, 0, Corrupt),
+            (1, 0, NewerWriter),
+        ] {
+            assert_eq!(
+                unknown_stop_cause_origin(stamp, supported),
+                want,
+                "stamp {stamp}, supported {supported}"
+            );
+        }
+    }
+
+    /// The shared classifier admits a NODE-STOP record and bounds its
+    /// `node_idx` like a FIRE's; the kinds past it stay refused.
+    #[test]
+    fn the_classifier_admits_a_node_stop_and_bounds_its_node_idx() {
+        use crate::scheduler::NodeStopCause;
+        let nodes = [3usize];
+        let in_range = TraceRingRecord::node_stop(4, 40, 2, 0, NodeStopCause::FatalError);
+        assert_eq!(classify_trace_record(&in_range, &nodes), None);
+        let past = TraceRingRecord::node_stop(4, 40, 3, 0, NodeStopCause::FatalError);
+        assert_eq!(
+            classify_trace_record(&past, &nodes),
+            Some(TraceRecordFault::NodeIdxOutOfRange {
+                rank: 0,
+                node_idx: 3,
+                nodes: 3,
+                record_type: 7,
+            })
+        );
+        // A stop record whose cause code names no cause is refused, after
+        // its node index is.
+        for code in [0u64, 4, u64::MAX] {
+            let rec = TraceRingRecord {
+                duration_ns: code,
+                ..in_range
+            };
+            assert_eq!(
+                classify_trace_record(&rec, &nodes),
+                Some(TraceRecordFault::UnknownStopCause { rank: 0, code }),
+                "code {code}"
+            );
+            let past = TraceRingRecord { node_idx: 3, ..rec };
+            assert!(
+                matches!(
+                    classify_trace_record(&past, &nodes),
+                    Some(TraceRecordFault::NodeIdxOutOfRange { .. })
+                ),
+                "code {code}"
+            );
+        }
+        assert_eq!(trace_record_noun(RECORD_TYPE_NODE_STOP), "NODE-STOP");
+        // Past the formats this build reads, a newer writer's cause; at them,
+        // a corrupt record.
+        assert_eq!(
+            TraceRecordFault::UnknownStopCause { rank: 1, code: 9 }
+                .detail(SUPPORTED_TRACE_FORMAT + 1),
+            "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which this \
+             Cerulion version does not define; the trace was written by a newer or foreign \
+             writer, so upgrade cerulion to replay it"
+        );
+        assert_eq!(
+            TraceRecordFault::UnknownStopCause { rank: 1, code: 9 }.detail(SUPPORTED_TRACE_FORMAT),
+            format!(
+                "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which trace \
+                 format {SUPPORTED_TRACE_FORMAT} does not define; the trace is corrupt"
+            )
+        );
+        for kind in [4u32, 5, 8, u32::MAX] {
+            let rec = TraceRingRecord {
+                record_type: kind,
+                ..in_range
+            };
+            assert_eq!(
+                classify_trace_record(&rec, &nodes),
+                Some(TraceRecordFault::UnsupportedRecordType { record_type: kind }),
+                "kind {kind}"
+            );
+        }
+    }
+
     /// The SHARED worker-roster contiguity rule, against a hand
     /// oracle.
     ///
@@ -2839,12 +3151,12 @@ mod tests {
         let dep = departure(2);
         let alien = TraceRingRecord {
             step: 3,
-            record_type: 7,
+            record_type: 8,
             ..TraceRingRecord::default()
         };
         let unsupported = || {
             Some(TraceRecordRefusal::Fault(
-                TraceRecordFault::UnsupportedRecordType { record_type: 7 },
+                TraceRecordFault::UnsupportedRecordType { record_type: 8 },
             ))
         };
 
@@ -2922,7 +3234,8 @@ mod tests {
     #[test]
     fn annotation_kinds_live_in_the_outcome_space_not_the_record_space() {
         // The RECORD type is unchanged — a format-3 reader's `record_type`
-        // gate (kinds >= 7 are UnsupportedRecordType) never sees them.
+        // gate (kinds 4, 5 and from 8 on are UnsupportedRecordType; a format-3
+        // reader's gate refuses 7 too) never sees them.
         assert_eq!(
             TraceRingRecord::read_outcome_truncated(1, 0, 0, 3, ReadSiteRole::Drain).record_type,
             RECORD_TYPE_READ_OUTCOME

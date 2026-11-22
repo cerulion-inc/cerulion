@@ -51,7 +51,7 @@ use cerulion_core::trace_ring::{
     pack_read_outcome_meta, read_site_role, unpack_read_outcome_meta, unpack_read_outcome_popped,
     TraceRingRecord, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
     READ_OUTCOME_NO_FRAME, READ_OUTCOME_ROLE_MASK, READ_OUTCOME_ROLE_SHIFT, READ_OUTCOME_SERVED,
-    RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
+    RECORD_TYPE_FIRE, RECORD_TYPE_NODE_STOP, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::WireHeader;
 use indexmap::IndexMap;
@@ -1268,19 +1268,30 @@ fn drain_all(
 
 /// Convert the runtime's [`cerulion_core::scheduler::TraceEntry`]s into the
 /// bag's 40-byte [`TraceRingRecord`] wire form (FIRE records; `node_idx` indexes
-/// the manifest's `node_ids` table).
+/// the manifest's `node_ids` table). A fire that stopped its node is followed
+/// by its NODE-STOP record, built by the production constructor the recording
+/// ring's push calls, so a crafted bag carries the stops the reference run made.
 fn trace_to_records(
     trace: &[cerulion_core::scheduler::TraceEntry],
     node_ids: &[String],
 ) -> Vec<TraceRingRecord> {
     trace
         .iter()
-        .map(|e| {
+        .flat_map(|e| {
             let node_idx = node_ids
                 .iter()
                 .position(|id| id.as_str() == &*e.node_id)
                 .expect("trace node id is in the manifest") as u32;
-            TraceRingRecord {
+            let stop = e.stop.map(|cause| {
+                TraceRingRecord::node_stop(
+                    e.step,
+                    e.fire_time_ns,
+                    node_idx,
+                    e.global_level as u32,
+                    cause,
+                )
+            });
+            let fire = TraceRingRecord {
                 step: e.step,
                 fire_time_ns: e.fire_time_ns,
                 duration_ns: 0,
@@ -1296,7 +1307,8 @@ fn trace_to_records(
                 } else {
                     0
                 },
-            }
+            };
+            std::iter::once(fire).chain(stop)
         })
         .collect()
 }
@@ -1304,6 +1316,32 @@ fn trace_to_records(
 // ===========================================================================
 // Bag writing
 // ===========================================================================
+
+thread_local! {
+    /// Set by a refusal vector that needs NODE-STOP records in a bag stamped
+    /// below the node-stops format, a shape no recorder writes.
+    static KEEP_STOPS_AT_ANY_FORMAT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The trace records a recorder that stamps `recorder_json` writes: one
+/// stamped below the node-stops format, or a bag with no `recorder.json`,
+/// writes no NODE-STOP record, so the reference run's stops are left out of
+/// such a bag (unless [`KEEP_STOPS_AT_ANY_FORMAT`] is set).
+fn recorded_at_stamp(
+    trace: &[TraceRingRecord],
+    recorder_json: Option<&[u8]>,
+) -> Vec<TraceRingRecord> {
+    let stamps_stops = recorder_json
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+        .and_then(|v| v["trace_format"].as_u64())
+        .is_some_and(|f| f >= u64::from(replay_engine::NODE_STOPS_MIN_TRACE_FORMAT));
+    let keep = stamps_stops || KEEP_STOPS_AT_ANY_FORMAT.with(std::cell::Cell::get);
+    trace
+        .iter()
+        .filter(|r| keep || r.record_type != RECORD_TYPE_NODE_STOP)
+        .copied()
+        .collect()
+}
 
 /// Write `rec` (with optional `env_json`) to an MCAP bag at `path`. Each topic
 /// in `rec.messages` becomes a channel; the frames are written in file order;
@@ -1898,7 +1936,10 @@ fn write_bag_impl_encoded(
                 c.write_message(topic, seq, ts, ts, &[&frame[..]])?;
             }
         }
-        for (i, r) in rec.trace.iter().enumerate() {
+        for (i, r) in recorded_at_stamp(&rec.trace, recorder_json.as_deref())
+            .iter()
+            .enumerate()
+        {
             c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
         }
         write_producer_labels_encoded(c, labels_channel, &label_channels, labels, encode_label)?;
@@ -9226,10 +9267,11 @@ fn write_multi_rank_bag_impl(
                     per_rank[rank as usize].push(b);
                 }
             }
-            RECORD_TYPE_FIRE | RECORD_TYPE_READ_OUTCOME => {
+            RECORD_TYPE_FIRE | RECORD_TYPE_READ_OUTCOME | RECORD_TYPE_NODE_STOP => {
                 // A kind-6 READ-OUTCOME record's
                 // `node_idx` is the CONSUMER, manifest-indexed exactly like a
-                // FIRE's — same rank stamp + same per-rank-table remap.
+                // FIRE's: same rank stamp + same per-rank-table remap. A
+                // NODE-STOP record names the node its fire stopped, the same.
                 let id = &rec.node_ids[r.node_idx as usize];
                 if omit_from_manifests.contains(&id.as_str()) {
                     continue;
@@ -9244,7 +9286,7 @@ fn write_multi_rank_bag_impl(
                 per_rank[rank as usize].push(f);
             }
             other => panic!(
-                "reference recordings carry only FIRE/BOUNDARY/READ-OUTCOME records, got {other}"
+                "reference recordings carry only FIRE/BOUNDARY/READ-OUTCOME/NODE-STOP records, got {other}"
             ),
         }
     }
@@ -9288,7 +9330,10 @@ fn write_multi_rank_bag_impl(
                 c.write_message(topic, seq, ts, ts, &[&frame[..]])?;
             }
         }
-        for (i, r) in ordered.iter().enumerate() {
+        for (i, r) in recorded_at_stamp(&ordered, recorder_json.as_deref())
+            .iter()
+            .enumerate()
+        {
             c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
         }
         write_producer_labels(c, labels_channel, &label_channels, producers.labels)?;
@@ -9466,6 +9511,7 @@ fn two_rank_block_layout_replays_clean_and_merges_in_canonical_order() {
                     global_level: r.global_level as usize,
                     duration_ns: 0,
                     discarded: false,
+                    stop: None,
                 })
                 .collect()
         })
@@ -15060,7 +15106,10 @@ fn write_checkpoint_bag_with_manifest_keys(
                 c.write_message(topic, seq, ts, ts, &[&frame[..]])?;
             }
         }
-        for (i, r) in rec.trace.iter().enumerate() {
+        for (i, r) in recorded_at_stamp(&rec.trace, recorder_json.as_deref())
+            .iter()
+            .enumerate()
+        {
             c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
         }
         for (i, record) in state.iter().enumerate() {
@@ -24328,7 +24377,7 @@ fn write_capture_bag(rec: &Recording, path: &std::path::Path, covered_through_ns
                 c.write_message(topic, seq, ts, ts, &[&frame[..]])?;
             }
         }
-        for (i, r) in rec.trace.iter().enumerate() {
+        for (i, r) in recorded_at_stamp(&rec.trace, None).iter().enumerate() {
             c.write_scheduler_trace(i as u32, r.fire_time_ns, r.fire_time_ns, r)?;
         }
         Ok(())
@@ -26559,6 +26608,17 @@ fn write_ls_resumed_bag(
     rec: &Recording,
     sink_anchor: bool,
 ) -> std::path::PathBuf {
+    write_ls_resumed_bag_stamped(dir, name, rec, sink_anchor, ri_free_run_recorder_json())
+}
+
+/// [`write_ls_resumed_bag`] with `recorder_json` as its `recorder.json`.
+fn write_ls_resumed_bag_stamped(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    sink_anchor: bool,
+    recorder_json: Vec<u8>,
+) -> std::path::PathBuf {
     let mid = make_mid_run(rec, LS_FIRST_STEP);
     let bag = dir.path().join(name);
     // The counter published `0..LS_FIRST_STEP` up to the anchor step.
@@ -26595,7 +26655,7 @@ fn write_ls_resumed_bag(
         Some(&coverage_for_nodes(&named)),
         None,
         None,
-        Some(ri_free_run_recorder_json()),
+        Some(recorder_json),
         manifest_keys,
     );
     bag
@@ -26810,13 +26870,17 @@ fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_si
 /// keeps counting.
 ///
 /// `--verify` refuses the bag before its first step ([`assert_ls_verify_refuses`],
-/// exit 2). A neutral `--resim all` replays it, and the slice shows the node
-/// running, so the unread-frame rule judges it: the fourth count after the fire
-/// at step 6 (step 10) passes the frame that fire's read took and two in
-/// delivery, a fire-schedule finding (the class `--verify` exits 6 on) with
+/// exit 2). A neutral `--resim all` replays it. The bag holds the stop as a
+/// NODE-STOP record, so the schedule check judges the sink by it and owes it no
+/// fire after step 6, and the finding is the recorded stop the candidate did
+/// not make: a fire-schedule finding (the class `--verify` exits 6 on) with
 /// nothing stood down, which the neutral summary reports as a differing fire
-/// schedule. The build the recording ran re-executes the stop at step 6 and
-/// re-derives clean, with nothing stood down either.
+/// schedule. The same recording stamped below the node-stops format says
+/// nothing about stops, and the slice shows the node running, so the
+/// unread-frame rule judges it: the fourth count after the fire at step 6
+/// (step 10) passes the frame that fire's read took and two in delivery. The
+/// build the recording ran re-executes the stop at step 6 and re-derives clean,
+/// with nothing stood down either.
 #[test]
 #[serial]
 fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_convicted() {
@@ -26824,6 +26888,47 @@ fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_con
     let rec = ls_reference(6);
     let bag = write_ls_resumed_bag(&dir, "ls_stops_inside.mcap", &rec, true);
     assert_ls_verify_refuses(&bag, SinkFailure::Logic(6.0));
+
+    let (stamped, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Logic(6.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let stamped = stamped.expect("the resumed neutral resim runs");
+    assert_eq!(
+        stamped.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 step 6: the recording stops node 'sink' at its \
+             fire 1 of the step (returned_fatal_error), and this re-execution does not stop it \
+             there"
+        )
+    );
+    assert!(!stamped.passed);
+    assert_eq!(resim_exit(&stamped, false), 0, "{stamped:?}");
+    assert_eq!(resim_exit(&stamped, true), 6, "{stamped:?}");
+    assert!(
+        stand_down_details(&stamped).is_empty(),
+        "a recorded stop is judged, never stood down: {:?}",
+        stand_down_details(&stamped)
+    );
+    let (stopping, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(6.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let stopping = stopping.expect("the resumed neutral resim runs");
+    assert!(
+        stopping.passed && stopping.trace_divergence.is_none(),
+        "the build the recording ran re-executes the recorded stop: {stopping:?}"
+    );
+
+    let bag = write_ls_resumed_bag_stamped(
+        &dir,
+        "ls_stops_inside_below.mcap",
+        &rec,
+        true,
+        ri_recorder_json_at(replay_engine::ANCHOR_STOPS_MIN_TRACE_FORMAT),
+    );
 
     let (candidate, _) = ri_replay(
         &bag,
@@ -29332,7 +29437,7 @@ fn a_format_ten_bag_with_no_part_for_a_stopped_node_stands_it_down_by_name() {
         "fifo_skipped_10.mcap",
         &rec,
         &[(LS_SINK, 1, vec![skip.to_vec()])],
-        ri_free_run_recorder_json(),
+        ri_recorder_json_at(10),
     );
     let (outcome, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
     let outcome = outcome.expect("the resumed neutral resim runs");
@@ -29432,15 +29537,20 @@ fn a_multi_rank_free_run_mid_run_bag_is_refused_by_name() {
                 "free_run",
                 "2 worker ranks",
                 "not supported yet",
-                "ONE process group",
-                "from its start",
+                "record the run from its first step with `cerulion graph run --record`",
             ] {
                 assert!(
                     msg.contains(needle),
-                    "the refusal names the stamp, the count, the limitation and both remedies \
+                    "the refusal names the stamp, the count, the limitation and the remedy \
                      (missing {needle:?}): {msg}"
                 );
             }
+            assert_eq!(
+                msg,
+                cerulion_core::flashback::resim::free_run_resume_unsupported_reason(2, 2, false),
+                "the replay prints the sentence about a bag that a capture of this shape carries \
+                 about itself"
+            );
         }
         other => panic!("expected FreeRunResumeUnsupported, got {other:?}"),
     }
@@ -54854,6 +54964,816 @@ fn synthetic_difference() -> ByteDifference {
         reason: None,
         more: 0,
     }
+}
+
+// ===========================================================================
+// A recorded node stop, held to the re-execution
+//
+// A `period_ms = 1` source fires five times per 5 ms step and returns
+// `NodeError::Fatal` on its third tick: the third fire of step 0. From the
+// node-stops trace format the recording holds that stop as a NODE-STOP record
+// directly after the fire, and a replay holds its own re-executed stop to it.
+// ===========================================================================
+
+/// A `period_ms = 1` source that returns `NodeError::Fatal` on its build's
+/// `stop_tick` (none on a build without one); every other tick publishes the
+/// tick count.
+#[cerulion_node(period_ms = 1)]
+#[derive(Default)]
+struct BurstStopSrc {
+    #[output]
+    out: Vector3,
+    ticks: u32,
+    /// The tick this build stops at, if any; a restore leaves it as built.
+    #[cerulion(reconstruct)]
+    stop_tick: Option<u32>,
+}
+
+#[cerulion_node_impl]
+impl BurstStopSrc {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1;
+        if self.stop_tick == Some(self.ticks) {
+            return Err(NodeError::Fatal(
+                "the source stops at this tick".to_string(),
+            ));
+        }
+        self.out.x = f64::from(self.ticks);
+        Ok(())
+    }
+}
+
+/// The burst source's node id, at manifest index 2, after the stopping-sink
+/// graph's counter and sink, whose reads give the bag a read log.
+const BS_SRC: &str = "src";
+/// [`BS_SRC`]'s manifest index.
+const BS_SRC_IDX: u32 = 2;
+/// The steps every burst-stop recording runs.
+const BS_STEPS: usize = 4;
+
+/// The stopping-sink graph ([`ls_yaml`]) with the burst source beside it.
+fn bs_yaml() -> String {
+    format!(
+        "{}\x20 - id: src\n    type: burst_stop_src\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n",
+        ls_yaml()
+    )
+}
+
+/// The counter, a sink that never fails (its `Logic` threshold is no frame
+/// the counter reaches), and the burst source stopping at `stop_tick`.
+fn bs_factories(stop_tick: Option<u32>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let mut f = ls_factories(SinkFailure::Logic(1.0e9));
+    f.insert(
+        BS_SRC.to_string(),
+        Box::new(BurstStopSrcEntry::with_state(BurstStopSrc {
+            stop_tick,
+            ..Default::default()
+        })),
+    );
+    f
+}
+
+/// Record the burst source stopping at its third tick and check the
+/// recording against the hand oracle: three fires at step 0 (1, 2 and 3 ms),
+/// none after, and one NODE-STOP record directly after the third, carrying
+/// the fatal cause (code 1).
+fn bs_reference() -> Recording {
+    let rec = record_uniform_with_read_log(&bs_yaml(), || bs_factories(Some(3)), &[], BS_STEPS);
+    assert_eq!(rec.node_ids[BS_SRC_IDX as usize], BS_SRC);
+    let fires: Vec<(u64, u64)> = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == BS_SRC_IDX)
+        .map(|r| (r.step, r.fire_time_ns))
+        .collect();
+    assert_eq!(
+        fires,
+        vec![(0, 1_000_000), (0, 2_000_000), (0, 3_000_000)],
+        "three fires at step 0, the third the stopping one"
+    );
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == 7)
+        .expect("the recording holds a stop record");
+    assert_eq!(
+        rec.trace[at],
+        TraceRingRecord {
+            step: 0,
+            fire_time_ns: 3_000_000,
+            duration_ns: 1,
+            node_idx: BS_SRC_IDX,
+            global_level: 0,
+            record_type: 7,
+            reserved: 0,
+        }
+    );
+    let before = rec.trace[at - 1];
+    assert_eq!(
+        (before.record_type, before.node_idx, before.fire_time_ns),
+        (RECORD_TYPE_FIRE, BS_SRC_IDX, 3_000_000),
+        "the stop record sits directly after the stopping fire"
+    );
+    assert_eq!(
+        rec.trace.iter().filter(|r| r.record_type == 7).count(),
+        1,
+        "one stop record"
+    );
+    rec
+}
+
+/// A from-start one-rank free-run bag of `rec` whose `recorder.json` is
+/// `recorder_json`, with the read log keys a recorder stamps.
+fn write_bs_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    recorder_json: Vec<u8>,
+) -> std::path::PathBuf {
+    let bag = dir.path().join(name);
+    write_bag_impl(
+        rec,
+        &bag,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        Some(serde_json::json!(0)),
+        Some(recorder_json),
+        Some(ri_publishers(rec)),
+        None,
+        Some(rec.stage_rows.clone()),
+    );
+    bag
+}
+
+/// The same build re-executes the recorded stop at the same fire: the replay
+/// holds it to the recorded one, finds them equal and passes (exit 0).
+#[test]
+#[serial]
+fn a_replay_that_stops_where_the_recording_did_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(&dir, "bs_same.mcap", &rec, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(Some(3)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
+}
+
+/// A build that does not stop leaves the recorded stop unmade: the schedule
+/// check judges by the recorded stop, so it owes no fire after it, and the
+/// one finding is the stop itself, at its recorded fire (the third of step 0)
+/// and cause (exit 6 under `--verify`).
+#[test]
+#[serial]
+fn a_replay_that_does_not_re_execute_the_recorded_stop_is_a_fire_schedule_divergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(&dir, "bs_unmade.mcap", &rec, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(None),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the unmade stop is a divergence");
+    assert_eq!(
+        divergence.detail,
+        "fire-schedule divergence: rank 0 step 0: the recording stops node 'src' at its fire 3 \
+         of the step (returned_fatal_error), and this re-execution does not stop it there"
+    );
+    assert!(!outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 6);
+}
+
+/// A build that stops at an EARLIER fire of the same burst: the schedule check
+/// judges by the recorded stop, the burst up to it is the recorded one, and the
+/// finding is the stop at another fire (exit 6). Without the stop held to the
+/// recorded one, nothing else in the replay reports it.
+#[test]
+#[serial]
+fn a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(&dir, "bs_early.mcap", &rec, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(Some(2)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the early stop is a divergence");
+    assert_eq!(
+        divergence.detail,
+        "fire-schedule divergence: rank 0 step 0: the recording stops node 'src' at its fire 3 \
+         of the step (returned_fatal_error), and this re-execution stops it at its fire 2 \
+         (returned_fatal_error)"
+    );
+    assert_eq!(resim_exit(&outcome, true), 6);
+}
+
+/// Below the node-stops trace format the trace holds no stop record (its
+/// recorder wrote none), so the stops the replay makes are not held to it: the
+/// same build re-executes the stop at the burst's third fire, which a bag at
+/// the node-stops format would hold, and the replay passes (exit 0).
+#[test]
+#[serial]
+fn below_the_node_stops_format_a_recorded_stop_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(
+        &dir,
+        "bs_format_below.mcap",
+        &rec,
+        ri_recorder_json_at(replay_engine::ANCHOR_STOPS_MIN_TRACE_FORMAT),
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(Some(3)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
+}
+
+// ===========================================================================
+// A node stop in a ragged tail, on another rank, and of a driver
+// ===========================================================================
+
+/// [`HalfRateSourceNode`] that returns `NodeError::Fatal` on its build's
+/// `stop_tick` (none on a build without one).
+#[cerulion_node(period_ms = 10)]
+#[derive(Default)]
+struct HalfRateStopSourceNode {
+    #[output]
+    out: Vector3,
+    counter: f64,
+    /// The tick this build stops at, if any; a restore leaves it as built.
+    #[cerulion(reconstruct)]
+    stop_tick: Option<u32>,
+    ticks: u32,
+}
+
+#[cerulion_node_impl]
+impl HalfRateStopSourceNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1;
+        if self.stop_tick == Some(self.ticks) {
+            return Err(NodeError::Fatal(
+                "the source stops at this tick".to_string(),
+            ));
+        }
+        self.counter += 1.0;
+        self.out.x = self.counter;
+        Ok(())
+    }
+}
+
+/// [`mp_slow_b_yaml`] whose rank-1 `src_b` can stop.
+fn mp_stop_b_yaml() -> &'static str {
+    "name: mpstop\nprefix: mp3\nnodes:\n\
+     \x20 - id: src_a1\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: src_a2\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: src_b\n    type: half_rate_stop_source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn mp_stop_b_factories(stop_tick: Option<u32>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src_a1", Box::new(SourceNodeEntry::new())),
+        ("src_a2", Box::new(SourceNodeEntry::new())),
+        (
+            "src_b",
+            Box::new(HalfRateStopSourceNodeEntry::with_state(
+                HalfRateStopSourceNode {
+                    stop_tick,
+                    ..Default::default()
+                },
+            )),
+        ),
+    ])
+}
+
+/// A two-rank lockstep bag at the node-stops format of the four-step
+/// recording `rec`, rank 1 (`src_b`) ending after step 2: its step-3
+/// boundary, fire and any stop record are dropped, a worker that exited
+/// between quanta.
+fn mp_stop_b_ragged_bag(rec: &Recording, path: &std::path::Path) {
+    write_multi_rank_bag_impl(
+        rec,
+        mp_rank_of,
+        2,
+        MpLayout::PerStepBatches,
+        path,
+        |per_rank| per_rank[1].retain(|r| r.step <= 2),
+        None,
+        Some(pre_stamp_recorder_json(
+            replay_engine::CoordinationMode::Lockstep,
+        )),
+        None,
+        &[],
+        ProducerAttributionFixture::default(),
+        None,
+        &[],
+    );
+}
+
+/// A stop the replay makes in a short rank's tolerated tail is tolerated
+/// with the re-fire that made it. `src_b` (rank 1, firing at steps 1 and 3)
+/// stops on its second tick, step 3, which rank 1's recording does not reach;
+/// the monolith re-execution re-fires it there and it stops again. The stop
+/// compare skips it as the other gates skip the re-fire, the replay passes
+/// and the one tolerated-tail note names `src_b`.
+#[test]
+#[serial]
+fn a_stop_in_a_ragged_tail_is_tolerated_with_its_re_fire() {
+    let rec = record_uniform(mp_stop_b_yaml(), || mp_stop_b_factories(Some(2)), &[], 4);
+    let stops: Vec<u64> = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+        .map(|r| r.step)
+        .collect();
+    assert_eq!(stops, vec![3], "PREMISE: src_b stops live at step 3");
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_stop_ragged_tail.mcap");
+    mp_stop_b_ragged_bag(&rec, &bag);
+    let outcome = replay(&bag, || mp_stop_b_factories(Some(2)), None, None).expect("replay runs");
+    assert!(
+        outcome.passed,
+        "a stop in the tolerated tail is tolerated: trace={:?} violations={:?}",
+        outcome.trace_divergence, outcome.violations
+    );
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert_eq!(
+        outcome.tolerated_ragged_tails.len(),
+        1,
+        "{:?}",
+        outcome.tolerated_ragged_tails
+    );
+    assert!(
+        outcome.tolerated_ragged_tails[0].contains("rank 1")
+            && outcome.tolerated_ragged_tails[0].contains("'src_b'"),
+        "{}",
+        outcome.tolerated_ragged_tails[0]
+    );
+}
+
+/// The converse, on the same ragged bag: a stop the replay makes at a step
+/// before the tail, which the recording does not hold, is still a
+/// fire-schedule divergence (exit 6), and it names the rank `src_b` was
+/// recorded on (rank 1), not the lockstep pass's rank 0.
+#[test]
+#[serial]
+fn a_stop_before_the_tail_the_recording_lacks_diverges_and_names_its_rank() {
+    let rec = record_uniform(mp_stop_b_yaml(), || mp_stop_b_factories(None), &[], 4);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("mp_stop_before_tail.mcap");
+    mp_stop_b_ragged_bag(&rec, &bag);
+    let outcome = replay(&bag, || mp_stop_b_factories(Some(1)), None, None).expect("replay runs");
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 1 step 1: this re-execution stops node 'src_b' at \
+             its fire 1 of the step (returned_fatal_error), and the recording holds no stop of \
+             it there"
+        )
+    );
+    assert!(!outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 6);
+}
+
+/// A camera driver that can stop: [`DrvCameraNode`] with a `stop_tick` on
+/// which its tick returns `NodeError::Fatal`, connected or not.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct StopDrvCameraNode {
+    #[output]
+    image: Vector3,
+    /// The device is attached: true in the live run only.
+    #[cerulion(reconstruct)]
+    connected: bool,
+    /// The tick this build stops at, if any.
+    #[cerulion(reconstruct)]
+    stop_tick: Option<u32>,
+    ticks: u32,
+    frames: f64,
+}
+
+#[cerulion_node_impl]
+impl StopDrvCameraNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1;
+        if self.stop_tick == Some(self.ticks) {
+            return Err(NodeError::Fatal("the camera lost its device".to_string()));
+        }
+        if !self.connected {
+            return Ok(());
+        }
+        self.frames += 1.0;
+        let k = self.frames;
+        self.image.x = DRV_DEVICE;
+        self.image.y = k;
+        self.image.z = 3.0 * k + 2.0;
+        Ok(())
+    }
+}
+
+/// [`drv_yaml`] with the camera that can stop.
+fn stop_drv_yaml() -> &'static str {
+    "name: sdrv\nprefix: sdrv\nnodes:\n\
+     \x20 - id: cam\n    type: stop_drv_camera_node\n    outputs:\n      - name: image\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: meter\n    type: drv_meter_node\n    inputs:\n      - name: image\n        source: cam/image\n    outputs:\n      - name: brightness\n        schema: geometry_msgs/Vector3\n"
+}
+
+fn stop_drv_factories(
+    connected: bool,
+    stop_tick: Option<u32>,
+) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        (
+            "cam",
+            Box::new(StopDrvCameraNodeEntry::with_state(StopDrvCameraNode {
+                connected,
+                stop_tick,
+                ..Default::default()
+            })),
+        ),
+        (
+            "meter",
+            Box::new(DrvMeterNodeEntry::with_state(DrvMeterNode {
+                gain: DRV_GAIN,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// The driver's live run, fired before every step as its device wakes it,
+/// stopping on `stop_tick`, as a single-rank bag at the node-stops format.
+/// Returns the bag and how many times the camera fired.
+fn stop_drv_bag(
+    dir: &std::path::Path,
+    name: &str,
+    stop_tick: Option<u32>,
+) -> (std::path::PathBuf, usize) {
+    ri_take();
+    let rec = record_reference_impl_fed(
+        stop_drv_yaml(),
+        || stop_drv_factories(true, stop_tick),
+        &[],
+        &vec![DELTA_MS; RI_STEPS],
+        16,
+        true,
+        None,
+        &["cam"],
+    );
+    ri_take();
+    let cam = rec
+        .node_ids
+        .iter()
+        .position(|id| id == "cam")
+        .expect("the camera is in the manifest") as u32;
+    let fires = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == cam)
+        .count();
+    let stops = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_NODE_STOP && r.node_idx == cam)
+        .count();
+    assert_eq!(
+        stops,
+        usize::from(stop_tick.is_some()),
+        "PREMISE: the camera stops live exactly when the build says"
+    );
+    let bag = dir.join(name);
+    ri_bag(&rec, &bag, ri_free_run_recorder_json());
+    (bag, fires)
+}
+
+/// A driver that stopped live (its device was lost at its fifth tick) is
+/// replayed with no device, so the replay does not stop it. A driver's stop
+/// is not compared, so the replay passes (exit 0).
+#[test]
+#[serial]
+fn a_recorded_stop_of_a_driver_is_not_held_to_the_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, fires) = stop_drv_bag(dir.path(), "sdrv_recorded.mcap", Some(5));
+    assert_eq!(fires, 5, "PREMISE: the camera fired until it stopped");
+    let (outcome, _) = ri_replay(
+        &bag,
+        || stop_drv_factories(false, None),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
+}
+
+/// The other side: a driver the recording never stopped, replayed by a build
+/// whose driver stops at its last recorded fire. A driver's stop is not
+/// compared, so the replay passes (exit 0).
+#[test]
+#[serial]
+fn a_re_executed_stop_of_a_driver_is_not_held_to_the_recording() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, fires) = stop_drv_bag(dir.path(), "sdrv_replayed.mcap", None);
+    let last = u32::try_from(fires).expect("a count that fits");
+    let (outcome, _) = ri_replay(
+        &bag,
+        || stop_drv_factories(false, Some(last)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the replay runs");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
+}
+
+/// The burst-stop recording with `edit` applied to its trace, written at
+/// `recorder_json` with its stop records kept whatever the stamp, and the
+/// file index of the first NODE-STOP record in it.
+fn bs_bag_with(
+    dir: &tempfile::TempDir,
+    name: &str,
+    recorder_json: Option<Vec<u8>>,
+    edit: impl FnOnce(&mut Vec<TraceRingRecord>),
+) -> (std::path::PathBuf, usize) {
+    let mut rec = bs_reference();
+    edit(&mut rec.trace);
+    let index = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+        .expect("the edited trace holds a stop record");
+    let bag = dir.path().join(name);
+    KEEP_STOPS_AT_ANY_FORMAT.with(|k| k.set(true));
+    write_bag_impl(
+        &rec,
+        &bag,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        Some(serde_json::json!(0)),
+        recorder_json,
+        Some(ri_publishers(&rec)),
+        None,
+        Some(rec.stage_rows.clone()),
+    );
+    KEEP_STOPS_AT_ANY_FORMAT.with(|k| k.set(false));
+    (bag, index)
+}
+
+/// The refusal a replay of `bag` must raise before its first step.
+fn bs_refusal(bag: &std::path::Path) -> ReplayError {
+    let (refused, _) = ri_replay(
+        bag,
+        || bs_factories(Some(3)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    refused.expect_err("the bag is refused")
+}
+
+/// A stop record that does not directly follow, on its own rank, the FIRE
+/// record of the fire that stopped its node is a trace no recorder writes:
+/// here it follows another FIRE of its node at its step, at another instant.
+/// Refused as corrupt (exit 2), naming the record, the node, the step and the
+/// rank.
+#[test]
+#[serial]
+fn a_stop_record_that_does_not_follow_its_stopping_fire_is_refused_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, index) = bs_bag_with(
+        &dir,
+        "bs_orphan.mcap",
+        Some(ri_free_run_recorder_json()),
+        |t| {
+            let at = t
+                .iter()
+                .position(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+                .expect("a stop record");
+            // The vector's shape: the record before the stopping fire's FIRE
+            // is the source's second FIRE of step 0 (at 2 ms), so with the
+            // stopping fire's FIRE removed the stop follows a FIRE of its node
+            // at its step, at another instant.
+            assert_eq!(
+                (
+                    t[at - 2].record_type,
+                    t[at - 2].node_idx,
+                    t[at - 2].step,
+                    t[at - 2].fire_time_ns
+                ),
+                (RECORD_TYPE_FIRE, BS_SRC_IDX, 0, 2_000_000)
+            );
+            t.remove(at - 1);
+        },
+    );
+    let err = bs_refusal(&bag);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert_eq!(
+            detail,
+            &format!(
+                "trace record {index} is a NODE-STOP record of node 'src' at step 0 on rank 0, \
+                 and the record before it on that rank is not the FIRE record of the fire that \
+                 stopped the node (the same node, step, instant and level)"
+            )
+        ),
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A second stop record of a node that already stopped is a trace no
+/// recorder writes (a node stops once in a run): refused as corrupt (exit 2).
+/// The second stop follows a FIRE of its node, so only the repeat is wrong.
+#[test]
+#[serial]
+fn a_second_stop_record_of_one_node_is_refused_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut second = 0usize;
+    let (bag, _) = bs_bag_with(
+        &dir,
+        "bs_second.mcap",
+        Some(ri_free_run_recorder_json()),
+        |t| {
+            let at = t
+                .iter()
+                .position(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+                .expect("a stop record");
+            let (fire, stop) = (t[at - 1], t[at]);
+            // Step 1's boundary is the first record past step 0; the copies go
+            // directly after it.
+            let after = t
+                .iter()
+                .position(|r| r.record_type == RECORD_TYPE_STEP_BOUNDARY && r.step == 1)
+                .expect("step 1's boundary");
+            // A fire of the source inside step 1's window (5 ms, 10 ms].
+            let (mut fire1, mut stop1) = (fire, stop);
+            fire1.step = 1;
+            fire1.fire_time_ns = 6_000_000;
+            stop1.step = 1;
+            stop1.fire_time_ns = 6_000_000;
+            t.insert(after + 1, fire1);
+            t.insert(after + 2, stop1);
+            second = after + 2;
+        },
+    );
+    let err = bs_refusal(&bag);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert_eq!(
+            detail,
+            &format!(
+                "trace record {second} is a second NODE-STOP record of node 'src' on rank 0; a \
+                 node stops once in a run"
+            )
+        ),
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A stop record in a bag stamped below the node-stops format, or with no
+/// stamp, is a trace no recorder writes: refused as corrupt (exit 2).
+#[test]
+#[serial]
+fn a_stop_record_below_the_node_stops_format_is_refused_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    for (label, recorder) in [
+        (
+            "below",
+            Some(ri_recorder_json_at(
+                replay_engine::ANCHOR_STOPS_MIN_TRACE_FORMAT,
+            )),
+        ),
+        ("unstamped", None),
+    ] {
+        let (bag, index) = bs_bag_with(&dir, &format!("bs_{label}.mcap"), recorder, |_| {});
+        let err = bs_refusal(&bag);
+        match &err {
+            ReplayError::RecordingInconsistent { detail } => assert_eq!(
+                detail,
+                &format!(
+                    "trace record {index} is a NODE-STOP record, and a bag stamped below trace \
+                     format {}, or with no trace format stamp, holds no NODE-STOP record",
+                    replay_engine::NODE_STOPS_MIN_TRACE_FORMAT
+                ),
+                "{label}"
+            ),
+            other => panic!("{label}: expected RecordingInconsistent, got {other:?}"),
+        }
+        assert_eq!(err.exit_code(), 2, "{label}");
+    }
+}
+
+/// A stop record whose cause names no cause, replayed without the record
+/// gate (the engine's own check), is refused with the gate's text: one fault,
+/// one text. At the node-stops format, which this build reads up to, every
+/// cause is defined, so the bag is corrupt (exit 2).
+#[test]
+#[serial]
+fn a_stop_record_with_an_unknown_cause_is_refused_by_the_engine_with_the_gate_text() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, index) = bs_bag_with(
+        &dir,
+        "bs_cause.mcap",
+        Some(ri_free_run_recorder_json()),
+        |t| {
+            let at = t
+                .iter()
+                .position(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+                .expect("a stop record");
+            t[at].duration_ns = 9;
+        },
+    );
+    let err = bs_refusal(&bag);
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "bag internal consistency check failed: trace record {index} is a NODE-STOP record \
+             of rank 0 that carries stop cause 9, which trace format {} does not define \u{2014} the \
+             recording is corrupt or hand-edited; re-record with `cerulion graph run --record`",
+            replay_engine::NODE_STOPS_MIN_TRACE_FORMAT
+        )
+    );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A stop record stamped with a rank the bag has no trace manifest for,
+/// replayed without the record gate, is refused as the FIRE walk refuses
+/// one: a corrupt bag (exit 2) naming the record, the rank and the ranks the
+/// bag holds.
+#[test]
+#[serial]
+fn a_stop_record_of_a_rank_with_no_manifest_is_refused_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, index) = bs_bag_with(
+        &dir,
+        "bs_foreign_rank.mcap",
+        Some(ri_free_run_recorder_json()),
+        |t| {
+            let at = t
+                .iter()
+                .position(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+                .expect("a stop record");
+            t[at].reserved = 5;
+        },
+    );
+    let err = bs_refusal(&bag);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert_eq!(
+            detail,
+            &format!(
+                "trace record {index} is a NODE-STOP record stamped with rank 5 (reserved) but \
+                 the bag carries worker trace manifests only for ranks 0..=0"
+            )
+        ),
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
 }
 
 // ===========================================================================

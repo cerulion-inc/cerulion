@@ -5,7 +5,7 @@ the script that computes the numbers from the rows.
 
 The benchmark: simulated robot manipulation tasks from LIBERO-PRO, each run twice with the same model. Once
 `without` Cerulion, through a published three-tool interface. Once `with` Cerulion, through the Cerulion
-harness's tools. Same simulator, same start state, same budget, same scorer. Fifteen models, 100 start states
+harness's tools. Same simulator, same start state, same budget, same scorer. Sixteen models, 100 start states
 each, one episode a start state an arm.
 
 Said before any number (RULES.md section 2):
@@ -178,8 +178,14 @@ is in cells.csv, and the success predicate was false at reset on every one.
 - At this package's read every model had finished all 100 start states in both arms. A model whose start
   states had not all ended at a read is marked incomplete, with its n and the read time: start states that end
   first are the short episodes, so an incomplete row is not a fair sample.
-- GPT-6.1 Terra was added to the grid after its first rows had been seen. Its column is marked so in SUMMARY.md
-  and on both charts.
+- GPT-6.1 Terra was added to the grid after its first rows had been seen, and Gemini 4 Neon after every other
+  column had finished and been read. Both columns are marked so in SUMMARY.md and on both charts.
+- Gemini 4 Neon's 200 episodes ran on 2026-11-21 from 06:54Z to 09:39Z, after the other 15 columns' rows
+  had been read at 2026-11-19T20:35:04Z. They ran on one machine, up to 8 at once, with other work on that
+  machine; the two arms of each start state started within 4 minutes of each other. Its price row was read on
+  2026-11-21. With it each per-model family holds 16 tests, so every Holm threshold under 0.05 moved: GPT-6.1
+  Terra's SOLVED test (p = 0.00763) is under its threshold with 15 models (0.0083) and over it with 16 (0.0071),
+  so it reads "points up, not established". Every other verdict reads the same with 15 models as with 16.
 - One further model, Gemini Robotics-ER 2 (preview), was tried and left out before any grid row: its endpoint
   failed the arm with Cerulion on 5 of 5 trial attempts. It has no column.
 - The four Claude models share one endpoint. To lower the load on it, no episode of theirs started between

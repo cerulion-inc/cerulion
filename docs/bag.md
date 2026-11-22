@@ -1165,12 +1165,12 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 10.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 10; a
+`recorder.json` stamps 12.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 12; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Six encodings set the number; the last three, read identity, batch
-frames and checkpoint stops, have their own sections below. Every kind-6 record carries a
+in it. Seven encodings set the number; the last four, read identity, batch
+frames, checkpoint stops and node stops, have their own sections below. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
@@ -1181,15 +1181,17 @@ role on a `none` record as that empty consult is what `trace_format` 7 means,
 and producer annotations on every edge (before every read of a multi-writer
 edge, once per writer run on a single-writer one) are what `trace_format` 8
 means, a `batch_frame` record for each frame a multi-frame read consumed
-besides the one it served is what `trace_format` 9 means, and a stopped flag in
+besides the one it served is what `trace_format` 9 means, a stopped flag in
 every complete checkpoint part of a node the scheduler had stopped is what
-`trace_format` 10 means.
+`trace_format` 10 means, and a NODE-STOP record (record kind 7) after every
+fire that stopped its node is what `trace_format` 12 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
 decodes as one occurrence each), since read identity every such bag is
-format 8, since batch frames format 9, and since checkpoint stops format 10. A bag
+format 8, since batch frames format 9, since checkpoint stops format 10, and
+since node stops format 12. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -1439,6 +1441,59 @@ bits, which this build reads past; a change to what they mean for a resim
 comes with a new `trace_format`, which this build refuses with "upgrade to
 replay it".
 
+### Node stops (`trace_format` 12)
+
+A format 12 recording holds every stop the scheduler made: the fire that
+stopped a node (a `NodeError::Fatal` return, a tick panic or a node entry found
+poisoned, or the consecutive-panic breaker) is followed, on its rank's trace
+ring, by a NODE-STOP record, record kind 7 in the 40-byte layout. Its `step`,
+`fire_time_ns`, `node_idx` and `global_level` are those of the stopping fire,
+`duration_ns` is the cause (`1` fatal error, `2` entry poisoned, `3` disabled
+after consecutive panics) and `reserved` carries the rank. The stop's position
+in its step's burst is the number of that node's FIRE records of the step on
+its rank up to the stop record. A node stopped by a fatal error or by the
+breaker fires no more; a poisoned node keeps firing with its tick skipped, so
+its FIRE records go on after its stop record.
+
+A resim of a format 12 bag holds each re-executed stop to the recorded one at
+every step it executes. A stop at another fire of the burst or for another
+cause, a recorded stop the re-execution does not make, and a re-executed stop
+the recording does not hold are each a fire-schedule difference (exit 6 under
+`--verify`), reported when the fire comparison finds no other difference, as
+in `fire-schedule divergence: rank 0 step 4: the recording stops node 'sink' at
+its fire 1 of the step (returned_fatal_error), and this re-execution does not
+stop it there`. The schedule check judges each node by its recorded stop, so
+it owes a node no fire after a recorded fatal or breaker stop whether or not
+the re-execution stops it. The stops of an `external` (driver) node are not
+compared, because a resim never gives a driver its device. A stop the resim
+makes in a short rank's tolerated ragged tail is tolerated with the re-fire
+that made it, under the same window as the fire comparison.
+
+A NODE-STOP record whose cause is none of the three is refused (exit 2). In a
+bag stamped past the formats this build reads, a newer or foreign writer added
+the cause, and the resim refuses it as it refuses an unknown record kind,
+saying to upgrade cerulion. In a bag stamped 12 or below, the cause cannot be
+a newer writer's, since a format at or below this build's defines no other
+cause, so the bag is corrupt (`bag internal consistency check failed`).
+A Flashback capture that holds one is not resimmable, and its
+`anchor.resimmable_reason` reads the capture's own stamp the same way: a newer
+or foreign writer's cause, with the upgrade remedy, past the formats this
+build reads, and a corrupt trace at 12 or below.
+Four more stop records are refused before the first replayed step as a
+corrupt bag (`bag internal consistency check failed`, exit 2): one stamped
+with a rank the bag has no trace manifest for, and three shapes no recorder
+writes: a stop record that does not directly follow, on its own rank, the
+FIRE record of the fire that stopped its node; a second stop record of a node
+that already stopped; and a stop record in a bag stamped below 12 or with no
+trace format stamp.
+
+Below 12 the trace holds no stop record, and a resim judges stops as before:
+by the re-execution, and by the checkpoint a resumed bag begins at. A reader
+below 12 does not define record kind 7: its record walk, which runs before its
+version gate, refuses the first stop record as an unknown record kind (exit 2,
+saying to upgrade cerulion), and its version gate refuses a format 12 bag that
+holds no stop record.
+
 ### The kind-6 annotations ride INSIDE the record kind
 
 The read log's two annotation kinds, the OVERFLOW MARKER (outcome kind **6**)
@@ -1446,8 +1501,9 @@ and the PRODUCER TOKEN (outcome kind **7**), are *outcome* kinds in the low
 half of a READ-OUTCOME record's packed field. They are **not record types of their own**,
 and that encoding has two consequences:
 
-- the record-type gate hard-refuses record kinds ≥ 7 **regardless of the
-  stamp**, so a record type of their own would push every marker-bearing or
+- the record-type gate hard-refuses every record kind it does not define
+  (4, 5 and from 8 on) **regardless of the stamp**, so a record type of their
+  own would push every marker-bearing or
   token-bearing LOCKSTEP bag up a format. A format bump is for a WIRE change,
   which is what the role bits and run folding each are; an annotation a reader
   can pass through is not one;

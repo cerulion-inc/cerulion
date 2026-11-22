@@ -744,6 +744,7 @@ dependencies = [
  "cerulion_link",
  "cerulion_msgio",
  "cerulion_netd",
+ "cerulion_ops_proto",
  "cerulion_pairing",
  "cerulion_wireclient",
  "clap",
