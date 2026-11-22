@@ -175,11 +175,13 @@ in prepare_pass_verification
 # flags and rank map each pass hands it (`reopen_flags`), a node's recorded
 # rank (`recorded_rank_of`) and whether a node is reopened (`reopens_node`). In
 # src/replay_feed.rs: the cause a read with no writer names on a bag that
-# begins mid-run (`absent_writer_cause`). The change's other lines in the two
-# files read the bag (the boundary walk and the per-rank cursors, the feed
-# planner's lookups), carry these answers through a pass, or drive the replay
-# loop (the mirror's call before each step), which the mutation rule does not
-# cover; the engine tests that fail with the mirror off pin that call.
+# begins mid-run (`absent_writer_cause`), and the code and text a feed refusal
+# renders (`FeedRefusalReason::code`, `<FeedRefusal as Display>::fmt`). The
+# change's other lines in the two files read the bag (the boundary walk and
+# the per-rank cursors, the feed planner's lookups), carry these answers
+# through a pass, or drive the replay loop (the mirror's call before each
+# step), which the mutation rule does not cover; the engine tests that fail
+# with the mirror off pin that call.
 #
 # Run:     cargo mutants -p cerulion_cli_engine \
 #            -f crates/cerulion_cli_engine/src/replay_feed.rs \
@@ -213,8 +215,15 @@ in prepare_pass_verification
 #          value (empty, `[true]`, `[false]`) with no rank map and with an
 #          empty one is caught; the 12 unviable build a one-entry map keyed
 #          by `Arc::new("")` or `Arc::new("xyzzy")`, an `Arc<&str>` where the
-#          map's key is `Arc<str>`, so they do not compile. Over the scope
-#          as it stands: 44 mutants, 28 caught, 16 unviable, 0 missed.
+#          map's key is `Arc<str>`, so they do not compile.
+#
+# And the refusal's code and text:
+#
+# Run:     the same over crates/cerulion_cli_engine/src/replay_feed.rs alone,
+#          with `--re 'FeedRefusal>::fmt|FeedRefusalReason::code'` and no
+#          shard (the unmutated baseline passed)
+# Result:  3 mutants, 3 caught, 0 missed. Over the scope as it stands:
+#          47 mutants, 31 caught, 16 unviable, 0 missed.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
