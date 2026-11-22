@@ -2350,10 +2350,10 @@ const EMITTED_TRACE_RECORD_KINDS: &[u32] = &[
     RECORD_TYPE_NODE_STOP,
 ];
 
-/// The highest trace-record kind a format-3 reader can decode. `trace_ring`
-/// reserves kinds 7+; a stream carrying one is not format-3-clean, and a bag
-/// carrying it MUST stamp >= 4 ([`stamp_trace_format`]'s never-under-claim
-/// law).
+/// The highest trace-record kind a format-3 reader can decode. A stream
+/// carrying a higher kind (the NODE-STOP record, kind 7, is one) is not
+/// format-3-clean, and a bag carrying it MUST stamp >= 4
+/// ([`stamp_trace_format`]'s never-under-claim law).
 ///
 /// # The two ANNOTATION kinds are deliberately NOT record kinds
 ///
@@ -2365,10 +2365,11 @@ const EMITTED_TRACE_RECORD_KINDS: &[u32] = &[
 /// marker-bearing or token-bearing LOCKSTEP bag to stamp format 4 and lose
 /// the byte-exact replay of older lockstep bags. Inside kind 6 an old reader passes both records through
 /// `classify_trace_record`, decodes every field it reads to the value the
-/// writer meant, and renders the kind as `unknown(6)`/`unknown(7)` — so the
-/// RECORD-kind inventory above is unchanged and `recorder_stream_needs_v4`
-/// stays `false`, which is exactly what
-/// `the_emitted_kind_inventory_is_format_three_clean` pins.
+/// writer meant, and renders the kind as `unknown(6)`/`unknown(7)`, so the
+/// annotations add no record kind to the inventory above. The NODE-STOP record
+/// is a record kind of its own, which is why `recorder_stream_needs_v4` answers
+/// `true`, as `the_emitted_kind_inventory_carries_the_stop_record_past_format_three`
+/// pins.
 const FORMAT_3_MAX_RECORD_KIND: u32 = RECORD_TYPE_READ_OUTCOME;
 
 /// Does THIS binary's recorder emit anything a format-3 reader cannot decode?
@@ -2454,9 +2455,11 @@ pub fn stamp_trace_format(
         // Every fire that stopped its node is followed, on its rank's ring,
         // by a NODE-STOP record (kind 7) naming the cause, so the trace states
         // where the recording stopped each node. A reader below this format
-        // refuses kind 7 as a reserved record, so the stamp moves and that
-        // reader refuses the bag by its format first. The term claims nothing
-        // without the three terms under it.
+        // does not define kind 7: its record walk, which runs before its
+        // version gate, refuses the first stop record as an unknown record
+        // kind (exit 2, with the upgrade remedy), and its version gate refuses
+        // a bag that holds none. The term claims nothing without the three
+        // terms under it.
         return NODE_STOPS_MIN_TRACE_FORMAT;
     }
     if records_consults && records_identity && states_anchor_stops {
@@ -2661,6 +2664,40 @@ pub fn recorder_records_node_stops_at(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= NODE_STOPS_MIN_TRACE_FORMAT)
 }
 
+/// PURE: the refusal of trace record `index`, a NODE-STOP record of `rank`
+/// whose stop cause `code` names no cause this build defines, in a bag
+/// stamped `stamp` (`1` when unstamped) and read by a build that reads up to
+/// `supported`. Past `supported`, a newer or foreign writer added the cause:
+/// [`ReplayError::TraceStopCauseUnknown`], with the upgrade remedy the unknown
+/// record kind gets. At or below it, that format defines every cause, so the
+/// bag is corrupt: [`ReplayError::RecordingInconsistent`]. The record gate and
+/// the engine both refuse through this one function.
+pub(crate) fn unknown_stop_cause_refusal(
+    index: usize,
+    rank: u32,
+    code: u64,
+    stamp: u32,
+    supported: u32,
+) -> ReplayError {
+    if stamp > supported {
+        ReplayError::TraceStopCauseUnknown {
+            index,
+            reason: format!(
+                "a NODE-STOP record of rank {rank} carries stop cause {code}, which this \
+                 Cerulion version does not define; the bag was written by a newer or foreign \
+                 writer; upgrade cerulion to replay it"
+            ),
+        }
+    } else {
+        ReplayError::RecordingInconsistent {
+            detail: format!(
+                "trace record {index} is a NODE-STOP record of rank {rank} that carries stop \
+                 cause {code}, which trace format {stamp} does not define"
+            ),
+        }
+    }
+}
+
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
 /// to carry read-site roles.
 ///
@@ -2842,9 +2879,11 @@ pub fn replay_stages_batch_frames(
 /// `NodeError::Fatal` return, a tick panic or a poisoned entry, the
 /// consecutive-panic breaker) is followed on its rank's ring by a NODE-STOP
 /// record, kind 7, naming the cause ([`NODE_STOPS_MIN_TRACE_FORMAT`]). A
-/// reader below 12 refuses kind 7 as a reserved record, so it must refuse the
-/// bag by its format first. The formats below it stay readable, and their traces
-/// say nothing about stops.
+/// reader below 12 does not define kind 7: its record walk, which runs before
+/// its version gate, refuses the first stop record as an unknown record kind
+/// (exit 2, with the upgrade remedy), and its version gate refuses a bag that
+/// holds none. The formats below it stay readable, and their traces say
+/// nothing about stops.
 ///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
@@ -5515,7 +5554,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         covered_range.as_ref(),
         &producing_rank,
     )?;
-    validate_stop_records(&trace, &rank_tables, stops_recorded)?;
+    validate_stop_records(
+        &trace,
+        &rank_tables,
+        stops_recorded,
+        recorder.as_ref().map_or(1, |r| r.trace_format),
+    )?;
 
     // 3c. The per-rank ragged-shutdown-tail context, derived from the
     //     boundary summaries the ONE walk above already produced. It feeds BOTH
@@ -18781,11 +18825,12 @@ impl RaggedTailContext {
 }
 
 /// The tolerated-window RULE — which `(rank, step)` pairs lie in a
-/// ragged rank's legitimate re-fire window — kept in ONE place because THREE
+/// ragged rank's legitimate re-fire window, kept in ONE place because FOUR
 /// gates consult it: the structural trace comparator ([`TailTolerance`]),
 /// the per-topic frame diff (step 6, which reads [`RaggedTailContext`]
-/// directly for its per-rank WIDTH), and the read-log verifier
-/// ([`ReadLogTail`]). Two gates disagreeing about one tolerated window IS the
+/// directly for its per-rank WIDTH), the read-log verifier
+/// ([`ReadLogTail`]) and the stop compare, which skips a re-executed stop in
+/// the window. Two gates disagreeing about one tolerated window IS the
 /// ragged-tail flake class, and a second copy of this predicate is exactly how they
 /// would come to disagree.
 #[derive(Clone)]
@@ -26036,17 +26081,22 @@ impl<'a> RankBoundaryCursors<'a> {
     }
 }
 
-/// Refuse, before any runtime is built, every NODE-STOP record shape no
-/// recorder writes: one in a bag that does not claim the node-stops format
-/// (`stops_recorded` false, which covers a bag with no stamp), one whose cause
-/// names no cause this build defines, one that does not directly follow, on
-/// its own rank, the FIRE record of the fire that stopped its node (same node,
-/// step, instant and level), and a second one of a node that already stopped.
-/// The fire demux then reads every stop record as a stop at a fire from 1.
+/// Refuse, before any runtime is built, every NODE-STOP record this replay
+/// cannot read as a stop: one stamped with a rank the bag has no trace
+/// manifest for; one in a bag that does not claim the node-stops format
+/// (`stops_recorded` false, which covers a bag with no stamp); one whose cause
+/// names no cause this build defines ([`unknown_stop_cause_refusal`], whose
+/// remedy depends on `stamp`, the bag's `trace_format`); one that does not
+/// directly follow, on its own rank, the FIRE record of the fire that stopped
+/// its node (same node, step, instant and level); and a second one of a node
+/// that already stopped. All but the unknown cause are shapes no recorder
+/// writes. The fire demux then reads every stop record as a stop at a fire
+/// from 1.
 fn validate_stop_records(
     trace: &RecordedTrace,
     rank_tables: &[Vec<Arc<str>>],
     stops_recorded: bool,
+    stamp: u32,
 ) -> Result<(), ReplayError> {
     let rank_count = rank_tables.len();
     let mut prev: Vec<Option<TraceRingRecord>> = vec![None; rank_count];
@@ -26056,8 +26106,20 @@ fn validate_stop_records(
         let at = index;
         index += 1;
         let rank = rec.rank() as usize;
-        // An out-of-range rank is refused by the walks above; skip it here.
+        // A FIRE or BOUNDARY record's out-of-range rank is refused by the
+        // walks above, and a stop record's here, as the FIRE walk words it.
         if rank >= rank_count {
+            if rec.record_type == RECORD_TYPE_NODE_STOP {
+                return Err(ReplayError::RecordingInconsistent {
+                    detail: format!(
+                        "trace record {at} is a NODE-STOP record stamped with rank {} \
+                         (reserved) but the bag carries worker trace manifests only for ranks \
+                         0..={}",
+                        rec.rank(),
+                        rank_count - 1
+                    ),
+                });
+            }
             return Ok(());
         }
         let before = prev[rank].replace(*rec);
@@ -26074,15 +26136,13 @@ fn validate_stop_records(
             });
         }
         if rec.stop_cause().is_none() {
-            let fault = cerulion_core::trace_ring::TraceRecordFault::UnknownStopCause {
-                rank: rec.rank(),
-                code: rec.duration_ns,
-            };
-            return Err(ReplayError::TraceRecordUnsupported {
-                index: at,
-                record_type: rec.record_type,
-                reason: fault.detail(),
-            });
+            return Err(unknown_stop_cause_refusal(
+                at,
+                rec.rank(),
+                rec.duration_ns,
+                stamp,
+                SUPPORTED_TRACE_FORMAT,
+            ));
         }
         let node = rank_tables[rank].get(rec.node_idx as usize).map_or_else(
             || format!("<node_idx {}>", rec.node_idx),
@@ -26099,8 +26159,8 @@ fn validate_stop_records(
             return Err(ReplayError::RecordingInconsistent {
                 detail: format!(
                     "trace record {at} is a NODE-STOP record of node '{node}' at step {} on rank \
-                     {rank}, and the record before it on that rank is not that node's FIRE at \
-                     that step",
+                     {rank}, and the record before it on that rank is not the FIRE record of the \
+                     fire that stopped the node (the same node, step, instant and level)",
                     rec.step
                 ),
             });
@@ -34159,6 +34219,37 @@ mod recorder_info_version_tests {
         }
         assert!(recorder_states_anchor_stops_at(Some(&recorder_info_at(10))));
         assert!(!recorder_states_anchor_stops_at(None));
+    }
+
+    /// The unknown-cause refusal against a hand table: at or below the
+    /// formats the build reads, a corrupt bag naming the stamp; one format
+    /// past it, the upgrade remedy; exit 2 either way.
+    #[test]
+    fn the_unknown_stop_cause_refusal_branches_on_the_stamp() {
+        let corrupt = |stamp: u32| ReplayError::RecordingInconsistent {
+            detail: format!(
+                "trace record 4 is a NODE-STOP record of rank 1 that carries stop cause 9, \
+                 which trace format {stamp} does not define"
+            ),
+        };
+        let newer = || ReplayError::TraceStopCauseUnknown {
+            index: 4,
+            reason: "a NODE-STOP record of rank 1 carries stop cause 9, which this Cerulion \
+                     version does not define; the bag was written by a newer or foreign \
+                     writer; upgrade cerulion to replay it"
+                .to_string(),
+        };
+        for (stamp, want) in [
+            (1u32, corrupt(1)),
+            (11, corrupt(11)),
+            (12, corrupt(12)),
+            (13, newer()),
+            (u32::MAX, newer()),
+        ] {
+            let got = unknown_stop_cause_refusal(4, 1, 9, stamp, 12);
+            assert_eq!(got.to_string(), want.to_string(), "stamp {stamp}");
+            assert_eq!(got.exit_code(), 2, "stamp {stamp}");
+        }
     }
 
     /// From the node-stops format a bag's trace holds every stop; a bag below

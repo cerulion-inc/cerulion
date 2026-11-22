@@ -55123,11 +55123,10 @@ fn a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges() {
     assert_eq!(resim_exit(&outcome, true), 6);
 }
 
-/// Below the node-stops trace format the trace says nothing about stops, so
-/// a bag restamped at the checkpoint-stops format with the same records is
-/// judged as before: the stop record is read past, the schedule check owes the
-/// source the rest of its burst, and the finding is the `period_ms` rule's,
-/// not the stop's.
+/// Below the node-stops trace format the trace holds no stop record (its
+/// recorder wrote none), so the stops the replay makes are not held to it: the
+/// same build re-executes the stop at the burst's third fire, which a bag at
+/// the node-stops format would hold, and the replay passes (exit 0).
 #[test]
 #[serial]
 fn below_the_node_stops_format_a_recorded_stop_is_not_read() {
@@ -55141,27 +55140,17 @@ fn below_the_node_stops_format_a_recorded_stop_is_not_read() {
     );
     let (outcome, _) = ri_replay(
         &bag,
-        || bs_factories(None),
+        || bs_factories(Some(3)),
         replay_engine::ReplayPurpose::Verify,
     );
     let outcome = outcome.expect("the --verify replay runs");
-    let divergence = outcome
-        .trace_divergence
-        .as_ref()
-        .expect("the owed fires are a divergence");
     assert!(
-        divergence
-            .detail
-            .contains("node 'src' step 0 period_ms schedule"),
-        "{}",
-        divergence.detail
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
     );
-    assert!(
-        !divergence.detail.contains("stops node"),
-        "{}",
-        divergence.detail
-    );
-    assert_eq!(resim_exit(&outcome, true), 6);
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
 }
 
 // ===========================================================================
@@ -55539,6 +55528,19 @@ fn a_stop_record_that_follows_no_fire_of_its_node_is_refused_exit_2() {
                 .iter()
                 .position(|r| r.record_type == RECORD_TYPE_NODE_STOP)
                 .expect("a stop record");
+            // The vector's shape: the record before the stopping fire's FIRE
+            // is the source's second FIRE of step 0 (at 2 ms), so with the
+            // stopping fire's FIRE removed the stop follows a FIRE of its node
+            // at its step, at another instant.
+            assert_eq!(
+                (
+                    t[at - 2].record_type,
+                    t[at - 2].node_idx,
+                    t[at - 2].step,
+                    t[at - 2].fire_time_ns
+                ),
+                (RECORD_TYPE_FIRE, BS_SRC_IDX, 0, 2_000_000)
+            );
             t.remove(at - 1);
         },
     );
@@ -55548,7 +55550,8 @@ fn a_stop_record_that_follows_no_fire_of_its_node_is_refused_exit_2() {
             detail,
             &format!(
                 "trace record {index} is a NODE-STOP record of node 'src' at step 0 on rank 0, \
-                 and the record before it on that rank is not that node's FIRE at that step"
+                 and the record before it on that rank is not the FIRE record of the fire that \
+                 stopped the node (the same node, step, instant and level)"
             )
         ),
         other => panic!("expected RecordingInconsistent, got {other:?}"),
@@ -55640,7 +55643,8 @@ fn a_stop_record_below_the_node_stops_format_is_refused_exit_2() {
 
 /// A stop record whose cause names no cause, replayed without the record
 /// gate (the engine's own check), is refused with the gate's text: one fault,
-/// one text (exit 2).
+/// one text. At the node-stops format, which this build reads up to, every
+/// cause is defined, so the bag is corrupt (exit 2).
 #[test]
 #[serial]
 fn a_stop_record_with_an_unknown_cause_is_refused_by_the_engine_with_the_gate_text() {
@@ -55661,11 +55665,45 @@ fn a_stop_record_with_an_unknown_cause_is_refused_by_the_engine_with_the_gate_te
     assert_eq!(
         err.to_string(),
         format!(
-            "scheduler-trace record {index} has unsupported record_type 7: a scheduler-trace \
-             NODE-STOP record of rank 0 carries stop cause 9, which this Cerulion version does \
-             not define; the trace was written by a newer or foreign writer, so upgrade \
-             cerulion to replay it"
+            "bag internal consistency check failed: trace record {index} is a NODE-STOP record \
+             of rank 0 that carries stop cause 9, which trace format {} does not define \u{2014} the \
+             recording is corrupt or hand-edited; re-record with `cerulion graph run --record`",
+            replay_engine::NODE_STOPS_MIN_TRACE_FORMAT
         )
     );
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A stop record stamped with a rank the bag has no trace manifest for,
+/// replayed without the record gate, is refused as the FIRE walk refuses
+/// one: a corrupt bag (exit 2) naming the record, the rank and the ranks the
+/// bag holds.
+#[test]
+#[serial]
+fn a_stop_record_of_a_rank_with_no_manifest_is_refused_exit_2() {
+    let dir = tempfile::tempdir().unwrap();
+    let (bag, index) = bs_bag_with(
+        &dir,
+        "bs_foreign_rank.mcap",
+        Some(ri_free_run_recorder_json()),
+        |t| {
+            let at = t
+                .iter()
+                .position(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+                .expect("a stop record");
+            t[at].reserved = 5;
+        },
+    );
+    let err = bs_refusal(&bag);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert_eq!(
+            detail,
+            &format!(
+                "trace record {index} is a NODE-STOP record stamped with rank 5 (reserved) but \
+                 the bag carries worker trace manifests only for ranks 0..=0"
+            )
+        ),
+        other => panic!("expected RecordingInconsistent, got {other:?}"),
+    }
     assert_eq!(err.exit_code(), 2);
 }

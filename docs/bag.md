@@ -1468,19 +1468,25 @@ compared, because a resim never gives a driver its device. A stop the resim
 makes in a short rank's tolerated ragged tail is tolerated with the re-fire
 that made it, under the same window as the fire comparison.
 
-A NODE-STOP record whose cause is none of the three was written by a newer or
-foreign writer, and the resim refuses it as it refuses an unknown record kind
-(exit 2, "upgrade cerulion to replay it"). Three shapes no recorder writes are
-refused before the first replayed step as a corrupt bag (`bag internal
-consistency check failed`, exit 2): a stop record that does not directly
-follow, on its own rank, the FIRE record of the fire that stopped its node; a
-second stop record of a node that already stopped; and a stop record in a bag
-stamped below 12 or with no trace format stamp.
+A NODE-STOP record whose cause is none of the three is refused (exit 2). In a
+bag stamped past the formats this build reads, a newer or foreign writer added
+the cause, and the resim refuses it as it refuses an unknown record kind,
+saying to upgrade cerulion. In a bag stamped 12 or below, that format defines
+every cause, so the bag is corrupt (`bag internal consistency check failed`).
+Four more stop records are refused before the first replayed step as a
+corrupt bag (`bag internal consistency check failed`, exit 2): one stamped
+with a rank the bag has no trace manifest for, and three shapes no recorder
+writes: a stop record that does not directly follow, on its own rank, the
+FIRE record of the fire that stopped its node; a second stop record of a node
+that already stopped; and a stop record in a bag stamped below 12 or with no
+trace format stamp.
 
 Below 12 the trace holds no stop record, and a resim judges stops as before:
 by the re-execution, and by the checkpoint a resumed bag begins at. A reader
-below 12 does not define record kind 7, so the stamp moves and that reader
-refuses the bag by its format.
+below 12 does not define record kind 7: its record walk, which runs before its
+version gate, refuses the first stop record as an unknown record kind (exit 2,
+saying to upgrade cerulion), and its version gate refuses a format 12 bag that
+holds no stop record.
 
 ### The kind-6 annotations ride INSIDE the record kind
 
