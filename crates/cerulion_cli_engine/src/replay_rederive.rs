@@ -366,6 +366,21 @@ impl StopPoint {
         }
     }
 
+    /// Is `step` after a stop that released the node's `block` slots? A stop
+    /// at the checkpoint released them before it, and a fatal error or a
+    /// poisoned entry releases them at the stopping fire
+    /// (`release_held_block_slots`), though a poisoned node keeps firing; the
+    /// consecutive-panic breaker releases none.
+    fn slots_released_after(self, step: u64) -> bool {
+        match self {
+            Self::AtAnchor { anchor_step } => step > anchor_step,
+            Self::InPass { step: stop, .. } => step > stop,
+            Self::Recorded {
+                step: stop, cause, ..
+            } => cause != NodeStopCause::DisabledAfterPanics && step > stop,
+        }
+    }
+
     /// At the step whose fire stopped the node in the pass, how many fires of
     /// it that step's re-execution performed; `None` at every other step, and
     /// at every step for a stop at the checkpoint.
@@ -4231,7 +4246,9 @@ impl SlotBound {
             older + at_clock
         };
         let sent = u64::try_from(counted).unwrap_or(u64::MAX);
-        let released = self.consumer_stop.is_some_and(|s| s.is_after(step));
+        let released = self
+            .consumer_stop
+            .is_some_and(|s| s.slots_released_after(step));
         let owed_now = if clock_continues { 0 } else { self.owed };
         let count = self
             .queued
@@ -4453,7 +4470,9 @@ pub(crate) struct StepDeferral {
 ///   frame ([`BodyDrain::ToEmpty`]), leaves the slot empty, and inside a
 ///   shared clock none of that clock's frames is counted. A consumer's stop
 ///   releases its slot for good, so from the step after it the edge holds
-///   nothing. While a slot holds, its count never passes the depth: the check
+///   nothing: a fatal error, or a poisoned entry, whose node keeps firing
+///   with its tick skipped ([`StopPoint::slots_released_after`]); the
+///   consecutive-panic breaker releases none. While a slot holds, its count never passes the depth: the check
 ///   stops the producer there, and each fire sends one frame. So a slot that
 ///   counts past it was released with no record: from that step it holds
 ///   nothing, and a step only it excused since its consumer last read it is
@@ -11308,6 +11327,51 @@ mod tests {
         stops.note("sink", 30, 1);
         let report = verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops);
         assert_eq!(findings_of(&report), vec![finding("relay", 40, 1, 0)]);
+    }
+
+    /// A consumer's recorded stop releases its slot from the next step when it
+    /// releases the slot live: a fatal error or a poisoned entry, though a
+    /// poisoned node keeps firing; the consecutive-panic breaker releases
+    /// none. Depth 2 on a FIFO input: the sink takes the step 0 frame, the
+    /// relay fills the slot, the sink takes a frame at step 3 and stops
+    /// there, fires again at step 4 with no read (a poisoned node's skipped
+    /// tick), and the relay fires one frame at step 4 and pops one at step 5
+    /// that it does not fire. Released after step 3, nothing holds the relay
+    /// at step 5, so it is the finding; armed, the slot counts two there and
+    /// the step is the hold.
+    #[test]
+    fn a_consumer_stop_releases_its_slot_where_it_does_live() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 15_000, &[("sink", 0, 1, 1)]),
+            fifo_step(4, 20_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 0)]),
+            fifo_step(5, 25_000, &[("relay", 1, 0, 0)]),
+        ];
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let judged = |cause| {
+            let mut stops = PassStops::none();
+            stops.note_recorded(
+                3,
+                &StepStop {
+                    node_id: "sink".to_string(),
+                    rank: 0,
+                    fires: NonZeroU32::MIN,
+                    cause,
+                },
+            );
+            verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops)
+        };
+        for cause in [NodeStopCause::EntryPoisoned, NodeStopCause::FatalError] {
+            assert_eq!(
+                findings_of(&judged(cause)),
+                vec![finding("relay", 5, 1, 0)],
+                "{cause:?}"
+            );
+        }
+        let breaker = judged(NodeStopCause::DisabledAfterPanics);
+        assert!(breaker.is_clean(), "{:?}", breaker.findings);
     }
 
     /// Depth 2 on a FIFO input: the sink reads one frame at step 0, the relay

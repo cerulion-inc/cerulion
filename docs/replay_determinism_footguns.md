@@ -324,7 +324,9 @@ empty read: a step-boundary input read empty ends every fire of its step, and
 a `sample(N)` trigger input whose gate dropped the frame ends that fire. For a
 node whose metadata does not say it needs a publisher for every output, which
 that macro sets, every such fire can hide a drain.
-A consumer's stop releases its slot from the next step on. While a slot holds,
+A consumer's stop releases its slot from the next step on: a fatal error, or a
+poisoned node entry, whose node keeps firing with its tick skipped; the
+consecutive-panic breaker releases none. While a slot holds,
 its count never passes the input's depth: the check stops the producer there,
 and each fire sends one frame. So a slot the recording counts past its depth
 was released with no record: it allows for no hold from that step on, and a
