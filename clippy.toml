@@ -38,4 +38,14 @@ disallowed-methods = [
     # `graph run-worker` body, a test's self-re-exec child - and each carries a
     # targeted `#[allow(clippy::disallowed_methods)]` naming itself.
     { path = "std::process::exit", reason = "P12: map errors to exit codes at the CLI boundary; only a process entrypoint may exit" },
+    # `std::env::vars` panics on the first variable whose name or value is not
+    # valid UTF-8, so one such variable in a user's shell aborts the caller.
+    # `std::env::vars_os` yields the raw bytes, and the caller decides what a
+    # variable that is not UTF-8 means.
+    { path = "std::env::vars", reason = "panics on a name or value that is not valid UTF-8: use std::env::vars_os" },
+    # `std::env::args` panics on the first argument that is not valid UTF-8, so
+    # one such argument (a file name, say) aborts a binary before its parser
+    # can answer. `std::env::args_os` hands every argument over as given; the
+    # binary then takes it as a path or refuses it by its position.
+    { path = "std::env::args", reason = "panics on an argument that is not valid UTF-8: read `std::env::args_os`, then take each argument as a path or refuse it by its position" },
 ]

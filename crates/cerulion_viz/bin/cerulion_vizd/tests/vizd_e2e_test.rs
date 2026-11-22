@@ -1120,6 +1120,71 @@ const STALL_READY_BOUND: Duration = Duration::from_secs(60);
 /// [`Publisher::spawn_paced`]).
 const STALL_ARM_PUBLISH_PERIOD: Duration = Duration::from_millis(100);
 
+/// How far [`RunningDaemon::skew_monitor_clock_for_test`] moves the monitor clock
+/// in the arms that must cross a row's settle window: 5 s, written by hand.
+///
+/// A sample taken after the skew is dated at least this much later than every
+/// sample before it. A RAISED settle window keeps that sample inside the window, so the arm that
+/// counts it fails; a skew read from `MONITOR_SETTLE_NS` would grow with the window
+/// and pass. The pin below holds the literal at the shipped window, so an arm that
+/// asserts "past the settle window, still nothing admitted" is never inside it.
+const MONITOR_SETTLE_SKEW: Duration = Duration::from_secs(5);
+const _: () = assert!(
+    MONITOR_SETTLE_SKEW.as_nanos() == cerulion_viz::monitor::MONITOR_SETTLE_NS as u128,
+    "MONITOR_SETTLE_SKEW is the shipped settle window, written by hand"
+);
+
+/// How far [`RunningDaemon::age_tap_observation_for_test`] ages a quiet tap in the
+/// arms that need its dated idle verdict: a quarter second short of the 5 s
+/// streaming window.
+///
+/// The verdict then flips only once the daemon's own clock covers what remains of
+/// that quarter second, so a verdict that does not advance with that clock stays
+/// streaming and fails the arm. A RAISED window would only make those arms wait
+/// longer and pass, so the window itself is pinned below at its shipped 5 s: a
+/// changed window fails to compile here.
+const TAP_AGE_SHORT_OF_THE_STREAMING_WINDOW: Duration = Duration::from_millis(4_750);
+const _: () = assert!(
+    cerulion_core::transport::liveness::LIVENESS_STREAMING_RECENCY_MS == 5_000,
+    "LIVENESS_STREAMING_RECENCY_MS is pinned at 5 s"
+);
+const _: () = assert!(
+    TAP_AGE_SHORT_OF_THE_STREAMING_WINDOW.as_millis()
+        < cerulion_core::transport::liveness::LIVENESS_STREAMING_RECENCY_MS as u128,
+    "the tap age stays short of the streaming window"
+);
+
+/// Block until one whole frame-drain pass has run since this call and drained
+/// nothing, so a tap whose producer has stopped has handed over its last frame.
+///
+/// Every pass drains every tap, so a pass that started after the producer stopped
+/// and left `poll_loop_frames_drained` where it was found the queue empty.
+fn wait_for_an_empty_drain_pass(daemon: &RunningDaemon) {
+    let empty = wait_until(Duration::from_secs(20), || {
+        let drained = daemon.poll_loop_frames_drained();
+        let pass = daemon.poll_loop_iterations();
+        // Pass `pass + 1` starts after both reads; once pass `pass + 2` has
+        // started, `pass + 1` has finished its drain.
+        wait_until(Duration::from_secs(5), || {
+            daemon.poll_loop_iterations() >= pass + 2
+        }) && daemon.poll_loop_frames_drained() == drained
+    });
+    assert!(
+        empty,
+        "precondition: a whole drain pass ran and drained nothing"
+    );
+}
+
+/// Age `topic`'s tap to [`TAP_AGE_SHORT_OF_THE_STREAMING_WINDOW`] once its queue
+/// is empty.
+fn age_quiet_tap_short_of_the_streaming_window(daemon: &RunningDaemon, topic: &str) {
+    wait_for_an_empty_drain_pass(daemon);
+    assert!(
+        daemon.age_tap_observation_for_test(topic, TAP_AGE_SHORT_OF_THE_STREAMING_WINDOW),
+        "precondition: `{topic}` has an observing tap to age"
+    );
+}
+
 /// Does the SUBJECT report this row in a state a `stalled` verdict can
 /// be reached from — i.e. may the arm apply its stimulus NOW?
 ///
@@ -1793,8 +1858,10 @@ fn a_killed_publisher_loses_its_rate_and_reports_the_liveness_verdict_e2e() {
     drop(publisher);
 
     // ── The three post-kill claims ──────────────────────────────────────────
-    // Bounded by the streaming-recency window the daemon shares with the liveness observer
-    // (5 s) plus slack; the rate must be GONE by then, not merely small.
+    // The streaming-recency window the daemon shares with the liveness observer is
+    // 5 s. The quiet tap is aged to a quarter second short of it, and the rest runs
+    // on the daemon's own clock; the rate must be GONE then, not merely small.
+    age_quiet_tap_short_of_the_streaming_window(&daemon, topic);
     assert!(
         wait_until(Duration::from_secs(20), || {
             let st = client.request(r#"{"id":4,"method":"status"}"#);
@@ -2922,6 +2989,249 @@ fn netd_demand_plane_reconnects_after_the_daemon_dies() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ── activity over the production netd plane. The daemon's follower reads a
+// hosted run's fires through a REAL in-process netd (its `query_fires` verb
+// and client) on a connection of its own, and lets it go once the controller
+// stops asking. Only the robot is a double: a netd query plane serving one run
+// whose node 0 fires once between polls.
+
+/// A netd query plane that hosts one run whose node 0 fires once between
+/// polls, and counts the fires GETs it serves. Every other query fails as a
+/// network-less netd's would.
+struct FiringRunQueryPlane {
+    gets: Arc<AtomicU32>,
+}
+
+impl cerulion_netd::query::QueryPlane for FiringRunQueryPlane {
+    fn query_catalog(
+        &self,
+        _robot: Option<&str>,
+    ) -> Result<CatalogGather, cerulion_netd::query::QueryError> {
+        Err(cerulion_netd::query::QueryError::NoNetwork)
+    }
+    fn query_schema(
+        &self,
+        _robot: Option<&str>,
+        _requested: &str,
+    ) -> Result<cerulion_netd::query::SchemaGather, cerulion_netd::query::QueryError> {
+        Err(cerulion_netd::query::QueryError::NoNetwork)
+    }
+    fn query_runs(
+        &self,
+        _robot: Option<&str>,
+    ) -> Result<cerulion_netd::RunsGather, cerulion_netd::query::QueryError> {
+        Err(cerulion_netd::query::QueryError::NoNetwork)
+    }
+    fn query_fires(
+        &self,
+        robot: &str,
+        run_id: &str,
+        after: Option<u64>,
+    ) -> Result<cerulion_core::transport::cerulion_q::FiresAnswer, cerulion_netd::query::QueryError>
+    {
+        use cerulion_core::fire_tap::{FireCause, FireFlags, FireRecord};
+        use cerulion_core::transport::cerulion_q::{
+            parse_run_id, FiresAnswer, FiresOutcome, FiresReply,
+        };
+        self.gets.fetch_add(1, Ordering::SeqCst);
+        let (next, fires) = match after {
+            None => (5119, Vec::new()),
+            Some(cursor) => (
+                cursor + 1,
+                vec![FireRecord {
+                    seq: cursor + 1,
+                    at_ns: 88_400_000_000,
+                    dur_ns: 38_211,
+                    node: 0,
+                    cause: FireCause::Period,
+                    flags: FireFlags(0),
+                    wrote: 1,
+                }],
+            ),
+        };
+        let run = parse_run_id(run_id).expect("netd forwards only a canonical run id");
+        Ok(FiresAnswer::Reply {
+            reply: FiresReply::new(
+                robot,
+                run,
+                FiresOutcome::Served {
+                    now_ns: 88_500_000_000,
+                    armed_since_ns: 87_900_000_000,
+                    next,
+                    lost: 0,
+                    in_tick: vec![],
+                    fires,
+                },
+            ),
+        })
+    }
+}
+
+const ACTIVITY_RUN: &str = "0x5d1c00000000000000000000000f9e02";
+
+/// An in-process netd serving [`FiringRunQueryPlane`]: the netd, its socket,
+/// its temp dir and the count of fires GETs it served.
+fn firing_run_netd(tag: &str) -> (RunningNetd, PathBuf, PathBuf, Arc<AtomicU32>) {
+    let gets = Arc::new(AtomicU32::new(0));
+    let netd_dir = std::env::temp_dir().join(format!("netd_{tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&netd_dir).expect("mk netd tempdir");
+    let netd_sock = netd_dir.join("netd.sock");
+    let netd = netd_daemon::start_with_planes(
+        netd_sock.clone(),
+        Arc::new(OkMirrorPlane),
+        Arc::new(cerulion_netd::egress::NoopEgressPlane),
+        Arc::new(FiringRunQueryPlane {
+            gets: Arc::clone(&gets),
+        }),
+        NetdConfig {
+            idle_grace: Duration::from_secs(3600),
+            idle_watch_poll: Duration::from_millis(50),
+            ..NetdConfig::default()
+        },
+    )
+    .expect("in-process netd starts");
+    (netd, netd_sock, netd_dir, gets)
+}
+
+#[test]
+fn activity_follows_a_hosted_run_through_netd_on_a_connection_of_its_own() {
+    const RUN: &str = ACTIVITY_RUN;
+    let (netd, netd_sock, netd_dir, gets) = firing_run_netd("activity");
+    let (worker, _flush, _storage) = memory_worker("activity");
+    let (socket, dir) = temp_socket("activity");
+    let mut daemon = start_with_demand_plane(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        isolated_transport_with_network("vizd_activity"),
+        worker,
+        builtin_walker(),
+        None,
+        Arc::new(NetdDemandPlane::with_socket(netd_sock)),
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    let runs = client.request(r#"{"id":1,"method":"runs","robot":"temi"}"#);
+    assert!(
+        wait_until(Duration::from_secs(5), || netd.active_connections() == 1),
+        "the daemon's own plane holds one netd connection after `runs`: {runs}"
+    );
+
+    let mut ask = |id: u64, after: Option<u64>| -> Value {
+        let after = after.map_or(String::new(), |after| format!(r#","after":{after}"#));
+        let reply = client.request(&format!(
+            r#"{{"id":{id},"method":"activity","robot":"temi","run_id":"{RUN}"{after}}}"#
+        ));
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["id"], id, "{reply}");
+        reply["activity"].clone()
+    };
+    let first = ask(2, None);
+    assert_eq!(first["state"]["kind"], "starting", "{first}");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let live = loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let answer = ask(3, Some(5119));
+        if answer["state"]["kind"] == "live"
+            && answer["fires"].as_array().is_some_and(|f| !f.is_empty())
+        {
+            break answer;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the follower never read a fire: {answer}"
+        );
+    };
+    let newest = &live["fires"][0];
+    assert_eq!(
+        live["next"], newest["seq"],
+        "next is the newest fire: {live}"
+    );
+    assert_eq!(
+        (live["lost"].as_u64(), live["skipped"].as_u64()),
+        (Some(0), Some(0)),
+        "{live}"
+    );
+    assert_eq!(
+        (
+            newest["node"].as_u64(),
+            newest["cause"].as_u64(),
+            newest["dur_ns"].as_u64(),
+            newest["wrote"].as_u64(),
+        ),
+        (Some(0), Some(1), Some(38_211), Some(1)),
+        "the robot's fire, through netd: {live}"
+    );
+    assert_eq!(
+        netd.active_connections(),
+        2,
+        "the follower polls on a netd connection of its own"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(8), || netd.active_connections() == 1),
+        "3 s after the last ask the follower ends and closes its connection"
+    );
+    let stopped = gets.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        gets.load(Ordering::SeqCst),
+        stopped,
+        "no GET after the follow ended"
+    );
+
+    daemon.shutdown();
+    drop(netd);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&netd_dir);
+}
+
+/// `CERULION_VIZD_NETWORK=off` keeps vizd from reaching a robot, and netd's
+/// network is its own, so a LOCAL-ONLY vizd refuses `activity` itself.
+#[test]
+fn a_local_only_daemon_refuses_activity_and_asks_netd_for_no_fires() {
+    let (netd, netd_sock, netd_dir, gets) = firing_run_netd("activity_local");
+    let (worker, _flush, _storage) = memory_worker("activity_local");
+    let (socket, dir) = temp_socket("activity_local");
+    let mut daemon = start_with_demand_plane(
+        socket.clone(),
+        DEFAULT_POLL_INTERVAL,
+        isolated_transport("vizd_activity_local"),
+        worker,
+        builtin_walker(),
+        None,
+        Arc::new(NetdDemandPlane::with_socket(netd_sock)),
+    )
+    .expect("daemon starts");
+    let mut client = Client::connect(&socket);
+
+    for id in [1, 2] {
+        let reply = client.request(&format!(
+            r#"{{"id":{id},"method":"activity","robot":"temi","run_id":"{ACTIVITY_RUN}"}}"#
+        ));
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert_eq!(reply["id"], id, "{reply}");
+        let error = reply["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("CERULION_VIZD_NETWORK=off") && error.contains("LOCAL-ONLY"),
+            "the refusal names the kill switch: {reply}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(gets.load(Ordering::SeqCst), 0, "no fires GET reached netd");
+    assert_eq!(
+        netd.active_connections(),
+        0,
+        "no follower opened a netd connection"
+    );
+
+    daemon.shutdown();
+    drop(netd);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&netd_dir);
+}
+
 // ── Test 5d: remote attach is idempotent + survives
 // detach. A daemon DEMANDS a remote topic's netd mirror at most ONCE per topic, so
 // a REPEAT remote attach reports already_attached (idempotent per-connection), a
@@ -3276,7 +3586,9 @@ fn a_leftover_mirror_is_dropped_through_discover_only_when_discovery_is_settled_
     assert_eq!(att["ok"].as_bool(), Some(true), "attach the mirror: {att}");
 
     // Two frames: the first is the tap's banked BASELINE (never dated — it could be a
-    // retained-history flush), the second dates the topic. Then go quiet.
+    // retained-history flush), the second dates the topic. Then go quiet. Each
+    // publish waits for the drain loop to hand that frame over, so the two land in
+    // two drains.
     for seq in 0..2u32 {
         mirror
             .publish_raw(&build_vector3_frame(
@@ -3285,9 +3597,17 @@ fn a_leftover_mirror_is_dropped_through_discover_only_when_discovery_is_settled_
                 [1.0, 2.0, 3.0],
             ))
             .expect("publish");
-        std::thread::sleep(Duration::from_millis(120));
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                daemon.poll_loop_frames_drained() > u64::from(seq)
+            }),
+            "precondition: the drain loop hands over frame {seq}"
+        );
     }
-    // Wait until the tap's own verdict is a DATED idle — the shape the gate acts on.
+    // The quiet tap is aged to a quarter second short of the streaming window, and
+    // the rest runs on the daemon's clock. Then wait until the tap's own verdict is
+    // a DATED idle, the shape the gate acts on.
+    age_quiet_tap_short_of_the_streaming_window(&daemon, jpeg);
     assert!(
         wait_until(Duration::from_secs(20), || {
             let st = client.request(r#"{"id":2,"method":"status"}"#);
@@ -5258,6 +5578,14 @@ fn discover_folds_the_remote_robot_catalog_into_a_robots_section() {
 /// than tuned.
 const ATTRIBUTION_CONVERGENCE_BOUND: Duration =
     Duration::from_secs(5 * cerulion_vizd::PROVENANCE_CACHE_TTL.as_secs());
+
+// The provenance arms age a snapshot past its TTL with
+// `age_provenance_snapshot_for_test` and never wait the TTL out, so this pins the
+// shipped value: a changed TTL fails to compile here.
+const _: () = assert!(
+    cerulion_vizd::PROVENANCE_CACHE_TTL.as_nanos() == 3_000_000_000,
+    "PROVENANCE_CACHE_TTL is pinned at 3 s"
+);
 
 /// Re-`discover` (retrying) until `predicate(&disc)` holds or the bound elapses;
 /// returns the LAST discover response (converged or not) so the caller asserts on it.
@@ -12294,6 +12622,11 @@ fn attaching_a_topic_makes_the_drain_loop_sample_it_e2e() {
 /// which is a real `rate_deviation` about the RUNNER. Scoping the negative to the
 /// condition under test keeps the discriminator sharp without asserting something
 /// load can falsify.
+///
+/// This arm runs on the REAL clock, with no clock seam: it is the end-to-end catch
+/// for a verdict that stops tracking observation age (a live sibling read idle on
+/// time watched rather than time since its last frame), and that needs a live tap
+/// watched past the streaming window on the daemon's own clock.
 #[test]
 fn a_stopped_publisher_raises_stalled_while_a_live_sibling_does_not_e2e() {
     let _statics = blueprint_statics_guard();
@@ -12771,10 +13104,14 @@ fn discover_until_monitors(
 /// tap is open — the verdict comes entirely from the catalog rows `discover`
 /// already gathers.
 ///
-/// Two FLOORS and no ceiling: `monitor_catalog_samples_taken` is the discovery plane's
-/// no-inert-shipping observable (a zero is the feature shipped dead behind a green
-/// unit suite), and the wall is polled to a deadline several times the substrate
-/// constants it must cross. Contention can only make this slower.
+/// The settle window is crossed by skewing the monitor clock by the hand-written
+/// [`MONITOR_SETTLE_SKEW`], and only `discover` feeds this plane, so the sample
+/// count is exact on both sides of the window: the row's first sample is withheld
+/// and the first one past the window is admitted. A removed settle window fails the
+/// first count; a raised `MONITOR_SETTLE_NS` fails the compile-time pin, and a
+/// raised window inside the engine fails the second count. `monitor_catalog_samples_taken` is the
+/// discovery plane's no-inert-shipping observable (a zero is the feature shipped
+/// dead behind a green unit suite).
 ///
 /// The `attached` control is in the same body: `list` must report NOTHING, so the
 /// row provably did not come from the attached plane.
@@ -12807,19 +13144,35 @@ fn an_unattached_catalog_topic_is_monitored_from_the_discover_gather_e2e() {
 
     // The row must ADMIT EVIDENCE, not merely exist: a row inside its settle
     // window exists with `samples: 0`, which correctly says "we are polling this and
-    // have learned nothing yet" and would pass a much weaker feed.
-    let learned = discover_until_monitors(&mut client, Duration::from_secs(60), |mon| {
-        row_for(&mon["monitors"], topic, Some("go2"))
-            .is_some_and(|row| row["samples"].as_u64().unwrap_or(0) > 0)
-    });
-    assert!(
-        learned,
-        "a topic NOBODY attached must become a watched row that LEARNS from the \
-         robot's own observation — that is the whole of the discovery plane"
-    );
-
+    // have learned nothing yet" and would pass a much weaker feed. Only `discover`
+    // feeds this plane, so the first one opens the row with its first sample, which
+    // is inside the row's own settle window.
+    client.request(r#"{"id":1,"method":"discover"}"#);
     let mon = client.request(r#"{"id":2,"method":"monitors"}"#);
+    let opened = row_for(&mon["monitors"], topic, Some("go2"))
+        .unwrap_or_else(|| panic!("the first discover opens the row: {:#}", mon["monitors"]));
+    assert_eq!(
+        opened["samples"].as_u64(),
+        Some(0),
+        "a row's first sample is inside its settle window: {opened}"
+    );
+    // The monitor clock is skewed across the settle window instead of waiting it
+    // out, so the next discover's sample is dated MONITOR_SETTLE_SKEW after the
+    // first and is the first one admitted.
+    assert!(
+        daemon.skew_monitor_clock_for_test(MONITOR_SETTLE_SKEW),
+        "precondition: the monitor clock takes the skew"
+    );
+    client.request(r#"{"id":3,"method":"discover"}"#);
+    let mon = client.request(r#"{"id":4,"method":"monitors"}"#);
     let row = row_for(&mon["monitors"], topic, Some("go2")).expect("the catalog row");
+    assert_eq!(
+        row["samples"].as_u64(),
+        Some(1),
+        "a topic NOBODY attached must become a watched row that LEARNS from the \
+         robot's own observation once past its settle window; that is the whole of \
+         the discovery plane: {row}"
+    );
     assert_eq!(
         row["robot"].as_str(),
         Some("go2"),
@@ -12910,14 +13263,28 @@ fn an_unconverged_catalog_gather_teaches_the_monitor_nothing_e2e() {
     .expect("daemon starts");
     let mut client = Client::connect(&socket);
 
-    // Drive the plane well past the settle window an evidential sample would have
-    // to clear. The row APPEARS (it is being polled) but must learn nothing.
+    // Drive the plane past the settle window an evidential sample would have to
+    // clear. The row APPEARS (it is being polled) but must learn nothing.
     let appeared = discover_until_monitors(&mut client, Duration::from_secs(30), |mon| {
         row_for(&mon["monitors"], topic, Some("go2")).is_some()
     });
     assert!(appeared, "the row is being polled even while unconverged");
-    // Past the settle window by a wide margin, driven by the same loop.
-    let _ = discover_until_monitors(&mut client, Duration::from_secs(12), |_| false);
+    // Past the settle window: the monitor clock is skewed by the hand-written
+    // MONITOR_SETTLE_SKEW, which its pin holds at the shipped window, and two more
+    // catalog passes are fed. Both are dated past the window, so only the
+    // unconverged marker can withhold them.
+    assert!(
+        daemon.skew_monitor_clock_for_test(MONITOR_SETTLE_SKEW),
+        "precondition: the monitor clock takes the skew"
+    );
+    let handed = daemon.monitor_catalog_samples_taken();
+    let fed = discover_until_monitors(&mut client, Duration::from_secs(30), |_| {
+        daemon.monitor_catalog_samples_taken() >= handed + 2
+    });
+    assert!(
+        fed,
+        "precondition: two catalog passes past the settle window reached the engine"
+    );
 
     let mon = client.request(r#"{"id":2,"method":"monitors"}"#);
     let row = row_for(&mon["monitors"], topic, Some("go2")).expect("the row");
@@ -13131,7 +13498,12 @@ fn an_attached_row_is_not_retired_by_the_discovery_plane_e2e() {
     );
 
     // The attached plane now owns the row. Let it learn something, so a retirement
-    // would be a visible loss rather than a no-op.
+    // would be a visible loss rather than a no-op. The monitor clock is skewed
+    // across the row's settle window instead of waiting it out.
+    assert!(
+        daemon.skew_monitor_clock_for_test(MONITOR_SETTLE_SKEW),
+        "precondition: the monitor clock takes the skew"
+    );
     let learned = wait_until(Duration::from_secs(30), || {
         let mon = client.request(r#"{"id":2,"method":"monitors"}"#);
         row_for(&mon["monitors"], mirror, Some("go2"))
@@ -13143,9 +13515,32 @@ fn an_attached_row_is_not_retired_by_the_discovery_plane_e2e() {
     // all, and the topic is absent from the discovery plane's sample set for BOTH
     // reasons at once (attached, and un-announced).
     plane.set_catalogs(vec![liveness_catalog("go2", &[])]);
-    for _ in 0..12 {
+    // The retirement passes run under a REBUILT fresh provenance snapshot: aged
+    // past its TTL here, the first discover below gathers it again, and every
+    // sampling pass after that re-confirms the tap's robot from the fresh map.
+    assert!(
+        daemon.age_provenance_snapshot_for_test(cerulion_vizd::PROVENANCE_CACHE_TTL),
+        "precondition: a gather stamped the snapshot"
+    );
+    let gathers = daemon.provenance_gathers_started();
+    let _ = client.request(r#"{"id":3,"method":"discover"}"#);
+    assert_eq!(
+        daemon.provenance_gathers_started() - gathers,
+        1,
+        "precondition: the first discover past the TTL gathers the snapshot again"
+    );
+    // Keep the discovery plane fed while the sampler hands over three more samples
+    // of the one tap. The counter moves after a pass releases the state lock, so at
+    // least two of those passes started after the fresh map was stored.
+    let from = daemon.monitor_samples_taken();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while daemon.monitor_samples_taken() < from + 3 {
+        assert!(
+            Instant::now() < deadline,
+            "the sampler must keep running while the discovery plane is fed"
+        );
         let _ = client.request(r#"{"id":3,"method":"discover"}"#);
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     let mon = client.request(r#"{"id":4,"method":"monitors"}"#);
@@ -13499,16 +13894,23 @@ fn a_snapshot_past_its_ttl_is_not_adopted_and_a_real_gather_withdraws_the_hint_e
     // Attach the topic that will KEEP its mirror, and warm the cache while both are
     // genuine mirrors — this is the snapshot that goes stale.
     client.request(&format!(r#"{{"id":1,"method":"attach","topic":"{held}"}}"#));
+    let sampled_from = daemon.monitor_samples_taken();
     // Monitors: the served catalog names BOTH topics under `ubuntu`, so
     // the DISCOVERY plane opens a row for each — and a topic-only lookup on this
     // verb can no longer tell a tap's row from a catalog's. What says the TAP was
     // attributed is that its row is no longer the LOCAL one: rows are keyed
     // `(topic, robot)`, so adopting `ubuntu` MOVES the tap's row off the
     // robot-less key, and the discovery plane never mints a robot-less row.
+    // Read only after the sampler has handed over two samples of the one tap since
+    // the attach, so at least one whole pass started after it: before its first
+    // pass the tap has no row at all, and the catalog's row alone would satisfy the
+    // check.
     let attributed = wait_until(ATTRIBUTION_CONVERGENCE_BOUND, || {
         client.request(r#"{"id":2,"method":"discover"}"#);
+        let sampled = daemon.monitor_samples_taken() >= sampled_from + 2;
         let r = client.request(r#"{"id":3,"method":"monitors"}"#);
-        row_for(&r["monitors"], held, Some("ubuntu")).is_some()
+        sampled
+            && row_for(&r["monitors"], held, Some("ubuntu")).is_some()
             && row_for(&r["monitors"], held, None).is_none()
     });
     assert!(
@@ -13516,14 +13918,18 @@ fn a_snapshot_past_its_ttl_is_not_adopted_and_a_real_gather_withdraws_the_hint_e
         "precondition: the held row is attributed to ubuntu"
     );
 
-    // The retirement + the name reuse, then let the snapshot AGE OUT. Only
-    // `discover` and a local `attach` gather, and `monitors` is neither, so polling
-    // it cannot refresh the cache: the staleness here is deterministic.
+    // The retirement + the name reuse, then AGE the snapshot past its TTL. Only
+    // `discover` and a local `attach` gather, and `monitors` and `compose_layout`
+    // are neither, so nothing below can refresh the cache before HALF 2: the
+    // staleness here is deterministic.
     mgr.unregister_mirror_provenance(reused)
         .expect("unregister the retired mirror's provenance");
     drop(retiring);
     let _desk_pub = Publisher::spawn(Arc::clone(&mgr), reused);
-    std::thread::sleep(cerulion_vizd::PROVENANCE_CACHE_TTL + Duration::from_millis(500));
+    assert!(
+        daemon.age_provenance_snapshot_for_test(cerulion_vizd::PROVENANCE_CACHE_TTL),
+        "precondition: a gather stamped the snapshot"
+    );
 
     // HALF 1 — compose the reused name. `compose_layout` does not gather, so the only
     // answer available is the expired snapshot, which still says `ubuntu`. It must
@@ -13541,8 +13947,17 @@ fn a_snapshot_past_its_ttl_is_not_adopted_and_a_real_gather_withdraws_the_hint_e
         row_for(&r["monitors"], reused, None).is_some()
     });
     assert!(appeared, "the compose-attached tap becomes a watched row");
-    let deadline = Instant::now() + Duration::from_millis(1_500);
-    while Instant::now() < deadline {
+    // Every sampling pass decides adoption afresh from the cached snapshot, so the
+    // row is watched until the sampler has handed over four more samples of the two
+    // taps. The counter moves after a pass releases the state lock, so at least one
+    // of those passes started after `from` was read.
+    let from = daemon.monitor_samples_taken();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while daemon.monitor_samples_taken() < from + 4 {
+        assert!(
+            Instant::now() < deadline,
+            "the sampler must keep running while the row is watched"
+        );
         let r = client.request(r#"{"id":6,"method":"monitors"}"#);
         assert!(
             row_for(&r["monitors"], reused, None).is_some(),
@@ -13555,6 +13970,12 @@ fn a_snapshot_past_its_ttl_is_not_adopted_and_a_real_gather_withdraws_the_hint_e
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let r = client.request(r#"{"id":6,"method":"monitors"}"#);
+    assert!(
+        row_for(&r["monitors"], reused, None).is_some(),
+        "the row is still robot-less after those passes: {:#}",
+        r["monitors"]
+    );
 
     // HALF 2 — the still-genuine sibling was attributed BEFORE the staleness, and a
     // real gather now reports its mirror gone, so its hint is WITHDRAWN. Without

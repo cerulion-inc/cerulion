@@ -93,6 +93,8 @@ use cerulion_bag::{BagAttachment, BagCompleteness, BagError, BagReader};
 use cerulion_core::graph::unknown_field_key;
 use cerulion_core::trace_ring::RECORD_TYPE_DEPARTURE;
 
+use cerulion_core::flashback::resim::{stated_coordination, RecordedCoordination};
+
 use cerulion_bagd::{RecordHealth, RECORD_HEALTH_ATTACHMENT};
 
 use crate::replay_engine::{self, CompiledTolerance, ReplayInputs, ReplayNodes};
@@ -748,17 +750,19 @@ pub enum ReplayError {
     /// A one-rank free-run bag takes the ordinary resume; the multi-rank
     /// shape is refused rather than silently mis-anchored, and per-rank
     /// anchors are not implemented.
+    ///
+    /// The sentence is
+    /// [`cerulion_core::flashback::resim::free_run_resume_unsupported_reason`]'s,
+    /// the reason a Flashback capture of this shape carries too, about a
+    /// capture, when no worker rank begins at step 0 and it embeds one rank's
+    /// checkpoint.
     #[error(
-        "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
-         first recorded STEP_BOUNDARY is step {first_step}, not step 0), and it holds \
-         {ranks} worker ranks. A mid-run resume anchors on the ONE first recorded boundary \
-         and places the clock off that single value, which holds for exactly one worker \
-         rank, and a free-run recording with several ranks abolishes it: each rank keeps \
-         its own boundary stream and its own clock, so there is no single first boundary, \
-         {ranks} clocks cannot be placed off one value, and a frame stamp compared against \
-         it crosses clock domains. Per-rank resume anchors are not supported yet; until \
-         they land, re-execute this bag from its start, or capture a deployment whose \
-         graph runs in ONE process group (its mid-run captures resume)"
+        "{}",
+        cerulion_core::flashback::resim::free_run_resume_unsupported_reason(
+            *first_step,
+            *ranks,
+            false
+        )
     )]
     FreeRunResumeUnsupported {
         /// The recording's first recorded (rank-0) STEP_BOUNDARY step.
@@ -2226,6 +2230,7 @@ struct RecorderRead {
 ///   exists for.
 /// - `coordination` present but not a value this binary knows → carried out as
 ///   `unknown_coordination` for the caller to refuse (exit 2) — see the gate.
+///   The key is read by `cerulion_core::flashback::resim::stated_coordination`.
 /// - `node_external` (each node's driver flag) is carried out as read, and the
 ///   caller refuses an unreadable one and checks a readable one against the
 ///   graph ([`replay_engine::DriverStamp::admit`]), both after the version
@@ -2295,12 +2300,15 @@ fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, Re
     // lockstep inference; an UNKNOWN value is NOT (a value this binary has
     // no variant for was written by a NEWER one, so "assume lockstep" is
     // exactly the wrong guess). Carried out; refused by the caller.
-    let (coordination, unknown_coordination) = match obj.get("coordination") {
-        None => (None, None),
-        Some(v) => match serde_json::from_value::<replay_engine::CoordinationMode>(v.clone()) {
-            Ok(mode) => (Some(mode), None),
-            Err(_) => (None, Some(v.to_string())),
-        },
+    // `stated_coordination` reads the key of the object parsed above, so its
+    // only unreadable answer is an unknown stamp, carried out as its JSON text.
+    let (coordination, unknown_coordination) = match stated_coordination(obj) {
+        RecordedCoordination::Lockstep { stamped: false } => (None, None),
+        RecordedCoordination::Lockstep { stamped: true } => {
+            (Some(replay_engine::CoordinationMode::Lockstep), None)
+        }
+        RecordedCoordination::FreeRun => (Some(replay_engine::CoordinationMode::FreeRun), None),
+        RecordedCoordination::Unreadable(why) => (None, Some(why.to_string())),
     };
 
     // CONTRACT key 3: each node's driver flag. ABSENT is a recording made
@@ -3249,6 +3257,56 @@ mod tests {
         w.write_attachment(RECORDER_ATTACHMENT, "application/json", 0, 0, recorder)
             .unwrap();
         w.finalize().unwrap();
+    }
+
+    /// Each `coordination` stamp reads to the contract and the carried-out
+    /// value written here by hand, and a document that is not a JSON object is
+    /// refused, naming why, before the stamp is read.
+    #[test]
+    fn each_coordination_stamp_reads_to_its_contract_or_is_carried_out() {
+        use crate::replay_engine::CoordinationMode::{FreeRun, Lockstep};
+        let dir = tempfile::tempdir().unwrap();
+        let cases: [(&str, Option<replay_engine::CoordinationMode>, Option<&str>); 7] = [
+            (r#"{}"#, None, None),
+            (r#"{"coordination":"lockstep"}"#, Some(Lockstep), None),
+            (r#"{"coordination":"free_run"}"#, Some(FreeRun), None),
+            (r#"{"coordination":{"free_run":null}}"#, Some(FreeRun), None),
+            (
+                r#"{"coordination":"quantum_entangled"}"#,
+                None,
+                Some("\"quantum_entangled\""),
+            ),
+            (r#"{"coordination":null}"#, None, Some("null")),
+            (r#"{"coordination":7}"#, None, Some("7")),
+        ];
+        for (i, (doc, coordination, unknown)) in cases.into_iter().enumerate() {
+            let bag = dir.path().join(format!("coordination_{i}.mcap"));
+            write_min_bag_with_recorder(&bag, doc.as_bytes());
+            let reader = BagReader::open(&bag).unwrap();
+            let read = read_recorder_info(&reader, &bag).unwrap();
+            let info = read.info.expect("a JSON object is read");
+            assert_eq!(info.coordination, coordination, "{doc}");
+            assert_eq!(read.unknown_coordination.as_deref(), unknown, "{doc}");
+        }
+        for (i, (doc, why)) in [
+            (r#"{"coordination":"free_run""#, "did not parse as JSON: "),
+            (r#"["free_run"]"#, "expected a JSON object at the top level"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bag = dir.path().join(format!("unreadable_{i}.mcap"));
+            write_min_bag_with_recorder(&bag, doc.as_bytes());
+            let reader = BagReader::open(&bag).unwrap();
+            match read_recorder_info(&reader, &bag) {
+                Err(ReplayError::BagInvalidAttachment { name, reason }) => {
+                    assert_eq!(name, RECORDER_ATTACHMENT, "{doc}");
+                    assert!(reason.starts_with(why), "{doc}: {reason}");
+                }
+                Err(other) => panic!("{doc}: expected BagInvalidAttachment, got {other:?}"),
+                Ok(_) => panic!("{doc}: a document that is not a JSON object is refused"),
+            }
+        }
     }
 
     /// A recorder.json whose CONTRACT keys read perfectly and whose HOST

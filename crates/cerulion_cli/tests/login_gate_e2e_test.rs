@@ -92,7 +92,24 @@ fn run_cerulion_at(
     extra_env: &[(&str, &str)],
     args: &[&str],
 ) -> (Option<i32>, String, String) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_cerulion"));
+    run_binary_at(
+        Path::new(env!("CARGO_BIN_EXE_cerulion")),
+        home,
+        cwd,
+        extra_env,
+        args,
+    )
+}
+
+/// [`run_cerulion_at`] with the `cerulion` binary at `bin`.
+fn run_binary_at(
+    bin: &Path,
+    home: &Path,
+    cwd: &Path,
+    extra_env: &[(&str, &str)],
+    args: &[&str],
+) -> (Option<i32>, String, String) {
+    let mut cmd = Command::new(bin);
     cmd.args(args)
         .current_dir(cwd)
         .env_remove("CERULION_LOGIN_GATE")
@@ -598,4 +615,255 @@ fn rcp_without_the_network_switch_stays_behind_the_login_gate() {
     assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
     assert!(stdout.is_empty(), "stdout={stdout}");
     assert_no_identity_was_written(home.path());
+}
+
+/// A harness folder whose launcher writes the words it was run with to
+/// `<dir>/ran.txt`, prints `MCP-STREAM` on stdout and exits 3: a run that
+/// reached the launcher leaves the file, and the exit code and stdout show the
+/// CLI handed both back untouched.
+fn recording_harness(dir: &Path) {
+    std::fs::write(
+        dir.join("rcp.sh"),
+        "printf '%s\\n' \"$@\" > \"$(dirname \"$0\")/ran.txt\"\nprintf 'MCP-STREAM\\n'\nexit 3\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("install.sh"), "exit 9\n").unwrap();
+}
+
+/// Every form of the simulated robot and the benchmark.
+const HARNESS_FORMS: &[&[&str]] = &[
+    &["rcp", "--sim"],
+    &["rcp", "--sim", "--http", "127.0.0.1:8765"],
+    &["rcp", "bench", "--model", "m"],
+    &["rcp", "bench", "--verify"],
+];
+
+#[test]
+fn the_simulated_robot_and_the_bench_stay_behind_the_login_gate() {
+    // A machine that never signed in is refused before the harness runs, with
+    // or without the network switch: the launcher never starts.
+    for args in HARNESS_FORMS {
+        for network in ["", "off"] {
+            let home = tempfile::tempdir().unwrap();
+            let harness = tempfile::tempdir().unwrap();
+            recording_harness(harness.path());
+            let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+            let dir = harness.path().to_str().unwrap();
+            let (code, stdout, stderr) = run_cerulion_at(
+                home.path(),
+                cwd.path(),
+                &[("CERULION_NETWORK", network), ("CERULION_HARNESS_DIR", dir)],
+                args,
+            );
+            assert!(
+                stderr.contains(REFUSAL_A_USER_READS),
+                "{args:?} network={network:?}: the whole refusal; stderr={stderr}"
+            );
+            assert_eq!(code, Some(i32::from(EXIT_AUTH_REQUIRED)), "stderr={stderr}");
+            assert!(stdout.is_empty(), "stdout={stdout}");
+            assert!(
+                !harness.path().join("ran.txt").exists(),
+                "{args:?} network={network:?}: the launcher ran before the gate"
+            );
+            assert_no_identity_was_written(home.path());
+        }
+    }
+}
+
+#[test]
+fn a_signed_in_machine_runs_the_harness_launcher_and_hands_back_its_stream_and_code() {
+    // The control for the arm above: on a signed-in home every form runs the
+    // launcher of the folder CERULION_HARNESS_DIR names, under bash, with the
+    // words hand-written below, and the CLI adds nothing to its stdout and
+    // returns its exit code.
+    let version = env!("CARGO_PKG_VERSION");
+    for (args, words) in [
+        (HARNESS_FORMS[0], &["sim"][..]),
+        (HARNESS_FORMS[1], &["sim", "--http", "127.0.0.1:8765"][..]),
+        (HARNESS_FORMS[2], &["bench", "--model", "m"][..]),
+        (HARNESS_FORMS[3], &["verify"][..]),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
+        let harness = tempfile::tempdir().unwrap();
+        recording_harness(harness.path());
+        let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+        let dir = harness.path().to_str().unwrap();
+        let (code, stdout, stderr) = run_cerulion_at(
+            home.path(),
+            cwd.path(),
+            &[("CERULION_NETWORK", "off"), ("CERULION_HARNESS_DIR", dir)],
+            args,
+        );
+        assert_eq!(code, Some(3), "{args:?}: stderr={stderr}");
+        assert_eq!(stdout, "MCP-STREAM\n", "{args:?}: stderr={stderr}");
+        let ran = std::fs::read_to_string(harness.path().join("ran.txt")).unwrap();
+        let mut want = vec![
+            "--home".to_string(),
+            home.path()
+                .join("harness")
+                .join(version)
+                .display()
+                .to_string(),
+        ];
+        want.extend(words.iter().map(|w| w.to_string()));
+        assert_eq!(ran.lines().collect::<Vec<_>>(), want, "{args:?}");
+    }
+}
+
+#[test]
+fn a_harness_folder_that_does_not_exist_is_named_and_nothing_runs() {
+    let home = tempfile::tempdir().unwrap();
+    auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    let missing = cwd.path().join("no-harness-here");
+    let (code, stdout, stderr) = run_cerulion_at(
+        home.path(),
+        cwd.path(),
+        &[("CERULION_HARNESS_DIR", missing.to_str().unwrap())],
+        &["rcp", "--sim"],
+    );
+    assert_eq!(code, Some(1), "stderr={stderr}");
+    assert!(stdout.is_empty(), "stdout={stdout}");
+    assert!(
+        stderr.contains(&format!(
+            "Error: CERULION_HARNESS_DIR names '{}', which does not exist",
+            missing.display()
+        )),
+        "stderr={stderr}"
+    );
+}
+
+/// Set `path`'s permission bits to `mode`.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A link to the built `cerulion` (a copy where the file system refuses a
+/// hard link) at `bin`, so the running binary's own folder is `bin`'s.
+#[cfg(unix)]
+fn link_cerulion_at(bin: &Path) {
+    let built = env!("CARGO_BIN_EXE_cerulion");
+    if std::fs::hard_link(built, bin).is_err() {
+        std::fs::copy(built, bin).unwrap();
+    }
+}
+
+/// Every form run with `bin` from `cwd`, signed in, with
+/// `CERULION_HARNESS_DIR` unset: none may run `planted`'s launcher, each exits
+/// 1 with nothing on stdout, and stderr holds `said`.
+#[cfg(unix)]
+fn assert_no_form_runs(bin: &Path, cwd: &Path, planted: &Path, said: &str) {
+    for args in HARNESS_FORMS {
+        let home = tempfile::tempdir().unwrap();
+        auth::seed_logged_in_at(home.path(), "acct-login-gate-e2e").unwrap();
+        let (code, stdout, stderr) = run_binary_at(
+            bin,
+            home.path(),
+            cwd,
+            &[("CERULION_NETWORK", "off"), ("CERULION_HARNESS_DIR", "")],
+            args,
+        );
+        assert!(
+            !planted.join("ran.txt").exists(),
+            "{args:?}: the planted launcher ran; stderr={stderr}"
+        );
+        assert_eq!(code, Some(1), "{args:?}: stderr={stderr}");
+        assert!(stdout.is_empty(), "{args:?}: stdout={stdout}");
+        assert!(stderr.contains(said), "{args:?}: stderr={stderr}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_harness_in_the_directory_cerulion_runs_in_never_runs() {
+    // A downloaded folder dressed as a Cerulion checkout (the checkout marker
+    // and a `harness/` with both file names) whose launcher records that it
+    // ran. Every form run inside it, signed in, with CERULION_HARNESS_DIR
+    // unset, runs nothing from it. The binary runs from a link outside any
+    // checkout, in a folder of its own inside a fence of mode 1777, so the
+    // folder beside it holds no harness and the walk up from it stops at the
+    // fence on every machine.
+    let fence = tempfile::tempdir().unwrap();
+    set_mode(fence.path(), 0o1777);
+    let bin_dir = fence.path().join("bin");
+    std::fs::create_dir(&bin_dir).unwrap();
+    set_mode(&bin_dir, 0o755);
+    let bin_dir_real = std::fs::canonicalize(&bin_dir).unwrap();
+    let fence_real = std::fs::canonicalize(fence.path()).unwrap();
+    assert_eq!(
+        cerulion_cli_engine::harness_cmd::checkout_root(&bin_dir_real),
+        cerulion_cli_engine::harness_cmd::CheckoutRoot::StoppedAt(&fence_real),
+    );
+    let bin = bin_dir.join("cerulion");
+    link_cerulion_at(&bin);
+    let download = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(download.path().join("crates/cerulion_cli")).unwrap();
+    std::fs::write(download.path().join("crates/cerulion_cli/Cargo.toml"), "").unwrap();
+    let harness = download.path().join("harness");
+    std::fs::create_dir_all(&harness).unwrap();
+    recording_harness(&harness);
+    let cwd = download.path().join("docs");
+    std::fs::create_dir_all(&cwd).unwrap();
+    assert_no_form_runs(
+        &bin,
+        &cwd,
+        &harness,
+        &format!(
+            "(3) a Cerulion source checkout around the binary, but the search up from '{}' \
+             stopped at '{}', which every user can write to, and no folder on the way there \
+             holds crates/cerulion_cli/Cargo.toml. The current directory is never searched.",
+            bin_dir_real.display(),
+            fence_real.display()
+        ),
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_harness_planted_in_a_folder_other_users_can_write_never_runs() {
+    // A folder of mode 1777 stands in for /tmp, where any user of the
+    // machine can plant the checkout marker and a `harness/` whose launcher
+    // records that it ran. The user's own cerulion sits in a folder of its own
+    // inside it, then in the shared folder itself, beside the planted harness.
+    // Each form runs from another directory and runs nothing planted.
+    let shared = tempfile::tempdir().unwrap();
+    let shared_real = std::fs::canonicalize(shared.path()).unwrap();
+    std::fs::create_dir_all(shared_real.join("crates/cerulion_cli")).unwrap();
+    std::fs::write(shared_real.join("crates/cerulion_cli/Cargo.toml"), "").unwrap();
+    let planted = shared_real.join("harness");
+    std::fs::create_dir_all(&planted).unwrap();
+    recording_harness(&planted);
+    set_mode(&shared_real, 0o1777);
+    let own = shared_real.join("rel");
+    std::fs::create_dir(&own).unwrap();
+    set_mode(&own, 0o700);
+    let cwd = tempfile::tempdir().unwrap(); // NOT a workspace
+    link_cerulion_at(&own.join("cerulion"));
+    assert_no_form_runs(
+        &own.join("cerulion"),
+        cwd.path(),
+        &planted,
+        &format!(
+            "(2) '{}', and (3) a Cerulion source checkout around the binary, but the search up \
+             from '{}' stopped at '{}', which every user can write to, and no folder on the \
+             way there holds crates/cerulion_cli/Cargo.toml.",
+            own.join("harness").display(),
+            own.display(),
+            shared_real.display()
+        ),
+    );
+    link_cerulion_at(&shared_real.join("cerulion"));
+    assert_no_form_runs(
+        &shared_real.join("cerulion"),
+        cwd.path(),
+        &planted,
+        &format!(
+            "(2) '{}', which is not taken because every user can write to '{}', and (3)",
+            planted.display(),
+            shared_real.display()
+        ),
+    );
 }

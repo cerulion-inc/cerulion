@@ -373,12 +373,15 @@ impl DemandAuthorizer for LanAccessAuthorizer {
     fn authorize_demand(&self, subject: &DemandSubject, topic: &str) -> DemandDecision {
         // Synthetic catalog/schema resources are gated separately; concrete topics
         // must also satisfy their producer's policy, whatever peer authorizer is installed.
+        // An authorizer runs on the session's callback: it never waits for a
+        // policy marker being torn down.
         if topic.starts_with('/') {
             if let Some(scope) = &self.run_scope {
-                if !scope
-                    .upgrade()
-                    .is_some_and(|manager| manager.remote_topic_allowed(topic).unwrap_or(false))
-                {
+                if !scope.upgrade().is_some_and(|manager| {
+                    manager
+                        .remote_topic_allowed(topic, super::TeardownWait::Never)
+                        .unwrap_or(false)
+                }) {
                     return DemandDecision::deny(
                         "the producing run excludes this topic from network egress",
                     );

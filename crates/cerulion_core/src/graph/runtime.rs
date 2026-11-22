@@ -19,15 +19,17 @@
 //! capable). It requires a caller-owned `TransportManager`.
 
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use indexmap::IndexMap;
 
 use crate::barrier::{MappedBarrier, WaitOutcome};
 use crate::clock::{Clock, VirtualClock};
 use crate::error::{InertReason, TransportError, TransportResult};
+use crate::fire_tap::{FireBody, FireCause, FireFlags, FireTap, FireTapConfig};
 use crate::read_outcome::{FireBurstBound, StageBurstBound, SyncTriggerShape};
 // Gated with its only consumer, `read_outcome_stage_capacities` — see that
 // Now a PRODUCTION type — the manifest writer's row shape.
@@ -1429,6 +1431,13 @@ struct DataTriggerBinding {
     /// delivers to one subscriber queue at a time, and the publisher notifies
     /// after the last one).
     unconfirmed_arrival: bool,
+    /// A resume restored this binding's node as stopped while its trigger
+    /// drain held a frame it had popped and no tick took
+    /// ([`GraphRuntime::restore_stopped_nodes`]). From then on
+    /// `drain_data_binding` answers this binding as the drain answers a held
+    /// head: one arrival, no pop, no read-gate consult and no read-outcome
+    /// record. `false` on every binding a build makes.
+    trigger_head_held: bool,
 }
 
 /// Per-input drain binding for a `Sync`/`UnboundedSync` node — the
@@ -2930,6 +2939,63 @@ const DEAD_NODE_SWEEP_NICE: libc::c_int = 10;
 /// var overrides it (see `spin_budget`).
 const SPIN_HOP_US: u64 = 10;
 
+/// The live loop's liveliness-sweep cadence: the longest wait (matches the 25a
+/// heartbeat).
+const LIVE_WAIT_CAP_NS: u64 = 250_000_000;
+/// The poll floor of a wait for anything but a Period deadline still ahead: a
+/// node due now, a Period node past its deadline, a throttle window or a
+/// `block` release. A node due now that the next step does not fire is re-read
+/// at this cadence, never busy-spun.
+const LIVE_POLL_FLOOR_NS: u64 = 1_000_000;
+/// The floor of an exact Period-deadline wait. A deadline less than this far
+/// ahead (a wake that landed a few ns before the gating clock reached it) waits
+/// this long, so a Period node costs at most one extra wake per fire.
+const LIVE_DEADLINE_FLOOR_NS: u64 = 10_000;
+
+/// PURE: the live loop's next wait in ns. A Period deadline still ahead is
+/// waited for exactly (floored at [`LIVE_DEADLINE_FLOOR_NS`]), capped at a
+/// fixed-quantum boundary when one applies; every other pending fire, capped at
+/// the same boundary, keeps the [`LIVE_POLL_FLOOR_NS`] poll, so the boundary
+/// waits less than 1 ms only beside a deadline still ahead. Nothing pending, or
+/// a wait past it, is capped at [`LIVE_WAIT_CAP_NS`].
+///
+/// The exact class is what keeps a Period node on its grid: a wait floored at
+/// 1 ms for a deadline less than 1 ms ahead starts each fire's wait from a late
+/// wake, so every fire lands later than the last by the step and wake overshoot
+/// until a slot is skipped and caught up with a double fire.
+pub(crate) fn live_wait_ns(
+    next: crate::scheduler::NextFire,
+    quantum_boundary_ns: Option<u64>,
+) -> u64 {
+    let exact = next.deadline_ns.map(|deadline| {
+        quantum_boundary_ns
+            .map_or(deadline, |boundary| deadline.min(boundary))
+            .max(LIVE_DEADLINE_FLOOR_NS)
+    });
+    // The boundary caps the poll too. Beside a deadline ahead that never
+    // changes the wait: a boundary below the poll caps the exact half as well,
+    // whose 10 µs floor sits below the poll's 1 ms floor.
+    let polled = next.poll_ns.map(|poll| {
+        quantum_boundary_ns
+            .map_or(poll, |boundary| poll.min(boundary))
+            .max(LIVE_POLL_FLOOR_NS)
+    });
+    match (exact, polled) {
+        (Some(e), Some(p)) => e.min(p),
+        (e, p) => e.or(p).unwrap_or(LIVE_WAIT_CAP_NS),
+    }
+    .min(LIVE_WAIT_CAP_NS)
+}
+
+/// Test-only: the wait the live loop sizes from `scheduler`'s pending fires at
+/// `now_ns`, with no fixed-quantum boundary: [`live_wait_ns`] over the
+/// scheduler's split read, the decision `live_timeout` takes. For a test that
+/// drives a bare [`Scheduler`] the way the live loop would.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn live_wait_for_test(scheduler: &Scheduler, now_ns: u64) -> Duration {
+    Duration::from_nanos(live_wait_ns(scheduler.next_fire_split(now_ns), None))
+}
+
 /// The manual-ceiling clamp for `CERULION_LIVE_SPIN_US`
 /// (100 ms, in µs). A spin budget beyond this is never sensible — the spin is a
 /// pre-block latency optimization for an *imminent* wake, not a polling loop —
@@ -3012,8 +3078,9 @@ struct LivelinessWatch {
 /// outlier sat on the 250 ms comb). The [`crate::transport::LivelinessCleaner`]
 /// holds only a `Config` clone and the reclaim is an associated fn keyed by it,
 /// so nothing of the live loop's transport crosses to this thread. Stopped and
-/// JOINED on drop (bounded by one in-flight pass). The cadence is an atomic so
-/// the test seam can shorten or park it without restarting the thread.
+/// JOINED on drop (bounded by one in-flight pass). The cadence lives in the
+/// shared schedule so the test seam can shorten or park it without restarting
+/// the thread.
 struct DeadNodeCleanupThread {
     shared: Arc<DeadNodeCleanupShared>,
     handle: Option<std::thread::JoinHandle<()>>,
@@ -3025,59 +3092,164 @@ struct DeadNodeCleanupThread {
 
 /// What the owner and the reclaim thread share.
 struct DeadNodeCleanupShared {
-    /// `true` once the owner asked the thread to exit; under the mutex so the
-    /// condvar wait cannot miss the flip.
-    stop: Mutex<bool>,
+    /// The thread's schedule, under one mutex so neither condvar wait can miss
+    /// a change.
+    gate: Mutex<CleanupGate>,
+    /// Wakes the thread: a stop, or a cadence change.
     wake: std::sync::Condvar,
+    /// Signalled when a pass ends (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    pass_done: std::sync::Condvar,
+}
+
+/// The reclaim thread's schedule.
+struct CleanupGate {
+    /// `true` once the owner asked the thread to exit.
+    stopped: bool,
     /// Cadence (ms); re-read after every wake so a change applies at once.
-    period_ms: AtomicU64,
+    period_ms: u64,
+    /// Bumped by every cadence change. A wait that sees it move re-arms with
+    /// the new period, also when the old period ran out before the wait took
+    /// the lock back. Only the test seam changes the cadence.
+    #[cfg(any(test, feature = "test-helpers"))]
+    period_changes: u64,
+    /// `true` from the moment the thread decides to run a pass until that
+    /// pass returns (the test seam waits on it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_pass: bool,
+    /// `true` from the lock hold that enters a timed wait until the thread
+    /// takes the lock back, so a reader that holds the lock and sees it set
+    /// holds it while the thread is inside `wait_timeout` (a unit test reads
+    /// it).
+    #[cfg(any(test, feature = "test-helpers"))]
+    in_wait: bool,
+}
+
+/// Ends the pass [`DeadNodeCleanupShared::wait_period`] started when dropped,
+/// so a pass that panics still ends. Only `wait_period` makes one, in the same
+/// lock hold that marks the pass as under way.
+#[cfg(any(test, feature = "test-helpers"))]
+struct PassEnd<'a>(&'a DeadNodeCleanupShared);
+
+/// The pass [`DeadNodeCleanupShared::wait_period`] decided to run. Under the
+/// test seam it is the [`PassEnd`] that ends it; otherwise it carries nothing.
+#[cfg(any(test, feature = "test-helpers"))]
+type PassToken<'a> = PassEnd<'a>;
+#[cfg(not(any(test, feature = "test-helpers")))]
+type PassToken<'a> = std::marker::PhantomData<&'a DeadNodeCleanupShared>;
+
+#[cfg(any(test, feature = "test-helpers"))]
+impl Drop for PassEnd<'_> {
+    fn drop(&mut self) {
+        self.0.lock_gate().in_pass = false;
+        self.0.pass_done.notify_all();
+    }
 }
 
 impl DeadNodeCleanupShared {
-    /// Wait one period. `true` when the period elapsed (run a pass), `false`
-    /// when the owner asked the thread to stop. A wake that is neither (the
-    /// period was changed) re-arms with the new value.
-    fn wait_period(&self) -> bool {
-        let mut stopped = self
-            .stop
+    fn new(period_ms: u64) -> Self {
+        Self {
+            gate: Mutex::new(CleanupGate {
+                stopped: false,
+                period_ms,
+                #[cfg(any(test, feature = "test-helpers"))]
+                period_changes: 0,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_pass: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                in_wait: false,
+            }),
+            wake: std::sync::Condvar::new(),
+            #[cfg(any(test, feature = "test-helpers"))]
+            pass_done: std::sync::Condvar::new(),
+        }
+    }
+
+    fn lock_gate(&self) -> std::sync::MutexGuard<'_, CleanupGate> {
+        // Every update under this lock is a plain assignment or increment, so
+        // a poisoned lock still holds a consistent schedule.
+        self.gate
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Run `pass` once per period until the owner stops the thread.
+    fn run_passes(&self, mut pass: impl FnMut()) {
+        while let Some(_end) = self.wait_period() {
+            pass();
+        }
+    }
+
+    /// Wait one period. `Some` when the period elapsed (run a pass; the pass
+    /// ends when the token drops), `None` when the owner asked the thread to
+    /// stop. A cadence change re-arms the wait with the new value, also when
+    /// it landed after the old period ran out but before this thread took the
+    /// lock back: the condvar reports that wake as a timeout.
+    fn wait_period(&self) -> Option<PassToken<'_>> {
+        let mut gate = self.lock_gate();
         loop {
-            if *stopped {
-                return false;
+            if gate.stopped {
+                return None;
             }
-            let period = Duration::from_millis(self.period_ms.load(Ordering::Relaxed));
+            #[cfg(any(test, feature = "test-helpers"))]
+            let changes = gate.period_changes;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = true;
+            }
+            let period = Duration::from_millis(gate.period_ms);
             let (guard, timeout) = self
                 .wake
-                .wait_timeout(stopped, period)
+                .wait_timeout(gate, period)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            stopped = guard;
-            if *stopped {
-                return false;
+            gate = guard;
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                gate.in_wait = false;
             }
-            if timeout.timed_out() {
-                return true;
+            if gate.stopped {
+                return None;
+            }
+            #[cfg(any(test, feature = "test-helpers"))]
+            let unchanged = gate.period_changes == changes;
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            let unchanged = true;
+            if timeout.timed_out() && unchanged {
+                #[cfg(any(test, feature = "test-helpers"))]
+                {
+                    gate.in_pass = true;
+                    return Some(PassEnd(self));
+                }
+                #[cfg(not(any(test, feature = "test-helpers")))]
+                return Some(std::marker::PhantomData);
             }
         }
     }
 
-    /// Test seam only (the production cadence never changes).
+    /// Test seam only (the production cadence never changes). Returns once
+    /// the change is in force: a pass already under way has ended, and the
+    /// next one starts only after the new period elapses.
     #[cfg(any(test, feature = "test-helpers"))]
     fn set_period_ms(&self, ms: u64) {
-        self.period_ms.store(ms, Ordering::Relaxed);
-        // Take the lock so the store is ordered before the thread's next wait.
-        let _guard = self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.change_period(self.lock_gate(), ms);
+    }
+
+    /// [`Self::set_period_ms`] with the schedule lock already held.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn change_period(&self, mut gate: std::sync::MutexGuard<'_, CleanupGate>, ms: u64) {
+        gate.period_ms = ms;
+        gate.period_changes = gate.period_changes.wrapping_add(1);
         self.wake.notify_all();
+        while gate.in_pass {
+            gate = self
+                .pass_done
+                .wait(gate)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 
     fn stop(&self) {
-        *self
-            .stop
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.lock_gate().stopped = true;
         self.wake.notify_all();
     }
 }
@@ -3087,11 +3259,7 @@ impl DeadNodeCleanupThread {
     /// the thread: the graph still runs, but a CRASHED publisher's port is then
     /// not reclaimed by this runtime (graceful disconnects are unaffected).
     fn spawn(cleaner: crate::transport::LivelinessCleaner) -> Option<Self> {
-        let shared = Arc::new(DeadNodeCleanupShared {
-            stop: Mutex::new(false),
-            wake: std::sync::Condvar::new(),
-            period_ms: AtomicU64::new(LIVELINESS_CLEANUP_PERIOD_MS),
-        });
+        let shared = Arc::new(DeadNodeCleanupShared::new(LIVELINESS_CLEANUP_PERIOD_MS));
         #[cfg(any(test, feature = "test-helpers"))]
         let call_count = cleaner.call_count_handle();
         let worker = Arc::clone(&shared);
@@ -3119,13 +3287,9 @@ impl DeadNodeCleanupThread {
 
     fn run(shared: &DeadNodeCleanupShared, cleaner: &crate::transport::LivelinessCleaner) {
         Self::lower_own_priority();
-        tracing::debug!(
-            period_ms = shared.period_ms.load(Ordering::Relaxed),
-            "liveliness: dead-node reclaim thread started"
-        );
-        while shared.wait_period() {
-            cleaner.cleanup_dead_nodes();
-        }
+        let period_ms = shared.lock_gate().period_ms;
+        tracing::debug!(period_ms, "liveliness: dead-node reclaim thread started");
+        shared.run_passes(|| cleaner.cleanup_dead_nodes());
     }
 
     /// Renice THIS thread to [`DEAD_NODE_SWEEP_NICE`]. Linux and Android:
@@ -3644,11 +3808,201 @@ struct LivePaceAnchor {
     gating_ns: u64,
 }
 
+/// Nodes a fire tap can index: record `node` is a `u16` and so is the tap's
+/// node count. Nodes past it run unrecorded.
+const FIRE_NODE_LIMIT: usize = u16::MAX as usize;
+
+/// What the tick callback's `catch_unwind` around `NodeEntry::tick` returns.
+type TickResult = std::thread::Result<TransportResult<()>>;
+
+/// How a recorded tick ended.
+enum TickOutcome {
+    Ok,
+    Err,
+    Panicked,
+}
+
+impl TickOutcome {
+    fn of(result: &TickResult) -> Self {
+        match result {
+            Ok(Ok(())) => Self::Ok,
+            // A node library catches its own panic and returns this variant.
+            Ok(Err(TransportError::NodeTickPanicked { .. })) | Err(_) => Self::Panicked,
+            Ok(Err(_)) => Self::Err,
+        }
+    }
+}
+
+/// An armed tick, started before the tick runs, with the tap that admitted it.
+struct FireStart<'t> {
+    tap: &'t FireTap,
+    node: u16,
+    at_ns: u64,
+    started: Instant,
+    counted: bool,
+}
+
+/// The installed fire tap and, per recorded node, whether that node's entry
+/// reported its commit counts at install. A tick asks only those entries.
+struct FireInstall {
+    tap: Arc<FireTap>,
+    reports_writes: Box<[bool]>,
+}
+
+/// One node's fire recording, moved into its tick callback at build. It
+/// reads no clock and asks the entry nothing until a reader arms the tap.
+struct FireSite {
+    tap: Arc<OnceLock<FireInstall>>,
+    node: Option<u16>,
+    cause: FireCause,
+    flags: u8,
+}
+
+/// One node's output commit counts around a recorded tick.
+struct FireCounts {
+    before: Box<[u32]>,
+    after: Box<[u32]>,
+}
+
+impl FireCounts {
+    // hot-path-alloc-ok-fn: cold: graph build sizes each node's two count buffers once
+    fn new(outputs: usize) -> Self {
+        Self {
+            before: vec![0; outputs].into_boxed_slice(),
+            after: vec![0; outputs].into_boxed_slice(),
+        }
+    }
+}
+
+impl FireSite {
+    fn new(
+        tap: Arc<OnceLock<FireInstall>>,
+        index: usize,
+        trigger: &TopologyTrigger,
+        outputs: usize,
+    ) -> Self {
+        let mut flags = 0;
+        if matches!(
+            trigger,
+            TopologyTrigger::Data {
+                ambiguous: true,
+                ..
+            }
+        ) {
+            flags |= FireFlags::TRIGGER_AMBIGUOUS;
+        }
+        if outputs > 64 {
+            flags |= FireFlags::WROTE_TRUNCATED;
+        }
+        Self {
+            tap,
+            node: (index < FIRE_NODE_LIMIT).then_some(index as u16),
+            cause: FireCause::try_from(trigger.cause()).unwrap_or(FireCause::Unknown),
+            flags,
+        }
+    }
+
+    /// `None` while disarmed. The commit-count probe is entry code, so the
+    /// caller runs this inside the tick's `catch_unwind`.
+    #[inline]
+    fn start(&self, counts: &mut FireCounts, entry: &dyn NodeEntry) -> Option<FireStart<'_>> {
+        let node = self.node?;
+        let installed = self.tap.get()?;
+        let at_ns = installed.tap.armed_now()?;
+        let counted = installed.reports_writes.get(usize::from(node)) == Some(&true)
+            && entry.output_commit_counts(&mut counts.before);
+        Some(FireStart {
+            tap: &installed.tap,
+            node,
+            at_ns,
+            started: Instant::now(),
+            counted,
+        })
+    }
+
+    /// Record `start`'s tick and return its result. A panic in the after
+    /// count is entry code panicking in this callback, so it becomes the
+    /// tick's panic unless the tick already panicked.
+    fn record(
+        &self,
+        start: FireStart<'_>,
+        counts: &mut FireCounts,
+        entry: &dyn NodeEntry,
+        result: TickResult,
+    ) -> TickResult {
+        let elapsed = start.started.elapsed();
+        let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            start.counted && entry.output_commit_counts(&mut counts.after)
+        }));
+        let (counted, result) = match probed {
+            Ok(counted) => (counted, result),
+            Err(payload) => (false, result.and(Err(payload))),
+        };
+        let writes = counted.then_some((&*counts.before, &*counts.after));
+        start.tap.push(self.body(
+            start.node,
+            start.at_ns,
+            elapsed,
+            TickOutcome::of(&result),
+            writes,
+        ));
+        result
+    }
+
+    /// The record of one armed tick. `writes` holds the commit counts before
+    /// and after it, `None` when the entry could not report them.
+    fn body(
+        &self,
+        node: u16,
+        at_ns: u64,
+        elapsed: Duration,
+        outcome: TickOutcome,
+        writes: Option<(&[u32], &[u32])>,
+    ) -> FireBody {
+        let mut flags = self.flags
+            | match outcome {
+                TickOutcome::Ok => 0,
+                TickOutcome::Err => FireFlags::TICK_ERROR,
+                TickOutcome::Panicked => FireFlags::PANICKED,
+            };
+        let dur_ns = match u32::try_from(elapsed.as_nanos()) {
+            Ok(dur_ns) => dur_ns,
+            Err(_) => {
+                flags |= FireFlags::DURATION_SATURATED;
+                u32::MAX
+            }
+        };
+        let mut wrote = 0_u64;
+        match writes {
+            Some((before, after)) => {
+                for (bit, (before, after)) in before.iter().zip(after).take(64).enumerate() {
+                    if before != after {
+                        wrote |= 1 << bit;
+                    }
+                }
+            }
+            None => flags |= FireFlags::WROTE_UNKNOWN,
+        }
+        FireBody {
+            at_ns,
+            dur_ns,
+            node,
+            cause: self.cause,
+            flags: FireFlags(flags),
+            wrote,
+        }
+    }
+}
+
 pub struct GraphRuntime {
     config: GraphConfig,
     scheduler: Scheduler,
     handles: IndexMap<String, NodeHandle>,
     topology_nodes: Vec<TopologyNode>,
+    /// Empty until [`Self::install_fire_tap`]; every tick callback holds a clone.
+    fire_tap: Arc<OnceLock<FireInstall>>,
+    /// The gating clock, which also stamps each node's in-tick marker.
+    fire_clock: Arc<dyn Clock>,
     /// Per capture-time Sync node, its trigger topics and the per-input
     /// capture states its sync ops share. Read only by
     /// [`Self::restore_sync_input_timestamps`], which seeds each input's
@@ -3970,6 +4324,10 @@ pub struct GraphRuntime {
     /// takes `&self`; only the live-loop thread takes it, so it is never
     /// contended.
     doorbell_baseline: std::sync::Mutex<Vec<u64>>,
+    /// The period-park's state (`CERULION_PERIOD_PARK=1`): the kernel lead, the
+    /// data-arrival learner and the record-only counters. A `Mutex` for the
+    /// same reason as `doorbell_baseline`: only the live-loop thread takes it.
+    period_park: std::sync::Mutex<super::period_park::State>,
     /// The registry's first topic when a kernel wake may arm on it, `None`
     /// otherwise. The registry spans data-trigger AND sync-input topics, so a
     /// sync input can hold the armed line. `None` covers a graph every one of
@@ -3981,6 +4339,11 @@ pub struct GraphRuntime {
     /// rather than guaranteeing one. Recorded once at build, on the open's
     /// success arm only, from [`rung_topics`].
     doorbell_armed_topic: Option<String>,
+    /// How many of this graph's data-trigger and sync input topics a writer
+    /// outside it can write, whatever the doorbell policy and whether its
+    /// registry opened: the armed line, when there is one, is among them.
+    /// Recorded once at build.
+    outside_input_topics: usize,
     /// How many of this graph's own publishers armed a doorbell, which under an
     /// active policy is every topic it publishes: a ring reaches whoever is
     /// blocked on the page, and this build cannot name those consumers. Recorded
@@ -4107,7 +4470,7 @@ pub struct GraphRuntime {
     /// moved after the loop-top poll, so no wait happened) yields but does
     /// NOT count, else doorbell-driven runs inflate slice telemetry. The
     /// yield is what
-    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`WFE`-parked thread
+    /// makes the HARDWARE park OS-cooperative: a `UMWAIT`/`MWAITX`/`WFE`-parked thread
     /// is RUNNING to the OS scheduler, so without it a co-located runnable
     /// peer got the core only at CFS wakeup granularity (measured p50
     /// 6.997 ms RTT on a same-core pinned ping-pong). The sleeping tiers
@@ -4151,6 +4514,14 @@ pub struct GraphRuntime {
     /// the `#[cfg(any(test, feature = "test-helpers"))]`
     /// [`Self::set_single_park_for_test`] (gate the SETTER, not the field).
     single_park_override: Option<bool>,
+    /// Test seam over the `CERULION_PERIOD_PARK` env read (`None` = the env
+    /// decides); see [`Self::set_period_park_for_test`].
+    period_park_override: Option<bool>,
+    /// Test seam: a closure the Sync drain runs right after a node's align
+    /// pass; see [`Self::set_sync_align_hook_for_test`]. Test and test-helpers
+    /// builds only (`GraphRuntime` never crosses an FFI boundary).
+    #[cfg(any(test, feature = "test-helpers"))]
+    sync_align_hook: Option<Box<dyn FnMut() + Send>>,
     /// Wake sources collected from `external`-policy ingress (driver)
     /// nodes — one per node whose [`NodeEntry::external_source`] returned an
     /// [`ExternalSource::Fd`] / [`ExternalSource::Blocking`]. Populated ONCE at
@@ -4177,6 +4548,9 @@ pub struct GraphRuntime {
     /// Every native node's params as this build resolved them, keyed by node
     /// id: what [`Self::param_differences`] compares a recording against.
     params_in_force: IndexMap<String, crate::graph::param_resume::ParamsInForce>,
+    /// The variables this build left out of its nodes' environment snapshot:
+    /// what [`Self::node_env_left_out`] returns.
+    node_env_left_out: NodeEnvLeftOut,
     /// Sticky inert-at-launch refusal.
     /// Once [`Self::collect_external_sources`] refuses the live run because one
     /// or more external nodes are provably inert (host-driven / no-source /
@@ -5773,10 +6147,18 @@ impl GraphRuntime {
         // Capture live env once at
         // build time so per-tick `ctx.env(...)` is replay-deterministic
         // (Principle #7). Wrapped in Arc so all NodeContexts in the
-        // graph share one allocation.
-        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(std::env::vars().collect());
+        // graph share one allocation. A variable whose name or value is not
+        // valid UTF-8 is left out of the snapshot and its name is kept on the
+        // runtime (`node_env_left_out`). The build logs nothing about it: the
+        // process that owns the run reports it once.
+        let NodeEnvCapture {
+            snapshot,
+            left_out: node_env_left_out,
+        } = capture_node_env(std::env::vars_os());
+        let env_snapshot: Arc<HashMap<String, String>> = Arc::new(snapshot);
         let mut handles = IndexMap::new();
         let mut topology_nodes = Vec::with_capacity(config.nodes.len());
+        let fire_tap: Arc<OnceLock<FireInstall>> = Arc::new(OnceLock::new());
         // Exit-3 widening: one shared PANIC-CLASS failure record per
         // node (first reason wins), written by the tick callback at the catch
         // site / on the structural FFI variant, read post-run via
@@ -8525,6 +8907,7 @@ impl GraphRuntime {
                         consume_latest,
                         probes_body: false,
                         unconfirmed_arrival: false,
+                        trigger_head_held: false,
                     });
                     // Mark the BODY
                     // subscriber this Unified binding drains through, arming
@@ -8771,6 +9154,7 @@ impl GraphRuntime {
                         probes_body: consume_latest
                             && probes_trigger_input.get(&node_def.id) == Some(&true),
                         unconfirmed_arrival: false,
+                        trigger_head_held: false,
                     });
                 }
             }
@@ -9197,6 +9581,68 @@ impl GraphRuntime {
             // lines up is a plain value.
             let node_death_for_callback = Arc::clone(&node_death);
             let mut node_death_reported = false;
+            // Trigger policy comes from the macro side only. Graph
+            // YAML no longer carries a `policy:` block.
+            // When a cdylib declares no `MacroPolicy`,
+            // the runtime falls back to `Data` (fires on any input
+            // arrival), which is a defensible default for ad-hoc
+            // closure-only graphs but worth surfacing at warn-level
+            // so operators notice unintended triggering on unrelated
+            // input deliveries. The
+            // `validate_no_silent_data_trigger` check already rejects the
+            // worst combo (silent never-fire with a
+            // `#[input(trigger)]` field).
+            let policy = match macro_policy {
+                Some(macro_p) => {
+                    tracing::debug!(node_id = %node_def.id, ?macro_p, "using macro-declared policy");
+                    macro_policy_to_trigger(
+                        macro_p,
+                        &node_def.id,
+                        &node_def.inputs,
+                        &entry_info.input_meta,
+                        &config.prefix,
+                    )
+                }
+                None => {
+                    tracing::warn!(
+                        node_id = %node_def.id,
+                        "no macro-declared policy; defaulting to Data trigger \
+                         (fires on any input arrival). Add a macro attribute \
+                         (`period_ms`, `sync_window_ms`, `unbounded_sync`, \
+                         `external`) or an `#[input(trigger)]` field to \
+                         silence this warning."
+                    );
+                    TriggerPolicy::Data
+                }
+            };
+            let trigger = match &policy {
+                TriggerPolicy::Period { interval, .. } => TopologyTrigger::Period {
+                    interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
+                },
+                TriggerPolicy::Data => {
+                    // Without a declared trigger input the node has no drain
+                    // binding, so no input arrival signals it; only the host's
+                    // `signal_data` does.
+                    let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
+                    TopologyTrigger::Data {
+                        topics: data_trigger_topic.into_iter().collect(),
+                        ambiguous,
+                    }
+                }
+                TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
+                    topics: inputs.clone(),
+                    window_ns: window
+                        .map(|window| u64::try_from(window.as_nanos()).unwrap_or(u64::MAX)),
+                },
+                TriggerPolicy::External => TopologyTrigger::External,
+            };
+            let fire = FireSite::new(
+                Arc::clone(&fire_tap),
+                topology_nodes.len(),
+                &trigger,
+                node_def.outputs.len(),
+            );
+            let mut fire_counts = FireCounts::new(node_def.outputs.len());
             let callback = Box::new(move || match entry_for_callback.lock() {
                 Ok(mut e) => {
                     // Catch the unwind to RECORD the panic reason
@@ -9211,8 +9657,18 @@ impl GraphRuntime {
                     // AssertUnwindSafe: the payload is resumed immediately —
                     // any torn `&mut` state unwinds exactly as it did without
                     // the intermediate catch.
-                    let result =
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| e.tick()));
+                    // The fire tap's commit-count probes are entry code too:
+                    // they run under this catch or `FireSite::record`'s, so a
+                    // probe panic takes the panic arm below.
+                    let mut fire_start = None;
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        fire_start = fire.start(&mut fire_counts, &**e);
+                        e.tick()
+                    }));
+                    let result = match fire_start {
+                        Some(start) => fire.record(start, &mut fire_counts, &**e, result),
+                        None => result,
+                    };
                     match result {
                         Err(payload) => {
                             record_first_reason(
@@ -9376,61 +9832,6 @@ impl GraphRuntime {
                 }
             });
 
-            // Trigger policy comes from the macro side only — graph
-            // YAML no longer carries a `policy:` block.
-            // When a cdylib declares no `MacroPolicy`,
-            // the runtime falls back to `Data` (fires on any input
-            // arrival), which is a defensible default for ad-hoc
-            // closure-only graphs but worth surfacing at warn-level
-            // so operators notice unintended triggering on unrelated
-            // input deliveries. The
-            // `validate_no_silent_data_trigger` check already rejects the
-            // worst combo (silent never-fire with a
-            // `#[input(trigger)]` field).
-            let policy = match macro_policy {
-                Some(macro_p) => {
-                    tracing::debug!(node_id = %node_def.id, ?macro_p, "using macro-declared policy");
-                    macro_policy_to_trigger(
-                        macro_p,
-                        &node_def.id,
-                        &node_def.inputs,
-                        &entry_info.input_meta,
-                        &config.prefix,
-                    )
-                }
-                None => {
-                    tracing::warn!(
-                        node_id = %node_def.id,
-                        "no macro-declared policy; defaulting to Data trigger \
-                         (fires on any input arrival). Add a macro attribute \
-                         (`period_ms`, `sync_window_ms`, `unbounded_sync`, \
-                         `external`) or an `#[input(trigger)]` field to \
-                         silence this warning."
-                    );
-                    TriggerPolicy::Data
-                }
-            };
-            let trigger = match &policy {
-                TriggerPolicy::Period { interval, .. } => TopologyTrigger::Period {
-                    interval_ns: u64::try_from(interval.as_nanos()).unwrap_or(u64::MAX),
-                },
-                TriggerPolicy::Data => {
-                    // Without a declared trigger input the node has no drain
-                    // binding, so no input arrival signals it; only the host's
-                    // `signal_data` does.
-                    let ambiguous = data_trigger_topic.is_none() && topology_inputs.len() > 1;
-                    TopologyTrigger::Data {
-                        topics: data_trigger_topic.into_iter().collect(),
-                        ambiguous,
-                    }
-                }
-                TriggerPolicy::Sync { inputs, window } => TopologyTrigger::Sync {
-                    topics: inputs.clone(),
-                    window_ns: window
-                        .map(|window| u64::try_from(window.as_nanos()).unwrap_or(u64::MAX)),
-                },
-                TriggerPolicy::External => TopologyTrigger::External,
-            };
             topology_nodes.push(TopologyNode {
                 id: node_def.id.clone(),
                 node_type: node_def.node_type.clone(),
@@ -10106,6 +10507,11 @@ impl GraphRuntime {
             .now_ns()
             .saturating_add(EXTERNAL_TOPIC_SILENCE_GRACE_MS.saturating_mul(1_000_000));
 
+        debug_assert!(
+            sync_bindings_contiguous(sync_input_bindings.iter().map(|b| b.node_id.as_ref())),
+            "every node's Sync bindings must sit in one contiguous run: the drain walks a \
+             node's bindings from its first one and stops at another node's"
+        );
         // Fail fast if the live-loop WaitSet would exceed the
         // FD-set attachment bound — the loop attaches one notification per
         // data-trigger input + per sync input. Past the cap, iceoryx2 silently
@@ -10128,6 +10534,34 @@ impl GraphRuntime {
             scheduler.external_policy_node_count(),
         )?;
 
+        // The data-trigger and sync inputs a publisher outside this graph can
+        // write, whatever the doorbell policy: the period-park refuses a
+        // runtime that has one with no doorbell wake word to end its naps.
+        let mut topics: Vec<String> = data_trigger_bindings
+            .iter()
+            .map(|b| b.topic.to_string())
+            .collect();
+        topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
+        // Which of them a publisher outside this graph can write, read
+        // off the provisioning this build already RESOLVED per topic rather
+        // than re-derived from the node list. `topic_is_writable_from_outside`
+        // is true for a topic in the graph's `multi_publisher_topics` opt-in,
+        // asked of the config directly whatever its provisioning, and for a
+        // topic whose provisioning is `External`, which is every topic absent
+        // from `owned_topic_configs` since that map holds exactly the topics
+        // with an in-graph producer.
+        let armable: std::collections::BTreeSet<String> = topics
+            .iter()
+            .filter(|t| {
+                let provisioning = owned_topic_configs
+                    .get(t.as_str())
+                    .map(|c| c.publisher_provisioning)
+                    .unwrap_or(PublisherProvisioning::External);
+                topic_is_writable_from_outside(&config, t, provisioning)
+            })
+            .cloned()
+            .collect();
+        let outside_input_topics = armable.len();
         // Under an active doorbell policy, build the CONSUMER-side
         // doorbell registry over this graph's data-trigger + sync input topics,
         // ordered by `rung_topics` so the armed slot holds a topic a publisher
@@ -10145,30 +10579,6 @@ impl GraphRuntime {
                 "an active doorbell policy must carry a non-empty ns (the CLI \
                  resolver sets default_namespace())"
             );
-            let mut topics: Vec<String> = data_trigger_bindings
-                .iter()
-                .map(|b| b.topic.to_string())
-                .collect();
-            topics.extend(sync_input_bindings.iter().map(|b| b.sync_input.to_string()));
-            // Which of them a publisher outside this graph can write, read
-            // off the provisioning this build already RESOLVED per topic rather
-            // than re-derived from the node list. `topic_is_writable_from_outside`
-            // is true for a topic in the graph's `multi_publisher_topics` opt-in,
-            // asked of the config directly whatever its provisioning, and for a
-            // topic whose provisioning is `External`, which is every topic absent
-            // from `owned_topic_configs` since that map holds exactly the topics
-            // with an in-graph producer.
-            let armable: std::collections::BTreeSet<String> = topics
-                .iter()
-                .filter(|t| {
-                    let provisioning = owned_topic_configs
-                        .get(t.as_str())
-                        .map(|c| c.publisher_provisioning)
-                        .unwrap_or(PublisherProvisioning::External);
-                    topic_is_writable_from_outside(&config, t, provisioning)
-                })
-                .cloned()
-                .collect();
             let rung = rung_topics(&topics, &armable);
             if rung.armed.is_none() {
                 // No declared topic of this graph is writable from outside it, so
@@ -10228,6 +10638,8 @@ impl GraphRuntime {
             scheduler,
             handles,
             topology_nodes,
+            fire_tap,
+            fire_clock: clock_dyn,
             sync_capture_ports,
             // Exit-3 widening: the per-node panic-class records the
             // tick callbacks write into (see the callback construction above).
@@ -10281,11 +10693,13 @@ impl GraphRuntime {
             // The resolved monitor-wait/doorbell policy + the
             // consumer-side doorbell registry built from it above.
             monitor_wait_policy: policy,
+            period_park: std::sync::Mutex::new(super::period_park::State::default()),
             doorbell_baseline: std::sync::Mutex::new(Vec::with_capacity(
                 doorbell_registry.as_ref().map_or(0, |r| r.len()),
             )),
             doorbell_registry,
             doorbell_armed_topic,
+            outside_input_topics,
             producer_doorbells_armed,
             producer_doorbells_planned,
             // Park-entry routing counter (see field doc) — starts at 0.
@@ -10313,11 +10727,15 @@ impl GraphRuntime {
             park_unslept_passes: std::sync::atomic::AtomicU64::new(0),
             credit_baseline_full_override: None,
             single_park_override: None,
+            period_park_override: None,
+            #[cfg(any(test, feature = "test-helpers"))]
+            sync_align_hook: None,
             // External ingress sources are collected lazily at run_live
             // entry (never under polled step); empty until then.
             external_bindings: Vec::new(),
             external_sources_collected: false,
             params_in_force,
+            node_env_left_out,
             // No refusal yet; set the first time
             // `collect_external_sources` rejects a self-source-less external node.
             external_refusal: None,
@@ -11675,8 +12093,10 @@ impl GraphRuntime {
                 // the resume side rather than the sharper "drain-to-latest"
                 // — both keep the whole band, so only the note's wording
                 // differs. (The format itself CAN say `Some({})`, and the
-                // reader rules for it are pinned; the carrier just has no
-                // node worth spending 4 bytes per anchor to say it about.)
+                // reader rules for it are pinned. A RUNNING node's section
+                // never says it; a stopped node's version-5 section always
+                // carries a table, empty when this leaves `None`, because a
+                // later tail follows it.)
                 state.input_service = self.service_cursors.get(id.as_str()).map(|cursors| {
                     cursors
                         .iter()
@@ -13075,7 +13495,7 @@ impl GraphRuntime {
         // recheck loop now POLLS every external fd/doorbell source each recheck
         // (`monitor_wait_block` → `park_poll_fd_ready`) and drains Notified
         // listeners inline — so external readiness wakes the park at the recheck
-        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / degraded
+        // cadence (≤~100µs) on EVERY tier (WFE / WAITPKG / MWAITX / degraded
         // sleep-recheck), NOT at the ≤250ms `live_timeout` sweep cadence the
         // earlier fd-skip left it at. Correctness always held (the sweep is
         // level-triggered / rings-delta'd and runs every live_step); the park's fd watch
@@ -13804,7 +14224,7 @@ impl GraphRuntime {
                 || self.has_credit_edges()
             {
                 // A shallow monitor-wait park replaces the blocking
-                // WaitSet wait, so the core stays in a SHALLOW C0.1/WFE state (no
+                // WaitSet wait, so the core stays in a SHALLOW C0.1/C0/WFE state (no
                 // deep cpuidle C-state) during the inter-step idle — removing the
                 // ~18µs C-state cold-wake the epoll-block suffers.
                 // Under the doorbell policy it ALSO arms on the
@@ -14080,7 +14500,7 @@ impl GraphRuntime {
     /// [`Self::monitor_wait_block`]'s recheck loop `poll(2)` every external
     /// fd/doorbell source each recheck (≤~100 µs, record-only via
     /// [`park_poll_fd_ready`]), so the park now wakes promptly on an fd on ALL
-    /// tiers (WFE / WAITPKG / degraded sleep-recheck) and the exclusion is GONE.
+    /// tiers (WFE / WAITPKG / MWAITX / degraded sleep-recheck) and the exclusion is GONE.
     /// This is still the ONE choke point every park-vs-reactor decision reads
     /// (reactor build in `run_live` + the test seam, the `live_step` park branch,
     /// the wait-policy telemetry line); external graphs now park uniformly. The
@@ -14186,6 +14606,60 @@ impl GraphRuntime {
             true,
             self.has_armed_line(),
         )
+    }
+
+    /// Is the period-park on for this runtime: the test seam, else
+    /// `CERULION_PERIOD_PARK=1`.
+    fn period_park_on(&self) -> bool {
+        self.period_park_override
+            .unwrap_or_else(|| super::period_park::env_mode().on())
+    }
+
+    /// Does the period-park apply to this park block? Only where every wake the
+    /// park waits for can end a kernel nap, or has none: the monitor-wait park
+    /// is active and real on this host, no barrier or credit word is waited on,
+    /// no external fd is polled, and a data input written from outside this
+    /// runtime has an armed line and the doorbell wake word. With no such input
+    /// every input is written by this runtime's own nodes inside its own step,
+    /// and the loop top sees it before any nap. Anywhere else the park runs as
+    /// it does with the switch off.
+    fn period_park_applies(&self, sources: &[(waitset::WaitSource<'_>, Arc<str>)]) -> bool {
+        super::period_park::admits(
+            self.period_park_gate(
+                sources
+                    .iter()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            ),
+        )
+    }
+
+    /// This runtime's period-park gate, given whether the park polls an
+    /// external fd source.
+    fn period_park_gate(&self, fd_sources: bool) -> super::period_park::Gate {
+        super::period_park::Gate {
+            on: self.period_park_on(),
+            park_active: self.park_active(),
+            primitive: crate::monitor_wait::monitor_wait_available(),
+            barrier: self.barrier_participant.is_some(),
+            credit_edges: !self.credit_park_edges.is_empty(),
+            fd_sources,
+            outside_inputs: self.outside_input_topics > 0,
+            armed_line: self.has_armed_line(),
+            data_wake: self.data_wake_rung(),
+        }
+    }
+
+    /// Test seam: the reason a requested period-park would not engage on this
+    /// runtime's wiring (the `reason` field of its warning), or `None` where it
+    /// would, with the host's CPU monitor-wait primitive taken as held, so the
+    /// wiring is judged on every host.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn period_park_wiring_refusal_for_test(&self) -> Option<&'static str> {
+        super::period_park::refusal(super::period_park::Gate {
+            primitive: true,
+            ..self.period_park_gate(false)
+        })
+        .map(|r| r.as_str())
     }
 
     /// Test seam over [`Self::data_wake_rung`], the decision the wait policy
@@ -14375,7 +14849,7 @@ impl GraphRuntime {
     /// chunks [`Self::monitor_wait_block`] has performed, whichever mechanism
     /// paced each (see the `park_recheck_naps` field doc; the os_sync-paced
     /// subset is [`Self::park_os_sync_nap_count_for_test`]). 0 on primitive
-    /// targets — the real UMWAIT/WFE park never takes the `!performed` arm.
+    /// targets; the real UMWAIT/MWAITX/WFE park never takes the `!performed` arm.
     /// (Renamed from `park_recheck_sleep_count_for_test` with the field.)
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_recheck_nap_count_for_test(&self) -> u64 {
@@ -14401,7 +14875,7 @@ impl GraphRuntime {
     /// a context whose rung applies reports `> 0` here after
     /// parking; reverting the swap zeroes it while the pins stay green
     /// (the wake word is additive latency, not new semantics). 0 whenever that
-    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park box (Linux WAITPKG/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
+    /// rung's own primitive is unavailable, which tier-gate assertions key on; on a HARDWARE-park host (Linux WAITPKG/MWAITX/WFE) it is ALSO 0 (the `!performed` arm never runs, pin 6's hardware arm).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn park_wake_word_block_count_for_test(&self) -> u64 {
         self.park_wake_word_blocks
@@ -14460,6 +14934,33 @@ impl GraphRuntime {
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_single_park_for_test(&mut self, forced: Option<bool>) {
         self.single_park_override = forced;
+    }
+
+    /// Test seam: force the period-park on (`Some(true)`) or off
+    /// (`Some(false)`) for this runtime, over the process-wide
+    /// `CERULION_PERIOD_PARK` read; `None` lets the env decide.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_period_park_for_test(&mut self, forced: Option<bool>) {
+        self.period_park_override = forced;
+    }
+
+    /// Test seam: the period-park's record-only counters.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn period_park_stats_for_test(&self) -> super::period_park::PeriodParkStats {
+        self.period_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats
+    }
+
+    /// Test seam: run `hook` in the step's drain right after each per-set Sync
+    /// node's listeners are emptied and its align pass has read every one of
+    /// its inputs. A frame the hook publishes then lands after the pass that
+    /// read the node's queues, at a fixed point in the drain. `None` removes
+    /// it.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn set_sync_align_hook_for_test(&mut self, hook: Option<Box<dyn FnMut() + Send>>) {
+        self.sync_align_hook = hook;
     }
 
     /// Holistic-review L6 (test seam): is a WaitSet reactor currently
@@ -14608,7 +15109,7 @@ impl GraphRuntime {
     /// os_sync) the predicate above is no longer merely POLLED at the
     /// recheck cadence: the `!performed` arm sets the rank's `parked` bit
     /// (RAII `ParkedRankGuard`, scoped to the block: a
-    /// hardware CPU park never sets it, so arrivers on WAITPKG/WFE machines pay
+    /// hardware CPU park never sets it, so arrivers on WAITPKG/MWAITX/WFE machines pay
     /// no futile wake syscall) and kernel-blocks on the barrier's
     /// `wake_seq` epoch instead of the pacing sleep — every arrive/open/drop
     /// bumps the epoch (arrivers gate only the SYSCALL on the parked mask), so
@@ -14619,11 +15120,11 @@ impl GraphRuntime {
     /// kernel wake only gets us there sooner, so `park_wakes_barrier`
     /// semantics and the pins are untouched; the block itself is
     /// counted by `park_wake_word_blocks`, the mutation seam). The Linux
-    /// park-ON hardware arm (UMWAIT/WFE on the doorbell line) is untouched —
+    /// park-ON hardware arm (UMWAIT/MWAITX/WFE on the doorbell line) is untouched:
     /// the futex arm is not promoted into the scratch-word
     /// park.
     ///
-    /// **OS-cooperative hardware park:** a `UMWAIT`/`WFE`-parked
+    /// **OS-cooperative hardware park:** a `UMWAIT`/`MWAITX`/`WFE`-parked
     /// thread is RUNNING to the OS scheduler, so a park that sliced without
     /// yielding held its core for the whole idle and a co-located runnable
     /// peer (graph processes > cores under the multi-process default,
@@ -14635,7 +15136,7 @@ impl GraphRuntime {
     /// pacing chunk) and every hardware slice ends with
     /// `std::thread::yield_now()` (counted in `park_core_yields`, record-only):
     /// a co-located peer runs within one slice, the core still never enters a
-    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`WFE`
+    /// deep C-state (the ARM/Jetson benefit is kept), and `UMWAIT`/`MWAITX`/`WFE`
     /// still wake instantly on the doorbell inside a slice. Cost: one ~0.5 µs
     /// `sched_yield` per slice, idle path only. The degraded sleep and
     /// wake-word arms keep their measured 100 µs pacing (a sleeping thread
@@ -14666,10 +15167,10 @@ impl GraphRuntime {
     /// a wakeup optimization, not part of the deterministic timeline.
     ///
     /// **No busy-spin:** on a target WITHOUT a real CPU monitor-wait primitive
-    /// (this macOS box, x86 without WAITPKG, or a forced-policy test seam) the
+    /// (macOS, x86 with neither WAITPKG nor MWAITX, or a forced-policy test seam) the
     /// park primitive returns `false` (a no-op); this method then
     /// `std::thread::sleep`s the recheck instead of re-looping immediately, so it
-    /// can never busy-spin at 100% CPU. On a real WAITPKG/WFE box the primitive
+    /// can never busy-spin at 100% CPU. On a real WAITPKG/MWAITX/WFE host the primitive
     /// parks for real and returns `true`. On the DEGRADED tier (the
     /// default-ON shape on no-primitive targets) the degraded sleep is ALWAYS
     /// the chunked ~100µs sleep-recheck. The single-sleep alternative was
@@ -14705,7 +15206,7 @@ impl GraphRuntime {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Loud over silent: name the DEGRADED tier once, at the FIRST
         // park of the runtime's life (`prior_entries == 0` — the counter is
-        // monotonic, never reset). Primitive (UMWAIT/WFE) targets skip this.
+        // monotonic, never reset). Primitive (UMWAIT/MWAITX/WFE) targets skip this.
         // The tier line names the NAP MECHANISM the degraded arm
         // resolved on THIS host — the os_sync timed wait (macOS ≥ 14.4, tier
         // active) or the plain chunked sleep — so an operator reading the log
@@ -14732,7 +15233,7 @@ impl GraphRuntime {
         let recheck = Duration::from_micros(100);
         // HARDWARE park slice: the shared 20µs
         // `monitor_wait::PARK_RECHECK` (the same constant rmw's `park_block`
-        // slices at). A `UMWAIT`/`WFE`-parked thread is RUNNING to the OS
+        // slices at). A `UMWAIT`/`MWAITX`/`WFE`-parked thread is RUNNING to the OS
         // scheduler, so the hardware arm keeps its slices short and the loop
         // bottom YIELDS after every hardware slice (`park_core_yields`), so a co-located
         // runnable peer gets the core within one slice instead of at CFS
@@ -14847,7 +15348,7 @@ impl GraphRuntime {
         // eligibility — computed ONCE per park; the `parked` bit itself is now
         // set ONLY inside the `!performed` arm, scoped tightly around the
         // kernel block (its semantic: "a waiter is blocked on the wake word
-        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/WFE — `performed ==
+        // RIGHT NOW"). A hardware CPU park (Linux UMWAIT/MWAITX/WFE, `performed ==
         // true`) never reaches that arm and therefore NEVER sets the bit, so
         // arrivers on hardware-park machines pay no futile wake syscall for a
         // waiter the CPU monitor cannot hear on that line (the earlier
@@ -14868,6 +15369,23 @@ impl GraphRuntime {
         // change only WHEN this park returns, never what fires.
         let wake_word_eligible =
             !self.barrier_failed && crate::barrier::wake_word_block_primitive_available();
+
+        // The period-park (`CERULION_PERIOD_PARK=1`, see `period_park`). The plan
+        // is fixed at entry: nap in the kernel until one lead before the predicted
+        // data window or the deadline, then run the park below for what remains.
+        // `None` keeps this block exactly as it is with the switch off. Data
+        // wakes teach the arrival learner only where data can come from outside
+        // this runtime (an armed line); in-process data arrives inside the step.
+        let period_park_learns = self.has_armed_line();
+        let mut period_park = self.period_park_applies(sources).then(|| {
+            let mut st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let plan = st.plan(std::time::Instant::now(), deadline);
+            (st, plan)
+        });
+        let mut period_park_last = super::period_park::LastWait::None;
 
         loop {
             // RECORD-ONLY poll — notification queue only (mirrors `spin_sources`
@@ -14903,7 +15421,7 @@ impl GraphRuntime {
                     }
                     // Poll external/doorbell raw fds (DeviceFd +
                     // DoorbellFd) each recheck. Earlier the park SKIPPED Fd
-                    // sources, so on a primitive target (WFE/WAITPKG) an external
+                    // sources, so on a primitive target (WFE/WAITPKG/MWAITX) an external
                     // node's only wake was the pre-step sweep at the ≤250ms
                     // `live_timeout` — ~1.9Hz per hop. `park_poll_fd_ready` is a
                     // non-blocking level-triggered readiness probe (record-only —
@@ -15025,6 +15543,12 @@ impl GraphRuntime {
                     self.park_wakes_credit
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                // Record-only: a data wake teaches the period-park's learner.
+                if let Some((st, _)) = period_park.as_mut() {
+                    if period_park_learns && (listener_got || doorbell_got) {
+                        st.note_data_wake(std::time::Instant::now(), period_park_last);
+                    }
+                }
                 return true;
             }
             if std::time::Instant::now() >= park_deadline {
@@ -15039,11 +15563,74 @@ impl GraphRuntime {
                 // Record-only TIMEOUT wake attribution (Relaxed).
                 self.park_wakes_timeout
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if let Some((st, plan)) = period_park.as_mut() {
+                    st.note_timer_wake(plan.deadline, std::time::Instant::now());
+                }
                 return true;
+            }
+            // The period-park: outside the plan's window, nap in the kernel
+            // instead of parking. A ring on the armed doorbell ends the nap
+            // through the doorbell wake word (snapshot, re-derive, block: the
+            // rung's own lost-wake protocol); a runtime with no armed line has
+            // nothing outside it to ring and takes a plain timed nap. Either way
+            // the loop top re-polls every source after the nap, so a ring on
+            // another input topic is seen within one nap.
+            if let Some((st, plan)) = period_park.as_mut() {
+                use super::period_park::{LastWait, Phase, NAP};
+                let now = std::time::Instant::now();
+                match plan.phase(now) {
+                    Phase::Kernel {
+                        until,
+                        before_window,
+                    } => {
+                        let cap = until.saturating_duration_since(now).min(NAP);
+                        let target = now + cap;
+                        #[cfg(any(
+                            target_os = "macos",
+                            target_os = "linux",
+                            target_os = "android"
+                        ))]
+                        let outcome = self.doorbell_wake_word_block(baseline, cap);
+                        #[cfg(not(any(
+                            target_os = "macos",
+                            target_os = "linux",
+                            target_os = "android"
+                        )))]
+                        let outcome = crate::monitor_wait::AddrParkOutcome::Unavailable;
+                        let napped = match outcome {
+                            crate::monitor_wait::AddrParkOutcome::RingPending => false,
+                            crate::monitor_wait::AddrParkOutcome::Parked => true,
+                            crate::monitor_wait::AddrParkOutcome::Unavailable => {
+                                let _ = crate::monitor_wait::park_nap(cap);
+                                true
+                            }
+                        };
+                        if napped {
+                            // A signal ends the kernel wait early too, so an
+                            // early return is a data cut only if the armed
+                            // line rang.
+                            let rang = primary_expected.is_some_and(|expected| {
+                                self.armed_primary_topic()
+                                    .and_then(|t| self.doorbell_registry.as_ref()?.bell(t))
+                                    .is_some_and(|bell| bell.seq() != expected)
+                            });
+                            st.note_kernel_sleep(target, std::time::Instant::now(), rang);
+                            self.park_slices
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            period_park_last = if before_window {
+                                LastWait::KernelBeforeWindow
+                            } else {
+                                LastWait::KernelOther
+                            };
+                        }
+                        continue;
+                    }
+                    Phase::Hot => period_park_last = LastWait::Hot,
+                }
             }
             // Shallow-park until the next recheck (or, with `single_park`, the
             // WHOLE remaining time) or the park deadline. With a doorbell, arm
-            // `UMONITOR`/`WFE` on the PRIMARY line against the pre-park snapshot so
+            // `UMONITOR`/`MONITORX`/`WFE` on the PRIMARY line against the pre-park snapshot so
             // a producer store wakes it early (the primitive's own arm-time
             // re-check closes the arm-window race); without one, park on a scratch
             // word (timer only). `single_park` passes `timeout` as the recheck cap
@@ -15387,10 +15974,12 @@ impl GraphRuntime {
     /// PARTICIPANT ignores this knob — the hardware monitor never arms on the
     /// barrier's `remaining` word, so a whole-window park (or single sleep)
     /// would blind the `peers_waiting` step-start wake until the park deadline.
-    /// Caveat: on x86 (`UMWAIT` honors the recheck cap) a single park
+    /// Caveat: under `MWAITX` (no OS limit on its timer) a single park
     /// covers the WHOLE window in one slice with no yield boundary, so a
     /// co-located runnable peer waits out the window — the exact same-core
-    /// starvation the default chunked-and-yielding shape fixes. Measurement
+    /// starvation the default chunked-and-yielding shape fixes. Under `UMWAIT`
+    /// Linux's time limit (`umwait_control/max_time`, 100000 TSC cycles by
+    /// default) ends each wait early, so the loop still yields. Measurement
     /// knob only; never set it on an oversubscribed box. (aarch64 `WFE` still
     /// returns at the ~100µs event stream regardless, so the loop — and its
     /// per-slice yield — keeps running there.)
@@ -15477,17 +16066,17 @@ impl GraphRuntime {
     /// (previously the `--sim-clock` flag). (The loop first landed
     /// as opt-in; a later change flipped the default.)
     ///
-    /// **Timeout (period-deadline precision):** each iteration's
-    /// WaitSet timeout is the MINIMUM of (a) the scheduler's
-    /// [`Scheduler::ns_until_next_fire`] — nanoseconds until the soonest
-    /// pending `Period` deadline — and (b) a 250 ms liveliness-sweep cadence
-    /// cap (matching the 25a heartbeat), clamped to a 1 ms floor. So a
-    /// `period_ms` node fires on time between data events instead of at coarse
-    /// heartbeat granularity, while the cadence cap still bounds non-data
-    /// liveliness sweeps and the 1 ms floor bounds CPU when a Period node is
-    /// past-due. A data wake returns immediately regardless of the timeout (the
-    /// WaitSet unblocks on the event), so the timeout only governs the
-    /// no-data-arriving case.
+    /// **Timeout (period-deadline precision):** each iteration's wait is
+    /// `live_wait_ns` over the scheduler's pending fires: a `Period` deadline
+    /// still ahead is waited for exactly (at least 10 µs), every other pending
+    /// fire (a node due now, a Period node past its deadline, a throttle
+    /// window, a `block` release) at no less than a 1 ms poll, and nothing
+    /// pending at the 250 ms liveliness-sweep cadence (matching the 25a
+    /// heartbeat). So a `period_ms` node fires on its deadline between data
+    /// events, the poll bounds CPU while a node is due but not firing, and the
+    /// cadence cap still bounds non-data liveliness sweeps. A data wake returns
+    /// immediately regardless of the timeout (the WaitSet unblocks on the
+    /// event), so the timeout only governs the no-data-arriving case.
     ///
     /// **Firewall:** `run_live` only changes WHEN `step()` runs, never its
     /// body. The reactor's fired-set is ignored; `step`/`drain_level`
@@ -15613,6 +16202,36 @@ impl GraphRuntime {
             primary_topic = tracing::field::display(self.armed_primary_topic().unwrap_or("none")),
             "live loop wait policy"
         );
+        // The period-park, as THIS process resolved it, at each live-loop entry,
+        // so a run's log shows whether it engages and, once, why not.
+        let period_park_at_entry = self
+            .period_park
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stats;
+        if self.period_park_override.is_none()
+            && super::period_park::env_mode() == super::period_park::Mode::Unrecognized
+        {
+            tracing::warn!(
+                graph = %self.config.identity(),
+                value = %std::env::var("CERULION_PERIOD_PARK").unwrap_or_default(),
+                "CERULION_PERIOD_PARK is set to a value other than 1 or 0; the period park stays off"
+            );
+        }
+        // Requested: either the `on` line, or one WARN per runtime naming the
+        // first term that refuses it. Only an engaged period-park reports exit
+        // telemetry.
+        let period_park_engaged = {
+            let gate = self.period_park_gate(
+                self.external_wake_sources()
+                    .any(|(s, _)| matches!(s, waitset::WaitSource::Fd(_))),
+            );
+            let mut st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            super::period_park::announce(gate, &mut st.warned, self.config.identity())
+        };
 
         // Entry snapshot of the (lifetime-cumulative) park counters so
         // the exit line reports THIS run's deltas — a resumed `run_live` must
@@ -15773,6 +16392,28 @@ impl GraphRuntime {
             park_core_yields = core_yields_now - core_yields_at_entry,
             "live loop park telemetry"
         );
+        if period_park_engaged {
+            let st = self
+                .period_park
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let s = st.stats.since(period_park_at_entry);
+            tracing::info!(
+                graph = %self.config.identity(),
+                blocks = s.blocks,
+                predicted_blocks = s.predicted_blocks,
+                kernel_sleeps = s.kernel_sleeps,
+                kernel_sleeps_cut_by_data = s.kernel_sleeps_cut_by_data,
+                timer_wakes = s.timer_wakes,
+                timer_late = s.timer_late,
+                data_wakes = s.data_wakes,
+                data_caught_hot = s.data_caught_hot,
+                data_before_window = s.data_before_window,
+                lead_us = st.lead.lead_ns() / 1_000,
+                data_regular = st.arrivals.regular(),
+                "live loop period park telemetry"
+            );
+        }
 
         // Delivery-accounting twin of the park telemetry (once at
         // loop exit): per data-trigger-bound input — fires + the input's
@@ -15821,23 +16462,16 @@ impl GraphRuntime {
         Ok(())
     }
 
-    /// The live-loop WaitSet timeout for the NEXT iteration —
-    /// `min(`[`Scheduler::ns_until_next_fire`]`, 250 ms liveliness-sweep cap)`,
-    /// floored at 1 ms. Shared by [`Self::run_live`]'s loop and the test seam
-    /// [`Self::live_timeout_for_test`] so the period-deadline integration is
-    /// directly pinnable (a freshly-built `period_ms = N` graph yields ~`N` ms,
-    /// NOT the coarse 250 ms heartbeat). PURE READ — `now_ns` + the scheduler's
-    /// pending Period deadlines; no mutation, never on the firing path.
-    ///
-    /// The 250 ms cap is the liveliness-sweep cadence (matches the 25a
-    /// heartbeat); the 1 ms floor is the old poll cadence (= the minimum
-    /// `period_ms` granularity, so it never under-shoots a real period) and
-    /// bounds CPU when a Period node is past-due. A data wake returns
-    /// immediately regardless of this timeout, so it only governs the
-    /// no-data-arriving case.
+    /// The live-loop wait for the NEXT iteration: [`live_wait_ns`] over the
+    /// scheduler's [`Scheduler::next_fire_split`] and, under a fixed-quantum
+    /// gating clock, the distance to the next quantum boundary. Shared by
+    /// [`Self::run_live`]'s loop and the test seam [`Self::live_timeout_for_test`]
+    /// so the period-deadline integration is directly pinnable (a freshly-built
+    /// `period_ms = N` graph yields ~`N` ms, NOT the coarse 250 ms heartbeat).
+    /// PURE READ: `now_ns` + the scheduler's pending deadlines; no mutation,
+    /// never on the firing path. A data wake returns immediately regardless of
+    /// this timeout, so it only governs the no-data-arriving case.
     fn live_timeout(&self) -> Duration {
-        const LIVELINESS_SWEEP_NS: u64 = 250_000_000;
-        const MIN_TIMEOUT_NS: u64 = 1_000_000;
         let now_ns = self.live_deadline_now_ns();
         // Read BEFORE the wait is sized: a drain of a mapped edge that lands
         // between this read and the park entry must still wake the park
@@ -15846,34 +16480,32 @@ impl GraphRuntime {
             e.sized_full
                 .store(e.word.outstanding() >= e.threshold, Ordering::Release);
         }
-        let next_fire_ns = self.scheduler.ns_until_next_fire(now_ns);
-        let mut wake_ns = next_fire_ns.unwrap_or(LIVELINESS_SWEEP_NS);
+        let next = self.scheduler.next_fire_split(now_ns);
         // Under a FIXED-quantum gating clock a step advances gating by exactly
         // one handed quantum however long the wait was, so a wait longer than
         // the distance to the next quantum boundary would leave gating behind
         // wall by the excess (a 20 ms Period over a 5 ms quantum would then
         // take ≈ P²/2q of wall per fire). Cap the wait at that boundary so
         // gating tracks wall one quantum per step; with quantum == period this
-        // is exactly the Period deadline. Only while a Period deadline is
-        // pending: a purely data-driven rank has nothing gating-paced to wake
-        // for (its 1 ms fallback quantum would otherwise turn the sweep into a
-        // 1 kHz poll), and a gating-follows-wall (free-run) clock advances by
-        // the measured wait, so it never falls behind.
-        if let (Some(quantum), Some(_), false) = (
+        // is exactly the Period deadline. Only while a fire is pending: a
+        // purely data-driven rank has nothing gating-paced to wake for (its
+        // 1 ms fallback quantum would otherwise turn the sweep into a 1 kHz
+        // poll), and a gating-follows-wall (free-run) clock advances by the
+        // measured wait, so it never falls behind.
+        let quantum_boundary_ns = match (
             self.live_gating_quantum,
-            next_fire_ns,
+            next.soonest(),
             self.gating_follows_wall,
         ) {
-            let boundary_ns = self
-                .scheduler
-                .gating_now_ns()
-                .saturating_add(quantum.as_nanos() as u64)
-                .saturating_sub(now_ns);
-            wake_ns = wake_ns.min(boundary_ns);
-        }
-        // clamp(floor, cap): MIN_TIMEOUT_NS (1 ms) < LIVELINESS_SWEEP_NS (250 ms),
-        // so the floor ≤ cap invariant holds (clamp would panic if floor > cap).
-        Duration::from_nanos(wake_ns.clamp(MIN_TIMEOUT_NS, LIVELINESS_SWEEP_NS))
+            (Some(quantum), Some(_), false) => Some(
+                self.scheduler
+                    .gating_now_ns()
+                    .saturating_add(quantum.as_nanos() as u64)
+                    .saturating_sub(now_ns),
+            ),
+            _ => None,
+        };
+        Duration::from_nanos(live_wait_ns(next, quantum_boundary_ns))
     }
 
     /// Test-only: the next live-loop WaitSet timeout
@@ -16972,10 +17604,13 @@ impl GraphRuntime {
 
     /// Test-only: change the dead-node reclaim thread's cadence (production:
     /// [`LIVELINESS_CLEANUP_PERIOD_MS`]). Applies at once, including to a wait
-    /// already in progress. A huge value PARKS the walk (the zero-alloc gates
-    /// use this to keep it out of their measured windows); a small one lets a
-    /// test observe a pass without waiting the production 2 s. No-op when the
-    /// runtime has no liveliness watches (no thread).
+    /// already in progress, and returns only after a pass already under way
+    /// has ended, so [`Self::liveliness_cleanup_call_count`] read after it
+    /// moves only when the new period elapses. A huge value PARKS the walk
+    /// (the zero-alloc gates use this to keep it out of their measured
+    /// windows); a small one lets a test observe a pass without waiting the
+    /// production 2 s. No-op when the runtime has no liveliness watches (no
+    /// thread).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn set_liveliness_cleanup_period_for_test(&mut self, ms: u64) {
         if let Some(c) = &self.liveliness_cleanup {
@@ -17047,6 +17682,16 @@ impl GraphRuntime {
         // hot-path-alloc-ok: not a heap allocation: the clone is one `Arc`
         // refcount bump, taken before the run, never on a fire
         self.tick_panic_records.clone()
+    }
+
+    /// The variables this build left out of the environment snapshot its
+    /// nodes read (`ctx.env`, `ctx.env_str`, `ctx.env_opt`), because a name
+    /// or a value is not valid UTF-8.
+    ///
+    /// The build logs nothing about them. The process that owns the run
+    /// reports them once with [`NodeEnvLeftOut::warn`].
+    pub fn node_env_left_out(&self) -> &NodeEnvLeftOut {
+        &self.node_env_left_out
     }
 
     /// Every node stopped by a `NodeError::Fatal` from its tick during this
@@ -17997,8 +18642,9 @@ impl GraphRuntime {
         self.scheduler.is_replay_driven()
     }
 
-    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return or by the
-    /// consecutive-panic breaker, so it will not fire again in this run? See
+    /// Is `node_id` stopped: disabled by a `NodeError::Fatal` return, by the
+    /// consecutive-panic breaker or by [`Self::restore_stopped_nodes`], so it
+    /// will not fire again in this run? See
     /// [`crate::scheduler::Scheduler::is_node_disabled`]. The replay engine
     /// reads it after each step to learn where a re-executed node stopped.
     pub fn is_node_stopped(&self, node_id: &str) -> bool {
@@ -18606,6 +19252,111 @@ impl GraphRuntime {
         }
     }
 
+    /// Keep each node in `stops` stopped on a runtime about to resume, as a
+    /// recording's framework sections state it
+    /// ([`crate::state_restore::StoppedAtAnchor`]). Called after the build and
+    /// before the first [`Self::step`], like every other restore seam.
+    ///
+    /// The node fires no more and this run records no failure for it
+    /// ([`Self::node_fatal_errors`] does not name it); see
+    /// [`crate::scheduler::Scheduler::restore_stopped_nodes`].
+    ///
+    /// Each `block` slot such a node holds as a consumer is then released, as
+    /// the node's live stop released it, so a producer it paced is not held
+    /// at depth by a consumer that will never drain. The release is SILENT:
+    /// no warning, and no `backpressure_block_slot_releases_count` bump. The
+    /// recorded run counted and announced that release when the node stopped,
+    /// and this run restores the stop rather than performing it again.
+    ///
+    /// A node whose entry states an unconsumed arrival
+    /// ([`crate::state_restore::StoppedAtAnchor::unconsumed_arrival`]) and
+    /// whose trigger input is per-message FIFO, drained through the node's own
+    /// subscriber, resumes with that input holding a frame. The recorded drain
+    /// had popped a frame no tick took, and every later boundary re-offered it,
+    /// popping nothing, consulting no read gate and recording nothing; the
+    /// restored binding answers each boundary the same way. The frame itself is
+    /// not restored: a stopped node never reads it. Every other trigger input
+    /// reads past the arrival: a `consume = latest` drain and a separate drain
+    /// subscriber consult their queue at every boundary, a frame held or not.
+    ///
+    /// Returns the nodes whose trigger input it restored holding a frame, in id
+    /// order.
+    ///
+    /// # Errors
+    ///
+    /// Nothing changes on either refusal.
+    ///
+    /// * [`TransportError::GraphError`] once this runtime has collected its
+    ///   external sources (it has run a live session), as
+    ///   [`Self::restore_node_states`] refuses.
+    /// * [`TransportError::NodeNotFound`] for an id this graph does not hold.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    pub fn restore_stopped_nodes(
+        &mut self,
+        stops: &std::collections::BTreeMap<String, crate::state_restore::StoppedAtAnchor>,
+    ) -> TransportResult<std::collections::BTreeSet<String>> {
+        if self.external_sources_collected {
+            return Err(TransportError::GraphError {
+                reason: format!(
+                    "graph '{}': a stop restore was attempted on a runtime that has already \
+                     collected its external sources (it has run a live session), so the stop \
+                     would land part way through a run rather than before its first step. Fix: \
+                     restore on a FRESHLY BUILT runtime (restore runs after the build and before \
+                     the first step)",
+                    self.config.identity()
+                ),
+            });
+        }
+        let ids: std::collections::BTreeSet<String> = stops.keys().cloned().collect();
+        self.scheduler.restore_stopped_nodes(&ids)?;
+        self.release_block_slots_held_by(&ids);
+        Ok(self.hold_restored_trigger_heads(stops))
+    }
+
+    /// Mark the trigger binding of each node in `stops` that states an
+    /// unconsumed arrival as holding a frame, when that binding is a
+    /// per-message FIFO input drained through the node's own subscriber, and
+    /// return those nodes. Called only after `Scheduler::restore_stopped_nodes`
+    /// has accepted `stops`.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    fn hold_restored_trigger_heads(
+        &mut self,
+        stops: &std::collections::BTreeMap<String, crate::state_restore::StoppedAtAnchor>,
+    ) -> std::collections::BTreeSet<String> {
+        let mut held = std::collections::BTreeSet::new();
+        for binding in &mut self.data_trigger_bindings {
+            let unconsumed = stops
+                .get(binding.node_id.as_ref())
+                .is_some_and(|stop| stop.unconsumed_arrival);
+            if unconsumed
+                && matches!(binding.drain, DrainSource::Unified { .. })
+                && !binding.consume_latest
+            {
+                binding.trigger_head_held = true;
+                held.insert(binding.node_id.to_string());
+            }
+        }
+        held
+    }
+
+    /// Release every `block` slot a node in `ids` holds as a consumer, with no
+    /// event and no counter bump.
+    ///
+    /// Called only after `Scheduler::restore_stopped_nodes` has accepted
+    /// `ids`, so every id names a node this runtime runs. For such a node,
+    /// each retained `block_credit_edges` entry whose consumer it is holds a
+    /// clone of the word its tick callback holds in a `HeldBlockSlot`, so this
+    /// releases exactly the slots `release_held_block_slots` releases on a
+    /// live stop. A cross-process word is the shared page, so the producer in
+    /// the other process stops waiting too.
+    fn release_block_slots_held_by(&self, ids: &std::collections::BTreeSet<String>) {
+        for edge in &self.block_credit_edges {
+            if ids.contains(&edge.consumer_node) {
+                edge.outstanding.release_slot();
+            }
+        }
+    }
+
     /// Raise each capture-time trigger input's capture high-water AND the
     /// scheduler's wire-stamp epoch high-water for it to the recorded stamp.
     ///
@@ -18710,6 +19461,69 @@ impl GraphRuntime {
             version: RUN_TOPOLOGY_VERSION,
             nodes: self.topology_nodes.clone(),
         }
+    }
+
+    /// Install this runtime's fire tap and return it. Later calls return the
+    /// first tap and ignore `config`.
+    ///
+    /// Record `node` is the index into [`Self::run_topology`]'s nodes, and the
+    /// tap's `in_tick` reads each node's in-tick marker. Installing also asks
+    /// every entry whether it can report its output commits, which
+    /// `run_topology` then reports as `reports_writes`. An entry that reports
+    /// no writes here, its probe panicking included, is not asked again: its
+    /// fires carry `WROTE_UNKNOWN` and it keeps ticking. Ticks record nothing
+    /// until a reader arms the tap with [`FireTap::serve`].
+    // hot-path-alloc-ok-fn: cold: a run host installs telemetry once, outside node execution
+    pub fn install_fire_tap(&mut self, config: FireTapConfig) -> Arc<FireTap> {
+        if let Some(installed) = self.fire_tap.get() {
+            return Arc::clone(&installed.tap);
+        }
+        let mut counts = Vec::new();
+        for node in &mut self.topology_nodes {
+            counts.clear();
+            counts.resize(node.outputs.len(), 0);
+            let Some(entry) = self.nodes.get(&node.id) else {
+                node.reports_writes = false;
+                continue;
+            };
+            // The guard lives outside the catch, so a probe panic poisons
+            // nothing and the node's tick callback still takes its lock.
+            let entry = entry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let probed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                entry.output_commit_counts(&mut counts)
+            }));
+            node.reports_writes = probed.unwrap_or_else(|payload| {
+                tracing::warn!(
+                    node_id = %node.id,
+                    error = %panic_payload_msg(payload.as_ref()),
+                    "node's output commit-count probe panicked; it reports no writes"
+                );
+                false
+            });
+        }
+        let recorded = self.topology_nodes.len().min(FIRE_NODE_LIMIT);
+        let in_tick = self.topology_nodes[..recorded]
+            .iter()
+            .map(|node| match self.handles.get(&node.id) {
+                Some(handle) => handle.in_tick_marker(),
+                None => Arc::new(AtomicU64::new(0)),
+            })
+            .collect();
+        let installed = FireInstall {
+            tap: Arc::new(FireTap::new(
+                config,
+                recorded as u16,
+                in_tick,
+                Arc::clone(&self.fire_clock),
+            )),
+            reports_writes: self.topology_nodes[..recorded]
+                .iter()
+                .map(|node| node.reports_writes)
+                .collect(),
+        };
+        Arc::clone(&self.fire_tap.get_or_init(|| installed).tap)
     }
 
     /// Shutdown the graph runtime.
@@ -19002,6 +19816,148 @@ fn shared_start_decision(
 }
 
 #[cfg(test)]
+mod live_wait_tests {
+    use super::{live_wait_ns, LIVE_DEADLINE_FLOOR_NS, LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS};
+    use crate::scheduler::NextFire;
+
+    const US: u64 = 1_000;
+    const MS: u64 = 1_000_000;
+
+    fn next(deadline: Option<u64>, poll: Option<u64>) -> NextFire {
+        NextFire {
+            deadline_ns: deadline,
+            poll_ns: poll,
+        }
+    }
+
+    /// The wait the live loop sized before the exact deadline: the soonest of
+    /// everything, capped at the boundary, clamped to [1 ms, 250 ms].
+    fn single_floor_oracle(n: NextFire, boundary: Option<u64>) -> u64 {
+        match n.soonest() {
+            None => LIVE_WAIT_CAP_NS,
+            Some(soonest) => boundary
+                .map_or(soonest, |b| soonest.min(b))
+                .clamp(LIVE_POLL_FLOOR_NS, LIVE_WAIT_CAP_NS),
+        }
+    }
+
+    #[test]
+    fn a_period_deadline_below_a_millisecond_is_waited_for_exactly() {
+        assert_eq!(live_wait_ns(next(Some(300 * US), None), None), 300 * US);
+        assert_eq!(live_wait_ns(next(Some(999 * US), None), None), 999 * US);
+        assert_eq!(live_wait_ns(next(Some(4 * MS), None), None), 4 * MS);
+    }
+
+    #[test]
+    fn a_deadline_closer_than_the_deadline_floor_waits_the_floor() {
+        assert_eq!(LIVE_DEADLINE_FLOOR_NS, 10 * US);
+        assert_eq!(live_wait_ns(next(Some(1), None), None), 10 * US);
+        assert_eq!(live_wait_ns(next(Some(9_999), None), None), 10 * US);
+        assert_eq!(live_wait_ns(next(Some(10_001), None), None), 10_001);
+    }
+
+    #[test]
+    fn every_other_pending_fire_keeps_the_millisecond_poll() {
+        assert_eq!(LIVE_POLL_FLOOR_NS, MS);
+        assert_eq!(live_wait_ns(next(None, Some(0)), None), MS, "due now");
+        assert_eq!(
+            live_wait_ns(next(None, Some(300 * US)), None),
+            MS,
+            "a window below 1 ms"
+        );
+        assert_eq!(
+            live_wait_ns(next(None, Some(7 * MS)), None),
+            7 * MS,
+            "a later release"
+        );
+    }
+
+    #[test]
+    fn a_deadline_and_a_poll_take_the_sooner_of_their_floored_waits() {
+        assert_eq!(live_wait_ns(next(Some(300 * US), Some(0)), None), 300 * US);
+        assert_eq!(live_wait_ns(next(Some(5 * MS), Some(0)), None), MS);
+        assert_eq!(live_wait_ns(next(Some(2 * US), Some(0)), None), 10 * US);
+    }
+
+    #[test]
+    fn nothing_pending_or_a_far_wait_is_capped_at_the_liveliness_sweep() {
+        assert_eq!(LIVE_WAIT_CAP_NS, 250 * MS);
+        assert_eq!(live_wait_ns(next(None, None), None), 250 * MS);
+        assert_eq!(live_wait_ns(next(None, None), Some(3 * MS)), 250 * MS);
+        assert_eq!(live_wait_ns(next(Some(400 * MS), None), None), 250 * MS);
+        assert_eq!(live_wait_ns(next(None, Some(900 * MS)), None), 250 * MS);
+    }
+
+    #[test]
+    fn a_quantum_boundary_is_exact_only_beside_a_deadline_still_ahead() {
+        // Beside a deadline: the sooner of the two, exact.
+        assert_eq!(
+            live_wait_ns(next(Some(4 * MS), None), Some(2_500 * US)),
+            2_500 * US
+        );
+        assert_eq!(
+            live_wait_ns(next(Some(4 * MS), None), Some(3 * US)),
+            10 * US
+        );
+        assert_eq!(
+            live_wait_ns(next(Some(400 * US), None), Some(2 * MS)),
+            400 * US
+        );
+        // Without one: it caps the poll and keeps the poll floor.
+        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(2 * MS)), 2 * MS);
+        assert_eq!(live_wait_ns(next(None, Some(5 * MS)), Some(400 * US)), MS);
+        assert_eq!(live_wait_ns(next(None, Some(0)), Some(400 * US)), MS);
+    }
+
+    /// No case polls faster than a single 1 ms floor: wherever no Period
+    /// deadline is ahead, the wait is exactly the old one, and a deadline ahead
+    /// only ever brings the wait forward to that deadline (never below it, and
+    /// never below the deadline floor).
+    #[test]
+    fn only_a_deadline_still_ahead_waits_less_than_the_single_floor_did() {
+        let values = [
+            None,
+            Some(0),
+            Some(1),
+            Some(9 * US),
+            Some(10 * US),
+            Some(300 * US),
+            Some(MS - 1),
+            Some(MS),
+            Some(2 * MS),
+            Some(250 * MS),
+            Some(900 * MS),
+        ];
+        for deadline in values {
+            let deadline = deadline.filter(|&d| d > 0);
+            for poll in values {
+                for boundary in values {
+                    let n = next(deadline, poll);
+                    let new = live_wait_ns(n, boundary);
+                    let old = single_floor_oracle(n, boundary);
+                    let case = format!("deadline {deadline:?} poll {poll:?} boundary {boundary:?}");
+                    match deadline {
+                        None => assert_eq!(new, old, "{case}"),
+                        Some(d) => {
+                            assert!(new <= old, "{case}: {new} > {old}");
+                            assert!(new >= LIVE_DEADLINE_FLOOR_NS, "{case}: {new}");
+                            if new < LIVE_POLL_FLOOR_NS {
+                                let exact =
+                                    boundary.map_or(d, |b| d.min(b)).max(LIVE_DEADLINE_FLOOR_NS);
+                                assert_eq!(
+                                    new, exact,
+                                    "{case}: only the deadline waits under 1 ms"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod shared_start_decision_tests {
     use super::{shared_start_decision, SharedStart};
     use std::time::Duration;
@@ -19259,6 +20215,51 @@ fn log_tick_failure_recovery(node_id: &str, suppressed: u64) {
         suppressed,
         "node tick recovered after failures"
     );
+}
+
+/// PURE: whether, in list order, every node id's entries sit in one
+/// contiguous run. The Sync drain's per-set walk relies on it: it empties a
+/// node's listeners from the node's first binding and stops at the first
+/// binding of another node.
+// hot-path-alloc-ok-fn: cold: build-time check only (one debug_assert per graph build)
+fn sync_bindings_contiguous<'a>(node_ids: impl IntoIterator<Item = &'a str>) -> bool {
+    let mut seen: Vec<&'a str> = Vec::new();
+    for id in node_ids {
+        if seen.last() == Some(&id) {
+            continue;
+        }
+        if seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+    }
+    true
+}
+
+#[cfg(test)]
+mod sync_binding_order_tests {
+    use super::sync_bindings_contiguous;
+
+    #[test]
+    fn a_node_whose_bindings_are_split_by_another_nodes_is_not_contiguous() {
+        // (node ids in binding order, contiguous)
+        let cases: [(&[&str], bool); 7] = [
+            (&[], true),
+            (&["a"], true),
+            (&["a", "a"], true),
+            (&["a", "a", "b", "b", "c"], true),
+            (&["a", "b", "a"], false),
+            (&["a", "a", "b", "c", "a"], false),
+            (&["a", "b", "b", "a", "b"], false),
+        ];
+        for (ids, want) in cases {
+            assert_eq!(
+                sync_bindings_contiguous(ids.iter().copied()),
+                want,
+                "{ids:?}"
+            );
+        }
+    }
 }
 
 fn log_drain_failure(
@@ -19523,7 +20524,21 @@ impl GraphRuntime {
                 // `&self.nodes` borrow and the `&mut self.scheduler` borrows
                 // are sequential (no aliasing).
                 let input = input_name.as_deref(); // Some for any DataTrigger binding.
+                let held = self.data_trigger_bindings[i].trigger_head_held;
+                // `GraphRuntime` exposes no way to re-enable a node, so a node
+                // restored holding a frame stays disabled for the whole run.
+                debug_assert!(
+                    !held || self.scheduler.is_node_disabled(&node_id),
+                    "a held trigger binding's node '{node_id}' is enabled"
+                );
                 let (popped, latest_ts) = match input {
+                    // A stopped node restored holding a frame
+                    // (`restore_stopped_nodes`). The recorded drain re-offered
+                    // its held head here: no pop, no read-gate consult, no
+                    // read-outcome record, and one arrival with the head's
+                    // stamp. The stamp is not in the anchor, so this answers
+                    // the arrival with none.
+                    _ if held => (1, None),
                     Some(name) => match self.nodes.get(node_id.as_ref()) {
                         Some(arc) => match arc.lock() {
                             Ok(mut g) => g.drain_trigger_input(name),
@@ -19752,44 +20767,62 @@ impl GraphRuntime {
                 continue;
             }
             // On the PER-SET path this binding's `trigger_subscribers`
-            // slot is a listener-only WAKE SOURCE, not a data receiver. Two
-            // things happen here instead of the legacy timestamp drain:
+            // slot is a listener-only WAKE SOURCE, not a data receiver. At the
+            // node's FIRST per-set binding, two things happen instead of the
+            // legacy timestamp drain, in this order:
             //
-            // 1. DRAIN ITS STALE NOTIFICATIONS. A publish onto a unified input
-            //    leaves its `SentSample` event in the standalone listener
-            //    forever if nothing on the step path takes it, and the live
-            //    loop's next idle poll reads the stale event as a data wake —
-            //    one spurious wake+step per publish, which under the multi-process
-            //    split is self-sustaining (the free-run class).
+            // 1. DRAIN THE STALE NOTIFICATIONS of every per-set binding of the
+            //    node. A publish onto a unified input leaves its `SentSample`
+            //    event in the standalone listener forever if nothing on the step
+            //    path takes it, and the live loop's next idle poll reads the
+            //    stale event as a data wake: one spurious wake+step per publish,
+            //    which under the multi-process split is self-sustaining (the
+            //    free-run class).
             // 2. RUN THE ALIGN PASS. It fills every unfilled head through the
             //    node lock and drives the matcher's verdicts, leaving a
-            //    complete in-window set for `decide_node` to fire — or not.
+            //    complete in-window set for `decide_node` to fire, or not.
+            //
+            // The order is the unified data-trigger drain's: empty, then read.
+            // A frame that lands after the align pass read its queue keeps its
+            // notification, so the next idle wait wakes on it. Emptying a later
+            // binding's listener after the pass would erase that notification
+            // while its sample stays queued, and the park or WaitSet would then
+            // sleep its full timeout. A frame that lands between the empty and
+            // the read is read by the pass if its head is empty, and leaves one
+            // stale wake either way: at most one spurious step, which needs a new
+            // publish in that window to recur.
             //
             // The align pass's own verdict is deliberately ignored here:
             // `decide_node` re-derives it from the heads, so there is ONE
             // authority for whether a node fires, and the burst loop is the
             // only other consumer of the outcome.
             if self.sync_input_bindings[i].per_set {
-                {
-                    let wake_listener = self.trigger_subscribers[sub_idx].listener();
-                    // iceoryx2 0.10: one `try_wait` empties the queue.
-                    let _ = wake_listener.try_wait(|_activation| {});
-                }
                 // ONCE PER NODE, not once per binding. The align pass is a
-                // WHOLE-NODE operation — it walks every declared trigger input —
+                // WHOLE-NODE operation (it walks every declared trigger input),
                 // so running it k times would re-probe every input k times, and
                 // each pass resets the per-input advance clamp, handing a k-input
                 // node k times the descent budget its own contract states.
                 //
                 // A node's bindings are pushed contiguously by the build loop
-                // (one per trigger input of one node), and the level filter above
-                // preserves that, so remembering the PREVIOUS node id is enough
-                // and costs no allocation on a path that runs every level of
-                // every step.
+                // (one per trigger input of one node; `sync_bindings_contiguous`
+                // checks it at build in debug builds), and the level filter above
+                // keeps or skips a node's bindings together, so remembering the
+                // PREVIOUS node id is enough, and the walk below stops at the
+                // first binding of another node. No allocation on a path that
+                // runs every level of every step.
                 if aligned_node.as_deref() == Some(node_id.as_ref()) {
                     continue;
                 }
                 aligned_node = Some(Arc::clone(&node_id));
+                for binding in self.sync_input_bindings[i..]
+                    .iter()
+                    .take_while(|b| b.node_id == node_id)
+                    .filter(|b| b.per_set)
+                {
+                    let wake_listener = self.trigger_subscribers[binding.subscriber_idx].listener();
+                    // iceoryx2 0.10: one `try_wait` empties the queue.
+                    let _ = wake_listener.try_wait(|_activation| {});
+                }
                 if let Err(e) = self
                     .scheduler
                     .align_sync_heads(&node_id, crate::scheduler::SyncAlignSite::Boundary)
@@ -19799,6 +20832,10 @@ impl GraphRuntime {
                         error = %e,
                         "sync alignment skipped (node absent from the scheduler)"
                     );
+                }
+                #[cfg(any(test, feature = "test-helpers"))]
+                if let Some(hook) = self.sync_align_hook.as_mut() {
+                    hook();
                 }
                 continue;
             }
@@ -20624,6 +21661,256 @@ fn validate_no_silent_data_trigger(
     })
 }
 
+/// The process environment as the nodes of one graph read it, split by
+/// [`capture_node_env`].
+struct NodeEnvCapture {
+    /// Every variable whose name and value are both valid UTF-8: the map that
+    /// `ctx.env`, `ctx.env_str` and `ctx.env_opt` read for the whole run.
+    snapshot: HashMap<String, String>,
+    /// Every variable left out of `snapshot` because its name or its value is
+    /// not valid UTF-8.
+    left_out: NodeEnvLeftOut,
+}
+
+/// The variables a graph build left out of the environment snapshot its nodes
+/// read, because a name or a value is not valid UTF-8. A node reads the
+/// default for each of them.
+///
+/// Each build records one ([`GraphRuntime::node_env_left_out`]) and logs
+/// nothing. The process that owns the run calls [`Self::warn`] once, for one
+/// of its builds: a single-process run for its build, the supervisor of a
+/// multi-process run for its planning build, a resim for its first pass. The
+/// workers and the other passes read the same environment and report nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NodeEnvLeftOut {
+    /// Sorted by bytes, each name once.
+    names: Vec<OsString>,
+}
+
+impl NodeEnvLeftOut {
+    /// The name of each variable left out, sorted by bytes, each once.
+    pub fn names(&self) -> &[OsString] {
+        &self.names
+    }
+
+    /// Warn once, naming each variable left out, or do nothing when none was.
+    ///
+    /// The message is constant. The names ride the `names` field, where each
+    /// byte that is not valid UTF-8 prints escaped (`CER_\xFF`). No value is
+    /// printed, because a value may be a secret.
+    pub fn warn(&self) {
+        if self.names.is_empty() {
+            return;
+        }
+        tracing::warn!(
+            names = ?self.names,
+            "node environment: variables whose name or value is not valid UTF-8 are left out, \
+             so ctx.env and ctx.env_str return the default for them"
+        );
+    }
+}
+
+/// Split `vars` into the snapshot the nodes read and the names left out of it.
+///
+/// A variable is kept only when both its name and its value are valid UTF-8,
+/// the case in which `std::env::var` returns its value, so a node reads the
+/// default for any other variable. The split is infallible: no name or value
+/// can fail the build, where `std::env::vars()` panics on the first variable
+/// that is not valid UTF-8.
+// hot-path-alloc-ok-fn: cold: graph BUILD, once per GraphRuntime, before the first step
+fn capture_node_env(vars: impl IntoIterator<Item = (OsString, OsString)>) -> NodeEnvCapture {
+    let mut snapshot = HashMap::new();
+    let mut left_out = Vec::new();
+    for (name, value) in vars {
+        match (name.into_string(), value.into_string()) {
+            (Ok(name), Ok(value)) => {
+                snapshot.insert(name, value);
+            }
+            (Ok(name), Err(_)) => left_out.push(OsString::from(name)),
+            (Err(name), _) => left_out.push(name),
+        }
+    }
+    left_out.sort();
+    left_out.dedup();
+    NodeEnvCapture {
+        snapshot,
+        left_out: NodeEnvLeftOut { names: left_out },
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod node_env_capture_tests {
+    //! Hand-written oracles for [`capture_node_env`] and
+    //! [`NodeEnvLeftOut::warn`]. Each input is the `(name, value)` list an
+    //! environment yields, built from raw bytes, so a name or value that is not
+    //! valid UTF-8 never enters this process's own environment. The build-level
+    //! arms, which run a real graph build in a child process, are in
+    //! `tests/env_snapshot_isolation_test.rs`.
+    use super::{capture_node_env, NodeEnvCapture};
+    use std::collections::HashMap;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt as _;
+    use tracing_test::traced_test;
+
+    fn os(bytes: &[u8]) -> OsString {
+        OsStr::from_bytes(bytes).to_os_string()
+    }
+
+    fn var(name: &[u8], value: &[u8]) -> (OsString, OsString) {
+        (os(name), os(value))
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// The warning text, typed out by hand rather than shared with the code.
+    const WARNING: &str = "node environment: variables whose name or value is not valid UTF-8 \
+                           are left out, so ctx.env and ctx.env_str return the default for them";
+
+    #[test]
+    fn node_env_capture_of_a_utf8_environment_keeps_every_pair_and_leaves_nothing_out() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_A", b"1"),
+            var(b"CER_B", b"two"),
+            var(b"PATH", b"/usr/bin:/bin"),
+        ]);
+        assert_eq!(
+            snapshot,
+            map(&[("CER_A", "1"), ("CER_B", "two"), ("PATH", "/usr/bin:/bin")])
+        );
+        assert!(
+            left_out.names().is_empty(),
+            "nothing is left out: {left_out:?}"
+        );
+    }
+
+    #[test]
+    fn node_env_capture_of_an_empty_environment_is_empty() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `caf\xc3\xa9` is "café" in UTF-8, a two-byte sequence the split must
+    /// not mistake for invalid bytes; an empty value is still a value.
+    #[test]
+    fn node_env_capture_keeps_a_multibyte_utf8_value_and_an_empty_value() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_LAYOUT", b"caf\xc3\xa9"), var(b"CER_EMPTY", b"")]);
+        assert_eq!(snapshot, map(&[("CER_LAYOUT", "café"), ("CER_EMPTY", "")]));
+        assert!(left_out.names().is_empty(), "{left_out:?}");
+    }
+
+    /// `\xff\xfe` is never UTF-8, and `caf\xe9` is "café" in Latin-1, where
+    /// `\xe9` starts a three-byte UTF-8 sequence that never finishes. Each is
+    /// left out by name; the UTF-8 neighbour is kept.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_value_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_LATIN1", b"caf\xe9"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_LATIN1"), os(b"CER_X")]);
+    }
+
+    /// A name that is not valid UTF-8 is left out whole: no lossy key such as
+    /// `CER_\u{FFFD}` appears in the snapshot.
+    #[test]
+    fn node_env_capture_leaves_out_a_non_utf8_name_and_names_it() {
+        let NodeEnvCapture { snapshot, left_out } =
+            capture_node_env([var(b"CER_\xff", b"v"), var(b"CER_KEPT", b"kept")]);
+        assert_eq!(snapshot, map(&[("CER_KEPT", "kept")]));
+        assert_eq!(left_out.names(), [os(b"CER_\xff")]);
+    }
+
+    /// The left-out names come back in byte order, each once, whatever order
+    /// and however often the environment yields them.
+    #[test]
+    fn node_env_capture_names_each_left_out_variable_once_in_byte_order() {
+        let NodeEnvCapture { snapshot, left_out } = capture_node_env([
+            var(b"CER_Z", b"\xff"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_A", b"\xfe"),
+            var(b"CER_Z", b"\xff"),
+        ]);
+        assert!(snapshot.is_empty(), "{snapshot:?}");
+        assert_eq!(
+            left_out.names(),
+            [os(b"CER_A"), os(b"CER_Z"), os(b"CER_\xff")]
+        );
+    }
+
+    /// Two splits of one environment, in opposite orders, both equal the same
+    /// hand-written oracle.
+    #[test]
+    fn node_env_capture_is_identical_for_reversed_input() {
+        let vars = vec![
+            var(b"CER_KEPT", b"kept"),
+            var(b"CER_X", b"\xff\xfe"),
+            var(b"CER_\xff", b"v"),
+            var(b"CER_LAYOUT", b"caf\xc3\xa9"),
+        ];
+        let reversed: Vec<_> = vars.iter().rev().cloned().collect();
+        for input in [vars, reversed] {
+            let NodeEnvCapture { snapshot, left_out } = capture_node_env(input);
+            assert_eq!(
+                snapshot,
+                map(&[("CER_KEPT", "kept"), ("CER_LAYOUT", "café")])
+            );
+            assert_eq!(left_out.names(), [os(b"CER_X"), os(b"CER_\xff")]);
+        }
+    }
+
+    /// The warning names every left-out variable, with its invalid byte
+    /// escaped, and carries no value: neither the secret-named one that is not
+    /// UTF-8 nor the plain value of a name that is not.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_names_every_left_out_variable_and_no_value() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([
+            var(b"CER_TOKEN", b"\xffhunter2"),
+            var(b"CER_\xff", b"plainvalue"),
+            var(b"CER_KEPT", b"kept"),
+        ]);
+        left_out.warn();
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|line| line.contains(WARNING))
+                .collect::<Vec<_>>()
+                .as_slice()
+            {
+                [line]
+                    if line.contains(" WARN ")
+                        && line.contains(r#"names=["CER_TOKEN", "CER_\xFF"]"#) =>
+                {
+                    Ok(())
+                }
+                other => Err(format!("one WARN line naming both variables: {other:#?}")),
+            }
+        });
+        for absent in ["hunter2", "plainvalue", "CER_KEPT"] {
+            assert!(!logs_contain(absent), "the warning never carries {absent}");
+        }
+    }
+
+    /// The control: nothing left out, nothing printed.
+    #[test]
+    #[traced_test]
+    fn node_env_warning_is_silent_when_nothing_is_left_out() {
+        let NodeEnvCapture { left_out, .. } = capture_node_env([var(b"CER_KEPT", b"kept")]);
+        left_out.warn();
+        assert!(!logs_contain("node environment"));
+    }
+}
+
 #[cfg(test)]
 mod chain_call_cut_tests {
     use super::{build_trigger_edges, ChainCalls, DataTriggerBinding, DrainSource, LevelPlan};
@@ -20705,6 +21992,7 @@ mod chain_call_cut_tests {
             consume_latest: false,
             probes_body: false,
             unconfirmed_arrival: false,
+            trigger_head_held: false,
         }
     }
 
@@ -22198,6 +23486,21 @@ mod tests {
             "a node with nothing to say costs only the v1 header"
         );
 
+        // A node that states only its stop takes the v2 header (the 16 bytes
+        // above plus the section's `u32` length: 20) and the 43-byte version-5
+        // section.
+        let stopped = NodeFrameworkState {
+            stopped: true,
+            ..Default::default()
+        };
+        assert!(!stopped.is_empty());
+        assert_eq!(crate::state_restore::ANCHOR_BLOB_V2_HEADER_SIZE, 20);
+        assert_eq!(
+            anchor_framing_bytes(std::slice::from_ref(&stopped)),
+            20 + 43,
+            "a stopped node with nothing else to state costs the v2 header and 43 bytes"
+        );
+
         // A node WITH a section takes the v2 header plus the section's own length,
         // and that length grows with the input NAMES — which is the whole point.
         let short = NodeFrameworkState {
@@ -22215,6 +23518,7 @@ mod tests {
             input_service: None,
             sync_capture_high_water: Default::default(),
             sync_epoch_floor: None,
+            stopped: false,
         };
         let short_bytes = anchor_framing_bytes(std::slice::from_ref(&short));
         let wide_bytes = anchor_framing_bytes(std::slice::from_ref(&wide));
@@ -22279,5 +23583,255 @@ mod tests {
         // `GraphRuntime::block_credits`.
         assert_eq!(compose_probe(false, true, true), (false, false));
         assert_eq!(compose_probe(false, true, false), (false, false));
+    }
+}
+
+#[cfg(test)]
+mod fire_site_tests {
+    use super::{FireSite, TickOutcome, TopologyTrigger};
+    use crate::fire_tap::{FireBody, FireCause, FireFlags};
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
+
+    /// `u32::MAX` nanoseconds, the longest duration a record holds exactly.
+    const DUR_MAX_NS: u32 = 4_294_967_295;
+
+    fn period_site(outputs: usize) -> FireSite {
+        FireSite::new(
+            Arc::new(OnceLock::new()),
+            2,
+            &TopologyTrigger::Period {
+                interval_ns: 1_000_000,
+            },
+            outputs,
+        )
+    }
+
+    fn body(elapsed: Duration, outcome: TickOutcome, writes: Option<(&[u32], &[u32])>) -> FireBody {
+        period_site(writes.map_or(0, |(before, _)| before.len()))
+            .body(2, 7, elapsed, outcome, writes)
+    }
+
+    fn writes<'a>(before: &'a [u32], after: &'a [u32]) -> Option<(&'a [u32], &'a [u32])> {
+        Some((before, after))
+    }
+
+    #[test]
+    fn a_tick_past_the_duration_column_saturates_and_says_so() {
+        let fits = body(
+            Duration::from_nanos(4_294_967_295),
+            TickOutcome::Ok,
+            writes(&[0], &[0]),
+        );
+        assert_eq!((fits.dur_ns, fits.flags.0), (DUR_MAX_NS, 0));
+
+        let over = body(
+            Duration::from_nanos(4_294_967_296),
+            TickOutcome::Ok,
+            writes(&[0], &[0]),
+        );
+        assert_eq!(
+            (over.dur_ns, over.flags.0),
+            (DUR_MAX_NS, FireFlags::DURATION_SATURATED)
+        );
+
+        let hour = body(Duration::from_secs(3600), TickOutcome::Panicked, None);
+        assert_eq!(
+            (hour.dur_ns, hour.flags.0, hour.wrote),
+            (
+                DUR_MAX_NS,
+                FireFlags::DURATION_SATURATED | FireFlags::PANICKED | FireFlags::WROTE_UNKNOWN,
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn each_changed_count_sets_its_output_bit() {
+        let fire = body(
+            Duration::from_nanos(10),
+            TickOutcome::Err,
+            writes(&[4, 9, 0], &[5, 9, 2]),
+        );
+        assert_eq!(
+            (
+                fire.at_ns,
+                fire.dur_ns,
+                fire.node,
+                fire.cause,
+                fire.flags.0,
+                fire.wrote
+            ),
+            (7, 10, 2, FireCause::Period, FireFlags::TICK_ERROR, 0b101)
+        );
+    }
+}
+
+#[cfg(test)]
+mod dead_node_cleanup_schedule_tests {
+    use super::*;
+    use std::sync::mpsc::{self, RecvTimeoutError};
+
+    /// How long a negative check watches for a pass that must not start. A
+    /// broken schedule shows within it; a correct one can never fail it, since
+    /// the parked period is an hour.
+    const QUIET_WINDOW: Duration = Duration::from_millis(200);
+
+    /// Guards a hang only: every wait below ends as soon as its condition holds.
+    const HANG_GUARD: Duration = Duration::from_secs(10);
+
+    const PARKED_MS: u64 = 3_600_000;
+
+    /// The reclaim loop on its own thread, counting passes.
+    fn start_counting(
+        period_ms: u64,
+    ) -> (
+        Arc<DeadNodeCleanupShared>,
+        Arc<AtomicU64>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let shared = Arc::new(DeadNodeCleanupShared::new(period_ms));
+        let passes = Arc::new(AtomicU64::new(0));
+        let worker = {
+            let (shared, passes) = (Arc::clone(&shared), Arc::clone(&passes));
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    passes.fetch_add(1, Ordering::Relaxed);
+                })
+            })
+        };
+        (shared, passes, worker)
+    }
+
+    fn wait_for_passes(passes: &AtomicU64, at_least: u64) {
+        let deadline = Instant::now() + HANG_GUARD;
+        while passes.load(Ordering::Relaxed) < at_least {
+            assert!(
+                Instant::now() < deadline,
+                "no pass ran within {HANG_GUARD:?}"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn passes_keep_running_at_a_short_period() {
+        let (shared, passes, worker) = start_counting(5);
+        wait_for_passes(&passes, 3);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// The test keeps the schedule lock only once it sees the thread inside
+    /// its 20 ms wait after a pass, then holds it for 100 ms, so that wait
+    /// runs out before the thread takes the lock back and the park lands
+    /// first: the condvar reports a timeout, and the park must still win.
+    #[test]
+    fn a_park_that_lands_after_the_old_period_ran_out_starts_no_pass() {
+        let (shared, passes, worker) = start_counting(20);
+        wait_for_passes(&passes, 1);
+        let deadline = Instant::now() + HANG_GUARD;
+        let gate = loop {
+            let gate = shared.lock_gate();
+            // A pass already ran, so the wait the thread sits in follows a
+            // pass, and the thread released the lock only inside it.
+            if gate.in_wait {
+                break gate;
+            }
+            drop(gate);
+            assert!(
+                Instant::now() < deadline,
+                "the thread never re-entered its wait after a pass"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        // The lock is held and no pass is under way, so none can start or
+        // count until the park below releases the lock: this is the count the
+        // park must keep.
+        let parked = passes.load(Ordering::Relaxed);
+        shared.change_period(gate, PARKED_MS);
+        std::thread::sleep(QUIET_WINDOW);
+        assert_eq!(
+            passes.load(Ordering::Relaxed),
+            parked,
+            "a pass started under the old period after the park returned"
+        );
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A park issued while a pass runs returns only once that pass has ended,
+    /// so a count read after the park already holds it.
+    #[test]
+    fn a_park_returns_only_after_the_pass_under_way_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.run_passes(|| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.recv();
+                })
+            })
+        };
+        started_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the first pass starts");
+        let (parked_tx, parked_rx) = mpsc::channel::<()>();
+        let parker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || {
+                shared.set_period_ms(PARKED_MS);
+                parked_tx.send(()).expect("test thread listening");
+            })
+        };
+        // The park has stored the new period and now waits on the pass.
+        let deadline = Instant::now() + HANG_GUARD;
+        while shared.lock_gate().period_changes == 0 {
+            assert!(Instant::now() < deadline, "the park never took the lock");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            parked_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "the park returned while a pass was still running"
+        );
+        release_tx.send(()).expect("pass waiting for release");
+        parked_rx
+            .recv_timeout(HANG_GUARD)
+            .expect("the park returns once the pass ends");
+        parker.join().expect("parker");
+        assert_eq!(
+            started_rx.recv_timeout(QUIET_WINDOW),
+            Err(RecvTimeoutError::Timeout),
+            "another pass started after the park"
+        );
+        drop(release_tx);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+    }
+
+    /// A pass that panics still ends, so a later park does not wait for it.
+    #[test]
+    fn a_pass_that_panics_still_ends() {
+        let shared = Arc::new(DeadNodeCleanupShared::new(1));
+        let worker = {
+            let shared = Arc::clone(&shared);
+            std::thread::spawn(move || shared.run_passes(|| panic!("reclaim pass panicked")))
+        };
+        assert!(worker.join().is_err(), "the pass panicked");
+        assert!(!shared.lock_gate().in_pass, "the panicked pass ended");
+        shared.set_period_ms(PARKED_MS);
+    }
+
+    #[test]
+    fn a_stop_ends_a_parked_wait() {
+        let (shared, passes, worker) = start_counting(PARKED_MS);
+        shared.stop();
+        worker.join().expect("reclaim thread");
+        assert_eq!(passes.load(Ordering::Relaxed), 0);
     }
 }
