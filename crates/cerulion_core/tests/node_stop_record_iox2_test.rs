@@ -390,7 +390,7 @@ fn an_entry_poisoned_outside_a_tick_stops_the_node_at_its_next_fire() {
 }
 
 /// The PARALLEL fire path: sixteen `Period(10)` sources and the `Period(5)`
-/// node that stops at its fourth tick fire as one 17-fire level under four
+/// node that stops at its fourth tick fire as one 17-node level under four
 /// fire threads, and the merge pass keeps the stop record directly after the
 /// stopping fire (the fast node's second fire of step 1, manifest index 16).
 #[test]
@@ -416,8 +416,9 @@ fn the_parallel_merge_keeps_a_stop_record_directly_after_its_fire() {
         "fast_fatal_at_fourth",
         Box::new(FastFatalAtFourthEntry::new()),
     ));
-    // The level is 17 fires wide, at or past the threshold at which a level
-    // fires on the parallel path.
+    // The level is 17 nodes wide (it fires 18 times at steps 0 and 1, the
+    // fast node twice), at or past the node count at which a level fires on
+    // the parallel path.
     assert!(
         SOURCES.len() + 1 >= GraphRuntime::parallel_fire_threshold(),
         "the level is wide enough to take the parallel path"

@@ -3159,11 +3159,6 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
     assert_ne!(base, differ_node_id);
 }
 
-/// The HAND-WRITTEN `PartialEq` INCLUDES `global_level`
-/// (replay-deterministic DAG topology) — the dual of the exclusion oracle above.
-/// Two entries equal in `(node_id, fire_time_ns)` but differing ONLY in
-/// `global_level` must compare `!=` (proving inclusion); re-affirm that differing
-/// ONLY in `duration_ns` still compares `==` (exclusion holds alongside).
 /// `stop` is replay-deterministic (a fire's own outcome), so it is INCLUDED in
 /// `PartialEq`: two entries that differ only in their stop are different fires.
 #[test]
@@ -3200,6 +3195,11 @@ fn test_trace_entry_partial_eq_includes_stop() {
     assert_ne!(fatal, poisoned, "two causes are two fires");
 }
 
+/// The HAND-WRITTEN `PartialEq` INCLUDES `global_level`
+/// (replay-deterministic DAG topology) — the dual of the exclusion oracle above.
+/// Two entries equal in `(node_id, fire_time_ns)` but differing ONLY in
+/// `global_level` must compare `!=` (proving inclusion); re-affirm that differing
+/// ONLY in `duration_ns` still compares `==` (exclusion holds alongside).
 #[test]
 fn test_trace_entry_partial_eq_includes_global_level() {
     let base = TraceEntry {

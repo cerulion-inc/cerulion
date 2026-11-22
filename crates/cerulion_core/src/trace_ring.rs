@@ -621,8 +621,9 @@ pub enum TraceRecordFault {
     /// [`NodeStopCause`](crate::scheduler::NodeStopCause) this build defines:
     /// a cause a newer or foreign writer added, or a corrupt record. The
     /// record walk runs before the version gate, so a newer writer's cause can
-    /// reach this check first, and the sentence names the newer writer and
-    /// says to upgrade, as [`Self::UnsupportedRecordType`]'s does.
+    /// reach this check first. [`Self::detail`] names the newer or foreign
+    /// writer and says to upgrade; `run_replay` and the replay engine word
+    /// their own refusal from the bag's stamp.
     UnknownStopCause {
         /// The record's rank.
         rank: u32,
