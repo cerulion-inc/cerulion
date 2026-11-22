@@ -4776,8 +4776,8 @@ fn replay_consumer_build(
 
 /// The consumer end of a fed edge builds for a replay: its `block` input has
 /// no in-graph producer and no credit word, and the build accepts it with no
-/// credit record. The same build with the default wiring is refused as
-/// producer-less, as before the wiring could name a fed edge.
+/// credit record. The same build with the default wiring keeps the
+/// producer-less refusal.
 #[test]
 #[serial]
 fn a_replay_build_holding_a_fed_edge_s_consumer_end_builds() {
@@ -4812,33 +4812,46 @@ fn a_replay_build_holding_a_fed_edge_s_consumer_end_builds() {
     );
 }
 
-/// An entry a MAPPED credit binding also names is refused: the edge counts on
-/// its credit word or is fed from the recording, never both.
+/// An entry a credit binding also names is refused, whether the binding's
+/// word is mapped or a process-local one: the edge counts on its credit word
+/// or is fed from the recording, never both. A local word earns no
+/// producer-less exemption, so without this refusal the fed entry would
+/// exempt the input and leave the binding's half wired with no probe.
 #[test]
 #[serial]
-fn a_fed_edge_a_mapped_credit_binding_also_names_is_refused() {
+fn a_fed_edge_a_credit_binding_also_names_is_refused() {
     let w = supervisor_word("fedbound", "consumer", "inp", DEPTH as u32);
-    let bound = [binding(
+    let mapped = binding(
         &w.consumer_side,
         "consumer",
         "inp",
         DEPTH,
         CreditRole::Consumer,
-    )];
-    let (_mgr, built) = replay_consumer_build(
-        "cbfb",
-        "cb_fed_bound",
-        &fed_wiring(vec![fed_edge(TOPIC)]),
-        &bound,
     );
-    let err = build_err(built, "a fed edge a binding also names is refused");
-    assert_eq!(
-        err.to_string(),
-        "Graph validation error: graph 'cbfb_consumer_ctx': the replay wiring feeds `block` edge \
-         '/cb/data' -> 'consumer.inp' from a recording, and a cross-process credit binding \
-         names the same edge: an edge counts on its credit word or is fed from a recording, \
-         never both"
+    let local = CreditBinding {
+        word: CreditWord::local(DEPTH as u32),
+        ..mapped.clone()
+    };
+    assert!(
+        !local.word.is_mapped(),
+        "PRECONDITION: the second binding's word is process-local"
     );
+    for (mgr_name, bound) in [("cb_fed_bound_m", mapped), ("cb_fed_bound_l", local)] {
+        let (_mgr, built) = replay_consumer_build(
+            "cbfb",
+            mgr_name,
+            &fed_wiring(vec![fed_edge(TOPIC)]),
+            &[bound],
+        );
+        let err = build_err(built, "a fed edge a binding also names is refused");
+        assert_eq!(
+            err.to_string(),
+            "Graph validation error: graph 'cbfb_consumer_ctx': the replay wiring feeds `block` \
+             edge '/cb/data' -> 'consumer.inp' from a recording, and a credit binding names the \
+             same edge: an edge counts on its credit word or is fed from a recording, never both",
+            "{mgr_name}"
+        );
+    }
 }
 
 /// Two builds with two entries the build holds neither end of, the second
@@ -4953,11 +4966,21 @@ enum Reader {
 /// What one overfill run observed: the consumer's reads and events, its
 /// `drop_oldest` count, and its staged read outcomes as
 /// `(step, input index, kind, served sequence, popped)`, the producer token
-/// left out (it names a publisher id each run mints afresh).
+/// left out (it names a publisher id each run mints afresh); its credit
+/// record as `(depth, mapped)`, if it has one; and the `drop_oldest` count of
+/// its sibling `watcher`, which reads the same topic in the same build.
 struct Overfill {
     observed: Observed,
     drop_oldest: u64,
     staged: Vec<(u64, u16, String, u64, u32)>,
+    credit: Option<(u64, bool)>,
+    watcher_drop_oldest: u64,
+}
+
+/// A staged-read oracle row: `(step, input index, kind, served sequence,
+/// popped)`.
+fn staged_row(step: u64, kind: &str, seq: u64, popped: u32) -> (u64, u16, String, u64, u32) {
+    (step, 0, kind.to_string(), seq, popped)
 }
 
 /// Overfill a depth-2 consumer input over real iceoryx2: the producer
@@ -4965,7 +4988,9 @@ struct Overfill {
 /// baseline), the producer publishes frames 2 to 6, and the consumer reads
 /// again. Its depth-2 queue keeps frames 5 and 6, so frames 2, 3 and 4 are
 /// evicted. The producer holds no credit binding, so nothing defers it;
-/// `bindings` are the consumer's.
+/// `bindings` are the consumer's. A `watcher` ([`PlainConsumer`], a
+/// `drop_oldest` input at depth 2) reads the same topic beside the consumer,
+/// with no entry naming it.
 fn overfill(
     prefix: &str,
     reader: Reader,
@@ -4982,7 +5007,10 @@ fn overfill(
     let cfg = config_of(
         prefix,
         "consumer_ctx",
-        vec![node("consumer", vec![input], vec![])],
+        vec![
+            node("consumer", vec![input], vec![]),
+            node("watcher", vec![topic_in("inp")], vec![]),
+        ],
     );
     let mut fac: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
     let entry: Box<dyn NodeEntry> = match reader {
@@ -5000,6 +5028,7 @@ fn overfill(
         )),
     };
     fac.insert("consumer".to_string(), entry);
+    fac.insert("watcher".to_string(), Box::new(PlainConsumerEntry::new()));
     let mut rt_c = match GraphRuntime::build_for_replay(
         cfg,
         fac,
@@ -5018,6 +5047,7 @@ fn overfill(
         if matches!(reader, Reader::Latest) {
             rt.trigger_external("consumer").expect("trigger");
         }
+        rt.trigger_external("watcher").expect("trigger the watcher");
         rt.step(Duration::from_millis(PERIOD_MS));
         staged.extend(rt.take_read_outcomes().into_iter().filter_map(|r| {
             (r.node_id == "consumer").then(|| {
@@ -5041,6 +5071,14 @@ fn overfill(
         .node_handle("consumer")
         .expect("the consumer's handle")
         .backpressure_drop_oldest_count("inp");
+    let watcher_drop_oldest = rt_c
+        .node_handle("watcher")
+        .expect("the watcher's handle")
+        .backpressure_drop_oldest_count("inp");
+    let credit = rt_c
+        .block_credits()
+        .find(|c| c.consumer_node == "consumer" && c.consumer_input == "inp")
+        .map(|c| (c.depth, c.mapped));
     let observed = std::mem::take(&mut *observed.lock().expect("observed"));
     rt_p.shutdown();
     rt_c.shutdown();
@@ -5048,6 +5086,8 @@ fn overfill(
         observed,
         drop_oldest,
         staged,
+        credit,
+        watcher_drop_oldest,
     }
 }
 
@@ -5068,18 +5108,31 @@ fn overfill_input(
 /// latest-value input and on a trigger input alike. Overfilled past its
 /// depth, the fed input raises no `BackpressureEvent` and counts no
 /// eviction, and reads the frames a depth-2 queue keeps: the newest on each
-/// latest-value drain, one per fire on the trigger.
+/// latest-value drain, one per fire on the trigger. The `watcher` beside it in
+/// the same build, which no entry names, keeps its `drop_oldest` probe and
+/// counts the three evictions, so the fed input alone lost its probe.
+///
+/// The staged reads are written by hand. Frame `n` carries wire sequence
+/// `n - 1`, and the topic has no producer in the build, so every read stages
+/// a `Producer` annotation (its read's sequence, popped 0) before it. A
+/// latest-value read serves its newest frame and stages each other frame it
+/// popped as a `BatchFrame` first. The trigger input declares `block`, so it
+/// is not unified onto its body subscriber and keeps two: each fire's body
+/// read pops one frame (`Served`), and the step's trigger drain takes every
+/// frame (`DrainedBatch` naming the newest, a `BatchFrame` first for each
+/// other), the body stage merged before the drain stage.
 ///
 /// Two twins make the fed run's numbers mean something:
 ///
-/// * the LIVE shape, the same `block` input bound to a mapped credit word,
-///   carries the block probe a split edge carries live. It reads the same
-///   frames and stages the same read outcomes, so taking the probe away
-///   changes no read the replay judges, in either consume mode;
+/// * the same `block` input bound to a mapped credit word carries the block
+///   probe a split edge carries live (below its threshold here, since the
+///   producer holds no binding). It reads the same frames and stages the
+///   same reads, so taking the probe away changes no read the replay judges,
+///   in either consume mode;
 /// * the `drop_oldest` twin, the same node with the graph's
 ///   `backpressure: drop_oldest` over its input, counts the three evictions
-///   by hand and raises one event for them, so the fed run's zeros are the
-///   missing probe and not an accessor that reads zero for any input.
+///   (hand count 3) and raises one event for them, so the fed run's zeros are
+///   the missing probe and not an accessor that reads zero for any input.
 ///
 /// A fed input that also sets `block_timeout_ms` reads, stages and counts the
 /// same as the fed one: the key has nothing to act on.
@@ -5087,9 +5140,31 @@ fn overfill_input(
 #[serial]
 fn a_fed_block_input_gets_no_probe_and_its_drop_oldest_twin_counts_the_evictions() {
     use cerulion_core::graph::config::InputBackpressure;
-    for (reader, tag, reads) in [
-        (Reader::Latest, "l", vec![1, 6]),
-        (Reader::Fifo, "f", vec![1, 5, 6]),
+    let latest_reads = vec![
+        staged_row(0, "Producer", 0, 0),
+        staged_row(0, "Served", 0, 1),
+        staged_row(1, "Producer", 4, 0),
+        staged_row(1, "BatchFrame", 4, 0),
+        staged_row(1, "Producer", 5, 0),
+        staged_row(1, "Served", 5, 2),
+    ];
+    let fifo_reads = vec![
+        staged_row(0, "Producer", 0, 0),
+        staged_row(0, "Served", 0, 1),
+        staged_row(0, "Producer", 0, 0),
+        staged_row(0, "DrainedBatch", 0, 1),
+        staged_row(1, "Producer", 4, 0),
+        staged_row(1, "Served", 4, 1),
+        staged_row(1, "Producer", 5, 0),
+        staged_row(1, "Served", 5, 1),
+        staged_row(1, "Producer", 4, 0),
+        staged_row(1, "BatchFrame", 4, 0),
+        staged_row(1, "Producer", 5, 0),
+        staged_row(1, "DrainedBatch", 5, 2),
+    ];
+    for (reader, tag, reads, staged) in [
+        (Reader::Latest, "l", vec![1, 6], latest_reads),
+        (Reader::Fifo, "f", vec![1, 5, 6], fifo_reads),
     ] {
         let wiring = fed_wiring(vec![fed_edge(TOPIC)]);
         let fed = overfill(
@@ -5106,7 +5181,12 @@ fn a_fed_block_input_gets_no_probe_and_its_drop_oldest_twin_counts_the_evictions
             "{tag}: no probe, so no BackpressureEvent"
         );
         assert_eq!(fed.drop_oldest, 0, "{tag}: no probe, so no eviction count");
-        assert!(!fed.staged.is_empty(), "{tag}: the reads were staged");
+        assert_eq!(fed.staged, staged, "{tag}: the fed input's staged reads");
+        assert_eq!(fed.credit, None, "{tag}: no credit record");
+        assert_eq!(
+            fed.watcher_drop_oldest, 3,
+            "{tag}: the unnamed watcher keeps its probe and counts frames 2, 3 and 4"
+        );
 
         let timed = overfill(
             &format!("cbfk{tag}"),
@@ -5122,7 +5202,7 @@ fn a_fed_block_input_gets_no_probe_and_its_drop_oldest_twin_counts_the_evictions
             "{tag}: `block_timeout_ms` raises nothing on a fed input"
         );
         assert_eq!(timed.drop_oldest, 0, "{tag}: and counts nothing");
-        assert_eq!(timed.staged, fed.staged, "{tag}: and changes no read");
+        assert_eq!(timed.staged, staged, "{tag}: and changes no read");
 
         let w = supervisor_word(&format!("fedlive{tag}"), "consumer", "inp", DEPTH as u32);
         let bound = [binding(
@@ -5139,9 +5219,18 @@ fn a_fed_block_input_gets_no_probe_and_its_drop_oldest_twin_counts_the_evictions
             &ReplayWiring::default(),
             &bound,
         );
+        assert_eq!(
+            live.credit,
+            Some((DEPTH, true)),
+            "{tag}: PRECONDITION: the live shape's input counts on its mapped word"
+        );
+        assert_eq!(
+            live.drop_oldest, 0,
+            "{tag}: a block-probed input carries no `drop_oldest` detector"
+        );
         assert_eq!(live.observed.seen, reads, "{tag}: the live shape's reads");
         assert_eq!(
-            live.staged, fed.staged,
+            live.staged, staged,
             "{tag}: the block probe a live split edge carries changes no staged read"
         );
 
@@ -5282,11 +5371,12 @@ fn a_fed_edge_s_producer_end_takes_a_trailing_refill_below_the_cap() {
 
 /// `run_live` refuses a runtime built for a replay that feeds a `block` edge
 /// from a recording, at either end, naming the edge first in `Ord` order,
-/// and with the same text on a second call. The consumer end's node is a
-/// host-driven `external` node, which `run_live` otherwise refuses as inert
-/// at launch: the fed refusal comes first, before any external source is
-/// collected. The same relay built with the default wiring is not refused
-/// this way.
+/// and with the same text on a second call. The refusal comes first: the
+/// consumer end's node is a host-driven `external` node, which external-source
+/// collection would refuse as inert at launch, and neither refused runtime
+/// has its node-death ledger armed. The same relay built with the default
+/// wiring runs: with `running` false its loop returns at once, the ledger
+/// armed.
 #[test]
 #[serial]
 fn run_live_refuses_a_runtime_built_to_feed_a_block_edge() {
@@ -5313,6 +5403,10 @@ fn run_live_refuses_a_runtime_built_to_feed_a_block_edge() {
         err.to_string(),
         "a second call refuses with the same text"
     );
+    assert!(
+        !producer_end.node_death_ledger_for_test().is_armed(),
+        "a refused call arms nothing"
+    );
     producer_end.shutdown();
 
     let (_mgr, built) = replay_consumer_build(
@@ -5334,14 +5428,20 @@ fn run_live_refuses_a_runtime_built_to_feed_a_block_edge() {
          replay that feeds `block` edge '/cb/data' -> 'consumer.inp' from a recording, with no \
          credit word, so `run_live` refuses it"
     );
+    assert!(
+        !consumer_end.node_death_ledger_for_test().is_armed(),
+        "a refused call arms nothing"
+    );
     consumer_end.shutdown();
 
     let (_mgr, mut plain) = relay_replay_build("cbfn", "cb_plain_live", &ReplayWiring::default());
+    assert!(!plain.node_death_ledger_for_test().is_armed());
     if let Err(e) = plain.run_live(&running) {
-        assert!(
-            !e.to_string().contains("feeds `block` edge"),
-            "the default wiring feeds nothing, so this refusal is not its: {e}"
-        );
+        panic!("the default wiring's relay runs live: {e}");
     }
+    assert!(
+        plain.node_death_ledger_for_test().is_armed(),
+        "a run that is not refused arms the ledger at entry"
+    );
     plain.shutdown();
 }

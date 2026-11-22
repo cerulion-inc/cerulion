@@ -11544,11 +11544,13 @@ mod tests {
     }
 
     /// A marked node below the cap DRIVES its trailing refill: three planned
-    /// fires ask the hook twice between fires, and a marked step once more
-    /// after the last, the frame the next step's first fire serves.
+    /// fires ask the hook twice between fires, and a step planned with a
+    /// trailing refill once more after the last, the frame the next step's
+    /// first fire serves. The mark alone, with no trailing refill planned,
+    /// adds no call and defers no fire.
     #[test]
     fn a_marked_node_below_the_cap_drives_its_trailing_refill() {
-        for (marked, want) in [(false, 2), (true, 3)] {
+        for (marked, trailing, want) in [(false, false, 2), (true, false, 2), (true, true, 3)] {
             let mut replay =
                 Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
             add_data(&mut replay, "relay");
@@ -11573,14 +11575,25 @@ mod tests {
                 .unwrap();
             if marked {
                 replay.mark_held_by_bag_fed_block_edge("relay").unwrap();
+            }
+            if trailing {
                 replay.set_replay_trailing_refills(0, &["relay"]).unwrap();
             }
             replay.step(Duration::from_millis(10));
             assert_eq!(
                 calls.load(Ordering::Relaxed),
                 want,
-                "marked={marked}: the hook is asked between fires, and once more after the \
-                 last on a marked step"
+                "marked={marked} trailing={trailing}: the hook is asked between fires, and \
+                 once more after the last on a step planned with a trailing refill"
+            );
+            assert_eq!(replay.replay_refill_shortfalls("relay"), Some(0));
+            assert_eq!(
+                replay
+                    .nodes
+                    .get("relay")
+                    .map(|n| n.fire_count.load(Ordering::Relaxed)),
+                Some(3),
+                "marked={marked} trailing={trailing}: every planned fire ran"
             );
         }
     }

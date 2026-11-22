@@ -424,9 +424,11 @@ pub struct ReplayWiring {
     /// the slots of the building runtime's own view of the topic.
     pub publisher_slots: std::collections::HashMap<String, usize>,
     /// The `block` edges this replay feeds from its recording, with no credit
-    /// word, because their producer and consumer run in different passes. Empty
-    /// on every build but a replay pass of a several-rank recording; see
-    /// [`BagFedBlockEdges`] for what the set does and why it is sound.
+    /// word, because their producer and consumer run in different passes.
+    /// Empty unless the caller of
+    /// [`GraphRuntime::build_for_replay`](crate::graph::GraphRuntime::build_for_replay)
+    /// names such an edge; see [`BagFedBlockEdges`] for what the set does and
+    /// why it is sound.
     pub bag_fed_block_edges: BagFedBlockEdges,
 }
 
@@ -484,6 +486,10 @@ impl ReplayWiring {
 ///
 /// A build holds at most one end of it, and which end is read off the build's
 /// own graph ([`BagFedBlockEdges`]), never stated by the caller.
+///
+/// The field order is the derived `Ord`'s: the edge's three names before its
+/// producers, so in the set two entries that name one edge are neighbours,
+/// which the refusal of such a pair relies on.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BagFedBlockEdge {
     /// The resolved absolute topic.
@@ -511,8 +517,9 @@ pub struct BagFedBlockEdge {
 ///   `drop_oldest` detector, whose eviction events and counts the live
 ///   `block` input never raised. The replay does not serve the block probe's
 ///   own at-depth event either: the recording does not hold when it fired.
-/// * The PRODUCER end: a build that holds one of `producer_nodes`, and not the
-///   consumer, writes `topic` with its consumer in another pass, and marks
+/// * The PRODUCER end: a build that holds one of `producer_nodes`, and not
+///   the consumer input, writes `topic` with its consumer in another pass,
+///   and marks
 ///   each of `producer_nodes` it holds as held by the edge, so the scheduler
 ///   accepts a trailing refill the recording holds on that node below the
 ///   burst cap. Live, the consumer's credit word in another process could
@@ -520,10 +527,11 @@ pub struct BagFedBlockEdge {
 ///   pre-fire check to show it.
 ///
 /// The build verifies the end it holds, the way it verifies a credit
-/// binding's role, and refuses, naming the entry: an entry a mapped credit
-/// binding also names, an entry it holds both ends of or neither end of, and
-/// a consumer end that is not a `block` input or whose topic has an in-graph
-/// producer the entry does not name.
+/// binding's role, and refuses, naming the entry: an entry that names no
+/// producer, an edge two entries name with different producers, an entry a
+/// credit binding of the build also names, an entry it holds both ends of or
+/// neither end of, and a consumer end that is not a `block` input or whose
+/// topic has an in-graph producer the entry does not name.
 ///
 /// # Why the exemption is sound
 ///
@@ -547,8 +555,10 @@ pub struct BagFedBlockEdge {
 /// producer. The polled seam does not refuse that; it is a documented limit
 /// of the seam, as `run_live`'s node-death arming states for its own.
 ///
-/// `block_timeout_ms` on a fed edge's input is accepted and has no effect on
-/// either end. The key acts only through a producer's defer edge
+/// `block_timeout_ms` on a fed edge's input passes the fed exemption as it
+/// is: the key's own refusals (a zero timeout, a topic
+/// `multi_publisher_topics` lists) still apply, and otherwise it has no
+/// effect on either end. The key acts only through a producer's defer edge
 /// (`BlockDeferEdge`), and neither build has one for the edge: the consumer
 /// end has no producer of the topic, and the producer end has no `block`
 /// consumer of it. A recording of an unchanged graph never holds such an
@@ -560,15 +570,25 @@ pub struct BagFedBlockEdges {
 }
 
 impl BagFedBlockEdges {
-    /// The set of `edges` (a repeat is held once).
+    /// The set of `edges`, each entry's producers in name order with repeats
+    /// dropped, so an entry given twice, or with its producers in another
+    /// order, is held once.
     #[must_use]
     pub fn new(edges: impl IntoIterator<Item = BagFedBlockEdge>) -> Self {
         Self {
-            edges: edges.into_iter().collect(),
+            edges: edges
+                .into_iter()
+                .map(|mut edge| {
+                    edge.producer_nodes.sort();
+                    edge.producer_nodes.dedup();
+                    edge
+                })
+                .collect(),
         }
     }
 
-    /// No edge at all, the set of every build but a replay pass.
+    /// No edge at all: the set of every build unless a replay pass names a
+    /// fed edge.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.edges.is_empty()
@@ -581,15 +601,17 @@ impl BagFedBlockEdges {
 
     /// Which end of each edge the build over `topology` holds, verified
     /// against that graph (see the type's docs) and refused, at the first
-    /// entry in `Ord` order that fails. `credited` is the build's own
-    /// credit-bound edges and `graph` its identity, for the refusals' text.
+    /// entry in `Ord` order that fails. `bindings` are the build's credit
+    /// bindings, mapped word or local, and `graph` its identity, for the
+    /// refusals' text.
     pub(crate) fn resolve(
         &self,
         topology: &crate::graph::topology::GraphTopology,
-        credited: &crate::graph::topology::CreditedEdges<'_>,
+        bindings: &[crate::graph::CreditBinding],
         graph: &str,
     ) -> crate::error::TransportResult<BagFedEnds> {
         let mut ends = BagFedEnds::default();
+        let mut previous: Option<&BagFedBlockEdge> = None;
         for edge in &self.edges {
             let refuse = |why: String| crate::error::TransportError::GraphError {
                 reason: format!(
@@ -598,10 +620,37 @@ impl BagFedBlockEdges {
                     edge.topic, edge.consumer_node, edge.consumer_input
                 ),
             };
-            if credited.contains(&edge.topic, &edge.consumer_node, &edge.consumer_input) {
+            if edge.producer_nodes.is_empty() {
                 return Err(refuse(
-                    "and a cross-process credit binding names the same edge: an edge counts on \
-                     its credit word or is fed from a recording, never both"
+                    "but the entry names no producer, and a fed edge is written by a producer \
+                     in another pass"
+                        .to_string(),
+                ));
+            }
+            // Entries are held in `Ord` order, so two that name one edge are
+            // neighbours and differ in their producers alone.
+            if let Some(prev) = previous.filter(|p| {
+                (&p.topic, &p.consumer_node, &p.consumer_input)
+                    == (&edge.topic, &edge.consumer_node, &edge.consumer_input)
+            }) {
+                return Err(refuse(format!(
+                    "but the wiring names that edge twice, with producers ({}) and ({})",
+                    prev.producer_nodes.join(", "),
+                    edge.producer_nodes.join(", ")
+                )));
+            }
+            previous = Some(edge);
+            // Any binding, a mapped word or a local one: the binding loop
+            // wires every binding it is handed, so an edge it names must not
+            // also lose its probe as a fed edge.
+            if bindings.iter().any(|b| {
+                b.topic == edge.topic
+                    && b.consumer_node == edge.consumer_node
+                    && b.consumer_input == edge.consumer_input
+            }) {
+                return Err(refuse(
+                    "and a credit binding names the same edge: an edge counts on its credit \
+                     word or is fed from a recording, never both"
                         .to_string(),
                 ));
             }
@@ -633,7 +682,7 @@ impl BagFedBlockEdges {
                 (Some(input), true) => {
                     if !matches!(input.policy, crate::graph::node::BackpressurePolicy::Block) {
                         return Err(refuse(format!(
-                            "but this build declares that input {:?}, not `block`",
+                            "but this build declares that input as {:?}, not `block`",
                             input.policy
                         )));
                     }
@@ -1013,7 +1062,7 @@ mod bag_fed_block_edge_tests {
 
     const PRODUCER: &str = "  - id: prod\n    type: p\n    outputs:\n      - name: out\n        \
         schema: geometry_msgs/Vector3\n        topic: /fb/data\n";
-    /// A second writer of `/fb/data` that no entry below names.
+    /// A second writer of `/fb/data`, `other`, which `edge` does not name.
     const OTHER_PRODUCER: &str =
         "  - id: other\n    type: p\n    outputs:\n      - name: out\n        \
         schema: geometry_msgs/Vector3\n        topic: /fb/data\n";
@@ -1023,8 +1072,9 @@ mod bag_fed_block_edge_tests {
     const HEAD: &str = "Graph validation error: graph 'fb': the replay wiring feeds `block` edge \
                         '/fb/data' -> 'sink.inp' from a recording, ";
 
-    /// A graph of `nodes` (YAML node entries) under prefix `fb`, with `sink`'s
-    /// `inp` declared `policy` at depth 2, and its topology.
+    /// A graph of `nodes` (YAML node entries) under prefix `fb`, with the
+    /// `inp` of each node whose id starts with `sink` declared `policy` at
+    /// depth 2, and its topology.
     fn topology(nodes: &[&str], policy: BackpressurePolicy) -> GraphTopology {
         topology_listing("", nodes, policy)
     }
@@ -1037,7 +1087,7 @@ mod bag_fed_block_edge_tests {
             .nodes
             .iter()
             .map(|n| {
-                let metas = if n.id == "sink" {
+                let metas = if n.id.starts_with("sink") {
                     vec![InputMeta {
                         name: "inp".to_string(),
                         schema_hash: 0,
@@ -1067,21 +1117,21 @@ mod bag_fed_block_edge_tests {
         }
     }
 
-    /// `set` resolved over `topology` with no credited edge, its refusal as
+    /// `set` resolved over `topology` with no credit binding, its refusal as
     /// text.
     fn resolve(set: &BagFedBlockEdges, topology: &GraphTopology) -> Result<(), String> {
-        set.resolve(topology, &CreditedEdges::none(), "fb")
+        set.resolve(topology, &[], "fb")
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    /// The empty set changes nothing: the consumer-only build is refused as
-    /// a `block` input with no in-graph producer, as before the set existed.
+    /// The empty set exempts nothing: the consumer-only build is refused as a
+    /// `block` input with no in-graph producer.
     #[test]
     fn the_empty_set_resolves_no_end_and_leaves_the_producer_less_refusal() {
         let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
         let ends = BagFedBlockEdges::default()
-            .resolve(&consumer_only, &CreditedEdges::none(), "fb")
+            .resolve(&consumer_only, &[], "fb")
             .expect("the empty set resolves");
         assert!(!ends.feeds_consumer("/fb/data", "sink", "inp"));
         let refused = consumer_only
@@ -1103,7 +1153,7 @@ mod bag_fed_block_edge_tests {
         let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
         let set = BagFedBlockEdges::new([edge("/fb/data")]);
         let ends = set
-            .resolve(&consumer_only, &CreditedEdges::none(), "fb")
+            .resolve(&consumer_only, &[], "fb")
             .expect("the consumer end resolves");
         assert!(ends.feeds_consumer("/fb/data", "sink", "inp"));
         assert!(!ends.feeds_consumer("/fb/data", "sink", "other"));
@@ -1133,7 +1183,7 @@ mod bag_fed_block_edge_tests {
         );
         let set = BagFedBlockEdges::new([edge("/fb/data")]);
         let ends = set
-            .resolve(&consumer_only, &CreditedEdges::none(), "fb")
+            .resolve(&consumer_only, &[], "fb")
             .expect("the consumer end resolves");
         consumer_only
             .validate_with_credit_edges(&CreditedEdges::none(), &ends)
@@ -1148,7 +1198,7 @@ mod bag_fed_block_edge_tests {
         let producer_only = topology(&[PRODUCER], BackpressurePolicy::Block);
         let set = BagFedBlockEdges::new([edge("/fb/data")]);
         let ends = set
-            .resolve(&producer_only, &CreditedEdges::none(), "fb")
+            .resolve(&producer_only, &[], "fb")
             .expect("the producer end resolves");
         assert!(!ends.feeds_consumer("/fb/data", "sink", "inp"));
         assert_eq!(ends.held_producers().collect::<Vec<_>>(), vec!["prod"]);
@@ -1158,7 +1208,7 @@ mod bag_fed_block_edge_tests {
             BackpressurePolicy::Block,
         );
         let ends = set
-            .resolve(&two_writers, &CreditedEdges::none(), "fb")
+            .resolve(&two_writers, &[], "fb")
             .expect("the producer end resolves");
         assert_eq!(ends.held_producers().collect::<Vec<_>>(), vec!["prod"]);
     }
@@ -1227,7 +1277,7 @@ mod bag_fed_block_edge_tests {
             assert_eq!(
                 resolve(&BagFedBlockEdges::new([edge("/fb/data")]), &consumer_only),
                 Err(format!(
-                    "{HEAD}but this build declares that input {shown}, not `block`"
+                    "{HEAD}but this build declares that input as {shown}, not `block`"
                 ))
             );
         }
@@ -1287,5 +1337,111 @@ mod bag_fed_block_edge_tests {
         assert_eq!(repeated.iter().count(), 1, "a repeat is held once");
         assert!(BagFedBlockEdges::default().is_empty());
         assert!(!repeated.is_empty());
+    }
+
+    /// The exemption covers the fed input alone: a second producer-less
+    /// `block` input in the same build, which no entry names, is still
+    /// refused.
+    #[test]
+    fn the_exemption_covers_only_the_input_an_entry_names() {
+        let other_sink =
+            "  - id: sink2\n    type: s\n    inputs:\n      - name: inp\n        source: /fb/other\n";
+        let two_sinks = topology(&[CONSUMER, other_sink], BackpressurePolicy::Block);
+        let ends = BagFedBlockEdges::new([edge("/fb/data")])
+            .resolve(&two_sinks, &[], "fb")
+            .expect("the consumer end resolves");
+        let refused = two_sinks
+            .validate_with_credit_edges(&CreditedEdges::none(), &ends)
+            .expect_err("the unnamed producer-less `block` input is refused");
+        assert!(
+            refused.to_string().starts_with(
+                "Graph validation error: block input 'sink2.inp' reads topic '/fb/other', which \
+                 has no in-graph producer; "
+            ),
+            "{refused}"
+        );
+    }
+
+    /// The graph's `backpressure:` key wins over the node's declaration, so a
+    /// node declaring `block` whose graph sets `drop_oldest` is refused as
+    /// the `drop_oldest` input it is.
+    #[test]
+    fn a_consumer_end_the_graph_sets_to_drop_oldest_is_refused() {
+        let overridden = format!("{CONSUMER}        backpressure: drop_oldest\n");
+        let consumer_only = topology(&[overridden.as_str()], BackpressurePolicy::Block);
+        assert_eq!(
+            resolve(&BagFedBlockEdges::new([edge("/fb/data")]), &consumer_only),
+            Err(format!(
+                "{HEAD}but this build declares that input as DropOldest, not `block`"
+            ))
+        );
+    }
+
+    /// An entry that names no producer is refused: a fed edge's producer
+    /// runs in another pass, so an entry with none describes no fed edge.
+    #[test]
+    fn an_entry_that_names_no_producer_is_refused() {
+        let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
+        let mut none = edge("/fb/data");
+        none.producer_nodes.clear();
+        assert_eq!(
+            resolve(&BagFedBlockEdges::new([none]), &consumer_only),
+            Err(format!(
+                "{HEAD}but the entry names no producer, and a fed edge is written by a \
+                 producer in another pass"
+            ))
+        );
+    }
+
+    /// Two entries for one edge that name different producers are refused,
+    /// naming both lists, where the same producers in another order or
+    /// repeated are one entry.
+    #[test]
+    fn an_edge_two_entries_name_with_different_producers_is_refused() {
+        let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
+        let named = |names: &[&str]| BagFedBlockEdge {
+            producer_nodes: names.iter().map(|n| (*n).to_string()).collect(),
+            ..edge("/fb/data")
+        };
+        let same =
+            BagFedBlockEdges::new([named(&["prod", "other"]), named(&["other", "prod", "prod"])]);
+        assert_eq!(same.iter().count(), 1, "one entry, producers in name order");
+        assert_eq!(
+            same.iter().next().map(|e| e.producer_nodes.clone()),
+            Some(vec!["other".to_string(), "prod".to_string()])
+        );
+        assert_eq!(resolve(&same, &consumer_only), Ok(()));
+        assert_eq!(
+            resolve(
+                &BagFedBlockEdges::new([named(&["prod"]), named(&["other", "prod"])]),
+                &consumer_only
+            ),
+            Err(format!(
+                "{HEAD}but the wiring names that edge twice, with producers (other, prod) and \
+                 (prod)"
+            ))
+        );
+    }
+
+    /// A producer end that holds two of the producers an entry names marks
+    /// both, in name order.
+    #[test]
+    fn a_producer_end_holds_every_named_producer_in_name_order() {
+        let two_writers = topology_listing(
+            "multi_publisher_topics:\n  - /fb/data\n",
+            &[PRODUCER, OTHER_PRODUCER],
+            BackpressurePolicy::Block,
+        );
+        let both = BagFedBlockEdge {
+            producer_nodes: vec!["prod".to_string(), "other".to_string()],
+            ..edge("/fb/data")
+        };
+        let ends = BagFedBlockEdges::new([both])
+            .resolve(&two_writers, &[], "fb")
+            .expect("the producer end resolves");
+        assert_eq!(
+            ends.held_producers().collect::<Vec<_>>(),
+            vec!["other", "prod"]
+        );
     }
 }

@@ -112,12 +112,14 @@ pub struct ConsumerEdge {
 /// # Why a newtype rather than a bare `HashSet<(&str, &str, &str)>`
 ///
 /// The exemption turns a REFUSAL into a build, so the question "may this edge
-/// be exempted?" has exactly one valid answer: *because a credit word for it
-/// was opened*. A bare set of three strings is forgeable from three string
-/// literals, which would make the exemption assertable by anyone who could
-/// spell the edge. The only non-empty constructor is
-/// [`from_bindings`](Self::from_bindings), and it credits ONLY the bindings
-/// carrying a MAPPED word.
+/// be exempted on a credit word?" has exactly one valid answer: *because a
+/// credit word for it was opened*. (A replay build's fed edges are the other
+/// exemption, and their soundness rests on a different argument, stated on
+/// [`crate::replay_feed::BagFedBlockEdges`].) A bare set of three strings is
+/// forgeable from three string literals, which would make the exemption
+/// assertable by anyone who could spell the edge. The only non-empty
+/// constructor is [`from_bindings`](Self::from_bindings), and it credits ONLY
+/// the bindings carrying a MAPPED word.
 ///
 /// The `is_mapped` filter is the half that makes the claim true rather than
 /// merely narrow. `CreditBinding` is public with public fields and

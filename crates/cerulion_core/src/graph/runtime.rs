@@ -4271,9 +4271,9 @@ pub struct GraphRuntime {
     /// ([`Self::block_gate_replay_bypass`]).
     block_gate_replay_bypass: Arc<AtomicBool>,
     /// The `block` edges this build's replay wiring feeds from a recording
-    /// ([`crate::replay_feed::BagFedBlockEdges`]); empty on every build but a
-    /// replay pass. Kept so [`Self::run_live`] refuses a runtime built with
-    /// any.
+    /// ([`crate::replay_feed::BagFedBlockEdges`]); empty unless a replay pass
+    /// names a fed edge. Kept so [`Self::run_live`] refuses a runtime built
+    /// with any.
     bag_fed_block_edges: crate::replay_feed::BagFedBlockEdges,
     /// The WaitSet reactor that backs [`Self::run_live`].
     /// `None` at build — the live loop lazily builds it on first use (sized
@@ -6318,11 +6318,11 @@ impl GraphRuntime {
             super::topology::CreditedEdges::from_bindings(cross_process.credit_bindings);
         // Which end of each `block` edge a replay feeds from its recording
         // this build holds, verified against this build's own graph and its
-        // credit bindings (see `BagFedBlockEdges`). Empty on every build but a
-        // replay pass, whose wiring alone can name such an edge.
+        // credit bindings (see `BagFedBlockEdges`). Empty unless a replay pass
+        // names a fed edge: only `build_for_replay` threads a caller's wiring.
         let bag_fed_ends = replay_wiring.bag_fed_block_edges.resolve(
             &topology,
-            &credit_bound_edges,
+            cross_process.credit_bindings,
             config.identity(),
         )?;
         topology.validate_with_credit_edges(&credit_bound_edges, &bag_fed_ends)?;
