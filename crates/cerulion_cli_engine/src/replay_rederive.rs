@@ -951,8 +951,10 @@ pub enum SlotRecord {
     /// more than one level, or either with no recorded fire), so its read can
     /// drain the slot before the producer decides in the same step, or the bag
     /// does not show the order; or the consumer drains the slot outside its
-    /// body reads (a Sync node's trigger input, which its matcher pops). Such
-    /// a slot never explains a step.
+    /// body reads (a Sync node's trigger input, which its matcher pops). Or
+    /// the bag's trace does not hold its node stops (a `trace_format` below
+    /// 12, or none), so a consumer's stop, which releases its slot live,
+    /// leaves no record. Such a slot never explains a step.
     Unaccounted,
 }
 
@@ -4376,8 +4378,9 @@ pub(crate) struct StepDeferral {
 ///   the edge explains no step: an unaccounted record
 ///   ([`SlotRecord::Unaccounted`], which an input that sets
 ///   `block_timeout_ms` always gives, since its release forgives the slot's
-///   frames with no record, and one whose `block` policy and depth the bag does
-///   not pin); on the consumer's input, from the step
+///   frames with no record, one whose `block` policy and depth the bag does
+///   not pin, and every edge of a bag whose trace does not hold its node
+///   stops); on the consumer's input, from the step
 ///   after a truncated read stream's marker, a drain whose site the read log
 ///   does not say, or, before any body read of the input is recorded, a
 ///   consumer fire the bag does not show ended before the input; and on a

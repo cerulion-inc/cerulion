@@ -13531,10 +13531,14 @@ fn block_hold_flows(
 /// release forgives the slot's frames and leaves no record, and one whose
 /// `block` policy and depth the bag does not pin ([`block_queue_pinned`]) give
 /// [`replay_rederive::SlotRecord::Unaccounted`] whatever the bag records of
-/// the slot.
+/// the slot. So does every edge of a bag whose trace does not hold its node
+/// stops (`stops_recorded` false: a stamp below
+/// [`NODE_STOPS_MIN_TRACE_FORMAT`], or none): a consumer's stop releases its
+/// slot live, and such a trace keeps no record of it.
 fn local_block_holds(
     flows: &[BlockHoldFlow],
     levels: &BTreeMap<String, RecordedLevel>,
+    stops_recorded: bool,
     record_of: &dyn Fn(&str, &str, &str) -> replay_rederive::SlotRecord,
 ) -> BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> {
     let mut holds: BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> = BTreeMap::new();
@@ -13547,7 +13551,8 @@ fn local_block_holds(
                     consumer_node: c.node.clone(),
                     consumer_input: c.input.clone(),
                     depth: c.depth,
-                    record: if c.released_on_timeout
+                    record: if !stops_recorded
+                        || c.released_on_timeout
                         || !c.pinned
                         || !recorded_after(levels, producer, &c.node)
                     {
@@ -14840,6 +14845,8 @@ fn prepare_pass_verification(
     // The queue the recording read each input through, where its
     // recorder.json states them.
     recorded_queues: Option<&RecordedInputQueues>,
+    // Does the bag's trace hold every node stop (`trace_format` 12 or later)?
+    stops_recorded: bool,
 ) -> Result<PassVerification, ReplayError> {
     let (recorded_inputs, producer_tokens, recorded_rims) = match load_recorded_input_tables(trace)
     {
@@ -15709,8 +15716,11 @@ fn prepare_pass_verification(
     } else {
         recorded_fire_levels(trace, rank_tables, plan.rank())?
     };
-    let mut block_holds =
-        local_block_holds(&hold_flows, &fire_levels, &|topic, consumer, input| {
+    let mut block_holds = local_block_holds(
+        &hold_flows,
+        &fire_levels,
+        stops_recorded,
+        &|topic, consumer, input| {
             slot_record(
                 hold_stamps.get(topic).and_then(Option::as_ref),
                 topic_recorded_whole(record_health, topic, config.is_multi_publisher(topic)),
@@ -15718,7 +15728,8 @@ fn prepare_pass_verification(
                     .get(consumer)
                     .and_then(|info| consumer_body_drain(info, input)),
             )
-        });
+        },
+    );
     let decls: Vec<replay_rederive::NodeDecl> = plan
         .members()
         .iter()
@@ -16264,6 +16275,7 @@ fn plan_pass_verification(
         pass.driver_nodes,
         pass.record_health,
         pass.recorded_queues,
+        pass.stops_recorded,
     )?;
     Ok(verification)
 }
@@ -40554,6 +40566,7 @@ mod trigger_input_capacity_tests {
             &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
                 .expect("builds"),
             &levels,
+            true,
             &record_of,
         );
         assert_eq!(
@@ -40569,6 +40582,23 @@ mod trigger_input_capacity_tests {
                 ("m".to_string(), vec![edge("n", 5, "/lb/bus")]),
             ])
         );
+        // A bag whose trace does not hold its node stops counts no edge.
+        let unstopped = local_block_holds(
+            &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
+                .expect("builds"),
+            &levels,
+            false,
+            &record_of,
+        );
+        assert_eq!(
+            unstopped.keys().collect::<Vec<_>>(),
+            held.keys().collect::<Vec<_>>()
+        );
+        for edges in unstopped.values() {
+            for e in edges {
+                assert_eq!(e.record, SlotRecord::Unaccounted, "{e:?}");
+            }
+        }
 
         infos.insert("f".to_string(), input(1, BackpressurePolicy::DropOldest));
         expected.remove("/lb/e/out");
@@ -40895,6 +40925,7 @@ mod trigger_input_capacity_tests {
                 &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
                     .expect("builds"),
                 &levels,
+                true,
                 &|_, _, _| SlotRecord::Counted {
                     frame_stamps: vec![1_000],
                     drain: BodyDrain::PerFrame,
@@ -41128,6 +41159,7 @@ mod trigger_input_capacity_tests {
                 &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
                     .expect("builds"),
                 &levels,
+                true,
                 &|_, _, _| counted.clone(),
             )
             .remove("relay")

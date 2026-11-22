@@ -57753,63 +57753,69 @@ fn fp3_recording(steps: usize, drop_at: u64) -> Recording {
     rec
 }
 
-/// TODAY'S VERDICT, a false pass, on `rec` with the relay's fire at `drop_at`
-/// taken out: replayed with a build in which the sink does not stop, the
-/// re-execution notes no stop, the slot keeps counting the relay's frames,
-/// and the relay's pop left unfired reads as the hold, so the re-derivation
-/// reports nothing. Replayed with the build that recorded the bag, the sink
-/// stops again at step 5, its slot is released, and the step is the finding.
-/// The relay's frames still differ either way, since the replay fires it as
-/// the bag records.
-fn fp3_assert_today(rec: &Recording, drop_at: u64, name: &str) {
-    let dir = tempfile::tempdir().unwrap();
-    let bag = dir.path().join(name);
-    ri_bag_labelled(rec, &bag, ri_free_run_recorder_json(), false);
-    let fixed = bh_replay_stamped(&bag, || fp3_factories(None), bh_clean_stamp(rec));
-    assert_eq!(
-        fixed.trace_divergence.as_ref().map(|d| d.detail.as_str()),
-        None,
-        "today the hold is excused although the live sink had stopped"
-    );
-    assert!(!fixed.passed);
-    let recorded = bh_replay_stamped(&bag, || fp3_factories(Some(6.0)), bh_clean_stamp(rec));
-    assert_eq!(
-        recorded.trace_divergence.as_ref().map(|d| d.detail.clone()),
-        Some(format!(
-            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
-             step {drop_at} FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
-        ))
-    );
-    assert!(!recorded.passed);
+/// The finding a replay of a [`fp3_recording`] with the relay's fire at
+/// `drop_at` taken out reports: that step left the relay's pop unfired.
+fn fp3_finding(drop_at: u64) -> String {
+    format!(
+        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step \
+         {drop_at} FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+    )
 }
 
-/// TODAY'S VERDICT (a false pass): one relay short step after a live sink stop
-/// the replayed build does not make, the relay producing after it, so the slot
-/// count passes the depth after the short step. Pins the first verdict until
-/// the bag records a stop.
-#[test]
-#[serial]
-fn today_a_short_step_after_a_live_stop_the_replay_does_not_make_reads_clean() {
-    fp3_assert_today(&fp3_recording(15, 9), 9, "fp3_short.mcap");
+/// `rec`, with the relay's fire at `drop_at` taken out after a live sink stop,
+/// replayed with a build in which the sink does not stop and with the build
+/// that recorded the bag. At the node-stops trace format the bag holds the
+/// sink's stop, which releases its slot from the next step, so nothing holds
+/// the relay after it and the step is the finding whichever build replays.
+/// Below that format the trace holds no stop, so the slot is not counted at
+/// all, as on a bag that does not pin its queue: the step is the finding
+/// there too. The relay's frames differ either way, since the replay fires it
+/// as the bag records.
+fn fp3_assert(rec: &Recording, drop_at: u64, name: &str) {
+    for format in [
+        replay_engine::NODE_STOPS_MIN_TRACE_FORMAT,
+        replay_engine::ANCHOR_STOPS_MIN_TRACE_FORMAT,
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let bag = dir.path().join(name);
+        ri_bag_labelled(rec, &bag, ri_recorder_json_at(format), false);
+        for die_at in [None, Some(6.0)] {
+            let outcome = bh_replay_stamped(&bag, || fp3_factories(die_at), bh_clean_stamp(rec));
+            assert_eq!(
+                outcome.trace_divergence.as_ref().map(|d| d.detail.clone()),
+                Some(fp3_finding(drop_at)),
+                "trace format {format}, the sink built to stop at {die_at:?}"
+            );
+            assert!(!outcome.passed);
+        }
+    }
 }
 
-/// TODAY'S VERDICT (a false pass): the same live stop with the short step
-/// after the slot count has passed the depth. Pins the first verdict until
-/// the bag records a stop.
+/// One relay short step after a live sink stop, the relay producing after it,
+/// so the slot would count past the depth after the short step: the step is
+/// the finding, from the bag's own stop or, below the node-stops format, with
+/// no slot counted.
 #[test]
 #[serial]
-fn today_a_short_step_past_the_depth_after_a_live_stop_reads_clean() {
-    fp3_assert_today(&fp3_recording(15, 12), 12, "fp3_past_depth.mcap");
+fn a_short_step_after_a_live_consumer_stop_is_the_finding() {
+    fp3_assert(&fp3_recording(15, 9), 9, "fp3_short.mcap");
 }
 
-/// TODAY'S VERDICT (a false pass): the same live stop with the short step the
-/// last of the recording, the slot count at the depth there, so no step after
-/// it shows the count past the depth. Pins the first verdict until the bag
-/// records a stop.
+/// The same live stop with the short step after the slot would count past
+/// the depth: the step is the finding.
 #[test]
 #[serial]
-fn today_a_short_last_step_after_a_live_stop_reads_clean() {
-    fp3_assert_today(&fp3_recording(10, 9), 9, "fp3_tail.mcap");
+fn a_short_step_past_the_depth_after_a_live_consumer_stop_is_the_finding() {
+    fp3_assert(&fp3_recording(15, 12), 12, "fp3_past_depth.mcap");
+}
+
+/// The same live stop with the short step the last of the recording, where
+/// the slot would count exactly the depth and no step after it counts past
+/// it: the step is the finding.
+#[test]
+#[serial]
+fn a_short_last_step_after_a_live_consumer_stop_is_the_finding() {
+    fp3_assert(&fp3_recording(10, 9), 9, "fp3_tail.mcap");
 }
 
 /// A relay nothing holds, on a bag that states its drain: its last fire is

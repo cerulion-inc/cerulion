@@ -293,8 +293,10 @@ steps share it counts none of that stamp's frames. A slot the bag cannot
 account for allows for no hold: the bag records no frames of the topic or a
 frame header it cannot parse, its record-health stamp is absent or malformed,
 keeps no entry for the topic, reports the topic lossy or written by several
-publishers (declared or observed), or any frame drained and never written, the
-graph lists the topic in `multi_publisher_topics`, the recording does not pin
+publishers (declared or observed), or any frame drained and never written,
+the bag is stamped below `trace_format` 12, so its trace does not hold the
+stop that releases a consumer's slot, the graph lists the topic in
+`multi_publisher_topics`, the recording does not pin
 the input's `block` policy and depth (its `recorder.json` names the input's
 queue with another policy or depth than the replayed build gives it, or, on a
 bag recorded before that key, its graph does not set both `backpressure: block`
