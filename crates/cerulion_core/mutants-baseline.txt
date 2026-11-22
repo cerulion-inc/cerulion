@@ -128,6 +128,27 @@
 #          unviable one returns `Some(Default::default())` from
 #          `classify_trace_record`.
 #
+# The origin of an unknown stop cause, read from the bag's stamp
+# (`unknown_stop_cause_origin` in trace_ring.rs), the fault sentence it words
+# (`TraceRecordFault::detail`) and the capture's stamp reader
+# (`recorded_trace_format` in flashback/resim.rs), on the lines the change
+# that words the capture judge's reason from the stamp added:
+#
+# Run:     cargo mutants -p cerulion_core --in-place --cap-lints true \
+#            -f crates/cerulion_core/src/trace_ring.rs \
+#            -f crates/cerulion_core/src/flashback/resim.rs \
+#            --in-diff <that change's diff of the two files> \
+#            --re 'unknown_stop_cause_origin|TraceRecordFault::detail|recorded_trace_format' \
+#            --timeout 600 -- --lib -- trace_ring:: flashback::resim::
+# Result:  8 mutants: 7 caught, 1 unviable (does not compile), 0 missed. The
+#          unviable one returns `Default::default()` from
+#          `unknown_stop_cause_origin`, and `UnknownStopCauseOrigin` has no
+#          default. The replay's `unknown_stop_cause_refusal` in
+#          cerulion_cli_engine maps this answer; `cargo mutants --list` gives
+#          it one mutant, its body replaced with `Default::default()`, which
+#          cannot compile because `ReplayError` has no default, so it was not
+#          run.
+#
 # The trace write path (the scheduler's fire arms that mark the stopping
 # fire, the runtime's stop signal stores and the ring push after the stopping
 # fire's FIRE record) is a scheduler and transport path the mutation rule does
