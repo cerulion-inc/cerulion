@@ -890,6 +890,12 @@ struct ScheduledNode {
     /// the rest of the step. The `block` predicate ignores the argument
     /// (it reads its outstanding-counter atomics).
     pre_fire_check: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// A replay build's mark: this node produces a `block` edge the replay
+    /// feeds from its recording, whose consumer runs in another pass (see
+    /// [`Scheduler::mark_held_by_bag_fed_block_edge`]). Read only by
+    /// [`Scheduler::set_replay_trailing_refills`]; `false` on every live
+    /// build.
+    held_by_bag_fed_block_edge: bool,
 
     // Circuit breaker state
     consecutive_panics: u32,
@@ -2643,6 +2649,7 @@ impl Scheduler {
             output_discards,
             notify_undelivered,
             pre_fire_check: None,
+            held_by_bag_fed_block_edge: false,
             consecutive_panics: 0,
             disabled: false,
             external_triggered: false,
@@ -2922,8 +2929,10 @@ impl Scheduler {
     /// [`TransportError::GraphError`] when no plan is installed for `step`, or
     /// a named node has no planned fire there, is not a `Data` node with a
     /// refill hook, or neither fires the cap at that step nor carries a
-    /// pre-fire check: a recording cannot hold a trailing refill on such a
-    /// node.
+    /// pre-fire check or the mark a replay build sets on the producer of a
+    /// `block` edge it feeds from its recording
+    /// (`mark_held_by_bag_fed_block_edge`): a recording cannot hold a
+    /// trailing refill on such a node.
     pub fn set_replay_trailing_refills(
         &mut self,
         step: u64,
@@ -2946,7 +2955,7 @@ impl Scheduler {
             if !matches!(node.policy, TriggerPolicy::Data) || node.trigger_refill.is_none() {
                 return Err(refuse(node_id, "it is not a Data node with a refill hook"));
             }
-            let deferrable = node.pre_fire_check.is_some();
+            let deferrable = node.pre_fire_check.is_some() || node.held_by_bag_fed_block_edge;
             let Some(plan) = self.replay_plan.as_mut().filter(|p| p.step == step) else {
                 return Err(refuse(node_id, "no fire plan is installed for this step"));
             };
@@ -2965,6 +2974,29 @@ impl Scheduler {
                 None => return Err(refuse(node_id, "it has no planned fire at this step")),
             }
         }
+        Ok(())
+    }
+
+    /// Mark `node_id` as a producer of a `block` edge a replay feeds from its
+    /// recording, whose consumer runs in another pass. Live, a credit word in
+    /// another process could defer the node between the fires of a burst, so
+    /// [`Self::set_replay_trailing_refills`] accepts a trailing refill on it
+    /// below the cap, as it does on a node with a pre-fire check. The mark
+    /// stands in for the pre-fire check there and nowhere else: it gives the
+    /// node no refill hook and defers no fire.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::NodeNotFound`] for an unknown node.
+    pub(crate) fn mark_held_by_bag_fed_block_edge(&mut self, node_id: &str) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                // hot-path-alloc-ok: cold: graph-build ERROR arm.
+                node_id: node_id.to_string(),
+            })?;
+        node.held_by_bag_fed_block_edge = true;
         Ok(())
     }
 
@@ -11431,12 +11463,21 @@ mod tests {
         add_data(&mut s, "sink");
         add_data(&mut s, "bare");
         add_period(&mut s, "tick", Duration::from_millis(1));
+        add_data(&mut s, "held");
         s.set_trigger_refill("sink", "inp", RefillOutcome::empty_queue)
+            .unwrap();
+        s.set_trigger_refill("held", "inp", RefillOutcome::empty_queue)
             .unwrap();
         let plan = |fires: u32| {
             [
                 ReplayFire {
                     node_id: "sink",
+                    first_fire_ns: 1_000_000,
+                    fire_count: fires,
+                    interval_ns: 0,
+                },
+                ReplayFire {
+                    node_id: "held",
                     first_fire_ns: 1_000_000,
                     fire_count: fires,
                     interval_ns: 0,
@@ -11475,6 +11516,86 @@ mod tests {
         // At the cap it is accepted.
         s.set_replay_fire_plan(0, &plan(cap)).unwrap();
         s.set_replay_trailing_refills(0, &["sink"]).unwrap();
+        // Below the cap, a node a fed `block` edge holds is refused until it
+        // is marked and accepted after; the unmarked `sink` stays refused.
+        s.set_replay_fire_plan(0, &plan(3)).unwrap();
+        let err = s.set_replay_trailing_refills(0, &["held"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Graph validation error: replay fire plan (step 0): node 'held' cannot carry a \
+             trailing refill: it fires 3 times, not the cap of 64, and has no pre-fire check"
+        );
+        s.mark_held_by_bag_fed_block_edge("held").unwrap();
+        s.set_replay_trailing_refills(0, &["held"]).unwrap();
+        let err = s.set_replay_trailing_refills(0, &["sink"]).unwrap_err();
+        assert!(err.to_string().contains("not the cap"), "{err}");
+        // The mark gives no refill hook: a marked Period node and a marked
+        // Data node with no hook are still refused.
+        for id in ["tick", "bare"] {
+            s.mark_held_by_bag_fed_block_edge(id).unwrap();
+            let err = s.set_replay_trailing_refills(0, &[id]).unwrap_err();
+            assert!(err.to_string().contains("refill hook"), "{id}: {err}");
+        }
+        // An unknown node cannot be marked.
+        assert!(matches!(
+            s.mark_held_by_bag_fed_block_edge("ghost"),
+            Err(TransportError::NodeNotFound { .. })
+        ));
+    }
+
+    /// A marked node below the cap DRIVES its trailing refill: three planned
+    /// fires ask the hook twice between fires, and a step planned with a
+    /// trailing refill once more after the last, the frame the next step's
+    /// first fire serves. The mark alone, with no trailing refill planned,
+    /// adds no call and defers no fire.
+    #[test]
+    fn a_marked_node_below_the_cap_drives_its_trailing_refill() {
+        for (marked, trailing, want) in [(false, false, 2), (true, false, 2), (true, true, 3)] {
+            let mut replay =
+                Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+            add_data(&mut replay, "relay");
+            let calls = Arc::new(AtomicU64::new(0));
+            let calls_hook = Arc::clone(&calls);
+            replay
+                .set_trigger_refill("relay", "inp", move || {
+                    calls_hook.fetch_add(1, Ordering::Relaxed);
+                    RefillOutcome::drained(1, Some(7), false)
+                })
+                .unwrap();
+            replay
+                .set_replay_fire_plan(
+                    0,
+                    &[ReplayFire {
+                        node_id: "relay",
+                        first_fire_ns: 1_000_000,
+                        fire_count: 3,
+                        interval_ns: 0,
+                    }],
+                )
+                .unwrap();
+            if marked {
+                replay.mark_held_by_bag_fed_block_edge("relay").unwrap();
+            }
+            if trailing {
+                replay.set_replay_trailing_refills(0, &["relay"]).unwrap();
+            }
+            replay.step(Duration::from_millis(10));
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                want,
+                "marked={marked} trailing={trailing}: the hook is asked between fires, and \
+                 once more after the last on a step planned with a trailing refill"
+            );
+            assert_eq!(replay.replay_refill_shortfalls("relay"), Some(0));
+            assert_eq!(
+                replay
+                    .nodes
+                    .get("relay")
+                    .map(|n| n.fire_count.load(Ordering::Relaxed)),
+                Some(3),
+                "marked={marked} trailing={trailing}: every planned fire ran"
+            );
+        }
     }
 
     fn add_external(scheduler: &mut Scheduler, id: &str, fires: &Arc<AtomicU64>) {
