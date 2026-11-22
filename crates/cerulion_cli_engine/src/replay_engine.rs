@@ -65,7 +65,7 @@
 //!   disagree (corrupt / hand-edited) → [`ReplayError::BagGraphMismatch`]
 //!   (exit 2).
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25701,11 +25701,8 @@ fn recorded_rank_of(
 fn reopen_flags<'a>(
     boundaries: &'a PassBoundaries<'_>,
     boundary: &'a StepBoundary,
-    node_rank: Option<&'a std::collections::HashMap<Arc<str>, u32>>,
-) -> (
-    &'a [bool],
-    Option<&'a std::collections::HashMap<Arc<str>, u32>>,
-) {
+    node_rank: Option<&'a HashMap<Arc<str>, u32>>,
+) -> (&'a [bool], Option<&'a HashMap<Arc<str>, u32>>) {
     match boundaries {
         PassBoundaries::Rank(_) => (std::slice::from_ref(&boundary.runs_reopened), None),
         PassBoundaries::Lockstep(cursors) => (cursors.reopened_ranks(), node_rank),
