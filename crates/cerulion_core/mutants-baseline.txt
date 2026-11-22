@@ -82,6 +82,27 @@
 # `flashback::resim::tests::the_first_named_frame_the_capture_does_not_hold_is_the_gap`
 # hold its sort; its dedup changes no answer `first_frame_gap` gives.
 #
+# Replay-fed `block` edges: `BagFedBlockEdges::{new, is_empty, iter,
+# resolve}` and `BagFedEnds::{feeds_consumer, held_producers}` in
+# replay_feed.rs, the fed exemption in
+# `GraphTopology::validate_with_credit_edges`, and the fed-edge mark read by
+# `Scheduler::set_replay_trailing_refills`, run on the changed lines only:
+#
+# Run:     cargo mutants -p cerulion_core --in-place --cap-lints true \
+#            --in-diff <the change's diff of crates/cerulion_core/src> \
+#            -f crates/cerulion_core/src/replay_feed.rs \
+#            -f crates/cerulion_core/src/graph/topology.rs \
+#            -f crates/cerulion_core/src/graph/runtime.rs \
+#            -f crates/cerulion_core/src/scheduler/mod.rs \
+#            -- --lib -- bag_fed_block_edge_tests trailing_refill
+# Result:  61 mutants: 23 caught, 33 unviable (do not compile; every
+#          whole-body mutant of a `TransportResult` function is one), 5 missed.
+#          The five were the credit-binding match in `BagFedBlockEdges::resolve`
+#          (each `==`, and each `&&` made `||`), which no lib oracle reached:
+#          now pinned by
+#          `replay_feed::bag_fed_block_edge_tests::an_entry_a_credit_binding_of_the_build_names_is_refused`.
+#          Re-run over the five (--iterate): 5 mutants, 5 caught, 0 missed.
+#
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
 # each test named here, and a run without it must pass that test.

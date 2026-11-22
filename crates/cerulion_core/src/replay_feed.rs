@@ -1444,4 +1444,53 @@ mod bag_fed_block_edge_tests {
             vec!["other", "prod"]
         );
     }
+
+    /// A credit binding of the build that names the entry's edge refuses it,
+    /// on a process-local word as on a mapped one. A binding of the same
+    /// input on another topic, of another node or of another input refuses
+    /// nothing: the match is on all three names.
+    #[test]
+    fn an_entry_a_credit_binding_of_the_build_names_is_refused() {
+        use crate::credit::CreditWord;
+        use crate::graph::{CreditBinding, CreditRole};
+        let consumer_only = topology(&[CONSUMER], BackpressurePolicy::Block);
+        let bind = |topic: &str, node: &str, input: &str| CreditBinding {
+            topic: topic.to_string(),
+            consumer_node: node.to_string(),
+            consumer_input: input.to_string(),
+            depth: 2,
+            role: CreditRole::Consumer,
+            word: CreditWord::local(2),
+            producer_slot: None,
+            producer_nodes: Vec::new(),
+        };
+        let set = BagFedBlockEdges::new([edge("/fb/data")]);
+        let resolved = |bindings: &[CreditBinding]| {
+            set.resolve(&consumer_only, bindings, "fb")
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            resolved(&[bind("/fb/data", "sink", "inp")]),
+            Err(format!(
+                "{HEAD}and a credit binding names the same edge: an edge counts on its credit \
+                 word or is fed from a recording, never both"
+            ))
+        );
+        for other in [
+            bind("/fb/other", "sink", "inp"),
+            bind("/fb/data", "sink2", "inp"),
+            bind("/fb/data", "sink", "other"),
+        ] {
+            let named = format!(
+                "{} -> {}.{}",
+                other.topic, other.consumer_node, other.consumer_input
+            );
+            assert_eq!(
+                resolved(&[other]),
+                Ok(()),
+                "a binding of another edge ({named}) refuses nothing"
+            );
+        }
+    }
 }
