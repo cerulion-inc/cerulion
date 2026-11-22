@@ -192,6 +192,18 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Session settings**: `remote_session::SessionLimits` supplies resource
+  defaults, and `shell_config::ShellFlags` validates parsed options before
+  changing `RemotedConfig`. The caller supplies environment text explicitly;
+  either local off wins, invalid text refuses, and parsing opens no state.
+  Concurrency and recording limits must be positive; zero disables optional
+  wall/idle timeouts, while zero exec stream budgets permit no bytes on that
+  stream. The I/O timeout stays positive. These types configure a session
+  service; the option resolver does not start or install that service.
+  Rust callers constructing `RemotedConfig` with a literal must supply the
+  shell prohibition, resource limits and concurrency fields, or use
+  `RemotedConfig::from_state_root` to obtain their defaults.
+
 - **Shell policy**: `cerulion_remoted::shell_policy::ShellPolicy` and
   `PairingAuthorizer::with_shell_policy` share a live owner setting. Shell and
   exec require the owner tier and the effective policy; a missing policy handle

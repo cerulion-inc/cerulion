@@ -12,6 +12,7 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
 - `PairingAuthorizer` gates accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
   Shell/exec: owner+policy; no file ON/invalid OFF; no handle: deny; immutable hard-off wins.
+  Settings: validate first; either OFF wins.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
@@ -31,8 +32,8 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
   task per stream. connectd mirrors the robot protocol (no production remoted dep);
   `protocol_parity_test.rs` gates parity: change both.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Desk key files are 32 raw bytes, created 0600 with `create_new`, NEVER
-  overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
+- Desk keys: 32 raw bytes, `create_new`, 0600; NEVER overwrite.
+  `~/.cerulion` secrets: `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
@@ -50,4 +51,4 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
   e2e: loopback iroh and relays only, bounded awaits.
 - remoted/link cold-compile iroh; remoted/connectd/wireclient/link/accountd need `-p`.
 
-Read docs/internals/remote-access.md before verb, trust, wire, pairing and epoch edits.
+Before verb/trust/wire/pairing/epoch edits: docs/internals/remote-access.md.
