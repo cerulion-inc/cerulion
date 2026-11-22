@@ -10099,6 +10099,14 @@ impl GraphRuntime {
         for node in &consume_latest_nodes {
             scheduler.set_data_consume_latest(node)?;
         }
+        // Each producer a replay's fed `block` edge holds here (see
+        // `BagFedBlockEdges`): live, the consumer's credit word in another
+        // process could defer it between the fires of a burst, so its recorded
+        // burst can end on a trailing refill below the cap with no pre-fire
+        // check in this build.
+        for node in bag_fed_ends.held_producers() {
+            scheduler.mark_held_by_bag_fed_block_edge(node)?;
+        }
         // Install ONE composed pre-fire per node that has block
         // edges and/or a throttle_ms cap. Defer if EITHER predicate fires.
         // The throttle + block actuators share the scheduler's single

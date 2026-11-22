@@ -55,9 +55,9 @@
 //! `depth`, and the once-per-regime `warn!` names the consumer edge.
 //!
 //! Per-test isolated SHM roots + pid/tag-scoped credit namespaces. `#[serial]`
-//! on 54 of the 55 arms: six are `#[traced_test]`, which installs a
+//! on 55 of the 56 arms: six are `#[traced_test]`, which installs a
 //! PROCESS-GLOBAL subscriber, and a sibling running beside one would both
-//! pollute its capture and race the install. The 55th,
+//! pollute its capture and race the install. The 56th,
 //! `the_depth_max_consumer_tracks_the_topology_ceiling`, is a pure constant
 //! drift guard that touches no transport and needs no turn.
 
@@ -5166,4 +5166,116 @@ fn a_fed_block_input_gets_no_probe_and_its_drop_oldest_twin_counts_the_evictions
             "{tag}: one eviction regime, one event naming the three frames"
         );
     }
+}
+
+/// A data-triggered relay that writes the shared topic: the PRODUCER end of a
+/// fed edge, a `Data` node with a refill hook on its trigger input.
+#[cerulion_node]
+#[derive(Default)]
+struct FedRelay {
+    #[input(trigger)]
+    inp: Vector3,
+    #[output]
+    out: Vector3,
+}
+
+#[cerulion_node_impl]
+impl FedRelay {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.out.x = self.inp.x;
+        Ok(())
+    }
+}
+
+/// Build the relay graph `prefix` (`relay` reads `/cb/src`, writes the shared
+/// topic) for a replay with `wiring`.
+fn relay_replay_build(
+    prefix: &str,
+    mgr_name: &str,
+    wiring: &ReplayWiring,
+) -> (Arc<TransportManager>, GraphRuntime) {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let clock = Arc::new(VirtualClock::new());
+    let mgr = manager(mgr_name, ix, Arc::clone(&clock));
+    let cfg = config_of(
+        prefix,
+        "relay_ctx",
+        vec![node(
+            "relay",
+            vec![InputDef {
+                name: "inp".to_string(),
+                source: "/cb/src".to_string(),
+                ..Default::default()
+            }],
+            vec![producer_out()],
+        )],
+    );
+    let mut fac: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    fac.insert("relay".to_string(), Box::new(FedRelayEntry::new()));
+    match GraphRuntime::build_for_replay(
+        cfg,
+        fac,
+        &mgr,
+        clock,
+        None,
+        CrossProcessWiring::none(),
+        wiring,
+    ) {
+        Ok(rt) => (mgr, rt),
+        Err(e) => panic!("the relay builds for the replay: {e}"),
+    }
+}
+
+/// The fed edge on the relay graph: `relay` writes the shared topic, read by
+/// `consumer` (absent here, in another pass).
+fn relay_fed_edge(consumer: &str) -> BagFedBlockEdge {
+    BagFedBlockEdge {
+        consumer_node: consumer.to_string(),
+        producer_nodes: vec!["relay".to_string()],
+        ..fed_edge(TOPIC)
+    }
+}
+
+/// The PRODUCER end of a fed edge takes a trailing refill below the burst
+/// cap: live, the consumer's credit word in another process could defer it.
+/// The same build with the default wiring refuses it, naming the missing
+/// pre-fire check.
+#[test]
+#[serial]
+fn a_fed_edge_s_producer_end_takes_a_trailing_refill_below_the_cap() {
+    let plan = [cerulion_core::scheduler::ReplayFire {
+        node_id: "relay",
+        first_fire_ns: 1_000_000,
+        fire_count: 2,
+        interval_ns: 0,
+    }];
+
+    let (_mgr, mut held) = relay_replay_build(
+        "cbfr",
+        "cb_fed_relay",
+        &fed_wiring(vec![relay_fed_edge("consumer")]),
+    );
+    assert!(
+        held.has_trigger_refill("relay"),
+        "PRECONDITION: the relay is a Data node with a refill hook"
+    );
+    held.set_replay_fire_plan(0, &plan)
+        .expect("the plan installs");
+    held.set_replay_trailing_refills(0, &["relay"])
+        .expect("the held producer takes the trailing refill");
+    held.shutdown();
+
+    let (_mgr, mut plain) = relay_replay_build("cbfp", "cb_plain_relay", &ReplayWiring::default());
+    plain
+        .set_replay_fire_plan(0, &plan)
+        .expect("the plan installs");
+    let err = plain
+        .set_replay_trailing_refills(0, &["relay"])
+        .expect_err("an unheld producer below the cap is refused");
+    assert_eq!(
+        err.to_string(),
+        "Graph validation error: replay fire plan (step 0): node 'relay' cannot carry a trailing \
+         refill: it fires 2 times, not the cap of 64, and has no pre-fire check"
+    );
+    plain.shutdown();
 }

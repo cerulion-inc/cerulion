@@ -512,7 +512,12 @@ pub struct BagFedBlockEdge {
 ///   `block` input never raised. The replay does not serve the block probe's
 ///   own at-depth event either: the recording does not hold when it fired.
 /// * The PRODUCER end: a build that holds one of `producer_nodes`, and not the
-///   consumer, writes `topic` with its consumer in another pass.
+///   consumer, writes `topic` with its consumer in another pass, and marks
+///   each of `producer_nodes` it holds as held by the edge, so the scheduler
+///   accepts a trailing refill the recording holds on that node below the
+///   burst cap. Live, the consumer's credit word in another process could
+///   defer the node between the fires of a burst, and this build has no
+///   pre-fire check to show it.
 ///
 /// The build verifies the end it holds, the way it verifies a credit
 /// binding's role, and refuses, naming the entry: an entry a mapped credit
@@ -644,7 +649,7 @@ impl BagFedBlockEdges {
                 }
                 // A producer end: this build writes `topic` and its consumer
                 // runs in another pass.
-                (None, false) => {}
+                (None, false) => ends.producers.extend(named.into_iter().map(str::to_string)),
             }
         }
         Ok(ends)
@@ -659,6 +664,8 @@ pub(crate) struct BagFedEnds {
     /// `(topic, consumer node, consumer input)` of each consumer end, in the
     /// set's order.
     consumers: Vec<(String, String, String)>,
+    /// Each producer node a fed edge holds here, in name order.
+    producers: std::collections::BTreeSet<String>,
 }
 
 impl BagFedEnds {
@@ -667,6 +674,11 @@ impl BagFedEnds {
         self.consumers
             .iter()
             .any(|(t, n, i)| t == topic && n == node && i == input)
+    }
+
+    /// The producer nodes a fed edge holds here, in name order.
+    pub(crate) fn held_producers(&self) -> impl Iterator<Item = &str> {
+        self.producers.iter().map(String::as_str)
     }
 }
 
@@ -1089,6 +1101,11 @@ mod bag_fed_block_edge_tests {
         assert!(ends.feeds_consumer("/fb/data", "sink", "inp"));
         assert!(!ends.feeds_consumer("/fb/data", "sink", "other"));
         assert!(!ends.feeds_consumer("/fb/other", "sink", "inp"));
+        assert_eq!(
+            ends.held_producers().count(),
+            0,
+            "a consumer end holds no producer"
+        );
         consumer_only
             .validate_with_credit_edges(&CreditedEdges::none(), &ends)
             .expect("the fed input is exempt");
@@ -1116,15 +1133,27 @@ mod bag_fed_block_edge_tests {
             .expect("the timeout on a fed input is accepted");
     }
 
-    /// The producer end resolves and exempts no input.
+    /// The producer end resolves, exempts no input and holds the producer the
+    /// entry names. Beside a writer of the same topic the entry does not
+    /// name, only the named one is held.
     #[test]
-    fn a_producer_end_resolves_with_no_input_to_exempt() {
+    fn a_producer_end_holds_the_producer_the_entry_names_and_exempts_no_input() {
         let producer_only = topology(&[PRODUCER], BackpressurePolicy::Block);
         let set = BagFedBlockEdges::new([edge("/fb/data")]);
         let ends = set
             .resolve(&producer_only, &CreditedEdges::none(), "fb")
             .expect("the producer end resolves");
         assert!(!ends.feeds_consumer("/fb/data", "sink", "inp"));
+        assert_eq!(ends.held_producers().collect::<Vec<_>>(), vec!["prod"]);
+        let two_writers = topology_listing(
+            "multi_publisher_topics:\n  - /fb/data\n",
+            &[PRODUCER, OTHER_PRODUCER],
+            BackpressurePolicy::Block,
+        );
+        let ends = set
+            .resolve(&two_writers, &CreditedEdges::none(), "fb")
+            .expect("the producer end resolves");
+        assert_eq!(ends.held_producers().collect::<Vec<_>>(), vec!["prod"]);
     }
 
     #[test]
