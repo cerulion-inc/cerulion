@@ -295,11 +295,16 @@ before the recording starts its read log and a resumed pass starts after reads
 its bag does not keep; a count past that queue is judged as one after a fire
 is, on a resumed pass too. A resumed pass that holds no fire of the node and no
 read its body made stands down by name once a count passes that queue (a
-`stand_down` of code `latest_unfired_since_anchor`, which also prints a warning
-on stderr and changes no exit code), because a node that
+`stand_down` of code `latest_unfired_since_anchor`), because a node that
 returned `NodeError::Fatal` before the pass's anchor records exactly
-that, and so does a running node the scheduler never fired in the pass: the bag
-records no stop and the anchor does not stamp each node's stopped state. A
+that, and so does a running node the scheduler never fired in the pass, and the
+recording does not state which it was: the bag is below trace format 10 and the
+node's checkpoint part carries no stopped flag, or the checkpoint holds no
+complete part for the node (a node that saves no state, or a skipped or torn
+part). From trace format 10 every complete checkpoint part of a stopped node
+carries the stopped flag, and a resumed pass keeps such a node stopped and
+judges no fire of it, and judges a node the checkpoint states as running in
+full. A
 from-start pass re-executes the stop, and a node that fires or reads in its
 body anywhere in a resumed pass is still judged. A `--verify` replay of a
 one-rank bag this build recorded mid-run is refused before its first step when
@@ -321,6 +326,25 @@ count of more than one frame is named whole from `trace_format` 9, when its
 batch frames fit the read stage. On a bag that does not record whether a
 `drop_oldest` input was read through one subscriber or two, a step that popped
 and fired nothing stands down rather than being judged as one.
+
+For a node a resumed pass never runs and whose stop the recording does not
+state, the other rules that owe a fire stand down the same way, at the first
+step they would convict: the FIFO pop count (`fifo_unfired_since_anchor`), the
+fire a pop owes a `consume = latest` input read through one subscriber
+(`latest_unfired_since_anchor`), and the fire an aligned set owes a `Sync`
+node (`sync_unfired_since_anchor`). Each of these stand-downs, the
+two-subscriber one included, prints a warning on stderr on every run, naming
+the node, the code, the bag's `trace_format` and the checkpoint step, and
+changes no exit code; its `stand_down` note is in the `--report` JSON, which
+only a `--verify` run writes. For a per-set `Sync` node a `--verify` replay
+reaches this rule only on a bag below trace format 8: from format 8 a free-run
+`--verify` is fed by read identity, which refuses a per-set `Sync` stage
+before its first step (`read_identity_ungateable_stage`, exit 2), so on such
+a bag a neutral `--resim all` is the replay that reaches it. A node that
+exports no state shape, such as a Python node, has no checkpoint part on any
+trace format, so the recording never states its stop: on a resumed pass where
+it neither fires nor reads in its body, these rules stand it down by name from
+trace format 10 too.
 
 ### Divergence LOCALIZES to the producing rank
 

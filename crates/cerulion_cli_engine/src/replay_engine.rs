@@ -89,7 +89,7 @@ use cerulion_core::state_restore::{
     enforce_strict_state, plan_backlog_admission, plan_restore, refuse_lossy_reexecuted_topics,
     seed_publisher_sequence, AnchorBlob, BacklogAdmission, BacklogClaim, InputServiceCursor,
     NodeFrameworkState, RestorePlan, RestoreRequest, ResumeAnchor, SeedEvidence, SeedRung,
-    TopicFrameCount, TopicLoss, TopicWriters,
+    StoppedAtAnchor, TopicFrameCount, TopicLoss, TopicWriters,
 };
 use cerulion_core::trace_ring::{
     unpack_read_outcome_meta, unpack_read_outcome_meta_full, unpack_read_outcome_popped,
@@ -252,7 +252,29 @@ fn resim_slot_lock_dir(base: &iceoryx2::config::Config) -> PathBuf {
 struct ResimSlot {
     slot: u32,
     /// Kept only to hold the lock.
-    _lock: std::fs::File,
+    _lock: SlotLock,
+}
+
+/// A slot's lock file with its exclusive `flock` held, released on drop.
+///
+/// A `flock` lock belongs to the open file description, not to one
+/// descriptor. A child this process forks holds a copy of every descriptor
+/// until it execs, so closing the file alone would leave the lock held for as
+/// long as such a copy lives. Drop therefore unlocks the description first,
+/// which releases the lock whatever copies exist, and then closes the file.
+#[derive(Debug)]
+struct SlotLock(std::fs::File);
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        if let Err(error) = rustix::fs::flock(&self.0, rustix::fs::FlockOperation::Unlock) {
+            tracing::warn!(
+                error = %error,
+                "replay: could not unlock a resim namespace slot before closing its lock file; \
+                 the slot stays held until every copy of the descriptor is closed"
+            );
+        }
+    }
 }
 
 /// Why a claim passed over a slot whose lock a running resim does not hold.
@@ -345,7 +367,8 @@ fn log_passed_over_slot(
 ///
 /// A slot whose lock another process holds is skipped. A slot whose lock file
 /// cannot be opened or locked (another user's, say) or that `ready` refuses
-/// is passed over, its lock released, and logged through one
+/// is passed over, its lock released (unlocked, then closed, see
+/// [`SlotLock`]), and logged through one
 /// [`FailureRegimeLatch`](cerulion_core::transport::failure_regime_latch::FailureRegimeLatch)
 /// per claim ([`log_passed_over_slot`]); a claim that then takes a slot after
 /// suppressed repeats logs how many. With no slot left the claim is
@@ -373,7 +396,7 @@ fn claim_resim_slot(
             .and_then(|lock| {
                 match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive)
                 {
-                    Ok(()) => Ok(Some(lock)),
+                    Ok(()) => Ok(Some(SlotLock(lock))),
                     Err(e) if e == rustix::io::Errno::WOULDBLOCK => Ok(None),
                     Err(e) => Err(format!("{}: {e}", path.display())),
                 }
@@ -577,6 +600,10 @@ fn remove_leftover_segment(path: &Path) -> SegmentRemoval {
 /// process ends. The process has one transport, so every resim it runs uses
 /// that one namespace, and a later resim never reclaims the namespace the
 /// transport is running on.
+///
+/// A static is never dropped, so the claimed slot's [`SlotLock`] never runs its
+/// unlock: the kernel releases the lock when the last copy of the descriptor
+/// closes, at process exit, or at the exec of a child forked just before it.
 static RESIM_SLOT: std::sync::Mutex<Option<ResimSlot>> = std::sync::Mutex::new(None);
 
 /// The slot of this process's resims (see [`RESIM_SLOT`]): the first call
@@ -2293,29 +2320,11 @@ impl RecorderInfo {
     }
 }
 
-/// Which coordination contract a recording was taken under, and
-/// therefore which replay contract applies to it.
-///
-/// Stamped into `__cerulion/recorder.json` by every current recorder (see
-/// `graph_cmd::render_recorder_json`) and read back through
-/// [`RecorderInfo::coordination`].
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, Hash,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CoordinationMode {
-    /// Barrier-lockstep: every rank advances the SAME handed quantum per step,
-    /// so the per-rank STEP_BOUNDARY streams carry EQUAL targets on every
-    /// shared step and one first boundary anchors a mid-run resume. The
-    /// contract every recording that predates the stamp was taken under, and the
-    /// DEFAULT — an absent stamp resolves here.
-    #[default]
-    Lockstep,
-    /// Free-run: each rank keeps its OWN wall-faithful boundary stream sharing
-    /// only the GO epoch, so cross-rank boundary equality does not hold by
-    /// design and there is no single first boundary to anchor off.
-    FreeRun,
-}
+// Which coordination contract a recording was taken under, and therefore which
+// replay contract applies to it: stamped into `__cerulion/recorder.json` by
+// every current recorder (`graph_cmd::render_recorder_json`) and read back
+// through `RecorderInfo::coordination`.
+pub use cerulion_core::flashback::resim::CoordinationMode;
 
 /// Serde default for [`RecorderInfo::trace_format`] — an absent field
 /// (every bag older than the discard marker) means format version 1 (no discard markers).
@@ -2403,9 +2412,9 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the IDENTITY term and stamps 9, because
-///   [`recorder_stamps_consult_records`] and
-///   [`recorder_records_read_identity`] are unconditionally true and this
+///   this binary writes takes the ANCHOR STOPS term and stamps 10, because
+///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`]
+///   and [`recorder_states_anchor_stops`] are unconditionally true and this
 ///   function returns before the ladder is consulted. The ladder below (the
 ///   fold term at 6, the role term at 5, then the mode and stream arms) is the
 ///   `records_consults == false` fallback, i.e. the rules that produced the
@@ -2422,8 +2431,8 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// NEVER-UNDER-CLAIM: a bag carrying a record kind >= 7 must stamp >= 4. That
 /// is the (b) arm, and it holds independently of the mode — a LOCKSTEP bag with
-/// such a stream would stamp 4 too. Every term above those arms stamps 5, 6 or
-/// 7, each >= 4, so the claim survives all three.
+/// such a stream would stamp 4 too. Every term above those arms stamps 5 or
+/// more, so the claim survives each of them.
 pub fn stamp_trace_format(
     coordination: CoordinationMode,
     stream_needs_v4: bool,
@@ -2431,7 +2440,19 @@ pub fn stamp_trace_format(
     folds_runs: bool,
     records_consults: bool,
     records_identity: bool,
+    states_anchor_stops: bool,
 ) -> u32 {
+    if records_consults && records_identity && states_anchor_stops {
+        // Every complete checkpoint part of a node the scheduler had stopped
+        // carries the stopped flag in its framework section, so a part
+        // without it states a running node. A format 9 reader reads past
+        // the flag and judges a node stopped before the checkpoint as one
+        // that owed fires, so the stamp moves and that reader refuses the
+        // bag. The term claims nothing without the consult and identity
+        // terms under it, as the identity term claims nothing without the
+        // consult term.
+        return 10;
+    }
     if records_consults && records_identity {
         // Every edge carries producer annotations, one per writer run, so
         // the read log names the writer and the sequence of every frame a read
@@ -2546,6 +2567,18 @@ pub fn recorder_records_read_identity() -> bool {
     true
 }
 
+/// Does THIS binary's recorder state, in every complete checkpoint part, whether
+/// the scheduler had stopped the node at that boundary?
+///
+/// `true`, unconditionally: the anchor walk writes each node's framework
+/// section from the scheduler's own view of it, and a stopped node's section
+/// carries the stopped flag
+/// (`cerulion_core::state_restore::NodeFrameworkState::stopped`), so a
+/// complete part without the flag states a running node.
+pub fn recorder_states_anchor_stops() -> bool {
+    true
+}
+
 /// The lowest `trace_format` whose read log names the identity of every read:
 /// the bags a `--verify` replay feeds read by read through private per-input
 /// feeds, refusing by name what it cannot feed, instead of re-creating each
@@ -2559,6 +2592,25 @@ const _: () = assert!(READ_IDENTITY_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
 /// Does this bag's read log name the identity of every read?
 pub fn recorder_records_read_identity_at(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= READ_IDENTITY_MIN_TRACE_FORMAT)
+}
+
+/// The lowest `trace_format` at which every complete checkpoint part of a stopped node carries the stopped flag,
+/// so a complete part without it states a running node. Below it a part
+/// without the flag says nothing about the node's stop.
+///
+/// The flag itself is a positive claim at every format: a bag below this one
+/// that carries it states the stop.
+pub const ANCHOR_STOPS_MIN_TRACE_FORMAT: u32 = 10;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(ANCHOR_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does this bag's format say that every complete checkpoint part of a stopped node carries the stopped flag, so
+/// that a complete part without the flag states a running node?
+///
+/// An ABSENT `recorder.json` answers `false`.
+pub fn recorder_states_anchor_stops_at(recorder: Option<&RecorderInfo>) -> bool {
+    recorder.is_some_and(|r| r.trace_format >= ANCHOR_STOPS_MIN_TRACE_FORMAT)
 }
 
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
@@ -2724,17 +2776,31 @@ pub fn replay_stages_batch_frames(
 /// replay of it stages no `BatchFrame` record
 /// ([`BATCH_FRAME_MIN_TRACE_FORMAT`]).
 ///
+/// Bumped to 10 by checkpoint stops: every complete checkpoint part of a node
+/// the scheduler had stopped carries the stopped flag in its framework section
+/// ([`ANCHOR_STOPS_MIN_TRACE_FORMAT`]), so a resumed replay keeps such a node
+/// stopped and expects no fire of it, and a complete part without the flag
+/// states a running node. A format 9 reader reads past the flag and judges a
+/// node stopped before the checkpoint as one that owed fires, so it must
+/// refuse the bag. Formats 1 to 9 stay readable: a part that carries the flag
+/// states the stop at any format, and below 10 a part without it states
+/// nothing about the node's stop. A section version above 5 may define more
+/// flag bits, and this binary reads past them, so a later claim that changes
+/// what a resumed replay concludes needs its own `trace_format` bump, which
+/// this binary refuses.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 9,
-/// because every one records every consult and every frame each read
-/// consumed when its batch fits the read stage's window), but the two remain
+/// them to zero for the bags this binary writes (every one of them stamps 10,
+/// because every one records every consult, every frame each read
+/// consumed when its batch fits the read stage's window, and the stopped flag
+/// in every complete checkpoint part of a stopped node), but the two remain
 /// separate functions serving separate
-/// questions, and the READ gate still admits 1 to 8
+/// questions, and the READ gate still admits 1 to 9
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 9;
+pub const SUPPORTED_TRACE_FORMAT: u32 = 10;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -5010,6 +5076,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // frames its recorded read consumed. Everything else keeps the queue
     // re-creation path, and the verdict says so.
     let identity_recorded = recorder_records_read_identity_at(recorder.as_ref());
+    // CHECKPOINT STOPS: does every complete checkpoint part of a stopped node
+    // carry the stopped flag, so that a part without it states a running node?
+    let every_stop_flagged = recorder_states_anchor_stops_at(recorder.as_ref());
     let fed = purpose == ReplayPurpose::Verify
         && coordination == CoordinationMode::FreeRun
         && identity_recorded;
@@ -5137,6 +5206,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
             &record_health,
             duration_bound_ns,
             coordination,
+            every_stop_flagged,
         )
     })?;
     let skipped_prefix = resume
@@ -5463,16 +5533,6 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // `RankBoundarySummary::first_target_ns`'s own doc says the
     // epochs share a DOMAIN, not a VALUE.
     let run_epoch_ns = crate::replay_rank::run_epoch_ns(&boundary_summaries);
-    // `--record-out`: the sink every rank's captures write into. Opened once,
-    // before any pass, so a path that cannot be created fails the run up front.
-    // An unfinalized sink removes its file when dropped (an abort, an error).
-    let record_out = match record_out {
-        Some(plan) => Some(Arc::new(crate::resim_record_out::RecordOut::open(
-            plan,
-            &classes.produced,
-        )?)),
-        None => None,
-    };
 
     // The loop has NO `?`. Each of its fallible seams
     // `break`s out with the failing rank and its error instead, so the
@@ -5522,6 +5582,18 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 e.detail
             ),
         })?;
+    // `--record-out`: the sink every rank's captures write into. Opened once,
+    // after the whole-run checks above and before any pass, so a bag those
+    // checks refuse creates no file, and a path that cannot be created fails
+    // the run before rank 0 runs a step. An unfinalized sink abandons its
+    // writer and removes its file when dropped (an abort, an error).
+    let record_out = match record_out {
+        Some(plan) => Some(Arc::new(crate::resim_record_out::RecordOut::open(
+            plan,
+            &classes.produced,
+        )?)),
+        None => None,
+    };
 
     let aborted: Option<(u32, ReplayError)> = 'passes: {
         for (pass_idx, plan) in plans.iter().enumerate() {
@@ -5543,6 +5615,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 stages_batch_frames,
                 identity: edge_identity,
                 kind_width,
+                trace_format: recorder.as_ref().map(|r| r.trace_format),
                 catchup_onset,
                 trace: &trace,
                 recorded_messages: &recorded_messages,
@@ -5598,6 +5671,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                     None
                 },
                 publisher_slots: publisher_slots.clone(),
+                bag_fed_block_edges: cerulion_core::replay_feed::BagFedBlockEdges::default(),
             };
             let mut runtime = match build_pass_runtime(
                 plan,
@@ -5616,6 +5690,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 Ok(runtime) => runtime,
                 Err(e) => break 'passes Some((rank, e)),
             };
+            // The resim owns its run and builds every pass in this one process
+            // from the same environment, so it reports what the first pass's
+            // build left out of the nodes' environment, once.
+            if pass_idx == 0 {
+                runtime.node_env_left_out().warn();
+            }
             if let Some(onset) = catchup_onset {
                 runtime.attach_replay_catchup_arm(onset);
             }
@@ -7038,6 +7118,9 @@ struct ResumePlan {
     /// See [`scan_suffix_fires`] for why this is not simply "every node in the
     /// graph" and what the reading costs.
     executed_nodes: BTreeSet<String>,
+    /// Per graph node, what the checkpoint states about its stop
+    /// ([`resolve_anchor_stops`]).
+    stops: AnchorStops,
 }
 
 /// What a Flashback capture's `resimmable` claim covered, and what the
@@ -7157,6 +7240,13 @@ pub struct ResumeReport {
     /// read against it rather than blamed on the candidate.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub anchor_pending_fires: BTreeMap<String, u64>,
+    /// Nodes the checkpoint states as stopped at the anchor step, in id
+    /// order: the resumed graph keeps each stopped and expects no fire of it.
+    ///
+    /// Additive: absent from an existing report, and empty for every bag
+    /// whose checkpoint states no stop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stopped_at_anchor: Vec<String>,
 }
 
 /// One re-executed topic's seeded starting sequence.
@@ -7211,9 +7301,10 @@ fn replayed_frame_count(
 
 /// The graph-produced topics, in graph order, deduplicated.
 ///
-/// Shared by [`classify_topics`] and the resume resolver so the two cannot
-/// disagree about which topics a replay RE-EXECUTES — the set the lossy
-/// refusal and the sequence-seed ladder are both scoped to. `graph run
+/// Shared by [`classify_topics`] and the resume resolver, which both read
+/// every produced topic. The resume resolver narrows it with
+/// [`reexecuted_topics`] for the lossy refusal and the sequence-seed ladder,
+/// which skip a topic only stopped nodes produce. `graph run
 /// --record` classifies a recording's outside topics by it too
 /// (`graph_cmd::external_consumers`), so the recording and the replay agree on
 /// which topics come from outside the graph.
@@ -7229,6 +7320,29 @@ pub(crate) fn graph_produced_topics(config: &GraphConfig) -> Vec<String> {
         }
     }
     produced
+}
+
+/// The graph-produced topics a resumed replay re-executes: every topic of
+/// `produced` except one whose every in-graph producer the checkpoint states
+/// as stopped, since its publishers never publish again in the replay.
+fn reexecuted_topics(
+    config: &GraphConfig,
+    produced: &[String],
+    stops: &AnchorStops,
+) -> Vec<String> {
+    produced
+        .iter()
+        .filter(|topic| {
+            let mut producers = config.nodes.iter().filter(|node| {
+                node.outputs.iter().any(|output| {
+                    cerulion_core::graph::resolve_output_topic(&config.prefix, &node.id, output)
+                        == **topic
+                })
+            });
+            producers.any(|node| !stops.is_stopped(&node.id))
+        })
+        .cloned()
+        .collect()
 }
 
 /// The first `STEP_BOUNDARY` on rank 0's stream, if any.
@@ -8229,13 +8343,19 @@ struct SuffixFireScan {
     /// this narrows WHICH nodes a missing anchor refuses for, and never makes a
     /// divergence quieter.
     executed: BTreeSet<String>,
+    /// Per node id in [`Self::executed`], the lowest step at which the
+    /// recording holds a FIRE record of it, discarded fires included (a
+    /// discarded fire still ran the node's tick).
+    first_fire: BTreeMap<String, u64>,
     /// Per node id, FIRE records at the steps sharing the FIRST boundary's
     /// target that COMMITTED (the discard bit clear).
     tie_commits: BTreeMap<String, usize>,
     /// Set when a FIRE record in either window could not be resolved to a node
     /// id (an out-of-range rank or `node_idx`). The recording is corrupt and
-    /// the validators refuse it a moment later; until then every count derived
-    /// here is unusable, so the caller falls back to the timestamp-only split.
+    /// the validators refuse it a moment later; until then the tie-band
+    /// counts are unusable, so the caller falls back to the timestamp-only
+    /// split. [`Self::executed`] and [`Self::first_fire`] stay exact for every
+    /// FIRE record that does resolve.
     unresolved_fire: bool,
 }
 
@@ -8271,6 +8391,10 @@ fn scan_suffix_fires(
         };
         if in_executed {
             out.executed.insert(node.to_string());
+            out.first_fire
+                .entry(node.to_string())
+                .and_modify(|step| *step = (*step).min(rec.step))
+                .or_insert(rec.step);
         }
         if in_tie && !rec.is_discarded() {
             *out.tie_commits.entry(node.to_string()).or_insert(0) += 1;
@@ -8387,6 +8511,7 @@ fn resolve_resume(
     record_health: &RecordHealthReport,
     duration_bound_ns: Option<u64>,
     coordination: CoordinationMode,
+    every_stop_flagged: bool,
 ) -> Result<Option<ResumePlan>, ReplayError> {
     let Some(first) = first_recorded_boundary(trace)? else {
         return Ok(None); // no boundaries at all — the existing refusal owns it.
@@ -8488,12 +8613,34 @@ fn resolve_resume(
         return Ok(None);
     };
 
+    // The anchor's complete parts and their framework sections (the
+    // scheduler's own view of each node at `S`, which every consumer below
+    // reads; a bag without framework sections states none), and what they
+    // state about each graph node's stop. A node the checkpoint states
+    // as stopped fires no more, so a fire of it in the steps this replay
+    // executes is a recording that contradicts itself, even when the scan
+    // also met a fire record it could not resolve to a node.
+    let blobs = anchors.blobs_at(anchor.run_id, anchor.step);
+    let framework = decode_framework_sections(&blobs)?;
+    let stops = resolve_anchor_stops(
+        config.nodes.iter().map(|node| node.id.as_str()),
+        &blobs,
+        &framework,
+        every_stop_flagged,
+    );
+    if let Some(refusal) = stopped_fire_refusal(&stops, &fires.first_fire, anchor.step) {
+        return Err(refusal);
+    }
+
     // A re-executed topic whose recording is lossy cannot have its
     // sequence derived, and a seed off by one is a byte mismatch on EVERY
-    // subsequent frame that reads to an operator as "my node changed".
+    // subsequent frame that reads to an operator as "my node changed". A
+    // topic only stopped nodes produce is not re-executed: its publishers
+    // never publish again, so it is neither refused for a loss nor seeded.
     let produced = graph_produced_topics(config);
+    let reexecuted = reexecuted_topics(config, &produced, &stops);
     let losses = collect_topic_losses(record_health, coverage);
-    refuse_lossy_reexecuted_topics(&produced, &losses).map_err(|refusal| {
+    refuse_lossy_reexecuted_topics(&reexecuted, &losses).map_err(|refusal| {
         ReplayError::StateRestore {
             reason: refusal.to_string(),
         }
@@ -8560,7 +8707,7 @@ fn resolve_resume(
 
     let mut seeds = BTreeMap::new();
     let mut seed_rungs = Vec::new();
-    for topic in &produced {
+    for topic in &reexecuted {
         let evidence = scan
             .get(topic)
             .map(|s| {
@@ -8664,8 +8811,6 @@ fn resolve_resume(
     // The framework section — the SCHEDULER's own view of
     // each node at `S`, which every consumer below reads and a bag without
     // framework sections states none of.
-    let blobs = anchors.blobs_at(anchor.run_id, anchor.step);
-    let framework = decode_framework_sections(&blobs)?;
     let period_baselines: BTreeMap<String, u64> = framework
         .iter()
         .filter_map(|(node, state)| state.next_fire_ns.map(|ns| (node.clone(), ns)))
@@ -8679,6 +8824,7 @@ fn resolve_resume(
         config,
         recorded_messages,
         &framework,
+        &stops,
         &produced,
         anchor_clock_ns,
     )?;
@@ -8698,9 +8844,12 @@ fn resolve_resume(
     // out loud, because it is the one piece of evidence in the bag that the
     // first replayed fires may differ for a reason the replayed code did not
     // cause.
+    //
+    // A node the checkpoint states as stopped is left out: it fires no more,
+    // so its count is arrivals it will never consume, not fires it owes.
     let anchor_pending_fires: BTreeMap<String, u64> = framework
         .iter()
-        .filter(|(_, state)| state.pending_data_count > 0)
+        .filter(|(node, state)| state.pending_data_count > 0 && !stops.is_stopped(node))
         .map(|(node, state)| (node.clone(), state.pending_data_count))
         .collect();
     for (node, pending) in &anchor_pending_fires {
@@ -8721,6 +8870,7 @@ fn resolve_resume(
         config,
         recorded_messages,
         &framework,
+        &stops,
         &produced,
         anchor_clock_ns,
     )?;
@@ -8773,6 +8923,7 @@ fn resolve_resume(
         seeds,
         seed_rungs,
         executed_nodes: fires.executed,
+        stops,
     }))
 }
 
@@ -8801,6 +8952,137 @@ fn decode_framework_sections(
         }
     }
     Ok(out)
+}
+
+/// What a mid-run bag's checkpoint states about ONE graph node's stop at the
+/// anchor step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnchorStop {
+    /// The node's framework section carries the stopped flag: the scheduler
+    /// had stopped it by the anchor step, and nothing in a graph run restarts
+    /// a stopped node. A positive claim, so it is read at every `trace_format`.
+    /// Carries what the same section states about the stopped node's trigger
+    /// queue ([`StoppedAtAnchor::from_section`]).
+    Stopped(StoppedAtAnchor),
+    /// The bag is at [`ANCHOR_STOPS_MIN_TRACE_FORMAT`] or later and holds a
+    /// complete part for the node without the flag: the node was running.
+    Running,
+    /// The checkpoint says nothing about the node's stop: it holds no complete
+    /// part for the node (a node that saves no state, or a skipped or torn
+    /// part), or the bag is below [`ANCHOR_STOPS_MIN_TRACE_FORMAT`] and the
+    /// part carries no flag.
+    Unstated,
+}
+
+/// Per graph node, what the checkpoint states about its stop
+/// ([`AnchorStop`]), in id order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AnchorStops {
+    by_node: BTreeMap<String, AnchorStop>,
+}
+
+impl AnchorStops {
+    /// The nodes the checkpoint states as stopped, in id order.
+    fn stopped(&self) -> impl Iterator<Item = &str> {
+        self.stops_at_anchor().map(|(node, _)| node)
+    }
+
+    /// The nodes the checkpoint states as stopped, each with what its section
+    /// states about its trigger queue, in id order: the input a stop restore
+    /// (`GraphRuntime::restore_stopped_nodes`) takes.
+    fn stops_at_anchor(&self) -> impl Iterator<Item = (&str, StoppedAtAnchor)> {
+        self.by_node.iter().filter_map(|(node, stop)| match stop {
+            AnchorStop::Stopped(at_anchor) => Some((node.as_str(), *at_anchor)),
+            AnchorStop::Running | AnchorStop::Unstated => None,
+        })
+    }
+
+    /// Does the checkpoint state `node` as stopped? Such a node owes no fire
+    /// in the replay, so its pending count, its backlog claim and its
+    /// service cursors describe a consumer that will never read again.
+    fn is_stopped(&self, node: &str) -> bool {
+        matches!(self.by_node.get(node), Some(AnchorStop::Stopped(_)))
+    }
+
+    /// The nodes whose stop the checkpoint states, stopped or running, in id
+    /// order: every node but the [`AnchorStop::Unstated`] ones.
+    fn stated(&self) -> BTreeSet<String> {
+        self.by_node
+            .iter()
+            .filter(|(_, stop)| **stop != AnchorStop::Unstated)
+            .map(|(node, _)| node.clone())
+            .collect()
+    }
+}
+
+/// The refusal for a stop restore the runtime declined. The stopped set is
+/// built from the graph's own nodes and the runtime is freshly built, so a
+/// refusal here is an engine bug (exit 5), never a bag fault.
+fn stop_restore_failure(error: &cerulion_core::TransportError) -> ReplayError {
+    ReplayError::Internal {
+        reason: format!(
+            "the resume could not keep the nodes its checkpoint states as stopped from firing: \
+             {error}; this is a bug in the replay engine, please report"
+        ),
+    }
+}
+
+/// Classify every node of the graph by what the checkpoint at the anchor step
+/// states about its stop ([`AnchorStop`]).
+///
+/// `blobs` holds only COMPLETE parts (`BagAnchors::blobs_at`), so a torn or
+/// skipped part is absent from it, and `framework` holds the sections decoded
+/// from those parts. A part for a node the graph does not run is not a stop:
+/// it is not in `graph_nodes`, the runtime lists it under `anchors_unused`,
+/// and nothing applies it. `every_stop_flagged` is
+/// [`recorder_states_anchor_stops_at`] for the bag: whether every complete part
+/// of a stopped node carries the flag.
+fn resolve_anchor_stops<'a>(
+    graph_nodes: impl IntoIterator<Item = &'a str>,
+    blobs: &BTreeMap<String, Vec<u8>>,
+    framework: &BTreeMap<String, NodeFrameworkState>,
+    every_stop_flagged: bool,
+) -> AnchorStops {
+    let by_node = graph_nodes
+        .into_iter()
+        .map(|node| {
+            let stopped = framework.get(node).and_then(StoppedAtAnchor::from_section);
+            let stop = if let Some(at_anchor) = stopped {
+                AnchorStop::Stopped(at_anchor)
+            } else if every_stop_flagged && blobs.contains_key(node) {
+                AnchorStop::Running
+            } else {
+                AnchorStop::Unstated
+            };
+            (node.to_string(), stop)
+        })
+        .collect();
+    AnchorStops { by_node }
+}
+
+/// The refusal for a recording that fires a node its checkpoint states as
+/// stopped, in the steps this replay executes: nothing in a graph run
+/// restarts a stopped node, so the bag contradicts itself
+/// ([`ReplayError::RecordingInconsistent`], exit 2, before the first replayed
+/// step).
+///
+/// `first_fire` is [`SuffixFireScan::first_fire`]. The first stopped node in
+/// id order that the recording fires is named, with its first fire.
+fn stopped_fire_refusal(
+    stops: &AnchorStops,
+    first_fire: &BTreeMap<String, u64>,
+    anchor_step: u64,
+) -> Option<ReplayError> {
+    stops.stopped().find_map(|node| {
+        let step = *first_fire.get(node)?;
+        Some(ReplayError::RecordingInconsistent {
+            detail: format!(
+                "the checkpoint at step {anchor_step} states that node '{node}' had stopped, and \
+                 the recording holds a fire of it at step {step}; nothing restarts a stopped \
+                 node in a run"
+            ),
+        })
+    })
 }
 
 /// Judge the undrained backlogs the framework sections
@@ -8855,11 +9137,17 @@ fn resolve_backlog_admission(
     config: &GraphConfig,
     recorded_messages: &RecordedMessages,
     framework: &BTreeMap<String, NodeFrameworkState>,
+    stops: &AnchorStops,
     produced: &[String],
     anchor_clock_ns: u64,
 ) -> Result<BacklogAdmission, ReplayError> {
     let mut claims: Vec<BacklogClaim> = Vec::new();
     for node in &config.nodes {
+        // A stopped node's count is arrivals it will never consume, so it
+        // claims no backlog a replay must re-feed.
+        if stops.is_stopped(&node.id) {
+            continue;
+        }
         let Some(state) = framework.get(&node.id) else {
             continue;
         };
@@ -9081,12 +9369,19 @@ fn resolve_pre_anchor_service(
     config: &GraphConfig,
     recorded_messages: &RecordedMessages,
     framework: &BTreeMap<String, NodeFrameworkState>,
+    stops: &AnchorStops,
     produced: &[String],
     anchor_clock_ns: u64,
 ) -> Result<PreAnchorService, ReplayError> {
     // Per EXTERNAL topic, what each of its in-graph consumers says about it.
     let mut consumers: BTreeMap<String, Vec<(String, String, ConsumerKind)>> = BTreeMap::new();
     for node in &config.nodes {
+        // A node the checkpoint states as stopped reads none of the band, so
+        // its cursor neither caps a running consumer's skip nor keeps the band
+        // whole.
+        if stops.is_stopped(&node.id) {
+            continue;
+        }
         for input in &node.inputs {
             let topic = cerulion_core::graph::resolve_source(&config.prefix, &input.source);
             if produced.contains(&topic) {
@@ -9781,6 +10076,10 @@ struct PassInputs<'a> {
     /// because they answer different questions and disagree on exactly the bag
     /// that has no recorder attachment — see [`KindFieldWidth`].
     kind_width: KindFieldWidth,
+    /// The bag's stamped `trace_format`, `None` with no recorder attachment.
+    /// Named on the warnings a resumed pass's stand-downs print, since the
+    /// format decides whether the checkpoint can state a node's stop.
+    trace_format: Option<u32>,
     /// The armed capture plane the recording ran under, if any: the
     /// SAME onset `attach_replay_catchup_arm` hands this pass's scheduler, so
     /// the re-derivation verifier runs the one clamp the replay runs.
@@ -10348,6 +10647,32 @@ fn apply_resume(
         .filter_map(|(node, state)| Some((node.clone(), state.sync_epoch_floor?)))
         .collect();
     runtime.restore_sync_epoch_floor(&epoch_floors);
+    // A node the checkpoint states as stopped stays stopped: the recorded run
+    // stopped it before the anchor, and nothing in the resumed steps re-runs
+    // that stop. The runtime disables it and releases each `block` slot it
+    // holds as a consumer, as its live stop did, so a producer it paced is not
+    // held by a consumer that will never drain. A stopped node whose section
+    // states an unconsumed arrival resumes with its per-message trigger input
+    // drained through its own subscriber (`drop_oldest`) holding the frame its
+    // drain had popped, so that drain reads nothing in the resumed steps, as
+    // the recorded one did.
+    let stopped: BTreeMap<String, StoppedAtAnchor> = plan
+        .stops
+        .stops_at_anchor()
+        .map(|(node, at_anchor)| (node.to_string(), at_anchor))
+        .collect();
+    let held = runtime
+        .restore_stopped_nodes(&stopped)
+        .map_err(|e| stop_restore_failure(&e))?;
+    for node in stopped.keys() {
+        tracing::info!(
+            node_id = %node,
+            anchor_step = plan.anchor.step,
+            holds_trigger_head = held.contains(node),
+            "replay resume: the checkpoint states this node had stopped, so the resumed graph \
+             keeps it stopped and releases its block slots"
+        );
+    }
     // `--strict-state` is judged HERE and not at the gate, because whether a
     // node has state is a property of its compiled TYPE (node metadata
     // lives in the source, never in the YAML), so the entries have to be loaded
@@ -10402,6 +10727,7 @@ fn apply_resume(
         pre_anchor_frames_already_read: plan.service_skip.clone(),
         service_cursor_notes: plan.service_notes.clone(),
         anchor_pending_fires: plan.anchor_pending_fires.clone(),
+        stopped_at_anchor: stopped.into_keys().collect(),
     })
 }
 
@@ -10651,23 +10977,51 @@ fn fifo_trailing_refills(
     out
 }
 
-/// How many kind-6 records ONE free-run pass will materialise before it
-/// DECLINES both the steered injection and the re-derivation verdict.
+/// The verifier's record budget: how many records one rank, or one pass, may
+/// hold in memory at each site [`verifier_record_budget`] is read at.
 ///
-/// Both pure modules take SLICES — `plan_topic_injection` needs an edge's whole
-/// recorded read stream before it can place the first frame, and `verify` takes
-/// `&[RecordedStep]` — so driving them for real means holding a rank's read log
-/// in memory, which the rest of this engine deliberately never does (the
-/// `TraceDiffStream` window, the advise-behind). The budget is what
-/// keeps that bounded, and blowing it is REPORTED rather than silently absorbed:
-/// a verifier that quietly stopped verifying would report "compared clean" over
-/// a bag it stopped reading.
+/// One count bounds five sites, three of them whole-recording:
 ///
-/// Sized against the shape it is for, not against a wish: a 10-node rank at one
-/// read per input per step reaches it at ~20k recorded steps, which is a long
-/// recording; past that the pass keeps its PRIMARY gates (the frame diff, the
-/// unconsumed-fire report, the read-log verifier — all streaming) and loses
-/// only the two additive ones.
+/// * the read-log census ([`collect_rank_read_log`]): the reads of ONE rank's
+///   kind-6 stream, cumulative over the whole recording, a folded record of N
+///   counting N ([`BudgetTally`]);
+/// * the frame index ([`collect_topic_frame_index`]): the recorded frames with
+///   a wire header on the topics one rank consumes;
+/// * the schedule: the fires and reads one pass accumulates for the
+///   re-derivation verdict, checked step by step inside the pass loop;
+///
+/// and two per step, a bound against a hostile run count that does not grow
+/// with the recording ([`expand_run`]): the per-step pull of the per-edge
+/// verifier, which counts one step's expansion, and its replayed half, which
+/// counts one edge's within one step.
+///
+/// A LOCKSTEP pass plans no read from the recording
+/// ([`PassVerification::inert`]): it takes no census, builds no frame index of
+/// the frames its ranks consume and accumulates no schedule, so none of the
+/// three whole-recording budgets refuses a lockstep replay or stands its
+/// verdict down. The two per-step sites run in every mode, lockstep included,
+/// and past one of them the per-edge verifier stands the edge down by name.
+/// The frame index of a co-located `multi_publisher_topics` capture diff reads
+/// the frame-index site in every mode too, and past it that diff falls back to
+/// one stream and refuses nothing ([`build_capture_partitionings`]). The rest
+/// is a FREE-RUN pass's.
+///
+/// Past the census budget, a rank that consumes a topic refuses a fed replay
+/// (a `--verify` of a free-run bag that records read identity) in the pre-pass
+/// ([`plan_bag_side_admissions`]), before any rank's first step
+/// (`read_identity_unplanned`), so a fed pass never reaches a census refusal
+/// of its own. Past the frame-index budget, and past the census on a pass that
+/// is not fed, a pass that gates a topic over a read log (every topic a fed
+/// pass consumes, and otherwise a topic its rank both produces and consumes
+/// and no other rank writes, [`rank_enforce_topics`]) is refused at its
+/// prepare (`read_log_budget_declined`), past the frame index only when its
+/// rank recorded a read. Any other pass stands down its read-log-steered
+/// injection and its re-derivation verdict ([`VerifierDecline`]) and runs.
+/// Past the schedule budget the re-derivation verdict stands down with a note.
+/// A census refusal names the reads the rank holds, the budget, the step of
+/// the first read past it and that step's time in the rank's recording
+/// ([`ReadLogOverrun`]); a frame-index refusal names the frames and the budget
+/// ([`FrameIndexOverrun`]).
 const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
 
 /// WHICH of the verifier's three record budgets a call site is asking for.
@@ -10685,7 +11039,9 @@ const REPLAY_VERIFIER_RECORD_BUDGET: usize = 200_000;
 /// production value.
 #[derive(Clone, Copy)]
 enum BudgetSite {
-    /// [`collect_rank_read_log`] — this rank's kind-6 records.
+    /// [`collect_rank_read_log`]: this rank's kind-6 records. The per-step
+    /// pull and the replayed half of the per-edge verifier read this site too,
+    /// each against its own per-step count ([`expand_run`]).
     ReadLog,
     /// [`collect_topic_frame_index`] — recorded frames on the topics this
     /// rank consumes.
@@ -10931,13 +11287,57 @@ enum ReadLogCensus {
     Declined(VerifierDecline),
 }
 
+/// The read-log census's count against the verifier's budget.
+///
+/// The census holds every read up to the budget and none past it, and keeps
+/// COUNTING past it, so a decline names how many reads the rank's log holds
+/// and the step at which it ran past the budget, not only the budget.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct BudgetTally {
+    /// Every read counted so far, a folded record counted by its run.
+    total: u64,
+    /// The step of the first record whose reads went past the budget; `None`
+    /// while every read counted fits.
+    over_at_step: Option<u64>,
+}
+
+impl BudgetTally {
+    /// Count one record of `occurrences` reads at `step` against `budget`.
+    ///
+    /// `true` when the record fits: every read counted so far, this record's
+    /// included, is within the budget, so the caller holds it. `false` from the
+    /// first record past the budget on: the tally counts it and the caller
+    /// holds none of it. The fit is [`expand_run`]'s rule (exactly at the
+    /// budget fits), with the reads already held as its `already`.
+    fn add(&mut self, step: u64, occurrences: u32, budget: usize) -> bool {
+        let fits = self.over_at_step.is_none()
+            && !expand_run(
+                occurrences,
+                usize::try_from(self.total).unwrap_or(usize::MAX),
+                budget,
+            )
+            .over_budget;
+        self.total = self.total.saturating_add(u64::from(occurrences));
+        if !fits && self.over_at_step.is_none() {
+            self.over_at_step = Some(step);
+        }
+        fits
+    }
+}
+
 /// Walk ONE rank's kind-6 stream front to back, resolving each record's node
 /// and input name through the rank manifest tables.
 ///
-/// `Ok(None)` = the budget was blown; the caller declines both additive gates
-/// and says so. A record whose `input_idx` the manifest cannot resolve is
-/// SKIPPED (its edge simply has no coverage, which both pure halves already
-/// model as a first-class answer) rather than given an invented name.
+/// [`ReadLogCensus::Declined`] names why the census was declined: over the
+/// budget, or records the rank's manifest cannot place. Over the budget the
+/// walk holds no read past it and counts the rest of the stream, then walks the
+/// rank's step boundaries once, so [`VerifierDecline::ReadLogBudget`] carries
+/// every read the rank holds, the step of the first read past the budget and
+/// that step's time. Whether the caller then refuses or stands down is the
+/// pass's gating ([`REPLAY_VERIFIER_RECORD_BUDGET`]). A record whose node or
+/// `input_idx` the manifest cannot resolve is skipped rather than given an
+/// invented name, and is not counted against the budget; a census within the
+/// budget that skipped one is declined as [`VerifierDecline::ReadLogUnplaceable`].
 ///
 /// # The KIND field is as wide as the bag's format says it is
 ///
@@ -10982,6 +11382,7 @@ fn collect_rank_read_log(
     // shipped build this is the constant itself (see `verifier_record_budget`).
     let budget = verifier_record_budget(BudgetSite::ReadLog);
     let mut out: Vec<CollectedRead> = Vec::new();
+    let mut tally = BudgetTally::default();
     // Read records this rank's own tables cannot place.
     let mut unresolvable: usize = 0;
     while let Some(r) = cursor.consume_next()? {
@@ -11018,14 +11419,17 @@ fn collect_rank_read_log(
         // annotation carries a TOKEN in its aux, never a count, so it expands
         // once (its pair's count rides the READ half).
         let runs = recorded_run_occurrences(kind, r.duration_ns);
-        let plan = expand_run(runs, out.len(), budget);
-        if plan.over_budget {
-            // The census is whole-bag and advisory: over budget it reports
-            // NOTHING rather than a truncated census that would read as a
-            // complete one.
-            return Ok(ReadLogCensus::Declined(VerifierDecline::ReadLogBudget));
+        if !tally.add(r.step, runs, budget) {
+            // Over budget the census reports NOTHING rather than a truncated
+            // census that would read as a complete one: what it held is
+            // released, and the rest of the stream is only counted, so the
+            // decline names the whole log's size. This tail runs on a declined
+            // census only, at prepare, before the pass's first step, and
+            // allocates nothing.
+            out = Vec::new();
+            continue;
         }
-        for _ in 0..plan.take {
+        for _ in 0..runs {
             out.push(CollectedRead {
                 step: r.step,
                 node_id: node_id.clone(),
@@ -11037,6 +11441,19 @@ fn collect_rank_read_log(
                 role,
             });
         }
+    }
+    // The budget cause takes precedence over unplaceable records: a log over
+    // the budget is declined for its size whether or not it also holds a
+    // record the manifest cannot place.
+    if let Some(step) = tally.over_at_step {
+        return Ok(ReadLogCensus::Declined(VerifierDecline::ReadLogBudget(
+            ReadLogOverrun {
+                reads: tally.total,
+                budget: budget as u64,
+                step,
+                time: rank_step_time(trace, rank, step)?,
+            },
+        )));
     }
     // An empty-but-clean census is the wrong answer when the
     // rank plainly HAD read records this bag cannot place.
@@ -11067,6 +11484,35 @@ fn collect_rank_read_log(
         return Ok(ReadLogCensus::Declined(VerifierDecline::ReadLogUnplaceable));
     }
     Ok(ReadLogCensus::Collected(out))
+}
+
+/// Where `step` sits in `rank`'s recording: its boundary target and the
+/// rank's last one, each measured from the rank's first boundary target.
+/// `None` when the rank holds no boundary record of `step`.
+///
+/// One walk of the rank's boundary stream, run only on a declined census.
+/// Every time is the rank's own clock: on a bag that begins mid-run it is time
+/// into the bag, not into the run.
+fn rank_step_time(
+    trace: &RecordedTrace,
+    rank: u32,
+    step: u64,
+) -> Result<Option<RunOutTime>, ReplayError> {
+    let mut cursor = BoundaryCursor::for_rank(trace, rank)?;
+    let mut first: Option<u64> = None;
+    let mut last = 0;
+    let mut at: Option<u64> = None;
+    while let Some(b) = cursor.next()? {
+        first.get_or_insert(b.target_ns);
+        last = b.target_ns;
+        if at.is_none() && b.step == step {
+            at = Some(b.target_ns);
+        }
+    }
+    Ok(match (first, at) {
+        (Some(first), Some(at)) => Some(RunOutTime::from_targets(first, at, last)),
+        _ => None,
+    })
 }
 
 /// One topic's recorded frames, in FILE order.
@@ -11129,15 +11575,26 @@ struct TopicFrameIndex {
     headerless: usize,
 }
 
+/// What [`collect_topic_frame_index`] came back as.
+enum FrameIndexCensus {
+    /// Every topic's index, within the budget.
+    Indexed(BTreeMap<String, TopicFrameIndex>),
+    /// The topics hold more recorded frames with a wire header than the
+    /// budget: no index is returned, and every such frame is counted.
+    OverBudget(FrameIndexOverrun),
+}
+
 /// Walk the recorded frames of `topics` once, collecting each topic's ordered
 /// sequences and wire timestamps and its `sequence -> wire stamp` join table.
 ///
-/// `Ok(None)` = the budget was blown (same contract as
-/// [`collect_rank_read_log`]).
+/// Every recorded frame with a wire header on `topics` counts against the
+/// budget. Past it the walk indexes no further frame and keeps counting, and
+/// the answer is [`FrameIndexCensus::OverBudget`] with the whole count, which
+/// the caller declines or refuses with ([`VerifierDecline::FrameIndexBudget`]).
 fn collect_topic_frame_index(
     rm: &RecordedMessages,
     topics: &BTreeSet<String>,
-) -> Result<Option<BTreeMap<String, TopicFrameIndex>>, ReplayError> {
+) -> Result<FrameIndexCensus, ReplayError> {
     let mut out: BTreeMap<String, TopicFrameIndex> = topics
         .iter()
         .map(|t| {
@@ -11154,10 +11611,10 @@ fn collect_topic_frame_index(
             )
         })
         .collect();
-    let mut total = 0usize;
+    // Recorded frames with a wire header on `topics`, counted past the budget.
+    let mut total: u64 = 0;
     // Same hoist, same reason as the read-log walk above.
-    let budget = verifier_record_budget(BudgetSite::FrameIndex);
-    let mut over_budget = false;
+    let budget = verifier_record_budget(BudgetSite::FrameIndex) as u64;
     rm.for_each_frame(&mut |topic: &str, frame: &[u8]| {
         let Some(idx) = out.get_mut(topic) else {
             return;
@@ -11178,7 +11635,6 @@ fn collect_topic_frame_index(
         };
         total += 1;
         if total > budget {
-            over_budget = true;
             return;
         }
         // Pushed TOGETHER — `TopicFrameIndex::ordinals`' length invariant.
@@ -11197,10 +11653,13 @@ fn collect_topic_frame_index(
             }
         }
     })?;
-    if over_budget {
-        return Ok(None);
+    if total > budget {
+        return Ok(FrameIndexCensus::OverBudget(FrameIndexOverrun {
+            frames: total,
+            budget,
+        }));
     }
-    Ok(Some(out))
+    Ok(FrameIndexCensus::Indexed(out))
 }
 
 // ===========================================================================
@@ -12207,6 +12666,95 @@ struct PassVerification {
     declined_detail: Option<String>,
 }
 
+/// How far one rank's read log ran past the verifier's budget: what a
+/// [`VerifierDecline::ReadLogBudget`] refusal names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReadLogOverrun {
+    /// Every read the rank's log holds, a folded record counted by its run.
+    reads: u64,
+    /// The budget the census read.
+    budget: u64,
+    /// The step of the first read past the budget.
+    step: u64,
+    /// Where [`Self::step`] sits in the rank's recording; `None` when the rank
+    /// holds no boundary record of that step.
+    time: Option<RunOutTime>,
+}
+
+impl ReadLogOverrun {
+    /// The cause's sentence: the reads, the budget, the step and, when the
+    /// rank recorded that step's boundary, its time.
+    fn sentence(self) -> String {
+        let head = format!(
+            "it holds {} reads, more than the verifier's budget of {} reads per rank, and \
+             reaches the budget at step {}",
+            self.reads, self.budget, self.step
+        );
+        match self.time {
+            Some(time) => format!(
+                "{head}, {} into the rank's {} of recording",
+                seconds_text(time.at_ns),
+                seconds_text(time.span_ns)
+            ),
+            None => head,
+        }
+    }
+}
+
+/// A step's place in its rank's recording, on the rank's own clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RunOutTime {
+    /// The step's boundary target, measured from the rank's first one.
+    at_ns: u64,
+    /// The rank's last boundary target, measured from its first one.
+    span_ns: u64,
+}
+
+impl RunOutTime {
+    /// From three boundary targets on one rank's clock: the rank's first, the
+    /// step's and the rank's last.
+    fn from_targets(first_ns: u64, at_ns: u64, last_ns: u64) -> Self {
+        Self {
+            at_ns: at_ns.saturating_sub(first_ns),
+            span_ns: last_ns.saturating_sub(first_ns),
+        }
+    }
+}
+
+/// How far the frames one rank consumes ran past the verifier's budget: what
+/// a [`VerifierDecline::FrameIndexBudget`] refusal names.
+///
+/// It names no time: the frames carry stamps from their producers' clocks,
+/// which no one number line orders.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameIndexOverrun {
+    /// Every recorded frame with a wire header on the topics the rank consumes.
+    frames: u64,
+    /// The budget the frame index read.
+    budget: u64,
+}
+
+impl FrameIndexOverrun {
+    /// The cause's sentence: the frames and the budget.
+    fn sentence(self) -> String {
+        format!(
+            "it consumes {} recorded frames, more than the verifier's budget of {} frames per \
+             rank",
+            self.frames, self.budget
+        )
+    }
+}
+
+/// `ns` as seconds with millisecond precision, `"0.055 s"`, truncated toward
+/// zero. Integer arithmetic only, so one count always prints one string.
+fn seconds_text(ns: u64) -> String {
+    format!(
+        "{}.{:03} s",
+        ns / 1_000_000_000,
+        ns % 1_000_000_000 / 1_000_000
+    )
+}
+
 /// WHY one free-run pass declined the two additive gates.
 ///
 /// SIX causes, five of them found at PREPARE time (before the step loop) and
@@ -12227,10 +12775,12 @@ enum VerifierDecline {
     /// The bag's rank manifests carry no readable input tables, so no read
     /// record can be resolved to a `(node, input)` at all.
     InputTables,
-    /// This rank's recorded read log is larger than the record budget.
-    ReadLogBudget,
-    /// This rank consumes more recorded frames than the record budget.
-    FrameIndexBudget,
+    /// This rank's recorded read log is larger than the record budget,
+    /// carrying the count the census took past it.
+    ReadLogBudget(ReadLogOverrun),
+    /// This rank consumes more recorded frames than the record budget,
+    /// carrying the count the frame index took past it.
+    FrameIndexBudget(FrameIndexOverrun),
     /// The per-step accumulation blew the budget MID-PASS (fires + reads).
     ScheduleBudget,
     /// This rank carries read records its own manifest cannot
@@ -12238,11 +12788,11 @@ enum VerifierDecline {
     ///
     /// Its own cause, not a budget one, and that distinction is the whole reason
     /// the variant exists: reported on the budget's channel, the headline
-    /// would tell an operator "the read log is larger
-    /// than the verifier's N-record budget" about a bag whose read log is SMALL
-    /// and whose INPUT TABLE is missing. Raising the budget would do nothing. It
-    /// is also the shape the degrade ladder produces, so the remedy is a
-    /// re-record, which the budget sentence does not say.
+    /// would tell an operator the read log holds more reads than the
+    /// verifier's budget about a bag whose read log is SMALL and whose INPUT
+    /// TABLE is missing. A shorter recording would do nothing. It is also the
+    /// shape the degrade ladder produces, so the remedy is a re-record, which
+    /// the budget sentence does not say.
     ReadLogUnplaceable,
     /// The bag's STAGING declaration could not
     /// be used. TEN conditions route here; among them, ILLUSTRATIVELY and not as
@@ -12279,8 +12829,8 @@ impl VerifierDecline {
     fn code(self) -> &'static str {
         match self {
             Self::InputTables => "verifier_declined_input_tables",
-            Self::ReadLogBudget => "verifier_declined_read_log_budget",
-            Self::FrameIndexBudget => "verifier_declined_frame_index_budget",
+            Self::ReadLogBudget(_) => "verifier_declined_read_log_budget",
+            Self::FrameIndexBudget(_) => "verifier_declined_frame_index_budget",
             Self::ScheduleBudget => "verifier_declined_schedule_budget",
             Self::ReadLogUnplaceable => "verifier_declined_read_log_unplaceable",
             Self::StagingRegime => "verifier_declined_staging_regime",
@@ -12296,20 +12846,8 @@ impl VerifierDecline {
             // Each names the budget the SITE actually read rather than the
             // constant, so the sentence stays true of the run that produced it.
             // In a shipped build the two are the same value.
-            Self::ReadLogBudget => {
-                let budget = verifier_record_budget(BudgetSite::ReadLog);
-                format!(
-                    "its recorded read log is larger than the verifier's \
-                     {budget}-record budget"
-                )
-            }
-            Self::FrameIndexBudget => {
-                let budget = verifier_record_budget(BudgetSite::FrameIndex);
-                format!(
-                    "it consumes more recorded frames than the verifier's \
-                     {budget}-record budget"
-                )
-            }
+            Self::ReadLogBudget(overrun) => overrun.sentence(),
+            Self::FrameIndexBudget(overrun) => overrun.sentence(),
             Self::ScheduleBudget => {
                 let budget = verifier_record_budget(BudgetSite::Schedule);
                 format!(
@@ -12335,6 +12873,36 @@ impl VerifierDecline {
                                     recorded and replayed read logs cannot be truncated \
                                     identically — re-record the bag with this binary"
                 .to_string(),
+        }
+    }
+
+    /// The remedy a refusal on this cause names, for the causes a shorter
+    /// recording cures: each budget counts what the refused free-run replay
+    /// holds in memory, so a recording that holds less is what fits. `None`
+    /// for a cause in the recording's manifest, whose refusal names a
+    /// re-record instead.
+    ///
+    /// Two refusals print it: a fed replay's census refusal
+    /// ([`declined_census_detail`]) and a gated rank's
+    /// ([`enforcement_blocked_by_decline`]), which a resim without `--verify`
+    /// reaches too, so the sentence speaks of this replay rather than of a
+    /// verifying one. The schedule budget declines mid-pass with a note and
+    /// refuses nothing, so no refusal prints its remedy.
+    fn remedy(self) -> Option<&'static str> {
+        match self {
+            Self::ReadLogBudget(_) => Some(
+                "This replay holds each rank's read log in memory up to this budget, so \
+                 replay a recording of this graph no longer than that",
+            ),
+            Self::FrameIndexBudget(_) => Some(
+                "This replay holds the frames each rank consumes in memory up to this budget, \
+                 so replay a shorter recording of this graph",
+            ),
+            Self::ScheduleBudget => Some(
+                "This replay holds each pass's recorded schedule in memory up to this budget, \
+                 so replay a shorter recording of this graph",
+            ),
+            Self::InputTables | Self::ReadLogUnplaceable | Self::StagingRegime => None,
         }
     }
 }
@@ -12870,25 +13438,31 @@ fn rank_has_read_records(trace: &RecordedTrace, rank: u32) -> Result<bool, Repla
 /// ran anyway would serve that edge whatever its queue happened to hold, which is
 /// the coincidence the enforcement removes. `None` when the rank gates nothing,
 /// which keeps every shipped rank split and every lockstep bag on today's path.
+///
+/// The refusal ends with the cause's own remedy ([`VerifierDecline::remedy`]):
+/// a shorter recording for a budget cause, a re-record for any other.
 fn enforcement_blocked_by_decline(
     enforce_topics: &[String],
-    cause: &str,
+    cause: VerifierDecline,
     sentence: &str,
 ) -> Option<ReplayError> {
     if enforce_topics.is_empty() {
         return None;
     }
+    let remedy = cause.remedy().unwrap_or(
+        "Re-record the bag with this binary, or replay it under CERULION_EXECUTION_MODE=lockstep, \
+         whose one gating clock orders every publish against every step",
+    );
     Some(ReplayError::ReadLogNotEnforceable {
         edge: None,
         cause: "read_log_budget_declined".to_string(),
         detail: format!(
             "this rank consumes {} topic(s) it also produces ({}), whose recorded reads the \
              replay must admit at their recorded steps, and the read log they would be built \
-             from was declined before the first step ({cause}): {sentence}. Re-record the bag \
-             with this binary, or replay it under CERULION_EXECUTION_MODE=lockstep, whose one \
-             gating clock orders every publish against every step",
+             from was declined before the first step ({}): {sentence}. {remedy}",
             enforce_topics.len(),
-            enforce_topics.join(", ")
+            enforce_topics.join(", "),
+            cause.code()
         ),
     })
 }
@@ -13011,6 +13585,21 @@ struct RankBagSide {
     /// On a FED replay, the frames every admission that pops consumed, by
     /// recorded identity: what the rank's private feeds publish.
     feed: Option<Arc<crate::replay_feed::FeedPlan>>,
+}
+
+/// The detail of a fed replay's refusal of `rank`, whose read-log census was
+/// declined for `cause`: the cause's token and sentence, then its remedy when
+/// a shorter recording cures it ([`VerifierDecline::remedy`]).
+fn declined_census_detail(rank: u32, cause: VerifierDecline) -> String {
+    let detail = format!(
+        "rank {rank}'s read log was declined ({}): {}",
+        cause.code(),
+        cause.reason()
+    );
+    match cause.remedy() {
+        Some(remedy) => format!("{detail}. {remedy}."),
+        None => detail,
+    }
 }
 
 /// The exit-2 refusal a FED replay answers for a read it cannot feed.
@@ -13353,12 +13942,7 @@ fn plan_bag_side_admissions(
                 return Err(read_identity_refusal(
                     None,
                     "read_identity_unplanned",
-                    format!(
-                        "rank {}'s read log was declined ({}): {}",
-                        plan.rank(),
-                        cause.code(),
-                        cause.reason()
-                    ),
+                    declined_census_detail(plan.rank(), cause),
                 ))
             }
             ReadLogCensus::Declined(_) => continue,
@@ -13813,7 +14397,7 @@ fn prepare_pass_verification(
             // and an unreadable one looked alike from here.
             if !enforce_topics.is_empty() && rank_has_read_records(trace, plan.rank())? {
                 if let Some(refusal) =
-                    enforcement_blocked_by_decline(enforce_topics, cause.code(), &reason)
+                    enforcement_blocked_by_decline(enforce_topics, cause, &reason)
                 {
                     return Err(refusal);
                 }
@@ -13849,9 +14433,19 @@ fn prepare_pass_verification(
         // sentence that is false about the bag and points at a knob that cannot
         // help. Both causes land here; each keeps its own headline and code.
         ReadLogCensus::Declined(cause) => {
+            // The count and the budget ride the line on a budget cause; an
+            // unplaceable-records decline has neither.
+            let (reads, budget) = match cause {
+                VerifierDecline::ReadLogBudget(overrun) => {
+                    (Some(overrun.reads), Some(overrun.budget))
+                }
+                _ => (None, None),
+            };
             tracing::warn!(
                 rank = plan.rank(),
                 cause = cause.code(),
+                reads,
+                budget,
                 declines = whole_rank_decline_note(inject_topics),
                 "replay: this rank's read log cannot be censused, so the rank-local \
                  re-derivation verdict is DECLINED for this rank and any read-log-steered \
@@ -13866,7 +14460,7 @@ fn prepare_pass_verification(
             // cannot be built from it, and falling back would replay that edge
             // on whatever its queue held.
             if let Some(refusal) =
-                enforcement_blocked_by_decline(enforce_topics, cause.code(), &cause.reason())
+                enforcement_blocked_by_decline(enforce_topics, cause, &cause.reason())
             {
                 return Err(refusal);
             }
@@ -13889,37 +14483,38 @@ fn prepare_pass_verification(
     for (topic, _, _) in &consumed {
         consumed_topics.insert(topic.clone());
     }
-    let Some(frame_index) = collect_topic_frame_index(recorded_messages, &consumed_topics)? else {
-        tracing::warn!(
-            rank = plan.rank(),
-            budget = verifier_record_budget(BudgetSite::FrameIndex),
-            declines = whole_rank_decline_note(inject_topics),
-            "replay: this rank consumes more recorded frames than the verifier's record \
-             budget, so the rank-local re-derivation verdict is DECLINED for this rank \
-             and any read-log-steered injection it had falls back to the recorded-clock \
-             window — `declines` says what that costs this rank's topics"
-        );
-        if !reads.is_empty() {
-            if let Some(refusal) = enforcement_blocked_by_decline(
-                enforce_topics,
-                VerifierDecline::FrameIndexBudget.code(),
-                &VerifierDecline::FrameIndexBudget.reason(),
-            ) {
-                return Err(refusal);
+    let frame_index = match collect_topic_frame_index(recorded_messages, &consumed_topics)? {
+        FrameIndexCensus::Indexed(index) => index,
+        FrameIndexCensus::OverBudget(overrun) => {
+            tracing::warn!(
+                rank = plan.rank(),
+                frames = overrun.frames,
+                budget = overrun.budget,
+                declines = whole_rank_decline_note(inject_topics),
+                "replay: this rank consumes more recorded frames than the verifier's record \
+                 budget, so the rank-local re-derivation verdict is DECLINED for this rank \
+                 and any read-log-steered injection it had falls back to the recorded-clock \
+                 window; `declines` says what that costs this rank's topics"
+            );
+            let cause = VerifierDecline::FrameIndexBudget(overrun);
+            if !reads.is_empty() {
+                if let Some(refusal) =
+                    enforcement_blocked_by_decline(enforce_topics, cause, &cause.reason())
+                {
+                    return Err(refusal);
+                }
             }
+            return Ok(
+                PassVerification::declined_at_prepare(cause, plan.rank(), inject_topics)
+                    .with_enforcement_skipped(
+                        enforce_topics.len(),
+                        format!(
+                            "this rank's frame index was declined at prepare ({})",
+                            cause.code()
+                        ),
+                    ),
+            );
         }
-        return Ok(PassVerification::declined_at_prepare(
-            VerifierDecline::FrameIndexBudget,
-            plan.rank(),
-            inject_topics,
-        )
-        .with_enforcement_skipped(
-            enforce_topics.len(),
-            format!(
-                "this rank's frame index was declined at prepare ({})",
-                VerifierDecline::FrameIndexBudget.code()
-            ),
-        ));
     };
 
     // ── plan each injected topic ─────────────────────────────────────────────
@@ -15710,12 +16305,17 @@ fn run_rank_pass(
     // never silently truncated into a "compared clean" over a slice the
     // verifier stopped reading.
     let mut rederive_steps: Vec<replay_rederive::RecordedStep> = Vec::new();
-    // Where a re-executed node was STOPPED (fatal error or panic breaker),
-    // read after each step: no rule may predict its fires past that step,
-    // because the recording correctly holds none. The stop carries how many
-    // fires of the node the stopping step performed, so a recording that
-    // stopped at another fire of the same burst is still a finding.
-    let mut rederive_stops = replay_rederive::PassStops::none();
+    // Where each node was STOPPED: seeded with the nodes the checkpoint a
+    // resumed pass began from states as stopped, then read after each step
+    // for a re-executed stop (fatal error or panic breaker). No rule may
+    // predict a node's fires past its stop, because the recording correctly
+    // holds none. An in-pass stop carries how many fires of the node the
+    // stopping step performed, so a recording that stopped at another fire of
+    // the same burst is still a finding. A seeded node is never noted again:
+    // its restored stop reads as stopped after the first resumed step too.
+    let mut rederive_stops = resume.map_or_else(replay_rederive::PassStops::none, |r| {
+        replay_rederive::PassStops::at_anchor(r.anchor.step, r.stops.stopped())
+    });
     // Per step, the FIFO `Data` nodes whose recorded burst ended on a trailing
     // refill (`fifo_trailing_refills`), derived from the recording alone in a
     // walk of this rank's boundaries and fires before step 0, so a fed pass
@@ -16610,24 +17210,35 @@ fn run_rank_pass(
                 // and its Sync heads are UNBACKED (real stamps with no kind-6
                 // record), so the verifier must start from them or it convicts
                 // the first resumed step. A from-start pass restores nothing.
+                // The nodes whose stop the checkpoint states ride with it, so a
+                // node it states as running is judged in full, and only a node
+                // whose stop the checkpoint does not state can stand down as
+                // unfired since the anchor.
                 &resume.map_or_else(replay_rederive::PassRestore::none, |r| {
                     replay_rederive::PassRestore::from_sync_heads(restored_sync_heads_by_input(
                         pass.config,
                         &r.sync_input_timestamps,
                     ))
+                    .with_stops_stated(r.stops.stated())
                 }),
                 &rederive_stops,
             );
+            // The checkpoint step a resumed pass began from, named on the
+            // unfired-since-anchor warnings, which only a resumed pass raises.
+            let anchor_step = resume.map(|r| r.anchor.step);
             for sd in &report.stand_downs {
-                // Two arms here are `warn!`, so they survive the default
+                // Four arms here are `warn!`, so they survive the default
                 // filter an operator actually runs under. The corrupt-recording
                 // stand-down is not "we declined to judge" but "this bag cannot
-                // have been written by any recorder". The unfired-since-anchor
-                // one leaves a whole node's unread-frame rule unjudged with no
-                // change to the verdict or the exit code, and a node the
-                // scheduler never fired records the same resumed slice as a
-                // stopped one; it is raised at most once per node per pass, and
-                // only on a resumed pass, which has one rank. The generic loop
+                // have been written by any recorder". Each unfired-since-anchor
+                // one leaves a rule that owed a node a fire unjudged with no
+                // change to the exit code, and a node the scheduler never fired
+                // records the same resumed slice as a stopped one; each is
+                // raised at most once per node per pass, and only on a resumed
+                // pass, which has one rank. A `--report` needs `--verify`, and
+                // a fed `--verify` can refuse such a bag before its first step,
+                // so their text says the note lands where a `--verify` replay
+                // reaches the rule. The generic loop
                 // stays `debug!` because a healthy multi-rank replay
                 // legitimately declines several deciders per rank and a warn
                 // per decline is the flood class.
@@ -16641,15 +17252,47 @@ fn run_rank_pass(
                          (corrupt recording — re-record the bag; report-only, the verdict is \
                          unchanged. See `detail`)"
                     );
+                } else if sd.reason == replay_rederive::StandDownReason::FifoUnfiredSinceAnchor {
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        node_id = %sd.node_id,
+                        code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
+                        detail = %sd,
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its FIFO pop rule was not verified. The exit code is \
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
+                    );
                 } else if sd.reason == replay_rederive::StandDownReason::LatestUnfiredSinceAnchor {
                     tracing::warn!(
                         rank = plan.rank(),
                         node_id = %sd.node_id,
                         code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
                         detail = %sd,
-                        "replay: the resumed pass holds no fire and no body read of this \
-                         consume = latest node, so its unread-frame rule was not verified \
-                         (report-only, the verdict is unchanged. See `detail`)"
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its consume = latest fire rule was not verified. The exit \
+                         code is unchanged; where a --verify replay reaches this rule, its \
+                         --report carries a stand_down note (see `code` and `detail`)"
+                    );
+                } else if sd.reason == replay_rederive::StandDownReason::SyncUnfiredSinceAnchor {
+                    tracing::warn!(
+                        rank = plan.rank(),
+                        node_id = %sd.node_id,
+                        code = sd.reason.code(),
+                        trace_format = pass.trace_format,
+                        anchor_step,
+                        detail = %sd,
+                        "replay: the resumed pass holds no fire and no body read of this node, \
+                         and the recording does not state whether it was stopped at the \
+                         anchor, so its Sync owed-fire rule was not verified. The exit code is \
+                         unchanged; where a --verify replay reaches this rule, its --report \
+                         carries a stand_down note (see `code` and `detail`)"
                     );
                 } else {
                     tracing::debug!(
@@ -19889,14 +20532,19 @@ fn build_capture_partitionings(
     let tokens = load_recorded_publisher_tokens(trace);
     let topics: BTreeSet<String> = candidates.keys().cloned().collect();
     let sidecar = read_producer_sidecar(&trace.reader, &topics);
-    let Some(frame_index) = collect_topic_frame_index(recorded_messages, &topics)? else {
-        tracing::warn!(
-            budget = verifier_record_budget(BudgetSite::FrameIndex),
-            "replay: this pass's co-located multi-publisher topics carry more recorded frames \
-             than the verifier's record budget, so their capture diff falls back to the \
-             single-stream path (which cannot tell two writers' sequence streams apart)"
-        );
-        return Ok(out);
+    let frame_index = match collect_topic_frame_index(recorded_messages, &topics)? {
+        FrameIndexCensus::Indexed(index) => index,
+        FrameIndexCensus::OverBudget(overrun) => {
+            tracing::warn!(
+                frames = overrun.frames,
+                budget = overrun.budget,
+                "replay: this pass's co-located multi-publisher topics carry more recorded \
+                 frames than the verifier's record budget, so their capture diff falls back \
+                 to the single-stream path (which cannot tell two writers' sequence streams \
+                 apart)"
+            );
+            return Ok(out);
+        }
     };
 
     for topic in candidates.keys() {
@@ -27643,8 +28291,8 @@ struct RunExpansion {
 /// which is the hostile-count class `trace_ring`'s own decoder states as a rule
 /// and `arm_at_recorded_capacity`'s doc states as a law ("a bag must never
 /// dictate an allocation"). The expansion happens at THREE sites (the replayed
-/// half included) and all
-/// three sit behind this.
+/// half included) and all three sit behind this, the census by way of
+/// [`BudgetTally::add`].
 ///
 /// # What is shared, stated precisely
 ///
@@ -27657,9 +28305,10 @@ struct RunExpansion {
 /// anything should compare against. What the sites must not do is disagree about
 /// the rule itself, and that is what this function is for.
 ///
-/// They also react differently once it is hit: the census reports nothing at all
-/// (an advisory whole-bag count, so a truncated one would read as complete), and
-/// both compare halves stand the affected EDGE down by name.
+/// They also react differently once it is hit: the census holds nothing past it
+/// and counts the rest of the rank's log, so its decline names the whole count
+/// (a truncated census would read as a complete one), and both compare halves
+/// stand the affected EDGE down by name.
 fn expand_run(occurrences: u32, already: usize, budget: usize) -> RunExpansion {
     let room = budget.saturating_sub(already);
     let want = occurrences as usize;
@@ -30240,6 +30889,104 @@ mod env_divergence_tests {
         );
     }
 
+    /// The `env.json` the recorder writes for one variable given as raw bytes.
+    fn recorded(
+        mode: crate::graph_cmd::RecordEnvMode,
+        name: &str,
+        value: &[u8],
+    ) -> serde_json::Value {
+        use std::os::unix::ffi::OsStrExt as _;
+        let render = crate::graph_cmd::render_env_json(
+            mode,
+            [(
+                name.into(),
+                std::ffi::OsStr::from_bytes(value).to_os_string(),
+            )],
+        );
+        serde_json::from_slice(&render.bytes).expect("env.json parses")
+    }
+
+    #[test]
+    fn a_recorded_non_utf8_value_matches_its_raw_bytes_at_replay_and_a_change_is_reported() {
+        // FNV-1a 64 of \xff\xfe is 0a99c807b6f645b0 and of \xff\xfd
+        // 0a99cb07b6f64ac9, both computed outside the tree.
+        let env = br#"{"CER_X": {"fnv64": "0a99c807b6f645b0", "redacted": true, "utf8": false}}"#;
+        assert_eq!(
+            recorded(crate::graph_cmd::RecordEnvMode::All, "CER_X", b"\xff\xfe"),
+            serde_json::from_slice::<serde_json::Value>(env).unwrap(),
+            "the recorder writes this entry for the value"
+        );
+        assert!(compare_env_against(Some(env), &current(&[("CER_X", b"\xff\xfe")])).is_empty());
+        assert_eq!(
+            project(&compare_env_against(
+                Some(env),
+                &current(&[("CER_X", b"\xff\xfd")])
+            )),
+            vec![row(
+                "CER_X",
+                "HashChanged",
+                "redacted variable 'CER_X' hash changed since recording (recorded \
+                 0a99c807b6f645b0, now 0a99cb07b6f64ac9)",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn a_names_only_entry_for_a_value_that_is_not_utf8_is_not_missing_while_it_is_set() {
+        let env = br#"{"CER_X": null}"#;
+        assert_eq!(
+            recorded(crate::graph_cmd::RecordEnvMode::None, "CER_X", b"\xff"),
+            serde_json::from_slice::<serde_json::Value>(env).unwrap(),
+            "the recorder writes this entry for the value"
+        );
+        assert!(compare_env_against(Some(env), &current(&[("CER_X", b"\xff")])).is_empty());
+        assert_eq!(
+            project(&compare_env_against(Some(env), &current(&[]))),
+            vec![row(
+                "CER_X",
+                "Missing",
+                "recorded (names-only) variable 'CER_X' is absent at replay",
+                None,
+            )]
+        );
+    }
+
+    #[test]
+    fn an_entry_marked_utf8_false_compares_like_the_same_hash_without_the_mark() {
+        // FNV-1a 64 of caf\xe9 (Latin-1 "café") is b538f990e85962dc, and of
+        // caf\xc3\xa9 (UTF-8 "café") 48e8823acfa40d89.
+        let marked =
+            br#"{"CER_X": {"fnv64": "b538f990e85962dc", "redacted": true, "utf8": false}}"#;
+        let unmarked = br#"{"CER_X": {"fnv64": "b538f990e85962dc", "redacted": true}}"#;
+        assert_eq!(
+            recorded(
+                crate::graph_cmd::RecordEnvMode::Allowlist,
+                "CER_X",
+                b"caf\xe9"
+            ),
+            serde_json::from_slice::<serde_json::Value>(marked).unwrap(),
+            "the recorder writes the marked entry for the value"
+        );
+        let changed = vec![row(
+            "CER_X",
+            "HashChanged",
+            "redacted variable 'CER_X' hash changed since recording (recorded \
+             b538f990e85962dc, now 48e8823acfa40d89)",
+            None,
+        )];
+        for env in [&marked[..], &unmarked[..]] {
+            assert!(compare_env_against(Some(env), &current(&[("CER_X", b"caf\xe9")])).is_empty());
+            assert_eq!(
+                project(&compare_env_against(
+                    Some(env),
+                    &current(&[("CER_X", b"caf\xc3\xa9")])
+                )),
+                changed
+            );
+        }
+    }
+
     #[test]
     fn a_shape_the_gate_refuses_yields_no_divergence() {
         let now = current(&[("CERULION_A", b"1")]);
@@ -32545,11 +33292,13 @@ mod recorder_info_version_tests {
         // EVERY gated consult wrote a record (an empty drain's `NoFrame`
         // included, which a v6 reader convicts as an impossible shape and
         // plans no position for), and v8 marks a stream in which every edge
-        // names its frames' writers by run (read identity). A recorder.json
-        // stamped v8 is NOT newer than this binary, and the absent-field
-        // back-compat default stays v1 (`trace_format_v1`). A bump must move
-        // this pin DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 9);
+        // names its frames' writers by run (read identity), v9 names every
+        // frame of a batch that fits its read stage, and v10 states every
+        // stopped node in its checkpoints. A recorder.json stamped v9 is NOT
+        // newer than this binary, and the absent-field back-compat default
+        // stays v1 (`trace_format_v1`). A bump must move this pin
+        // DELIBERATELY.
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 10);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -32560,6 +33309,7 @@ mod recorder_info_version_tests {
         assert_eq!(EVERY_CONSULT_MIN_TRACE_FORMAT, 7);
         assert_eq!(READ_IDENTITY_MIN_TRACE_FORMAT, 8);
         assert_eq!(BATCH_FRAME_MIN_TRACE_FORMAT, 9);
+        assert_eq!(ANCHOR_STOPS_MIN_TRACE_FORMAT, 10);
     }
 
     /// The decoupling pin.
@@ -32567,7 +33317,8 @@ mod recorder_info_version_tests {
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
     /// its consults and the frames of every batch that fits its read stage's
-    /// window, and therefore stamps 9, so the write
+    /// window, and flags every complete checkpoint part of a stopped node, and
+    /// therefore stamps 10, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -32576,9 +33327,9 @@ mod recorder_info_version_tests {
     /// What holds, and is what this pins: the two are separate
     /// FUNCTIONS answering separate questions; the write stamp never EXCEEDS
     /// the read gate (a bag this binary writes must be one it can read); and
-    /// the gate still admits formats 1 to 6, which the write stamp never
+    /// the gate still admits formats 1 to 9, which the write stamp never
     /// emits. The decoupling is therefore alive in both directions, the READ
-    /// side reading six formats the WRITE side never produces.
+    /// side reading nine formats the WRITE side never produces.
     #[test]
     fn write_stamp_and_read_gate_stay_two_decisions() {
         let stamp = stamp_trace_format(
@@ -32588,21 +33339,24 @@ mod recorder_info_version_tests {
             true,
             recorder_stamps_consult_records(),
             recorder_records_read_identity(),
+            recorder_states_anchor_stops(),
         );
         assert_eq!(
-            stamp, 9,
-            "a recorder that records every consult AND the frames of every batch \
-             that fits its read stage stamps 9: a format-7 reader would replay its \
-             reads by queue re-creation and call the result clean, and a format-8 \
-             reader does not know the batch frame record"
+            stamp, 10,
+            "a recorder that records every consult, the frames of every batch \
+             that fits its read stage AND flags every complete checkpoint part of a \
+             stopped node stamps 10: a format-7 reader would replay its reads by queue \
+             re-creation and call the result clean, a format-8 reader does not \
+             know the batch frame record, and a format-9 reader reads past the \
+             stopped flag"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: seven formats this binary
+        // The gate is strictly WIDER than the stamp: nine formats this binary
         // reads and never writes.
-        for archived in [1u32, 2, 3, 4, 5, 6, 7] {
+        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -32618,9 +33372,10 @@ mod recorder_info_version_tests {
     /// The role term doubled it: EIGHT rows, one per `(mode, stream_needs_v4,
     /// stamps_roles)`, so the role term is pinned as an OVERRIDE above both
     /// pre-existing arms and the pre-roles table survives intact underneath it.
-    /// Every row then carries three more expected values: `folds_runs` alone is
-    /// 6, and `records_consults` is 7 with folding on or off, the consult term
-    /// being the strongest claim.
+    /// Every row then carries more expected values: `folds_runs` alone is 6,
+    /// `records_consults` is 7 with folding on or off, consults with identity
+    /// is 9, and consults with identity and checkpoint stops is 10, the
+    /// strongest claim.
     #[test]
     fn stamp_trace_format_answers_its_hand_table() {
         let cases = [
@@ -32640,7 +33395,7 @@ mod recorder_info_version_tests {
         ];
         for (mode, needs_v4, roles, expected) in cases {
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, false, false, false),
+                stamp_trace_format(mode, needs_v4, roles, false, false, false, false),
                 expected,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=false, consults=false)"
             );
@@ -32648,7 +33403,7 @@ mod recorder_info_version_tests {
             // unreadable to anything below 6 whatever the coordination mode or
             // the role bits say.
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, true, false, false),
+                stamp_trace_format(mode, needs_v4, roles, true, false, false, false),
                 6,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=true, consults=false)"
             );
@@ -32657,7 +33412,7 @@ mod recorder_info_version_tests {
             // else is true of it, folding included.
             for folds in [false, true] {
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, false),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, false),
                     7,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, consults=true)"
                 );
@@ -32665,13 +33420,33 @@ mod recorder_info_version_tests {
                 // plus per-frame batch identity), and it claims nothing without
                 // the consult records under it.
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, true),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, false),
                     9,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, identity)"
                 );
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, true) < 8,
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, false) < 8,
                     "identity without the consult records is not format 8 or 9"
+                );
+                // Checkpoint stops ride both: 10 over every axis, and the term
+                // claims nothing without the consult and identity terms under it.
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, true),
+                    10,
+                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, stops)"
+                );
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, true),
+                    7,
+                    "stops without identity stay at the consult term's 7"
+                );
+                assert!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, true) < 8,
+                    "stops without the consult records are not format 8, 9 or 10"
+                );
+                assert!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, false, true) < 7,
+                    "stops alone claim nothing above the ladder"
                 );
             }
         }
@@ -32758,6 +33533,7 @@ mod recorder_info_version_tests {
                         true,
                         false,
                         false,
+                        false,
                     );
                     assert!(
                         folded > PRE_FOLD_SUPPORTED,
@@ -32776,8 +33552,15 @@ mod recorder_info_version_tests {
         // format-5 reader's range, so the arm above is about folding rather than
         // about the bump having happened.
         assert!(
-            stamp_trace_format(CoordinationMode::Lockstep, false, true, false, false, false)
-                <= PRE_FOLD_SUPPORTED,
+            stamp_trace_format(
+                CoordinationMode::Lockstep,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false
+            ) <= PRE_FOLD_SUPPORTED,
             "a non-folding lockstep recorder that records no consult stamps 5, \
              inside a format-5 reader's range"
         );
@@ -33043,6 +33826,287 @@ mod recorder_info_version_tests {
         assert!(replay_stages_batch_frames(Some(&info(9)), false));
         assert!(replay_stages_batch_frames(None, true));
         assert!(!replay_stages_batch_frames(None, false));
+    }
+
+    /// A recorder.json stamped at `trace_format`.
+    fn recorder_info_at(trace_format: u32) -> RecorderInfo {
+        serde_json::from_str(&format!(
+            r#"{{"arch":"x86_64","os":"linux","cerulion_version":"0.0.1",
+                 "recorded_at_ns":7,"trace_format":{trace_format}}}"#
+        ))
+        .expect("valid recorder.json")
+    }
+
+    /// From format 10 every complete checkpoint part of a stopped node carries
+    /// the stopped flag, and a bag with no `recorder.json` makes no such claim.
+    #[test]
+    fn checkpoint_stops_are_stated_from_format_ten() {
+        for older in 1u32..=9 {
+            assert!(
+                !recorder_states_anchor_stops_at(Some(&recorder_info_at(older))),
+                "a format-{older} part without the flag states nothing"
+            );
+        }
+        assert!(recorder_states_anchor_stops_at(Some(&recorder_info_at(10))));
+        assert!(!recorder_states_anchor_stops_at(None));
+    }
+
+    /// One complete anchor part for a node saving a `u64`, carrying
+    /// `framework` when it is given and no framework section otherwise, built
+    /// by the encoder `cerulion_core`'s `state_restore_test` pins to its hand
+    /// vectors.
+    fn anchor_part(framework: Option<&NodeFrameworkState>) -> Vec<u8> {
+        let mut sink = cerulion_core::state::VecSink::new();
+        match framework {
+            Some(section) => cerulion_core::state_restore::capture_anchor_blob_with_framework(
+                &7u64, section, &mut sink,
+            ),
+            None => cerulion_core::state_restore::capture_anchor_blob(&7u64, &mut sink),
+        }
+        .expect("the part fits an unbounded sink");
+        sink.into_inner()
+    }
+
+    /// The classification of every node, as a HAND table over the part shapes
+    /// a checkpoint can hold for it, at format 9 and format 10, with a part
+    /// for a node the graph does not run.
+    ///
+    /// `stopped` carries a section with the stopped flag and nothing else;
+    /// `fifo_stopped` the flag beside a served cursor and one pending arrival;
+    /// `running` a section
+    /// without the flag; `v1` a part with no framework section (what a running
+    /// node with nothing to say writes); `absent` no complete part, which is
+    /// also every torn or skipped part (`BagAnchors::blobs_at` holds complete
+    /// parts only); `ghost` a stopped part for a node outside the graph.
+    #[test]
+    fn anchor_stops_answer_their_hand_table() {
+        let stopped_section = NodeFrameworkState {
+            stopped: true,
+            ..Default::default()
+        };
+        let fifo_stopped_section = NodeFrameworkState {
+            pending_data_count: 1,
+            input_service: Some([("inp".to_string(), Some(7u32))].into_iter().collect()),
+            stopped: true,
+            ..Default::default()
+        };
+        let running_section = NodeFrameworkState {
+            input_service: Some(BTreeMap::new()),
+            ..Default::default()
+        };
+        let blobs: BTreeMap<String, Vec<u8>> = [
+            ("stopped", anchor_part(Some(&stopped_section))),
+            ("fifo_stopped", anchor_part(Some(&fifo_stopped_section))),
+            ("running", anchor_part(Some(&running_section))),
+            ("v1", anchor_part(None)),
+            ("ghost", anchor_part(Some(&stopped_section))),
+        ]
+        .into_iter()
+        .map(|(node, part)| (node.to_string(), part))
+        .collect();
+        let framework = decode_framework_sections(&blobs).expect("every part decodes");
+        assert!(
+            !framework.contains_key("v1"),
+            "PRECONDITION: a part with no section decodes to no section"
+        );
+        // The FIFO consumer's section states one unconsumed arrival.
+        let held = StoppedAtAnchor {
+            unconsumed_arrival: true,
+        };
+        let graph = ["absent", "fifo_stopped", "running", "stopped", "v1"];
+        let table = |every_stop_flagged: bool| -> Vec<(String, AnchorStop)> {
+            resolve_anchor_stops(graph, &blobs, &framework, every_stop_flagged)
+                .by_node
+                .into_iter()
+                .collect()
+        };
+        let hand = |rows: &[(&str, AnchorStop)]| -> Vec<(String, AnchorStop)> {
+            rows.iter()
+                .map(|(node, stop)| ((*node).to_string(), *stop))
+                .collect()
+        };
+        assert_eq!(
+            table(recorder_states_anchor_stops_at(Some(&recorder_info_at(10)))),
+            hand(&[
+                ("absent", AnchorStop::Unstated),
+                ("fifo_stopped", AnchorStop::Stopped(held)),
+                ("running", AnchorStop::Running),
+                ("stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+                ("v1", AnchorStop::Running),
+            ]),
+            "format 10: a complete part without the flag states a running node"
+        );
+        assert_eq!(
+            table(recorder_states_anchor_stops_at(Some(&recorder_info_at(9)))),
+            hand(&[
+                ("absent", AnchorStop::Unstated),
+                ("fifo_stopped", AnchorStop::Stopped(held)),
+                ("running", AnchorStop::Unstated),
+                ("stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+                ("v1", AnchorStop::Unstated),
+            ]),
+            "format 9: the flag states the stop, and its absence states nothing"
+        );
+        let stops = resolve_anchor_stops(graph, &blobs, &framework, true);
+        assert_eq!(
+            stops.stopped().collect::<Vec<_>>(),
+            vec!["fifo_stopped", "stopped"],
+            "a stopped part for a node outside the graph is not a stop"
+        );
+        assert_eq!(
+            stops.stops_at_anchor().collect::<Vec<_>>(),
+            vec![
+                ("fifo_stopped", held),
+                ("stopped", StoppedAtAnchor::default())
+            ],
+            "each stop carries its section's unconsumed arrival"
+        );
+        for (node, stopped) in [
+            ("stopped", true),
+            ("fifo_stopped", true),
+            ("running", false),
+            ("v1", false),
+            ("absent", false),
+            ("ghost", false),
+        ] {
+            assert_eq!(stops.is_stopped(node), stopped, "{node}");
+        }
+        let names = |nodes: &[&str]| -> BTreeSet<String> {
+            nodes.iter().map(|node| (*node).to_string()).collect()
+        };
+        assert_eq!(
+            stops.stated(),
+            names(&["fifo_stopped", "running", "stopped", "v1"]),
+            "format 10: every node with a complete part has its stop stated"
+        );
+        assert_eq!(
+            resolve_anchor_stops(graph, &blobs, &framework, false).stated(),
+            names(&["fifo_stopped", "stopped"]),
+            "format 9: only a flagged part states anything"
+        );
+        // Determinism: the same inputs give the same classification.
+        assert_eq!(stops, resolve_anchor_stops(graph, &blobs, &framework, true));
+    }
+
+    /// A topic is re-executed while any in-graph producer of it runs: two
+    /// writers of one `multi_publisher_topics` topic and a sole writer of
+    /// another, against each set of stops, by hand.
+    #[test]
+    fn a_topic_only_stopped_nodes_produce_is_not_reexecuted() {
+        let config = cerulion_core::graph::parse_graph(
+            "name: sh\nprefix: mp\nmulti_publisher_topics:\n  - /mp/bus\nnodes:\n\
+             \x20 - id: alpha\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: geometry_msgs/Vector3\n        topic: /mp/bus\n\
+             \x20 - id: beta\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: geometry_msgs/Vector3\n        topic: /mp/bus\n\
+             \x20 - id: solo\n    type: t\n    outputs:\n      - name: out\n        \
+             schema: geometry_msgs/Vector3\n",
+        )
+        .expect("the fixture graph parses");
+        let produced = graph_produced_topics(&config);
+        assert_eq!(
+            produced,
+            vec!["/mp/bus".to_string(), "/mp/solo/out".to_string()]
+        );
+        let stopped = |nodes: &[&str]| AnchorStops {
+            by_node: ["alpha", "beta", "solo"]
+                .into_iter()
+                .map(|node| {
+                    let stop = if nodes.contains(&node) {
+                        AnchorStop::Stopped(StoppedAtAnchor::default())
+                    } else {
+                        AnchorStop::Running
+                    };
+                    (node.to_string(), stop)
+                })
+                .collect(),
+        };
+        for (nodes, kept) in [
+            (&[][..], &["/mp/bus", "/mp/solo/out"][..]),
+            (&["alpha"][..], &["/mp/bus", "/mp/solo/out"][..]),
+            (&["alpha", "beta"][..], &["/mp/solo/out"][..]),
+            (&["solo"][..], &["/mp/bus"][..]),
+            (&["alpha", "beta", "solo"][..], &[][..]),
+        ] {
+            assert_eq!(
+                reexecuted_topics(&config, &produced, &stopped(nodes)),
+                kept.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
+                "stopped {nodes:?}"
+            );
+        }
+    }
+
+    /// The refusal for a fire of a node the checkpoint states as stopped, over
+    /// hand-written fire maps: only a node stated
+    /// stopped AND fired in the executed steps refuses, naming the checkpoint
+    /// step, the node and its first fire; the refusal is exit 2.
+    #[test]
+    fn a_fire_of_a_node_stated_stopped_is_refused_naming_the_node_and_both_steps() {
+        let stops = AnchorStops {
+            by_node: [
+                ("a_stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+                ("b_running", AnchorStop::Running),
+                ("c_unstated", AnchorStop::Unstated),
+                ("d_stopped", AnchorStop::Stopped(StoppedAtAnchor::default())),
+            ]
+            .into_iter()
+            .map(|(node, stop)| (node.to_string(), stop))
+            .collect(),
+        };
+        let fires = |rows: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            rows.iter()
+                .map(|(node, step)| ((*node).to_string(), *step))
+                .collect()
+        };
+        assert!(stopped_fire_refusal(&stops, &BTreeMap::new(), 3).is_none());
+        assert!(
+            stopped_fire_refusal(&stops, &fires(&[("b_running", 4), ("c_unstated", 5)]), 3)
+                .is_none(),
+            "a running or unstated node may fire"
+        );
+        assert!(
+            stopped_fire_refusal(&AnchorStops::default(), &fires(&[("a_stopped", 4)]), 3).is_none(),
+            "no stop stated, nothing refused"
+        );
+        let refusal =
+            stopped_fire_refusal(&stops, &fires(&[("d_stopped", 5), ("b_running", 4)]), 3)
+                .expect("a fire of a stopped node is refused");
+        let ReplayError::RecordingInconsistent { detail } = &refusal else {
+            panic!("expected RecordingInconsistent, got {refusal:?}");
+        };
+        assert_eq!(
+            detail,
+            "the checkpoint at step 3 states that node 'd_stopped' had stopped, and the \
+             recording holds a fire of it at step 5; nothing restarts a stopped node in a run"
+        );
+        assert_eq!(refusal.exit_code(), 2, "a bag fault, not a divergence");
+        let both = stopped_fire_refusal(&stops, &fires(&[("d_stopped", 4), ("a_stopped", 9)]), 3)
+            .expect("refused");
+        assert!(
+            both.to_string().contains("node 'a_stopped' had stopped")
+                && both.to_string().contains("at step 9"),
+            "the first stopped node in id order is named, with its own first fire: {both}"
+        );
+    }
+
+    /// A stop restore the runtime declines is an engine bug: exit 5, naming
+    /// the runtime's own refusal.
+    #[test]
+    fn a_declined_stop_restore_is_an_internal_error() {
+        let refusal = stop_restore_failure(&cerulion_core::TransportError::NodeNotFound {
+            node_id: "ghost".to_string(),
+        });
+        assert_eq!(refusal.exit_code(), 5);
+        let ReplayError::Internal { reason } = &refusal else {
+            panic!("expected Internal, got {refusal:?}");
+        };
+        assert!(
+            reason.starts_with(
+                "the resume could not keep the nodes its checkpoint states as stopped from firing: "
+            ) && reason.contains("ghost")
+                && reason.ends_with("this is a bug in the replay engine, please report"),
+            "{reason}"
+        );
     }
 
     /// The kind-field width and the role trust are
@@ -35597,9 +36661,11 @@ mod frame_ordinal_collection_tests {
         .collect();
         let rm = RecordedMessages::from_owned_frames(frames);
         let topics: BTreeSet<String> = [topic.to_string()].into_iter().collect();
-        let index = collect_topic_frame_index(&rm, &topics)
-            .expect("the walk succeeds")
-            .expect("and stays inside the budget");
+        let FrameIndexCensus::Indexed(index) =
+            collect_topic_frame_index(&rm, &topics).expect("the walk succeeds")
+        else {
+            panic!("and stays inside the budget");
+        };
         let idx = &index[topic];
 
         assert_eq!(
@@ -35634,9 +36700,12 @@ mod frame_ordinal_collection_tests {
                 .collect();
         let rm = RecordedMessages::from_owned_frames(frames);
         let topics: BTreeSet<String> = [topic.to_string()].into_iter().collect();
-        let idx = &collect_topic_frame_index(&rm, &topics)
-            .expect("the walk succeeds")
-            .expect("and stays inside the budget")[topic];
+        let FrameIndexCensus::Indexed(index) =
+            collect_topic_frame_index(&rm, &topics).expect("the walk succeeds")
+        else {
+            panic!("and stays inside the budget");
+        };
+        let idx = &index[topic];
         assert_eq!(idx.ordinals, vec![0, 1, 2]);
         assert_eq!(idx.headerless, 0);
         assert_eq!(idx.recorded, 3);
@@ -38718,7 +39787,12 @@ mod trailing_refill_tests {
             vec![(0, vec![])]
         );
         let mut declined = verification(&[(0, CAP + 1)], false);
-        declined.declined = Some(VerifierDecline::ReadLogBudget);
+        declined.declined = Some(VerifierDecline::ReadLogBudget(ReadLogOverrun {
+            reads: 2,
+            budget: 1,
+            step: 0,
+            time: None,
+        }));
         assert_eq!(
             derive(&declined, &[(0, CAP)], false, true),
             vec![(0, vec![])]
@@ -38868,8 +39942,8 @@ mod unlisted_macro_output_tests {
 mod resim_namespace_tests {
     use super::{
         claim_resim_slot, reclaim_resim_slot, resim_ix_config, resim_namespace_prefix,
-        resim_namespace_slot, ResimSlot, SlotPassedOver, SlotReclaim, RESIM_NAMESPACE_MARKER,
-        RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
+        resim_namespace_slot, ResimSlot, SlotLock, SlotPassedOver, SlotReclaim,
+        RESIM_NAMESPACE_MARKER, RESIM_NAMESPACE_SLOTS, SEGMENT_NAME_DIR,
     };
     use cerulion_core::testing::IsolatedRoot;
     use cerulion_core::transport::dead_node_sweep::BoundedCleanup;
@@ -39073,6 +40147,52 @@ mod resim_namespace_tests {
         .expect("slot 1 is ready");
         assert_eq!((claimed.slot, tried), (1, vec![0, 1]));
         assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
+    }
+
+    /// Dropping a holder releases its lock while another descriptor of the
+    /// same open file description stays open, as one does in a child forked
+    /// between a claim and the child's exec: the next claim takes the slot.
+    #[test]
+    fn a_dropped_slot_is_released_while_a_copy_of_its_descriptor_is_open() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let first = claim(dir.path(), 4);
+        assert_eq!(first.slot, 0);
+        let copy = first._lock.0.try_clone().expect("a second descriptor");
+        drop(first);
+        assert_eq!(claim(dir.path(), 4).slot, 0, "slot 0's lock was released");
+        drop(copy);
+    }
+
+    /// The lock a passed-over slot drops is released the same way: a second
+    /// open of the file can lock it while a copy of the first descriptor is
+    /// still open.
+    #[test]
+    fn a_slot_lock_unlocks_its_file_description_when_dropped() {
+        let dir = tempfile::tempdir().expect("a lock directory");
+        let path = dir.path().join("cer_resim_00000000.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .expect("the lock file opens")
+        };
+        let file = open();
+        rustix::fs::flock(&file, rustix::fs::FlockOperation::NonBlockingLockExclusive)
+            .expect("the first lock is free");
+        let lock = SlotLock(file);
+        let copy = lock.0.try_clone().expect("a second descriptor");
+        drop(lock);
+        let second = open();
+        rustix::fs::flock(
+            &second,
+            rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        )
+        .expect("the dropped lock was released while a copy of its descriptor stayed open");
+        drop(second);
+        drop(copy);
     }
 
     /// A reclaim that leaves a node: what the dead-node sweep did, from
@@ -39751,5 +40871,264 @@ mod resim_namespace_tests {
         assert_eq!(reclaimed.nodes_left, Ok(0));
         assert_eq!(reclaimed.refusal(), None);
         assert_eq!(namespace_files(&root, slot), BTreeSet::new());
+    }
+}
+
+#[cfg(test)]
+mod verifier_budget_overrun_tests {
+    use super::*;
+
+    /// Feed `records` (`(step, occurrences)`) to a fresh tally against
+    /// `budget`: what each `add` answered, every read counted, and the run-out
+    /// step.
+    fn tally_of(records: &[(u64, u32)], budget: usize) -> (Vec<bool>, u64, Option<u64>) {
+        let mut tally = BudgetTally::default();
+        let fits = records
+            .iter()
+            .map(|&(step, occurrences)| tally.add(step, occurrences, budget))
+            .collect();
+        (fits, tally.total, tally.over_at_step)
+    }
+
+    /// The tally holds reads up to the budget, counts every read past it, and
+    /// names the step of the first record that went past it, against a hand
+    /// oracle at three budgets over one four-read stream.
+    #[test]
+    fn a_budget_tally_counts_every_read_past_the_budget_and_names_the_step_it_ran_out() {
+        let stream = [(0, 1), (0, 1), (1, 1), (2, 1)];
+        // Exactly at the budget fits: `expand_run`'s strict `>`.
+        assert_eq!(tally_of(&stream, 4), (vec![true; 4], 4, None));
+        // One read over: the record at step 2 is the first past it, and it is
+        // still counted.
+        assert_eq!(
+            tally_of(&stream, 3),
+            (vec![true, true, true, false], 4, Some(2))
+        );
+        // A zero budget holds nothing and runs out at the first record.
+        assert_eq!(tally_of(&stream, 0), (vec![false; 4], 4, Some(0)));
+        // Once over, a record small enough to fit what was HELD is still not
+        // held, and the run-out step stays the first one.
+        assert_eq!(
+            tally_of(&[(0, 1), (1, 3), (2, 1)], 3),
+            (vec![true, false, false], 5, Some(1))
+        );
+        // Determinism: the same stream answers the same tally twice.
+        assert_eq!(tally_of(&stream, 3), tally_of(&stream, 3));
+    }
+
+    /// A folded run is counted by every read it stands for, the one that
+    /// straddles the budget included, and the largest runs a record can state
+    /// are counted without overflow and without holding anything.
+    #[test]
+    fn a_folded_run_that_straddles_the_budget_is_counted_whole() {
+        assert_eq!(
+            tally_of(&[(0, 2), (1, 5), (2, 1)], 4),
+            (vec![true, false, false], 8, Some(1))
+        );
+        // 2 x 4,294,967,295 = 8,589,934,590 reads, counted in a u64.
+        assert_eq!(
+            tally_of(&[(0, u32::MAX), (1, u32::MAX)], 200_000),
+            (vec![false, false], 8_589_934_590, Some(0))
+        );
+        // A count at the top of u64 saturates rather than wrapping to a small
+        // number that would read as a log within the budget.
+        let mut tally = BudgetTally {
+            total: u64::MAX - 1,
+            over_at_step: Some(0),
+        };
+        assert!(!tally.add(5, u32::MAX, 200_000));
+        assert_eq!((tally.total, tally.over_at_step), (u64::MAX, Some(0)));
+    }
+
+    /// The reads past the budget, the budget, the step and the time, as the
+    /// census decline renders them, and the same sentence with no time when the
+    /// rank recorded no boundary of that step.
+    #[test]
+    fn the_read_log_budget_sentence_names_the_reads_the_budget_the_step_and_the_time() {
+        let time = RunOutTime::from_targets(1_000_000_000, 1_055_000_000, 1_055_000_000);
+        assert_eq!((time.at_ns, time.span_ns), (55_000_000, 55_000_000));
+        let timed = ReadLogOverrun {
+            reads: 26,
+            budget: 25,
+            step: 11,
+            time: Some(time),
+        };
+        assert_eq!(
+            VerifierDecline::ReadLogBudget(timed).reason(),
+            "it holds 26 reads, more than the verifier's budget of 25 reads per rank, and \
+             reaches the budget at step 11, 0.055 s into the rank's 0.055 s of recording"
+        );
+        assert_eq!(
+            declined_census_detail(0, VerifierDecline::ReadLogBudget(timed)),
+            "rank 0's read log was declined (verifier_declined_read_log_budget): it holds 26 \
+             reads, more than the verifier's budget of 25 reads per rank, and reaches the \
+             budget at step 11, 0.055 s into the rank's 0.055 s of recording. This replay \
+             holds each rank's read log in memory up to this budget, so replay a recording of \
+             this graph no longer than that."
+        );
+        let untimed = ReadLogOverrun {
+            time: None,
+            ..timed
+        };
+        assert_eq!(
+            VerifierDecline::ReadLogBudget(untimed).reason(),
+            "it holds 26 reads, more than the verifier's budget of 25 reads per rank, and \
+             reaches the budget at step 11"
+        );
+        // A step whose target precedes the rank's first saturates to zero.
+        let early = RunOutTime::from_targets(10, 4, 30);
+        assert_eq!((early.at_ns, early.span_ns), (0, 20));
+        // A cause with no shorter-recording remedy keeps its sentence alone.
+        assert_eq!(
+            declined_census_detail(3, VerifierDecline::ReadLogUnplaceable),
+            format!(
+                "rank 3's read log was declined (verifier_declined_read_log_unplaceable): {}",
+                VerifierDecline::ReadLogUnplaceable.reason()
+            )
+        );
+    }
+
+    /// A Vector3-shaped frame carrying `sequence`.
+    fn framed(sequence: u32) -> Vec<u8> {
+        let mut out = vec![0u8; WireHeader::SIZE + 24];
+        WireHeader {
+            schema_hash: 0,
+            total_size: (WireHeader::SIZE + 24) as u32,
+            offset_table_offset: 0,
+            offset_table_count: 0,
+            sequence,
+            timestamp_ns: u64::from(sequence) + 1,
+            step_tag: cerulion_core::wire::StepTag::UNTAGGED,
+        }
+        .write_to_buf(&mut out);
+        out
+    }
+
+    /// The frames past the budget and the budget, as the frame-index decline
+    /// renders them, and the frame index's own count: every frame with a wire
+    /// header on the consumed topics, past the budget too, and no headerless
+    /// one.
+    #[test]
+    fn the_frame_index_budget_sentence_names_the_frames_and_the_budget() {
+        let overrun = FrameIndexOverrun {
+            frames: 12,
+            budget: 11,
+        };
+        assert_eq!(
+            VerifierDecline::FrameIndexBudget(overrun).reason(),
+            "it consumes 12 recorded frames, more than the verifier's budget of 11 frames per \
+             rank"
+        );
+        // Four headered frames on the two consumed topics: three on `/a`
+        // beside its headerless one, one on `/b`; `/unread` is not consumed.
+        let frames: IndexMap<String, Vec<Vec<u8>>> = [
+            ("/a", vec![framed(0), vec![0u8; 4], framed(1), framed(2)]),
+            ("/b", vec![framed(0)]),
+            ("/unread", vec![framed(0), framed(1)]),
+        ]
+        .into_iter()
+        .map(|(t, f)| (t.to_string(), f))
+        .collect();
+        let rm = RecordedMessages::from_owned_frames(frames);
+        let topics: BTreeSet<String> = ["/a", "/b"].into_iter().map(str::to_string).collect();
+        let census = |budget: usize| {
+            let _guard = override_frame_index_record_budget(budget);
+            match collect_topic_frame_index(&rm, &topics).expect("the walk succeeds") {
+                FrameIndexCensus::OverBudget(o) => Err((o.frames, o.budget)),
+                FrameIndexCensus::Indexed(index) => Ok(index),
+            }
+        };
+        assert_eq!(census(2).err(), Some((4, 2)), "the two past it counted too");
+        assert_eq!(census(3).err(), Some((4, 3)));
+        let index = census(4).expect("exactly at the budget fits");
+        assert_eq!(index["/a"].sequences, vec![0, 1, 2]);
+        assert_eq!(index["/b"].sequences, vec![0]);
+    }
+
+    /// Every decline cause, the remedy a refusal on it ends with: a shorter
+    /// recording for each budget, and the re-record sentence verbatim for every
+    /// cause in the recording's manifest.
+    #[test]
+    fn each_decline_cause_names_its_own_remedy() {
+        const RE_RECORD: &str = "Re-record the bag with this binary, or replay it under \
+                                 CERULION_EXECUTION_MODE=lockstep, whose one gating clock \
+                                 orders every publish against every step";
+        const READ_LOG: &str = "This replay holds each rank's read log in memory up to this \
+                                budget, so replay a recording of this graph no longer than \
+                                that";
+        const FRAMES: &str = "This replay holds the frames each rank consumes in memory up to \
+                              this budget, so replay a shorter recording of this graph";
+        const SCHEDULE: &str = "This replay holds each pass's recorded schedule in memory up \
+                                to this budget, so replay a shorter recording of this graph";
+        let read_log = ReadLogOverrun {
+            reads: 26,
+            budget: 25,
+            step: 11,
+            time: None,
+        };
+        let frames = FrameIndexOverrun {
+            frames: 12,
+            budget: 11,
+        };
+        let topics = ["/t".to_string()];
+        for cause in [
+            VerifierDecline::InputTables,
+            VerifierDecline::ReadLogBudget(read_log),
+            VerifierDecline::FrameIndexBudget(frames),
+            VerifierDecline::ScheduleBudget,
+            VerifierDecline::ReadLogUnplaceable,
+            VerifierDecline::StagingRegime,
+        ] {
+            // Exhaustive, so a seventh cause does not compile until it is
+            // given its remedy here.
+            let (remedy, ends_with) = match cause {
+                VerifierDecline::ReadLogBudget(_) => (Some(READ_LOG), READ_LOG),
+                VerifierDecline::FrameIndexBudget(_) => (Some(FRAMES), FRAMES),
+                VerifierDecline::ScheduleBudget => (Some(SCHEDULE), SCHEDULE),
+                VerifierDecline::InputTables
+                | VerifierDecline::ReadLogUnplaceable
+                | VerifierDecline::StagingRegime => (None, RE_RECORD),
+            };
+            assert_eq!(cause.remedy(), remedy, "{cause:?}");
+            let Some(ReplayError::ReadLogNotEnforceable {
+                edge,
+                cause: token,
+                detail,
+            }) = enforcement_blocked_by_decline(&topics, cause, "SENTENCE")
+            else {
+                panic!("a rank that gates a topic is refused: {cause:?}");
+            };
+            assert_eq!((edge, token.as_str()), (None, "read_log_budget_declined"));
+            assert_eq!(
+                detail,
+                format!(
+                    "this rank consumes 1 topic(s) it also produces (/t), whose recorded reads \
+                     the replay must admit at their recorded steps, and the read log they would \
+                     be built from was declined before the first step ({}): SENTENCE. \
+                     {ends_with}",
+                    cause.code()
+                ),
+            );
+            // A rank that gates nothing is not refused, whatever the cause.
+            assert!(enforcement_blocked_by_decline(&[], cause, "SENTENCE").is_none());
+        }
+    }
+
+    /// Seconds with millisecond precision, in integer arithmetic: truncated
+    /// toward zero, three digits always, and total over `u64`.
+    #[test]
+    fn seconds_text_renders_milliseconds_with_integer_arithmetic() {
+        for (ns, want) in [
+            (0, "0.000 s"),
+            (999_999, "0.000 s"),
+            (1_000_000, "0.001 s"),
+            (55_000_000, "0.055 s"),
+            (1_000_000_000, "1.000 s"),
+            (838_123_456_789, "838.123 s"),
+            (u64::MAX, "18446744073.709 s"),
+        ] {
+            assert_eq!(seconds_text(ns), want, "{ns} ns");
+            assert_eq!(seconds_text(ns), seconds_text(ns), "two calls agree");
+        }
     }
 }

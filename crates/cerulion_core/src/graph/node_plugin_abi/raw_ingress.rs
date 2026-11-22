@@ -55,7 +55,10 @@ impl RawIngress {
     ) -> TransportResult<RawPublisher> {
         match &self.backend {
             Backend::Native(manager) => {
-                let local_scope = manager.retain_local_topic_scope(topic)?.map(Box::new);
+                // A node creates the port on its executor thread: never wait there.
+                let local_scope = manager
+                    .retain_local_topic_scope(topic, crate::transport::TeardownWait::Never)?
+                    .map(Box::new);
                 Ok(RawPublisher {
                     backend: PublisherBackend::Native {
                         publisher: Box::new(manager.create_ingress_publisher_with(

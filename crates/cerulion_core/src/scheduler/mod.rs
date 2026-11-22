@@ -890,6 +890,12 @@ struct ScheduledNode {
     /// the rest of the step. The `block` predicate ignores the argument
     /// (it reads its outstanding-counter atomics).
     pre_fire_check: Option<Arc<dyn Fn(u64) -> bool + Send + Sync>>,
+    /// A replay build's mark: this node produces a `block` edge the replay
+    /// feeds from its recording, whose consumer runs in another pass (see
+    /// [`Scheduler::mark_held_by_bag_fed_block_edge`]). Read only by
+    /// [`Scheduler::set_replay_trailing_refills`]; `false` on every live
+    /// build.
+    held_by_bag_fed_block_edge: bool,
 
     // Circuit breaker state
     consecutive_panics: u32,
@@ -1814,6 +1820,30 @@ struct ReplayFirePlan {
     mismatches: u64,
 }
 
+/// The live loop's next wake, split by whether it may wait for it exactly
+/// ([`Scheduler::next_fire_split`]). Both are nanoseconds from the `now` they
+/// were read at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct NextFire {
+    /// The soonest Period deadline still ahead, unmoved by a throttle window or
+    /// a `block` hold. Never 0.
+    pub(crate) deadline_ns: Option<u64>,
+    /// The soonest of every other pending fire: 0 for a node due now (a Period
+    /// node past its deadline included), or a throttle window or `block`
+    /// release still to run.
+    pub(crate) poll_ns: Option<u64>,
+}
+
+impl NextFire {
+    /// The soonest of the two: what [`Scheduler::ns_until_next_fire`] reports.
+    pub(crate) fn soonest(self) -> Option<u64> {
+        match (self.deadline_ns, self.poll_ns) {
+            (Some(d), Some(p)) => Some(d.min(p)),
+            (d, p) => d.or(p),
+        }
+    }
+}
+
 /// Deterministic scheduler for node execution.
 ///
 /// Nodes are evaluated in insertion order (`IndexMap`) at each `step()` call.
@@ -2242,69 +2272,100 @@ impl Scheduler {
     /// `pending_data_count` deliberately cannot describe — see that field).
     /// Either way the node is due NOW, and `Some(0)` clamps to the loop's 1 ms
     /// floor: the remainder drains at the poll cadence, never a busy-spin.
+    ///
+    /// The live loop reads the same value in two halves (`next_fire_split`):
+    /// this is the sooner of them.
     pub fn ns_until_next_fire(&self, now_ns: u64) -> Option<u64> {
-        self.nodes
-            .values()
-            .filter(|n| !n.disabled)
-            .filter_map(|n| {
-                let due = match &n.policy {
-                    TriggerPolicy::Period { .. } => {
-                        n.next_fire_ns.map(|nf| nf.saturating_sub(now_ns))
-                    }
-                    TriggerPolicy::Data if n.pending_data_count > 0 || n.data_backlog_hint => {
-                        Some(0)
-                    }
-                    // A Sync node holding a COMPLETE aligned set it has
-                    // not fired is due NOW, exactly as a Data node holding a
-                    // popped-but-unfired frame is. Without this arm a carried set
-                    // waits for an unrelated publish to wake the loop, or for the
-                    // 250 ms liveliness cap, where Data recovers at the 1 ms floor.
-                    TriggerPolicy::Sync { .. } if n.sync_backlog_hint => Some(0),
-                    // An External node whose mark the last step left set owes
-                    // a fire that a pre-fire check (a full `block` slot or
-                    // `throttle_ms`) deferred. For a doorbell or pipe source
-                    // nothing rings for it again: the sweep drained the source
-                    // when it set the mark. A device fd source stays ready
-                    // until the node reads it. Either way the node is due NOW,
-                    // so the throttle window and the `block` hold below bound
-                    // the wait at the instant it can fire. An unmarked
-                    // External node owes nothing and adds no deadline.
-                    TriggerPolicy::External if n.external_triggered => Some(0),
-                    _ => None,
-                }?;
-                // A node that is DUE but THROTTLE-DEFERRED
-                // cannot run until its rate cap expires, so its real deadline is
-                // the LATER of the two. Without this the arms above report
-                // `Some(0)` for the whole throttle window — the node is due by
-                // every signal the scheduler can see — and the loop polls at its
-                // 1 ms floor, deciding to defer again each time.
-                //
-                // `max`, not "replace": the throttle bounds when the node MAY
-                // fire, it never brings a later deadline forward. A Period node
-                // cannot reach this arm anyway (`throttle_ms` and `period_ms`
-                // are mutually exclusive at the macro), so in practice this
-                // lifts a `Some(0)` to the remaining window.
-                let due = match n.throttle_remaining_ns(now_ns) {
-                    Some(remaining) => due.max(remaining),
-                    None => due,
-                };
-                // A node held by a full `block` slot is due by the same
-                // signals and cannot run either. It runs at the earliest
-                // `block_timeout_ms` release of its full slots, or after a
-                // drain or a release, each of which wakes the loop itself (the
-                // consumer drains on this level loop, or the peer's drain
-                // rings the credit park). A slot the loop may not wait on, or
-                // whose stall clock the next evaluation must start, keeps the
-                // node due.
-                match n.block_hold.as_ref().map(|hold| hold()) {
-                    None | Some(crate::scheduler::block::BlockHold::Clear) => Some(due),
-                    Some(crate::scheduler::block::BlockHold::Until(at_ns)) => {
-                        Some(due.max(at_ns.saturating_sub(now_ns)))
-                    }
-                    Some(crate::scheduler::block::BlockHold::UntilWake) => None,
+        self.next_fire_split(now_ns).soonest()
+    }
+
+    /// [`Self::ns_until_next_fire`] split by what the live loop may wait for
+    /// exactly. [`NextFire::deadline_ns`] is the soonest Period deadline that
+    /// lies ahead of `now_ns` and that no throttle window or `block` hold
+    /// moved: the loop waits to it exactly. [`NextFire::poll_ns`] is the
+    /// soonest of every other pending fire (a node due now, a Period node past
+    /// its deadline, a throttle window, a `block_timeout_ms` release): the loop
+    /// keeps its 1 ms poll floor for those. PURE READ, same reads as
+    /// [`Self::ns_until_next_fire`].
+    pub(crate) fn next_fire_split(&self, now_ns: u64) -> NextFire {
+        let mut next = NextFire::default();
+        let soonest = |slot: &mut Option<u64>, ns: u64| {
+            *slot = Some(slot.map_or(ns, |cur| cur.min(ns)));
+        };
+        for (ns, exact) in self.nodes.values().filter(|n| !n.disabled).filter_map(|n| {
+            // `ahead`: a Period node whose own deadline is still in the future.
+            let mut ahead = false;
+            let due = match &n.policy {
+                TriggerPolicy::Period { .. } => n.next_fire_ns.map(|nf| {
+                    ahead = nf > now_ns;
+                    nf.saturating_sub(now_ns)
+                }),
+                TriggerPolicy::Data if n.pending_data_count > 0 || n.data_backlog_hint => Some(0),
+                // A Sync node holding a COMPLETE aligned set it has
+                // not fired is due NOW, exactly as a Data node holding a
+                // popped-but-unfired frame is. Without this arm a carried set
+                // waits for an unrelated publish to wake the loop, or for the
+                // 250 ms liveliness cap, where Data recovers at the 1 ms floor.
+                TriggerPolicy::Sync { .. } if n.sync_backlog_hint => Some(0),
+                // An External node whose mark the last step left set owes
+                // a fire that a pre-fire check (a full `block` slot or
+                // `throttle_ms`) deferred. For a doorbell or pipe source
+                // nothing rings for it again: the sweep drained the source
+                // when it set the mark. A device fd source stays ready
+                // until the node reads it. Either way the node is due NOW,
+                // so the throttle window and the `block` hold below bound
+                // the wait at the instant it can fire. An unmarked
+                // External node owes nothing and adds no deadline.
+                TriggerPolicy::External if n.external_triggered => Some(0),
+                _ => None,
+            }?;
+            // A node that is DUE but THROTTLE-DEFERRED
+            // cannot run until its rate cap expires, so its real deadline is
+            // the LATER of the two. Without this the arms above report
+            // `Some(0)` for the whole throttle window (the node is due by
+            // every signal the scheduler can see), and the loop polls at its
+            // 1 ms floor, deciding to defer again each time.
+            //
+            // `max`, not "replace": the throttle bounds when the node MAY
+            // fire, it never brings a later deadline forward. A Period node
+            // cannot reach this arm anyway (`throttle_ms` and `period_ms`
+            // are mutually exclusive at the macro), so in practice this
+            // lifts a `Some(0)` to the remaining window.
+            let due = match n.throttle_remaining_ns(now_ns) {
+                Some(remaining) if remaining > due => {
+                    ahead = false;
+                    remaining
                 }
-            })
-            .min()
+                _ => due,
+            };
+            // A node held by a full `block` slot is due by the same
+            // signals and cannot run either. It runs at the earliest
+            // `block_timeout_ms` release of its full slots, or after a
+            // drain or a release, each of which wakes the loop itself (the
+            // consumer drains on this level loop, or the peer's drain
+            // rings the credit park). A slot the loop may not wait on, or
+            // whose stall clock the next evaluation must start, keeps the
+            // node due.
+            match n.block_hold.as_ref().map(|hold| hold()) {
+                None | Some(crate::scheduler::block::BlockHold::Clear) => Some((due, ahead)),
+                Some(crate::scheduler::block::BlockHold::Until(at_ns)) => {
+                    let release = at_ns.saturating_sub(now_ns);
+                    Some(if release > due {
+                        (release, false)
+                    } else {
+                        (due, ahead)
+                    })
+                }
+                Some(crate::scheduler::block::BlockHold::UntilWake) => None,
+            }
+        }) {
+            if exact {
+                soonest(&mut next.deadline_ns, ns);
+            } else {
+                soonest(&mut next.poll_ns, ns);
+            }
+        }
+        next
     }
 
     /// The gating clock's current time (ns) — the domain every `next_fire_ns`
@@ -2588,6 +2649,7 @@ impl Scheduler {
             output_discards,
             notify_undelivered,
             pre_fire_check: None,
+            held_by_bag_fed_block_edge: false,
             consecutive_panics: 0,
             disabled: false,
             external_triggered: false,
@@ -2867,8 +2929,10 @@ impl Scheduler {
     /// [`TransportError::GraphError`] when no plan is installed for `step`, or
     /// a named node has no planned fire there, is not a `Data` node with a
     /// refill hook, or neither fires the cap at that step nor carries a
-    /// pre-fire check: a recording cannot hold a trailing refill on such a
-    /// node.
+    /// pre-fire check or the mark a replay build sets on the producer of a
+    /// `block` edge it feeds from its recording
+    /// (`mark_held_by_bag_fed_block_edge`): a recording cannot hold a
+    /// trailing refill on such a node.
     pub fn set_replay_trailing_refills(
         &mut self,
         step: u64,
@@ -2891,7 +2955,7 @@ impl Scheduler {
             if !matches!(node.policy, TriggerPolicy::Data) || node.trigger_refill.is_none() {
                 return Err(refuse(node_id, "it is not a Data node with a refill hook"));
             }
-            let deferrable = node.pre_fire_check.is_some();
+            let deferrable = node.pre_fire_check.is_some() || node.held_by_bag_fed_block_edge;
             let Some(plan) = self.replay_plan.as_mut().filter(|p| p.step == step) else {
                 return Err(refuse(node_id, "no fire plan is installed for this step"));
             };
@@ -2910,6 +2974,29 @@ impl Scheduler {
                 None => return Err(refuse(node_id, "it has no planned fire at this step")),
             }
         }
+        Ok(())
+    }
+
+    /// Mark `node_id` as a producer of a `block` edge a replay feeds from its
+    /// recording, whose consumer runs in another pass. Live, a credit word in
+    /// another process could defer the node between the fires of a burst, so
+    /// [`Self::set_replay_trailing_refills`] accepts a trailing refill on it
+    /// below the cap, as it does on a node with a pre-fire check. The mark
+    /// stands in for the pre-fire check there and nowhere else: it gives the
+    /// node no refill hook and defers no fire.
+    ///
+    /// # Errors
+    ///
+    /// [`TransportError::NodeNotFound`] for an unknown node.
+    pub(crate) fn mark_held_by_bag_fed_block_edge(&mut self, node_id: &str) -> TransportResult<()> {
+        let node = self
+            .nodes
+            .get_mut(node_id)
+            .ok_or_else(|| TransportError::NodeNotFound {
+                // hot-path-alloc-ok: cold: graph-build ERROR arm.
+                node_id: node_id.to_string(),
+            })?;
+        node.held_by_bag_fed_block_edge = true;
         Ok(())
     }
 
@@ -3755,7 +3842,7 @@ impl Scheduler {
     /// The capture carrier calls this at a due step boundary, where "right
     /// now" is the state AFTER the step completed, which is what an anchor at
     /// `S` means. Nothing here reads a clock or mutates anything: the
-    /// three fields are copied out and the caller owns what happens next.
+    /// scheduler's fields are copied out and the caller owns what happens next.
     ///
     /// `None` for an id this scheduler does not hold — a carrier walking a
     /// recording's node list against a live graph is the ordinary reason, and
@@ -3770,15 +3857,22 @@ impl Scheduler {
     /// scheduler itself was holding. This states the second, because the second
     /// is the one a rebuilt `Scheduler` cannot recover.
     ///
-    /// # This fills THREE of the section's four fields
+    /// # This fills the scheduler's fields of the section
     ///
     /// `NodeFrameworkState` is the CARRIER's composite view (see its own doc).
-    /// The fourth, `input_service`, is a TRANSPORT fact: the wire `sequence` of
-    /// the last frame each per-message FIFO input's tick actually read — which
-    /// the scheduler does not hold and cannot invent, so this leaves it `None`
-    /// and the graph runtime's capture site fills it in from the ports. A
-    /// caller that uses this value verbatim therefore states "no cursor", which
-    /// is the accurate reading of a scheduler asked on its own.
+    /// This fills `next_fire_ns`, `pending_data_count`,
+    /// `sync_input_timestamps` and `stopped` (`disabled`: a `NodeError::Fatal`
+    /// return, the consecutive-panic breaker or [`Self::restore_stopped_nodes`]
+    /// stopped the node).
+    ///
+    /// `input_service` is a TRANSPORT fact: the wire `sequence` of the last
+    /// frame each per-message FIFO input's tick actually read, which the
+    /// scheduler does not hold and cannot invent, so this leaves it `None` and
+    /// the graph runtime's capture site fills it in from the ports. A caller
+    /// that uses this value verbatim therefore states "no cursor", which is
+    /// the accurate reading of a scheduler asked on its own. The capture-time
+    /// Sync tail (`sync_capture_high_water`, `sync_epoch_floor`) is left empty
+    /// the same way; the runtime fills it for a capture-time Sync node.
     // hot-path-alloc-ok-fn: cold: introspection read for the state-capture plane
     pub fn node_framework_state(
         &self,
@@ -3822,6 +3916,7 @@ impl Scheduler {
             input_service: None,
             sync_capture_high_water: Default::default(),
             sync_epoch_floor: None,
+            stopped: node.disabled,
         })
     }
 
@@ -3947,6 +4042,46 @@ impl Scheduler {
         if matches!(node.policy, TriggerPolicy::Sync { .. }) {
             node.sync_epoch_floor = Some(ts);
         }
+    }
+
+    /// Stop each node in `ids` on a resumed run, as a recording's framework
+    /// sections state it
+    /// ([`crate::state_restore::NodeFrameworkState::stopped`]).
+    ///
+    /// Sets `disabled` and nothing else, so the node fires no more: a decided
+    /// fire, a planned replay fire and an `External` trigger mark all skip it,
+    /// as after the live stop. It does not set the fatal-stop flag, change the
+    /// consecutive-panic count or write the node-death ledger, so this run
+    /// records no failure for the node. [`Self::reset_node`] lifts the stop
+    /// like any other.
+    ///
+    /// Every id is checked before any node changes: the first id, in the
+    /// set's order, that this scheduler does not hold is refused as
+    /// [`TransportError::NodeNotFound`] and no node is stopped.
+    ///
+    /// Must be called after the build and BEFORE the first `step()`, like
+    /// every other restore seam.
+    // hot-path-alloc-ok-fn: cold: a resume edit before step 1
+    pub fn restore_stopped_nodes(
+        &mut self,
+        ids: &std::collections::BTreeSet<String>,
+    ) -> TransportResult<()> {
+        let indices = ids
+            .iter()
+            .map(|id| {
+                self.nodes
+                    .get_index_of(id.as_str())
+                    .ok_or_else(|| TransportError::NodeNotFound {
+                        node_id: id.clone(),
+                    })
+            })
+            .collect::<TransportResult<Vec<usize>>>()?;
+        for idx in indices {
+            if let Some((_, node)) = self.nodes.get_index_mut(idx) {
+                node.disabled = true;
+            }
+        }
+        Ok(())
     }
 
     /// Configure a per-input expected interval
@@ -4764,11 +4899,11 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return or by the
-    /// consecutive-panic breaker? A disabled node never fires until
-    /// [`Self::reset_node`] re-enables it. `false` for an unknown id. One map
-    /// lookup, no allocation: the live loop reads it per external binding per
-    /// wait.
+    /// Is `node_id` disabled: stopped by a `NodeError::Fatal` return, by the
+    /// consecutive-panic breaker or by [`Self::restore_stopped_nodes`]? A
+    /// disabled node never fires until [`Self::reset_node`] re-enables it.
+    /// `false` for an unknown id. One map lookup, no allocation: the live loop
+    /// reads it per external binding per wait.
     pub fn is_node_disabled(&self, node_id: &str) -> bool {
         self.nodes.get(node_id).is_some_and(|n| n.disabled)
     }
@@ -11328,12 +11463,21 @@ mod tests {
         add_data(&mut s, "sink");
         add_data(&mut s, "bare");
         add_period(&mut s, "tick", Duration::from_millis(1));
+        add_data(&mut s, "held");
         s.set_trigger_refill("sink", "inp", RefillOutcome::empty_queue)
+            .unwrap();
+        s.set_trigger_refill("held", "inp", RefillOutcome::empty_queue)
             .unwrap();
         let plan = |fires: u32| {
             [
                 ReplayFire {
                     node_id: "sink",
+                    first_fire_ns: 1_000_000,
+                    fire_count: fires,
+                    interval_ns: 0,
+                },
+                ReplayFire {
+                    node_id: "held",
                     first_fire_ns: 1_000_000,
                     fire_count: fires,
                     interval_ns: 0,
@@ -11372,6 +11516,86 @@ mod tests {
         // At the cap it is accepted.
         s.set_replay_fire_plan(0, &plan(cap)).unwrap();
         s.set_replay_trailing_refills(0, &["sink"]).unwrap();
+        // Below the cap, a node a fed `block` edge holds is refused until it
+        // is marked and accepted after; the unmarked `sink` stays refused.
+        s.set_replay_fire_plan(0, &plan(3)).unwrap();
+        let err = s.set_replay_trailing_refills(0, &["held"]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Graph validation error: replay fire plan (step 0): node 'held' cannot carry a \
+             trailing refill: it fires 3 times, not the cap of 64, and has no pre-fire check"
+        );
+        s.mark_held_by_bag_fed_block_edge("held").unwrap();
+        s.set_replay_trailing_refills(0, &["held"]).unwrap();
+        let err = s.set_replay_trailing_refills(0, &["sink"]).unwrap_err();
+        assert!(err.to_string().contains("not the cap"), "{err}");
+        // The mark gives no refill hook: a marked Period node and a marked
+        // Data node with no hook are still refused.
+        for id in ["tick", "bare"] {
+            s.mark_held_by_bag_fed_block_edge(id).unwrap();
+            let err = s.set_replay_trailing_refills(0, &[id]).unwrap_err();
+            assert!(err.to_string().contains("refill hook"), "{id}: {err}");
+        }
+        // An unknown node cannot be marked.
+        assert!(matches!(
+            s.mark_held_by_bag_fed_block_edge("ghost"),
+            Err(TransportError::NodeNotFound { .. })
+        ));
+    }
+
+    /// A marked node below the cap DRIVES its trailing refill: three planned
+    /// fires ask the hook twice between fires, and a step planned with a
+    /// trailing refill once more after the last, the frame the next step's
+    /// first fire serves. The mark alone, with no trailing refill planned,
+    /// adds no call and defers no fire.
+    #[test]
+    fn a_marked_node_below_the_cap_drives_its_trailing_refill() {
+        for (marked, trailing, want) in [(false, false, 2), (true, false, 2), (true, true, 3)] {
+            let mut replay =
+                Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()));
+            add_data(&mut replay, "relay");
+            let calls = Arc::new(AtomicU64::new(0));
+            let calls_hook = Arc::clone(&calls);
+            replay
+                .set_trigger_refill("relay", "inp", move || {
+                    calls_hook.fetch_add(1, Ordering::Relaxed);
+                    RefillOutcome::drained(1, Some(7), false)
+                })
+                .unwrap();
+            replay
+                .set_replay_fire_plan(
+                    0,
+                    &[ReplayFire {
+                        node_id: "relay",
+                        first_fire_ns: 1_000_000,
+                        fire_count: 3,
+                        interval_ns: 0,
+                    }],
+                )
+                .unwrap();
+            if marked {
+                replay.mark_held_by_bag_fed_block_edge("relay").unwrap();
+            }
+            if trailing {
+                replay.set_replay_trailing_refills(0, &["relay"]).unwrap();
+            }
+            replay.step(Duration::from_millis(10));
+            assert_eq!(
+                calls.load(Ordering::Relaxed),
+                want,
+                "marked={marked} trailing={trailing}: the hook is asked between fires, and \
+                 once more after the last on a step planned with a trailing refill"
+            );
+            assert_eq!(replay.replay_refill_shortfalls("relay"), Some(0));
+            assert_eq!(
+                replay
+                    .nodes
+                    .get("relay")
+                    .map(|n| n.fire_count.load(Ordering::Relaxed)),
+                Some(3),
+                "marked={marked} trailing={trailing}: every planned fire ran"
+            );
+        }
     }
 
     fn add_external(scheduler: &mut Scheduler, id: &str, fires: &Arc<AtomicU64>) {
@@ -12309,5 +12533,218 @@ mod align_driver_tests {
             "a@0 is provably in no set: UNMATCHABLE, not PASSED-OVER. A \
              descent-first matcher reaches the same set counting (0, 1)"
         );
+    }
+}
+
+#[cfg(test)]
+mod next_fire_split_tests {
+    use super::*;
+    use crate::scheduler::block::BlockHold;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    const PERIOD_NS: u64 = 1_000_000;
+
+    fn scheduler() -> Scheduler {
+        Scheduler::with_virtual_clock(Arc::new(crate::clock::VirtualClock::new()))
+    }
+
+    fn add(s: &mut Scheduler, id: &str, policy: TriggerPolicy) {
+        s.add_node(NodeConfig {
+            id: id.to_string(),
+            policy,
+            callback: Box::new(|| {}),
+        })
+        .unwrap();
+    }
+
+    fn period() -> TriggerPolicy {
+        TriggerPolicy::Period {
+            interval: Duration::from_nanos(PERIOD_NS),
+            max_catchup: None,
+        }
+    }
+
+    #[test]
+    fn a_period_deadline_still_ahead_is_the_exact_half() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        let next = s.next_fire_split(0);
+        assert_eq!(next.deadline_ns, Some(PERIOD_NS));
+        assert_eq!(next.poll_ns, None);
+        let next = s.next_fire_split(400_000);
+        assert_eq!(
+            next.deadline_ns,
+            Some(600_000),
+            "the time left, not a floor"
+        );
+        assert_eq!(s.ns_until_next_fire(400_000), Some(600_000));
+    }
+
+    #[test]
+    fn a_period_node_past_its_deadline_is_the_poll_half() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        let next = s.next_fire_split(PERIOD_NS);
+        assert_eq!(
+            next.deadline_ns, None,
+            "a deadline reached is not still ahead"
+        );
+        assert_eq!(next.poll_ns, Some(0));
+        let next = s.next_fire_split(PERIOD_NS + 1);
+        assert_eq!((next.deadline_ns, next.poll_ns), (None, Some(0)));
+    }
+
+    #[test]
+    fn a_hold_that_moves_a_period_deadline_makes_it_a_poll() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        let release_at = Arc::new(AtomicU64::new(5_000_000));
+        let wake_only = Arc::new(AtomicBool::new(false));
+        let (at, wake) = (Arc::clone(&release_at), Arc::clone(&wake_only));
+        s.set_block_hold("tick", move || {
+            if wake.load(Ordering::Relaxed) {
+                BlockHold::UntilWake
+            } else {
+                BlockHold::Until(at.load(Ordering::Relaxed))
+            }
+        })
+        .unwrap();
+        // The release (5 ms) is later than the deadline (1 ms): it is what the
+        // node waits for, and it is a poll.
+        let next = s.next_fire_split(0);
+        assert_eq!((next.deadline_ns, next.poll_ns), (None, Some(5_000_000)));
+        // A release earlier than the deadline moves nothing: still exact.
+        release_at.store(500_000, Ordering::Relaxed);
+        let next = s.next_fire_split(0);
+        assert_eq!((next.deadline_ns, next.poll_ns), (Some(PERIOD_NS), None));
+        // Held until a wake: no deadline at all.
+        wake_only.store(true, Ordering::Relaxed);
+        assert_eq!(s.next_fire_split(0), NextFire::default());
+        assert_eq!(s.ns_until_next_fire(0), None);
+    }
+
+    /// `throttle_ms` and `period_ms` are exclusive at the macro, but the
+    /// scheduler API takes a throttle on any node: a throttle window that ends
+    /// after a Period deadline is what the node waits for, and it is a poll.
+    #[test]
+    fn a_throttle_that_moves_a_period_deadline_makes_it_a_poll() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        s.set_throttle_ns("tick", 5_000_000).unwrap();
+        s.step(Duration::from_nanos(PERIOD_NS));
+        assert_eq!(s.node_handle("tick").unwrap().fire_count(), 1);
+        // Fired at 1 ms; its next deadline is 2 ms, the throttle ends at 6 ms.
+        let next = s.next_fire_split(1_200_000);
+        assert_eq!((next.deadline_ns, next.poll_ns), (None, Some(4_800_000)));
+    }
+
+    /// A throttle window that ends before the Period deadline, or exactly at
+    /// it, moves nothing: the deadline stays the exact half.
+    #[test]
+    fn a_throttle_that_ends_by_the_deadline_leaves_it_exact() {
+        for (throttle_ns, now_ns, left_ns) in [
+            (300_000, 1_100_000, 900_000),
+            (PERIOD_NS, 1_200_000, 800_000),
+        ] {
+            let mut s = scheduler();
+            add(&mut s, "tick", period());
+            s.set_throttle_ns("tick", throttle_ns).unwrap();
+            s.step(Duration::from_nanos(PERIOD_NS));
+            let next = s.next_fire_split(now_ns);
+            assert_eq!(
+                (next.deadline_ns, next.poll_ns),
+                (Some(left_ns), None),
+                "throttle {throttle_ns} ns at {now_ns} ns"
+            );
+        }
+    }
+
+    /// A `block` release at exactly the Period deadline moves nothing either.
+    #[test]
+    fn a_hold_released_at_the_deadline_leaves_it_exact() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        s.set_block_hold("tick", || BlockHold::Until(PERIOD_NS))
+            .unwrap();
+        let next = s.next_fire_split(250_000);
+        assert_eq!((next.deadline_ns, next.poll_ns), (Some(750_000), None));
+    }
+
+    #[test]
+    fn a_due_data_node_beside_a_period_deadline_reports_both_halves() {
+        let mut s = scheduler();
+        add(&mut s, "tick", period());
+        add(&mut s, "sink", TriggerPolicy::Data);
+        s.signal_data("sink").unwrap();
+        let next = s.next_fire_split(250_000);
+        assert_eq!(next.deadline_ns, Some(750_000));
+        assert_eq!(next.poll_ns, Some(0), "a due node is a poll");
+        assert_eq!(next.soonest(), Some(0));
+        assert_eq!(s.ns_until_next_fire(250_000), Some(0));
+    }
+
+    /// A Data or Sync node owes a fire only while it holds a backlog: idle, it
+    /// adds nothing to either half; with its backlog flag set it is due now.
+    #[test]
+    fn a_data_or_sync_node_is_due_only_while_it_holds_a_backlog() {
+        let mut s = scheduler();
+        add(&mut s, "sink", TriggerPolicy::Data);
+        add(
+            &mut s,
+            "join",
+            TriggerPolicy::Sync {
+                inputs: vec!["/a".to_string(), "/b".to_string()],
+                window: None,
+            },
+        );
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire::default(),
+            "idle: nothing owed"
+        );
+        s.nodes.get_mut("join").expect("join").sync_backlog_hint = true;
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire {
+                deadline_ns: None,
+                poll_ns: Some(0)
+            },
+            "a carried complete set is due now"
+        );
+        s.nodes.get_mut("join").expect("join").sync_backlog_hint = false;
+        s.nodes.get_mut("sink").expect("sink").data_backlog_hint = true;
+        assert_eq!(
+            s.next_fire_split(0),
+            NextFire {
+                deadline_ns: None,
+                poll_ns: Some(0)
+            },
+            "a frame held at the carry cap is due now"
+        );
+    }
+
+    #[test]
+    fn soonest_is_the_smaller_half_or_either_alone() {
+        let both = NextFire {
+            deadline_ns: Some(7),
+            poll_ns: Some(3),
+        };
+        assert_eq!(both.soonest(), Some(3));
+        let both = NextFire {
+            deadline_ns: Some(2),
+            poll_ns: Some(3),
+        };
+        assert_eq!(both.soonest(), Some(2));
+        let only = NextFire {
+            deadline_ns: Some(9),
+            poll_ns: None,
+        };
+        assert_eq!(only.soonest(), Some(9));
+        let only = NextFire {
+            deadline_ns: None,
+            poll_ns: Some(4),
+        };
+        assert_eq!(only.soonest(), Some(4));
+        assert_eq!(NextFire::default().soonest(), None);
     }
 }

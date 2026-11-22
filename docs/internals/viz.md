@@ -764,6 +764,19 @@ the build boundary from §1, with controls that fail loudly if a rule stops prob
 - Cached surfaces (attribution, provenance) are polled to a deadline, never
   read once. An attribution poll includes a `discover`: `list` and `status`
   never refresh the snapshot.
+- Time-driven verdicts in `vizd_e2e_test.rs` are reached through the daemon's
+  `test-helpers` clock seams, never a sleep: `skew_monitor_clock_for_test`
+  crosses a monitor row's settle window, `age_tap_observation_for_test` ages a
+  quiet tap to just short of its streaming window, and
+  `age_provenance_snapshot_for_test` ages the provenance snapshot past its TTL.
+  The settle skew is a hand-written amount (an amount read from the shipped
+  constant grows with it and lets a raised window pass), pinned at compile time
+  to the shipped settle window. The tap age is a hand-written amount short of the
+  streaming window; a raised streaming window only makes those arms wait longer,
+  so the window itself is pinned at compile time at its shipped 5 s, as is the
+  TTL at 3 s. The stopped-publisher arm stays on the real clock: it is the
+  end-to-end catch for a live tap read idle on time watched rather than time
+  since its last frame.
 
 ## 5. Test map
 

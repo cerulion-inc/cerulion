@@ -982,7 +982,9 @@ fn gateway_ingress_reinjects_into_local_shm() {
     // The run's own ingress is NOT a network mirror: a topic observer on B reads
     // it from local SHM directly (automatic or local scope), and a local-scope
     // observer may hold its source lease while the gateway re-injects.
-    assert!(!b_observer.is_network_mirror(&topic).expect("marker check"));
+    assert!(!b_observer
+        .is_network_mirror(&topic, cerulion_core::transport::TeardownWait::Bounded)
+        .expect("marker check"));
     let _b_lease = b_observer
         .acquire_local_topic_lease(&topic)
         .expect("a declared ingress topic belongs to the run's local set");

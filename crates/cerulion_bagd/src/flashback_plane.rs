@@ -2554,6 +2554,14 @@ pub(crate) enum AnchorReport {
         /// between them is missing because the bag is missing all of it. That
         /// state is stated by `achieved_from_ns: null` rather than by inventing a
         /// span for it.
+        ///
+        /// REPORT ONLY, and NOT a frame-coverage signal. Both instants are the
+        /// recorder's own drain readings (the anchor's first drained record and
+        /// the first held batch), not the run's step clock, so frames the run
+        /// published before the taps attached are invisible here: a capture
+        /// missing them reads about 0. The verdict does not read this field;
+        /// it checks every frame the kept trace reads against the frames held
+        /// (`cerulion_core::flashback::resim::first_frame_gap`).
         frames_missing_after_anchor_ms: u64,
         /// The SET, one entry per rank, keyed by rank.
         ///
@@ -3244,7 +3252,9 @@ mod tests {
             serde_json::json!(
                 "this rank retained no checkpoint: it published no state ring, its plane was \
                  refused at arm time, or it had not reached its first anchor cadence when the \
-                 capture was triggered"
+                 capture was triggered. A capture of several worker ranks does not resume from \
+                 their checkpoints, since per-rank resume is not supported: \
+                 record the run from its first step with `cerulion graph run --record`"
             )
         );
 
@@ -5073,7 +5083,7 @@ mod tests {
         // …and the kept records are unchanged: the recovery is a lookup, never a
         // widening of what the capture carries.
         assert_eq!(trimmed.records.len(), 2);
-        assert_eq!(trimmed.first_recorded_step, Some(4));
+        assert_eq!(trimmed.per_rank[&0].first_recorded_step, Some(4));
     }
 
     /// THE CAPTURE-END CUT, through the selection the close calls.

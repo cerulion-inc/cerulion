@@ -2,8 +2,9 @@
 //! The read-identity oracle's own checks, on every platform: the judge
 //! against hand-built logs (its mutants included), the record reader's
 //! rules, the fire-window check the slow-node arms run on every leg, and the
-//! harness workspace build (every generated node source compiles). Nothing
-//! here loads a node or runs a graph; the live and resim arms are in
+//! harness workspace build (every node source compiles, the template node as
+//! `node create` wrote it among them, and `node_build` places each cdylib).
+//! Nothing here loads a node or runs a graph; the live and resim arms are in
 //! `read_identity_box_test`.
 
 mod det_scaffold;
@@ -300,14 +301,66 @@ fn the_judge_refuses_a_stream_under_its_floor() {
     );
 }
 
-/// Every node source the harness generates builds, and every fixture's graph
-/// serializes.
+/// Every node type in the harness workspace builds in this run, the template
+/// node as `node create` wrote it included, and every fixture's graph
+/// serializes. The types are read from the workspace's `nodes/` directory,
+/// and a cdylib counts only if it is no older than its node's `src/lib.rs`,
+/// which this run wrote: a cdylib an earlier run left in the shared target
+/// directory does not.
 #[test]
 fn the_harness_workspace_builds_every_node_type() {
     let ws = &read_identity::workspace();
-    for (name, lib) in read_identity::built_cdylibs(ws) {
-        assert!(lib.exists(), "{name}: {} built", lib.display());
+    let nodes_dir = ws.root.join("nodes");
+    let mut names: Vec<String> = std::fs::read_dir(&nodes_dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", nodes_dir.display()))
+        .map(|entry| entry.expect("a nodes/ entry").path())
+        .filter(|dir| dir.join("Cargo.toml").is_file())
+        .map(|dir| {
+            dir.file_name()
+                .and_then(|n| n.to_str())
+                .expect("a UTF-8 node name")
+                .to_string()
+        })
+        .collect();
+    names.sort();
+    assert!(
+        names.iter().any(|n| n == read_identity::TEMPLATE_NODE),
+        "the template node is in the workspace: {names:?}"
+    );
+    let modified = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|e| panic!("mtime of {}: {e}", path.display()))
+    };
+    for name in &names {
+        let source = nodes_dir.join(name).join("src").join("lib.rs");
+        let lib = ws
+            .target_dir
+            .join("debug")
+            .join(mp_support::dylib_file(name));
+        assert!(lib.exists(), "{name}: no cdylib at {}", lib.display());
+        assert!(
+            modified(&lib) >= modified(&source),
+            "{name}: {} is older than {}, so this run did not build it",
+            lib.display(),
+            source.display()
+        );
     }
+    let template = nodes_dir
+        .join(read_identity::TEMPLATE_NODE)
+        .join("src")
+        .join("lib.rs");
+    let source = std::fs::read_to_string(&template)
+        .unwrap_or_else(|e| panic!("read {}: {e}", template.display()));
+    assert!(
+        source.contains("use native_ros2_messages::std_msgs::Int32;"),
+        "the template node imports its std_msgs/Int32 output type\n{source}"
+    );
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    assert!(
+        lines.windows(2).any(|w| w == ["#[output]", "out: Int32,"]),
+        "the template node declares `out: Int32` as an output\n{source}"
+    );
     for f in read_identity::Fixture::ALL {
         let (graph, prefix) = read_identity::unique_names(f.name());
         let config = f.graph_config(&graph, &prefix);

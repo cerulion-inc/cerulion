@@ -91,7 +91,7 @@ tokio = { version = "1", default-features = false, features = [
 ] }
 # OS entropy is used only for provisioning MAC and recovery secrets, and for
 # the rcpd token the daemon writes when its token file is absent.
-getrandom = "0.2"
+getrandom = "0.4"
 # Safe file opens use these platform constants without calling unsafe APIs.
 libc = "0.2"
 # The rcp plane is an MCP streamable HTTP client of the robot's local
@@ -119,10 +119,10 @@ hex = "0.4"
 # SOLE device_key→account binding the accept gate trusts, so it MUST carry the
 # same integrity guarantee as the trust store: it is authenticated with the SAME
 # firmware secure-storage MAC key, mirroring `cerulion_pairing`'s store framing.
-# These exact versions are already in the workspace lock (via `cerulion_pairing`)
-# — no new crate versions enter the tree.
-hmac = "0.12"
-sha2 = "0.10"
+# These are the majors `cerulion_pairing` pins, so the two crates share one hmac
+# and one sha2 in the workspace lock.
+hmac = "0.13"
+sha2 = "0.11"
 subtle = "2"
 # The strong-path `pair` verb carries a `PairingPresentation` over the wire. The
 # pairing crate's cert/grant/signature types are BYTE-oriented serde (an ed25519
@@ -136,6 +136,10 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 # the --network kill-switch). Already a workspace citizen (cerud/bagd). The
 # `env` feature powers the CERULION_STATE_ROOT / CERULION_RELAY_URL fallbacks.
 clap = { version = "4", features = ["derive", "env"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Native process handles and readiness checks for caller-owned session cleanup.
+rustix = { version = "1", features = ["process", "event"] }
 
 [dev-dependencies]
 # Genuine loopback relay tests only; server features never enter normal builds.

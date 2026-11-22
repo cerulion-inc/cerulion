@@ -1,15 +1,15 @@
 # cerulion_cli_engine
 
-Clap calls here; tests never spawn. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) through check/write: UNIX flock with wsd, reentrant; wait warns once; no-op elsewhere.
+Clap delegates; tests never spawn. Writers hold `workspace_lock::WorkspaceLock` (`<root>/.cerulion/workspace.lock`) through check/write: reentrant UNIX flock with wsd; others wait (one warn); no-op elsewhere.
 Reads: `acquire_read` creates nothing, refuses same-thread re-entry; all
 refuse symlinked `.cerulion`. Only `acquire_and_track_gitignore` edits
-tracked `.gitignore` when creating `.cerulion/`; migrate polls with
-`acquire_interruptibly(root, interrupted)` returning `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
+tracked `.gitignore` when creating `.cerulion/`; polls use
+`acquire_interruptibly(root, interrupted)` -> `AcquireError` (no `From`); per-root; `--workspace` selects COLCON.
 Ports: `graph_cmd::stage_declared_node`.
 ## Rules
 - Engine enforces invariants; CLI checks are UX.
 - Sessions: literal argv; network refusal before lookup/spawn.
-- Catalogs bind account/key; resolve collisions. Paired skips implicit LAN; Open/locators/scan keep it; diagnose broken pairs. Refresh<=2s, save<=1s; enroll<=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; warn on failed registration.
+- Catalogs bind account/key; resolve collisions. Paired skips implicit LAN; Open/locators/scan keep it; diagnose broken pairs. Refresh<=2s, save<=1s; enroll/renew<=2s once/process, existing keys, no browser. Cache debug. Unread catalogs prove no absence; unpaired account keys need login; warn on failed registration.
 - Scope precedes ports: off/inert excludes all, strict non-egress. Drop after ports/workers; recorder I/O absolute; output/status keep spelling.
 - Paired graph producers need serving_authority; canonical ingress before GO retains pinned demands; refuse schema/QoS/writer mismatches.
 - Observers pin source/hash/channel; busy=unknown. Loss re-demands, graph rechecks identity. Epoch errors retain trust and route latches on reconnect.
@@ -19,21 +19,20 @@ Ports: `graph_cmd::stage_declared_node`.
 - Android libs: <target>/<triple>/<profile>, then <target>/<profile>; viz refuses before connect/spawn; account TLS: system roots, no JVM.
 - Ports/triggers: only `node_metadata::parse_node_metadata`; INFO_END before INFO_START is fatal.
 - Pinned hashes: run `pinned_hashes`, copy into `topic_cmd.rs`; never hand-compute.
-- Completions: no hangs/spawns/network (run_bounded, completions_test).
+- Completions: no hangs/spawns/network (`run_bounded`, `completions_test`).
 - Size ports before acceptance; unverifiable: `CliError::SchemaUnchecked`.
   Un-carryable duplicate bearers refuse.
 - Rewrite `node modify` with `syn` spans, never `str::replace`. Raw INFO has PORT_SCHEMAS names and typed wire facts.
 - iceoryx2 namespace prefixes must be prefix-free: fixed-length hashes and
   `Config::global_config().clone()`, never `Config::default()`.
 - Interrupted waits check running; retry<=MAX_CONSECUTIVE_WAIT_ERRORS, never sleep-retry errors. Foreign SIGINT: child_signals (exec inherits ignore/blocks), self_exe excepted.
-- `templates.rs` changes regenerate its root fixture:
+- For `templates.rs` changes, regenerate at repo root:
   `cargo run -p cerulion_cli_engine --example dump_raw_ffi_emit > crates/test_fixtures/test_node_raw_ffi_template_cdylib/src/lib.rs`.
 ## Dependencies
-Deps follow binary: checkout/exact registry pins.
-Checks: cli dossier §11.
+Binary deps: checkout/exact registry pins; checks: cli dossier §11.
 ## Tests: lib env `test_env::env_lock`
 - `ci_test_coverage_test`/`ci_doc_pin_walk_test`: no CI step gated on an
-  ungrounded/unmarked (`selection:`) selection, no `# doc-pin:`-less doc
+  ungrounded or unmarked (`selection:`) selection, no `# doc-pin:`-less doc
   root; no bash-only construct in a `container:` run step lacking `shell: bash`.
 - Serial: `replay_engine_test`, `graph_profile_iox2_test`, `topic_observer_iox2_test`,
   `topic_type_iox2_test` (last 3 share namespace), `account_robot_access_e2e_test` (env);

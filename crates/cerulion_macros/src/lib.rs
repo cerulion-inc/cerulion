@@ -170,7 +170,8 @@ fn with_root_diagnostic(
 ///    attribute for an ATTRIBUTE macro (only a `#[proc_macro_derive(..,
 ///    attributes(cerulion))]` does that, and a node goes through no derive),
 ///    so each one reaches rustc as `cannot find attribute 'cerulion' in this
-///    scope`. Pinned by `tests/ui/node_escape_on_a_failing_node_does_not_cascade.rs`.
+///    scope`. Pinned by
+///    `crates/test_fixtures/node_macro_ui/tests/ui/node_escape_on_a_failing_node_does_not_cascade.rs`.
 /// 2. **An explicit `#[derive(CerulionState)]`.** The success path drops it
 ///    (`codegen::strip_state_derive`, beside the `compile_error!` that names
 ///    the real fix), and the error arms must too — otherwise a node that BOTH fails
@@ -183,10 +184,10 @@ fn with_root_diagnostic(
 ///    `compile_error!`: this path exists to surface the REAL error, and the
 ///    redundant derive is still reported in full on the next compile, once
 ///    the validation failure is fixed and the success path runs. Pinned by
-///    `tests/ui/node_state_derive_on_a_failing_node_does_not_cascade.rs`.
+///    `crates/test_fixtures/node_macro_ui/tests/ui/node_state_derive_on_a_failing_node_does_not_cascade.rs`.
 ///
 /// Deliberately scoped to those two. `#[input]`/`#[output]` cascade the same
-/// way (`tests/ui/input_unknown_attribute.stderr` records
+/// way (`crates/test_fixtures/node_macro_ui/tests/ui/input_unknown_attribute.stderr` records
 /// it), but that snapshot is a rustc RENDERING and re-blessing the whole
 /// `tests/ui/` set to tidy that cascade is exactly the toolchain-drift
 /// risk the `#[ignore]`d group exists for. Closing the two above
