@@ -6,12 +6,12 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
 - Linux: unreaped leader pins SID; capture identity before SID. Use pidfds.
   Fallback rechecks SID/birth nonatomically. No containment.
   Probe waits/readiness/signals before spawn.
-- Catalog/schema/demand/acts gate producer scope/origin before ports (acts: e-stop, args, then scope); taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
+- Catalog/schema/demand/acts gate producer scope/origin before ports; acts order: e-stop, args, scope. Taps/mirrors keep leases; privacy wins over caps; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
   final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
-- `PairingAuthorizer` classifies every accept; extend authorizer.rs for each new
-  verb/capability. Unknown verbs are DENIED; `authorizer_matrix_test.rs` pins cells.
+- `PairingAuthorizer` gates accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
+  Shell/exec: owner+policy; no file ON/invalid OFF; no handle: deny; immutable hard-off wins.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS

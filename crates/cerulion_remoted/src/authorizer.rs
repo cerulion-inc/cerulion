@@ -21,6 +21,7 @@
 //! | `restart` / `deploy` | Normal | Role ≥ `OPERATOR` (a lifecycle mutation; no fine-grained cap models it, so the role IS the gate). |
 //! | `teleop` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR` — actuation. |
 //! | `cloud-access` | Normal | Role `OWNER`; the handler also requires a non-cloud owner row. |
+//! | `shell` / `exec` / `remote-shell-policy` | Normal | Owner tier. Sessions additionally require the effective shell policy. |
 //! | `clear-estop` | **NonCloud** | Role `OPERATOR` or higher, and never a row whose principal is cloud, whatever the allow-from-cloud switch says. |
 //! | `estop-status` | Normal | `CAP_OBSERVE` and role `VIEWER` or higher: read the e-stop latch. |
 //! | `topic-publish` / `service-call` | Normal | `CAP_TELEOP` AND role ≥ `OPERATOR`: act on the robot's shared memory (`act_verbs`). |
@@ -59,7 +60,10 @@ use cerulion_core::transport::demand_authorizer::{
 use cerulion_pairing::format::{PrincipalKind, Role, Scope};
 use cerulion_pairing::verify::TrustStore;
 
+use std::sync::Arc;
+
 use crate::device_index::DeviceAccountIndex;
+use crate::shell_policy::ShellPolicy;
 use crate::trust::{KeyAccess, SharedTrust};
 use crate::verbs;
 
@@ -115,6 +119,12 @@ fn classify_verb(verb: &str) -> Option<VerbClass> {
             required_caps: 0,
             max_role: Role::OPERATOR,
         }),
+        verbs::SHELL | verbs::EXEC | verbs::REMOTE_SHELL_POLICY => {
+            VerbClass::Normal(AccessRequirement {
+                required_caps: 0,
+                max_role: Role::OWNER,
+            })
+        }
         verbs::TELEOP => VerbClass::Normal(AccessRequirement {
             required_caps: Scope::CAP_TELEOP,
             max_role: Role::OPERATOR,
@@ -184,6 +194,7 @@ pub enum AcceptDecision {
 #[derive(Debug)]
 pub struct PairingAuthorizer {
     shared: SharedTrust,
+    shell_policy: Option<Arc<ShellPolicy>>,
 }
 
 impl PairingAuthorizer {
@@ -199,12 +210,34 @@ impl PairingAuthorizer {
     /// Build the authorizer over an existing LIVE [`SharedTrust`] handle — the
     /// daemon path, so the accept gate reads the state the pairing verbs write.
     pub fn from_shared(shared: SharedTrust) -> Self {
-        PairingAuthorizer { shared }
+        PairingAuthorizer {
+            shared,
+            shell_policy: None,
+        }
     }
 
-    /// Authorize one `(caller, verb)`. The args-free core of the `Authorizer`
-    /// trait impl (the policy is verb-based; there is no args-based policy).
+    /// Attach the same durable policy handle used by the owner setting verb.
+    pub fn with_shell_policy(mut self, policy: Arc<ShellPolicy>) -> Self {
+        self.shell_policy = Some(policy);
+        self
+    }
+
+    /// Authorize one `(caller, verb)` against identity, scope and live policy.
     pub fn authorize_verb(&self, caller: &CallerIdentity, verb: &str) -> AuthzDecision {
+        let decision = self.authorize_identity_scope(caller, verb);
+        if matches!(decision, AuthzDecision::Allow)
+            && matches!(verb, verbs::SHELL | verbs::EXEC)
+            && !self
+                .shell_policy
+                .as_ref()
+                .is_some_and(|policy| policy.allowed())
+        {
+            return AuthzDecision::deny("remote shell is disabled by the robot policy".to_string());
+        }
+        decision
+    }
+
+    fn authorize_identity_scope(&self, caller: &CallerIdentity, verb: &str) -> AuthzDecision {
         // 1. Classify the verb. Unclassified → deny-by-default.
         let class = match classify_verb(verb) {
             Some(c) => c,
