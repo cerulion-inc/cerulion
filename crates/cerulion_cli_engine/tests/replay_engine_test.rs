@@ -29285,7 +29285,7 @@ fn a_format_ten_bag_with_no_part_for_a_stopped_node_stands_it_down_by_name() {
         "fifo_skipped_10.mcap",
         &rec,
         &[(LS_SINK, 1, vec![skip.to_vec()])],
-        ri_free_run_recorder_json(),
+        ri_recorder_json_at(10),
     );
     let (outcome, _) = ri_replay(&bag, make, replay_engine::ReplayPurpose::Resim);
     let outcome = outcome.expect("the resumed neutral resim runs");

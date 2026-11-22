@@ -2437,6 +2437,9 @@ pub fn recorder_stream_needs_v4() -> bool {
 /// is the (b) arm, and it holds independently of the mode — a LOCKSTEP bag with
 /// such a stream would stamp 4 too. Every term above those arms stamps 5 or
 /// more, so the claim survives each of them.
+// One argument per format term, in the order the formats arrived: each term
+// is one independent fact about what the recorder wrote.
+#[allow(clippy::too_many_arguments)]
 pub fn stamp_trace_format(
     coordination: CoordinationMode,
     stream_needs_v4: bool,
