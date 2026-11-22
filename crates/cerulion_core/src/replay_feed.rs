@@ -506,7 +506,11 @@ pub struct BagFedBlockEdge {
 /// * The CONSUMER end: a build that holds `consumer_node`, and no in-graph
 ///   producer of `topic`, accepts the `block` input that
 ///   [`GraphTopology::validate`](crate::graph::topology::GraphTopology::validate)
-///   refuses as having no producer to defer.
+///   refuses as having no producer to defer, and installs no backpressure
+///   probe on it: no block probe, since no credit word counts it, and no
+///   `drop_oldest` detector, whose eviction events and counts the live
+///   `block` input never raised. The replay does not serve the block probe's
+///   own at-depth event either: the recording does not hold when it fired.
 /// * The PRODUCER end: a build that holds one of `producer_nodes`, and not the
 ///   consumer, writes `topic` with its consumer in another pass.
 ///

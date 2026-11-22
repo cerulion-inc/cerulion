@@ -55,9 +55,9 @@
 //! `depth`, and the once-per-regime `warn!` names the consumer edge.
 //!
 //! Per-test isolated SHM roots + pid/tag-scoped credit namespaces. `#[serial]`
-//! on 53 of the 54 arms: six are `#[traced_test]`, which installs a
+//! on 54 of the 55 arms: six are `#[traced_test]`, which installs a
 //! PROCESS-GLOBAL subscriber, and a sibling running beside one would both
-//! pollute its capture and race the install. The 54th,
+//! pollute its capture and race the install. The 55th,
 //! `the_depth_max_consumer_tracks_the_topology_ceiling`, is a pure constant
 //! drift guard that touches no transport and needs no turn.
 
@@ -4866,4 +4866,304 @@ fn two_builds_with_two_bad_fed_entries_refuse_with_the_same_text() {
          any of its producers (producer)"
     );
     assert_eq!(texts[0], texts[1]);
+}
+
+/// What a consumer of the overfill arms keeps: every value it read, and the
+/// policy and `dropped` count of every `BackpressureEvent` its input raised.
+#[derive(Default)]
+struct Observed {
+    seen: Vec<u64>,
+    events: Vec<(String, u64)>,
+}
+
+/// A host-driven `block` consumer, depth 2. An `external` node's every input
+/// is a latest-value read (no trigger), drained to its newest frame at the
+/// tick.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct ObservingLatestConsumer {
+    #[input(backpressure = block, depth = 2)]
+    inp: Vector3,
+    #[cerulion(reconstruct)]
+    observed: Arc<Mutex<Observed>>,
+}
+
+#[cerulion_node_impl]
+impl ObservingLatestConsumer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let v = self.inp.x;
+        if let Ok(mut o) = self.observed.lock() {
+            o.seen.push(v as u64);
+        }
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_pressure(&mut self, event: BackpressureEvent) {
+        if let Ok(mut o) = self.observed.lock() {
+            o.events
+                .push((format!("{:?}", event.policy), event.dropped));
+        }
+    }
+
+    fn external_source(&mut self) -> ExternalSource {
+        ExternalSource::HostDriven
+    }
+}
+
+/// A data-triggered `block` consumer, depth 2: its one input is its trigger,
+/// read one frame per fire in arrival order (`consume = fifo`, the default).
+#[cerulion_node]
+#[derive(Default)]
+struct ObservingFifoConsumer {
+    #[input(trigger, backpressure = block, depth = 2)]
+    inp: Vector3,
+    #[cerulion(reconstruct)]
+    observed: Arc<Mutex<Observed>>,
+}
+
+#[cerulion_node_impl]
+impl ObservingFifoConsumer {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        let v = self.inp.x;
+        if let Ok(mut o) = self.observed.lock() {
+            o.seen.push(v as u64);
+        }
+        Ok(())
+    }
+
+    #[on_event(input = "inp")]
+    fn on_pressure(&mut self, event: BackpressureEvent) {
+        if let Ok(mut o) = self.observed.lock() {
+            o.events
+                .push((format!("{:?}", event.policy), event.dropped));
+        }
+    }
+}
+
+/// Which overfill consumer an arm builds.
+#[derive(Clone, Copy)]
+enum Reader {
+    /// [`ObservingLatestConsumer`]: a non-trigger, latest-value input.
+    Latest,
+    /// [`ObservingFifoConsumer`]: a trigger input, one fire per frame.
+    Fifo,
+}
+
+/// What one overfill run observed: the consumer's reads and events, its
+/// `drop_oldest` count, and its staged read outcomes as
+/// `(step, input index, kind, served sequence, popped)`, the producer token
+/// left out (it names a publisher id each run mints afresh).
+struct Overfill {
+    observed: Observed,
+    drop_oldest: u64,
+    staged: Vec<(u64, u16, String, u64, u32)>,
+}
+
+/// Overfill a depth-2 consumer input over real iceoryx2: the producer
+/// publishes frame 1, the consumer reads (its first read sets the eviction
+/// baseline), the producer publishes frames 2 to 6, and the consumer reads
+/// again. Its depth-2 queue keeps frames 5 and 6, so frames 2, 3 and 4 are
+/// evicted. The producer holds no credit binding, so nothing defers it;
+/// `bindings` are the consumer's.
+fn overfill(
+    prefix: &str,
+    reader: Reader,
+    input: InputDef,
+    wiring: &ReplayWiring,
+    bindings: &[CreditBinding],
+) -> Overfill {
+    let ix = cerulion_core::testing::iceoryx_test_config();
+    let clock_p = Arc::new(VirtualClock::new());
+    let (_mgr_p, mut rt_p) = producer_ctx(prefix, &ix, &format!("{prefix}_p"), &clock_p, &[]);
+    let observed = Arc::new(Mutex::new(Observed::default()));
+    let clock_c = Arc::new(VirtualClock::new());
+    let mgr_c = manager(&format!("{prefix}_c"), ix, Arc::clone(&clock_c));
+    let cfg = config_of(
+        prefix,
+        "consumer_ctx",
+        vec![node("consumer", vec![input], vec![])],
+    );
+    let mut fac: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
+    let entry: Box<dyn NodeEntry> = match reader {
+        Reader::Latest => Box::new(ObservingLatestConsumerEntry::with_state(
+            ObservingLatestConsumer {
+                observed: Arc::clone(&observed),
+                ..Default::default()
+            },
+        )),
+        Reader::Fifo => Box::new(ObservingFifoConsumerEntry::with_state(
+            ObservingFifoConsumer {
+                observed: Arc::clone(&observed),
+                ..Default::default()
+            },
+        )),
+    };
+    fac.insert("consumer".to_string(), entry);
+    let mut rt_c = match GraphRuntime::build_for_replay(
+        cfg,
+        fac,
+        &mgr_c,
+        Arc::clone(&clock_c),
+        None,
+        CrossProcessWiring::with_credit(None, bindings),
+        wiring,
+    ) {
+        Ok(rt) => rt,
+        Err(e) => panic!("the consumer builds for the replay: {e}"),
+    };
+    rt_c.enable_read_outcome_memory_sink();
+    let mut staged = Vec::new();
+    let mut read = |rt: &mut GraphRuntime| {
+        if matches!(reader, Reader::Latest) {
+            rt.trigger_external("consumer").expect("trigger");
+        }
+        rt.step(Duration::from_millis(PERIOD_MS));
+        staged.extend(rt.take_read_outcomes().into_iter().filter_map(|r| {
+            (r.node_id == "consumer").then(|| {
+                (
+                    r.step,
+                    r.input_idx,
+                    format!("{:?}", r.outcome.kind),
+                    r.outcome.served_seq,
+                    r.outcome.popped,
+                )
+            })
+        }));
+    };
+    step_free_run(&mut rt_p, &clock_p, 0);
+    read(&mut rt_c);
+    for i in 1..6 {
+        step_free_run(&mut rt_p, &clock_p, i);
+    }
+    read(&mut rt_c);
+    let drop_oldest = rt_c
+        .node_handle("consumer")
+        .expect("the consumer's handle")
+        .backpressure_drop_oldest_count("inp");
+    let observed = std::mem::take(&mut *observed.lock().expect("observed"));
+    rt_p.shutdown();
+    rt_c.shutdown();
+    Overfill {
+        observed,
+        drop_oldest,
+        staged,
+    }
+}
+
+/// The input of the overfill arms, with the graph's `backpressure:` key
+/// `policy` over the node's `block` declaration, and `block_timeout_ms`.
+fn overfill_input(
+    policy: Option<cerulion_core::graph::config::InputBackpressure>,
+    block_timeout_ms: Option<u64>,
+) -> InputDef {
+    InputDef {
+        backpressure: policy,
+        block_timeout_ms,
+        ..topic_in("inp")
+    }
+}
+
+/// The consumer end of a fed edge gets no backpressure probe, on a
+/// latest-value input and on a trigger input alike. Overfilled past its
+/// depth, the fed input raises no `BackpressureEvent` and counts no
+/// eviction, and reads the frames a depth-2 queue keeps: the newest on each
+/// latest-value drain, one per fire on the trigger.
+///
+/// Two twins make the fed run's numbers mean something:
+///
+/// * the LIVE shape, the same `block` input bound to a mapped credit word,
+///   carries the block probe a split edge carries live. It reads the same
+///   frames and stages the same read outcomes, so taking the probe away
+///   changes no read the replay judges, in either consume mode;
+/// * the `drop_oldest` twin, the same node with the graph's
+///   `backpressure: drop_oldest` over its input, counts the three evictions
+///   by hand and raises one event for them, so the fed run's zeros are the
+///   missing probe and not an accessor that reads zero for any input.
+///
+/// A fed input that also sets `block_timeout_ms` reads, stages and counts the
+/// same as the fed one: the key has nothing to act on.
+#[test]
+#[serial]
+fn a_fed_block_input_gets_no_probe_and_its_drop_oldest_twin_counts_the_evictions() {
+    use cerulion_core::graph::config::InputBackpressure;
+    for (reader, tag, reads) in [
+        (Reader::Latest, "l", vec![1, 6]),
+        (Reader::Fifo, "f", vec![1, 5, 6]),
+    ] {
+        let wiring = fed_wiring(vec![fed_edge(TOPIC)]);
+        let fed = overfill(
+            &format!("cbfo{tag}"),
+            reader,
+            overfill_input(None, None),
+            &wiring,
+            &[],
+        );
+        assert_eq!(fed.observed.seen, reads, "{tag}: the fed input's reads");
+        assert_eq!(
+            fed.observed.events,
+            Vec::<(String, u64)>::new(),
+            "{tag}: no probe, so no BackpressureEvent"
+        );
+        assert_eq!(fed.drop_oldest, 0, "{tag}: no probe, so no eviction count");
+        assert!(!fed.staged.is_empty(), "{tag}: the reads were staged");
+
+        let timed = overfill(
+            &format!("cbfk{tag}"),
+            reader,
+            overfill_input(None, Some(1)),
+            &wiring,
+            &[],
+        );
+        assert_eq!(timed.observed.seen, reads, "{tag}: the timed input's reads");
+        assert_eq!(
+            timed.observed.events,
+            Vec::<(String, u64)>::new(),
+            "{tag}: `block_timeout_ms` raises nothing on a fed input"
+        );
+        assert_eq!(timed.drop_oldest, 0, "{tag}: and counts nothing");
+        assert_eq!(timed.staged, fed.staged, "{tag}: and changes no read");
+
+        let w = supervisor_word(&format!("fedlive{tag}"), "consumer", "inp", DEPTH as u32);
+        let bound = [binding(
+            &w.consumer_side,
+            "consumer",
+            "inp",
+            DEPTH,
+            CreditRole::Consumer,
+        )];
+        let live = overfill(
+            &format!("cbfw{tag}"),
+            reader,
+            overfill_input(None, None),
+            &ReplayWiring::default(),
+            &bound,
+        );
+        assert_eq!(live.observed.seen, reads, "{tag}: the live shape's reads");
+        assert_eq!(
+            live.staged, fed.staged,
+            "{tag}: the block probe a live split edge carries changes no staged read"
+        );
+
+        let twin = overfill(
+            &format!("cbft{tag}"),
+            reader,
+            overfill_input(Some(InputBackpressure::DropOldest), None),
+            &ReplayWiring::default(),
+            &[],
+        );
+        assert_eq!(
+            twin.observed.seen, reads,
+            "{tag}: the twin reads the same frames"
+        );
+        assert_eq!(
+            twin.drop_oldest, 3,
+            "{tag}: frames 2, 3 and 4 were evicted from the depth-2 queue"
+        );
+        assert_eq!(
+            twin.observed.events,
+            vec![("DropOldest".to_string(), 3)],
+            "{tag}: one eviction regime, one event naming the three frames"
+        );
+    }
 }

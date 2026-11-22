@@ -8572,7 +8572,17 @@ impl GraphRuntime {
                 // `block`: the outstanding mirror (each drain decrements it)
                 // plus the threshold + counters so the consumer's block
                 // event fires when its queue is at the defer line.
-                if let Some((outstanding, threshold, counters)) = sub_block_by_input.get(&key) {
+                if bag_fed_ends.feeds_consumer(&topic, &node_def.id, &input.name) {
+                    // A `block` input a replay feeds from its recording
+                    // (`BagFedBlockEdges`) gets NO probe and registers no
+                    // counter. No credit word counts it, so a block probe
+                    // would have no mirror to decrement, and the `drop_oldest`
+                    // detector below would raise eviction events and counts
+                    // on a `block` input, which live, held lossless by its
+                    // producer's credit word, raised none.
+                } else if let Some((outstanding, threshold, counters)) =
+                    sub_block_by_input.get(&key)
+                {
                     subscriber.register_block_probe(
                         outstanding.clone(),
                         *threshold,
