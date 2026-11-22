@@ -9221,7 +9221,7 @@ fn write_multi_rank_bag_impl(
             RECORD_TYPE_FIRE | RECORD_TYPE_READ_OUTCOME | RECORD_TYPE_NODE_STOP => {
                 // A kind-6 READ-OUTCOME record's
                 // `node_idx` is the CONSUMER, manifest-indexed exactly like a
-                // FIRE's — same rank stamp + same per-rank-table remap. A
+                // FIRE's: same rank stamp + same per-rank-table remap. A
                 // NODE-STOP record names the node its fire stopped, the same.
                 let id = &rec.node_ids[r.node_idx as usize];
                 if omit_from_manifests.contains(&id.as_str()) {
