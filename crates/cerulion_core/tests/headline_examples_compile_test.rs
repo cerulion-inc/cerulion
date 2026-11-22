@@ -558,7 +558,7 @@ fn macro_tick_within_ms_compiles_and_propagates_to_node_info() {
 // Compile-coverage for the four `#[on_event]`
 // handler shapes documented in `docs/user-api.md` ("Backpressure → #[on_event]
 // callbacks", Event types 1–4). The UI compile-FAIL tests
-// (`tests/ui/on_event_*`) pin the rejection cases; this pins the POSITIVE
+// (`node_macro_ui/tests/ui/on_event_*`) pin the rejection cases; this pins the POSITIVE
 // surface so a future macro change that breaks a documented handler
 // signature — including `LivelinessEvent`, the fourth event
 // type added to the input-scoped filter — surfaces here instead of

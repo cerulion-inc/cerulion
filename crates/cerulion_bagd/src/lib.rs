@@ -2764,8 +2764,9 @@ pub struct BagdConfig {
     /// (each `(name, bytes)` → one MCAP Attachment record, `media_type` inferred
     /// from the name's extension). The graph-integrated recorder passes
     /// `graph.yaml` (the raw graph source) and `env.json` (a sorted snapshot of
-    /// `std::env::vars()`) so a replayer can reconstruct the run
-    /// context. Written with `log_time = create_time = 0` (metadata, off the
+    /// the environment, read with `std::env::vars_os()`) so a replayer can
+    /// compare the run's environment with its own. Written with
+    /// `log_time = create_time = 0` (metadata, off the
     /// wall clock — a determinism requirement of the bag writer). Empty for the
     /// standalone attach-mode binary.
     pub attachments: Vec<(String, Vec<u8>)>,
@@ -9871,6 +9872,7 @@ fn judge_capture_resimmable(
     trace_rings: TraceRingCoverage,
     ranks_missing: &[u32],
     rank_space_walked: bool,
+    frame_gap: Option<cerulion_core::flashback::resim::FrameGap>,
 ) -> Result<(), cerulion_core::flashback::resim::ResimGap> {
     let (anchor_run_id, runs_at_step) = match anchor {
         flashback_plane::AnchorReport::Embedded { run_id, .. } => (*run_id, 1),
@@ -9942,8 +9944,53 @@ fn judge_capture_resimmable(
             // bag carries no record of a rank's removed steps.
             ranks_without_a_kept_step: &trimmed.ranks_without_a_kept_step,
             anchor_facts,
+            // The first frame a kept read consumed that the window does not
+            // hold. The recorder alone knows it: its taps hold frames from the
+            // moment they attached, while it can read the trace and the checkpoint
+            // rings from their first record.
+            frame_gap,
         },
     )
+}
+
+/// The frames a capture's window holds, per WRITER TOKEN: the key a read
+/// annotation names its writer by, so the capture judge looks a kept read's
+/// frame up the way a `--verify` replay does.
+///
+/// A labeled frame carries its publisher; an unlabeled one is its tap's FIRST
+/// origin, which every frame staged before labeling armed carried (see
+/// [`ProducerLabeling`]). A headerless frame has no sequence to name and is
+/// skipped, as the replay's index skips it.
+fn held_frames_by_writer(
+    batches: &[(String, std::sync::Arc<StagedFrames>)],
+    first_origins: &std::collections::HashMap<String, u128>,
+) -> BTreeMap<u64, cerulion_core::flashback::resim::HeldFrames> {
+    let mut held: BTreeMap<u64, (&str, Vec<u32>)> = BTreeMap::new();
+    for (topic, staged) in batches {
+        for (header, origin, _) in staged.iter() {
+            let (Some((sequence, _)), Some(id)) = (
+                header,
+                origin.id().or_else(|| first_origins.get(topic).copied()),
+            ) else {
+                continue;
+            };
+            // The token the recorder mints producer annotations with:
+            // FNV-1a over the publisher id's little-endian bytes.
+            let token = cerulion_core::wire::fnv1a_hash(&id.to_le_bytes());
+            held.entry(token)
+                .or_insert_with(|| (topic.as_str(), Vec::new()))
+                .1
+                .push(sequence);
+        }
+    }
+    held.into_iter()
+        .map(|(token, (topic, sequences))| {
+            (
+                token,
+                cerulion_core::flashback::resim::HeldFrames::new(topic.to_string(), sequences),
+            )
+        })
+        .collect()
 }
 
 /// Flashback phase 2: resolve and bank the anchors one drain closed.
@@ -17413,6 +17460,12 @@ impl Recorder {
             // …and whether the walk that fills it ran at all, read at the same
             // place and for the same borrow reason.
             state_rank_space_walked,
+            // Every frame the kept reads consumed, against the frames this
+            // capture writes.
+            cerulion_core::flashback::resim::first_frame_gap(
+                &trimmed.named_frames,
+                &held_frames_by_writer(&batches, &first_origins),
+            ),
         );
         // The earlier handoff, with the seam it left OPEN now CLOSED.
         //
@@ -29066,6 +29119,539 @@ mod judge_remedy_tests {
             }
             Ok(())
         });
+    }
+}
+
+#[cfg(test)]
+mod frame_coverage_judge_tests {
+    //! The frame-coverage gate over its pure parts: a hand-built rank-0 trace
+    //! trimmed at a complete step-0 checkpoint, a window built to begin where
+    //! each arm says, and the verdict. No shared memory, no race.
+    use super::*;
+    use cerulion_core::flashback::resim::{FrameGap, HeldFrom, ResimGap};
+    use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
+    use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
+    use cerulion_core::trace_ring::{ReadRun, TraceRingRecord};
+
+    const MS: u64 = 1_000_000;
+    const RUN: u64 = 0xC1E5;
+    const TICKER_TOPIC: &str = "/p/ticker/cmd";
+    /// The ticker's publisher id, and a second writer's.
+    const TICKER_ID: u128 = 0x007A_C4E2;
+    const OTHER_ID: u128 = 0x0DD5;
+    const TICKER: u32 = 0;
+    const RELAY: u32 = 1;
+
+    /// The token relay.trigger_in's annotation names the ticker by.
+    fn w() -> u64 {
+        cerulion_core::wire::fnv1a_hash(&TICKER_ID.to_le_bytes())
+    }
+
+    /// Steps 0..=5 of ticker -> relay: STEP_BOUNDARY at (k+1) x 50 ms, the two
+    /// FIREs, then relay.trigger_in's read of `read_seq(k)` (none at a `None`),
+    /// with one producer annotation before its first serving read, the
+    /// single-writer shape of trace format 8 on.
+    fn trace(read_seq: impl Fn(u64) -> Option<u32>) -> Vec<TraceRingRecord> {
+        let mut records = Vec::new();
+        let mut annotated = false;
+        for k in 0..=5u64 {
+            let boundary = TraceRingRecord {
+                step: k,
+                fire_time_ns: (k + 1) * 50 * MS,
+                duration_ns: 0,
+                node_idx: 0,
+                global_level: 0,
+                record_type: cerulion_core::trace_ring::RECORD_TYPE_STEP_BOUNDARY,
+                reserved: 0,
+            };
+            let fire = |node_idx| TraceRingRecord {
+                node_idx,
+                duration_ns: 7,
+                record_type: cerulion_core::trace_ring::RECORD_TYPE_FIRE,
+                ..boundary
+            };
+            records.extend([boundary, fire(TICKER), fire(RELAY)]);
+            let seq = read_seq(k);
+            if seq.is_some() && !annotated {
+                annotated = true;
+                records.push(TraceRingRecord::read_outcome_producer(
+                    k,
+                    RELAY,
+                    0,
+                    seq,
+                    w(),
+                    ReadSiteRole::Drain,
+                ));
+            }
+            let (kind, popped) = match seq {
+                Some(_) => (ReadOutcomeKind::Served, 1),
+                None => (ReadOutcomeKind::NoFrame, 0),
+            };
+            records.push(TraceRingRecord::read_outcome(
+                k,
+                RELAY,
+                0,
+                kind,
+                seq,
+                ReadRun::once(popped),
+                ReadSiteRole::Drain,
+            ));
+        }
+        records
+    }
+
+    /// The ticker's frames in the window at `seqs`, each stamped at its step's
+    /// target, under `origin`.
+    fn window(
+        seqs: impl IntoIterator<Item = u32>,
+        origin: FrameOrigin,
+    ) -> Vec<(String, Arc<StagedFrames>)> {
+        let mut staged = StagedFrames::default();
+        for s in seqs {
+            staged.push(Some((s, (u64::from(s) + 1) * 50 * MS)), origin, b"cmd");
+        }
+        vec![(TICKER_TOPIC.to_string(), Arc::new(staged))]
+    }
+
+    /// The verdict on `records` trimmed at the step-0 checkpoint, against
+    /// `frames`, whose unlabeled frames the tap attributes to the ticker.
+    fn verdict(
+        records: Vec<TraceRingRecord>,
+        frames: &[(String, Arc<StagedFrames>)],
+    ) -> Result<(), ResimGap> {
+        let trimmed = trace_window::trim_to_anchor(
+            records.into_iter(),
+            &BTreeMap::from([(0, 0)]),
+            &BTreeMap::from([(0, vec!["ticker".to_string(), "relay".to_string()])]),
+        );
+        let first_origins =
+            std::collections::HashMap::from([(TICKER_TOPIC.to_string(), TICKER_ID)]);
+        let anchors: Vec<AnchorFact> = ["ticker", "relay"]
+            .iter()
+            .map(|node| AnchorFact {
+                run_id: RUN,
+                step: 0,
+                node: node.to_string(),
+                outcome: AnchorOutcome::Complete,
+            })
+            .collect();
+        let report = flashback_plane::AnchorReport::Embedded {
+            run_id: RUN,
+            step: 0,
+            nodes: 2,
+            complete: 2,
+            records: 2,
+            fit: anchor_window::AnchorFit::CoversTheClaimedWindow,
+            taken_at_ns: 0,
+            frames_before_anchor_ms: 0,
+            frames_missing_after_anchor_ms: 0,
+            per_rank: BTreeMap::new(),
+            missing_ranks: Vec::new(),
+        };
+        judge_capture_resimmable(
+            &trimmed,
+            &report,
+            &anchors,
+            1,
+            &[(
+                GRAPH_ATTACHMENT.to_string(),
+                b"prefix: p\nnodes:\n  - id: ticker\n    type: t\n  - id: relay\n    type: t\n"
+                    .to_vec(),
+            )],
+            true,
+            &[0],
+            cerulion_core::trace_ring::first_trace_record_refusal(trimmed.records.iter(), &[2]),
+            None,
+            TraceRingCoverage {
+                declared: 1,
+                unreadable: 0,
+            },
+            &[],
+            true,
+            cerulion_core::flashback::resim::first_frame_gap(
+                &trimmed.named_frames,
+                &held_frames_by_writer(frames, &first_origins),
+            ),
+        )
+    }
+
+    /// Step k reads sequence k (the lockstep shape), or the frame of step k - 1
+    /// (the free-run shape, whose step-1 read is the frame published before the
+    /// checkpoint).
+    fn lockstep() -> Vec<TraceRingRecord> {
+        trace(|k| u32::try_from(k).ok())
+    }
+    fn free_run() -> Vec<TraceRingRecord> {
+        trace(|k| k.checked_sub(1).and_then(|s| u32::try_from(s).ok()))
+    }
+
+    fn not_held(step: u64, sequence: u32, first: Option<u32>) -> Result<(), ResimGap> {
+        Err(ResimGap::FrameNotHeld {
+            resume_step: 1,
+            gap: FrameGap {
+                step,
+                writer: w(),
+                sequence,
+                held_from: first.map(|first_sequence| HeldFrom {
+                    topic: TICKER_TOPIC.to_string(),
+                    first_sequence,
+                }),
+            },
+        })
+    }
+
+    /// The defect: the capture resumes at step 1 off the step-0 checkpoint and
+    /// its ticker frames begin at sequence 3, so its first kept read names a
+    /// frame it never held, in the "frames begin late" form. Twice, to the same
+    /// verdict.
+    #[test]
+    fn a_capture_whose_frames_begin_after_its_checkpoint_is_not_resimmable() {
+        let held = window(3..=6, FrameOrigin::Unlabeled);
+        let refused = verdict(lockstep(), &held);
+        assert_eq!(refused, not_held(1, 1, Some(3)));
+        assert_eq!(refused, verdict(lockstep(), &held), "two runs, one verdict");
+        let reason = refused.unwrap_err().reason();
+        assert!(
+            reason.contains("begin at sequence 3, but its trace resumes at step 1"),
+            "{reason}"
+        );
+        assert_eq!(verdict(free_run(), &held), not_held(1, 0, Some(3)));
+    }
+
+    /// The controls, every frame from sequence 0 held, unlabeled or labeled,
+    /// are resimmable; with sequence 4 missing between held 3 and 5 the step-4
+    /// read is refused in the "a frame its window lost" form.
+    #[test]
+    fn a_capture_is_judged_on_every_frame_its_kept_reads_name() {
+        for origin in [FrameOrigin::Unlabeled, FrameOrigin::Labeled(TICKER_ID)] {
+            let held = window(0..=6, origin);
+            assert_eq!(verdict(lockstep(), &held), Ok(()), "{origin:?}");
+            assert_eq!(verdict(free_run(), &held), Ok(()), "{origin:?}");
+        }
+        let lost = verdict(
+            lockstep(),
+            &window([0, 1, 2, 3, 5, 6], FrameOrigin::Unlabeled),
+        );
+        assert_eq!(lost, not_held(4, 4, Some(0)));
+        let reason = lost.unwrap_err().reason();
+        assert!(
+            reason.contains("sequence 4, a frame its window lost"),
+            "{reason}"
+        );
+    }
+
+    /// Adversarial: frames at the right sequences from ANOTHER writer hold none
+    /// of the ticker's, and a headerless frame names no sequence.
+    #[test]
+    fn frames_of_another_writer_or_without_a_header_do_not_cover_a_read() {
+        let mut held = window(0..=6, FrameOrigin::Labeled(OTHER_ID));
+        let mut headerless = StagedFrames::default();
+        headerless.push(None, FrameOrigin::Labeled(TICKER_ID), b"cmd");
+        held.push((TICKER_TOPIC.to_string(), Arc::new(headerless)));
+        assert_eq!(verdict(lockstep(), &held), not_held(1, 1, None));
+    }
+}
+
+#[cfg(test)]
+mod ranks_begin_apart_judge_tests {
+    //! The capture judge on two-rank captures whose ranks begin at different
+    //! steps, through the adapter, over hand-built traces trimmed the way a
+    //! capture trims them and the `recorder.json` the capture carries. Every
+    //! verdict is written out by hand. No shared memory, no race.
+    use super::*;
+    use cerulion_core::flashback::resim::ResimGap;
+    use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
+    use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY};
+
+    const MS: u64 = 1_000_000;
+    const RUN: u64 = 0xC1E5;
+    /// The one node on each rank: `src_a` on rank 0, `src_b` on rank 1.
+    const NODES: [&str; 2] = ["src_a", "src_b"];
+
+    /// A `recorder.json` as `graph run --record` writes it, with `coordination`
+    /// holding the JSON value `coordination`, or no such key for `None`.
+    fn recorder_json(coordination: Option<&str>) -> (String, Vec<u8>) {
+        let key = coordination.map_or(String::new(), |v| format!(r#""coordination":{v},"#));
+        (
+            RECORDER_JSON_ATTACHMENT.to_string(),
+            format!(
+                r#"{{"arch":"aarch64","os":"linux","cerulion_version":"2.0.0","recorded_at_ns":7,"trace_format":10,{key}"node_external":{{"src_a":false,"src_b":false}}}}"#
+            )
+            .into_bytes(),
+        )
+    }
+
+    /// The documents a capture can carry about its contract. `--recorder-json`
+    /// attaches the file's bytes as they are, so each of these can reach a
+    /// capture: a free-run or a lockstep stamp, a document with no
+    /// `coordination` key, a stamp with no contract (`"barrier"`), bytes that
+    /// are not JSON, and no document at all (a standalone recorder handed no
+    /// `--recorder-json`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Stamp {
+        FreeRun,
+        Lockstep,
+        Unstamped,
+        Unknown,
+        NotJson,
+        Absent,
+    }
+    const STAMPS: [Stamp; 6] = [
+        Stamp::FreeRun,
+        Stamp::Lockstep,
+        Stamp::Unstamped,
+        Stamp::Unknown,
+        Stamp::NotJson,
+        Stamp::Absent,
+    ];
+
+    /// Rank `rank`'s records over `steps`: a STEP_BOUNDARY at (k + 1) x 50 ms,
+    /// then one FIRE of its node, stamped with the rank.
+    fn rank_steps(rank: u32, steps: std::ops::RangeInclusive<u64>) -> Vec<TraceRingRecord> {
+        steps
+            .flat_map(|k| {
+                let boundary = TraceRingRecord {
+                    step: k,
+                    fire_time_ns: (k + 1) * 50 * MS,
+                    duration_ns: 0,
+                    node_idx: 0,
+                    global_level: 0,
+                    record_type: RECORD_TYPE_STEP_BOUNDARY,
+                    reserved: rank,
+                };
+                let fire = TraceRingRecord {
+                    duration_ns: 7,
+                    record_type: RECORD_TYPE_FIRE,
+                    ..boundary
+                };
+                [boundary, fire]
+            })
+            .collect()
+    }
+
+    /// A capture's trace and the one rank whose checkpoint it embeds, at step 5;
+    /// every other rank kept no checkpoint and is kept whole.
+    struct Shape {
+        records: Vec<TraceRingRecord>,
+        /// The rank whose anchor the capture embeds, or `None` for none.
+        anchored: Option<u32>,
+        /// The worker trace manifests the capture attaches.
+        worker_ranks: &'static [u32],
+    }
+
+    /// The anchor step every shape's anchored rank resumes from.
+    const ANCHOR_STEP: u64 = 5;
+
+    /// Rank 0 kept no checkpoint, so the capture keeps its retention from step
+    /// 0, while rank 1 resumes from its anchor (first kept step 6).
+    fn rank_1_begins_later() -> Shape {
+        Shape {
+            records: [rank_steps(0, 0..=8), rank_steps(1, 0..=8)].concat(),
+            anchored: Some(1),
+            worker_ranks: &[0, 1],
+        }
+    }
+
+    /// The reverse: rank 0 resumes from its anchor (first kept step 6) while
+    /// rank 1 kept no checkpoint and keeps its retention from step 0.
+    fn rank_0_begins_later() -> Shape {
+        Shape {
+            anchored: Some(0),
+            ..rank_1_begins_later()
+        }
+    }
+
+    /// A capture taken after the first window: rank 0 resumes from its anchor
+    /// (first kept step 6), and rank 1, which kept no checkpoint, keeps a
+    /// retention that no longer reaches step 0 (first kept step 2).
+    fn both_begin_past_step_0() -> Shape {
+        Shape {
+            records: [rank_steps(0, 3..=8), rank_steps(1, 2..=8)].concat(),
+            anchored: Some(0),
+            worker_ranks: &[0, 1],
+        }
+    }
+
+    /// The controls: two ranks that both begin at step 0 with no checkpoint,
+    /// and one rank resuming from its anchor.
+    fn both_begin_at_step_0() -> Shape {
+        Shape {
+            anchored: None,
+            ..rank_1_begins_later()
+        }
+    }
+    fn one_rank_from_its_anchor() -> Shape {
+        Shape {
+            records: rank_steps(0, 0..=8),
+            anchored: Some(0),
+            worker_ranks: &[0],
+        }
+    }
+
+    fn manifests(worker_ranks: &[u32]) -> BTreeMap<u32, Vec<String>> {
+        worker_ranks
+            .iter()
+            .map(|&r| (r, vec![NODES[r as usize].to_string()]))
+            .collect()
+    }
+
+    /// The trim a capture of `shape` makes: one cut, at the anchored rank.
+    fn trim(shape: &Shape) -> trace_window::TrimmedTrace {
+        let manifests = manifests(shape.worker_ranks);
+        match shape.anchored {
+            Some(rank) => trace_window::trim_to_anchor(
+                shape.records.iter().copied(),
+                &BTreeMap::from([(rank, ANCHOR_STEP)]),
+                &manifests,
+            ),
+            None => trace_window::keep_all(shape.records.iter().copied(), &manifests),
+        }
+    }
+
+    /// The verdict a capture of `shape` stamped `stamp` reports.
+    fn verdict(shape: &Shape, stamp: Stamp) -> Result<(), ResimGap> {
+        let trimmed = trim(shape);
+        let (report, anchors) = match shape.anchored {
+            Some(rank) => {
+                let rank_anchor = flashback_plane::RankAnchor {
+                    capture_seq: 0,
+                    step: ANCHOR_STEP,
+                    taken_at_ns: 0,
+                    nodes: 1,
+                    complete: 1,
+                    records: 1,
+                    fit: anchor_window::AnchorFit::CoversTheClaimedWindow,
+                    frames_before_anchor_ms: 0,
+                    frames_missing_after_anchor_ms: 0,
+                };
+                (
+                    flashback_plane::AnchorReport::Embedded {
+                        run_id: RUN,
+                        step: ANCHOR_STEP,
+                        nodes: 1,
+                        complete: 1,
+                        records: 1,
+                        fit: anchor_window::AnchorFit::CoversTheClaimedWindow,
+                        taken_at_ns: 0,
+                        frames_before_anchor_ms: 0,
+                        frames_missing_after_anchor_ms: 0,
+                        per_rank: BTreeMap::from([(rank, rank_anchor)]),
+                        missing_ranks: Vec::new(),
+                    },
+                    vec![AnchorFact {
+                        run_id: RUN,
+                        step: ANCHOR_STEP,
+                        node: NODES[rank as usize].to_string(),
+                        outcome: AnchorOutcome::Complete,
+                    }],
+                )
+            }
+            None => (
+                flashback_plane::AnchorReport::Absent(
+                    anchor_window::NoAnchorReason::NothingRetained,
+                ),
+                Vec::new(),
+            ),
+        };
+        let mut attachments = vec![(
+            GRAPH_ATTACHMENT.to_string(),
+            b"prefix: mp\nnodes:\n  - id: src_a\n    type: t\n  - id: src_b\n    type: t\n"
+                .to_vec(),
+        )];
+        match stamp {
+            Stamp::FreeRun => attachments.push(recorder_json(Some(r#""free_run""#))),
+            Stamp::Lockstep => attachments.push(recorder_json(Some(r#""lockstep""#))),
+            Stamp::Unstamped => attachments.push(recorder_json(None)),
+            Stamp::Unknown => attachments.push(recorder_json(Some(r#""barrier""#))),
+            Stamp::NotJson => {
+                attachments.push((RECORDER_JSON_ATTACHMENT.to_string(), b"{\"arch\":".to_vec()))
+            }
+            Stamp::Absent => {}
+        }
+        let node_counts = vec![1usize; shape.worker_ranks.len()];
+        judge_capture_resimmable(
+            &trimmed,
+            &report,
+            &anchors,
+            // The checkpoint's anchors come from the one anchored rank's ring.
+            usize::from(shape.anchored.is_some()),
+            &attachments,
+            // The production rule: the node map is known iff one worker ring.
+            shape.worker_ranks.len() == 1,
+            shape.worker_ranks,
+            cerulion_core::trace_ring::first_trace_record_refusal(
+                trimmed.records.iter(),
+                &node_counts,
+            ),
+            None,
+            TraceRingCoverage {
+                declared: shape.worker_ranks.len(),
+                unreadable: 0,
+            },
+            &[],
+            true,
+            None,
+        )
+    }
+
+    /// The first step each rank keeps, so a verdict below is about the shape
+    /// it names.
+    #[test]
+    fn the_shapes_keep_the_first_steps_they_are_named_for() {
+        let firsts = |shape: Shape| {
+            trim(&shape)
+                .per_rank
+                .iter()
+                .map(|(rank, per)| (*rank, per.first_recorded_step))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(firsts(rank_1_begins_later()), [(0, Some(0)), (1, Some(6))]);
+        assert_eq!(firsts(rank_0_begins_later()), [(0, Some(6)), (1, Some(0))]);
+        assert_eq!(
+            firsts(both_begin_past_step_0()),
+            [(0, Some(6)), (1, Some(2))]
+        );
+        assert_eq!(firsts(both_begin_at_step_0()), [(0, Some(0)), (1, Some(0))]);
+        assert_eq!(firsts(one_rank_from_its_anchor()), [(0, Some(6))]);
+    }
+
+    /// What the judge says about each shape, whatever the capture's stamp: rank
+    /// 1 beginning later reads resimmable (rank 0's first kept step is 0), and
+    /// both shapes whose rank 0 resumes mid-run read the unknown node map of a
+    /// recorder holding two trace rings.
+    #[test]
+    fn a_capture_whose_ranks_begin_apart_is_judged_on_rank_0_alone() {
+        for stamp in STAMPS {
+            assert_eq!(verdict(&rank_1_begins_later(), stamp), Ok(()), "{stamp:?}");
+            assert_eq!(
+                verdict(&rank_0_begins_later(), stamp),
+                Err(ResimGap::AmbiguousNodeMap),
+                "{stamp:?}"
+            );
+            assert_eq!(
+                verdict(&both_begin_past_step_0(), stamp),
+                Err(ResimGap::AmbiguousNodeMap),
+                "{stamp:?}"
+            );
+        }
+    }
+
+    /// The controls: two ranks that both begin at step 0, and one rank resuming
+    /// from its anchor, are resimmable under every stamp.
+    #[test]
+    fn ranks_that_begin_together_and_a_lone_rank_are_resimmable() {
+        for stamp in STAMPS {
+            assert_eq!(
+                verdict(&both_begin_at_step_0(), stamp),
+                Ok(()),
+                "{stamp:?}: both from step 0"
+            );
+            assert_eq!(
+                verdict(&one_rank_from_its_anchor(), stamp),
+                Ok(()),
+                "{stamp:?}: one rank from its anchor"
+            );
+        }
     }
 }
 

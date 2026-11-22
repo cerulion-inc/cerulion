@@ -1,15 +1,18 @@
 # cerulion_remoted
 
-One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + ops/1; pairing/link/wireclient/connectd/accountd/cerud/cerulion-wire.
+One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
 
 ## Invariants
-- Catalog/schema/demand/acts gate producer scope/origin before ports; taps/mirrors retain leases. Capabilities never override privacy; safety ops independent.
+- Linux: unreaped leader pins SID; capture identity before SID. Use pidfds.
+  Fallback rechecks SID/birth nonatomically. No containment.
+  Probe waits/readiness/signals before spawn.
+- Catalog/schema/demand/acts gate producer scope/origin before ports; acts order: e-stop, args, scope. Taps/mirrors keep leases; privacy wins over caps; safety ops independent.
 - Daemon `OpsServing::serving_holds` is required: acquire before shell/exec through
   final drain/witness. Ops/RCP/latch/owed work hold the shared fence; parent exclusive
   fences idle. Never unlink; explicit SIGTERM still runs shutdown participants.
-- `PairingAuthorizer` classifies accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
-  Shell/exec: owner + policy; missing file ON, invalid OFF; absent handle denies, immutable hard-off wins.
-  Settings: validate bounds first; either OFF wins.
+- `PairingAuthorizer` gates accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
+  Shell/exec: owner+policy; no file ON/invalid OFF; no handle: deny; immutable hard-off wins.
+  Settings: validate first; either OFF wins.
 - Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
@@ -21,17 +24,16 @@ One endpoint: public key = EndpointId; 32-byte secret seeds pairing. wire/2 + op
 - E-stop is the permission floor: any paired account, never lease-gated, served
   concurrently so no session starves it (`estop_starvation_test.rs`).
   TLS: docs/remote_plane.md; paired keys Retry first.
-  Trust persistence is fail-closed: store-BEFORE-index, the live binding published
-  only after the durable write succeeds. Never reorder (`trust.rs`).
+  Trust: fail closed; durable store before index/binding (`trust.rs`).
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
-- `cerulion_link` framing is NOT cancel-safe: never `select!`; one task per stream.
-  connectd mirrors the robot protocol (no production remoted dep): update both,
-  pinned by `protocol_parity_test.rs`.
+- `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
+  task per stream. connectd mirrors the robot protocol (no production remoted dep);
+  `protocol_parity_test.rs` gates parity: change both.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
-- Desk key files are 32 raw bytes, created 0600 with `create_new`, NEVER
-  overwritten; `~/.cerulion` secret writes go through `auth::atomic_write_secret`.
+- Desk keys: 32 raw bytes, `create_new`, 0600; NEVER overwrite.
+  `~/.cerulion` secrets: `auth::atomic_write_secret`.
   Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
   writer and both desk readers, never hand-rolled (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands

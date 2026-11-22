@@ -1687,8 +1687,10 @@ pub struct NodeContext {
     /// produce such a state; the only
     /// constructors are `with_runtime_env` (production canonical,
     /// fully-explicit) and `for_tests` (test-only, empty snapshot).
-    /// Code that genuinely needs live env must call
-    /// `with_runtime_env(.., Arc::new(std::env::vars().collect()))`.
+    /// Code that genuinely needs live env must build the map from
+    /// `std::env::vars_os()`, keeping each variable whose name and value
+    /// are valid UTF-8, and pass it to `with_runtime_env`;
+    /// `std::env::vars()` panics on the first variable that is not.
     /// The runtime does this automatically; only hand-rolled
     /// NodeContext callers need to supply it.
     env_snapshot: Arc<std::collections::HashMap<String, String>>,
@@ -1869,6 +1871,23 @@ impl NodeContext {
     /// Get a mutable reference to a publisher by output name.
     pub fn publisher_mut(&mut self, name: &str) -> Option<&mut AnyPublisher> {
         self.publishers.get_mut(name)
+    }
+
+    /// Write each publisher's [`AnyPublisher::committed_frames`] into `out`, in
+    /// the graph's `outputs:` order. Returns `false`, leaving `out` unchanged,
+    /// when `out.len()` is not this node's output count.
+    ///
+    /// Only a loaned proxy's commit moves a count. A frame sent with
+    /// [`AnyPublisher::publish_raw`] carries its caller's own wire sequence and
+    /// moves none, so the fire tap does not see that write.
+    pub fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+        if out.len() != self.publishers.len() {
+            return false;
+        }
+        for (count, publisher) in out.iter_mut().zip(self.publishers.values()) {
+            *count = publisher.committed_frames();
+        }
+        true
     }
 
     /// Drive `pump_history` on every publisher this node owns
@@ -2410,7 +2429,9 @@ impl NodeContext {
     /// Reads the snapshot of the environment taken when the graph was built,
     /// never live `std::env`, so every read in a run returns the same value; a
     /// resim takes the snapshot from the shell it runs in. A key that was unset
-    /// at build time returns `default` for the whole run.
+    /// at build time returns `default` for the whole run. A variable whose name
+    /// or value is not valid UTF-8 is not in the snapshot, so `ctx.env` and
+    /// `ctx.env_str` return the default for it.
     ///
     /// # Example
     ///
@@ -2469,7 +2490,9 @@ impl NodeContext {
     ///
     /// Reads from the runtime's frozen env snapshot, so every read in a run
     /// returns the same value. There is no live `std::env::var` fallback;
-    /// keys absent from the snapshot return `default`.
+    /// keys absent from the snapshot return `default`. A variable whose name
+    /// or value is not valid UTF-8 is not in the snapshot, so `ctx.env` and
+    /// `ctx.env_str` return the default for it.
     ///
     /// See [`Self::env`] for an example in a node's `init`.
     pub fn env_str(&self, key: &str, default: &str) -> String {
@@ -3273,6 +3296,18 @@ pub trait NodeEntry: Send {
     /// grep `"producer reconciliation (per topic)"`.
     fn collect_publisher_recon_stats(&self, _out: &mut Vec<PublisherReconStat>) {}
 
+    /// Write each output's committed-frame count into `out`, in the graph's
+    /// `outputs:` order, through [`NodeContext::output_commit_counts`].
+    ///
+    /// The default returns `false`: the entry cannot see its publishers, so
+    /// the fire tap records its fires with `FireFlags::WROTE_UNKNOWN`. An
+    /// entry that reaches its `NodeContext` forwards to it: the generated
+    /// `#[cerulion_node]` entry, `ClosureNodeEntry`, and `DylibNodeEntry`,
+    /// whose context the host keeps.
+    fn output_commit_counts(&self, _out: &mut [u32]) -> bool {
+        false
+    }
+
     /// This node's `CerulionState::STATE_SHAPE`, or `None`
     /// if it declares no restorable state.
     ///
@@ -3843,6 +3878,12 @@ impl NodeEntry for ClosureNodeEntry {
         if let Some(ctx) = self.context.as_ref() {
             ctx.collect_publisher_recon_stats(out);
         }
+    }
+
+    fn output_commit_counts(&self, out: &mut [u32]) -> bool {
+        self.context
+            .as_ref()
+            .is_some_and(|ctx| ctx.output_commit_counts(out))
     }
 
     // Forward the unified trigger drain to the NodeContext,

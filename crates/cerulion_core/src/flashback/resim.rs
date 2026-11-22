@@ -274,6 +274,106 @@ pub struct ResimFacts<'a> {
     pub required_nodes: &'a [String],
     /// What the embedded checkpoint covers, one fact per node.
     pub anchor_facts: &'a [AnchorFact],
+    /// The first frame a kept read consumed that this capture does not hold,
+    /// when there is one: [`first_frame_gap`] over the kept trace and the
+    /// held frames.
+    ///
+    /// A RECORDER fact, like [`trace_gap`](Self::trace_gap): the trace and the
+    /// checkpoint come from rings a recorder can read from their first record,
+    /// while the frames are what its taps drained from the moment they
+    /// attached. A capture whose resume begins before its frames do, or whose
+    /// window lost a frame a kept read consumed, carries a trace that names a
+    /// frame `bag play --resim --verify` then cannot find (its
+    /// `read_identity_frame_missing`). `None` is "every named frame is held".
+    pub frame_gap: Option<FrameGap>,
+}
+
+/// One frame a KEPT read record consumed, as the read log names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamedFrame {
+    /// The consumer's step.
+    pub step: u64,
+    /// The producer token of the frame's writer: the last producer annotation
+    /// of the read's site before it.
+    pub writer: u64,
+    /// The frame's wire sequence.
+    pub sequence: u32,
+}
+
+/// The frames a capture holds of ONE writer.
+///
+/// Private fields: [`first_frame_gap`] binary-searches the sequences, so the
+/// only way in is [`HeldFrames::new`], which sorts them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldFrames {
+    /// The topic the writer's frames are on.
+    topic: String,
+    /// The wire sequences held, ascending and distinct.
+    sequences: Vec<u32>,
+}
+
+impl HeldFrames {
+    /// The frames of one writer on `topic`, at `sequences` in any order.
+    #[must_use]
+    pub fn new(topic: String, mut sequences: Vec<u32>) -> Self {
+        sequences.sort_unstable();
+        sequences.dedup();
+        Self { topic, sequences }
+    }
+}
+
+/// A frame a kept read consumed that the capture does not hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameGap {
+    /// The step of the read that names it.
+    pub step: u64,
+    /// The writer's producer token.
+    pub writer: u64,
+    /// The missing frame's wire sequence.
+    pub sequence: u32,
+    /// Where the capture's frames of that writer begin. `None` when it holds
+    /// none of them.
+    pub held_from: Option<HeldFrom>,
+}
+
+/// The first frame a capture holds of one writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldFrom {
+    /// The topic the writer's frames are on.
+    pub topic: String,
+    /// The lowest sequence held.
+    pub first_sequence: u32,
+}
+
+/// PURE: the first frame in `named` (record order) that `held` (keyed by
+/// writer token) does not hold.
+///
+/// The replay's `read_identity_frame_missing` predicate, asked at capture time:
+/// a fed `--verify` replay looks up every frame a read consumed by its
+/// `(writer, sequence)` and refuses before its first step when the bag holds
+/// none. Keyed by writer alone because a writer token names one publisher port,
+/// and a port publishes on one topic.
+pub fn first_frame_gap(
+    named: &[NamedFrame],
+    held: &std::collections::BTreeMap<u64, HeldFrames>,
+) -> Option<FrameGap> {
+    named.iter().find_map(|frame| {
+        let frames = held.get(&frame.writer);
+        if frames.is_some_and(|f| f.sequences.binary_search(&frame.sequence).is_ok()) {
+            return None;
+        }
+        Some(FrameGap {
+            step: frame.step,
+            writer: frame.writer,
+            sequence: frame.sequence,
+            held_from: frames.and_then(|f| {
+                f.sequences.first().map(|&first_sequence| HeldFrom {
+                    topic: f.topic.clone(),
+                    first_sequence,
+                })
+            }),
+        })
+    })
 }
 
 /// A HOLE a recorder observed in its OWN read of a run's scheduler-trace ring.
@@ -343,6 +443,120 @@ impl TraceGap {
             return false;
         };
         min <= self.last_step_before && max >= after
+    }
+}
+
+/// The coordination contract a recording was taken under, as the `coordination`
+/// key of its `__cerulion/recorder.json` stamps it: `"lockstep"` or
+/// `"free_run"`. A recorder writes the stamp through this type's `Serialize`
+/// and [`recorded_coordination`] reads it back through its `Deserialize`.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinationMode {
+    /// Barrier lockstep: every rank advances the SAME handed quantum per step,
+    /// so the per-rank STEP_BOUNDARY streams carry EQUAL targets on every
+    /// shared step and one first boundary anchors a mid-run resume. The
+    /// DEFAULT: a recording with no stamp is replayed under it.
+    #[default]
+    Lockstep,
+    /// Free run: each rank keeps its OWN wall-faithful boundary stream sharing
+    /// only the GO epoch, so cross-rank boundary equality does not hold and
+    /// there is no single first boundary to anchor off.
+    FreeRun,
+}
+
+/// The coordination contract a recording's `__cerulion/recorder.json` states,
+/// as one of three answers: see [`recorded_coordination`] and
+/// [`stated_coordination`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecordedCoordination {
+    /// [`CoordinationMode::Lockstep`].
+    Lockstep {
+        /// Whether the document stamps `"lockstep"` itself. `false` when there
+        /// is no document or it carries no `coordination` key: replay reads
+        /// such a recording as lockstep, the contract of a recording with no
+        /// stamp.
+        stamped: bool,
+    },
+    /// [`CoordinationMode::FreeRun`], stamped `"free_run"`.
+    FreeRun,
+    /// A document or stamp this build cannot read. Replay refuses it rather
+    /// than reading it as lockstep.
+    Unreadable(UnreadableCoordination),
+}
+
+/// Why a `recorder.json` states no coordination contract this build can read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnreadableCoordination {
+    /// The document does not parse as JSON.
+    NotJson,
+    /// The document parses, and its top level is not a JSON object.
+    NotAnObject,
+    /// The `coordination` key holds a value [`CoordinationMode`] does not
+    /// decode, as JSON text: a string keeps its quotes, so `"barrier"` and
+    /// `null` read apart.
+    UnknownStamp(String),
+}
+
+impl std::fmt::Display for UnreadableCoordination {
+    /// The stamp as a sentence can quote it: the value itself for an unknown
+    /// stamp, else what the document is.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotJson => f.write_str("not JSON"),
+            Self::NotAnObject => f.write_str("not a JSON object"),
+            Self::UnknownStamp(value) => f.write_str(value),
+        }
+    }
+}
+
+/// PURE: the coordination contract `recorder_json`, the bytes of a recording's
+/// `__cerulion/recorder.json` (`None` when the recording carries none), states.
+///
+/// * no document: [`RecordedCoordination::Lockstep`] with `stamped: false`;
+/// * bytes that are not JSON, or a top level that is not an object:
+///   [`RecordedCoordination::Unreadable`], saying which;
+/// * a JSON object: [`stated_coordination`] of it.
+pub fn recorded_coordination(recorder_json: Option<&[u8]>) -> RecordedCoordination {
+    let Some(bytes) = recorder_json else {
+        return RecordedCoordination::Lockstep { stamped: false };
+    };
+    let Ok(doc) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return RecordedCoordination::Unreadable(UnreadableCoordination::NotJson);
+    };
+    let Some(obj) = doc.as_object() else {
+        return RecordedCoordination::Unreadable(UnreadableCoordination::NotAnObject);
+    };
+    stated_coordination(obj)
+}
+
+/// PURE: the coordination contract a parsed `recorder.json` object states.
+///
+/// * no `coordination` key: [`RecordedCoordination::Lockstep`] with
+///   `stamped: false`;
+/// * a value [`CoordinationMode`] decodes (`"lockstep"` or `"free_run"`, or
+///   serde's one-key map spelling such as `{"free_run": null}`): that
+///   contract, stamped;
+/// * any other value (`null`, a number, an unknown string):
+///   [`RecordedCoordination::Unreadable`] with
+///   [`UnreadableCoordination::UnknownStamp`].
+///
+/// Reads the `coordination` key and nothing else, so a malformed sibling key
+/// (an `arch` that is a number) does not make the contract unreadable.
+pub fn stated_coordination(
+    recorder: &serde_json::Map<String, serde_json::Value>,
+) -> RecordedCoordination {
+    let Some(value) = recorder.get("coordination") else {
+        return RecordedCoordination::Lockstep { stamped: false };
+    };
+    match <CoordinationMode as serde::Deserialize>::deserialize(value) {
+        Ok(CoordinationMode::Lockstep) => RecordedCoordination::Lockstep { stamped: true },
+        Ok(CoordinationMode::FreeRun) => RecordedCoordination::FreeRun,
+        Err(_) => RecordedCoordination::Unreadable(UnreadableCoordination::UnknownStamp(
+            value.to_string(),
+        )),
     }
 }
 
@@ -473,6 +687,14 @@ pub enum ResimGap {
     AnchorIncomplete {
         /// `plan_restore`'s own refusal, rendered.
         detail: String,
+    },
+    /// A kept read consumed a frame this capture does not hold: a `--verify`
+    /// resim's `read_identity_frame_missing`. See [`ResimFacts::frame_gap`].
+    FrameNotHeld {
+        /// The step the capture's trace resumes at.
+        resume_step: u64,
+        /// The first missing frame and where the held ones begin.
+        gap: FrameGap,
     },
 }
 
@@ -764,7 +986,72 @@ impl ResimGap {
                 "this capture's anchor does not cover every node the resumed window executes: \
                  {detail}"
             ),
+            Self::FrameNotHeld { resume_step, gap } => frame_not_held_reason(*resume_step, gap),
         }
+    }
+}
+
+/// The two remedies a capture whose frames begin late carries.
+const FRAMES_BEGIN_LATE_REMEDY: &str =
+    "A capture taken more than one Flashback window into the run (`CERULION_FLASHBACK_WINDOW_MS`) \
+     resumes from a checkpoint its frames cover, and `cerulion graph run --record` records a run \
+     from its first step";
+
+/// [`ResimGap::FrameNotHeld`]'s sentence: the "frames begin late" form when the
+/// missing sequence is below the first one held of its writer (or none is
+/// held), the "a frame its window lost" form otherwise.
+fn frame_not_held_reason(resume_step: u64, gap: &FrameGap) -> String {
+    let FrameGap {
+        step,
+        writer,
+        sequence,
+        held_from,
+    } = gap;
+    let readable = "`cerulion bag play --resim all --verify` cannot judge it. The frames, the \
+                    state and the trace are in the bag and readable.";
+    let read = if *step == resume_step {
+        "whose read".to_string()
+    } else {
+        format!("and its read at step {step}")
+    };
+    let attached_after = if resume_step == 0 {
+        "the run's first step"
+    } else {
+        "the checkpoint this capture resumes from"
+    };
+    let late = |lead: String, frames: &str| {
+        format!(
+            "{lead}, a frame the capture never held: its frames {frames} start later than \
+             {attached_after}, because the recorder's taps attached after it, as in a capture \
+             taken in the first seconds of a run, or because the window let them go. {readable} \
+             {FRAMES_BEGIN_LATE_REMEDY}"
+        )
+    };
+    match held_from {
+        Some(HeldFrom {
+            topic,
+            first_sequence,
+        }) if sequence < first_sequence => late(
+            format!(
+                "this capture's frames on '{topic}' from writer {writer:016x} begin at sequence \
+                 {first_sequence}, but its trace resumes at step {resume_step}, {read} of that \
+                 topic names sequence {sequence}"
+            ),
+            "on that topic",
+        ),
+        Some(HeldFrom { topic, .. }) => format!(
+            "this capture keeps a read at step {step} of '{topic}' that names writer \
+             {writer:016x}, sequence {sequence}, a frame its window lost: the window recorder \
+             could not keep up with that topic. {readable} `cerulion graph run --record` records \
+             every frame of a run"
+        ),
+        None => late(
+            format!(
+                "this capture holds no frame from writer {writer:016x}, but its trace resumes at \
+                 step {resume_step}, {read} names that writer's sequence {sequence}"
+            ),
+            "from that writer",
+        ),
     }
 }
 
@@ -847,9 +1134,11 @@ pub fn resimmable_reason(from_start: bool, covered_through_ns: Option<u64>) -> S
 /// 0: the constructor's state IS the state, so no anchor is needed and none is
 /// looked for. A capture whose window happens to reach the run's own first step
 /// is therefore resimmable with no checkpoint at all, and refusing it for a
-/// missing anchor would be refusing a bag resim would accept. The one refusal
-/// it still takes there is a rank left with no complete step
-/// ([`ResimGap::RankWithoutCompleteStep`]), which no anchor would repair.
+/// missing anchor would be refusing a bag resim would accept. The refusals it
+/// still takes there are a rank left with no complete step
+/// ([`ResimGap::RankWithoutCompleteStep`]) and a kept read whose frame the
+/// capture does not hold ([`ResimGap::FrameNotHeld`]), neither of which an
+/// anchor would repair.
 pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     // 1. `BagNoSchedulerTrace` — the first thing `run_replay` refuses on.
     if facts.trace_records == 0 {
@@ -990,9 +1279,23 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
             })
         }
     };
+    // 4c. A frame a kept read consumed and the capture does not hold, asked
+    //     LAST on both paths: the replay resolves its resume (every gate it
+    //     shares with this judge) and only then plans the fed reads that refuse
+    //     a missing frame.
+    let frames_held = || -> Result<(), ResimGap> {
+        match &facts.frame_gap {
+            None => Ok(()),
+            Some(gap) => Err(ResimGap::FrameNotHeld {
+                resume_step: first_recorded_step,
+                gap: gap.clone(),
+            }),
+        }
+    };
     if first_recorded_step == 0 {
         // FromStart — see the doc comment. No anchor is consulted.
-        return rank_without_a_step();
+        rank_without_a_step()?;
+        return frames_held();
     }
     // 5. `MultiRingAmbiguous`. A property of the MANIFEST, so it is asked before
     //    anything about a particular step's records — the same ordering
@@ -1050,8 +1353,9 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
     .map_err(|refusal| ResimGap::AnchorIncomplete {
         detail: refusal.to_string(),
     })?;
-    // 8. The resumed half of 4b.
-    rank_without_a_step()
+    // 8. The resumed halves of 4b and 4c.
+    rank_without_a_step()?;
+    frames_held()
 }
 
 #[cfg(test)]
@@ -1077,6 +1381,306 @@ mod tests {
             step,
             node: node.to_string(),
             outcome,
+        }
+    }
+
+    /// The writer token of the ticker in the coverage arms below.
+    const W: u64 = 0x42cb_ecd9_a96b_9f36;
+
+    fn named(step: u64, writer: u64, sequence: u32) -> NamedFrame {
+        NamedFrame {
+            step,
+            writer,
+            sequence,
+        }
+    }
+
+    fn held(topic: &str, sequences: &[u32]) -> HeldFrames {
+        HeldFrames::new(topic.to_string(), sequences.to_vec())
+    }
+
+    /// The step-41 read of a capture whose ticker frames begin at sequence 43.
+    fn late_gap() -> FrameGap {
+        FrameGap {
+            step: 41,
+            writer: W,
+            sequence: 41,
+            held_from: Some(HeldFrom {
+                topic: "/p/ticker/cmd".to_string(),
+                first_sequence: 43,
+            }),
+        }
+    }
+
+    /// Each stamp a recorder writes, `CoordinationMode`'s `Serialize`, reads
+    /// back as that contract, stamped.
+    #[test]
+    fn every_written_coordination_stamp_reads_back_as_its_contract() {
+        for (mode, text, want) in [
+            (
+                CoordinationMode::Lockstep,
+                "\"lockstep\"",
+                RecordedCoordination::Lockstep { stamped: true },
+            ),
+            (
+                CoordinationMode::FreeRun,
+                "\"free_run\"",
+                RecordedCoordination::FreeRun,
+            ),
+        ] {
+            // Exhaustive: a new contract stops this test compiling, which
+            // points at the rows above.
+            match mode {
+                CoordinationMode::Lockstep | CoordinationMode::FreeRun => {}
+            }
+            let stamp = serde_json::to_value(mode).expect("a unit variant serializes");
+            assert_eq!(stamp.to_string(), text, "{mode:?}");
+            let doc = serde_json::Map::from_iter([("coordination".to_string(), stamp)]);
+            assert_eq!(stated_coordination(&doc), want, "{mode:?}");
+        }
+        assert_eq!(CoordinationMode::default(), CoordinationMode::Lockstep);
+    }
+
+    /// Every arm of the coordination parse over hand-written documents, each
+    /// answer written out rather than derived.
+    #[test]
+    fn the_coordination_parse_reads_each_document_shape_one_way() {
+        use RecordedCoordination::{FreeRun, Lockstep, Unreadable};
+        use UnreadableCoordination::{NotAnObject, NotJson, UnknownStamp};
+        let unknown = |text: &str| Unreadable(UnknownStamp(text.to_string()));
+        let cases: [(Option<&[u8]>, RecordedCoordination); 19] = [
+            // No document, and a document without the key: lockstep, unstamped.
+            (None, Lockstep { stamped: false }),
+            (Some(b"{}"), Lockstep { stamped: false }),
+            (
+                Some(br#"{"arch":"aarch64","trace_format":10}"#),
+                Lockstep { stamped: false },
+            ),
+            // The two stamps a recorder writes.
+            (
+                Some(br#"{"coordination":"lockstep"}"#),
+                Lockstep { stamped: true },
+            ),
+            (Some(br#"{"coordination":"free_run"}"#), FreeRun),
+            // A malformed SIBLING costs the contract nothing.
+            (Some(br#"{"arch":42,"coordination":"free_run"}"#), FreeRun),
+            // serde's one-key map spelling of a unit variant.
+            (Some(br#"{"coordination":{"free_run":null}}"#), FreeRun),
+            (
+                Some(br#"{"coordination":{"lockstep":null}}"#),
+                Lockstep { stamped: true },
+            ),
+            // A duplicated key: the last one is the document's value.
+            (
+                Some(br#"{"coordination":"lockstep","coordination":"free_run"}"#),
+                FreeRun,
+            ),
+            // Every other value is unreadable, quoted as JSON text.
+            (
+                Some(br#"{"coordination":"quantum_entangled"}"#),
+                unknown("\"quantum_entangled\""),
+            ),
+            (
+                Some(br#"{"coordination":"FreeRun"}"#),
+                unknown("\"FreeRun\""),
+            ),
+            (Some(br#"{"coordination":null}"#), unknown("null")),
+            (Some(br#"{"coordination":7}"#), unknown("7")),
+            (
+                Some(br#"{"coordination":["free_run"]}"#),
+                unknown("[\"free_run\"]"),
+            ),
+            // A document that is not an object, or not JSON at all.
+            (Some(br#"["free_run"]"#), Unreadable(NotAnObject)),
+            (Some(br#""free_run""#), Unreadable(NotAnObject)),
+            (Some(b"null"), Unreadable(NotAnObject)),
+            (Some(b""), Unreadable(NotJson)),
+            (Some(b"{\"coordination\":\"free_run\""), Unreadable(NotJson)),
+        ];
+        for (bytes, want) in cases {
+            let shown = bytes.map(String::from_utf8_lossy);
+            assert_eq!(recorded_coordination(bytes), want, "{shown:?}");
+        }
+        // The text a refusal quotes.
+        assert_eq!(
+            UnknownStamp("\"barrier\"".to_string()).to_string(),
+            "\"barrier\""
+        );
+        assert_eq!(NotJson.to_string(), "not JSON");
+        assert_eq!(NotAnObject.to_string(), "not a JSON object");
+    }
+
+    /// The coverage rule over hand vectors: a held frame is no gap, and the
+    /// first unheld one in RECORD order is named with where its writer's held
+    /// frames begin.
+    #[test]
+    fn the_first_named_frame_the_capture_does_not_hold_is_the_gap() {
+        const V: u64 = 0x0bad_cafe;
+        let map = std::collections::BTreeMap::from([
+            // Unsorted, with a repeat: the constructor orders them.
+            (W, held("/p/ticker/cmd", &[6, 3, 5, 3])),
+            (V, held("/p/odom", &[0, 1])),
+        ]);
+        let gap = |step, writer, sequence, from: Option<(&str, u32)>| FrameGap {
+            step,
+            writer,
+            sequence,
+            held_from: from.map(|(topic, first_sequence)| HeldFrom {
+                topic: topic.to_string(),
+                first_sequence,
+            }),
+        };
+        assert_eq!(first_frame_gap(&[], &map), None, "no read names nothing");
+        assert_eq!(
+            first_frame_gap(&[named(3, W, 3), named(5, W, 5), named(1, V, 1)], &map),
+            None,
+            "every named frame is held"
+        );
+        assert_eq!(
+            first_frame_gap(&[named(1, W, 1), named(2, W, 2)], &map),
+            Some(gap(1, W, 1, Some(("/p/ticker/cmd", 3)))),
+            "below the first held frame"
+        );
+        assert_eq!(
+            first_frame_gap(&[named(3, W, 3), named(4, W, 4)], &map),
+            Some(gap(4, W, 4, Some(("/p/ticker/cmd", 3)))),
+            "a hole between held frames"
+        );
+        assert_eq!(
+            first_frame_gap(&[named(7, W, 7)], &map),
+            Some(gap(7, W, 7, Some(("/p/ticker/cmd", 3)))),
+            "past the last held frame"
+        );
+        assert_eq!(
+            first_frame_gap(&[named(1, V, 0), named(2, 0xFEED, 0)], &map),
+            Some(gap(2, 0xFEED, 0, None)),
+            "a writer the capture holds nothing of, and V's sequence 0 is held"
+        );
+        assert_eq!(
+            first_frame_gap(&[named(9, W, 9), named(1, W, 1)], &map),
+            Some(gap(9, W, 9, Some(("/p/ticker/cmd", 3)))),
+            "record order, not the lowest step"
+        );
+        let empty = std::collections::BTreeMap::from([(W, held("/p/ticker/cmd", &[]))]);
+        assert_eq!(
+            first_frame_gap(&[named(1, W, 1)], &empty),
+            Some(gap(1, W, 1, None)),
+            "an entry holding no sequence holds nothing"
+        );
+    }
+
+    /// The coverage gate is asked LAST on both paths, after every arm the
+    /// replay's resume resolves, so each existing refusal keeps its place.
+    #[test]
+    fn the_coverage_gate_is_asked_after_every_other_arm() {
+        let nodes = vec!["a".to_string()];
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let missing = [1u32];
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                frame_gap: Some(late_gap()),
+                ..healthy(&nodes, &anchors)
+            }),
+            Err(ResimGap::FrameNotHeld {
+                resume_step: 41,
+                gap: late_gap(),
+            })
+        );
+        assert!(
+            matches!(
+                judge_resimmable(&ResimFacts {
+                    frame_gap: Some(late_gap()),
+                    ..healthy(&nodes, &[])
+                }),
+                Err(ResimGap::AnchorIncomplete { .. })
+            ),
+            "an incomplete anchor is named first"
+        );
+        for first in [0, 41] {
+            assert_eq!(
+                judge_resimmable(&ResimFacts {
+                    first_recorded_step: Some(first),
+                    ranks_without_a_kept_step: &missing,
+                    frame_gap: Some(late_gap()),
+                    ..healthy(&nodes, &anchors)
+                }),
+                Err(ResimGap::RankWithoutCompleteStep { ranks: vec![1] }),
+                "a rank with no step is named first, step {first}"
+            );
+        }
+        // The from-start path asks it too: no anchor repairs a missing frame.
+        assert_eq!(
+            judge_resimmable(&ResimFacts {
+                first_recorded_step: Some(0),
+                frame_gap: Some(late_gap()),
+                ..healthy(&[], &[])
+            }),
+            Err(ResimGap::FrameNotHeld {
+                resume_step: 0,
+                gap: late_gap(),
+            })
+        );
+    }
+
+    /// Each lead names the topic, the step, the writer and both sequences, and
+    /// says what to do.
+    #[test]
+    fn the_frame_not_held_reason_names_the_frame_and_the_remedy() {
+        let reason = |resume_step, step, sequence, first: Option<u32>| {
+            ResimGap::FrameNotHeld {
+                resume_step,
+                gap: FrameGap {
+                    step,
+                    writer: W,
+                    sequence,
+                    held_from: first.map(|first_sequence| HeldFrom {
+                        topic: "/p/ticker/cmd".to_string(),
+                        first_sequence,
+                    }),
+                },
+            }
+            .reason()
+        };
+        assert_eq!(
+            reason(1, 1, 1, Some(3)),
+            "this capture's frames on '/p/ticker/cmd' from writer 42cbecd9a96b9f36 begin at \
+             sequence 3, but its trace resumes at step 1, whose read of that topic names sequence \
+             1, a frame the capture never held: its frames on that topic start later than the \
+             checkpoint this capture resumes from, because the recorder's taps attached after it, \
+             as in a capture taken in the first seconds of a run, or because the window let them \
+             go. `cerulion bag play --resim all --verify` cannot judge it. The frames, the state \
+             and the trace are in the bag and readable. A capture taken more than one Flashback window \
+             into the run (`CERULION_FLASHBACK_WINDOW_MS`) resumes from a checkpoint its frames \
+             cover, and `cerulion graph run --record` records a run from its first step"
+        );
+        assert_eq!(
+            reason(1, 4, 4, Some(0)),
+            "this capture keeps a read at step 4 of '/p/ticker/cmd' that names writer \
+             42cbecd9a96b9f36, sequence 4, a frame its window lost: the window recorder could \
+             not keep up with that topic. `cerulion bag play --resim all --verify` cannot judge \
+             it. The frames, the state and the trace are in the bag and readable. `cerulion graph \
+             run --record` records every frame of a run"
+        );
+        for (text, clause) in [
+            // A first missing read after the resume step names both steps.
+            (
+                reason(1, 4, 2, Some(3)),
+                "resumes at step 1, and its read at step 4 of that topic names sequence 2,",
+            ),
+            // A from-start capture has no checkpoint to name.
+            (
+                reason(0, 0, 0, Some(3)),
+                "start later than the run's first step,",
+            ),
+            // A writer the capture holds nothing of.
+            (
+                reason(1, 1, 0, None),
+                "this capture holds no frame from writer 42cbecd9a96b9f36, but its trace resumes \
+                 at step 1, whose read names that writer's sequence 0, a frame the capture never \
+                 held: its frames from that writer start later than the checkpoint",
+            ),
+        ] {
+            assert!(text.contains(clause), "{clause:?} in {text}");
         }
     }
 
@@ -1116,6 +1720,9 @@ mod tests {
             trace_gap: None,
             min_recorded_step: Some(41),
             max_recorded_step: Some(45),
+            // Every frame the kept reads name is held, so the coverage gate is
+            // inert unless an arm says otherwise.
+            frame_gap: None,
         }
     }
 
@@ -1223,6 +1830,9 @@ mod tests {
             }),
             min_recorded_step: Some(38),
             max_recorded_step: Some(99),
+            // A missing frame too, hostile like the rest: the coverage gate is
+            // asked last.
+            frame_gap: Some(late_gap()),
         };
         assert_eq!(judge_resimmable(&facts), Err(ResimGap::NoTrace));
     }
@@ -1276,6 +1886,9 @@ mod tests {
             }),
             min_recorded_step: Some(38),
             max_recorded_step: Some(99),
+            // A missing frame too, hostile like the rest: the coverage gate is
+            // asked last.
+            frame_gap: Some(late_gap()),
         };
         assert_eq!(judge_resimmable(&facts), Err(ResimGap::NoGraph));
     }
@@ -2359,6 +2972,26 @@ mod tests {
             ResimGap::AmbiguousRun { runs: 2 },
             ResimGap::AnchorIncomplete {
                 detail: "node `a` has no state".to_string(),
+            },
+            // The coverage gate's three leads: frames that begin late, a frame
+            // the window lost, and a writer the capture holds nothing of.
+            ResimGap::FrameNotHeld {
+                resume_step: 41,
+                gap: late_gap(),
+            },
+            ResimGap::FrameNotHeld {
+                resume_step: 41,
+                gap: FrameGap {
+                    sequence: 44,
+                    ..late_gap()
+                },
+            },
+            ResimGap::FrameNotHeld {
+                resume_step: 41,
+                gap: FrameGap {
+                    held_from: None,
+                    ..late_gap()
+                },
             },
         ];
         let mut seen: Vec<String> = Vec::new();

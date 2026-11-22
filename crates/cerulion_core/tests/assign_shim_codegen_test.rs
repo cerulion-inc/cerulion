@@ -1183,7 +1183,7 @@ fn no_complex_schema_still_emits_recursion_terminators() {
 fn keyword_nested_child_leaf_shim_is_r_hash_stripped() {
     // Keyword-nested pin (codegen route — a real native schema
     // `autoware_perception_msgs::PredictedObject.shape` → `Shape.type` also
-    // has a COMPILE pin in tests/ui/pass/shim_assign_and_fill_from_passes.rs).
+    // has a COMPILE pin in node_macro_ui's tests/ui/pass/shim_assign_and_fill_from_passes.rs).
     // A nested child schema with a keyword `type` field must emit the
     // r#-STRIPPED assign shim ident `__cer_assign_type`, never the invalid
     // `__cer_assign_r#type` (which panics `format_ident!`).
