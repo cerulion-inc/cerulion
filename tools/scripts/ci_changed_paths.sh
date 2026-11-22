@@ -135,6 +135,7 @@ EVERY=all
 PACKAGING_PATHS='
 tools/scripts/build_deb.sh
 tools/scripts/test_build_deb.sh
+tools/scripts/stage_harness.sh
 tools/scripts/build_release_linux_container.sh
 tools/scripts/check_release_glibc.py
 tools/scripts/check_no_dev_issuer.sh
@@ -530,6 +531,7 @@ self_test() {
     # `<input paths>|<expected packaging>`; `;` separates paths.
     local packaging_cases='
 tools/scripts/build_deb.sh|true
+tools/scripts/stage_harness.sh|true
 tools/scripts/build_release_linux_container.sh|true
 tools/scripts/check_no_dev_issuer.sh|true
 docs/packaging/apt.md|true
@@ -771,7 +773,7 @@ $name
     esac
 
     # ---- THE EMERGENCY STOP DOES NOT BREAK THIS GATE ---------------------
-    # `lint` runs this self-test with the workflow-level environment, so the
+    # `lint-gates` runs this self-test with the workflow-level environment, so the
     # repository variable `CI_SELECTION=off` reaches it. Every arm above pins
     # the switch, and this arm proves it by running the WHOLE suite again with
     # the variable set: turning the selection off must red nothing.

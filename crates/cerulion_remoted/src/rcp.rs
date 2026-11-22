@@ -2158,6 +2158,10 @@ pub(crate) struct RcpdEstop {
     retry_first: Duration,
     /// The longest wait between two attempts.
     retry_cap: Duration,
+    /// TEST SEAM: how long each delivery's mark waits, once it has cleared
+    /// `running`, before it writes its line, if it writes one.
+    #[cfg(test)]
+    mark_line_delay: Duration,
     /// `true` once the daemon stops; a delivery ends when it reads `true` or
     /// this sender is dropped.
     stop: watch::Sender<bool>,
@@ -2260,6 +2264,8 @@ impl RcpdEstop {
             runtime,
             retry_first: OPS_ESTOP_RETRY_FIRST,
             retry_cap: OPS_ESTOP_RETRY_CAP,
+            #[cfg(test)]
+            mark_line_delay: Duration::ZERO,
             stop: watch::channel(false).0,
             task: Mutex::new(None),
         }
@@ -2320,6 +2326,8 @@ impl RcpdEstop {
                 by: hex::encode(first),
                 attempts: 0,
                 answered_at_start: None,
+                #[cfg(test)]
+                line_delay: self.mark_line_delay,
             },
             target: self.target.clone(),
             shared: self.shared.clone(),
@@ -2384,6 +2392,10 @@ struct Running {
     /// `DELETE`; `None` until then and again once the delivery sends once
     /// more.
     answered_at_start: Option<u64>,
+    /// TEST SEAM: how long the drop waits, once it has cleared `running`,
+    /// before it writes its line, if it writes one.
+    #[cfg(test)]
+    line_delay: Duration,
 }
 
 impl Drop for Running {
@@ -2391,6 +2403,8 @@ impl Drop for Running {
         let Some(engages) = self.owing.clear_mark(self.id) else {
             return;
         };
+        #[cfg(test)]
+        std::thread::sleep(self.line_delay);
         match self
             .answered_at_start
             .map(|at_start| after_answer(at_start, engages))
@@ -3545,6 +3559,15 @@ mod tests {
         .await;
     }
 
+    /// Wait until the task of the latest delivery started on `rcpd` ends. Its
+    /// mark drops inside that task, so any line the mark writes is written
+    /// before the task ends.
+    async fn until_task_ends(rcpd: &RcpdEstop) {
+        let task = rcpd.task.lock().unwrap().take();
+        let (_, task) = task.expect("no delivery task was stored");
+        within("the delivery's task ends", task).await.unwrap();
+    }
+
     /// Wait on this thread, within 20 s, until `done` holds.
     fn until_blocking(what: &str, done: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
@@ -4187,12 +4210,15 @@ mod tests {
         });
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    #[tracing_test::traced_test]
-    async fn a_delivery_rcpd_never_answers_ends_when_the_daemon_shuts_down() {
+    /// Start a delivery to an rcpd that never answers and stop it with
+    /// `shut_down`, then engage once more and wait for that delivery's task;
+    /// each mark waits `line_delay` between clearing `running` and writing
+    /// its end line.
+    async fn stop_an_unanswered_delivery_then_engage_again(line_delay: Duration) {
         let dir = tempfile::tempdir().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let rcpd = sender_to(dir.path(), listener.local_addr().unwrap());
+        let mut rcpd = sender_to(dir.path(), listener.local_addr().unwrap());
+        rcpd.mark_line_delay = line_delay;
         assert!(rcpd.send(&[1; 32]));
         let (_held, _) = within("the estop connects", listener.accept())
             .await
@@ -4209,14 +4235,42 @@ mod tests {
             rcpd.send(&[2; 32]),
             "an engage after the stop started nothing"
         );
-        until_delivered(&rcpd).await;
+        until_task_ends(&rcpd).await;
+    }
+
+    /// Whether the captured lines hold exactly two early-end lines, at error,
+    /// each for one attempt under `[1; 32]`.
+    fn two_early_ends_for_one_attempt(logs: &[&str]) -> Result<(), String> {
         let by = format!("by={}", hex::encode([1u8; 32]));
-        logs_assert(|logs| {
-            match lines_with(logs, &[ENDED_EARLY, "ERROR", "attempts=1", &by]).len() {
-                2 => Ok(()),
-                n => Err(format!("{n} early-end lines")),
-            }
-        });
+        match lines_with(logs, &[ENDED_EARLY, "ERROR", "attempts=1", &by]).len() {
+            2 => Ok(()),
+            n => Err(format!("{n} early-end lines")),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn a_delivery_rcpd_never_answers_ends_when_the_daemon_shuts_down() {
+        stop_an_unanswered_delivery_then_engage_again(Duration::ZERO).await;
+        logs_assert(two_early_ends_for_one_attempt);
+    }
+
+    /// A mark clears `running` before it writes its end line. Here each
+    /// mark writes its line at least 50 ms after it clears `running`, and
+    /// the count taken once the delivery's task ends finds both lines.
+    #[tokio::test(flavor = "multi_thread")]
+    #[tracing_test::traced_test]
+    async fn an_end_line_written_50_ms_after_the_mark_clears_is_counted_once_the_task_ends() {
+        let delay = Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        stop_an_unanswered_delivery_then_engage_again(delay).await;
+        logs_assert(two_early_ends_for_one_attempt);
+        // `shut_down` awaits the first mark's task and `until_task_ends` the
+        // second's, so the span holds both waits.
+        assert!(
+            started.elapsed() >= 2 * delay,
+            "the marks did not wait {delay:?} each before their lines"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4699,6 +4753,7 @@ mod tests {
             by: hex::encode([id as u8; 32]),
             attempts: 1,
             answered_at_start,
+            line_delay: Duration::ZERO,
         };
         // A delivery that no longer runs leaves the running one alone, even
         // one whose answered attempt began before the engage counted since.
@@ -4966,6 +5021,7 @@ mod tests {
                 by: hex::encode([7u8; 32]),
                 attempts: 1,
                 answered_at_start,
+                line_delay: Duration::ZERO,
             };
             tracing::subscriber::with_default(watch, || drop(mark));
             assert_eq!(

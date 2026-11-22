@@ -83,7 +83,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "android_e2e_demand_probe"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
  "native_ros2_messages",
@@ -1129,7 +1129,7 @@ dependencies = [
 
 [[package]]
 name = "cerud"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerud",
  "cerulion_ops_proto",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
  "cerulion_macros",
@@ -1217,14 +1217,14 @@ dependencies = [
 
 [[package]]
 name = "cerulion-wire"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "cerulion_accountd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_android",
  "cerulion_bag",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android_remote"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_android",
  "cerulion_core",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bag"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_core",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bagd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_bagd",
@@ -1333,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_bagd",
@@ -1362,7 +1362,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli_engine"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_accountd",
@@ -1410,7 +1410,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli_tui"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
@@ -1420,7 +1420,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_connectd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerud",
  "cerulion_core",
@@ -1442,7 +1442,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "bytemuck",
@@ -1505,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_dds"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "async-channel",
  "cerulion-ros2-client",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_discovery"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "dirs",
  "serde",
@@ -1530,7 +1530,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_heaphook"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libc",
  "tracing",
@@ -1538,7 +1538,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_hygiene"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libc",
  "rustix 1.1.6",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_link"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "iroh",
  "rustls",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_macros"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1573,7 +1573,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_mdns"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_discovery",
  "mdns-sd",
@@ -1586,7 +1586,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_msgio"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
@@ -1601,7 +1601,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_netd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
@@ -1634,7 +1634,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_node_abi"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libloading",
  "stabby",
@@ -1643,7 +1643,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_ops_proto"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -1654,7 +1654,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_pairing"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "data-encoding",
  "dirs",
@@ -1679,7 +1679,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_rcpd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerud",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_remoted"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerud",
  "cerulion_core",
@@ -1738,6 +1738,7 @@ dependencies = [
  "libc",
  "native_ros2_messages",
  "postcard",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "serial_test",
@@ -1753,7 +1754,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_telemetry"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "dirs",
  "reqwest",
@@ -1770,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_tf"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -1840,11 +1841,12 @@ dependencies = [
 
 [[package]]
 name = "cerulion_wireclient"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
  "cerulion_link",
+ "cerulion_ops_proto",
  "cerulion_pairing",
  "ed25519-dalek 2.2.0",
  "getrandom 0.4.3",
@@ -1860,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_wsd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_cli_engine",
  "cerulion_core",
@@ -2055,7 +2057,7 @@ dependencies = [
 
 [[package]]
 name = "codegen_fixture_msgs"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
 ]
@@ -2630,7 +2632,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 1.0.109",
+ "syn 2.0.114",
 ]
 
 [[package]]
@@ -2818,7 +2820,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3067,7 +3069,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3620,14 +3622,14 @@ dependencies = [
 
 [[package]]
 name = "heaphook_probe"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "heaphook_shim"
-version = "2.0.0"
+version = "2.1.0"
 
 [[package]]
 name = "heck"
@@ -4662,7 +4664,7 @@ version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "82cb6a9f675da968c63b6208c641b9dca58fc0133ae53375736b1767b0cab8bd"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5448,7 +5450,7 @@ dependencies = [
 
 [[package]]
 name = "native_ros2_messages"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
  "paste",
@@ -5625,6 +5627,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43794a0ace135be66a25d3ae77d41b91615fb68ae937f904090203e81f755b65"
 
 [[package]]
+name = "node_macro_ui"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+ "serde",
+ "trybuild",
+]
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5736,7 +5748,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6701,7 +6713,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn 2.0.114",
@@ -6806,7 +6818,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.5",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8197,7 +8209,7 @@ dependencies = [
 
 [[package]]
 name = "rmw_cerulion"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "bindgen 0.70.1",
  "cc",
@@ -8318,7 +8330,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8420,7 +8432,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8634,7 +8646,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5b55fb86dfd3a2f5f76ea78310a88f96c4ea21a3031f8d212443d56123fd0521"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9408,7 +9420,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9470,6 +9482,22 @@ dependencies = [
 
 [[package]]
 name = "test_node_hang_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_links_host_app"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "test_node_links_timer",
+]
+
+[[package]]
+name = "test_node_links_timer"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
@@ -9718,6 +9746,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "test_node_modified_raw_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
 name = "test_node_nondeterministic_cdylib"
 version = "0.1.0"
 dependencies = [
@@ -9737,7 +9773,6 @@ name = "test_node_raw_ffi_template_cdylib"
 version = "0.1.0"
 dependencies = [
  "cerulion_core",
- "native_ros2_messages",
 ]
 
 [[package]]
@@ -9755,6 +9790,22 @@ dependencies = [
  "cerulion_core",
  "native_ros2_messages",
  "stabby",
+]
+
+[[package]]
+name = "test_node_start_order_cons_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
+]
+
+[[package]]
+name = "test_node_start_order_prod_cdylib"
+version = "0.1.0"
+dependencies = [
+ "cerulion_core",
+ "native_ros2_messages",
 ]
 
 [[package]]
@@ -10083,7 +10134,7 @@ dependencies = [
  "indexmap 2.14.2",
  "serde_core",
  "serde_spanned",
- "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_datetime 1.1.3+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 0.7.14",
@@ -10100,21 +10151,21 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "1.1.1+spec-1.1.0"
+version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
+checksum = "173f25c883cd2176a2d8212155638c0a60d484a9d84546d270866f40f56b6e49"
 dependencies = [
  "serde_core",
 ]
 
 [[package]]
 name = "toml_edit"
-version = "0.25.15+spec-1.1.0"
+version = "0.25.19+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1340ea94a5856333492c9064b02c778b191dd2c853778d9609debdcdfea3a614"
+checksum = "dd43688c4858d7264ae1cf9a9f874a67c3feb74a883b1cd7bebd6a4ea8307218"
 dependencies = [
  "indexmap 2.14.2",
- "toml_datetime 1.1.1+spec-1.1.0",
+ "toml_datetime 1.1.3+spec-1.1.0",
  "toml_parser",
  "winnow 1.0.4",
 ]
@@ -10379,7 +10430,7 @@ version = "1.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
- "cfg-if 0.1.10",
+ "cfg-if 1.0.4",
  "static_assertions",
 ]
 
@@ -10926,7 +10977,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -306,6 +306,24 @@ jobs:
           cp docs/legal/NOTICE docs/legal/LICENSE-BSD-3-CLAUSE "$stage/"
           cp THIRD-PARTY-LICENSES.md "$stage/"
           chmod +x "$stage"/cerulion "$stage"/cerulion-netd "$stage"/cerulion-connectd "$stage"/cerulion-remoted
+          # The agent harness ships beside the binaries on every target: the
+          # CLI resolves `harness/` in its own directory, the sibling rule the
+          # rmw library and cerulion-connectd follow. The source is the tagged
+          # commit's tree exactly (no untracked, ignored or changed file), and
+          # stage_harness.sh copies it without its development files, refuses
+          # any entry that is not a regular file or directory, and removes
+          # group and other write.
+          if [ ! -d harness ] || [ -L harness ]; then
+            echo "::error::the tagged tree has no harness/ directory to ship beside the CLI"
+            exit 1
+          fi
+          stray=$(git status --porcelain --ignored -- harness)
+          if [ -n "$stray" ]; then
+            echo "::error::harness/ differs from the tagged commit:"
+            printf '%s\n' "$stray"
+            exit 1
+          fi
+          tools/scripts/stage_harness.sh harness "$stage/harness"
           case "$TARGET" in
             *-unknown-linux-gnu)
               rmw="$RUNNER_TEMP/rmw/librmw_cerulion.so"
@@ -319,7 +337,10 @@ jobs:
               chmod +x "$stage/libcerulion_heaphook.so"
               ;;
           esac
-          tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
+          # COPYFILE_DISABLE keeps macOS tar from adding `._` metadata files
+          # for any extended attribute, so every archive holds the staged
+          # files and nothing else.
+          COPYFILE_DISABLE=1 tar czf "$archive" -C "$RUNNER_TEMP" "$stem"
           if command -v sha256sum >/dev/null 2>&1; then
             (cd "$RUNNER_TEMP" && sha256sum "$stem.tar.gz" > "$stem.tar.gz.sha256")
           else
@@ -516,11 +537,22 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Download the Lyrical rmw libraries
+      # One download per target, by name, into a folder named for its
+      # artifact, which is where the packaging step below reads each library.
+      # A pattern download does not pin that folder: download-artifact v5 and
+      # later extract a pattern that matches one artifact straight into
+      # `path`, without the artifact-name folder.
+      - name: Download the Lyrical rmw library for x86_64
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          pattern: rmw-lyrical-*
-          path: rmw-lyrical
+          name: rmw-lyrical-x86_64-unknown-linux-gnu
+          path: rmw-lyrical/rmw-lyrical-x86_64-unknown-linux-gnu
+
+      - name: Download the Lyrical rmw library for aarch64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: rmw-lyrical-aarch64-unknown-linux-gnu
+          path: rmw-lyrical/rmw-lyrical-aarch64-unknown-linux-gnu
 
       # The Lyrical rmw is a separate asset: the library bakes in the distro it
       # was built for and refuses a mismatched ROS_DISTRO, and the CLI looks for
@@ -734,6 +766,39 @@ jobs:
                 { echo "::error::the installer did not place $library beside the CLI"; exit 1; }
             done
           fi
+          # Every archive of a tag whose tree holds harness/ carries it, and
+          # the installer places it beside the CLI byte for byte: the tree the
+          # tag's stage_harness.sh stages from it. A tag cut before harness/
+          # existed carries none.
+          if [ -d source-checkout/harness ]; then
+            if [ ! -d "$RUNNER_TEMP/cerulion-bin/harness" ] || [ -L "$RUNNER_TEMP/cerulion-bin/harness" ]; then
+              echo "::error::the installer did not place harness/ beside the CLI"
+              exit 1
+            fi
+            want="$RUNNER_TEMP/harness-want"
+            source-checkout/tools/scripts/stage_harness.sh source-checkout/harness "$want"
+            diff -r "$want" "$RUNNER_TEMP/cerulion-bin/harness" ||
+              { echo "::error::the installed harness/ differs from the tag's staged harness"; exit 1; }
+            # diff compares bytes only; the executable files must match too.
+            (cd "$want" && find . -type f -perm -0100 | LC_ALL=C sort) > "$RUNNER_TEMP/harness-exec.want"
+            (cd "$RUNNER_TEMP/cerulion-bin/harness" && find . -type f -perm -0100 | LC_ALL=C sort) > "$RUNNER_TEMP/harness-exec.got"
+            diff "$RUNNER_TEMP/harness-exec.want" "$RUNNER_TEMP/harness-exec.got" ||
+              { echo "::error::the installed harness/ marks other files executable than the tag's staged harness"; exit 1; }
+          fi
+
+      # The installed harness is the one the benchmark measured. With no
+      # CERULION_HARNESS_DIR and no source checkout around the install
+      # directory, `cerulion rcp bench --verify` can only find the harness
+      # beside the installed CLI; it hashes the measured code there against
+      # the harness's provenance manifests, installs nothing and needs only
+      # python3. A tag cut before harness/ existed has nothing to verify.
+      - name: Verify the installed harness
+        run: |
+          if [ ! -d source-checkout/harness ]; then
+            echo "$TAG predates the harness; nothing to verify"
+            exit 0
+          fi
+          env -u CERULION_HARNESS_DIR "$RUNNER_TEMP/cerulion-bin/cerulion" rcp bench --verify
 
       # release.yml publishes on the SAME tag push and verifies all 20 crates
       # before uploading — measured 30 min on a cold hosted runner — so the

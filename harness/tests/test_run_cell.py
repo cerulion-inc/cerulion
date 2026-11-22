@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """run-cell, the engine behind cerulion rcp bench: what it refuses before anything starts, the one test request
-to the model endpoint, and the row it reads from a scored episode. Standard library only: the endpoint is a
-server on the loopback address inside the test, and the episode results are hand-written fixtures."""
+to the model endpoint, where its scratch folder goes, and the row and the prices it reads from a scored episode.
+Standard library only: the endpoint is a server on the loopback address inside the test, and the episode results
+are hand-written fixtures. A whole run and its interrupts: test_run_cell_episode.py."""
 import contextlib
 import http.server
 import io
 import json
 import os
 import pathlib
+import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -186,6 +189,22 @@ class Endpoint(unittest.TestCase):
         self.assertEqual(auth, "Bearer " + KEY)
         self.assertEqual(body["model"], "gemini-3.8-flash")
 
+    def test_the_request_adds_the_object_every_request_body_adds(self):
+        # As cmd_run_cell sets it for OpenRouter: the provider pin is tried before any simulator starts.
+        ns = self.ns()
+        ns.extra_body = '{"reasoning_effort": "high", "provider": {"only": ["google-vertex"]}}'
+        self.assertIsNone(cli.endpoint_refusal(ns))
+        self.assertEqual(self.seen[0][2], {"model": "gemini-3.8-flash", "messages": [
+            {"role": "user", "content": "Reply with the word ok."}], "reasoning_effort": "high",
+            "provider": {"only": ["google-vertex"]}})
+        self.seen.clear()
+        self.assertIsNone(cli.endpoint_refusal(self.ns()))   # none set: the model and the message only
+        self.assertEqual(sorted(self.seen[0][2]), ["messages", "model"])
+        self.seen.clear()
+        ns.extra_body = '{"reasoning_effort": null, "provider": {"only": ["google-vertex"]}}'
+        self.assertIsNone(cli.endpoint_refusal(ns))   # null drops its key, as in the operator's bodies
+        self.assertEqual(sorted(self.seen[0][2]), ["messages", "model", "provider"])
+
     def test_a_url_that_already_names_the_route_is_used_as_it_is(self):
         self.assertIsNone(cli.endpoint_refusal(self.ns(self.url + "/chat/completions/")))
         self.assertEqual(self.seen[0][0], "/v1/chat/completions")
@@ -270,6 +289,21 @@ class Results(unittest.TestCase):
         self.assertEqual(row["list_price_usd"], 0.1125)
         self.assertEqual(row["price_table"], {"key": "gemini-3.8-flash", "date": "2026-11-17"})
 
+    def test_a_row_read_after_the_tables_date_records_its_own_date(self):
+        write_json(os.path.join(self.group, CELL + ".json"), {"success": True, "grid": {"attempt": 1}})
+        logs = os.path.join(self.group, "_episodes", CELL, "a1")
+        os.makedirs(logs)
+        usage = {"prompt_tokens": 100_000, "completion_tokens": 10_000,
+                 "prompt_tokens_details": {"cached_tokens": 40_000}}
+        with open(os.path.join(logs, "operator.jsonl"), "w", encoding="utf-8") as f:
+            f.write(json.dumps({"kind": "reply", "usage": usage}) + "\n")
+        ns = cli.parser().parse_args(["run-cell", "--model", "google/gemini-4-neon", "--out", self.out])
+        row = cli.read_result(ns, "rcp", self.out)
+        # gemini-4-neon: 60,000 x 3.00 + 40,000 x 0.15 + 10,000 x 15.00 = 0.18 + 0.006 + 0.15 = 0.336 USD.
+        self.assertEqual(row["list_price_usd"], 0.336)
+        self.assertEqual(row["price_table"], {"key": "gemini-4-neon", "date": "2026-11-21"})
+        self.assertEqual(cli.cost_text(row), "0.3360 USD at list price (the package's price table of 2026-11-21)")
+
     def test_a_model_the_price_table_lacks_has_no_price(self):
         write_json(os.path.join(self.out, "rcp", "libero_pro", "run_with", CELL + ".json"), {"success": False})
         ns = cli.parser().parse_args(["run-cell", "--model", "a-local-model", "--out", self.out])
@@ -294,6 +328,167 @@ class Results(unittest.TestCase):
             f.write("{")
         row = cli.read_result(args("--out", self.out), "rcp", self.out)
         self.assertEqual(row["state"], "not started")
+
+
+class Scratch(unittest.TestCase):
+    """The scratch folder: a new short folder under /tmp, and the socket paths an episode binds under it."""
+
+    def setUp(self):
+        self.base = tempfile.mkdtemp(dir="/tmp")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.base, ignore_errors=True))
+
+    def test_the_longest_socket_path_is_the_plain_setups_truth_socket_of_the_last_attempt(self):
+        # "/w" + "/p" + "/run_without" + "/_scoring" + "/pro_spatial_swap_t00_i00_a3" + "/truth.sock"
+        # = 2 + 2 + 12 + 9 + 28 + 11 = 64 bytes
+        self.assertEqual(cli.longest_socket_path("/w", "run", CELL), 64)
+        self.assertEqual(cli.longest_socket_path("/w", "longer", CELL), 67)
+
+    def test_a_new_folder_under_the_parent_each_time(self):
+        first, second = cli.scratch_for(self.base), cli.scratch_for(self.base)
+        self.assertNotEqual(first, second)
+        for path in (first, second):
+            self.assertEqual(os.path.dirname(path), self.base)
+            self.assertRegex(os.path.basename(path), r"^cerulion-bench-[A-Za-z0-9_]{8}$")
+            self.assertTrue(os.path.isdir(path))
+
+    def test_the_default_folder_leaves_room_for_every_socket_path(self):
+        # "/tmp/cerulion-bench-" and 8 characters: 28 bytes; then "/p/", the label, "_without/_scoring/", the
+        # cell, "_a3/truth.sock": 59 bytes and the label. The default label "run": 90; a label of 16 fits in 103.
+        path = os.path.join(cli.SCRATCH_PARENT, cli.SCRATCH_PREFIX + "x" * 8)
+        self.assertEqual(len(path), 28)
+        self.assertEqual(cli.longest_socket_path(path, "run", CELL), 90)
+        self.assertEqual(cli.longest_socket_path(path, "l" * 16, CELL), 103)
+        self.assertEqual(cli.longest_socket_path(path, "l" * 17, CELL), 104)
+
+    def test_a_label_too_long_for_any_scratch_folder_is_refused_before_start(self):
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": KEY}, clear=True):
+            ns = args("--base-url", "http://127.0.0.1:9/v1", "--out", os.path.join(self.base, "o"),
+                      "--label", "l" * 17)
+            code, text = cli.refusal_before_start(ns, ["plain"])
+            self.assertEqual(code, 2)
+            self.assertEqual(text, "the episode's socket paths under /tmp would be longer than 103 bytes: use a "
+                                   "shorter --label")
+            ns = args("--base-url", "http://127.0.0.1:9/v1", "--out", os.path.join(self.base, "o"),
+                      "--work", self.base + "/" + "w" * 60)
+            code, text = cli.refusal_before_start(ns, ["plain"])
+            self.assertEqual(code, 2)
+            self.assertTrue(text.endswith("use a shorter --label or --work"), text)
+
+    def test_a_base_url_that_is_not_http_with_a_host_is_refused_before_start(self):
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": KEY}, clear=True):
+            for url in ("ftp://example.com/v1", "example.com/v1", "http://", "http://[::1"):
+                code, text = cli.refusal_before_start(args("--base-url", url, "--out", self.base), ["plain"])
+                self.assertEqual((code, text), (2, f"the base URL must be http or https with a host, not {url!r}"))
+
+
+class Prices(unittest.TestCase):
+    """The cost a scored row prints: the package's list price, and the endpoint's own figure when it gives one."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.out = self.tmp.name
+        self.group = os.path.join(self.out, "rcp", "libero_pro", "run_with")
+        write_json(os.path.join(self.group, CELL + ".json"), {"success": True, "grid": {"attempt": 1}})
+        os.makedirs(os.path.join(self.group, "_episodes", CELL, "a1"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def log(self, *usages):
+        with open(os.path.join(self.group, "_episodes", CELL, "a1", "operator.jsonl"), "w", encoding="utf-8") as f:
+            for u in usages:
+                f.write(json.dumps({"kind": "reply", "usage": u}) + "\n")
+
+    def test_both_prices_are_read_and_labelled(self):
+        # gemini-3.8-flash, per reply: 50,000 x 0.75 + 150,000 x 0.075 + 2,000 x 3.75 = 0.05625 USD; two: 0.1125.
+        usage = {"prompt_tokens": 200_000, "completion_tokens": 2_000,
+                 "prompt_tokens_details": {"cached_tokens": 150_000}}
+        self.log(dict(usage, cost=0.06), dict(usage, cost=0.07))
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        self.assertEqual((row["list_price_usd"], row["reported_usd"], row["reported_cost_replies"],
+                          row["usage_replies"]), (0.1125, 0.13, 2, 2))
+        self.assertEqual(cli.cost_text(row), "0.1125 USD at list price (the package's price table of 2026-11-17); "
+                                             "0.1300 USD reported by the endpoint (usage.cost of 2 of 2 replies)")
+
+    def test_an_endpoint_that_reports_no_cost_shows_the_list_price_only(self):
+        self.log({"prompt_tokens": 1_000_000, "completion_tokens": 0}, {"prompt_tokens": 0, "cost": "free"})
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        self.assertEqual((row["reported_usd"], row["reported_cost_replies"]), (None, 0))
+        self.assertEqual(cli.cost_text(row), "0.7500 USD at list price (the package's price table of 2026-11-17)")
+
+    def test_a_cost_on_some_replies_says_on_how_many(self):
+        self.log({"prompt_tokens": 0, "cost": 0.25}, {"prompt_tokens": 0})
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        self.assertTrue(cli.cost_text(row).endswith("; 0.2500 USD reported by the endpoint (usage.cost of 1 of 2 "
+                                                    "replies)"), cli.cost_text(row))
+
+    def test_a_model_the_table_lacks_still_shows_the_endpoints_figure(self):
+        self.log({"prompt_tokens": 10, "cost": 0.5})
+        ns = cli.parser().parse_args(["run-cell", "--model", "a-local-model", "--out", self.out])
+        row = cli.read_result(ns, "rcp", self.out)
+        self.assertEqual(cli.cost_text(row), "no list price for this model name in the package's price table; "
+                                             "0.5000 USD reported by the endpoint (usage.cost of 1 of 1 replies)")
+
+    def test_the_verdict_lines(self):
+        self.log({"prompt_tokens": 1_000_000, "completion_tokens": 0, "cost": 0.8})
+        row = cli.read_result(args("--out", self.out), "rcp", self.out)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            cli.show(row)
+            cli.show({"arm": "plain", "scored": False, "state": "failed", "reasons": ["endpoint", "endpoint"]})
+        self.assertEqual(out.getvalue().splitlines(), [
+            "  rcp    solved: True  within the published step limit: None  false claim: None",
+            "         replies: None  control steps: None  operator seconds: None",
+            "         cost: 0.7500 USD at list price (the package's price table of 2026-11-17); 0.8000 USD reported "
+            "by the endpoint (usage.cost of 1 of 1 replies)",
+            "  plain  NOT SCORED: failed; endpoint; endpoint"])
+
+
+class Bytecode(unittest.TestCase):
+    """run-cell started without -B and without PYTHONDONTWRITEBYTECODE, in a copy of the harness folder: what it
+    imports from the folder, the plain tree builder among them, leaves no bytecode there but the package's own
+    first file's."""
+
+    def run_python(self, *flags):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = pathlib.Path(tmp.name)
+        shutil.copytree(pathlib.Path(cli.__file__).resolve().parent, root / "src" / "cerulion_harness",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        (root / "measured").mkdir()
+        (root / "measured" / "assemble.py").write_text("ABSENT_LIST = 'plain-absent.txt'\n", encoding="utf-8")
+        # -I: the environment's PYTHON* variables are not read, PYTHONDONTWRITEBYTECODE among them.
+        code = ("import runpy, sys; src, measured = sys.argv[1:3]; sys.path.insert(0, src); "
+                "from cerulion_harness import body_record, layout; layout.assembler(measured); "
+                "sys.argv[1:] = ['run-cell', '--model', 'm']; "
+                "runpy.run_module('cerulion_harness', run_name='__main__')")
+        done = subprocess.run([sys.executable, "-I", *flags, "-c", code, str(root / "src"), str(root / "measured")],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("no endpoint", done.stderr)
+        return sorted(str(p.relative_to(root)) for p in root.rglob("*.pyc"))
+
+    def test_only_the_packages_first_file_is_compiled_to_bytecode(self):
+        tag = sys.implementation.cache_tag
+        self.assertEqual(self.run_python(), [f"src/cerulion_harness/__pycache__/__init__.{tag}.pyc"])
+
+    def test_with_dash_b_nothing_is(self):
+        self.assertEqual(self.run_python("-B"), [])
+
+
+class PathsAsGiven(unittest.TestCase):
+    def test_a_folder_that_holds_a_result_is_named_as_given(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        cwd = os.getcwd()
+        os.chdir(tmp.name)
+        self.addCleanup(os.chdir, cwd)
+        write_json(os.path.join("o", "plain", "libero_pro", "run_without", CELL + ".json"), {})
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": KEY}, clear=True):
+            code, text = cli.refusal_before_start(args("--base-url", "http://127.0.0.1:9/v1", "--out", "o"), ["plain"])
+        self.assertEqual(text, f"o already holds a plain result of {CELL} (o/plain/libero_pro/run_without/"
+                               f"{CELL}.json), which the driver would report again instead of running a new episode: "
+                               f"name a new --out folder")
 
 
 if __name__ == "__main__":

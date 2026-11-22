@@ -607,6 +607,12 @@ CACHE_HIT_PREFIX_RE = re.compile(r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.cache-hit 
 STEP_OUTPUT_GUARD_RE = re.compile(
     r"^steps\.[A-Za-z0-9_.\-]+\.outputs\.[A-Za-z0-9_.\-]+ == '[A-Za-z0-9_.\-]+'$"
 )
+# The gate every step of a job whose `runs-on` follows the classifier's `code`
+# class carries. On a change that reaches no package that job's legs land on
+# another runner, and `runner.os` in the key then names THAT runner's
+# namespace, so a prune or save there would act on another job's archive. A
+# conjunct like the others, so it only ever narrows the gate.
+SELECTION_CODE_CLAUSE = "needs.changes.outputs.code == 'true'"
 TOOL_CACHE_PATH_RE = re.compile(r"^(?:~/\.cargo/bin/[A-Za-z0-9_.\-]+|"
                                 r"~/\.cache/cerulion-tool-tarballs)$")
 EVENT_NE_PULL_REQUEST = "github.event_name != 'pull_request'"
@@ -818,6 +824,8 @@ def classify_conjunct(part, ns_clauses):
         return "main-only"
     if part in ns_clauses:
         return "namespace"
+    if part == SELECTION_CODE_CLAUSE:
+        return "selection-code"
     if STEP_OUTPUT_GUARD_RE.match(part):
         return "step-output guard"
     return None
@@ -862,8 +870,16 @@ def _check_closed_conjunction(add, line, what, cond, allowed, ns_clauses):
 #
 #   prune  = [matrix.shard == 0 &&] [a step-output guard &&]
 #            github.event_name != 'merge_group' && <main-only>
+#            [&& needs.changes.outputs.code == 'true']
 #   save   = steps.<restore id>.outputs.cache-hit != 'true' && <the prune's if>
 #            && steps.cache-prune.outputs.proceed == 'true' && <namespace gate>
+#
+# The `code` conjunct is for a job whose runner follows that class. In a job
+# that needs `changes` it never narrows a default-branch run: the classifier
+# selects every package on `push` and `workflow_dispatch`, so `code` is `true`
+# there. In a job that does not, it reads the empty string, so that job's
+# prune and save never run and its namespace stays restore-only.
+# `ci_test_coverage_test` requires a routed job to need `changes`.
 #
 # The `proceed` conjunct is what keeps a default-branch run BEHIND THE TIP from
 # uploading. Such a run skips the prune (correctly: only the tip may delete) and
@@ -877,7 +893,7 @@ def _check_closed_conjunction(add, line, what, cond, allowed, ns_clauses):
 # time, so GitHub's idle eviction never fires on one). Now every default-branch
 # run of a job that has a prune step prunes, keeping exactly that job's current
 # key -- which empties a restore-only namespace, and that is the intent.
-PRUNE_ALLOWED = ("shard", "step-output guard", "merge-group", "main-only")
+PRUNE_ALLOWED = ("shard", "step-output guard", "merge-group", "main-only", "selection-code")
 SAVE_ALLOWED = ("cache-hit",) + PRUNE_ALLOWED + ("prune-proceed", "namespace")
 TOOL_CACHE_ALLOWED = ("cache-hit", "merge-group")
 
@@ -961,11 +977,16 @@ def _check_timings(add, job):
             add(step.line, code,
                 "step %r saves a cache before %r runs, so the archive carries the reports"
                 % (step.label(), collect.label()))
-    for step, want in ((collect, "always()"), (upload, "always()")):
-        if norm(step.cond) != want:
+    # A job whose runner follows the classifier's `code` class gates every step
+    # on it, these two included: its cache steps skip on the same legs, so no
+    # report is left for a save there.
+    timings_conds = ("always()", "always() && " + SELECTION_CODE_CLAUSE)
+    for step in (collect, upload):
+        if norm(step.cond) not in timings_conds:
             add(step.cond_line, code,
-                "step %r runs under %r; expected `if: %s`, so a red or timed-out job still "
-                "reports" % (step.label(), norm(step.cond) or None, want))
+                "step %r runs under %r; expected `if: always()` (or `always() && %s` in a "
+                "job routed by that class), so a red or timed-out job still reports"
+                % (step.label(), norm(step.cond) or None, SELECTION_CODE_CLAUSE))
     if collect.node.has("continue-on-error"):
         add(collect.line, code,
             "step %r carries `continue-on-error`; a collect step that fails must fail the job, "
@@ -1137,6 +1158,7 @@ def check_text(path, text):
 
             cond = norm(step.cond)
             _check_namespace_gate(add, step, key)
+            _check_one_writer(add, job, step, key, cond)
 
             # R2.
             if MAIN_ONLY_CLAUSE not in cond:
@@ -1245,6 +1267,66 @@ def _check_tool_cache(add, steps, index, step, key):
                 "TOOL_CACHE",
                 "tool-cache save step %r does not carry %s" % (label, wanted),
             )
+
+
+# The key segments R12 reads as one archive per shard: the shard number
+# itself, or nothing on shard 0 and `-shard<k>` on every other shard. Any other
+# expression naming `matrix.shard` can give two shards one key, so it is refused
+# rather than read.
+SHARD_KEY_SEGMENTS = (
+    "${{ matrix.shard }}",
+    "${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}",
+)
+
+
+def _job_declares_shard_matrix(job):
+    """Whether the job's matrix declares `shard`, as a key or in an `include` entry."""
+    strategy = job.node.get("strategy") if job.node.has("strategy") else None
+    if not isinstance(strategy, Map) or not strategy.has("matrix"):
+        return False
+    matrix = strategy.get("matrix")
+    if not isinstance(matrix, Map):
+        return False
+    if matrix.has("shard"):
+        return True
+    include = matrix.get("include") if matrix.has("include") else None
+    return isinstance(include, Seq) and any(
+        isinstance(entry, Map) and entry.has("shard") for entry in include.items
+    )
+
+
+def _check_one_writer(add, job, step, key, cond):
+    """R12. A lockfile-keyed save in a sharded job has ONE writer per archive.
+
+    `actions/cache` reserves a key at save time, so shards sharing one key race:
+    all but the first upload an archive that is refused, and which shard's build
+    lands is arbitrary. A save in a job whose matrix declares `shard` therefore
+    either runs on shard 0 alone (the `matrix.shard == 0` conjunct) or carries
+    one of SHARD_KEY_SEGMENTS in its key, so every shard writes an archive of
+    its own.
+    """
+    if not _job_declares_shard_matrix(job):
+        return
+    conjuncts, _ = split_conjuncts(cond)
+    if SHARD_CLAUSE in conjuncts or any(seg in key for seg in SHARD_KEY_SEGMENTS):
+        return
+    if "matrix.shard" in key:
+        add(
+            step.line,
+            "R12_ONE_WRITER",
+            "save step %r in sharded job %s names `matrix.shard` in its key in a form that "
+            "can give two shards one key; use one of %s, or run the save on shard 0 alone "
+            "(`%s`)"
+            % (step.label(), job.job_id, " or ".join(SHARD_KEY_SEGMENTS), SHARD_CLAUSE),
+        )
+        return
+    add(
+        step.line,
+        "R12_ONE_WRITER",
+        "save step %r in sharded job %s neither runs on shard 0 alone (`%s`) nor puts "
+        "`matrix.shard` in its key, so every shard races for one archive"
+        % (step.label(), job.job_id, SHARD_CLAUSE),
+    )
 
 
 def _check_namespace_gate(add, step, key):
@@ -1973,6 +2055,39 @@ def _mutants():
     clean = CLEAN_WORKFLOW
     out = []
 
+    # R12: the sharded job's save loses `matrix.shard == 0` (from the prune too,
+    # so R3 still pairs them) and keeps the shared key: every shard races.
+    shared = _mut(clean, "          matrix.shard == 0\n          && github.event_name != 'merge_group'\n",
+                  "          github.event_name != 'merge_group'\n")
+    shared = _mut(shared, "          && matrix.shard == 0\n", "", total=1)
+    out.append(("R12 sharded save on a shared key with no shard clause", shared, {"R12_ONE_WRITER"}))
+    # The near-miss: the same gates with the shard in the key, a namespace per
+    # shard and the gate naming it, is one writer per archive and passes.
+    seg = "${{ matrix.shard != 0 && format('-shard{0}', matrix.shard) || '' }}"
+    per_shard = shared.replace(
+        "cargo-${{ runner.os }}-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}",
+        "cargo-${{ runner.os }}" + seg + "-${{ github.ref == 'refs/heads/main' && 'main' || 'pr' }}-${{ hashFiles('**/Cargo.lock') }}",
+    )
+    per_shard = _mut(
+        per_shard,
+        "contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0} ', runner.os)))",
+        "contains(format(' {0} ', env.CACHE_SAVE_NAMESPACES), format(' {0}{1} ', runner.os, "
+        "matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))",
+    )
+    out.append(("R12 near-miss: a key per shard", per_shard, set()))
+    # A key that names the shard but gives shards 1 to 3 one value.
+    repeated = per_shard.replace(seg, "${{ matrix.shard != 0 && '-shard' || '' }}")
+    repeated = repeated.replace(
+        "matrix.shard != 0 && format('-shard{0}', matrix.shard) || '')))",
+        "matrix.shard != 0 && '-shard' || '')))",
+    )
+    assert repeated != per_shard
+    out.append(("R12 key names the shard but repeats a value", repeated, {"R12_ONE_WRITER"}))
+    # The shard declared through `include` entries is still a sharded job.
+    included = _mut(shared, "        shard: [0, 1, 2, 3]\n",
+                    "        include:\n          - shard: 0\n          - shard: 1\n")
+    out.append(("R12 shard declared by include entries", included, {"R12_ONE_WRITER"}))
+
     # R1: the lint job's token no longer matches its own key template.
     out.append((
         "R1 wrong token",
@@ -2175,6 +2290,17 @@ def _mutants():
         "          && steps.present.outputs.present == 'true'\n",
     )
     out.append(("R8 a reordered but complete conjunction passes", reordered, set()))
+    # R8: the `code` routing conjunct on both gates is a member of the set, and
+    # the same conjunct with its literal flipped is not.
+    routed = _mut(clean, CROSS_PRUNE_IF,
+                  CROSS_PRUNE_IF + "          && " + SELECTION_CODE_CLAUSE + "\n")
+    routed = _mut(routed, CROSS_SAVE_IF,
+                  CROSS_SAVE_IF + "          && " + SELECTION_CODE_CLAUSE + "\n")
+    out.append(("R8 the code routing conjunct on both gates passes", routed, set()))
+    flipped = SELECTION_CODE_CLAUSE.replace("'true'", "'false'")
+    inverted = _mut(clean, CROSS_PRUNE_IF, CROSS_PRUNE_IF + "          && " + flipped + "\n")
+    inverted = _mut(inverted, CROSS_SAVE_IF, CROSS_SAVE_IF + "          && " + flipped + "\n")
+    out.append(("R8 the code routing conjunct inverted", inverted, {"R8_CLOSED_CONJUNCTION"}))
     # R9: the container lane without the install step. `gh` and `jq` are on
     # every hosted image and on none of the ros: images.
     install_step = (
@@ -2373,6 +2499,18 @@ def _mutants():
     out.append((
         "TIMINGS a collect step that runs only on success",
         _mut(clean, collect_head + "        if: always()\n", collect_head),
+        {"TIMINGS_REPORTS"},
+    ))
+    out.append((
+        "TIMINGS both steps under always() and the code routing conjunct pass",
+        clean.replace("        if: always()\n",
+                      "        if: always() && needs.changes.outputs.code == 'true'\n"),
+        set(),
+    ))
+    out.append((
+        "TIMINGS a collect step under always() and another conjunct",
+        _mut(clean, collect_head + "        if: always()\n",
+             collect_head + "        if: always() && github.event_name == 'push'\n"),
         {"TIMINGS_REPORTS"},
     ))
     out.append((

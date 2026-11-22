@@ -1,32 +1,29 @@
-list,cell,arm,model,attempts,reason,usd_attempts,price_date
-grid,pro_goal_task_t01_i03,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.096694,2026-11-17
-grid,pro_goal_task_t02_i03,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,10.629089,2026-11-17
-grid,pro_goal_swap_t03_i07,with,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,8.309677,2026-11-17
-grid,pro_spatial_task_t00_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,1.702561,2026-11-17
-grid,pro_spatial_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.535052,2026-11-17
-grid,pro_spatial_task_t02_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,7.006863,2026-11-17
-grid,pro_object_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,3.284183,2026-11-17
-grid,pro_goal_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.435286,2026-11-17
-grid,pro_goal_swap_t02_i08,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.078206,2026-11-17
-grid,pro_goal_swap_t03_i08,with,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.882793,2026-11-17
-grid,pro_goal_task_t00_i04,with,Claude Fable 5.2,1,the 90 minute episode clock ran out,35.528882,2026-11-17
-grid,pro_goal_task_t00_i05,with,Claude Fable 5.2,1,the 90 minute episode clock ran out,29.146153,2026-11-17
-grid,pro_goal_swap_t03_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,7.142726,2026-11-17
-grid,pro_goal_swap_t05_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.998314,2026-11-17
-grid,pro_goal_task_t00_i03,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,9.393369,2026-11-17
-grid,pro_goal_task_t00_i03,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.588140,2026-11-17
-grid,pro_goal_task_t01_i03,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.386631,2026-11-17
-grid,pro_goal_swap_t05_i07,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,3.342496,2026-11-17
-grid,pro_goal_task_t01_i04,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,9.733755,2026-11-17
-grid,pro_goal_swap_t02_i08,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,10.472769,2026-11-17
-grid,pro_goal_task_t00_i05,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,8.602748,2026-11-17
-grid,pro_goal_task_t01_i05,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.044296,2026-11-17
-grid,pro_goal_swap_t02_i09,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,3.063606,2026-11-17
-grid,pro_goal_swap_t03_i09,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,5.466582,2026-11-17
-grid,pro_goal_swap_t09_i10,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,13.116084,2026-11-17
-grid,pro_goal_task_t01_i06,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.408195,2026-11-17
-grid,pro_goal_task_t02_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,4.711012,2026-11-17
-grid,pro_goal_task_t00_i04,without,Gemini 4 Argon,1,the 90 minute episode clock ran out,18.583132,2026-11-17
-grid,pro_goal_swap_t00_i08,without,Gemini 4 Argon,1,the 90 minute episode clock ran out,13.145591,2026-11-17
-grid,pro_goal_task_t01_i06,without,Gemini 4 Argon,1,the 90 minute episode clock ran out,3.246479,2026-11-17
-grid,pro_object_swap_t00_i03,without,Grok 4.7,1,the 90 minute episode clock ran out,2.346646,2026-11-17
+list,cell,arm,model,attempts,reason,usd_attempts,price_date,replies_tool_calls,replies_stop,replies_length,replies_content_filter,replies_other,requests_no_reply
+grid,pro_goal_task_t01_i03,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.096694,2026-11-17,3,0,0,0,0,23
+grid,pro_goal_task_t02_i03,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,10.629089,2026-11-17,87,0,0,0,0,59
+grid,pro_spatial_task_t00_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,1.702561,2026-11-17,35,0,0,0,0,56
+grid,pro_spatial_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.535052,2026-11-17,13,0,0,0,0,34
+grid,pro_spatial_task_t02_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,7.006863,2026-11-17,70,0,0,0,0,52
+grid,pro_object_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,3.284183,2026-11-17,46,0,0,0,0,48
+grid,pro_goal_task_t01_i04,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.435286,2026-11-17,10,0,0,0,0,31
+grid,pro_goal_swap_t02_i08,without,Claude Opus 5.5,3,the model endpoint answered rate limit on every attempt,0.078206,2026-11-17,3,0,0,0,0,20
+grid,pro_goal_task_t00_i03,with,Claude Fable 5.2,1,the 90 minute episode clock ran out,19.247276,2026-11-17,48,0,0,0,0,3
+grid,pro_goal_swap_t03_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,7.142726,2026-11-17,27,0,0,0,0,5
+grid,pro_goal_swap_t05_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.998314,2026-11-17,37,0,0,0,0,6
+grid,pro_goal_task_t00_i03,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,9.393369,2026-11-17,56,0,0,0,0,4
+grid,pro_goal_task_t00_i03,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.588140,2026-11-17,29,0,0,0,0,5
+grid,pro_goal_task_t01_i03,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.386631,2026-11-17,54,0,0,0,0,5
+grid,pro_goal_swap_t05_i07,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,3.342496,2026-11-17,22,0,0,0,0,6
+grid,pro_goal_task_t01_i04,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,9.733755,2026-11-17,41,0,0,0,0,7
+grid,pro_goal_swap_t02_i08,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,10.472769,2026-11-17,47,0,0,0,0,6
+grid,pro_goal_task_t00_i05,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,8.602748,2026-11-17,51,0,0,0,0,8
+grid,pro_goal_task_t01_i05,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.044296,2026-11-17,48,0,0,0,0,14
+grid,pro_goal_swap_t02_i09,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,3.063606,2026-11-17,20,0,0,0,0,5
+grid,pro_goal_swap_t03_i09,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,5.466582,2026-11-17,28,0,0,0,0,9
+grid,pro_goal_swap_t09_i10,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,13.116084,2026-11-17,55,0,0,0,0,3
+grid,pro_goal_task_t01_i06,with,Gemini 4 Carbon,1,the 90 minute episode clock ran out,6.408195,2026-11-17,47,0,0,0,0,3
+grid,pro_goal_task_t02_i06,without,Gemini 4 Carbon,1,the 90 minute episode clock ran out,4.711012,2026-11-17,26,0,0,0,0,5
+grid,pro_goal_task_t00_i04,without,Gemini 4 Argon,1,the 90 minute episode clock ran out,18.583132,2026-11-17,72,0,0,0,0,7
+grid,pro_goal_swap_t00_i08,without,Gemini 4 Argon,1,the 90 minute episode clock ran out,13.145591,2026-11-17,59,0,0,1,0,15
+grid,pro_goal_task_t01_i06,without,Gemini 4 Argon,1,the 90 minute episode clock ran out,3.246479,2026-11-17,23,0,0,0,0,3
+grid,pro_object_swap_t00_i03,without,Grok 4.7,1,the 90 minute episode clock ran out,2.346646,2026-11-17,78,0,0,0,0,35

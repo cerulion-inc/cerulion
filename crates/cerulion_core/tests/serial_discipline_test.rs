@@ -605,6 +605,12 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
         "self-re-exec entry point reporting the probe's env-resolved settings to its parent",
     ),
     (
+        "env_snapshot_isolation_test.rs",
+        "subprocess_child_builds_a_graph_and_prints_what_its_node_reads",
+        "child",
+        "self-re-exec entry point; a name or value that is not valid UTF-8 is set only in the child's environment, and the parent reads what its node read, what its builds left out and what it logged",
+    ),
+    (
         "reg_channel_iox2_test.rs",
         "subprocess_child_pump_panic_storm_probe",
         "child",
@@ -648,8 +654,8 @@ const IGNORED_ARM_INVENTORY: &[(&str, &str, &str, &str)] = &[
 /// assumed. A grep for the cfg ANYWHERE in the file would call
 /// `cross_thread_rtt_test` and `flat_latency_test` release-only; both are
 /// deliberately DEBUG-OK (their metric is a RATIO, which is build-mode
-/// invariant) and gate every pull request. That makes those two the members
-/// this fence matters most for — the release-only five run on push-to-main lanes
+/// invariant) and gate every pull request. The DEBUG-OK members are the ones
+/// this fence matters most for; the release-only seven run on push-to-main lanes
 /// where little else is competing for the machine.
 const TIMING_INVENTORY: &[(&str, &str)] = &[
     (
@@ -699,6 +705,16 @@ const TIMING_INVENTORY: &[(&str, &str)] = &[
     (
         "period_decompose_bench_test",
         "release-only per-hop decomposition bench",
+    ),
+    (
+        "period_park_iox2_test",
+        "runs live consumers and a 1 kHz ticker for counts and order only; \
+         DEBUG-OK, so it gates every PR, and a loaded runner slows its live runs",
+    ),
+    (
+        "period_park_latency_test",
+        "release-only: the period-park's frame delays and its 1 kHz grid against \
+         wall time",
     ),
     (
         "streaming_latency_bench_test",
@@ -1215,6 +1231,7 @@ fn serialised_packages_from_texts<'a>(
             for pkg in packages_named(line)
                 .into_iter()
                 .chain(shard_script_package(line))
+                .chain(shard_script_with_packages(line))
             {
                 map.entry(pkg).or_default().note(policy);
             }
@@ -1397,6 +1414,34 @@ fn shard_script_package(line: &str) -> Option<String> {
     })
 }
 
+/// The packages a `tools/scripts/ci_test_shard.sh` run line adds with
+/// `--with <package>`: the script runs their integration tests in the same
+/// `cargo nextest run`, so the line's policy is theirs too. Only on a run line,
+/// whose first argument after the script is the package; a `--list`,
+/// `--check` or `--selected` line runs nothing. The arguments end at the
+/// first `;`, `&&`, `||` or `|`, where the coverage walk's reader
+/// (`crates/cerulion_cli_engine/tests/ci_test_line/mod.rs`) ends the command
+/// too.
+fn shard_script_with_packages(line: &str) -> Vec<String> {
+    let line = line.replace(';', " ; ");
+    let toks: Vec<&str> = line.split_whitespace().collect();
+    let Some(at) = toks.iter().position(|t| t.contains("ci_test_shard.sh")) else {
+        return Vec::new();
+    };
+    let end = toks[at + 1..]
+        .iter()
+        .position(|t| matches!(*t, ";" | "&&" | "||" | "|"))
+        .map_or(toks.len(), |n| at + 1 + n);
+    let args = &toks[at + 1..end];
+    if args.first().is_none_or(|first| first.starts_with('-')) {
+        return Vec::new();
+    }
+    args.windows(2)
+        .filter(|pair| pair[0] == "--with")
+        .map(|pair| pair[1].to_string())
+        .collect()
+}
+
 /// `true` when a `cargo test` invocation is capable of running a file under a
 /// package's `tests/` directory — which is this gate's ENTIRE scope.
 ///
@@ -1515,6 +1560,48 @@ fn the_workflow_reader_finds_packages_and_their_thread_policy() {
          `cargo nextest run` — so the package must read as NEXTEST (and never as parallel). \
          Got {core:?}; if `ci_test_shard.sh` moved back to `cargo test`, this reader and the \
          fence must move with it."
+    );
+
+    // A `--with` package rides the same nextest invocation, so the shard line
+    // reads as NEXTEST for it too; a `--list` line runs nothing.
+    assert_eq!(
+        shard_script_with_packages(
+            "        run: ./tools/scripts/ci_test_shard.sh cerulion_core ${{ matrix.shard }} 4 --with alpha --with beta"
+        ),
+        vec!["alpha".to_string(), "beta".to_string()]
+    );
+    assert_eq!(
+        shard_script_with_packages(
+            "        run: args=$(./tools/scripts/ci_test_shard.sh --list cerulion_core 2 4 --with alpha)"
+        ),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        shard_script_with_packages(
+            "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4"
+        ),
+        Vec::<String>::new()
+    );
+    for other_command in [
+        "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4; echo --with alpha",
+        "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4 && echo --with alpha",
+        "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4 || echo --with alpha",
+        "        run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4 | tee --with alpha",
+    ] {
+        assert_eq!(
+            shard_script_with_packages(other_command),
+            Vec::<String>::new(),
+            "`--with` after a command separator belongs to the next command: {other_command}"
+        );
+    }
+    let with_line = "jobs:\n  a:\n    steps:\n      - run: ./tools/scripts/ci_test_shard.sh cerulion_core 2 4 --with alpha\n";
+    let with_map = serialised_packages_from_texts(&repo_root(), [with_line]);
+    assert!(
+        with_map
+            .get("alpha")
+            .is_some_and(|r| r.nextest && !r.parallel),
+        "a `--with` package runs in the shard's nextest invocation; got {:?}",
+        with_map.get("alpha")
     );
 
     // A shard of a DIFFERENT package must not vouch for cerulion_core.

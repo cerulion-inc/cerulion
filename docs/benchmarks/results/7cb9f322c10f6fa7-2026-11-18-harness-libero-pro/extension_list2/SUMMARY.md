@@ -1,6 +1,6 @@
 # Summary of list 2: 400 further start states of LIBERO-PRO, 2 models, both arms
 
-Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-18T17:23:47Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
+Computed by ../recompute.py from this folder's CSV files and those of the grid (../) and the other extension folders, as read at 2026-11-19T08:40:01Z. Every start state of this list has ended in both arms of both models. The two arms: `with` is the model on Cerulion's tools; `without`, the plain interface, is the same model on the published three-tool interface.
 
 Read these lines before any number here:
 
@@ -185,10 +185,10 @@ The grid's tests are read on the grid's 100 start states only, by the grid's rul
 | Gemini 3.8 Flash SOLVED | the main test: 73 against 25 of 100 (with only 52, without only 4), p 1.10e-11: passes at 0.05 | passes | the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)" |
 | GPT-6 Astra CLEAN | declared secondary: 61 against 44 (26 against 9), p 0.00599: passes at 0.05 | passes | the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)" |
 | GPT-6 Astra SOLVED | in the per-model family: 70 against 71 (13 against 14), p 1: cannot pass at any threshold | does not pass | no statement; both printed |
-| Gemini 3.8 Flash CLEAN | in the grid's CLEAN family, not settled while the grid runs; 68 against 10 (60 against 2), p 8.47e-16, under 0.05 / 15, the strictest threshold that family can set | passes | when the grid's test is settled and passes: the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)"; until then, no upgrade |
-| FALSE CLAIM, a model | the grid's test pools every model and is not settled while the grid runs; the grid's per-model counts (Gemini 3.8 Flash 16 against 30; GPT-6 Astra 14 against 24) are not a grid test | passes for both models | this list's own sentences only |
+| Gemini 3.8 Flash CLEAN | in the grid's CLEAN family, settled; 68 against 10 (60 against 2), p 8.47e-16, under 0.05 / 16, the strictest threshold that family can set | passes | the statement, then "and it held on 400 further start states (a list added after the first grid rows were seen)" |
+| FALSE CLAIM, a model | the grid's test pools every model and is settled; the grid's per-model counts (Gemini 3.8 Flash 16 against 30; GPT-6 Astra 14 against 24) are not a grid test | passes for both models | this list's own sentences only |
 
-"Replicated" may be said only where both columns read passes: Gemini 3.8 Flash SOLVED and GPT-6 Astra CLEAN. Not of Gemini 3.8 Flash CLEAN, Gemini 3.8 Flash FALSE CLAIM, GPT-6 Astra FALSE CLAIM from this list. One effect is one statement: the grid's test and this list's test on the same model and measure are one finding, their p values are never combined, and nothing is confirmed twice.
+"Replicated" may be said only where both columns read passes: Gemini 3.8 Flash SOLVED and GPT-6 Astra CLEAN and Gemini 3.8 Flash CLEAN. Not of Gemini 3.8 Flash FALSE CLAIM, GPT-6 Astra FALSE CLAIM from this list. One effect is one statement: the grid's test and this list's test on the same model and measure are one finding, their p values are never combined, and nothing is confirmed twice.
 
 ## The one cross-model pair named beforehand: Gemini 3.8 Flash with Cerulion against GPT-6 Astra without (descriptive, outside the corrected family)
 
@@ -207,6 +207,19 @@ The grid's tests are read on the grid's 100 start states only, by the grid's rul
 | GPT-6 Astra | without Cerulion | 34.2 | 339.2 | 13686 | 1391 | 219,585,114 (11.0 percent) | 3,544,034 | 2154.72 | 1, 2.32 | 5.39 | 7.46 | 818.6 |
 
 USD a start state and USD a solved start state count the scored rows and the attempts in no row (lost_attempts.csv) over all start states of the arm, or over its solved ones. USD is list price only, not a billed amount; part of the gap between the arms is caching (the cached share of input tokens), not only fewer requests. Seconds are wall clock from the episode's start to its end and include the time an endpoint stalled or refused requests; a failed request was sent again inside its episode.
+
+## How the replies ended (finish reason), scored episodes
+
+| model | arm | replies | tool_calls | stop | length | content_filter | other | requests with no reply | scored episodes with a content_filter reply | ended on content_filter replies |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Gemini 3.8 Flash | without Cerulion | 21,890 | 21,865 | 25 | 0 | 0 | 0 | 1 | 0 | 0 |
+| Gemini 3.8 Flash | with Cerulion | 10,746 | 10,649 | 97 | 0 | 0 | 0 | 2 | 0 | 0 |
+| GPT-6 Astra | without Cerulion | 13,686 | 13,686 | 0 | 0 | 0 | 0 | 1,391 | 0 | 0 |
+| GPT-6 Astra | with Cerulion | 6,208 | 6,208 | 0 | 0 | 0 | 0 | 580 | 0 | 0 |
+
+A reply's finish reason is the one its model endpoint returned: `tool_calls` a reply with a tool call, `stop` and `length` one that ended on its own or at the output limit, `content_filter` one the provider's content filter stopped, `other` any other. Every reply of each scored attempt is counted, so the five reasons add up to the replies. A request with no reply is a failed request (sent again) or one the endpoint refused for a request field it does not take (sent again without the field).
+
+No reply came back content_filter in any arm.
 
 ## Episodes that ended without a score
 

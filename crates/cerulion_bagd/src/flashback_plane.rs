@@ -3252,7 +3252,9 @@ mod tests {
             serde_json::json!(
                 "this rank retained no checkpoint: it published no state ring, its plane was \
                  refused at arm time, or it had not reached its first anchor cadence when the \
-                 capture was triggered"
+                 capture was triggered. A capture of several worker ranks does not resume from \
+                 their checkpoints, since per-rank resume is not supported: \
+                 record the run from its first step with `cerulion graph run --record`"
             )
         );
 
@@ -5081,7 +5083,7 @@ mod tests {
         // …and the kept records are unchanged: the recovery is a lookup, never a
         // widening of what the capture carries.
         assert_eq!(trimmed.records.len(), 2);
-        assert_eq!(trimmed.first_recorded_step, Some(4));
+        assert_eq!(trimmed.per_rank[&0].first_recorded_step, Some(4));
     }
 
     /// THE CAPTURE-END CUT, through the selection the close calls.

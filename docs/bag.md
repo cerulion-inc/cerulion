@@ -1133,6 +1133,11 @@ DRIVERS.
 | `coordination` | "Which execution contract was I recorded under?": `lockstep` or `free_run` |
 | `node_external` | "Which of my nodes ran as `external` (driver) nodes?": a map of node id to `true` or `false`, one entry for every node of the recorded graph but its `ros2:` entries, `true` where the loaded node declared the `external` policy. A resim judges drivers by it and refuses a build that declares any node differently (exit 2, naming each node). ABSENT on a bag recorded before the key existed: the build you replay declares the drivers, and a warning says so. A value that is not such a map (`null` included), or one that names a node the embedded graph does not run or leaves one out, is refused with exit 2. A Cerulion older than the key reads the bag and ignores it |
 
+`recorder.json` also carries `env_names_left_out`: how many environment
+variables the bag's `env.json` left out because their name is not valid UTF-8,
+`0` when none was. It is data, not part of the contract: a replay does not read
+it. A bag recorded before the count has no such key.
+
 ### The `coordination` contract, and what each reading does
 
 | Stamp | Bag it came from | Behaviour |
@@ -1302,6 +1307,48 @@ the bag's frames are walked (exit 2, `read_identity_feed_index_budget`), naming
 the bytes the reads need, the frame identities and labels they are charged for,
 the budget and the flag.
 
+A replay of a free-run recording also holds in memory, for each rank (one
+process or executor unit of the recording), the rank's reads, a folded record
+of N identical reads counting N, and the recorded frames with a wire header on
+the topics the rank consumes, up to the verifier's budget of 200000 of each.
+Both cover the whole recording, whatever `--duration` bounds. A lockstep
+recording replays on its one gating clock and plans no read from the bag, so
+neither budget limits its replay; the 200000 recorded frames that attributing
+a `multi_publisher_topics` topic's frames to their writers needs, above, apply
+to it as to any replay. A free-run rank over a budget is refused only where
+the replay feeds or gates its recorded reads:
+
+- A `--verify` of a recording at `trace_format` 8 or later feeds every read,
+  as above, so a rank that consumes any topic is refused (exit 2): over the
+  reads before the replay's first step, with `read_identity_unplanned`, and
+  over the frames before the rank's first step, with
+  `read_log_budget_declined`.
+- Any other replay of a free-run recording, a resim without `--verify` or a
+  `--verify` of a recording below `trace_format` 8, gates only the reads of a
+  topic that one rank both produces and consumes and no other rank writes,
+  such as a topic inside a `process_groups:` group holding its producer and
+  its consumer. A rank that consumes such a topic is refused before its first
+  step (exit 2, `read_log_budget_declined`).
+
+Neither refuses a rank over the frames when the recording holds no read of
+that rank. A rank that is not refused runs, and a warning names the count and
+the budget. Its re-derivation verdict stands down with a note that names the
+cause (`verifier_declined_read_log_budget` or
+`verifier_declined_frame_index_budget`) and the count, and where it injects
+recorded topics, they fall back to the recorded-clock injection window, so the
+frame comparison on the topics it produces is declined, neither passed nor
+failed (`declined_frame_comparisons`). The read-log verifier still compares
+the rank's reads with the recording, so under `--verify` a read the fallback
+moves is reported as an edge-read difference (exit 6).
+
+A refusal names how many reads or frames the rank holds and the budget. A read
+refusal also names the step of the first read past the budget and that step's
+time into the rank's recording, counted from the rank's first step in the bag,
+so on a bag that begins mid-run it is time into the bag, not into the run. The
+remedy it names is a shorter recording: the longest that fits is about the
+budget divided by the rank's reads per second, or by the frames per second on
+the topics it consumes, whichever is reached first.
+
 What cannot be fed is refused by name before the first step (exit 2), with the
 node, the input, the writer and the sequence:
 
@@ -1375,6 +1422,18 @@ produce needs no sequence seed. `resume.stopped_at_anchor` in the
 `--report` JSON names those nodes. A bag that fires such a node in the steps
 the resim executes contradicts itself and is refused before the first replayed
 step (`bag internal consistency check failed`, exit 2).
+
+A stopped node's per-message FIFO trigger input with the default `drop_oldest`
+backpressure takes one more frame after the stop, when one arrives, and then
+reads nothing; a later checkpoint states that frame as the node's one
+unconsumed arrival, and the resim keeps the frame held, so that input reads
+nothing in the resim either. A `block` or `sample(N)` trigger input of a
+stopped node reads every frame at every step, in the recording and in the
+resim alike. A node stopped at the checkpoint's own step by a fire that never
+read its `drop_oldest` trigger input (possible only for a node not built with
+`#[cerulion_node]`) holds a frame the checkpoint does not state, and a
+`--verify` of the resim reports a read-log difference at that input's first
+read.
 
 The flag is a positive claim at any format, so a part that carries it states
 the stop on a bag below 10 too. Below 10 a part without it states nothing, and
@@ -1580,3 +1639,4 @@ holding those `.msg` files, or point `DDS_BRIDGE_CONFIG` at a config whose
 | **With discovery OFF** (which is `cerulion bag record` always, and any recorder run under `CERULION_RECORD_DISCOVERY=off`), a topic that appears mid-recording is neither recorded NOR named | `bag record` sets `discover_live = false` (it owns its own selection policy), and that flag short-circuits discovery entirely, so nothing is watching for the topic and there is nothing to write into `untapped` either. The bag records `enumerated: false`, which is the accurate form of "nobody looked", but it cannot name what it did not look for | Nothing widens a window that is not open. Re-run the capture with the producer already live, or use `graph run --record` (where discovery is on) if you need the recorder to pick up producers that register after it arms. `--discovery-settle-ms` is **inert** here: the hold is released immediately when discovery is off |
 | A non-finalized bag cannot be played | The zero-copy frame walk needs the summary footer | None: only a finalized bag is playable |
 | A type NEITHER this machine NOR the bag defines still renders nothing | Nothing anywhere knows it: the bag can only carry what its recording machine could resolve | Re-record from a workspace that holds the `.msg` files |
+| A replay of a free-run recording holds each rank's reads and the recorded frames it consumes in memory, up to 200000 of each, so over either a rank whose recorded reads it feeds or gates is refused (exit 2) before its first step, and any other rank runs with its re-derivation verdict stood down. A lockstep recording is not limited | The replay plans those reads from the whole recording before the first step, so it holds both whole; `--duration` shortens neither. A lockstep replay plans no read from the bag | Replay a shorter recording. The refusal names the count, the budget and, for the reads, the step and time at which the rank ran past it; the longest recording that fits is about the budget divided by the rank's reads, or consumed frames, per second. Which ranks a replay feeds or gates is under "Read identity" above |

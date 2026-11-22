@@ -207,7 +207,16 @@ fn parse_cli(argv: &[String]) -> Result<(&str, Args), String> {
 }
 
 fn run() -> Result<ExitCode, String> {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .enumerate()
+        .map(|(index, arg)| {
+            arg.into_string().map_err(|arg| {
+                let position = index + 1;
+                format!("argument {position} is not valid UTF-8: {arg:?}")
+            })
+        })
+        .collect::<Result<_, _>>()?;
     let (mode, args) = parse_cli(&argv)?;
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing_subscriber::filter::LevelFilter::WARN)
@@ -632,7 +641,10 @@ fn load_pynode(
         output_subscribers.push((name.to_string(), harness));
     }
     println!("node_info={info}");
-    let mut runtime_env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    // Each variable whose name and value are valid UTF-8, as the runtime keeps.
+    let mut runtime_env: std::collections::HashMap<String, String> = std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+        .collect();
     runtime_env.insert(
         "CERULION_WORKSPACE".to_string(),
         workspace.to_string_lossy().into_owned(),

@@ -813,7 +813,7 @@ fn a_harness_in_the_directory_cerulion_runs_in_never_runs() {
         &harness,
         &format!(
             "(3) a Cerulion source checkout around the binary, but the search up from '{}' \
-             stopped at '{}', which other users can write to, and no folder on the way there \
+             stopped at '{}', which every user can write to, and no folder on the way there \
              holds crates/cerulion_cli/Cargo.toml. The current directory is never searched.",
             bin_dir_real.display(),
             fence_real.display()
@@ -848,7 +848,7 @@ fn a_harness_planted_in_a_folder_other_users_can_write_never_runs() {
         &planted,
         &format!(
             "(2) '{}', and (3) a Cerulion source checkout around the binary, but the search up \
-             from '{}' stopped at '{}', which other users can write to, and no folder on the \
+             from '{}' stopped at '{}', which every user can write to, and no folder on the \
              way there holds crates/cerulion_cli/Cargo.toml.",
             own.join("harness").display(),
             own.display(),
@@ -861,7 +861,7 @@ fn a_harness_planted_in_a_folder_other_users_can_write_never_runs() {
         cwd.path(),
         &planted,
         &format!(
-            "(2) '{}', which is not taken because other users can write to '{}', and (3)",
+            "(2) '{}', which is not taken because every user can write to '{}', and (3)",
             planted.display(),
             shared_real.display()
         ),

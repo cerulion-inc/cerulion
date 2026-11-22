@@ -323,7 +323,7 @@ report_scan() {
 # WHY IT EXISTS. A banned-token gate whose regex has stopped matching looks
 # exactly like a clean tree — the same shape `check_hot_path_allocs.sh
 # --self-test` and `check_pr_title.sh --self-test` exist for, and the reason
-# both run FIRST in `lint`. The real tree is clean by construction, so CI
+# both run FIRST in `lint-gates`. The real tree is clean by construction, so CI
 # otherwise never drives these patterns over content that VIOLATES them.
 #
 # It scans through the SAME `scan_file` the real sweep uses, so a self-test that

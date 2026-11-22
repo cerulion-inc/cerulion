@@ -1190,6 +1190,8 @@ Interpreting `connect_endpoints`:
 
 ## Two-machine quickstart (Go2: Mac ↔ robot)
 
+Start with the single-machine [README quickstart](../README.md#quickstart); this section adds a second machine.
+
 Sign in with the same account on both machines, or use an established explicit
 pairing. Each real-clock graph registers its exports automatically. Add a
 `network:` block to restrict exports and declare imports; authenticated producer

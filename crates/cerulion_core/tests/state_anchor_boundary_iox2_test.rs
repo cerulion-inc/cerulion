@@ -1642,20 +1642,24 @@ const SINK_STOP_STEP: u64 = 3;
 /// The step [`FatalTally`] stops at: step 0 is quiet and steps 1 to 8 each
 /// serve it one frame, so its 8th fire is at step 8.
 const FIFO_STOP_STEP: u64 = 8;
-/// The last step the stop drive runs: two quiet steps after the FIFO stop.
+/// The step before which the stop drive publishes one more frame (wire
+/// sequence 8), after the FIFO stop: the stopped FIFO drain pops it at this
+/// step and holds it.
+const HELD_FRAME_STEP: u64 = 9;
+/// The last step the stop drive runs: a quiet step after the held frame.
 const STOP_LAST_STEP: u64 = 10;
 
 /// A stopped node's framework section, byte for byte: version 5, the
-/// version-1 prefix with nothing in it, the service table (one served
-/// cursor on `inp` for `Some(seq)`, else empty), an empty high-water table,
-/// the epoch floor stated absent, then the flags byte with bit 0 set.
-/// `None` is 43 bytes and `Some` 55.
-fn stopped_section_bytes(served: Option<u32>) -> Vec<u8> {
+/// version-1 prefix with `pending` arrivals in it and no next fire, the service
+/// table (one served cursor on `inp` for `Some(seq)`, else empty), an empty
+/// high-water table, the epoch floor stated absent, then the flags byte with
+/// bit 0 set. `None` is 43 bytes and `Some` 55.
+fn stopped_section_bytes(served: Option<u32>, pending: u64) -> Vec<u8> {
     let mut b = Vec::new();
     b.extend_from_slice(&[0x05, 0x00, 0x00, 0x00]); // version 5
     b.push(0x00); // no next fire
     b.extend_from_slice(&[0x00; 8]);
-    b.extend_from_slice(&[0x00; 8]); // pending data
+    b.extend_from_slice(&pending.to_le_bytes()); // pending data
     b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // no sync heads
     match served {
         None => b.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]), // empty service table
@@ -1679,8 +1683,9 @@ fn stopped_section_bytes(served: Option<u32>) -> Vec<u8> {
 /// `fifo` ([`FatalTally`]) and `sink` ([`FatalSink`]) both read one external
 /// topic, and every step from 0 to [`STOP_LAST_STEP`] anchors. Step 0 is
 /// quiet; steps 1 to 8 each publish one frame (wire sequence 0 to 7) before
-/// the step; `sink` is marked before step [`SINK_STOP_STEP`]; steps 9 and 10
-/// are quiet.
+/// the step; `sink` is marked before step [`SINK_STOP_STEP`]; one more frame
+/// (wire sequence 8) is published before step [`HELD_FRAME_STEP`], and step
+/// 10 is quiet.
 fn drive_stops(tag: &str) -> Vec<StateAnchorEvent> {
     let ext_topic = format!("/{tag}/ext");
     let mut factories: IndexMap<String, Box<dyn NodeEntry>> = IndexMap::new();
@@ -1732,6 +1737,9 @@ fn drive_stops(tag: &str) -> Vec<StateAnchorEvent> {
         }
         step_n(&mut h.runtime, 1);
     }
+    let mut proxy = ext.loan_proxy::<Vector3>().expect("loan");
+    proxy.x = HELD_FRAME_STEP as f64;
+    drop(proxy);
     step_n(&mut h.runtime, (STOP_LAST_STEP - FIFO_STOP_STEP) as usize);
     assert!(
         h.runtime.is_node_stopped("fifo"),
@@ -1745,7 +1753,10 @@ fn drive_stops(tag: &str) -> Vec<StateAnchorEvent> {
 ///
 /// `fifo` (index 0): at step 0 nothing is served, so it rides the v1 header
 /// with no section; at step `S` from 1 to 7 it has read frame `S - 1` and is
-/// running; from step 8 on it states the stop with cursor 7 (55 bytes).
+/// running; from step 8 on it states the stop with cursor 7 (55 bytes). Its
+/// pending count is 0 at step 8, where the stopping fire consumed its one
+/// arrival, and 1 from step 9: the stopped drain popped frame 8 there, held it
+/// and minted its arrival, which a stopped node never consumes.
 /// `sink` (index 1): it has nothing to state before step 3, so no section;
 /// from step 3 on it states the stop alone (43 bytes).
 fn assert_stop_anchors(events: &[StateAnchorEvent]) {
@@ -1783,14 +1794,19 @@ fn assert_stop_anchors(events: &[StateAnchorEvent]) {
                 }),
                 "fifo at S={step}: running, with the last frame it read"
             ),
+            ("fifo", FIFO_STOP_STEP) => assert_eq!(
+                blob.framework,
+                stopped_section_bytes(Some(7), 0).as_slice(),
+                "fifo at S={step}: the stop and its cursor"
+            ),
             ("fifo", _) => assert_eq!(
                 blob.framework,
-                stopped_section_bytes(Some(7)).as_slice(),
-                "fifo at S={step}: the stop and its cursor"
+                stopped_section_bytes(Some(7), 1).as_slice(),
+                "fifo at S={step}: the stop, its cursor and the held frame's arrival"
             ),
             _ => assert_eq!(
                 blob.framework,
-                stopped_section_bytes(None).as_slice(),
+                stopped_section_bytes(None, 0).as_slice(),
                 "sink at S={step}: the stop alone"
             ),
         }
@@ -1799,8 +1815,8 @@ fn assert_stop_anchors(events: &[StateAnchorEvent]) {
 
 #[test]
 fn an_anchor_states_a_fatal_nodes_stop_from_its_stop_step() {
-    assert_eq!(stopped_section_bytes(None).len(), 43);
-    assert_eq!(stopped_section_bytes(Some(7)).len(), 55);
+    assert_eq!(stopped_section_bytes(None, 0).len(), 43);
+    assert_eq!(stopped_section_bytes(Some(7), 0).len(), 55);
     assert_stop_anchors(&drive_stops("stop"));
 }
 
@@ -1820,7 +1836,7 @@ fn two_encodes_and_two_armed_runs_give_identical_bytes() {
     assert_eq!(first_encode, second_encode, "two encodes");
     assert_eq!(
         first_encode,
-        stopped_section_bytes(Some(7)),
+        stopped_section_bytes(Some(7), 0),
         "and the hand vector"
     );
 
