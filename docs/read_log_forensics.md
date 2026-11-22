@@ -94,7 +94,7 @@ the slots. All little-endian.
 | 16..24 | `duration_ns` | Packed aux: low 32 bits = `popped`, high 32 bits = the FOLD RUN COUNT (`0` and `1` both mean one occurrence; see "Folded runs"). Through `trace_format` 5 the high half is structurally zero. **Exception:** on a `producer` annotation the whole 64 bits are the producer token, so it has no high half to read |
 | 24..28 | `node_idx` | The CONSUMER node, indexing that rank's manifest `node_ids` |
 | 28..32 | `global_level` | Packed `(input_idx:16 << 16) \| outcome_kind:16` |
-| 32..36 | `record_type` | `6` for every record in this doc (`1` = fire, `2` = departure, `3` = step boundary) |
+| 32..36 | `record_type` | `6` for every record in this doc (`1` = fire, `2` = departure, `3` = step boundary, `7` = node stop) |
 | 36..40 | `reserved` | The owning worker RANK, stamped by `bagd` at bag-write time |
 
 ### The outcome kinds

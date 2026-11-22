@@ -17780,10 +17780,11 @@ pub fn render_recorder_json(
         // consult a replay also makes wrote a record, which is every bag this
         // binary writes; v8 marks a stream in which every edge names its frames'
         // writers by run, v9 one in which every multi-frame read whose batch
-        // fits its read stage's window names each frame it consumed, and v10
-        // one in which every complete checkpoint part of a stopped node
-        // carries the stopped flag, all three also every bag this binary
-        // writes.
+        // fits its read stage's window names each frame it consumed, v10 one
+        // in which every complete checkpoint part of a stopped node carries
+        // the stopped flag, and v12 one in which every fire that stopped its
+        // node is followed by a NODE-STOP record, all four also every bag this
+        // binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17794,7 +17795,7 @@ pub fn render_recorder_json(
             crate::replay_engine::recorder_stamps_read_site_roles(),
             // Whether THIS run folds identical runs, read from the one switch.
             // `stamp_trace_format` tests the stops, identity and consult terms
-            // first, so the stamp is 10 with folding on or off; this term
+            // first, so the stamp is 12 with folding on or off; this term
             // decides the stamp on the ladder below 7, which is the arm an
             // older recorder's bag took.
             cerulion_core::read_outcome::fold_enabled(),
@@ -17809,9 +17810,12 @@ pub fn render_recorder_json(
             // stage's window names each frame it consumed: it does.
             crate::replay_engine::recorder_records_read_identity(),
             // Whether every complete checkpoint part of a stopped node carries
-            // the stopped flag: it does, so every bag this binary writes
-            // stamps 10.
+            // the stopped flag: it does.
             crate::replay_engine::recorder_states_anchor_stops(),
+            // Whether every fire that stopped its node is followed by a
+            // NODE-STOP record: it is, so every bag this binary writes stamps
+            // 12.
+            crate::replay_engine::recorder_records_node_stops(),
         ),
         // The coordination contract this run executed under.
         "coordination": coordination,
@@ -31344,17 +31348,18 @@ nodes:
                 cerulion_core::read_outcome::fold_enabled(),
                 crate::replay_engine::recorder_stamps_consult_records(),
                 crate::replay_engine::recorder_records_read_identity(),
-                crate::replay_engine::recorder_states_anchor_stops()
+                crate::replay_engine::recorder_states_anchor_stops(),
+                crate::replay_engine::recorder_records_node_stops()
             )
         );
         assert_eq!(
-            v["trace_format"], 10,
+            v["trace_format"], 12,
             "every bag this binary writes carries read-site roles, folds runs, \
              records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
-             read stage's window AND flags every complete checkpoint part of a stopped node: \
-             a reader below 10 reads past the stopped flag, so the stamp makes it \
-             refuse the bag"
+             read stage's window, flags every complete checkpoint part of a stopped \
+             node AND records every stop: a reader below 12 refuses the stop \
+             record, so the stamp makes it refuse the bag by its format"
         );
     }
 
@@ -31365,13 +31370,13 @@ nodes:
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
     /// it to 5, folding to 6, the consult record to 7, read identity to 8,
-    /// per-frame batch identity to 9 and checkpoint stops to the 10 asserted
-    /// here.
+    /// per-frame batch identity to 9, checkpoint stops to 10 and node stops
+    /// to the 12 asserted here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_ten() {
+    fn a_free_run_recorder_json_stamps_free_run_and_the_node_stops_format() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
@@ -31386,9 +31391,10 @@ nodes:
         // folding overrides both. 7, not 6: the consult record overrides
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
         // every consumed frame of a batch is named. 10, not 9: every complete
-        // checkpoint part of a stopped node carries the stopped flag
-        // (`stamp_trace_format`'s hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 10);
+        // checkpoint part of a stopped node carries the stopped flag. 12, not
+        // 10: every stop is a NODE-STOP record (`stamp_trace_format`'s hand
+        // table pins the whole matrix).
+        assert_eq!(v["trace_format"], 12);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -31422,7 +31428,7 @@ nodes:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":10}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":12}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,

@@ -1164,12 +1164,12 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 10.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 10; a
+`recorder.json` stamps 12.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 12; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Six encodings set the number; the last three, read identity, batch
-frames and checkpoint stops, have their own sections below. Every kind-6 record carries a
+in it. Seven encodings set the number; the last four, read identity, batch
+frames, checkpoint stops and node stops, have their own sections below. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
@@ -1180,15 +1180,17 @@ role on a `none` record as that empty consult is what `trace_format` 7 means,
 and producer annotations on every edge (before every read of a multi-writer
 edge, once per writer run on a single-writer one) are what `trace_format` 8
 means, a `batch_frame` record for each frame a multi-frame read consumed
-besides the one it served is what `trace_format` 9 means, and a stopped flag in
+besides the one it served is what `trace_format` 9 means, a stopped flag in
 every complete checkpoint part of a node the scheduler had stopped is what
-`trace_format` 10 means.
+`trace_format` 10 means, and a NODE-STOP record (record kind 7) after every
+fire that stopped its node is what `trace_format` 12 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
 decodes as one occurrence each), since read identity every such bag is
-format 8, since batch frames format 9, and since checkpoint stops format 10. A bag
+format 8, since batch frames format 9, since checkpoint stops format 10, and
+since node stops format 12. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -1445,8 +1447,9 @@ and the PRODUCER TOKEN (outcome kind **7**), are *outcome* kinds in the low
 half of a READ-OUTCOME record's packed field. They are **not record types of their own**,
 and that encoding has two consequences:
 
-- the record-type gate hard-refuses record kinds ≥ 7 **regardless of the
-  stamp**, so a record type of their own would push every marker-bearing or
+- the record-type gate hard-refuses every record kind it does not define
+  (4, 5 and from 8 on) **regardless of the stamp**, so a record type of their
+  own would push every marker-bearing or
   token-bearing LOCKSTEP bag up a format. A format bump is for a WIRE change,
   which is what the role bits and run folding each are; an annotation a reader
   can pass through is not one;

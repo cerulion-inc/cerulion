@@ -96,7 +96,7 @@ use cerulion_core::trace_ring::{
     unpack_read_outcome_run, TraceRingRecord, AUTHORITATIVE_TRACE_RANK, READ_OUTCOME_DECIMATED,
     READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE, READ_OUTCOME_NO_FRAME,
     READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED, RECORD_TYPE_DEPARTURE,
-    RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
+    RECORD_TYPE_FIRE, RECORD_TYPE_NODE_STOP, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{NodeEntry, TransportManager, VirtualClock};
@@ -2347,6 +2347,7 @@ const EMITTED_TRACE_RECORD_KINDS: &[u32] = &[
     RECORD_TYPE_DEPARTURE,
     RECORD_TYPE_STEP_BOUNDARY,
     RECORD_TYPE_READ_OUTCOME,
+    RECORD_TYPE_NODE_STOP,
 ];
 
 /// The highest trace-record kind a format-3 reader can decode. `trace_ring`
@@ -2372,10 +2373,11 @@ const FORMAT_3_MAX_RECORD_KIND: u32 = RECORD_TYPE_READ_OUTCOME;
 
 /// Does THIS binary's recorder emit anything a format-3 reader cannot decode?
 ///
-/// `false` today: the recorder emits nothing above kind 6, which is what lets a lockstep
-/// bag keep stamping 3. Adding a kind >= 7 to the module-private
-/// `EMITTED_TRACE_RECORD_KINDS` inventory flips this on its own and every
-/// lockstep bag starts stamping 4 — the never-under-claim law.
+/// `true` since the NODE-STOP record (kind 7) joined the module-private
+/// `EMITTED_TRACE_RECORD_KINDS` inventory: a kind above 6 flips it on its own,
+/// the never-under-claim law. It decides nothing for a bag this binary writes,
+/// whose stamp comes from the terms [`stamp_trace_format`] tests before the
+/// mode and stream arms; it is the stream fact those arms would read.
 ///
 /// # The inventory is a LITERAL LIST, held by a WALK — not "by construction"
 ///
@@ -2412,9 +2414,11 @@ pub fn recorder_stream_needs_v4() -> bool {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the ANCHOR STOPS term and stamps 10, because
-///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`]
-///   and [`recorder_states_anchor_stops`] are unconditionally true and this
+///   this binary writes takes the NODE STOPS term and stamps
+///   [`NODE_STOPS_MIN_TRACE_FORMAT`], because
+///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`],
+///   [`recorder_states_anchor_stops`] and [`recorder_records_node_stops`] are
+///   unconditionally true and this
 ///   function returns before the ladder is consulted. The ladder below (the
 ///   fold term at 6, the role term at 5, then the mode and stream arms) is the
 ///   `records_consults == false` fallback, i.e. the rules that produced the
@@ -2441,7 +2445,17 @@ pub fn stamp_trace_format(
     records_consults: bool,
     records_identity: bool,
     states_anchor_stops: bool,
+    records_node_stops: bool,
 ) -> u32 {
+    if records_consults && records_identity && states_anchor_stops && records_node_stops {
+        // Every fire that stopped its node is followed, on its rank's ring,
+        // by a NODE-STOP record (kind 7) naming the cause, so the trace states
+        // where the recording stopped each node. A reader below this format
+        // refuses kind 7 as a reserved record, so the stamp moves and that
+        // reader refuses the bag by its format first. The term claims nothing
+        // without the three terms under it.
+        return NODE_STOPS_MIN_TRACE_FORMAT;
+    }
     if records_consults && records_identity && states_anchor_stops {
         // Every complete checkpoint part of a node the scheduler had stopped
         // carries the stopped flag in its framework section, so a part
@@ -2567,6 +2581,17 @@ pub fn recorder_records_read_identity() -> bool {
     true
 }
 
+/// Does THIS binary's recorder follow every fire that stopped its node with a
+/// NODE-STOP record (`cerulion_core::trace_ring::RECORD_TYPE_NODE_STOP`)?
+///
+/// `true`, unconditionally: the scheduler marks the stopping fire's trace entry
+/// (`cerulion_core::scheduler::TraceEntry::stop`) at each site that stops a
+/// node, and the recording ring pushes the record directly after that fire's
+/// FIRE record.
+pub fn recorder_records_node_stops() -> bool {
+    true
+}
+
 /// Does THIS binary's recorder state, in every complete checkpoint part, whether
 /// the scheduler had stopped the node at that boundary?
 ///
@@ -2611,6 +2636,26 @@ const _: () = assert!(ANCHOR_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
 /// An ABSENT `recorder.json` answers `false`.
 pub fn recorder_states_anchor_stops_at(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= ANCHOR_STOPS_MIN_TRACE_FORMAT)
+}
+
+/// The lowest `trace_format` whose trace follows every fire that stopped its
+/// node with a NODE-STOP record, so a stop the trace does not hold is a stop
+/// the recording did not make. Below it the trace says nothing about stops.
+///
+/// The ONE place the node-stops format number is written: the stamp
+/// ([`stamp_trace_format`]) and the read gate ([`SUPPORTED_TRACE_FORMAT`])
+/// both read it from here.
+pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = 12;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(NODE_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does this bag's trace hold a NODE-STOP record for every stop the recording
+/// made?
+///
+/// An ABSENT `recorder.json` answers `false`.
+pub fn recorder_records_node_stops_at(recorder: Option<&RecorderInfo>) -> bool {
+    recorder.is_some_and(|r| r.trace_format >= NODE_STOPS_MIN_TRACE_FORMAT)
 }
 
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
@@ -2789,18 +2834,27 @@ pub fn replay_stages_batch_frames(
 /// what a resumed replay concludes needs its own `trace_format` bump, which
 /// this binary refuses.
 ///
+/// Bumped to [`NODE_STOPS_MIN_TRACE_FORMAT`] (12) by node stops: every fire
+/// that stopped its node (a
+/// `NodeError::Fatal` return, a tick panic or a poisoned entry, the
+/// consecutive-panic breaker) is followed on its rank's ring by a NODE-STOP
+/// record, kind 7, naming the cause ([`NODE_STOPS_MIN_TRACE_FORMAT`]). A
+/// reader below 12 refuses kind 7 as a reserved record, so it must refuse the
+/// bag by its format first. The formats below it stay readable, and their traces
+/// say nothing about stops.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 10,
+/// them to zero for the bags this binary writes (every one of them stamps 12,
 /// because every one records every consult, every frame each read
-/// consumed when its batch fits the read stage's window, and the stopped flag
-/// in every complete checkpoint part of a stopped node), but the two remain
-/// separate functions serving separate
-/// questions, and the READ gate still admits 1 to 9
+/// consumed when its batch fits the read stage's window, the stopped flag
+/// in every complete checkpoint part of a stopped node, and every stop), but
+/// the two remain separate functions serving separate
+/// questions, and the READ gate still admits the formats below it
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 10;
+pub const SUPPORTED_TRACE_FORMAT: u32 = NODE_STOPS_MIN_TRACE_FORMAT;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -33297,7 +33351,7 @@ mod recorder_info_version_tests {
         // newer than this binary, and the absent-field back-compat default
         // stays v1 (`trace_format_v1`). A bump must move this pin
         // DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 10);
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 12);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -33309,6 +33363,7 @@ mod recorder_info_version_tests {
         assert_eq!(READ_IDENTITY_MIN_TRACE_FORMAT, 8);
         assert_eq!(BATCH_FRAME_MIN_TRACE_FORMAT, 9);
         assert_eq!(ANCHOR_STOPS_MIN_TRACE_FORMAT, 10);
+        assert_eq!(NODE_STOPS_MIN_TRACE_FORMAT, 12);
     }
 
     /// The decoupling pin.
@@ -33316,8 +33371,8 @@ mod recorder_info_version_tests {
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
     /// its consults and the frames of every batch that fits its read stage's
-    /// window, and flags every complete checkpoint part of a stopped node, and
-    /// therefore stamps 10, so the write
+    /// window, flags every complete checkpoint part of a stopped node, and
+    /// records every stop, and therefore stamps 12, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -33326,9 +33381,10 @@ mod recorder_info_version_tests {
     /// What holds, and is what this pins: the two are separate
     /// FUNCTIONS answering separate questions; the write stamp never EXCEEDS
     /// the read gate (a bag this binary writes must be one it can read); and
-    /// the gate still admits formats 1 to 9, which the write stamp never
-    /// emits. The decoupling is therefore alive in both directions, the READ
-    /// side reading nine formats the WRITE side never produces.
+    /// the gate still admits every format below its own, which the write
+    /// stamp never emits. The decoupling is therefore alive in both
+    /// directions, the READ side reading formats the WRITE side never
+    /// produces.
     #[test]
     fn write_stamp_and_read_gate_stay_two_decisions() {
         let stamp = stamp_trace_format(
@@ -33339,23 +33395,25 @@ mod recorder_info_version_tests {
             recorder_stamps_consult_records(),
             recorder_records_read_identity(),
             recorder_states_anchor_stops(),
+            recorder_records_node_stops(),
         );
         assert_eq!(
-            stamp, 10,
+            stamp, 12,
             "a recorder that records every consult, the frames of every batch \
-             that fits its read stage AND flags every complete checkpoint part of a \
-             stopped node stamps 10: a format-7 reader would replay its reads by queue \
-             re-creation and call the result clean, a format-8 reader does not \
-             know the batch frame record, and a format-9 reader reads past the \
-             stopped flag"
+             that fits its read stage, flags every complete checkpoint part of a \
+             stopped node AND records every stop stamps 12: a format-7 reader would \
+             replay its reads by queue re-creation and call the result clean, a \
+             format-8 reader does not know the batch frame record, a format-9 \
+             reader reads past the stopped flag, and a reader below 12 refuses \
+             the stop record"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: nine formats this binary
-        // reads and never writes.
-        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9] {
+        // The gate is strictly WIDER than the stamp: the formats below it are
+        // ones this binary reads and never writes.
+        for archived in 1..SUPPORTED_TRACE_FORMAT {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -33394,7 +33452,7 @@ mod recorder_info_version_tests {
         ];
         for (mode, needs_v4, roles, expected) in cases {
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, false, false, false, false),
+                stamp_trace_format(mode, needs_v4, roles, false, false, false, false, false),
                 expected,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=false, consults=false)"
             );
@@ -33402,7 +33460,7 @@ mod recorder_info_version_tests {
             // unreadable to anything below 6 whatever the coordination mode or
             // the role bits say.
             assert_eq!(
-                stamp_trace_format(mode, needs_v4, roles, true, false, false, false),
+                stamp_trace_format(mode, needs_v4, roles, true, false, false, false, false),
                 6,
                 "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds=true, consults=false)"
             );
@@ -33411,7 +33469,7 @@ mod recorder_info_version_tests {
             // else is true of it, folding included.
             for folds in [false, true] {
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, false),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, false, false),
                     7,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, consults=true)"
                 );
@@ -33419,33 +33477,58 @@ mod recorder_info_version_tests {
                 // plus per-frame batch identity), and it claims nothing without
                 // the consult records under it.
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, false),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, false, false),
                     9,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, identity)"
                 );
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, false) < 8,
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, false, false) < 8,
                     "identity without the consult records is not format 8 or 9"
                 );
                 // Checkpoint stops ride both: 10 over every axis, and the term
                 // claims nothing without the consult and identity terms under it.
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, true),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, true, false),
                     10,
                     "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, stops)"
                 );
                 assert_eq!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, true),
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, true, false),
                     7,
                     "stops without identity stay at the consult term's 7"
                 );
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, true) < 8,
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, true, false) < 8,
                     "stops without the consult records are not format 8, 9 or 10"
                 );
                 assert!(
-                    stamp_trace_format(mode, needs_v4, roles, folds, false, false, true) < 7,
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, false, true, false) < 7,
                     "stops alone claim nothing above the ladder"
+                );
+                // Node stops ride all three: 12 over every axis, and the term
+                // claims nothing without the three terms under it.
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, true, true),
+                    12,
+                    "stamp_trace_format({mode:?}, {needs_v4}, {roles}, folds={folds}, node stops)"
+                );
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, true, false, true),
+                    9,
+                    "node stops without checkpoint stops stay at the identity term's 9"
+                );
+                assert_eq!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, true, false, true, true),
+                    7,
+                    "node stops without identity stay at the consult term's 7"
+                );
+                assert!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, true, true, true) < 8,
+                    "node stops without the consult records are not format 8 or above"
+                );
+                assert!(
+                    stamp_trace_format(mode, needs_v4, roles, folds, false, false, false, true) < 7,
+                    "node stops alone claim nothing above the ladder"
                 );
             }
         }
@@ -33533,6 +33616,7 @@ mod recorder_info_version_tests {
                         false,
                         false,
                         false,
+                        false,
                     );
                     assert!(
                         folded > PRE_FOLD_SUPPORTED,
@@ -33555,6 +33639,7 @@ mod recorder_info_version_tests {
                 CoordinationMode::Lockstep,
                 false,
                 true,
+                false,
                 false,
                 false,
                 false,
@@ -34183,25 +34268,28 @@ mod recorder_info_version_tests {
     }
 
     /// `stream_needs_v4` is a STATIC property of this
-    /// binary's emitted-kind inventory, not an observation of one trace — the
+    /// binary's emitted-kind inventory, not an observation of one trace: the
     /// `bag_cmd --run` attach copies a stamp frozen at run start into a bag
     /// whose records are drained later, so an observed-stream basis could
     /// under-claim there. This pins BOTH halves: the inventory's own maximum is
-    /// the format-3 ceiling, and the derived answer is therefore `false`.
+    /// the NODE-STOP record, one past the format-3 ceiling, and the derived
+    /// answer is therefore `true`.
     #[test]
-    fn the_emitted_kind_inventory_is_format_three_clean() {
+    fn the_emitted_kind_inventory_carries_the_stop_record_past_format_three() {
         assert!(
             !EMITTED_TRACE_RECORD_KINDS.is_empty(),
             "an EMPTY inventory would make `recorder_stream_needs_v4` vacuously false"
         );
         let max = EMITTED_TRACE_RECORD_KINDS.iter().copied().max().unwrap();
         assert_eq!(
-            max, FORMAT_3_MAX_RECORD_KIND,
-            "the recorder emits nothing above kind 6 — a new kind here must be a deliberate edit"
+            max, RECORD_TYPE_NODE_STOP,
+            "the highest kind the recorder emits is the NODE-STOP record; a new kind here \
+             must be a deliberate edit"
         );
+        assert!(max > FORMAT_3_MAX_RECORD_KIND);
         assert!(
-            !recorder_stream_needs_v4(),
-            "…so a lockstep bag written by this binary is format-3-clean"
+            recorder_stream_needs_v4(),
+            "…so a bag written by this binary is not format-3-clean"
         );
         // The two ANNOTATION kinds (the overflow marker
         // and the producer token) ride INSIDE record-type 6 as new OUTCOME

@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A recording's scheduler trace holds every node stop: the fire that stopped a node is followed on its rank's trace ring by a NODE-STOP record, record kind 7, carrying that fire's step, instant, node and level and the cause in `duration_ns` (1 for a `NodeError::Fatal` return, 2 for a tick panic or a poisoned node entry, 3 for the consecutive-panic breaker). A poisoned node keeps firing with its tick skipped, so its FIRE records go on after its stop record. In `cerulion_core`, `scheduler::TraceEntry` gains `stop`, so a struct literal names the field; `scheduler::NodeStopCause`, `trace_ring::RECORD_TYPE_NODE_STOP`, `TraceRingRecord::node_stop` and `TraceRingRecord::stop_cause` are new.
+
 ### Changed
+- Every bag this build writes stamps `trace_format` 12. A binary that reads below format 12, 2.1.0 included, refuses such a bag with "upgrade to replay it" (exit 2). `cerulion_cli_engine::replay_engine::stamp_trace_format` gains an eighth argument, `records_node_stops`; `SUPPORTED_TRACE_FORMAT` is 12, and `NODE_STOPS_MIN_TRACE_FORMAT`, `recorder_records_node_stops` and `recorder_records_node_stops_at` are new.
 - `cerulion rcp bench` with a model name that holds `gemini-4-neon` prints, before the run, what an episode of each setup took in the results package's measured run of Gemini 4 Neon, and prices each episode at that model's list price, read on 2026-11-21. 2.1.0 printed "no measured run of this model" and gave no list price for it.
 
 ### Fixed

@@ -1250,19 +1250,30 @@ fn drain_all(
 
 /// Convert the runtime's [`cerulion_core::scheduler::TraceEntry`]s into the
 /// bag's 40-byte [`TraceRingRecord`] wire form (FIRE records; `node_idx` indexes
-/// the manifest's `node_ids` table).
+/// the manifest's `node_ids` table). A fire that stopped its node is followed
+/// by its NODE-STOP record, built by the production constructor the recording
+/// ring's push calls, so a crafted bag carries the stops the reference run made.
 fn trace_to_records(
     trace: &[cerulion_core::scheduler::TraceEntry],
     node_ids: &[String],
 ) -> Vec<TraceRingRecord> {
     trace
         .iter()
-        .map(|e| {
+        .flat_map(|e| {
             let node_idx = node_ids
                 .iter()
                 .position(|id| id.as_str() == &*e.node_id)
                 .expect("trace node id is in the manifest") as u32;
-            TraceRingRecord {
+            let stop = e.stop.map(|cause| {
+                TraceRingRecord::node_stop(
+                    e.step,
+                    e.fire_time_ns,
+                    node_idx,
+                    e.global_level as u32,
+                    cause,
+                )
+            });
+            let fire = TraceRingRecord {
                 step: e.step,
                 fire_time_ns: e.fire_time_ns,
                 duration_ns: 0,
@@ -1278,7 +1289,8 @@ fn trace_to_records(
                 } else {
                     0
                 },
-            }
+            };
+            std::iter::once(fire).chain(stop)
         })
         .collect()
 }
