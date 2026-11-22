@@ -4094,14 +4094,21 @@ fn a_one_rank_capture_whose_window_starts_after_the_first_reads_verifies_by_read
 /// against the rim its rank manifest states. One capture holds few window
 /// heads (see [`WINDOW_HEAD_MAX_CAPTURES`]), so the short cadence takes
 /// captures off its run until their heads reach [`WINDOW_HEAD_FLOOR`], and arm
-/// 9's cadence takes one. The guard: every capture begins at a window head and
-/// measures at least that head's window, the short cadence reaches its floor
-/// within [`WINDOW_HEAD_MAX_CAPTURES`] captures, no stage staged an overflow
-/// marker in a window's opening step or filled its rim there, and a `--verify`
-/// of every capture exits 0 with neither `read_log_record_dropped` nor
-/// `read_identity_batch_unattributed`. Each stage of each capture prints one
-/// `WINDOW_HEADS` line, prefixed with the arm's `cadence_ms`, its floor and the
-/// capture's number, with its rim, its fullest opening step, the windows
+/// 9's cadence takes one. It is a measurement of this graph, not a check of
+/// the two per-window limits: each stage here reads about one frame a step,
+/// far below its rim, so neither a writer switch dropped at the rim nor a
+/// batch pushed past it can happen on it. The `cerulion_core` tests
+/// `a_reopen_window_holds_both_openings_inside_the_writer_run_reserve`,
+/// `a_writer_switch_in_a_reopen_window_is_refused_as_one_pair` and
+/// `a_batch_at_a_reopen_window_stages_no_frames_when_only_the_openings_push_it_past_the_rim`
+/// pin those limits. What the arm asserts: every capture begins at a window
+/// head and measures at least that head's window, the short cadence reaches its
+/// floor within [`WINDOW_HEAD_MAX_CAPTURES`] captures, no stage staged an
+/// overflow marker in a window's opening step or filled its rim there, and a
+/// `--verify` of every capture exits 0 with neither `read_log_record_dropped`
+/// nor `read_identity_batch_unattributed`. Each stage of each capture prints
+/// one `WINDOW_HEADS` line, prefixed with the arm's `cadence_ms`, its floor and
+/// the capture's number, with its rim, its fullest opening step, the windows
 /// measured and the overflow markers in them (`truncated=`).
 #[test]
 #[serial]
