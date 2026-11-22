@@ -2,7 +2,8 @@
 # `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
 # resumed replay make about a node a checkpoint states as stopped, the
 # stand-downs a resumed replay applies to a node whose stop the recording
-# does not state, and the verifier budget's pure decision functions.
+# does not state, the verifier budget's pure decision functions, and the
+# decisions a replay makes about checkpoint window heads.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -159,3 +160,38 @@ in prepare_pass_verification
   prepare_pass_verification (the label join, describe_label_reading and
   classify_label_reading) runs only for a topic in that empty set, so no
   output changes.
+
+# Fifth scope: the decisions a replay makes about checkpoint window heads.
+#
+# Scope: the pure decision functions on the lines the window-head change added
+# or changed. In src/replay_engine.rs: whether a recorder names the writer at
+# every checkpoint window (`recorder_names_window_heads_at`), the refusal of a
+# step boundary flags word with a bit the format does not define
+# (`boundary_flags_refusal`) and the per-rank choice of the nodes a flagged
+# boundary reopens (`reopens_node`). In src/replay_feed.rs: the cause a read
+# with no writer names on a bag that begins mid-run (`absent_writer_cause`).
+# Every other line of the two files is outside the change's diff, or reads the
+# bag or drives the replay loop, which the mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_feed.rs \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re '\babsent_writer_cause\b|\brecorder_names_window_heads_at\b|\bboundary_flags_refusal\b|\breopens_node\b' \
+#            --cap-lints true --in-place --timeout 600 --shard 0/3 \
+#            -- --lib -- replay_feed:: replay_engine::
+#          and the same with `--shard 1/3 --baseline=skip` and
+#          `--shard 2/3 --baseline=skip` (the unmutated baseline passed on
+#          shard 0/3)
+# Result:  shard 0/3: 6 mutants, 6 caught; shard 1/3: 6 mutants, 4 caught,
+#          2 unviable; shard 2/3: 4 mutants, 4 caught. Total: 16 mutants,
+#          14 caught, 2 unviable, 0 missed. The unviable ones replace
+#          `boundary_flags_refusal` with `Some(Default::default())` and
+#          `absent_writer_cause` with `Default::default()`: neither
+#          `ReplayError` nor `AbsentWriter` has a default.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
