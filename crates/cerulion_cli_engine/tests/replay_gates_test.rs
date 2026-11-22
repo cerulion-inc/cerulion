@@ -987,6 +987,72 @@ fn a_node_stop_record_on_a_node_stops_format_bag_passes_the_gates() {
     assert_eq!(err.exit_code(), 3);
 }
 
+/// A NODE-STOP record whose cause code names no cause is refused by the
+/// record gate (exit 2), naming the record, its rank and the code.
+#[test]
+fn a_node_stop_record_with_an_unknown_cause_is_refused_exit_2() {
+    let (_dir, path) = tmp_bag("node_stop_cause.mcap");
+    let mut atts = replay_grade_attachments(&["node0"]);
+    atts.push(recorder_att(Some(
+        cerulion_cli_engine::replay_engine::NODE_STOPS_MIN_TRACE_FORMAT,
+    )));
+    let stop = TraceRingRecord {
+        step: 2,
+        fire_time_ns: 1002,
+        duration_ns: 9,
+        node_idx: 0,
+        global_level: 0,
+        record_type: 7,
+        reserved: 0,
+    };
+    write_bag(&path, &[fire(0, 1), fire(0, 2), stop], &atts, true);
+    let err = gate(&path);
+    match &err {
+        ReplayError::RecordingInconsistent { detail } => assert_eq!(
+            detail,
+            "trace record 2: a scheduler-trace NODE-STOP record of rank 0 carries stop cause 9, \
+             which names no cause this Cerulion version defines, so the trace is corrupt"
+        ),
+        other => panic!("expected RecordingInconsistent (stop cause), got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+}
+
+/// A NODE-STOP record's `node_idx` is manifest-indexed like a FIRE's, and one
+/// past the table is refused naming the record kind (exit 2).
+#[test]
+fn a_node_stop_record_past_its_manifest_is_exit_2() {
+    let (_dir, path) = tmp_bag("node_stop_idx.mcap");
+    let stop = TraceRingRecord {
+        step: 2,
+        fire_time_ns: 1002,
+        duration_ns: 1,
+        node_idx: 1,
+        global_level: 0,
+        record_type: 7,
+        reserved: 0,
+    };
+    write_bag(
+        &path,
+        &[fire(0, 2), stop],
+        &replay_grade_attachments(&["a"]),
+        true,
+    );
+    let err = gate(&path);
+    match &err {
+        ReplayError::BagInvalidAttachment { name, reason } => {
+            assert!(name.contains("trace_manifest_rank0"), "got {name}");
+            assert_eq!(
+                reason,
+                "a scheduler-trace NODE-STOP record references node_idx 1 but the manifest \
+                 lists only 1 node id(s)"
+            );
+        }
+        other => panic!("expected BagInvalidAttachment (stop node_idx), got {other:?}"),
+    }
+    assert_eq!(err.exit_code(), 2);
+}
+
 /// The version gate sits at the node-stops format: a bag stamped one past it
 /// is refused up front with the upgrade message (exit 2), whatever its records.
 #[test]

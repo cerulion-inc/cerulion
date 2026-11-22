@@ -26512,6 +26512,17 @@ fn write_ls_resumed_bag(
     rec: &Recording,
     sink_anchor: bool,
 ) -> std::path::PathBuf {
+    write_ls_resumed_bag_stamped(dir, name, rec, sink_anchor, ri_free_run_recorder_json())
+}
+
+/// [`write_ls_resumed_bag`] with `recorder_json` as its `recorder.json`.
+fn write_ls_resumed_bag_stamped(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    sink_anchor: bool,
+    recorder_json: Vec<u8>,
+) -> std::path::PathBuf {
     let mid = make_mid_run(rec, LS_FIRST_STEP);
     let bag = dir.path().join(name);
     // The counter published `0..LS_FIRST_STEP` up to the anchor step.
@@ -26548,7 +26559,7 @@ fn write_ls_resumed_bag(
         Some(&coverage_for_nodes(&named)),
         None,
         None,
-        Some(ri_free_run_recorder_json()),
+        Some(recorder_json),
         manifest_keys,
     );
     bag
@@ -26763,13 +26774,17 @@ fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_si
 /// keeps counting.
 ///
 /// `--verify` refuses the bag before its first step ([`assert_ls_verify_refuses`],
-/// exit 2). A neutral `--resim all` replays it, and the slice shows the node
-/// running, so the unread-frame rule judges it: the fourth count after the fire
-/// at step 6 (step 10) passes the frame that fire's read took and two in
-/// delivery, a fire-schedule finding (the class `--verify` exits 6 on) with
+/// exit 2). A neutral `--resim all` replays it. The bag holds the stop as a
+/// NODE-STOP record, so the schedule check judges the sink by it and owes it no
+/// fire after step 6, and the finding is the recorded stop the candidate did
+/// not make: a fire-schedule finding (the class `--verify` exits 6 on) with
 /// nothing stood down, which the neutral summary reports as a differing fire
-/// schedule. The build the recording ran re-executes the stop at step 6 and
-/// re-derives clean, with nothing stood down either.
+/// schedule. The same recording stamped below the node-stops format says
+/// nothing about stops, and the slice shows the node running, so the
+/// unread-frame rule judges it: the fourth count after the fire at step 6
+/// (step 10) passes the frame that fire's read took and two in delivery. The
+/// build the recording ran re-executes the stop at step 6 and re-derives clean,
+/// with nothing stood down either.
 #[test]
 #[serial]
 fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_convicted() {
@@ -26777,6 +26792,47 @@ fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_con
     let rec = ls_reference(6);
     let bag = write_ls_resumed_bag(&dir, "ls_stops_inside.mcap", &rec, true);
     assert_ls_verify_refuses(&bag, SinkFailure::Logic(6.0));
+
+    let (stamped, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Logic(6.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let stamped = stamped.expect("the resumed neutral resim runs");
+    assert_eq!(
+        stamped.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 step 6: the recording stops node 'sink' at its \
+             fire 1 of the step (returned_fatal_error), and this re-execution does not stop it \
+             there"
+        )
+    );
+    assert!(!stamped.passed);
+    assert_eq!(resim_exit(&stamped, false), 0, "{stamped:?}");
+    assert_eq!(resim_exit(&stamped, true), 6, "{stamped:?}");
+    assert!(
+        stand_down_details(&stamped).is_empty(),
+        "a recorded stop is judged, never stood down: {:?}",
+        stand_down_details(&stamped)
+    );
+    let (stopping, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(6.0)),
+        replay_engine::ReplayPurpose::Resim,
+    );
+    let stopping = stopping.expect("the resumed neutral resim runs");
+    assert!(
+        stopping.passed && stopping.trace_divergence.is_none(),
+        "the build the recording ran re-executes the recorded stop: {stopping:?}"
+    );
+
+    let bag = write_ls_resumed_bag_stamped(
+        &dir,
+        "ls_stops_inside_below.mcap",
+        &rec,
+        true,
+        ri_recorder_json_at(replay_engine::ANCHOR_STOPS_MIN_TRACE_FORMAT),
+    );
 
     let (candidate, _) = ri_replay(
         &bag,
@@ -54806,4 +54862,268 @@ fn synthetic_difference() -> ByteDifference {
         reason: None,
         more: 0,
     }
+}
+
+// ===========================================================================
+// A recorded node stop, held to the re-execution
+//
+// A `period_ms = 1` source fires five times per 5 ms step and returns
+// `NodeError::Fatal` on its third tick: the third fire of step 0. From the
+// node-stops trace format the recording holds that stop as a NODE-STOP record
+// directly after the fire, and a replay holds its own re-executed stop to it.
+// ===========================================================================
+
+/// A `period_ms = 1` source that returns `NodeError::Fatal` on its build's
+/// `stop_tick` (none on a build without one); every other tick publishes the
+/// tick count.
+#[cerulion_node(period_ms = 1)]
+#[derive(Default)]
+struct BurstStopSrc {
+    #[output]
+    out: Vector3,
+    ticks: u32,
+    /// The tick this build stops at, if any; a restore leaves it as built.
+    #[cerulion(reconstruct)]
+    stop_tick: Option<u32>,
+}
+
+#[cerulion_node_impl]
+impl BurstStopSrc {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1;
+        if self.stop_tick == Some(self.ticks) {
+            return Err(NodeError::Fatal(
+                "the source stops at this tick".to_string(),
+            ));
+        }
+        self.out.x = f64::from(self.ticks);
+        Ok(())
+    }
+}
+
+/// The burst source's node id, at manifest index 2, after the stopping-sink
+/// graph's counter and sink, whose reads give the bag a read log.
+const BS_SRC: &str = "src";
+/// [`BS_SRC`]'s manifest index.
+const BS_SRC_IDX: u32 = 2;
+/// The steps every burst-stop recording runs.
+const BS_STEPS: usize = 4;
+
+/// The stopping-sink graph ([`ls_yaml`]) with the burst source beside it.
+fn bs_yaml() -> String {
+    format!(
+        "{}\x20 - id: src\n    type: burst_stop_src\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n",
+        ls_yaml()
+    )
+}
+
+/// The counter, a sink that never fails (its `Logic` threshold is no frame
+/// the counter reaches), and the burst source stopping at `stop_tick`.
+fn bs_factories(stop_tick: Option<u32>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    let mut f = ls_factories(SinkFailure::Logic(1.0e9));
+    f.insert(
+        BS_SRC.to_string(),
+        Box::new(BurstStopSrcEntry::with_state(BurstStopSrc {
+            stop_tick,
+            ..Default::default()
+        })),
+    );
+    f
+}
+
+/// Record the burst source stopping at its third tick and check the
+/// recording against the hand oracle: three fires at step 0 (1, 2 and 3 ms),
+/// none after, and one NODE-STOP record directly after the third, carrying
+/// the fatal cause (code 1).
+fn bs_reference() -> Recording {
+    let rec = record_uniform_with_read_log(&bs_yaml(), || bs_factories(Some(3)), &[], BS_STEPS);
+    assert_eq!(rec.node_ids[BS_SRC_IDX as usize], BS_SRC);
+    let fires: Vec<(u64, u64)> = rec
+        .trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == BS_SRC_IDX)
+        .map(|r| (r.step, r.fire_time_ns))
+        .collect();
+    assert_eq!(
+        fires,
+        vec![(0, 1_000_000), (0, 2_000_000), (0, 3_000_000)],
+        "three fires at step 0, the third the stopping one"
+    );
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == 7)
+        .expect("the recording holds a stop record");
+    assert_eq!(
+        rec.trace[at],
+        TraceRingRecord {
+            step: 0,
+            fire_time_ns: 3_000_000,
+            duration_ns: 1,
+            node_idx: BS_SRC_IDX,
+            global_level: 0,
+            record_type: 7,
+            reserved: 0,
+        }
+    );
+    let before = rec.trace[at - 1];
+    assert_eq!(
+        (before.record_type, before.node_idx, before.fire_time_ns),
+        (RECORD_TYPE_FIRE, BS_SRC_IDX, 3_000_000),
+        "the stop record sits directly after the stopping fire"
+    );
+    assert_eq!(
+        rec.trace.iter().filter(|r| r.record_type == 7).count(),
+        1,
+        "one stop record"
+    );
+    rec
+}
+
+/// A from-start one-rank free-run bag of `rec` whose `recorder.json` is
+/// `recorder_json`, with the read log keys a recorder stamps.
+fn write_bs_bag(
+    dir: &tempfile::TempDir,
+    name: &str,
+    rec: &Recording,
+    recorder_json: Vec<u8>,
+) -> std::path::PathBuf {
+    let bag = dir.path().join(name);
+    write_bag_impl(
+        rec,
+        &bag,
+        None,
+        VECTOR3_SCHEMA,
+        24,
+        None,
+        rec.input_names.as_ref().map(|i| serde_json::json!(i)),
+        Some(serde_json::json!(0)),
+        Some(recorder_json),
+        Some(ri_publishers(rec)),
+        None,
+        Some(rec.stage_rows.clone()),
+    );
+    bag
+}
+
+/// The same build re-executes the recorded stop at the same fire: the replay
+/// holds it to the recorded one, finds them equal and passes (exit 0).
+#[test]
+#[serial]
+fn a_replay_that_stops_where_the_recording_did_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(&dir, "bs_same.mcap", &rec, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(Some(3)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    assert!(
+        outcome.trace_divergence.is_none(),
+        "{:?}",
+        outcome.trace_divergence
+    );
+    assert!(outcome.passed, "{outcome:?}");
+    assert_eq!(resim_exit(&outcome, true), 0);
+}
+
+/// A build that does not stop leaves the recorded stop unmade: the schedule
+/// check judges by the recorded stop, so it owes no fire after it, and the
+/// one finding is the stop itself, at its recorded fire (the third of step 0)
+/// and cause (exit 6 under `--verify`).
+#[test]
+#[serial]
+fn a_replay_that_does_not_re_execute_the_recorded_stop_is_a_fire_schedule_divergence() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(&dir, "bs_unmade.mcap", &rec, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(None),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the unmade stop is a divergence");
+    assert_eq!(
+        divergence.detail,
+        "fire-schedule divergence: rank 0 step 0: the recording stops node 'src' at its fire 3 \
+         of the step (returned_fatal_error), and this re-execution does not stop it there"
+    );
+    assert!(!outcome.passed);
+    assert_eq!(resim_exit(&outcome, true), 6);
+}
+
+/// A build that stops at an EARLIER fire of the same burst: the schedule check
+/// judges by the recorded stop, the burst up to it is the recorded one, and the
+/// finding is the stop at another fire (exit 6). Without the stop held to the
+/// recorded one, nothing else in the replay reports it.
+#[test]
+#[serial]
+fn a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(&dir, "bs_early.mcap", &rec, ri_free_run_recorder_json());
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(Some(2)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the early stop is a divergence");
+    assert_eq!(
+        divergence.detail,
+        "fire-schedule divergence: rank 0 step 0: the recording stops node 'src' at its fire 3 \
+         of the step (returned_fatal_error), and this re-execution stops it at its fire 2 \
+         (returned_fatal_error)"
+    );
+    assert_eq!(resim_exit(&outcome, true), 6);
+}
+
+/// Below the node-stops trace format the trace says nothing about stops, so
+/// a bag restamped at the checkpoint-stops format with the same records is
+/// judged as before: the stop record is read past, the schedule check owes the
+/// source the rest of its burst, and the finding is the `period_ms` rule's,
+/// not the stop's.
+#[test]
+#[serial]
+fn below_the_node_stops_format_a_recorded_stop_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let rec = bs_reference();
+    let bag = write_bs_bag(
+        &dir,
+        "bs_format_below.mcap",
+        &rec,
+        ri_recorder_json_at(replay_engine::ANCHOR_STOPS_MIN_TRACE_FORMAT),
+    );
+    let (outcome, _) = ri_replay(
+        &bag,
+        || bs_factories(None),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let outcome = outcome.expect("the --verify replay runs");
+    let divergence = outcome
+        .trace_divergence
+        .as_ref()
+        .expect("the owed fires are a divergence");
+    assert!(
+        divergence
+            .detail
+            .contains("node 'src' step 0 period_ms schedule"),
+        "{}",
+        divergence.detail
+    );
+    assert!(
+        !divergence.detail.contains("stops node"),
+        "{}",
+        divergence.detail
+    );
+    assert_eq!(resim_exit(&outcome, true), 6);
 }

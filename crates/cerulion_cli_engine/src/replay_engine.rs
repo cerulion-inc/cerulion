@@ -5182,6 +5182,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // the read gate's rule and the shape predicate branch on. `false` on every
     // archived bag and on an absent attachment: the counted arm.
     let consults_recorded = recorder_records_every_consult(recorder.as_ref());
+    // And whether its trace holds a NODE-STOP record for every stop, so a
+    // re-executed stop can be held to the recorded one.
+    let stops_recorded = recorder_records_node_stops_at(recorder.as_ref());
     // …and, separately, how wide its kind field is. ABSENT is NOT the archived
     // arm here (see `KindFieldWidth`), which is why this is not `!roles_stamped`.
     let kind_width = kind_field_width(recorder.as_ref());
@@ -5668,6 +5671,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 coordination,
                 roles_stamped,
                 consults_recorded,
+                stops_recorded,
                 stages_every_consult,
                 stages_batch_frames,
                 identity: edge_identity,
@@ -10108,6 +10112,12 @@ struct PassInputs<'a> {
     /// the counted arm, under which an empty drain wrote no record and a
     /// consult past the plan is a reported number.
     consults_recorded: bool,
+    /// Does this bag's trace hold a NODE-STOP record for every stop the
+    /// recording made (`trace_format >= NODE_STOPS_MIN_TRACE_FORMAT`)? Then
+    /// each recorded stop is the one the schedule check judges by, and a
+    /// re-executed stop that differs from it is a fire-schedule divergence.
+    /// `false` on every bag below that format and on an absent attachment.
+    stops_recorded: bool,
     /// Does the replay's staging write a record at an empty consult, the
     /// shape this bag's recorder wrote (`replay_stages_every_consult`)?
     ///
@@ -16347,6 +16357,15 @@ fn run_rank_pass(
     };
     let mut rec_step_fires: Vec<RecordedFire> = Vec::new(); // reused per step.
     let mut rep_step_fires: Vec<ReplayedFire> = Vec::new(); // reused per step.
+
+    // The step's stops, as the recording's trace holds them and as the
+    // re-execution made them, reused per step; and the first step at which the
+    // two differ (a bag at the node-stops format or later only), outside the
+    // stops of the `external` (driver) nodes, whose recorded stops a replay
+    // cannot re-execute without their devices.
+    let mut rec_step_stops: Vec<replay_rederive::StepStop> = Vec::new();
+    let mut rep_step_stops: Vec<replay_rederive::StepStop> = Vec::new();
+    let mut stop_report: Option<(u64, replay_rederive::StopDisagreement)> = None;
     let mut ticks_replayed = 0usize;
     // This pass's own EXECUTION range, for `rank_execution`.
     // `first_step`/`last_step` are the steps actually EXECUTED (not the ones the
@@ -16514,6 +16533,21 @@ fn run_rank_pass(
             pass.rank_tables,
             &mut rec_step_fires,
         )?;
+        rec_step_stops.clear();
+        if pass.stops_recorded {
+            rec_step_stops.extend(
+                fire_cursors
+                    .step_stops()
+                    .iter()
+                    .filter(|s| !pass.driver_nodes.contains(&s.node_id))
+                    .cloned(),
+            );
+            if !lockstep {
+                for stop in &rec_step_stops {
+                    rederive_stops.note_recorded(boundary.step, stop);
+                }
+            }
+        }
         // Accumulate this step for the rank-local re-derivation
         // verifier, which takes the whole slice (it re-derives a SCHEDULE, and a
         // schedule is a statement about a sequence of steps). The reads were
@@ -16616,6 +16650,34 @@ fn run_rank_pass(
             }
         }
         runtime.step(Duration::from_nanos(delta));
+        if pass.stops_recorded && stop_report.is_none() {
+            // The trace holds exactly this step's fires (it is cleared below
+            // every step); a stopping fire's position is its node's entries up
+            // to and including it.
+            rep_step_stops.clear();
+            let trace = runtime.trace();
+            for (i, e) in trace.iter().enumerate() {
+                if let Some(cause) = e.stop {
+                    if pass.driver_nodes.contains(e.node_id.as_ref()) {
+                        continue;
+                    }
+                    let fires = trace[..=i]
+                        .iter()
+                        .filter(|x| *x.node_id == *e.node_id)
+                        .count();
+                    rep_step_stops.push(replay_rederive::StepStop {
+                        node_id: e.node_id.to_string(),
+                        fires: u32::try_from(fires).unwrap_or(u32::MAX),
+                        cause,
+                    });
+                }
+            }
+            if let Some(disagreement) =
+                replay_rederive::first_stop_disagreement(&rec_step_stops, &rep_step_stops)
+            {
+                stop_report = Some((boundary.step, disagreement));
+            }
+        }
         if !lockstep {
             for decl in &verification.decls {
                 if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
@@ -17532,6 +17594,21 @@ fn run_rank_pass(
             context: Vec::new(),
         }),
     };
+    // A re-executed stop that differs from the recorded one is a fire-schedule
+    // divergence too, reported when the compare above found none.
+    let divergence = divergence.or_else(|| {
+        stop_report.map(|(step, disagreement)| TraceDivergenceReport {
+            position: 0,
+            detail: format!(
+                "{}: rank {} step {step}: {disagreement}",
+                DivergenceClass::FireSchedule.phrase(),
+                plan.rank()
+            ),
+            recorded: None,
+            replayed: None,
+            context: Vec::new(),
+        })
+    });
     tail_notes.extend(read_log.take_tail_notes());
     let read_log_outcome = read_log.finalize();
 
@@ -27210,6 +27287,10 @@ struct RankedFireCursors<'a> {
     stamp_rank: bool,
     /// Per-step merge scratch: `(global_level, rank, seq, fire)` — reused.
     scratch: Vec<(u32, u32, u32, RecordedFire)>,
+    /// The NODE-STOP records of the step the last pull read, in rank order and
+    /// each rank's stream order, with the stopping fire's position among its
+    /// node's FIRE records of that step on its rank; reused.
+    stops: Vec<replay_rederive::StepStop>,
 }
 
 impl<'a> RankedFireCursors<'a> {
@@ -27223,7 +27304,14 @@ impl<'a> RankedFireCursors<'a> {
             ranks: (0..rank_count as u32).collect(),
             stamp_rank: rank_count > 1,
             scratch: Vec::new(),
+            stops: Vec::new(),
         })
+    }
+
+    /// The NODE-STOP records of the step the last
+    /// [`Self::pull_merged_step_fires`] read.
+    fn step_stops(&self) -> &[replay_rederive::StepStop] {
+        &self.stops
     }
 
     /// The MIN absolute bag offset across every rank's FIRE cursor — the
@@ -27252,6 +27340,7 @@ impl<'a> RankedFireCursors<'a> {
             ranks: vec![rank],
             stamp_rank: true,
             scratch: Vec::new(),
+            stops: Vec::new(),
         })
     }
 
@@ -27269,6 +27358,7 @@ impl<'a> RankedFireCursors<'a> {
         out: &mut Vec<RecordedFire>,
     ) -> Result<(), ReplayError> {
         self.scratch.clear();
+        self.stops.clear();
         // Rank is a diagnostic on multi-rank bags only (`None` keeps
         // single-rank divergence output byte-identical).
         let multi_rank = self.stamp_rank;
@@ -27318,6 +27408,37 @@ impl<'a> RankedFireCursors<'a> {
                         },
                     ));
                     seq += 1;
+                } else if r.record_type == RECORD_TYPE_NODE_STOP && r.step == step {
+                    // The recorder pushes a stop directly after the FIRE record of
+                    // the fire that made it, so its position is its node's FIRE
+                    // records of this step on this rank so far. The cause was
+                    // checked by the record gate; a stream that reaches here
+                    // unchecked is refused the same way.
+                    let Some(cause) = r.stop_cause() else {
+                        let fault = cerulion_core::trace_ring::TraceRecordFault::UnknownStopCause {
+                            rank: rank as u32,
+                            code: r.duration_ns,
+                        };
+                        return Err(ReplayError::RecordingInconsistent {
+                            detail: fault.detail(),
+                        });
+                    };
+                    let node_id = rank_tables[rank]
+                        .get(r.node_idx as usize)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            Arc::from(format!("<node_idx {}>", r.node_idx).as_str())
+                        });
+                    let fires = self
+                        .scratch
+                        .iter()
+                        .filter(|e| e.1 == rank as u32 && e.3.node_id == node_id)
+                        .count();
+                    self.stops.push(replay_rederive::StepStop {
+                        node_id: node_id.to_string(),
+                        fires: u32::try_from(fires).unwrap_or(u32::MAX),
+                        cause,
+                    });
                 }
             }
         }

@@ -617,6 +617,16 @@ pub enum TraceRecordFault {
         /// [`RECORD_TYPE_NODE_STOP`]. Render it with [`trace_record_noun`].
         record_type: u32,
     },
+    /// A NODE-STOP record whose cause code names no
+    /// [`NodeStopCause`](crate::scheduler::NodeStopCause): a corrupt record,
+    /// since a cause a later writer adds comes with a `trace_format` this
+    /// build refuses first.
+    UnknownStopCause {
+        /// The record's rank.
+        rank: u32,
+        /// The code the record carries in `duration_ns`.
+        code: u64,
+    },
     /// `record_type` 0 — a zeroed slot, i.e. a corrupt recording.
     ZeroedRecord,
     /// A reserved or unknown `record_type` (4 and 5 are reserved, 8+ are
@@ -649,6 +659,10 @@ impl TraceRecordFault {
                 "a scheduler-trace {} record references node_idx {node_idx} but rank {rank}'s \
                  manifest lists only {nodes} node id(s)",
                 trace_record_noun(*record_type)
+            ),
+            Self::UnknownStopCause { rank, code } => format!(
+                "a scheduler-trace NODE-STOP record of rank {rank} carries stop cause {code}, \
+                 which names no cause this Cerulion version defines, so the trace is corrupt"
             ),
             Self::ZeroedRecord => {
                 "a scheduler-trace record has record_type 0 — an invalid (zeroed) record, so \
@@ -701,6 +715,14 @@ pub fn classify_trace_record(
                 node_idx: rec.node_idx,
                 nodes,
                 record_type: rec.record_type,
+            })
+        }
+        RECORD_TYPE_NODE_STOP
+            if crate::scheduler::NodeStopCause::from_code(rec.duration_ns).is_none() =>
+        {
+            Some(TraceRecordFault::UnknownStopCause {
+                rank,
+                code: rec.duration_ns,
             })
         }
         RECORD_TYPE_FIRE
@@ -761,6 +783,7 @@ pub fn trace_record_noun(record_type: u32) -> String {
     match record_type {
         RECORD_TYPE_FIRE => "FIRE".to_string(),
         RECORD_TYPE_READ_OUTCOME => "READ-OUTCOME".to_string(),
+        RECORD_TYPE_NODE_STOP => "NODE-STOP".to_string(),
         other => format!("record_type {other}"),
     }
 }
@@ -2766,6 +2789,33 @@ mod tests {
                 nodes: 3,
                 record_type: 7,
             })
+        );
+        // A stop record whose cause code names no cause is refused, after
+        // its node index is.
+        for code in [0u64, 4, u64::MAX] {
+            let rec = TraceRingRecord {
+                duration_ns: code,
+                ..in_range
+            };
+            assert_eq!(
+                classify_trace_record(&rec, &nodes),
+                Some(TraceRecordFault::UnknownStopCause { rank: 0, code }),
+                "code {code}"
+            );
+            let past = TraceRingRecord { node_idx: 3, ..rec };
+            assert!(
+                matches!(
+                    classify_trace_record(&past, &nodes),
+                    Some(TraceRecordFault::NodeIdxOutOfRange { .. })
+                ),
+                "code {code}"
+            );
+        }
+        assert_eq!(trace_record_noun(RECORD_TYPE_NODE_STOP), "NODE-STOP");
+        assert_eq!(
+            TraceRecordFault::UnknownStopCause { rank: 1, code: 9 }.detail(),
+            "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which names no \
+             cause this Cerulion version defines, so the trace is corrupt"
         );
         for kind in [4u32, 5, 8, u32::MAX] {
             let rec = TraceRingRecord {

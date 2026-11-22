@@ -1440,6 +1440,39 @@ bits, which this build reads past; a change to what they mean for a resim
 comes with a new `trace_format`, which this build refuses with "upgrade to
 replay it".
 
+### Node stops (`trace_format` 12)
+
+A format 12 recording holds every stop the scheduler made: the fire that
+stopped a node (a `NodeError::Fatal` return, a tick panic or a node entry found
+poisoned, or the consecutive-panic breaker) is followed, on its rank's trace
+ring, by a NODE-STOP record, record kind 7 in the 40-byte layout. Its `step`,
+`fire_time_ns`, `node_idx` and `global_level` are those of the stopping fire,
+`duration_ns` is the cause (`1` fatal error, `2` entry poisoned, `3` disabled
+after consecutive panics) and `reserved` carries the rank. The stop's position
+in its step's burst is the number of that node's FIRE records of the step on
+its rank up to the stop record. A node stopped by a fatal error or by the
+breaker fires no more; a poisoned node keeps firing with its tick skipped, so
+its FIRE records go on after its stop record.
+
+A resim of a format 12 bag holds each re-executed stop to the recorded one at
+every step it executes. A stop at another fire of the burst or for another
+cause, a recorded stop the re-execution does not make, and a re-executed stop
+the recording does not hold are each a fire-schedule difference (exit 6 under
+`--verify`), reported when the fire comparison finds no other difference, as
+in `fire-schedule divergence: rank 0 step 4: the recording stops node 'sink' at
+its fire 1 of the step (returned_fatal_error), and this re-execution does not
+stop it there`. The schedule check judges each node by its recorded stop, so
+it owes a node no fire after a recorded fatal or breaker stop whether or not
+the re-execution stops it. The stops of an `external` (driver) node are not
+compared, because a resim never gives a driver its device. A NODE-STOP record
+whose cause is none of the three is refused before the first replayed step
+(`bag internal consistency check failed`, exit 2).
+
+Below 12 the trace holds no stop record, and a resim judges stops as before:
+by the re-execution, and by the checkpoint a resumed bag begins at. A reader
+below 12 does not define record kind 7, so the stamp moves and that reader
+refuses the bag by its format.
+
 ### The kind-6 annotations ride INSIDE the record kind
 
 The read log's two annotation kinds, the OVERFLOW MARKER (outcome kind **6**)

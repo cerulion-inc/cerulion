@@ -94,6 +94,7 @@ use std::fmt;
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
 use cerulion_core::replay_feed::EdgeIdentity;
 use cerulion_core::scheduler::catchup_clamp::{derive_catchup_cap_override, effective_max_catchup};
+use cerulion_core::scheduler::NodeStopCause;
 
 use crate::replay_engine::DivergenceClass;
 
@@ -289,10 +290,12 @@ impl PassRestore {
     }
 }
 
-/// Where each node of the pass was STOPPED ([`StopPoint`]): either at the
-/// checkpoint a resumed pass began from, as that checkpoint states it, or by
-/// a fire the re-execution performed (a `NodeError::Fatal` return or the
-/// panic breaker), with the stopping fire's position in that step's burst.
+/// Where each node of the pass was STOPPED ([`StopPoint`]): at the checkpoint
+/// a resumed pass began from, as that checkpoint states it; by a fire the
+/// recording's trace states stopped it (a NODE-STOP record, on a bag at the
+/// node-stops `trace_format` or later); or by a fire the re-execution performed (a
+/// `NodeError::Fatal` return or the panic breaker), with the stopping fire's
+/// position in that step's burst.
 ///
 /// A stopped node never fires again, so the recording holds no fire of it
 /// after the stop, and every decider must stop predicting there: the clock
@@ -302,6 +305,9 @@ impl PassRestore {
 /// recording, so a recording that kept firing past the stop is still a
 /// finding. Replay = Live puts the re-executed stop on the recorded one, and
 /// a stop at the checkpoint on the stop the recorded run had made before it.
+/// A recorded stop is noted before the step's re-execution, so the recording's
+/// own stop is the one every rule judges by, and a re-executed stop that
+/// disagrees with it is a finding of its own ([`first_stop_disagreement`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct PassStops {
     stopped_at: BTreeMap<String, StopPoint>,
@@ -331,6 +337,19 @@ pub(crate) enum StopPoint {
         /// The stopping fire's position in that step's burst.
         fires: u32,
     },
+    /// The recording's trace states that the `fires`-th fire of the node at
+    /// `step` stopped it, with `cause`. A stop whose cause leaves the node
+    /// firing ([`NodeStopCause::fires_again`]: a poisoned entry, whose later
+    /// fires skip its tick) changes no rule's expectation; any other is judged
+    /// as [`Self::InPass`] is.
+    Recorded {
+        /// The step whose fire stopped the node.
+        step: u64,
+        /// The stopping fire's position among the node's fires of that step.
+        fires: u32,
+        /// Why the node stopped.
+        cause: NodeStopCause,
+    },
 }
 
 impl StopPoint {
@@ -339,6 +358,9 @@ impl StopPoint {
         match self {
             Self::AtAnchor { anchor_step } => step > anchor_step,
             Self::InPass { step: stop, .. } => step > stop,
+            Self::Recorded {
+                step: stop, cause, ..
+            } => !cause.fires_again() && step > stop,
         }
     }
 
@@ -348,7 +370,12 @@ impl StopPoint {
     fn burst_at(self, step: u64) -> Option<u32> {
         match self {
             Self::InPass { step: stop, fires } if stop == step => Some(fires),
-            Self::InPass { .. } | Self::AtAnchor { .. } => None,
+            Self::Recorded {
+                step: stop,
+                fires,
+                cause,
+            } if stop == step && !cause.fires_again() => Some(fires),
+            Self::InPass { .. } | Self::AtAnchor { .. } | Self::Recorded { .. } => None,
         }
     }
 }
@@ -385,6 +412,18 @@ impl PassStops {
             .or_insert(StopPoint::InPass { step, fires });
     }
 
+    /// Note the stop the recording's trace states at `step` ([`StopPoint::Recorded`]).
+    /// The FIRST stop wins, as for [`Self::note`].
+    pub(crate) fn note_recorded(&mut self, step: u64, stop: &StepStop) {
+        self.stopped_at
+            .entry(stop.node_id.clone())
+            .or_insert(StopPoint::Recorded {
+                step,
+                fires: stop.fires,
+                cause: stop.cause,
+            });
+    }
+
     /// Is `node_id` stopped, at the checkpoint or by a noted fire?
     pub(crate) fn contains(&self, node_id: &str) -> bool {
         self.stopped_at.contains_key(node_id)
@@ -394,6 +433,123 @@ impl PassStops {
     fn stop_point(&self, node_id: &str) -> Option<StopPoint> {
         self.stopped_at.get(node_id).copied()
     }
+}
+
+/// One node's stop at one step, as the recording's trace holds it (a
+/// NODE-STOP record) or as the re-execution made it (the stopping fire's trace
+/// entry).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StepStop {
+    /// The stopped node.
+    pub(crate) node_id: String,
+    /// The stopping fire's position among the node's fires of the step, the
+    /// stopping fire included (`1` = its first fire stopped it).
+    pub(crate) fires: u32,
+    /// Why the node stopped.
+    pub(crate) cause: NodeStopCause,
+}
+
+/// A step at which the re-execution's stop of one node differs from the stop
+/// the recording's trace holds. Each stop is `(fires, cause)`: the stopping
+/// fire's position among the node's fires of the step, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StopDisagreement {
+    /// The recording stops the node at the step; the re-execution does not.
+    NotReExecuted {
+        /// The node.
+        node_id: String,
+        /// The recording's stop.
+        recorded: (u32, NodeStopCause),
+    },
+    /// The re-execution stops the node at the step; the recording does not.
+    NotRecorded {
+        /// The node.
+        node_id: String,
+        /// The re-execution's stop.
+        replayed: (u32, NodeStopCause),
+    },
+    /// Both stop the node at the step, at another fire or for another cause.
+    Differs {
+        /// The node.
+        node_id: String,
+        /// The recording's stop.
+        recorded: (u32, NodeStopCause),
+        /// The re-execution's stop.
+        replayed: (u32, NodeStopCause),
+    },
+}
+
+impl fmt::Display for StopDisagreement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cause = |c: NodeStopCause| c.death_cause().as_wire();
+        match self {
+            Self::NotReExecuted {
+                node_id,
+                recorded: (fires, c),
+            } => write!(
+                f,
+                "the recording stops node '{node_id}' at its fire {fires} of the step ({}), and \
+                 this re-execution does not stop it there",
+                cause(*c)
+            ),
+            Self::NotRecorded {
+                node_id,
+                replayed: (fires, c),
+            } => write!(
+                f,
+                "this re-execution stops node '{node_id}' at its fire {fires} of the step ({}), \
+                 and the recording holds no stop of it there",
+                cause(*c)
+            ),
+            Self::Differs {
+                node_id,
+                recorded: (rf, rc),
+                replayed: (pf, pc),
+            } => write!(
+                f,
+                "the recording stops node '{node_id}' at its fire {rf} of the step ({}), and \
+                 this re-execution stops it at its fire {pf} ({})",
+                cause(*rc),
+                cause(*pc)
+            ),
+        }
+    }
+}
+
+/// PURE: the first node at one step whose re-executed stop differs from the
+/// recorded one, or `None` when the two agree. The recorded stops are asked
+/// first, in the order the trace holds them, then the re-executed stops the
+/// recording does not hold, in the order the re-execution made them.
+pub(crate) fn first_stop_disagreement(
+    recorded: &[StepStop],
+    replayed: &[StepStop],
+) -> Option<StopDisagreement> {
+    let side = |s: &StepStop| (s.fires, s.cause);
+    for r in recorded {
+        match replayed.iter().find(|p| p.node_id == r.node_id) {
+            None => {
+                return Some(StopDisagreement::NotReExecuted {
+                    node_id: r.node_id.clone(),
+                    recorded: side(r),
+                })
+            }
+            Some(p) if side(p) != side(r) => {
+                return Some(StopDisagreement::Differs {
+                    node_id: r.node_id.clone(),
+                    recorded: side(r),
+                    replayed: side(p),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    replayed
+        .iter()
+        .find(|p| !recorded.iter().any(|r| r.node_id == p.node_id))
+        .map(|p| StopDisagreement::NotRecorded {
+            node_id: p.node_id.clone(),
+            replayed: side(p),
+        })
 }
 
 /// At the step a node was stopped in the pass, the recording holds the
@@ -5313,6 +5469,193 @@ mod tests {
             Some(StopPoint::InPass { step: 6, fires: 1 })
         );
         assert_eq!(PassStops::at_anchor(3, []), PassStops::none());
+    }
+
+    /// A recorded stop against the same hand table: a stop that ends the
+    /// node's fires is judged as an in-pass stop is, and a poisoned entry's
+    /// stop, after which the node keeps firing, owes nothing and cuts no burst.
+    #[test]
+    fn a_recorded_stop_point_answers_its_hand_table() {
+        let fatal = StopPoint::Recorded {
+            step: 5,
+            fires: 2,
+            cause: NodeStopCause::FatalError,
+        };
+        let breaker = StopPoint::Recorded {
+            step: 5,
+            fires: 3,
+            cause: NodeStopCause::DisabledAfterPanics,
+        };
+        let poisoned = StopPoint::Recorded {
+            step: 5,
+            fires: 1,
+            cause: NodeStopCause::EntryPoisoned,
+        };
+        let rows: &[(StopPoint, u64, bool, Option<u32>)] = &[
+            (fatal, 4, false, None),
+            (fatal, 5, false, Some(2)),
+            (fatal, 6, true, None),
+            (breaker, 5, false, Some(3)),
+            (breaker, 9, true, None),
+            (poisoned, 4, false, None),
+            (poisoned, 5, false, None),
+            (poisoned, 6, false, None),
+        ];
+        for (stop, step, after, burst) in rows {
+            assert_eq!(stop.is_after(*step), *after, "{stop:?} at step {step}");
+            assert_eq!(stop.burst_at(*step), *burst, "{stop:?} at step {step}");
+        }
+    }
+
+    /// A recorded stop is noted like any other: the first stop of a node wins,
+    /// so a node the checkpoint states keeps that stop and a later note of the
+    /// same node moves nothing.
+    #[test]
+    fn a_recorded_stop_is_noted_first_wins() {
+        let stop = |node: &str, fires: u32, cause: NodeStopCause| StepStop {
+            node_id: node.to_string(),
+            fires,
+            cause,
+        };
+        let mut stops = PassStops::at_anchor(3, ["sink"]);
+        stops.note_recorded(5, &stop("sink", 1, NodeStopCause::FatalError));
+        stops.note_recorded(6, &stop("relay", 2, NodeStopCause::EntryPoisoned));
+        stops.note("relay", 6, 1);
+        stops.note_recorded(8, &stop("relay", 1, NodeStopCause::FatalError));
+        assert_eq!(
+            stops.stop_point("sink"),
+            Some(StopPoint::AtAnchor { anchor_step: 3 })
+        );
+        assert_eq!(
+            stops.stop_point("relay"),
+            Some(StopPoint::Recorded {
+                step: 6,
+                fires: 2,
+                cause: NodeStopCause::EntryPoisoned,
+            })
+        );
+        assert!(stops.contains("relay"));
+    }
+
+    /// The stop comparison at one step, against a hand table: agreement, each
+    /// of the three ways to differ, and the order the first difference is
+    /// taken in (recorded stops first, in trace order, then the re-executed
+    /// stops the recording does not hold).
+    #[test]
+    fn the_first_stop_disagreement_answers_its_hand_table() {
+        use NodeStopCause::{DisabledAfterPanics, EntryPoisoned, FatalError};
+        let stop = |node: &str, fires: u32, cause: NodeStopCause| StepStop {
+            node_id: node.to_string(),
+            fires,
+            cause,
+        };
+        let a1 = stop("a", 1, FatalError);
+        let b2 = stop("b", 2, EntryPoisoned);
+        // Agreement, in any order, and an empty step.
+        assert_eq!(first_stop_disagreement(&[], &[]), None);
+        assert_eq!(
+            first_stop_disagreement(&[a1.clone(), b2.clone()], &[b2.clone(), a1.clone()]),
+            None
+        );
+        // A recorded stop the re-execution did not make.
+        assert_eq!(
+            first_stop_disagreement(std::slice::from_ref(&a1), &[]),
+            Some(StopDisagreement::NotReExecuted {
+                node_id: "a".to_string(),
+                recorded: (1, FatalError),
+            })
+        );
+        // A re-executed stop the recording does not hold.
+        assert_eq!(
+            first_stop_disagreement(&[], std::slice::from_ref(&b2)),
+            Some(StopDisagreement::NotRecorded {
+                node_id: "b".to_string(),
+                replayed: (2, EntryPoisoned),
+            })
+        );
+        // Another fire, and another cause.
+        assert_eq!(
+            first_stop_disagreement(std::slice::from_ref(&a1), &[stop("a", 2, FatalError)]),
+            Some(StopDisagreement::Differs {
+                node_id: "a".to_string(),
+                recorded: (1, FatalError),
+                replayed: (2, FatalError),
+            })
+        );
+        assert_eq!(
+            first_stop_disagreement(
+                std::slice::from_ref(&a1),
+                &[stop("a", 1, DisabledAfterPanics)]
+            ),
+            Some(StopDisagreement::Differs {
+                node_id: "a".to_string(),
+                recorded: (1, FatalError),
+                replayed: (1, DisabledAfterPanics),
+            })
+        );
+        // Order: the recorded stops are asked first, so a missing recorded stop
+        // of "b" is named before an unrecorded stop of "c" that precedes it in
+        // the re-execution.
+        assert_eq!(
+            first_stop_disagreement(
+                &[a1.clone(), b2.clone()],
+                &[stop("c", 1, FatalError), a1.clone()]
+            ),
+            Some(StopDisagreement::NotReExecuted {
+                node_id: "b".to_string(),
+                recorded: (2, EntryPoisoned),
+            })
+        );
+        // …and among the unrecorded stops, the re-execution's order.
+        assert_eq!(
+            first_stop_disagreement(
+                std::slice::from_ref(&a1),
+                &[
+                    stop("d", 1, FatalError),
+                    a1.clone(),
+                    stop("c", 1, FatalError)
+                ]
+            ),
+            Some(StopDisagreement::NotRecorded {
+                node_id: "d".to_string(),
+                replayed: (1, FatalError),
+            })
+        );
+    }
+
+    /// Each disagreement renders the node, both stops' positions and their
+    /// causes in the node-death vocabulary.
+    #[test]
+    fn a_stop_disagreement_renders_each_side() {
+        use NodeStopCause::{EntryPoisoned, FatalError};
+        assert_eq!(
+            StopDisagreement::NotReExecuted {
+                node_id: "sink".to_string(),
+                recorded: (1, FatalError),
+            }
+            .to_string(),
+            "the recording stops node 'sink' at its fire 1 of the step (returned_fatal_error), \
+             and this re-execution does not stop it there"
+        );
+        assert_eq!(
+            StopDisagreement::NotRecorded {
+                node_id: "sink".to_string(),
+                replayed: (2, EntryPoisoned),
+            }
+            .to_string(),
+            "this re-execution stops node 'sink' at its fire 2 of the step \
+             (entry_poisoned_after_panic), and the recording holds no stop of it there"
+        );
+        assert_eq!(
+            StopDisagreement::Differs {
+                node_id: "sink".to_string(),
+                recorded: (2, FatalError),
+                replayed: (1, EntryPoisoned),
+            }
+            .to_string(),
+            "the recording stops node 'sink' at its fire 2 of the step (returned_fatal_error), \
+             and this re-execution stops it at its fire 1 (entry_poisoned_after_panic)"
+        );
     }
 
     /// The checkpoint step of the resumed rule tests below: each slice
