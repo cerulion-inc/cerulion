@@ -7413,10 +7413,11 @@ impl GraphRuntime {
         // `NodeHandle::backpressure_block_fires_deferred_count` reads them.
         let mut block_counter_registrations: Vec<(String, String, Arc<BackpressureCounters>)> =
             Vec::new();
-        // One retained read-only record per block CONSUMER edge —
-        // the credit the replay verifier asserts conservation on
-        // ([`GraphRuntime::block_credits`]). Empty for every graph with no
-        // `block` input.
+        // One retained read-only record per block CONSUMER edge a credit
+        // word counts: the credit the replay verifier asserts conservation
+        // on ([`GraphRuntime::block_credits`]). Empty for every graph with no
+        // `block` input, and none for an edge a replay feeds from its
+        // recording.
         let mut block_credit_edges: Vec<BlockCreditEdge> = Vec::new();
         // The MAPPED edges this process PRODUCES on, kept
         // so the live loop can park on their credit words. EMPTY for every
@@ -7536,7 +7537,10 @@ impl GraphRuntime {
             // other consumers declare: they hold no slot and the producer's
             // deferral never consults them.
             if !flow.holds_its_producers() {
-                continue; // a producer-less `block` edge is refused by validate
+                // A producer-less `block` edge is refused by validate unless
+                // a replay feeds it from its recording, and no credit word
+                // counts a fed edge.
+                continue;
             }
             for edge in flow
                 .consumers
@@ -8566,7 +8570,7 @@ impl GraphRuntime {
                     )?
                 };
                 // Install this input's single backpressure probe.
-                // The three arms are mutually exclusive BY CONTROL FLOW —
+                // The arms are mutually exclusive BY CONTROL FLOW,
                 // mirroring the subscriber's one-variant `BackpressureProbe`
                 // slot. Map disjointness is already guaranteed
                 // upstream (each consumer edge carries a single
@@ -8574,9 +8578,11 @@ impl GraphRuntime {
                 // probe is installed — this chain is the wiring-site layer
                 // of that same defense.
                 //
-                // `block`: the outstanding mirror (each drain decrements it)
-                // plus the threshold + counters so the consumer's block
-                // event fires when its queue is at the defer line.
+                // `block`: no probe on an input a replay feeds from its
+                // recording; on any other, the outstanding mirror (each drain
+                // decrements it) plus the threshold + counters so the
+                // consumer's block event fires when its queue is at the defer
+                // line.
                 if bag_fed_ends.feeds_consumer(&topic, &node_def.id, &input.name) {
                     // A `block` input a replay feeds from its recording
                     // (`BagFedBlockEdges`) gets NO probe and registers no
@@ -19164,9 +19170,9 @@ impl GraphRuntime {
     /// ONE item per consumer edge in build order, allocating nothing (the
     /// strings are borrowed from the retained records), so a per-fire
     /// conservation assert is cheap. Empty for a graph that declares no `block`
-    /// input. A `block` input a replay feeds from its recording
-    /// ([`crate::replay_feed::BagFedBlockEdges`]) has no in-graph producer and
-    /// no credit binding, so it has no item here.
+    /// input. A `block` edge a replay feeds from its recording
+    /// ([`crate::replay_feed::BagFedBlockEdges`]) has no item in either pass:
+    /// the build holds only one end of it, and no credit binding names it.
     pub fn block_credits(&self) -> impl Iterator<Item = BlockCredit<'_>> + '_ {
         self.block_credit_edges.iter().map(|e| BlockCredit {
             topic: e.topic.as_str(),
