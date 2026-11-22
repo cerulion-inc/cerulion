@@ -48628,7 +48628,11 @@ fn identity_fed_replay_reproduces_reads_of_three_writers_on_one_topic() {
 /// MUTANT: the recorded identity dropped from the bag. On a single-writer
 /// edge one annotation opens the writer's run, so dropping it leaves every
 /// read of the run unattributed. The replay refuses by name (node, input,
-/// writer, sequence) at the first of them, before its first step.
+/// writer, sequence) at the first of them, before its first step. The same
+/// records stamped at trace format 10, below the format that names a writer at
+/// every window head, are refused with the same text: the bag begins at step
+/// 0, so the read continues no run the bag lacks, and the refusal neither says
+/// the bag begins mid-run nor asks for the run to be recorded again.
 #[test]
 #[serial]
 fn a_dropped_read_identity_is_refused_by_node_input_writer_and_sequence() {
@@ -48678,6 +48682,28 @@ fn a_dropped_read_identity_is_refused_by_node_input_writer_and_sequence() {
     ] {
         assert!(msg.contains(part), "the refusal names `{part}`: {msg}");
     }
+    assert!(
+        msg.ends_with(&format!(
+            "writer none, sequence {named}: the read popped frames and the recording names no \
+             writer for them"
+        )),
+        "a bag that begins at step 0 gets the plain sentence: {msg}"
+    );
+
+    let at_ten = dir.path().join("ri_dropped_identity_10.mcap");
+    ri_bag(&live.rec, &at_ten, ri_recorder_json_at(10));
+    let (outcome, _) = ri_replay(
+        &at_ten,
+        ri_evict_factories,
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let err = outcome.expect_err("a format-10 read with no recorded identity is refused");
+    assert_eq!(err.exit_code(), 2, "{err}");
+    assert_eq!(
+        err.to_string(),
+        msg,
+        "a format-10 bag recorded from step 0 is refused with the same sentence"
+    );
 }
 
 /// MUTANT: one recorded identity dropped on the three-writer topic, where the
