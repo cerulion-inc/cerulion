@@ -16732,18 +16732,11 @@ fn run_rank_pass(
         // its own flag; a lockstep pass reopens each flagged rank's nodes, on
         // that rank's own flag, since ranks legitimately differ.
         //
-        // ONE walk of the stages, decided per node by `reopens_node`: a
-        // free-run pass hands its own flag as rank 0's and no rank map, so
-        // every node is at rank 0; a lockstep pass hands the per-rank buffer
-        // and the bag's rank map, so each node is at its recorded rank. Both
-        // come from the same match, so a pass cannot pair one rank's buffer
-        // with another's map. The walk runs only on a bag that names window
-        // heads, on a step some rank flagged.
-        let (reopened, ranked): (&[bool], Option<&std::collections::HashMap<Arc<str>, u32>>) =
-            match &boundaries {
-                PassBoundaries::Rank(_) => (std::slice::from_ref(&boundary.runs_reopened), None),
-                PassBoundaries::Lockstep(cursors) => (cursors.reopened_ranks(), node_rank),
-            };
+        // ONE walk of the stages, decided per node by `reopens_node` over the
+        // flags and rank map `reopen_flags` hands it, so a pass cannot pair one
+        // rank's buffer with another's map. The walk runs only on a bag that
+        // names window heads, on a step some rank flagged.
+        let (reopened, ranked) = reopen_flags(&boundaries, &boundary, node_rank);
         if window_heads_named && reopened.contains(&true) {
             runtime.reopen_writer_runs_where(|node| {
                 reopens_node(window_heads_named, reopened, recorded_rank_of(ranked, node))
@@ -25687,6 +25680,28 @@ fn recorded_rank_of(
     node: &str,
 ) -> Option<u32> {
     node_rank.map_or(Some(0), |ranks| ranks.get(node).copied())
+}
+
+/// PURE: the reopen mirror's inputs at one step of a pass: the per-rank reopen
+/// flags and the node-to-rank map [`reopens_node`] reads them through.
+///
+/// A free-run pass is one rank's stream, so it hands the flag of `boundary`,
+/// the boundary it is at, as rank 0's, and no map whatever the bag's map
+/// holds, which puts every node at rank 0. A lockstep pass hands each rank's
+/// own flag from its cursors and the bag's `node_rank` map. Borrows only, so
+/// the step path allocates nothing.
+fn reopen_flags<'a>(
+    boundaries: &'a PassBoundaries<'_>,
+    boundary: &'a StepBoundary,
+    node_rank: Option<&'a std::collections::HashMap<Arc<str>, u32>>,
+) -> (
+    &'a [bool],
+    Option<&'a std::collections::HashMap<Arc<str>, u32>>,
+) {
+    match boundaries {
+        PassBoundaries::Rank(_) => (std::slice::from_ref(&boundary.runs_reopened), None),
+        PassBoundaries::Lockstep(cursors) => (cursors.reopened_ranks(), node_rank),
+    }
 }
 
 /// PURE: the refusal of one STEP_BOUNDARY record whose flags word sets a bit
@@ -41633,6 +41648,81 @@ mod boundary_flag_tests {
             !StepBoundary::from_record(&boundary(0, 3, 0b11)).runs_reopened,
             "a word with an undefined bit decodes as no flag"
         );
+    }
+
+    /// The reopen mirror's inputs on a free-run pass: the flag of the boundary
+    /// the pass is at, as rank 0's, and no rank map even where the bag has
+    /// one, over a word that carries the flag and one that does not. No engine
+    /// fixture makes this arm observable through a replay: an external or
+    /// `multi_publisher_topics` stage is annotated before every read, so a
+    /// reopen adds nothing to it; a per-set `Sync` burst's read log already
+    /// differs, its reads being staged at the matcher's own site
+    /// (`a_recorded_per_set_sync_burst_replays_without_a_schedule_divergence`);
+    /// and a stage that pops one frame a step either fits the opening pair or
+    /// refuses it at every window, so a reopen moves no read past its rim.
+    #[test]
+    fn a_free_run_pass_hands_the_reopen_mirror_its_own_boundarys_flag_and_no_rank_map() {
+        let (path, trace) = trace_of("flags_rank", &[boundary(0, 0, 0)]);
+        let pass = PassBoundaries::Rank(BoundaryCursor::for_rank(&trace, 0).unwrap());
+        let ranks: std::collections::HashMap<Arc<str>, u32> =
+            [(Arc::from("near"), 0), (Arc::from("far"), 1)]
+                .into_iter()
+                .collect();
+        for (word, want) in [(0u32, [false]), (STEP_BOUNDARY_FLAG_RUNS_REOPENED, [true])] {
+            let at = StepBoundary::from_record(&boundary(0, 5, word));
+            for map in [Some(&ranks), None] {
+                let (flags, ranked) = reopen_flags(&pass, &at, map);
+                assert_eq!(flags, &want[..], "word {word:#x}, map {}", map.is_some());
+                assert!(ranked.is_none(), "a free-run pass is one rank's stream");
+            }
+        }
+        drop(pass);
+        drop(trace);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    /// The reopen mirror's inputs on a lockstep pass: each rank's own flag from
+    /// its cursors, and the bag's rank map itself. Hand oracle: rank 0 flags
+    /// step 1 and rank 1 flags step 2, so the steps read `[false, false]`,
+    /// `[true, false]` and `[false, true]`.
+    #[test]
+    fn a_lockstep_pass_hands_the_reopen_mirror_each_ranks_own_flag_and_the_rank_map() {
+        let records: Vec<TraceRingRecord> = (0..3u64)
+            .flat_map(|step| {
+                [
+                    boundary(0, step, u32::from(step == 1)),
+                    boundary(1, step, u32::from(step == 2)),
+                ]
+            })
+            .collect();
+        let (path, trace) = trace_of("flags_lockstep", &records);
+        let mut pass = PassBoundaries::Lockstep(
+            RankBoundaryCursors::new(&trace, 2, CoordinationMode::Lockstep).unwrap(),
+        );
+        let ranks: std::collections::HashMap<Arc<str>, u32> =
+            [(Arc::from("near"), 0), (Arc::from("far"), 1)]
+                .into_iter()
+                .collect();
+        let mut seen = Vec::new();
+        while let Some(at) = pass.next().unwrap() {
+            let (flags, ranked) = reopen_flags(&pass, &at, Some(&ranks));
+            assert!(
+                ranked.is_some_and(|map| std::ptr::eq(map, &ranks)),
+                "a lockstep pass hands the bag's own rank map"
+            );
+            seen.push((at.step, flags.to_vec()));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                (0, vec![false, false]),
+                (1, vec![true, false]),
+                (2, vec![false, true]),
+            ]
+        );
+        drop(pass);
+        drop(trace);
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// The same refusal through the boundary walk over a real bag: a two-rank
