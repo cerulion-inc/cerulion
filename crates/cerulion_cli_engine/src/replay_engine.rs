@@ -41779,8 +41779,7 @@ mod boundary_flag_tests {
                 .collect()
         };
         let (path, trace) = trace_of("walk_bad", &records(0b10));
-        let Err(refusal) =
-            validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, Some(11))
+        let Err(refusal) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, Some(11))
         else {
             panic!("an undefined bit on rank 1 must be refused at 11");
         };

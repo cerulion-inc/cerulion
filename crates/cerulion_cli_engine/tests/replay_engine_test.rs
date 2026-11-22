@@ -46968,9 +46968,8 @@ fn a_wrong_writer_at_a_mid_run_window_head_on_an_unlabeled_topic_is_fed_by_seque
             && unpack_read_outcome_meta(r.global_level).1
                 == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
     };
-    let counter_token = cerulion_core::wire::fnv1a_hash(
-        &real_publisher_id(&rec, CP_NODE, "out").to_le_bytes(),
-    );
+    let counter_token =
+        cerulion_core::wire::fnv1a_hash(&real_publisher_id(&rec, CP_NODE, "out").to_le_bytes());
     const WRONG: u64 = 0xDEAD_BEEF;
     let port_tokens: Vec<u64> = rec
         .publisher_ids
