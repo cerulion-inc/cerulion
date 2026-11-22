@@ -90,6 +90,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::num::NonZeroU32;
 
 use cerulion_core::read_outcome::{ReadOutcomeKind, ReadSiteRole};
 use cerulion_core::replay_feed::EdgeIdentity;
@@ -345,8 +346,9 @@ pub(crate) enum StopPoint {
     Recorded {
         /// The step whose fire stopped the node.
         step: u64,
-        /// The stopping fire's position among the node's fires of that step.
-        fires: u32,
+        /// The stopping fire's position among the node's fires of that step,
+        /// from 1.
+        fires: NonZeroU32,
         /// Why the node stopped.
         cause: NodeStopCause,
     },
@@ -374,7 +376,7 @@ impl StopPoint {
                 step: stop,
                 fires,
                 cause,
-            } if stop == step && !cause.fires_again() => Some(fires),
+            } if stop == step && !cause.fires_again() => Some(fires.get()),
             Self::InPass { .. } | Self::AtAnchor { .. } | Self::Recorded { .. } => None,
         }
     }
@@ -442,41 +444,62 @@ impl PassStops {
 pub(crate) struct StepStop {
     /// The stopped node.
     pub(crate) node_id: String,
+    /// The rank the node ran on in the recording: its record's rank, or the
+    /// rank the recorded manifests give the re-executed node.
+    pub(crate) rank: u32,
     /// The stopping fire's position among the node's fires of the step, the
     /// stopping fire included (`1` = its first fire stopped it).
-    pub(crate) fires: u32,
+    pub(crate) fires: NonZeroU32,
     /// Why the node stopped.
     pub(crate) cause: NodeStopCause,
 }
 
 /// A step at which the re-execution's stop of one node differs from the stop
 /// the recording's trace holds. Each stop is `(fires, cause)`: the stopping
-/// fire's position among the node's fires of the step, and why.
+/// fire's position among the node's fires of the step, and why. `rank` is the
+/// rank the node ran on in the recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum StopDisagreement {
     /// The recording stops the node at the step; the re-execution does not.
     NotReExecuted {
         /// The node.
         node_id: String,
+        /// Its recorded rank.
+        rank: u32,
         /// The recording's stop.
-        recorded: (u32, NodeStopCause),
+        recorded: (NonZeroU32, NodeStopCause),
     },
     /// The re-execution stops the node at the step; the recording does not.
     NotRecorded {
         /// The node.
         node_id: String,
+        /// Its recorded rank.
+        rank: u32,
         /// The re-execution's stop.
-        replayed: (u32, NodeStopCause),
+        replayed: (NonZeroU32, NodeStopCause),
     },
     /// Both stop the node at the step, at another fire or for another cause.
     Differs {
         /// The node.
         node_id: String,
+        /// Its recorded rank.
+        rank: u32,
         /// The recording's stop.
-        recorded: (u32, NodeStopCause),
+        recorded: (NonZeroU32, NodeStopCause),
         /// The re-execution's stop.
-        replayed: (u32, NodeStopCause),
+        replayed: (NonZeroU32, NodeStopCause),
     },
+}
+
+impl StopDisagreement {
+    /// The rank the node ran on in the recording.
+    pub(crate) fn rank(&self) -> u32 {
+        match self {
+            Self::NotReExecuted { rank, .. }
+            | Self::NotRecorded { rank, .. }
+            | Self::Differs { rank, .. } => *rank,
+        }
+    }
 }
 
 impl fmt::Display for StopDisagreement {
@@ -486,6 +509,7 @@ impl fmt::Display for StopDisagreement {
             Self::NotReExecuted {
                 node_id,
                 recorded: (fires, c),
+                ..
             } => write!(
                 f,
                 "the recording stops node '{node_id}' at its fire {fires} of the step ({}), and \
@@ -495,6 +519,7 @@ impl fmt::Display for StopDisagreement {
             Self::NotRecorded {
                 node_id,
                 replayed: (fires, c),
+                ..
             } => write!(
                 f,
                 "this re-execution stops node '{node_id}' at its fire {fires} of the step ({}), \
@@ -505,6 +530,7 @@ impl fmt::Display for StopDisagreement {
                 node_id,
                 recorded: (rf, rc),
                 replayed: (pf, pc),
+                ..
             } => write!(
                 f,
                 "the recording stops node '{node_id}' at its fire {rf} of the step ({}), and \
@@ -530,12 +556,14 @@ pub(crate) fn first_stop_disagreement(
             None => {
                 return Some(StopDisagreement::NotReExecuted {
                     node_id: r.node_id.clone(),
+                    rank: r.rank,
                     recorded: side(r),
                 })
             }
             Some(p) if side(p) != side(r) => {
                 return Some(StopDisagreement::Differs {
                     node_id: r.node_id.clone(),
+                    rank: r.rank,
                     recorded: side(r),
                     replayed: side(p),
                 })
@@ -548,6 +576,7 @@ pub(crate) fn first_stop_disagreement(
         .find(|p| !recorded.iter().any(|r| r.node_id == p.node_id))
         .map(|p| StopDisagreement::NotRecorded {
             node_id: p.node_id.clone(),
+            rank: p.rank,
             replayed: side(p),
         })
 }
@@ -5471,6 +5500,11 @@ mod tests {
         assert_eq!(PassStops::at_anchor(3, []), PassStops::none());
     }
 
+    /// A fire position from 1.
+    fn nz(n: u32) -> NonZeroU32 {
+        NonZeroU32::new(n).expect("a fire position counts from 1")
+    }
+
     /// A recorded stop against the same hand table: a stop that ends the
     /// node's fires is judged as an in-pass stop is, and a poisoned entry's
     /// stop, after which the node keeps firing, owes nothing and cuts no burst.
@@ -5478,17 +5512,17 @@ mod tests {
     fn a_recorded_stop_point_answers_its_hand_table() {
         let fatal = StopPoint::Recorded {
             step: 5,
-            fires: 2,
+            fires: nz(2),
             cause: NodeStopCause::FatalError,
         };
         let breaker = StopPoint::Recorded {
             step: 5,
-            fires: 3,
+            fires: nz(3),
             cause: NodeStopCause::DisabledAfterPanics,
         };
         let poisoned = StopPoint::Recorded {
             step: 5,
-            fires: 1,
+            fires: nz(1),
             cause: NodeStopCause::EntryPoisoned,
         };
         let rows: &[(StopPoint, u64, bool, Option<u32>)] = &[
@@ -5514,7 +5548,8 @@ mod tests {
     fn a_recorded_stop_is_noted_first_wins() {
         let stop = |node: &str, fires: u32, cause: NodeStopCause| StepStop {
             node_id: node.to_string(),
-            fires,
+            rank: 0,
+            fires: nz(fires),
             cause,
         };
         let mut stops = PassStops::at_anchor(3, ["sink"]);
@@ -5530,7 +5565,7 @@ mod tests {
             stops.stop_point("relay"),
             Some(StopPoint::Recorded {
                 step: 6,
-                fires: 2,
+                fires: nz(2),
                 cause: NodeStopCause::EntryPoisoned,
             })
         );
@@ -5546,7 +5581,8 @@ mod tests {
         use NodeStopCause::{DisabledAfterPanics, EntryPoisoned, FatalError};
         let stop = |node: &str, fires: u32, cause: NodeStopCause| StepStop {
             node_id: node.to_string(),
-            fires,
+            rank: 0,
+            fires: nz(fires),
             cause,
         };
         let a1 = stop("a", 1, FatalError);
@@ -5562,7 +5598,8 @@ mod tests {
             first_stop_disagreement(std::slice::from_ref(&a1), &[]),
             Some(StopDisagreement::NotReExecuted {
                 node_id: "a".to_string(),
-                recorded: (1, FatalError),
+                rank: 0,
+                recorded: (nz(1), FatalError),
             })
         );
         // A re-executed stop the recording does not hold.
@@ -5570,7 +5607,8 @@ mod tests {
             first_stop_disagreement(&[], std::slice::from_ref(&b2)),
             Some(StopDisagreement::NotRecorded {
                 node_id: "b".to_string(),
-                replayed: (2, EntryPoisoned),
+                rank: 0,
+                replayed: (nz(2), EntryPoisoned),
             })
         );
         // Another fire, and another cause.
@@ -5578,8 +5616,9 @@ mod tests {
             first_stop_disagreement(std::slice::from_ref(&a1), &[stop("a", 2, FatalError)]),
             Some(StopDisagreement::Differs {
                 node_id: "a".to_string(),
-                recorded: (1, FatalError),
-                replayed: (2, FatalError),
+                rank: 0,
+                recorded: (nz(1), FatalError),
+                replayed: (nz(2), FatalError),
             })
         );
         assert_eq!(
@@ -5589,8 +5628,9 @@ mod tests {
             ),
             Some(StopDisagreement::Differs {
                 node_id: "a".to_string(),
-                recorded: (1, FatalError),
-                replayed: (1, DisabledAfterPanics),
+                rank: 0,
+                recorded: (nz(1), FatalError),
+                replayed: (nz(1), DisabledAfterPanics),
             })
         );
         // Order: the recorded stops are asked first, so a missing recorded stop
@@ -5603,8 +5643,26 @@ mod tests {
             ),
             Some(StopDisagreement::NotReExecuted {
                 node_id: "b".to_string(),
-                recorded: (2, EntryPoisoned),
+                rank: 0,
+                recorded: (nz(2), EntryPoisoned),
             })
+        );
+        // Each disagreement carries the rank of the stop it names: the
+        // recorded stop's, or the re-executed node's when the recording
+        // holds none.
+        let on_rank = |stop: StepStop, rank: u32| StepStop { rank, ..stop };
+        assert_eq!(
+            first_stop_disagreement(&[on_rank(a1.clone(), 3)], &[]).map(|d| d.rank()),
+            Some(3)
+        );
+        assert_eq!(
+            first_stop_disagreement(&[on_rank(a1.clone(), 3)], &[stop("a", 2, FatalError)])
+                .map(|d| d.rank()),
+            Some(3)
+        );
+        assert_eq!(
+            first_stop_disagreement(&[], &[on_rank(b2.clone(), 2)]).map(|d| d.rank()),
+            Some(2)
         );
         // …and among the unrecorded stops, the re-execution's order.
         assert_eq!(
@@ -5618,7 +5676,8 @@ mod tests {
             ),
             Some(StopDisagreement::NotRecorded {
                 node_id: "d".to_string(),
-                replayed: (1, FatalError),
+                rank: 0,
+                replayed: (nz(1), FatalError),
             })
         );
     }
@@ -5631,7 +5690,8 @@ mod tests {
         assert_eq!(
             StopDisagreement::NotReExecuted {
                 node_id: "sink".to_string(),
-                recorded: (1, FatalError),
+                rank: 0,
+                recorded: (nz(1), FatalError),
             }
             .to_string(),
             "the recording stops node 'sink' at its fire 1 of the step (returned_fatal_error), \
@@ -5640,7 +5700,8 @@ mod tests {
         assert_eq!(
             StopDisagreement::NotRecorded {
                 node_id: "sink".to_string(),
-                replayed: (2, EntryPoisoned),
+                rank: 0,
+                replayed: (nz(2), EntryPoisoned),
             }
             .to_string(),
             "this re-execution stops node 'sink' at its fire 2 of the step \
@@ -5649,8 +5710,9 @@ mod tests {
         assert_eq!(
             StopDisagreement::Differs {
                 node_id: "sink".to_string(),
-                recorded: (2, FatalError),
-                replayed: (1, EntryPoisoned),
+                rank: 0,
+                recorded: (nz(2), FatalError),
+                replayed: (nz(1), EntryPoisoned),
             }
             .to_string(),
             "the recording stops node 'sink' at its fire 2 of the step (returned_fatal_error), \

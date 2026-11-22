@@ -5515,6 +5515,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         covered_range.as_ref(),
         &producing_rank,
     )?;
+    validate_stop_records(&trace, &rank_tables, stops_recorded)?;
 
     // 3c. The per-rank ragged-shutdown-tail context, derived from the
     //     boundary summaries the ONE walk above already produced. It feeds BOTH
@@ -16366,6 +16367,10 @@ fn run_rank_pass(
     let mut rec_step_stops: Vec<replay_rederive::StepStop> = Vec::new();
     let mut rep_step_stops: Vec<replay_rederive::StepStop> = Vec::new();
     let mut stop_report: Option<(u64, replay_rederive::StopDisagreement)> = None;
+    // A re-executed stop in a short rank's tolerated tail is part of the
+    // re-fire the other gates tolerate there, so the stop compare skips it
+    // under the same window.
+    let stop_tail = TailWindow::from_ragged(pass.ragged);
     let mut ticks_replayed = 0usize;
     // This pass's own EXECUTION range, for `rank_execution`.
     // `first_step`/`last_step` are the steps actually EXECUTED (not the ones the
@@ -16661,13 +16666,24 @@ fn run_rank_pass(
                     if pass.driver_nodes.contains(e.node_id.as_ref()) {
                         continue;
                     }
+                    let node_rank = pass
+                        .node_rank
+                        .and_then(|m| m.get(e.node_id.as_ref()).copied());
+                    if stop_tail.is_tail(node_rank, boundary.step) {
+                        continue;
+                    }
+                    // The entry itself is counted, so the position is at least 1.
                     let fires = trace[..=i]
                         .iter()
                         .filter(|x| *x.node_id == *e.node_id)
                         .count();
                     rep_step_stops.push(replay_rederive::StepStop {
                         node_id: e.node_id.to_string(),
-                        fires: u32::try_from(fires).unwrap_or(u32::MAX),
+                        rank: node_rank.unwrap_or_else(|| plan.rank()),
+                        fires: u32::try_from(fires)
+                            .ok()
+                            .and_then(std::num::NonZeroU32::new)
+                            .unwrap_or(std::num::NonZeroU32::MAX),
                         cause,
                     });
                 }
@@ -17602,7 +17618,7 @@ fn run_rank_pass(
             detail: format!(
                 "{}: rank {} step {step}: {disagreement}",
                 DivergenceClass::FireSchedule.phrase(),
-                plan.rank()
+                disagreement.rank()
             ),
             recorded: None,
             replayed: None,
@@ -26020,6 +26036,87 @@ impl<'a> RankBoundaryCursors<'a> {
     }
 }
 
+/// Refuse, before any runtime is built, every NODE-STOP record shape no
+/// recorder writes: one in a bag that does not claim the node-stops format
+/// (`stops_recorded` false, which covers a bag with no stamp), one whose cause
+/// names no cause this build defines, one that does not directly follow, on
+/// its own rank, the FIRE record of the fire that stopped its node (same node,
+/// step, instant and level), and a second one of a node that already stopped.
+/// The fire demux then reads every stop record as a stop at a fire from 1.
+fn validate_stop_records(
+    trace: &RecordedTrace,
+    rank_tables: &[Vec<Arc<str>>],
+    stops_recorded: bool,
+) -> Result<(), ReplayError> {
+    let rank_count = rank_tables.len();
+    let mut prev: Vec<Option<TraceRingRecord>> = vec![None; rank_count];
+    let mut stopped: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); rank_count];
+    let mut index = 0usize;
+    trace.for_each(|rec| {
+        let at = index;
+        index += 1;
+        let rank = rec.rank() as usize;
+        // An out-of-range rank is refused by the walks above; skip it here.
+        if rank >= rank_count {
+            return Ok(());
+        }
+        let before = prev[rank].replace(*rec);
+        if rec.record_type != RECORD_TYPE_NODE_STOP {
+            return Ok(());
+        }
+        if !stops_recorded {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "trace record {at} is a NODE-STOP record, and a bag stamped below trace \
+                     format {NODE_STOPS_MIN_TRACE_FORMAT}, or with no trace format stamp, holds \
+                     no NODE-STOP record"
+                ),
+            });
+        }
+        if rec.stop_cause().is_none() {
+            let fault = cerulion_core::trace_ring::TraceRecordFault::UnknownStopCause {
+                rank: rec.rank(),
+                code: rec.duration_ns,
+            };
+            return Err(ReplayError::TraceRecordUnsupported {
+                index: at,
+                record_type: rec.record_type,
+                reason: fault.detail(),
+            });
+        }
+        let node = rank_tables[rank].get(rec.node_idx as usize).map_or_else(
+            || format!("<node_idx {}>", rec.node_idx),
+            |id| id.to_string(),
+        );
+        let follows_its_fire = before.is_some_and(|f| {
+            f.record_type == RECORD_TYPE_FIRE
+                && f.node_idx == rec.node_idx
+                && f.step == rec.step
+                && f.fire_time_ns == rec.fire_time_ns
+                && f.global_level == rec.global_level
+        });
+        if !follows_its_fire {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "trace record {at} is a NODE-STOP record of node '{node}' at step {} on rank \
+                     {rank}, and the record before it on that rank is not that node's FIRE at \
+                     that step",
+                    rec.step
+                ),
+            });
+        }
+        if !stopped[rank].insert(rec.node_idx) {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "trace record {at} is a second NODE-STOP record of node '{node}' on rank \
+                     {rank}; a node stops once in a run"
+                ),
+            });
+        }
+        Ok(())
+    })
+}
+
 /// Cross-check the recording's internal consistency BEFORE the replay loop —
 /// the corruption tripwire (all violations are
 /// [`ReplayError::RecordingInconsistent`], exit 2):
@@ -27411,18 +27508,8 @@ impl<'a> RankedFireCursors<'a> {
                 } else if r.record_type == RECORD_TYPE_NODE_STOP && r.step == step {
                     // The recorder pushes a stop directly after the FIRE record of
                     // the fire that made it, so its position is its node's FIRE
-                    // records of this step on this rank so far. The cause was
-                    // checked by the record gate; a stream that reaches here
-                    // unchecked is refused the same way.
-                    let Some(cause) = r.stop_cause() else {
-                        let fault = cerulion_core::trace_ring::TraceRecordFault::UnknownStopCause {
-                            rank: rank as u32,
-                            code: r.duration_ns,
-                        };
-                        return Err(ReplayError::RecordingInconsistent {
-                            detail: fault.detail(),
-                        });
-                    };
+                    // records of this step on this rank so far. `validate_stop_records`
+                    // refused every other shape before the pass began.
                     let node_id = rank_tables[rank]
                         .get(r.node_idx as usize)
                         .cloned()
@@ -27434,9 +27521,24 @@ impl<'a> RankedFireCursors<'a> {
                         .iter()
                         .filter(|e| e.1 == rank as u32 && e.3.node_id == node_id)
                         .count();
+                    let (Some(cause), Some(fires)) = (
+                        r.stop_cause(),
+                        u32::try_from(fires)
+                            .ok()
+                            .and_then(std::num::NonZeroU32::new),
+                    ) else {
+                        return Err(ReplayError::Internal {
+                            reason: format!(
+                                "a NODE-STOP record of node '{node_id}' at step {step} reached \
+                                 the fire demux without the stop record checks; this is a bug \
+                                 in the replay engine, please report"
+                            ),
+                        });
+                    };
                     self.stops.push(replay_rederive::StepStop {
                         node_id: node_id.to_string(),
-                        fires: u32::try_from(fires).unwrap_or(u32::MAX),
+                        rank: rank as u32,
+                        fires,
                         cause,
                     });
                 }
@@ -33535,9 +33637,9 @@ mod recorder_info_version_tests {
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: the formats below it are
-        // ones this binary reads and never writes.
-        for archived in 1..SUPPORTED_TRACE_FORMAT {
+        // The gate is strictly WIDER than the stamp: eleven formats this
+        // binary reads and never writes, listed by hand.
+        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"

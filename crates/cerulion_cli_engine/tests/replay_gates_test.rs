@@ -988,7 +988,8 @@ fn a_node_stop_record_on_a_node_stops_format_bag_passes_the_gates() {
 }
 
 /// A NODE-STOP record whose cause code names no cause is refused by the
-/// record gate (exit 2), naming the record, its rank and the code.
+/// record gate (exit 2) as the unknown record kind is: written by a newer or
+/// foreign writer, so upgrade. It names the record, its rank and the code.
 #[test]
 fn a_node_stop_record_with_an_unknown_cause_is_refused_exit_2() {
     let (_dir, path) = tmp_bag("node_stop_cause.mcap");
@@ -1008,12 +1009,20 @@ fn a_node_stop_record_with_an_unknown_cause_is_refused_exit_2() {
     write_bag(&path, &[fire(0, 1), fire(0, 2), stop], &atts, true);
     let err = gate(&path);
     match &err {
-        ReplayError::RecordingInconsistent { detail } => assert_eq!(
-            detail,
-            "trace record 2: a scheduler-trace NODE-STOP record of rank 0 carries stop cause 9, \
-             which names no cause this Cerulion version defines, so the trace is corrupt"
-        ),
-        other => panic!("expected RecordingInconsistent (stop cause), got {other:?}"),
+        ReplayError::TraceRecordUnsupported {
+            index,
+            record_type,
+            reason,
+        } => {
+            assert_eq!((*index, *record_type), (2, 7));
+            assert_eq!(
+                reason,
+                "a scheduler-trace NODE-STOP record of rank 0 carries stop cause 9, which this \
+                 Cerulion version does not define; the trace was written by a newer or foreign \
+                 writer, so upgrade cerulion to replay it"
+            );
+        }
+        other => panic!("expected TraceRecordUnsupported (stop cause), got {other:?}"),
     }
     assert_eq!(err.exit_code(), 2);
 }

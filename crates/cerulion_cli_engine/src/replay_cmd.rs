@@ -1733,8 +1733,10 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
                         cerulion_core::trace_ring::trace_record_noun(record_type)
                     ),
                 },
-                TraceRecordFault::UnknownStopCause { .. } => ReplayError::RecordingInconsistent {
-                    detail: format!("trace record {index}: {}", fault.detail()),
+                TraceRecordFault::UnknownStopCause { .. } => ReplayError::TraceRecordUnsupported {
+                    index,
+                    record_type: rec.record_type,
+                    reason: fault.detail(),
                 },
                 TraceRecordFault::ZeroedRecord => ReplayError::TraceRecordUnsupported {
                     index,

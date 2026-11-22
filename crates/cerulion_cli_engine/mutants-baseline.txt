@@ -170,13 +170,18 @@ in prepare_pass_verification
 # (`first_stop_disagreement`). The trace read path (the fire demux reading a
 # step's stop records, and the replay reading its own stops off its trace) and
 # the record gate walk the bag and drive the scheduler, which the mutation
-# rule does not cover. They are pinned by the red-first vectors
-# `a_replay_that_stops_where_the_recording_did_passes`,
+# rule does not cover. They are pinned in tests/replay_engine_test.rs by the
+# red-first vectors
 # `a_replay_that_does_not_re_execute_the_recorded_stop_is_a_fire_schedule_divergence`,
-# `a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges` and
-# `below_the_node_stops_format_a_recorded_stop_is_not_read` in
-# tests/replay_engine_test.rs, and `a_node_stop_record_*` in
-# tests/replay_gates_test.rs.
+# `a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges`,
+# `a_stop_in_a_ragged_tail_is_tolerated_with_its_re_fire`,
+# `a_stop_before_the_tail_the_recording_lacks_diverges_and_names_its_rank`, the
+# three refusals of a stop record shape no recorder writes and
+# `a_stop_record_with_an_unknown_cause_is_refused_by_the_engine_with_the_gate_text`,
+# with `a_replay_that_stops_where_the_recording_did_passes`,
+# `below_the_node_stops_format_a_recorded_stop_is_not_read` and the two
+# driver vectors as pins that passed before the paths they guard; and by
+# `a_node_stop_record_*` in tests/replay_gates_test.rs.
 #
 # Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \

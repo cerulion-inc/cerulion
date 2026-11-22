@@ -1464,9 +1464,18 @@ its fire 1 of the step (returned_fatal_error), and this re-execution does not
 stop it there`. The schedule check judges each node by its recorded stop, so
 it owes a node no fire after a recorded fatal or breaker stop whether or not
 the re-execution stops it. The stops of an `external` (driver) node are not
-compared, because a resim never gives a driver its device. A NODE-STOP record
-whose cause is none of the three is refused before the first replayed step
-(`bag internal consistency check failed`, exit 2).
+compared, because a resim never gives a driver its device. A stop the resim
+makes in a short rank's tolerated ragged tail is tolerated with the re-fire
+that made it, under the same window as the fire comparison.
+
+A NODE-STOP record whose cause is none of the three was written by a newer or
+foreign writer, and the resim refuses it as it refuses an unknown record kind
+(exit 2, "upgrade cerulion to replay it"). Three shapes no recorder writes are
+refused before the first replayed step as a corrupt bag (`bag internal
+consistency check failed`, exit 2): a stop record that does not directly
+follow, on its own rank, the FIRE record of the fire that stopped its node; a
+second stop record of a node that already stopped; and a stop record in a bag
+stamped below 12 or with no trace format stamp.
 
 Below 12 the trace holds no stop record, and a resim judges stops as before:
 by the re-execution, and by the checkpoint a resumed bag begins at. A reader
