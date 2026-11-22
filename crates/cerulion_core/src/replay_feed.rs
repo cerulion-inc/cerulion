@@ -538,7 +538,14 @@ pub struct BagFedBlockEdge {
 ///   deterministic-live and worker constructor builds with
 ///   `ReplayWiring::default()`, whose set is empty;
 /// * a replay pass takes its fires from the recorded trace, so no fire is
-///   decided against a count the build does not keep.
+///   decided against a count the build does not keep;
+/// * [`GraphRuntime::run_live`](crate::graph::GraphRuntime::run_live) refuses
+///   a runtime built with a non-empty set, before it sets anything up.
+///
+/// A library caller that drives such a runtime with `step()` and no recorded
+/// fire plan runs the consumer end's `block` input with nothing holding its
+/// producer. The polled seam does not refuse that; it is a documented limit
+/// of the seam, as `run_live`'s node-death arming states for its own.
 ///
 /// `block_timeout_ms` on a fed edge's input is accepted and has no effect on
 /// either end. The key acts only through a producer's defer edge

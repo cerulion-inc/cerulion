@@ -55,9 +55,9 @@
 //! `depth`, and the once-per-regime `warn!` names the consumer edge.
 //!
 //! Per-test isolated SHM roots + pid/tag-scoped credit namespaces. `#[serial]`
-//! on 55 of the 56 arms: six are `#[traced_test]`, which installs a
+//! on 56 of the 57 arms: six are `#[traced_test]`, which installs a
 //! PROCESS-GLOBAL subscriber, and a sibling running beside one would both
-//! pollute its capture and race the install. The 56th,
+//! pollute its capture and race the install. The 57th,
 //! `the_depth_max_consumer_tracks_the_topology_ceiling`, is a pure constant
 //! drift guard that touches no transport and needs no turn.
 
@@ -5277,5 +5277,71 @@ fn a_fed_edge_s_producer_end_takes_a_trailing_refill_below_the_cap() {
         "Graph validation error: replay fire plan (step 0): node 'relay' cannot carry a trailing \
          refill: it fires 2 times, not the cap of 64, and has no pre-fire check"
     );
+    plain.shutdown();
+}
+
+/// `run_live` refuses a runtime built for a replay that feeds a `block` edge
+/// from a recording, at either end, naming the edge first in `Ord` order,
+/// and with the same text on a second call. The consumer end's node is a
+/// host-driven `external` node, which `run_live` otherwise refuses as inert
+/// at launch: the fed refusal comes first, before any external source is
+/// collected. The same relay built with the default wiring is not refused
+/// this way.
+#[test]
+#[serial]
+fn run_live_refuses_a_runtime_built_to_feed_a_block_edge() {
+    let running = std::sync::atomic::AtomicBool::new(false);
+    let (_mgr, mut producer_end) = relay_replay_build(
+        "cbfl",
+        "cb_fed_live",
+        &fed_wiring(vec![relay_fed_edge("zeta"), relay_fed_edge("alpha")]),
+    );
+    let err = producer_end
+        .run_live(&running)
+        .expect_err("a runtime built to feed a `block` edge never runs live");
+    assert_eq!(
+        err.to_string(),
+        "Graph validation error: graph 'cbfl_relay_ctx': this runtime was built for a replay \
+         that feeds `block` edge '/cb/data' -> 'alpha.inp' from a recording, with no credit \
+         word, so `run_live` refuses it"
+    );
+    assert_eq!(
+        producer_end
+            .run_live(&running)
+            .expect_err("refused again")
+            .to_string(),
+        err.to_string(),
+        "a second call refuses with the same text"
+    );
+    producer_end.shutdown();
+
+    let (_mgr, built) = replay_consumer_build(
+        "cbfm",
+        "cb_fed_live_c",
+        &fed_wiring(vec![fed_edge(TOPIC)]),
+        &[],
+    );
+    let mut consumer_end = match built {
+        Ok(rt) => rt,
+        Err(e) => panic!("the consumer end of a fed edge builds: {e}"),
+    };
+    assert_eq!(
+        consumer_end
+            .run_live(&running)
+            .expect_err("the consumer end never runs live either")
+            .to_string(),
+        "Graph validation error: graph 'cbfm_consumer_ctx': this runtime was built for a \
+         replay that feeds `block` edge '/cb/data' -> 'consumer.inp' from a recording, with no \
+         credit word, so `run_live` refuses it"
+    );
+    consumer_end.shutdown();
+
+    let (_mgr, mut plain) = relay_replay_build("cbfn", "cb_plain_live", &ReplayWiring::default());
+    if let Err(e) = plain.run_live(&running) {
+        assert!(
+            !e.to_string().contains("feeds `block` edge"),
+            "the default wiring feeds nothing, so this refusal is not its: {e}"
+        );
+    }
     plain.shutdown();
 }

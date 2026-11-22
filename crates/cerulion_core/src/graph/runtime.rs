@@ -4270,6 +4270,11 @@ pub struct GraphRuntime {
     /// flip has one owner and the state is observable
     /// ([`Self::block_gate_replay_bypass`]).
     block_gate_replay_bypass: Arc<AtomicBool>,
+    /// The `block` edges this build's replay wiring feeds from a recording
+    /// ([`crate::replay_feed::BagFedBlockEdges`]); empty on every build but a
+    /// replay pass. Kept so [`Self::run_live`] refuses a runtime built with
+    /// any.
+    bag_fed_block_edges: crate::replay_feed::BagFedBlockEdges,
     /// The WaitSet reactor that backs [`Self::run_live`].
     /// `None` at build — the live loop lazily builds it on first use (sized
     /// to the data-trigger binding count) and parks it back here between
@@ -10711,6 +10716,7 @@ impl GraphRuntime {
             block_credit_edges,
             credit_park_edges,
             block_gate_replay_bypass,
+            bag_fed_block_edges: replay_wiring.bag_fed_block_edges.clone(),
             // `run_live` lazily builds the reactor on
             // first use and parks it here between iterations.
             reactor: None,
@@ -16130,8 +16136,37 @@ impl GraphRuntime {
     /// Any bindings/helpers built for sibling nodes are cleaned up by
     /// `GraphRuntime::drop` when the caller drops the refused runtime. A normal
     /// run returns `Ok(())`.
+    ///
+    /// Returns [`TransportError::GraphError`] before anything else, naming the
+    /// first edge in `Ord` order, for a runtime built for a replay that feeds
+    /// a `block` edge from a recording
+    /// ([`crate::replay_feed::BagFedBlockEdges`]): no credit word counts that
+    /// edge, and only a replay's recorded fires may drive it. The refusal is
+    /// sticky, as the inert-external one is.
     pub fn run_live(&mut self, running: &std::sync::atomic::AtomicBool) -> TransportResult<()> {
         use std::sync::atomic::Ordering::Relaxed;
+
+        // A runtime built to feed a `block` edge from a recording has no
+        // credit word on that edge, so no live loop may run it. Asked FIRST,
+        // before any external source is collected or the node-death ledger
+        // is armed, so a refused call sets nothing up. The confinement of the
+        // set to `build_for_replay` is the primary guard; this is the
+        // backstop. The polled `step()` seam is not guarded (see
+        // `BagFedBlockEdges`).
+        if let Some(edge) = self.bag_fed_block_edges.iter().next() {
+            return Err(TransportError::GraphError {
+                // hot-path-alloc-ok: cold: the run_live entry REFUSAL, once per call.
+                reason: format!(
+                    "graph '{}': this runtime was built for a replay that feeds `block` edge \
+                     '{}' -> '{}.{}' from a recording, with no credit word, so `run_live` \
+                     refuses it",
+                    self.config.identity(),
+                    edge.topic,
+                    edge.consumer_node,
+                    edge.consumer_input
+                ),
+            });
+        }
 
         // Collect external ingress wake sources ONCE, at loop
         // entry, AFTER init() — a driver node's `external_source()` may open its

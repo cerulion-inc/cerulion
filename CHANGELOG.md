@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `cerulion_core::replay_feed::ReplayWiring::bag_fed_block_edges` names the `block` edges a replay build feeds from its recording, as a `BagFedBlockEdges` set of `BagFedBlockEdge` entries (the topic, the consumer node and input, and the producer nodes). A build that holds an entry's consumer accepts its `block` input with no in-graph producer and installs no backpressure probe on it; a build that holds one of its producers accepts a replay's trailing refill on that node below the burst cap. The build refuses an entry a mapped credit binding also names, an entry it holds both ends or neither end of, and a consumer end that is not a `block` input or whose topic has an in-graph producer the entry does not name, and `GraphRuntime::run_live` refuses a runtime built with any entry. No replay fills the set yet, so no replay changes.
+
 ### Changed
+- `cerulion_core::replay_feed::ReplayWiring` has a new public field, `bag_fed_block_edges`. A struct literal that names every field adds `bag_fed_block_edges: BagFedBlockEdges::default()`, or ends with `..ReplayWiring::default()`.
 - `cerulion rcp bench` with a model name that holds `gemini-4-neon` prints, before the run, what an episode of each setup took in the results package's measured run of Gemini 4 Neon, and prices each episode at that model's list price, read on 2026-11-21. 2.1.0 printed "no measured run of this model" and gave no list price for it.
 
 ### Fixed
