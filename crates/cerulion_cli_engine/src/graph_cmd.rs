@@ -31358,8 +31358,9 @@ nodes:
              records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
              read stage's window, flags every complete checkpoint part of a stopped \
-             node AND records every stop: a reader below 12 refuses the stop \
-             record, so the stamp makes it refuse the bag by its format"
+             node AND records every stop: a reader below 12 refuses a bag that \
+             holds a stop record as an unknown record kind, and the stamp makes it \
+             refuse one that holds none by its format"
         );
     }
 
