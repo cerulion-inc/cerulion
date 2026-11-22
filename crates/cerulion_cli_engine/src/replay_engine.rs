@@ -34238,7 +34238,9 @@ mod recorder_info_version_tests {
     }
 
     /// From format 10 every complete checkpoint part of a stopped node carries
-    /// the stopped flag, and a bag with no `recorder.json` makes no such claim.
+    /// the stopped flag, so on every format from 10 to the supported one a part
+    /// without it states the node running, and a bag with no `recorder.json`
+    /// makes no such claim.
     #[test]
     fn checkpoint_stops_are_stated_from_format_ten() {
         for older in 1u32..=9 {
@@ -34247,7 +34249,12 @@ mod recorder_info_version_tests {
                 "a format-{older} part without the flag states nothing"
             );
         }
-        assert!(recorder_states_anchor_stops_at(Some(&recorder_info_at(10))));
+        for stated in 10u32..=SUPPORTED_TRACE_FORMAT {
+            assert!(
+                recorder_states_anchor_stops_at(Some(&recorder_info_at(stated))),
+                "a format-{stated} part without the flag states the node running"
+            );
+        }
         assert!(!recorder_states_anchor_stops_at(None));
     }
 
