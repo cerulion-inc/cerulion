@@ -7538,8 +7538,9 @@ impl GraphRuntime {
             // deferral never consults them.
             if !flow.holds_its_producers() {
                 // A producer-less `block` edge is refused by validate unless
-                // a replay feeds it from its recording, and no credit word
-                // counts a fed edge.
+                // a mapped credit word counts it (the injection pass below
+                // wires it) or a replay feeds it from its recording (no word
+                // counts it).
                 continue;
             }
             for edge in flow
