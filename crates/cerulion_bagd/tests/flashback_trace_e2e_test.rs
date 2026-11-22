@@ -1141,7 +1141,7 @@ fn a_capture_whose_graph_parses_but_fails_validation_reads_not_resimmable() {
 /// records were ones the replay gate ACCEPTS. `run_replay` walks every trace
 /// record and refuses a reserved/unknown `record_type` outright
 /// (`replay_cmd.rs` 628-722, `TraceRecordUnsupported` -> exit 2), so a trace
-/// written by a NEWER Cerulion — the shape this arm models, `record_type` 7 —
+/// written by a NEWER Cerulion, the shape this arm models (`record_type` 8),
 /// was stamped `resimmable: true` and then refused. That is the confident-false
 /// class, and it is the likeliest of the four to be met in the field: it is what
 /// a forward-compatible writer produces.
@@ -1153,7 +1153,7 @@ fn a_capture_whose_graph_parses_but_fails_validation_reads_not_resimmable() {
 fn a_capture_carrying_an_unsupported_trace_record_type_reads_not_resimmable() {
     let mut trace = trace_across_the_anchor();
     let mut alien = fire(ANCHOR_STEP + 2, 0);
-    alien.record_type = 7;
+    alien.record_type = 8;
     trace.push(alien);
 
     let h = capture("aliankind", &trace, &full_anchor(), 64 * 1024 * 1024, true);
@@ -1168,7 +1168,7 @@ fn a_capture_carrying_an_unsupported_trace_record_type_reads_not_resimmable() {
         .unwrap_or_default()
         .to_string();
     assert!(
-        reason.contains("record_type 7"),
+        reason.contains("record_type 8"),
         "the reason must name the KIND, so an operator knows to upgrade rather than \
          re-record: {reason}"
     );
@@ -1352,7 +1352,7 @@ fn the_gap_a_capture_names_is_the_first_refusing_records_in_file_order() {
     // trim carries them, and they are pushed in file order.
     let mut fault_first = trace_across_the_anchor();
     let mut alien = fire(ANCHOR_STEP + 2, 0);
-    alien.record_type = 7;
+    alien.record_type = 8;
     fault_first.push(alien);
     fault_first.push(departure(ANCHOR_STEP + 3));
 
@@ -1374,7 +1374,7 @@ fn the_gap_a_capture_names_is_the_first_refusing_records_in_file_order() {
         .expect("a refusal states its reason")
         .to_string();
     assert!(
-        reason.contains("record_type 7"),
+        reason.contains("record_type 8"),
         "the gate refuses at the ALIEN record, which comes first — so that is the gap: {reason}"
     );
     assert!(
@@ -1389,7 +1389,7 @@ fn the_gap_a_capture_names_is_the_first_refusing_records_in_file_order() {
     let mut departure_first = trace_across_the_anchor();
     departure_first.push(departure(ANCHOR_STEP + 2));
     let mut later_alien = fire(ANCHOR_STEP + 3, 0);
-    later_alien.record_type = 7;
+    later_alien.record_type = 8;
     departure_first.push(later_alien);
 
     let h2 = capture(
@@ -1414,7 +1414,7 @@ fn the_gap_a_capture_names_is_the_first_refusing_records_in_file_order() {
         "the departure comes first, so fault replay is the gap: {reason2}"
     );
     assert!(
-        !reason2.contains("record_type 7"),
+        !reason2.contains("record_type 8"),
         "…and NOT the later alien record: {reason2}"
     );
     h2.cleanup();

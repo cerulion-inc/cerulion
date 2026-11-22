@@ -2238,14 +2238,14 @@ mod tests {
             // A contiguous single-worker roster — the ordinary shape,
             // so the new gate is inert unless an arm says otherwise.
             worker_manifest_ranks: &[0],
-            first_record_refusal: fault(7),
+            first_record_refusal: fault(8),
             ..healthy(&[], &anchors)
         };
         let gap = judge_resimmable(&faulted).expect_err("a refused record is not resimmable");
         match &gap {
             ResimGap::TraceRecordRejected { detail } => {
                 assert!(
-                    detail.contains("record_type 7"),
+                    detail.contains("record_type 8"),
                     "the reason must name the record kind an operator has to act on: {detail}"
                 );
             }
@@ -2264,7 +2264,7 @@ mod tests {
             }),
             Err(ResimGap::TraceRecordRejected {
                 detail: crate::trace_ring::TraceRecordFault::UnsupportedRecordType {
-                    record_type: 7
+                    record_type: 8
                 }
                 .detail(),
             }),

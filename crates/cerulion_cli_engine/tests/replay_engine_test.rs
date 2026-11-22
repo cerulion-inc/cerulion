@@ -9416,6 +9416,7 @@ fn two_rank_block_layout_replays_clean_and_merges_in_canonical_order() {
                     global_level: r.global_level as usize,
                     duration_ns: 0,
                     discarded: false,
+                    stop: None,
                 })
                 .collect()
         })

@@ -1753,6 +1753,22 @@ fn release_held_block_slots(consumer: &str, slots: &[HeldBlockSlot]) {
     }
 }
 
+/// Signal the scheduler, once per node, that its entry is poisoned: the
+/// scheduler marks the fire that reads the signal as the node's stop
+/// (`NodeStopCause::EntryPoisoned`) and keeps firing the node. `signalled` is
+/// the tick callback's own latch, so every later poisoned fire costs one
+/// branch. A node whose signal carries the fatal code is disabled and never
+/// reaches the poison arms.
+fn signal_poisoned_entry(signalled: &mut bool, signal: &std::sync::atomic::AtomicU8) {
+    if !*signalled {
+        *signalled = true;
+        signal.store(
+            crate::scheduler::NodeStopCause::EntryPoisoned.code(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
 /// How many CONSECUTIVE deferred pre-fire evaluations with
 /// ZERO credit motion separate "a busy consumer" from "a consumer that has
 /// stopped draining".
@@ -6165,7 +6181,7 @@ impl GraphRuntime {
         // [`GraphRuntime::node_tick_panics`] (the replay engine's exit-3 seam).
         let mut tick_panic_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
         let mut fatal_records: IndexMap<String, Arc<Mutex<Option<String>>>> = IndexMap::new();
-        let mut fatal_stops: IndexMap<String, Arc<std::sync::atomic::AtomicBool>> = IndexMap::new();
+        let mut stop_signals: IndexMap<String, Arc<std::sync::atomic::AtomicU8>> = IndexMap::new();
         // The ONE node-death ledger, minted BEFORE the node
         // loop so the same instance reaches all three of its readers — every
         // `ScheduledNode`, every tick callback, and this runtime. UNARMED, so
@@ -9562,13 +9578,16 @@ impl GraphRuntime {
             let panic_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             tick_panic_records.insert(node_def.id.clone(), Arc::clone(&panic_record));
             let mut failure_latch = TickFailureLatch::new();
-            // This node's fatal record + the flag the scheduler reads after the
-            // fire (it disables the node). Shared once at build; the callback
-            // touches them only on a FATAL return.
+            // This node's fatal record + the stop signal the scheduler reads
+            // after the fire (a fatal code disables the node; the poisoned code
+            // marks the fire that first saw the poison). Shared once at build;
+            // the callback touches them only on a FATAL return or a poisoned
+            // entry, and stores the poisoned code once (`poison_signalled`).
             let fatal_record: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
             fatal_records.insert(node_def.id.clone(), Arc::clone(&fatal_record));
-            let fatal_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            fatal_stops.insert(node_def.id.clone(), Arc::clone(&fatal_stop));
+            let stop_signal = Arc::new(std::sync::atomic::AtomicU8::new(0));
+            stop_signals.insert(node_def.id.clone(), Arc::clone(&stop_signal));
+            let mut poison_signalled = false;
             // The `block` slots this node holds as a consumer, released by the
             // callback when the node stops for good.
             let held_slots: Vec<HeldBlockSlot> =
@@ -9691,6 +9710,7 @@ impl GraphRuntime {
                                 crate::scheduler::NodeDeathCause::EntryPoisoned,
                             );
                             release_held_block_slots(&node_id_for_log, &held_slots);
+                            signal_poisoned_entry(&mut poison_signalled, &stop_signal);
                             std::panic::resume_unwind(payload);
                         }
                         Ok(Err(err)) => {
@@ -9733,7 +9753,10 @@ impl GraphRuntime {
                             if let TransportError::NodeFailed { kind, reason, .. } = &err {
                                 if kind.is_fatal() {
                                     record_first_reason(&fatal_record, reason);
-                                    fatal_stop.store(true, std::sync::atomic::Ordering::Release);
+                                    stop_signal.store(
+                                        crate::scheduler::NodeStopCause::FatalError.code(),
+                                        std::sync::atomic::Ordering::Release,
+                                    );
                                     latch_node_death(
                                         &mut node_death_reported,
                                         &node_death_for_callback,
@@ -9829,6 +9852,10 @@ impl GraphRuntime {
                         crate::scheduler::NodeDeathCause::EntryPoisoned,
                     );
                     release_held_block_slots(&node_id_for_log, &held_slots);
+                    // The first poisoned fire this arm sees is the stop when the
+                    // entry was poisoned outside a tick; after the panic arm
+                    // above signalled it, this is one branch on a plain `bool`.
+                    signal_poisoned_entry(&mut poison_signalled, &stop_signal);
                 }
             });
 
@@ -9861,8 +9888,8 @@ impl GraphRuntime {
             // causes stay two records and the recorder's gate is what coalesces
             // them into one capture.
             scheduler.set_node_death_ledger(&node_def.id, Arc::clone(&node_death))?;
-            if let Some(flag) = fatal_stops.get(&node_def.id) {
-                scheduler.set_node_fatal_stop(&node_def.id, Arc::clone(flag))?;
+            if let Some(signal) = stop_signals.get(&node_def.id) {
+                scheduler.set_node_stop_signal(&node_def.id, Arc::clone(signal))?;
             }
             // Register this node's read-outcome stages (the
             // SAME Arcs wired into its subscribers above) so the level-end
