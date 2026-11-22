@@ -764,17 +764,19 @@ pub enum ReplayError {
     /// A one-rank free-run bag takes the ordinary resume; the multi-rank
     /// shape is refused rather than silently mis-anchored, and per-rank
     /// anchors are not implemented.
+    ///
+    /// The sentence is
+    /// [`cerulion_core::flashback::resim::free_run_resume_unsupported_reason`]'s,
+    /// the reason a Flashback capture of this shape carries too, about a
+    /// capture, when no worker rank begins at step 0 and it embeds one rank's
+    /// checkpoint.
     #[error(
-        "this bag is stamped `coordination: free_run`, its recording begins MID-RUN (its \
-         first recorded STEP_BOUNDARY is step {first_step}, not step 0), and it holds \
-         {ranks} worker ranks. A mid-run resume anchors on the ONE first recorded boundary \
-         and places the clock off that single value, which holds for exactly one worker \
-         rank, and a free-run recording with several ranks abolishes it: each rank keeps \
-         its own boundary stream and its own clock, so there is no single first boundary, \
-         {ranks} clocks cannot be placed off one value, and a frame stamp compared against \
-         it crosses clock domains. Per-rank resume anchors are not supported yet; until \
-         they land, re-execute this bag from its start, or capture a deployment whose \
-         graph runs in ONE process group (its mid-run captures resume)"
+        "{}",
+        cerulion_core::flashback::resim::free_run_resume_unsupported_reason(
+            *first_step,
+            *ranks,
+            false
+        )
     )]
     FreeRunResumeUnsupported {
         /// The recording's first recorded (rank-0) STEP_BOUNDARY step.

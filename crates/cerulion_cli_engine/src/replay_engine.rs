@@ -5777,6 +5777,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                     None
                 },
                 publisher_slots: publisher_slots.clone(),
+                bag_fed_block_edges: cerulion_core::replay_feed::BagFedBlockEdges::default(),
             };
             let mut runtime = match build_pass_runtime(
                 plan,

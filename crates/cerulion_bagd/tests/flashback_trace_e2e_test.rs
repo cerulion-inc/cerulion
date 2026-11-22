@@ -473,6 +473,7 @@ fn capture_with_extra_state_rings(
         extra_state_rings,
         false,
         &[],
+        &[],
     )
 }
 
@@ -496,6 +497,7 @@ fn capture_inner(
         0,
         false,
         &[],
+        &[],
     )
 }
 
@@ -513,6 +515,7 @@ fn capture_with_departure_ring(tag: &str, trace: &[TraceRingRecord], state: &[Ve
         false,
         0,
         true,
+        &[],
         &[],
     )
 }
@@ -536,6 +539,10 @@ fn capture_inner_full(
     // from `ring_rank_bytes[i]` at the trailing drain), so a second RANK in a
     // bag's trace needs a second RING and nothing else will do.
     peer_rank_trace: &[TraceRingRecord],
+    // Attachments the recorder is handed beside the graph, as `--recorder-json`
+    // hands it `__cerulion/recorder.json`. Empty for every arm but the
+    // coordination ones.
+    extra_attachments: &[(String, Vec<u8>)],
 ) -> Harness {
     let mgr = make_manager(64);
     let topic = unique_topic("/fbt/probe");
@@ -557,6 +564,7 @@ fn capture_inner_full(
     if let Some(graph) = graph_attachment {
         cfg.attachments = vec![("graph.yaml".to_string(), graph.to_vec())];
     }
+    cfg.attachments.extend(extra_attachments.iter().cloned());
     // A REAL armed capture plane, when the arm asks for one. The recorder ARMS
     // NOTHING (the graph owns the word); it only OBSERVES it, so
     // this stands in for the graph. Held to the end of this function, which
@@ -1718,6 +1726,7 @@ fn a_peer_ending_shorter_renders_the_folds_instant_and_names_it_as_the_fold() {
         0,
         false,
         &peer,
+        &[],
     );
 
     // PRECONDITION, and the one this arm turns on: the BAG's own trace records
@@ -1816,6 +1825,7 @@ fn a_final_step_tied_to_its_predecessors_target_ends_the_range_below_the_tie() {
         0,
         false,
         &[],
+        &[],
     );
 
     let m = flashback_manifest(&h.bag);
@@ -1881,6 +1891,7 @@ fn a_rank_with_no_complete_step_declines_the_resume_claim() {
         0,
         false,
         &peer,
+        &[],
     );
 
     let m = flashback_manifest(&h.bag);
@@ -2176,4 +2187,137 @@ fn a_one_group_capture_resolves_its_node_map_despite_the_departure_ring() {
         "…and it is refused for the ANCHOR, not for an ambiguity the departure ring never \
          created: {reason}"
     );
+}
+
+// ===========================================================================
+// The coordination stamp: a free-run capture whose ranks begin apart
+// ===========================================================================
+
+/// A `recorder.json` as `graph run --record` hands it to its recorder, stamping
+/// `coordination` with the JSON value `coordination`.
+fn recorder_json(coordination: &str) -> (String, Vec<u8>) {
+    (
+        cerulion_bagd::RECORDER_JSON_ATTACHMENT.to_string(),
+        format!(
+            r#"{{"arch":"aarch64","os":"linux","cerulion_version":"2.0.0","recorded_at_ns":7,"trace_format":10,"coordination":{coordination},"node_external":{{"probe":false}}}}"#
+        )
+        .into_bytes(),
+    )
+}
+
+/// Rank 0's trace from the run's own step 0, and a PEER's on its own ring
+/// beginning at step 5: the shape of a capture whose peer kept a checkpoint
+/// and resumed from it while rank 0 kept none. No state is pushed, so no anchor
+/// is embedded and every record is kept but each rank's last, unproven step.
+///
+/// HAND ORACLE. Rank 0 keeps steps 0 to 2, the peer keeps 5 to 7.
+fn ranks_that_begin_apart() -> (Vec<TraceRingRecord>, Vec<TraceRingRecord>) {
+    let rank0 = (0..=3u64)
+        .flat_map(|step| [boundary(step), fire(step, 0)])
+        .collect();
+    let peer = (5..=8u64)
+        .flat_map(|step| [boundary(step), fire(step, 0)])
+        .collect();
+    (rank0, peer)
+}
+
+/// One capture of [`ranks_that_begin_apart`] handed `recorder` beside the graph.
+fn capture_ranks_that_begin_apart(tag: &str, recorder: (String, Vec<u8>)) -> Harness {
+    let (rank0, peer) = ranks_that_begin_apart();
+    capture_inner_full(
+        tag,
+        &rank0,
+        &[],
+        64 * 1024 * 1024,
+        true,
+        Some(GRAPH_YAML),
+        false,
+        0,
+        false,
+        &peer,
+        &[recorder],
+    )
+}
+
+/// The ranks the bag's own trace records carry, and each one's first kept step.
+fn first_steps_by_rank(bag: &Path) -> std::collections::BTreeMap<u32, u64> {
+    let mut firsts = std::collections::BTreeMap::new();
+    for payload in trace_payloads(bag) {
+        for raw in payload.as_chunks::<{ TRACE_RECORD_SIZE as usize }>().0 {
+            let record = TraceRingRecord::from_bytes(raw);
+            if record.record_type == RECORD_TYPE_STEP_BOUNDARY {
+                firsts.entry(record.rank()).or_insert(record.step);
+            }
+        }
+    }
+    firsts
+}
+
+/// A free-run capture whose peer begins past step 0 while rank 0 begins at
+/// step 0 is stamped not resimmable, with the sentence naming each rank,
+/// through the whole close path: the recorder reads the coordination off the
+/// `recorder.json` it was handed and each rank's first step off the trace it
+/// carries. Two captures of one stimulus write one `anchor` object.
+#[test]
+fn a_free_run_capture_whose_ranks_begin_apart_reads_not_resimmable_naming_each_rank() {
+    let a = capture_ranks_that_begin_apart("apartfree_a", recorder_json(r#""free_run""#));
+    let b = capture_ranks_that_begin_apart("apartfree_b", recorder_json(r#""free_run""#));
+    assert_eq!(
+        first_steps_by_rank(&a.bag),
+        std::collections::BTreeMap::from([(0, 0), (1, 5)]),
+        "PRECONDITION: the bag's own trace has rank 0 from step 0 and the peer from \
+         step 5"
+    );
+    let m = flashback_manifest(&a.bag);
+    assert_eq!(
+        m["anchor"]["embedded"],
+        serde_json::json!(false),
+        "PRECONDITION: no checkpoint is embedded, so the verdict is about where the \
+         ranks begin: {m}"
+    );
+    assert_eq!(m["anchor"]["resimmable"], serde_json::json!(false), "{m}");
+    assert_eq!(
+        m["anchor"]["resimmable_reason"],
+        serde_json::json!(
+            "worker rank 1 of this free-run capture begins at step 5 while rank 0 begins at \
+             step 0, and re-executing a rank that begins past step 0 beside one that begins \
+             at step 0 is not supported: record the run from its first step with `cerulion \
+             graph run --record`"
+        ),
+        "{m}"
+    );
+    let n = flashback_manifest(&b.bag);
+    assert_eq!(
+        m["anchor"].to_string(),
+        n["anchor"].to_string(),
+        "two captures of one stimulus write one anchor object"
+    );
+    a.cleanup();
+    b.cleanup();
+}
+
+/// A capture handed a `recorder.json` that is not JSON is stamped not
+/// resimmable, as `bag play --resim` refuses it, on the same traces.
+#[test]
+fn a_capture_whose_recorder_json_is_not_json_reads_not_resimmable() {
+    let h = capture_ranks_that_begin_apart(
+        "apartnotjson",
+        (
+            cerulion_bagd::RECORDER_JSON_ATTACHMENT.to_string(),
+            b"{\"arch\":".to_vec(),
+        ),
+    );
+    let m = flashback_manifest(&h.bag);
+    assert_eq!(m["anchor"]["resimmable"], serde_json::json!(false), "{m}");
+    assert_eq!(
+        m["anchor"]["resimmable_reason"],
+        serde_json::json!(
+            "this capture's `__cerulion/recorder.json` is not JSON, so it states no \
+             coordination contract, and `cerulion bag play --resim` refuses a recording whose \
+             contract it cannot read before it re-executes anything. The frames, the state and \
+             the trace are in the bag and readable"
+        ),
+        "{m}"
+    );
+    h.cleanup();
 }

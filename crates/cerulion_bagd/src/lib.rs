@@ -9878,11 +9878,29 @@ fn judge_capture_resimmable(
         flashback_plane::AnchorReport::Embedded { run_id, .. } => (*run_id, 1),
         flashback_plane::AnchorReport::Absent(_) => (0, 0),
     };
+    // Each worker rank's first kept boundary, off the per-rank trim. Only the
+    // worker manifest ranks vote: the departure ring's sentinel rank names no
+    // worker's step.
+    let rank_first_steps: BTreeMap<u32, u64> = trimmed
+        .per_rank
+        .iter()
+        .filter(|(rank, _)| worker_manifest_ranks.contains(rank))
+        .filter_map(|(rank, per)| per.first_recorded_step.map(|step| (*rank, step)))
+        .collect();
     cerulion_core::flashback::resim::judge_resimmable(
         &cerulion_core::flashback::resim::ResimFacts {
             trace_records: trimmed.records.len(),
             departure_records: trimmed.departures,
-            first_recorded_step: trimmed.first_recorded_step,
+            rank_first_steps: &rank_first_steps,
+            // The contract the capture's own `recorder.json` states, the stamp
+            // `bag play --resim` reads off the same attachment. No document
+            // reads as an unstamped recording.
+            coordination: cerulion_core::flashback::resim::recorded_coordination(
+                attachments
+                    .iter()
+                    .find(|(name, _)| name == RECORDER_JSON_ATTACHMENT)
+                    .map(|(_, bytes)| bytes.as_slice()),
+            ),
             // The hole this recorder watched open in its own
             // read of the ring, and the edges of the record stream that has to
             // straddle it for this capture to be holding it. Measured HERE, over
@@ -29356,26 +29374,34 @@ mod frame_coverage_judge_tests {
 mod ranks_begin_apart_judge_tests {
     //! The capture judge on two-rank captures whose ranks begin at different
     //! steps, through the adapter, over hand-built traces trimmed the way a
-    //! capture trims them and the `recorder.json` the capture carries. Every
-    //! verdict is written out by hand. No shared memory, no race.
+    //! capture trims them and the `recorder.json` the capture carries: the
+    //! free-run stamp refuses them by name, and a document that states no
+    //! readable contract refuses every capture. A free-run worker rank that keeps
+    //! no step boundary is refused by name too. Under the lockstep stamp, a
+    //! document with no stamp or no document, the judge reads rank 0 alone: it
+    //! does not model the replay's lockstep boundary check, which refuses ranks
+    //! whose streams start apart. Every verdict is written out by hand. No
+    //! shared memory, no race.
     use super::*;
-    use cerulion_core::flashback::resim::ResimGap;
+    use cerulion_core::flashback::resim::{ResimGap, UnreadableCoordination};
     use cerulion_core::state_restore::{AnchorFact, AnchorOutcome};
     use cerulion_core::trace_ring::{TraceRingRecord, RECORD_TYPE_FIRE, RECORD_TYPE_STEP_BOUNDARY};
 
     const MS: u64 = 1_000_000;
     const RUN: u64 = 0xC1E5;
-    /// The one node on each rank: `src_a` on rank 0, `src_b` on rank 1.
-    const NODES: [&str; 2] = ["src_a", "src_b"];
+    /// The one node on each rank: `src_a` on rank 0, `src_b` on rank 1 and
+    /// `src_c` on rank 2.
+    const NODES: [&str; 3] = ["src_a", "src_b", "src_c"];
 
-    /// A `recorder.json` as `graph run --record` writes it, with `coordination`
-    /// holding the JSON value `coordination`, or no such key for `None`.
+    /// A `recorder.json` as `graph run --record` writes it for this graph, with
+    /// `coordination` holding the JSON value `coordination`, or no such key for
+    /// `None`.
     fn recorder_json(coordination: Option<&str>) -> (String, Vec<u8>) {
         let key = coordination.map_or(String::new(), |v| format!(r#""coordination":{v},"#));
         (
             RECORDER_JSON_ATTACHMENT.to_string(),
             format!(
-                r#"{{"arch":"aarch64","os":"linux","cerulion_version":"2.0.0","recorded_at_ns":7,"trace_format":10,{key}"node_external":{{"src_a":false,"src_b":false}}}}"#
+                r#"{{"arch":"aarch64","os":"linux","cerulion_version":"2.0.0","recorded_at_ns":7,"trace_format":10,{key}"node_external":{{"src_a":false,"src_b":false,"src_c":false}}}}"#
             )
             .into_bytes(),
         )
@@ -29472,6 +29498,53 @@ mod ranks_begin_apart_judge_tests {
         }
     }
 
+    /// Three ranks: rank 1 resumes from its anchor (first kept step 6), while
+    /// ranks 0 and 2 kept no checkpoint and keep their retention from step 0.
+    fn rank_1_begins_later_of_three() -> Shape {
+        Shape {
+            records: [
+                rank_steps(0, 0..=8),
+                rank_steps(1, 0..=8),
+                rank_steps(2, 0..=8),
+            ]
+            .concat(),
+            anchored: Some(1),
+            worker_ranks: &[0, 1, 2],
+        }
+    }
+
+    /// Rank 1 attaches a manifest and keeps no record at all, while rank 0 kept
+    /// no checkpoint and keeps its retention from step 0.
+    fn rank_1_keeps_no_boundary() -> Shape {
+        Shape {
+            records: rank_steps(0, 0..=8),
+            anchored: None,
+            worker_ranks: &[0, 1],
+        }
+    }
+
+    /// The free-run stamp refuses a worker rank with no boundary stream by
+    /// name, and a lockstep reading keeps it, as the replay plans rank 0 alone
+    /// under lockstep.
+    #[test]
+    fn a_free_run_worker_rank_with_no_boundary_stream_is_refused_by_name() {
+        let refused = verdict(&rank_1_keeps_no_boundary(), Stamp::FreeRun);
+        assert_eq!(
+            refused,
+            Err(ResimGap::RankWithoutBoundaryStream { ranks: vec![1] })
+        );
+        assert!(refused.is_err_and(|gap| gap.reason().starts_with(
+            "worker rank 1 of this free-run capture has a trace manifest and no step boundary"
+        )));
+        for stamp in [Stamp::Lockstep, Stamp::Unstamped, Stamp::Absent] {
+            assert_eq!(
+                verdict(&rank_1_keeps_no_boundary(), stamp),
+                Ok(()),
+                "{stamp:?}"
+            );
+        }
+    }
+
     /// The controls: two ranks that both begin at step 0 with no checkpoint,
     /// and one rank resuming from its anchor.
     fn both_begin_at_step_0() -> Shape {
@@ -29555,7 +29628,7 @@ mod ranks_begin_apart_judge_tests {
         };
         let mut attachments = vec![(
             GRAPH_ATTACHMENT.to_string(),
-            b"prefix: mp\nnodes:\n  - id: src_a\n    type: t\n  - id: src_b\n    type: t\n"
+            b"prefix: mp\nnodes:\n  - id: src_a\n    type: t\n  - id: src_b\n    type: t\n  - id: src_c\n    type: t\n"
                 .to_vec(),
         )];
         match stamp {
@@ -29612,16 +29685,86 @@ mod ranks_begin_apart_judge_tests {
             [(0, Some(6)), (1, Some(2))]
         );
         assert_eq!(firsts(both_begin_at_step_0()), [(0, Some(0)), (1, Some(0))]);
+        assert_eq!(
+            firsts(rank_1_begins_later_of_three()),
+            [(0, Some(0)), (1, Some(6)), (2, Some(0))]
+        );
         assert_eq!(firsts(one_rank_from_its_anchor()), [(0, Some(6))]);
+        assert_eq!(firsts(rank_1_keeps_no_boundary()), [(0, Some(0))]);
     }
 
-    /// What the judge says about each shape, whatever the capture's stamp: rank
-    /// 1 beginning later reads resimmable (rank 0's first kept step is 0), and
-    /// both shapes whose rank 0 resumes mid-run read the unknown node map of a
+    /// The free-run stamp: ranks that begin apart, in either direction, are
+    /// refused by name, and a rank 0 that resumes mid-run beside a peer that
+    /// begins past step 0 reads the replay's own free-run mid-run refusal.
+    #[test]
+    fn a_free_run_capture_whose_ranks_begin_apart_is_refused_by_name() {
+        let reason = |shape: Shape| match verdict(&shape, Stamp::FreeRun) {
+            Err(gap @ ResimGap::MixedStart(_)) => gap.reason(),
+            other => panic!("expected MixedStart, got {other:?}"),
+        };
+        assert_eq!(
+            reason(rank_1_begins_later()),
+            "worker rank 1 of this free-run capture begins at step 6 while rank 0 begins at \
+             step 0, and re-executing a rank that begins past step 0 beside one that begins at \
+             step 0 is not supported: record the run from its first step with `cerulion graph \
+             run --record`"
+        );
+        assert_eq!(
+            reason(rank_0_begins_later()),
+            "worker rank 0 of this free-run capture begins at step 6 while rank 1 begins at \
+             step 0, and re-executing a rank that begins past step 0 beside one that begins at \
+             step 0 is not supported: record the run from its first step with `cerulion graph \
+             run --record`"
+        );
+        assert_eq!(
+            reason(rank_1_begins_later_of_three()),
+            "worker rank 1 of this free-run capture begins at step 6 while ranks 0 and 2 begin \
+             at step 0, and re-executing a rank that begins past step 0 beside one that begins \
+             at step 0 is not supported: record the run from its first step with `cerulion \
+             graph run --record`"
+        );
+        let past = verdict(&both_begin_past_step_0(), Stamp::FreeRun);
+        assert_eq!(
+            past,
+            Err(ResimGap::FreeRunResumeUnsupported {
+                first_step: 6,
+                ranks: 2
+            })
+        );
+        assert!(past.is_err_and(|gap| gap.reason().starts_with(
+            "this capture is stamped `coordination: free_run`, its recording begins MID-RUN \
+             (its first recorded STEP_BOUNDARY is step 6, not step 0), and it holds 2 worker ranks"
+        )));
+        // One capture, judged twice, is one verdict.
+        for shape in [
+            rank_1_begins_later,
+            rank_0_begins_later,
+            rank_1_begins_later_of_three,
+            rank_1_keeps_no_boundary,
+            both_begin_past_step_0,
+        ] {
+            assert_eq!(
+                verdict(&shape(), Stamp::FreeRun),
+                verdict(&shape(), Stamp::FreeRun)
+            );
+        }
+    }
+
+    /// The documents that state no readable contract.
+    const UNREADABLE: [Stamp; 2] = [Stamp::Unknown, Stamp::NotJson];
+
+    /// Under the lockstep stamp, a document with no stamp or no document, the
+    /// judge reads rank 0 alone. Rank 1 beginning later reads resimmable, since
+    /// rank 0's first kept step is 0 and this judge does not model the replay's
+    /// lockstep boundary check, which refuses ranks whose streams start apart.
+    /// Both shapes whose rank 0 resumes mid-run read the unknown node map of a
     /// recorder holding two trace rings.
     #[test]
-    fn a_capture_whose_ranks_begin_apart_is_judged_on_rank_0_alone() {
-        for stamp in STAMPS {
+    fn under_a_lockstep_reading_ranks_that_begin_apart_are_judged_on_rank_0_alone() {
+        for stamp in STAMPS
+            .into_iter()
+            .filter(|s| *s != Stamp::FreeRun && !UNREADABLE.contains(s))
+        {
             assert_eq!(verdict(&rank_1_begins_later(), stamp), Ok(()), "{stamp:?}");
             assert_eq!(
                 verdict(&rank_0_begins_later(), stamp),
@@ -29636,11 +29779,39 @@ mod ranks_begin_apart_judge_tests {
         }
     }
 
+    /// A document that states no readable contract refuses every shape, the
+    /// controls included, naming what it states.
+    #[test]
+    fn a_capture_whose_recorder_json_states_no_readable_contract_is_refused_by_name() {
+        let unknown = ResimGap::CoordinationUnreadable(UnreadableCoordination::UnknownStamp(
+            "\"barrier\"".to_string(),
+        ));
+        let not_json = ResimGap::CoordinationUnreadable(UnreadableCoordination::NotJson);
+        for shape in [
+            rank_1_begins_later,
+            rank_0_begins_later,
+            rank_1_begins_later_of_three,
+            both_begin_past_step_0,
+            both_begin_at_step_0,
+            one_rank_from_its_anchor,
+        ] {
+            assert_eq!(verdict(&shape(), Stamp::Unknown), Err(unknown.clone()));
+            assert_eq!(verdict(&shape(), Stamp::NotJson), Err(not_json.clone()));
+        }
+        assert_eq!(
+            not_json.reason(),
+            "this capture's `__cerulion/recorder.json` is not JSON, so it states no \
+             coordination contract, and `cerulion bag play --resim` refuses a recording whose \
+             contract it cannot read before it re-executes anything. The frames, the state and \
+             the trace are in the bag and readable"
+        );
+    }
+
     /// The controls: two ranks that both begin at step 0, and one rank resuming
-    /// from its anchor, are resimmable under every stamp.
+    /// from its anchor, are resimmable under every readable stamp.
     #[test]
     fn ranks_that_begin_together_and_a_lone_rank_are_resimmable() {
-        for stamp in STAMPS {
+        for stamp in STAMPS.into_iter().filter(|s| !UNREADABLE.contains(s)) {
             assert_eq!(
                 verdict(&both_begin_at_step_0(), stamp),
                 Ok(()),
