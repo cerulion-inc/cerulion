@@ -164,31 +164,57 @@ in prepare_pass_verification
 # Fifth scope: the decisions a replay makes about checkpoint window heads.
 #
 # Scope: the pure decision functions on the lines the window-head change added
-# or changed. In src/replay_engine.rs: whether a recorder names the writer at
-# every checkpoint window (`recorder_names_window_heads_at`), the refusal of a
-# step boundary flags word with a bit the format does not define
-# (`boundary_flags_refusal`) and the per-rank choice of the nodes a flagged
-# boundary reopens (`reopens_node`). In src/replay_feed.rs: the cause a read
-# with no writer names on a bag that begins mid-run (`absent_writer_cause`).
-# Every other line of the two files is outside the change's diff, or reads the
-# bag or drives the replay loop, which the mutation rule does not cover.
+# or changed. In src/replay_engine.rs: the recorder's trace format stamp
+# (`stamp_trace_format`) over the claims this build's recorder makes
+# (`RecorderClaims::of_this_recorder`); whether this build's recorder and a
+# bag's recorder name the writer at every checkpoint window
+# (`recorder_names_window_heads`, `recorder_names_window_heads_at`); a step
+# boundary record's decode (`StepBoundary::from_record`) and the refusal of a
+# flags word with a bit the bag's format does not define
+# (`boundary_flags_refusal`); and the reopen mirror's inputs and choice: the
+# flags and rank map each pass hands it (`reopen_flags`), a node's recorded
+# rank (`recorded_rank_of`) and whether a node is reopened (`reopens_node`). In
+# src/replay_feed.rs: the cause a read with no writer names on a bag that
+# begins mid-run (`absent_writer_cause`). The change's other lines in the two
+# files read the bag (the boundary walk and the per-rank cursors, the feed
+# planner's lookups), carry these answers through a pass, or drive the replay
+# loop (the mirror's call before each step), which the mutation rule does not
+# cover; the engine tests that fail with the mirror off pin that call.
 #
 # Run:     cargo mutants -p cerulion_cli_engine \
 #            -f crates/cerulion_cli_engine/src/replay_feed.rs \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --in-diff <the change's diff of the two files> \
-#            --re '\babsent_writer_cause\b|\brecorder_names_window_heads_at\b|\bboundary_flags_refusal\b|\breopens_node\b' \
-#            --cap-lints true --in-place --timeout 600 --shard 0/3 \
+#            --re '\babsent_writer_cause\b|\brecorder_names_window_heads_at\b|\bboundary_flags_refusal\b|\breopens_node\b|\bstamp_trace_format\b|\brecorder_names_window_heads\b|RecorderClaims::of_this_recorder|StepBoundary::from_record|\brecorded_rank_of\b|\breopen_flags\b' \
+#            --cap-lints true --in-place --timeout 600 --shard 0/7 \
 #            -- --lib -- replay_feed:: replay_engine::
-#          and the same with `--shard 1/3 --baseline=skip` and
-#          `--shard 2/3 --baseline=skip` (the unmutated baseline passed on
-#          shard 0/3)
-# Result:  shard 0/3: 6 mutants, 6 caught; shard 1/3: 6 mutants, 4 caught,
-#          2 unviable; shard 2/3: 4 mutants, 4 caught. Total: 16 mutants,
-#          14 caught, 2 unviable, 0 missed. The unviable ones replace
-#          `boundary_flags_refusal` with `Some(Default::default())` and
-#          `absent_writer_cause` with `Default::default()`: neither
-#          `ReplayError` nor `AbsentWriter` has a default.
+#          and the same with `--shard k/7 --baseline=skip` for k = 1 to 6
+#          (the unmutated baseline passed on shard 0/7)
+# Result:  shard 0/7: 7 mutants, 6 caught, 1 unviable; 1/7: 7 mutants,
+#          6 caught, 1 unviable; 2/7: 7 mutants, 4 caught, 3 unviable;
+#          3/7: 7 mutants, 1 caught, 6 unviable; 4/7: 7 mutants, 1 caught,
+#          6 unviable; 5/7: 7 mutants, 5 caught, 2 unviable; 6/7: 2 mutants,
+#          2 caught. Total: 44 mutants, 25 caught, 19 unviable, 0 missed.
+#          Four of the unviable replace `RecorderClaims::of_this_recorder`,
+#          `StepBoundary::from_record`, `boundary_flags_refusal` and
+#          `absent_writer_cause` with a default of a type that has none. The
+#          other 15 replaced `reopen_flags` with a rank map named `HashMap`,
+#          which the file did not import at that run.
+#
+# With `HashMap` imported, `reopen_flags`'s own mutants:
+#
+# Run:     the same with `--re '\breopen_flags\b'`, over
+#          crates/cerulion_cli_engine/src/replay_engine.rs alone, and
+#          `--shard k/3` (`--baseline=skip` for k = 1 and 2; the unmutated
+#          baseline passed on shard 0/3)
+# Result:  shard 0/3: 6 mutants, 2 caught, 4 unviable; 1/3: 6 mutants,
+#          2 caught, 4 unviable; 2/3: 6 mutants, 2 caught, 4 unviable.
+#          Total: 18 mutants, 6 caught, 12 unviable, 0 missed. Each flags
+#          value (empty, `[true]`, `[false]`) with no rank map and with an
+#          empty one is caught; the 12 unviable build a one-entry map keyed
+#          by `Arc::new("")` or `Arc::new("xyzzy")`, an `Arc<&str>` where the
+#          map's key is `Arc<str>`, so they do not compile. Over the scope
+#          as it stands: 44 mutants, 28 caught, 16 unviable, 0 missed.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
