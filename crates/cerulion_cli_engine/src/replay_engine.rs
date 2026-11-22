@@ -34059,6 +34059,22 @@ mod recorder_info_version_tests {
         assert!(!recorder_states_anchor_stops_at(None));
     }
 
+    /// From the node-stops format a bag's trace holds every stop; a bag below
+    /// it, or with no `recorder.json`, makes no such claim.
+    #[test]
+    fn node_stops_are_recorded_from_their_format() {
+        for older in 1..NODE_STOPS_MIN_TRACE_FORMAT {
+            assert!(
+                !recorder_records_node_stops_at(Some(&recorder_info_at(older))),
+                "a format-{older} trace says nothing about stops"
+            );
+        }
+        assert!(recorder_records_node_stops_at(Some(&recorder_info_at(
+            NODE_STOPS_MIN_TRACE_FORMAT
+        ))));
+        assert!(!recorder_records_node_stops_at(None));
+    }
+
     /// One complete anchor part for a node saving a `u64`, carrying
     /// `framework` when it is given and no framework section otherwise, built
     /// by the encoder `cerulion_core`'s `state_restore_test` pins to its hand
