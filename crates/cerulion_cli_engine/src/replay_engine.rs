@@ -5498,7 +5498,15 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     let BoundaryWalk {
         summaries: boundary_summaries,
         last_fire_step,
-    } = validate_step_boundaries(&trace, rank_count, coordination, window_heads_named)?;
+    } = validate_step_boundaries(
+        &trace,
+        rank_count,
+        coordination,
+        recorder
+            .as_ref()
+            .map(|r| r.trace_format)
+            .filter(|_| window_heads_named),
+    )?;
     // 3a. WHICH runtimes this replay stands up, and over which
     //     slice of the recorded step axis each is driven.
     //
@@ -25710,24 +25718,23 @@ fn reopen_flags<'a>(
 /// From [`WINDOW_HEADS_MIN_TRACE_FORMAT`] on the word carries
 /// `cerulion_core::trace_ring::STEP_BOUNDARY_FLAG_RUNS_REOPENED` and nothing
 /// else, so any other bit, on any rank, names a recording this binary cannot
-/// read as it was written ([`ReplayError::RecordingInconsistent`], exit 2).
+/// read as it was written ([`ReplayError::RecordingInconsistent`], exit 2), and
+/// the refusal names the bag's own stamped format, `window_heads_format`.
 /// Below that format no recorder wrote anything but 0 there and the word is
-/// not read (`window_heads_named` false: `None` whatever the word holds).
+/// not read (`window_heads_format` is `None`: `None` whatever the word holds).
 fn boundary_flags_refusal(
-    window_heads_named: bool,
+    window_heads_format: Option<u32>,
     rank: u32,
     step: u64,
     global_level: u32,
 ) -> Option<ReplayError> {
-    if !window_heads_named {
-        return None;
-    }
+    let trace_format = window_heads_format?;
     let undefined = step_boundary_flags(global_level).err()?;
     Some(ReplayError::RecordingInconsistent {
         detail: format!(
             "rank {rank}'s STEP_BOUNDARY record of step {step} sets flag bits {undefined:#x}, \
-             which trace format {WINDOW_HEADS_MIN_TRACE_FORMAT} does not define (it defines \
-             bit 0 alone, the reopened writer runs)"
+             which trace format {trace_format} does not define (it defines bit 0 alone, the \
+             reopened writer runs)"
         ),
     })
 }
@@ -25789,10 +25796,11 @@ fn validate_step_boundaries(
     trace: &RecordedTrace,
     rank_count: usize,
     coordination: CoordinationMode,
-    // Does this bag's format define the boundary flags word
-    // (`trace_format >= WINDOW_HEADS_MIN_TRACE_FORMAT`)? Then a word with any
-    // other bit is refused on every rank, before the first replayed step.
-    window_heads_named: bool,
+    // The bag's stamped `trace_format` when it defines the boundary flags word
+    // (`trace_format >= WINDOW_HEADS_MIN_TRACE_FORMAT`), else `None`. With a
+    // format, a word with any other bit is refused on every rank, before the
+    // first replayed step, and the refusal names that format.
+    window_heads_format: Option<u32>,
 ) -> Result<BoundaryWalk, ReplayError> {
     // Multi-rank: the trace interleaves k independent
     // per-rank boundary streams in file order (bagd drains ring-by-ring), so
@@ -25853,7 +25861,7 @@ fn validate_step_boundaries(
             seen_rank0 = true;
         }
         if let Some(refusal) =
-            boundary_flags_refusal(window_heads_named, r.rank(), r.step, r.global_level)
+            boundary_flags_refusal(window_heads_format, r.rank(), r.step, r.global_level)
         {
             return Err(refusal);
         }
@@ -41617,7 +41625,7 @@ mod boundary_flag_tests {
     fn boundary_flags_are_validated_only_where_the_format_defines_them() {
         for word in [0u32, STEP_BOUNDARY_FLAG_RUNS_REOPENED] {
             assert!(
-                boundary_flags_refusal(true, 0, 4, word).is_none(),
+                boundary_flags_refusal(Some(11), 0, 4, word).is_none(),
                 "word {word:#x} is defined at 11"
             );
         }
@@ -41627,7 +41635,7 @@ mod boundary_flag_tests {
             (1, 0x8000_0000, "0x80000000"),
             (0, u32::MAX, "0xfffffffe"),
         ] {
-            let Some(refusal) = boundary_flags_refusal(true, rank, 7, word) else {
+            let Some(refusal) = boundary_flags_refusal(Some(11), rank, 7, word) else {
                 panic!("word {word:#x} on rank {rank} must be refused at 11");
             };
             assert_eq!(refusal.exit_code(), 2);
@@ -41645,7 +41653,7 @@ mod boundary_flag_tests {
         }
         for word in [0b10u32, 0b11, 0x8000_0000, u32::MAX] {
             assert!(
-                boundary_flags_refusal(false, 1, 7, word).is_none(),
+                boundary_flags_refusal(None, 1, 7, word).is_none(),
                 "below 11 the word {word:#x} is not read"
             );
         }
@@ -41732,6 +41740,30 @@ mod boundary_flag_tests {
         std::fs::remove_file(&path).unwrap();
     }
 
+    /// The refusal names the format the bag itself is stamped with, not the
+    /// lowest format that defines the word: a bag stamped 11 reads "trace
+    /// format 11", and one stamped 12, a later format that defines the same
+    /// word, reads "trace format 12".
+    #[test]
+    fn the_undefined_flag_refusal_names_the_bags_own_format() {
+        for format in [11u32, 12] {
+            let Some(refusal) = boundary_flags_refusal(Some(format), 2, 9, 0b110) else {
+                panic!("bits 1 and 2 must be refused at format {format}");
+            };
+            match refusal {
+                ReplayError::RecordingInconsistent { detail } => assert_eq!(
+                    detail,
+                    format!(
+                        "rank 2's STEP_BOUNDARY record of step 9 sets flag bits 0x6, which \
+                         trace format {format} does not define (it defines bit 0 alone, the \
+                         reopened writer runs)"
+                    )
+                ),
+                other => panic!("a bag fault, RecordingInconsistent: {other:?}"),
+            }
+        }
+    }
+
     /// The same refusal through the boundary walk over a real bag: a two-rank
     /// bag whose rank 1 sets bit 1 on step 2 is refused at 11, naming rank 1
     /// and step 2, and walks clean below 11 and when every word is defined.
@@ -41747,7 +41779,8 @@ mod boundary_flag_tests {
                 .collect()
         };
         let (path, trace) = trace_of("walk_bad", &records(0b10));
-        let Err(refusal) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, true)
+        let Err(refusal) =
+            validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, Some(11))
         else {
             panic!("an undefined bit on rank 1 must be refused at 11");
         };
@@ -41758,14 +41791,14 @@ mod boundary_flag_tests {
             detail.starts_with("rank 1's STEP_BOUNDARY record of step 2 sets flag bits 0x2,"),
             "{detail}"
         );
-        if let Err(e) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, false) {
+        if let Err(e) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, None) {
             panic!("below 11 the flags word is not read: {e:?}");
         }
         drop(trace);
         std::fs::remove_file(&path).unwrap();
 
         let (path, trace) = trace_of("walk_good", &records(STEP_BOUNDARY_FLAG_RUNS_REOPENED));
-        if let Err(e) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, true) {
+        if let Err(e) = validate_step_boundaries(&trace, 2, CoordinationMode::FreeRun, Some(11)) {
             panic!("defined words on both ranks walk clean at 11: {e:?}");
         }
         drop(trace);
