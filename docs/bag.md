@@ -1471,8 +1471,9 @@ that made it, under the same window as the fire comparison.
 A NODE-STOP record whose cause is none of the three is refused (exit 2). In a
 bag stamped past the formats this build reads, a newer or foreign writer added
 the cause, and the resim refuses it as it refuses an unknown record kind,
-saying to upgrade cerulion. In a bag stamped 12 or below, that format defines
-every cause, so the bag is corrupt (`bag internal consistency check failed`).
+saying to upgrade cerulion. In a bag stamped 12 or below, the cause cannot be
+a newer writer's, since a format at or below this build's defines no other
+cause, so the bag is corrupt (`bag internal consistency check failed`).
 A Flashback capture that holds one is not resimmable, and its
 `anchor.resimmable_reason` reads the capture's own stamp the same way: a newer
 or foreign writer's cause, with the upgrade remedy, past the formats this

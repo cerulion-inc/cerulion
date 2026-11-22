@@ -2007,8 +2007,8 @@ mod tests {
     }
 
     /// The capture judge words an unknown stop cause from the capture's own
-    /// stamp, as the replay does: at the formats this build reads, that format
-    /// defines every cause, so the trace is corrupt; one format past them, a
+    /// stamp, as the replay does: at the formats this build reads, which
+    /// define no other cause, the trace is corrupt; one format past them, a
     /// newer or foreign writer added the cause. The full reason, each side.
     #[test]
     fn an_unknown_stop_cause_is_worded_from_the_captures_stamp() {

@@ -659,8 +659,8 @@ pub enum UnknownStopCauseOrigin {
     /// The bag is stamped past the formats the reading build reads: a newer or
     /// foreign writer added the cause, and upgrading is the remedy.
     NewerWriter,
-    /// The bag is stamped at or below them, where the stamped format defines
-    /// every stop cause: the record is corrupt.
+    /// The bag is stamped at or below them, and a format at or below the
+    /// reading build's defines no other stop cause: the record is corrupt.
     Corrupt,
 }
 

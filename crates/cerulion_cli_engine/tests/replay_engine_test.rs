@@ -55517,12 +55517,14 @@ fn bs_refusal(bag: &std::path::Path) -> ReplayError {
     refused.expect_err("the bag is refused")
 }
 
-/// A stop record whose own rank holds no FIRE of its node directly before it
-/// is a trace no recorder writes: refused as corrupt (exit 2), naming the
-/// record, the node, the step and the rank.
+/// A stop record that does not directly follow, on its own rank, the FIRE
+/// record of the fire that stopped its node is a trace no recorder writes:
+/// here it follows another FIRE of its node at its step, at another instant.
+/// Refused as corrupt (exit 2), naming the record, the node, the step and the
+/// rank.
 #[test]
 #[serial]
-fn a_stop_record_that_follows_no_fire_of_its_node_is_refused_exit_2() {
+fn a_stop_record_that_does_not_follow_its_stopping_fire_is_refused_exit_2() {
     let dir = tempfile::tempdir().unwrap();
     let (bag, index) = bs_bag_with(
         &dir,

@@ -2671,8 +2671,9 @@ pub fn recorder_records_node_stops_at(recorder: Option<&RecorderInfo>) -> bool {
 /// reads it, the answer the capture judge's reason is worded from too. Past
 /// `supported`, a newer or foreign writer added the cause:
 /// [`ReplayError::TraceStopCauseUnknown`], with the upgrade remedy the unknown
-/// record kind gets. At or below it, that format defines every cause, so the
-/// bag is corrupt: [`ReplayError::RecordingInconsistent`]. The record gate and
+/// record kind gets. At or below it, a format at or below this build's
+/// defines no other cause, so the bag is corrupt:
+/// [`ReplayError::RecordingInconsistent`]. The record gate and
 /// the engine both refuse through this one function.
 pub(crate) fn unknown_stop_cause_refusal(
     index: usize,
