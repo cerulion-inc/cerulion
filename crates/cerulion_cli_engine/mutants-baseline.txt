@@ -159,3 +159,44 @@ in prepare_pass_verification
   prepare_pass_verification (the label join, describe_label_reading and
   classify_label_reading) runs only for a topic in that empty set, so no
   output changes.
+
+# Fifth scope: the pure decisions a replay makes about a recorded node stop.
+#
+# Scope: in src/replay_engine.rs the trace format stamp and its node stops
+# predicates (`stamp_trace_format`, `recorder_records_node_stops`,
+# `recorder_records_node_stops_at`), and in src/replay_rederive.rs where a
+# recorded stop leaves a node (`StopPoint::is_after`, `StopPoint::burst_at`)
+# and the comparison of the recorded and re-executed stops at one step
+# (`first_stop_disagreement`). The trace read path (the fire demux reading a
+# step's stop records, and the replay reading its own stops off its trace) and
+# the record gate walk the bag and drive the scheduler, which the mutation
+# rule does not cover. They are pinned by the red-first vectors
+# `a_replay_that_stops_where_the_recording_did_passes`,
+# `a_replay_that_does_not_re_execute_the_recorded_stop_is_a_fire_schedule_divergence`,
+# `a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges` and
+# `below_the_node_stops_format_a_recorded_stop_is_not_read` in
+# tests/replay_engine_test.rs, and `a_node_stop_record_*` in
+# tests/replay_gates_test.rs.
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re 'StopPoint::|first_stop_disagreement|stamp_trace_format|recorder_records_node_stops' \
+#            --timeout 600 -- --lib -- replay_engine:: replay_rederive:: graph_cmd::
+#          (in 6 shards, --shard k/6; the unmutated baseline passed)
+# Result:  35 mutants: 31 caught, 1 unviable, 3 missed, killed since: the
+#          three on `recorder_records_node_stops_at` (its body replaced with
+#          true or with false, and `>=` replaced with `<`), which no lib test
+#          asked. Killed by
+#          `replay_engine::recorder_info_version_tests::node_stops_are_recorded_from_their_format`
+#          (re-run with `--re 'recorder_records_node_stops_at' --iterate`: 3
+#          mutants, 3 caught). The unviable one returns
+#          `Some(Default::default())` from `first_stop_disagreement`, and
+#          `StopDisagreement` has no default.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
