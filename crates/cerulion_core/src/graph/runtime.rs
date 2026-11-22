@@ -4270,6 +4270,11 @@ pub struct GraphRuntime {
     /// flip has one owner and the state is observable
     /// ([`Self::block_gate_replay_bypass`]).
     block_gate_replay_bypass: Arc<AtomicBool>,
+    /// The `block` edges this build's replay wiring feeds from a recording
+    /// ([`crate::replay_feed::BagFedBlockEdges`]); empty unless a replay pass
+    /// names a fed edge. Kept so [`Self::run_live`] refuses a runtime built
+    /// with any.
+    bag_fed_block_edges: crate::replay_feed::BagFedBlockEdges,
     /// The WaitSet reactor that backs [`Self::run_live`].
     /// `None` at build — the live loop lazily builds it on first use (sized
     /// to the data-trigger binding count) and parks it back here between
@@ -6114,9 +6119,10 @@ impl GraphRuntime {
         // moves it into a cdylib.
         purpose: BuildPurpose,
         // How a REPLAY wires this runtime (see `crate::replay_feed`): the
-        // producer-annotation rule its recording staged under, and whether its
-        // read stages subscribe to private feeds. The default (every edge
-        // annotated, no feeds) on every live, recording and test build.
+        // producer-annotation rule its recording staged under, whether its read
+        // stages subscribe to private feeds, and the `block` edges it feeds
+        // from its recording. The default (every edge annotated, no feeds, no
+        // fed `block` edge) on every live, recording and test build.
         replay_wiring: &crate::replay_feed::ReplayWiring,
     ) -> TransportResult<Self> {
         // A `ros2:` entry is SPAWNED by `cerulion graph run` as a supervised
@@ -6310,7 +6316,16 @@ impl GraphRuntime {
         // credited.
         let credit_bound_edges =
             super::topology::CreditedEdges::from_bindings(cross_process.credit_bindings);
-        topology.validate_with_credit_edges(&credit_bound_edges)?;
+        // Which end of each `block` edge a replay feeds from its recording
+        // this build holds, verified against this build's own graph and its
+        // credit bindings (see `BagFedBlockEdges`). Empty unless a replay pass
+        // names a fed edge: only `build_for_replay` threads a caller's wiring.
+        let bag_fed_ends = replay_wiring.bag_fed_block_edges.resolve(
+            &topology,
+            cross_process.credit_bindings,
+            config.identity(),
+        )?;
+        topology.validate_with_credit_edges(&credit_bound_edges, &bag_fed_ends)?;
 
         // Derive the trigger-aware DAG levels and
         // REJECT algebraic cycles (a feedback loop composed entirely of
@@ -7398,10 +7413,11 @@ impl GraphRuntime {
         // `NodeHandle::backpressure_block_fires_deferred_count` reads them.
         let mut block_counter_registrations: Vec<(String, String, Arc<BackpressureCounters>)> =
             Vec::new();
-        // One retained read-only record per block CONSUMER edge —
-        // the credit the replay verifier asserts conservation on
-        // ([`GraphRuntime::block_credits`]). Empty for every graph with no
-        // `block` input.
+        // One retained read-only record per block CONSUMER edge a credit
+        // word counts: the credit the replay verifier asserts conservation
+        // on ([`GraphRuntime::block_credits`]). Empty for every graph with no
+        // `block` input, and none for an edge a replay feeds from its
+        // recording.
         let mut block_credit_edges: Vec<BlockCreditEdge> = Vec::new();
         // The MAPPED edges this process PRODUCES on, kept
         // so the live loop can park on their credit words. EMPTY for every
@@ -7521,7 +7537,11 @@ impl GraphRuntime {
             // other consumers declare: they hold no slot and the producer's
             // deferral never consults them.
             if !flow.holds_its_producers() {
-                continue; // a producer-less `block` edge is refused by validate
+                // A producer-less `block` edge is refused by validate unless
+                // a mapped credit word counts it (the injection pass below
+                // wires it) or a replay feeds it from its recording (no word
+                // counts it).
+                continue;
             }
             for edge in flow
                 .consumers
@@ -8551,7 +8571,7 @@ impl GraphRuntime {
                     )?
                 };
                 // Install this input's single backpressure probe.
-                // The three arms are mutually exclusive BY CONTROL FLOW —
+                // The arms are mutually exclusive BY CONTROL FLOW,
                 // mirroring the subscriber's one-variant `BackpressureProbe`
                 // slot. Map disjointness is already guaranteed
                 // upstream (each consumer edge carries a single
@@ -8559,10 +8579,22 @@ impl GraphRuntime {
                 // probe is installed — this chain is the wiring-site layer
                 // of that same defense.
                 //
-                // `block`: the outstanding mirror (each drain decrements it)
-                // plus the threshold + counters so the consumer's block
-                // event fires when its queue is at the defer line.
-                if let Some((outstanding, threshold, counters)) = sub_block_by_input.get(&key) {
+                // `block`: no probe on an input a replay feeds from its
+                // recording; on any other, the outstanding mirror (each drain
+                // decrements it) plus the threshold + counters so the
+                // consumer's block event fires when its queue is at the defer
+                // line.
+                if bag_fed_ends.feeds_consumer(&topic, &node_def.id, &input.name) {
+                    // A `block` input a replay feeds from its recording
+                    // (`BagFedBlockEdges`) gets NO probe and registers no
+                    // counter. No credit word counts it, so a block probe
+                    // would have no mirror to decrement, and the `drop_oldest`
+                    // detector below would raise eviction events and counts
+                    // on a `block` input, which live, held lossless by its
+                    // producer's credit word, raised none.
+                } else if let Some((outstanding, threshold, counters)) =
+                    sub_block_by_input.get(&key)
+                {
                     subscriber.register_block_probe(
                         outstanding.clone(),
                         *threshold,
@@ -10079,6 +10111,14 @@ impl GraphRuntime {
         for node in &consume_latest_nodes {
             scheduler.set_data_consume_latest(node)?;
         }
+        // Each producer a replay's fed `block` edge holds here (see
+        // `BagFedBlockEdges`): live, the consumer's credit word in another
+        // process could defer it between the fires of a burst, so its recorded
+        // burst can end on a trailing refill below the cap with no pre-fire
+        // check in this build.
+        for node in bag_fed_ends.held_producers() {
+            scheduler.mark_held_by_bag_fed_block_edge(node)?;
+        }
         // Install ONE composed pre-fire per node that has block
         // edges and/or a throttle_ms cap. Defer if EITHER predicate fires.
         // The throttle + block actuators share the scheduler's single
@@ -10683,6 +10723,7 @@ impl GraphRuntime {
             block_credit_edges,
             credit_park_edges,
             block_gate_replay_bypass,
+            bag_fed_block_edges: replay_wiring.bag_fed_block_edges.clone(),
             // `run_live` lazily builds the reactor on
             // first use and parks it here between iterations.
             reactor: None,
@@ -16102,8 +16143,37 @@ impl GraphRuntime {
     /// Any bindings/helpers built for sibling nodes are cleaned up by
     /// `GraphRuntime::drop` when the caller drops the refused runtime. A normal
     /// run returns `Ok(())`.
+    ///
+    /// Returns [`TransportError::GraphError`] before anything else, naming the
+    /// first edge in `Ord` order, for a runtime built for a replay that feeds
+    /// a `block` edge from a recording
+    /// ([`crate::replay_feed::BagFedBlockEdges`]): no credit word counts that
+    /// edge, and only a replay's recorded fires may drive it. The refusal is
+    /// sticky, as the inert-external one is.
     pub fn run_live(&mut self, running: &std::sync::atomic::AtomicBool) -> TransportResult<()> {
         use std::sync::atomic::Ordering::Relaxed;
+
+        // A runtime built to feed a `block` edge from a recording has no
+        // credit word on that edge, so no live loop may run it. Asked FIRST,
+        // before any external source is collected or the node-death ledger
+        // is armed, so a refused call sets nothing up. The confinement of the
+        // set to `build_for_replay` is the primary guard; this is the
+        // backstop. The polled `step()` seam is not guarded (see
+        // `BagFedBlockEdges`).
+        if let Some(edge) = self.bag_fed_block_edges.iter().next() {
+            return Err(TransportError::GraphError {
+                // hot-path-alloc-ok: cold: the run_live entry REFUSAL, once per call.
+                reason: format!(
+                    "graph '{}': this runtime was built for a replay that feeds `block` edge \
+                     '{}' -> '{}.{}' from a recording, with no credit word, so `run_live` \
+                     refuses it",
+                    self.config.identity(),
+                    edge.topic,
+                    edge.consumer_node,
+                    edge.consumer_input
+                ),
+            });
+        }
 
         // Collect external ingress wake sources ONCE, at loop
         // entry, AFTER init() — a driver node's `external_source()` may open its
@@ -19139,7 +19209,9 @@ impl GraphRuntime {
     /// ONE item per consumer edge in build order, allocating nothing (the
     /// strings are borrowed from the retained records), so a per-fire
     /// conservation assert is cheap. Empty for a graph that declares no `block`
-    /// input.
+    /// input. A `block` edge a replay feeds from its recording
+    /// ([`crate::replay_feed::BagFedBlockEdges`]) has no item in either pass:
+    /// the build holds only one end of it, and no credit binding names it.
     pub fn block_credits(&self) -> impl Iterator<Item = BlockCredit<'_>> + '_ {
         self.block_credit_edges.iter().map(|e| BlockCredit {
             topic: e.topic.as_str(),
