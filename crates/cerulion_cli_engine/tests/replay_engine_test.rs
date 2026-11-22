@@ -46941,6 +46941,85 @@ fn a_window_head_annotation_naming_a_second_writer_on_an_unlabeled_topic_refuses
     }
 }
 
+/// A wrong writer at the head of a mid-run bag, on a topic with one writer and
+/// no producer labels, is fed by sequence and passes under `--verify`. The
+/// stopped latest sink's bag ([`ls_window_head_bag`]) begins at the window
+/// head, so the one annotation of the sink's reads in it is the drain site's
+/// at step 4, which restates the counter's writer; it is rewritten to a token
+/// no port of the bag's `publishers` table hashes to. The replay looks up a
+/// frame of a topic with no producer label by its wire sequence alone, since
+/// such a topic had one writer, and does not check the token a run's
+/// annotation names against the `publishers` table: that table lists only the
+/// recording's own node outputs, while a token names whichever publisher wrote
+/// the frame, so an external input's genuine token is never in it. Hand
+/// count, as for the intact bag: eight reads, eight frames, a clean read log
+/// over the sink's one edge, and exit 0.
+#[test]
+#[serial]
+fn a_wrong_writer_at_a_mid_run_window_head_on_an_unlabeled_topic_is_fed_by_sequence() {
+    let mut rec = ls_reference_at_window_head(2);
+    let sink_idx = rec
+        .node_ids
+        .iter()
+        .position(|id| id == LS_SINK)
+        .expect("the sink is in the manifest") as u32;
+    let is_annotation = |r: &TraceRingRecord| {
+        r.record_type == RECORD_TYPE_READ_OUTCOME
+            && unpack_read_outcome_meta(r.global_level).1
+                == cerulion_core::trace_ring::READ_OUTCOME_PRODUCER
+    };
+    let counter_token = cerulion_core::wire::fnv1a_hash(
+        &real_publisher_id(&rec, CP_NODE, "out").to_le_bytes(),
+    );
+    const WRONG: u64 = 0xDEAD_BEEF;
+    let port_tokens: Vec<u64> = rec
+        .publisher_ids
+        .values()
+        .flatten()
+        .map(|(_, id)| cerulion_core::wire::fnv1a_hash(&id.to_le_bytes()))
+        .collect();
+    assert!(
+        !port_tokens.contains(&WRONG),
+        "PREMISE: no port of the publishers table hashes to the rewritten token"
+    );
+    let mut rewritten = Vec::new();
+    for r in rec.trace.iter_mut() {
+        if is_annotation(r) && r.node_idx == sink_idx && r.step >= LS_FIRST_STEP {
+            rewritten.push((r.step, read_site_role(r.global_level), r.duration_ns));
+            r.duration_ns = WRONG;
+        }
+    }
+    assert_eq!(
+        rewritten,
+        vec![(LS_FIRST_STEP, ReadSiteRole::Drain, counter_token)],
+        "PREMISE: the bag's one annotation of the sink is the drain site's restated writer \
+         at the window head"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = write_stop_resumed_bag(
+        &dir,
+        "ls_wrong_head_writer.mcap",
+        &rec,
+        &ls_stopped_part(&rec),
+        ri_free_run_recorder_json(),
+    );
+    let (verified, _) = ri_replay(
+        &bag,
+        || ls_factories(SinkFailure::Fatal(2.0)),
+        replay_engine::ReplayPurpose::Verify,
+    );
+    let verified = verified.expect("a wrong writer on an unlabeled topic is fed by sequence");
+    assert_eq!(ri_assert_fed(&verified), (8, 8), "{verified:?}");
+    match &verified.read_log {
+        replay_engine::ReadLogStatus::VerifiedClean { edges_compared, .. } => {
+            assert_eq!(*edges_compared, 1, "{:?}", verified.read_log)
+        }
+        other => panic!("expected a clean read log, got {other:?}"),
+    }
+    assert!(verified.passed, "{verified:?}");
+    assert_eq!(resim_exit(&verified, true), 0);
+}
+
 // ===========================================================================
 // A stage at its rim across a window head
 // ===========================================================================
