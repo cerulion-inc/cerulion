@@ -57193,10 +57193,13 @@ impl CfgBlockSinkNode {
 /// The bag records the sink a level after the relays, so the slot is counted,
 /// the first fire that ended at `cfg` keeps its count, and the stamped replay
 /// reproduces every frame. Two replays are byte-identical. With the relay's
-/// last fire record taken out, its frame still in the bag, the step 9 pop of
-/// two frames with no fire is the finding, and the replay, which fires each
-/// node as the bag records, holds eight relay frames where the recording holds
-/// nine.
+/// last fire record taken out, its frame still in the bag, the bag shows the
+/// relay sending a frame at step 9 that no recorded fire sent, so no slot of
+/// its topic is counted, and the relay's first held step, step 1, is the
+/// finding. The replay, which fires each node as the bag records, holds eight
+/// relay frames where the recording holds nine, and with no slot counted it
+/// plans no refill after the relay's held fire, so from the third frame on
+/// the relay serves the frame after the one the live hold froze.
 #[test]
 #[serial]
 fn a_first_fire_that_ends_at_a_context_input_before_its_first_delivery_keeps_the_slot() {
@@ -57296,12 +57299,16 @@ fn a_first_fire_that_ends_at_a_context_input_before_its_first_delivery_keeps_the
         outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
         Some(
             "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
-             step 9 FIFO pop count \u{2014} re-derived 2 fire(s), recorded 0 fire(s)"
+             step 1 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
         )
     );
     assert_eq!(
         bh_violations(&outcome),
-        vec!["/fc/relay/out: recorded 9 frame(s), replay produced 8 on '/fc/relay/out'"]
+        vec![
+            "/fc/relay/out: recorded 9 frame(s), replay produced 8 on '/fc/relay/out'",
+            "/fc/relay/out: frame 2 on '/fc/relay/out' differs at x: recorded 3.0, replayed \
+             4.0 (recorded 64 B, replayed 64 B)"
+        ]
     );
     assert!(!outcome.passed);
 }
@@ -57727,7 +57734,11 @@ const FP3_YAML: &str = "name: fpgraph\nprefix: fp\nnodes:\n\
 /// (`x` 6) stops it, which releases its slot, so nothing ever holds the relay,
 /// which fires each step's frame. Then take out the relay's fire record at
 /// `drop_at`, its frame still in the bag, the shape of a relay that popped a
-/// frame there and fired nothing.
+/// frame there and fired nothing. The frame with no fire also makes the bag
+/// show the relay sending more frames at that step than it fired, which
+/// counts no slot of its topic on its own: these vectors pin the verdict on
+/// such a bag, and the pure vectors and the stopping-sink vectors pin the
+/// release itself.
 fn fp3_recording(steps: usize, drop_at: u64) -> Recording {
     let mut rec = record_uniform_with_read_log(FP3_YAML, || fp3_factories(Some(6.0)), &[], steps);
     let last = steps as u64 - 1;
@@ -57764,13 +57775,14 @@ fn fp3_finding(drop_at: u64) -> String {
 
 /// `rec`, with the relay's fire at `drop_at` taken out after a live sink stop,
 /// replayed with a build in which the sink does not stop and with the build
-/// that recorded the bag. At the node-stops trace format the bag holds the
-/// sink's stop, which releases its slot from the next step, so nothing holds
-/// the relay after it and the step is the finding whichever build replays.
-/// Below that format the trace holds no stop, so the slot is not counted at
-/// all, as on a bag that does not pin its queue: the step is the finding
-/// there too. The relay's frames differ either way, since the replay fires it
-/// as the bag records.
+/// that recorded the bag. The frame the taken-out fire sent stays in the bag,
+/// so the bag shows the relay sending more frames at `drop_at` than it fired
+/// there, and no slot of its topic is counted on any stamp: nothing holds the
+/// relay and the step is the finding whichever build replays. At the
+/// node-stops trace format the bag also holds the sink's stop, which releases
+/// its slot from the next step; below it the trace holds no stop, so no slot
+/// is counted there either. The relay's frames differ either way, since the
+/// replay fires it as the bag records.
 fn fp3_assert(rec: &Recording, drop_at: u64, name: &str) {
     for format in [
         replay_engine::NODE_STOPS_MIN_TRACE_FORMAT,

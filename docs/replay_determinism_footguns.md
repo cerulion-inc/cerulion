@@ -295,7 +295,8 @@ frame header it cannot parse, its record-health stamp is absent or malformed,
 keeps no entry for the topic, reports the topic lossy or written by several
 publishers (declared or observed), or any frame drained and never written,
 the bag is stamped below `trace_format` 12, so its trace does not hold the
-stop that releases a consumer's slot, the graph lists the topic in
+stop that releases a consumer's slot, the recording shows the producer sending
+more frames at a step than it fired there, the graph lists the topic in
 `multi_publisher_topics`, the recording does not pin
 the input's `block` policy and depth (its `recorder.json` names the input's
 queue with another policy or depth than the replayed build gives it, or, on a
@@ -323,7 +324,13 @@ empty read: a step-boundary input read empty ends every fire of its step, and
 a `sample(N)` trigger input whose gate dropped the frame ends that fire. For a
 node whose metadata does not say it needs a publisher for every output, which
 that macro sets, every such fire can hide a drain.
-A consumer's stop releases its slot from the next step on. As for a throttle,
+A consumer's stop releases its slot from the next step on. While a slot holds,
+its count never passes the input's depth: the check stops the producer there,
+and each fire sends one frame. So a slot the recording counts past its depth
+was released with no record: it allows for no hold from that step on, and a
+step only it excused since its consumer last read it is a divergence that says
+so. A slot that a consumer's stop released is not held to its depth after the
+stop. As for a throttle,
 whose window the rule reads off the recorded clock, a step no such check could
 defer owes every popped frame a fire. Read through one
 subscriber, such a node may leave one popped frame unfired at a step a check

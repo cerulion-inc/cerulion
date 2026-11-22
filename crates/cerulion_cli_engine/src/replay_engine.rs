@@ -13444,6 +13444,67 @@ fn recorded_fire_levels(
     Ok(levels)
 }
 
+/// The instants of each node's FIRE records on `rank` in the bag's trace,
+/// ascending. A node the trace holds no fire of is absent.
+///
+/// # Errors
+///
+/// A trace the walk cannot read.
+fn recorded_fire_instants(
+    trace: &RecordedTrace,
+    rank_tables: &[Vec<Arc<str>>],
+    rank: u32,
+) -> Result<BTreeMap<String, Vec<u64>>, ReplayError> {
+    let mut instants: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let Some(table) = rank_tables.get(rank as usize) else {
+        return Ok(instants);
+    };
+    trace.for_each(|rec| {
+        if rec.record_type == RECORD_TYPE_FIRE && rec.rank() == rank {
+            if let Some(node) = table.get(rec.node_idx as usize) {
+                instants
+                    .entry(node.to_string())
+                    .or_default()
+                    .push(rec.fire_time_ns);
+            }
+        }
+        Ok(())
+    })?;
+    for list in instants.values_mut() {
+        list.sort_unstable();
+    }
+    Ok(instants)
+}
+
+/// PURE: does the bag record more frames of a topic at one wire stamp
+/// (`frame_stamps`, ascending) than its producer fired at that instant
+/// (`fire_instants`, ascending), at any stamp from `from_ns` (the rank's first
+/// recorded fire) on? A fire stamps every frame it sends with its step's
+/// gating clock, which is also its FIRE record's instant, and a
+/// `#[cerulion_node]` node sends one frame per output per fire, so its slot
+/// never counts past the depth while it holds. A producer that sends more, or
+/// a frame no recorded fire sent, can. Frames stamped before `from_ns` precede
+/// the trace and are not compared.
+fn writes_past_fires(frame_stamps: &[u64], fire_instants: &[u64], from_ns: u64) -> bool {
+    let start = frame_stamps.partition_point(|&at| at < from_ns);
+    let frames = &frame_stamps[start..];
+    let mut at = 0;
+    while at < frames.len() {
+        let stamp = frames[at];
+        let sent = frames[at..].iter().take_while(|&&s| s == stamp).count();
+        let lo = fire_instants.partition_point(|&f| f < stamp);
+        let fired = fire_instants[lo..]
+            .iter()
+            .take_while(|&&f| f == stamp)
+            .count();
+        if sent > fired {
+            return true;
+        }
+        at += sent;
+    }
+    false
+}
+
 /// PURE: do the bag's fire records put `consumer` on a later level than
 /// `producer`? Where they do, each of the consumer's reads ran after the
 /// producer decided in its step. A node with no recorded fire, or with fires
@@ -13534,11 +13595,16 @@ fn block_hold_flows(
 /// the slot. So does every edge of a bag whose trace does not hold its node
 /// stops (`stops_recorded` false: a stamp below
 /// [`NODE_STOPS_MIN_TRACE_FORMAT`], or none): a consumer's stop releases its
-/// slot live, and such a trace keeps no record of it.
+/// slot live, and such a trace keeps no record of it. And so does an edge
+/// whose producer the bag shows writing more frames to the topic than it
+/// fires (`writes_past_fires(producer, topic)`, [`writes_past_fires`]): its
+/// slot can pass the depth while it holds, which the replay reads as a
+/// release.
 fn local_block_holds(
     flows: &[BlockHoldFlow],
     levels: &BTreeMap<String, RecordedLevel>,
     stops_recorded: bool,
+    writes_past_fires: &dyn Fn(&str, &str) -> bool,
     record_of: &dyn Fn(&str, &str, &str) -> replay_rederive::SlotRecord,
 ) -> BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> {
     let mut holds: BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> = BTreeMap::new();
@@ -13552,6 +13618,7 @@ fn local_block_holds(
                     consumer_input: c.input.clone(),
                     depth: c.depth,
                     record: if !stops_recorded
+                        || writes_past_fires(producer, &flow.topic)
                         || c.released_on_timeout
                         || !c.pinned
                         || !recorded_after(levels, producer, &c.node)
@@ -15711,15 +15778,37 @@ fn prepare_pass_verification(
     let hold_flows = block_hold_flows(plan.subgraph(), node_infos, recorded_queues, plan.rank())?;
     let hold_topics: BTreeSet<String> = hold_flows.iter().map(|f| f.topic.clone()).collect();
     let hold_stamps = recorded_frame_stamps(recorded_messages, &hold_topics)?;
-    let fire_levels = if hold_flows.is_empty() {
-        BTreeMap::new()
+    let (fire_levels, fire_instants) = if hold_flows.is_empty() {
+        (BTreeMap::new(), BTreeMap::new())
     } else {
-        recorded_fire_levels(trace, rank_tables, plan.rank())?
+        (
+            recorded_fire_levels(trace, rank_tables, plan.rank())?,
+            recorded_fire_instants(trace, rank_tables, plan.rank())?,
+        )
     };
+    let first_fire_ns = fire_instants
+        .values()
+        .filter_map(|instants| instants.first())
+        .min()
+        .copied()
+        .unwrap_or(u64::MAX);
+    let no_fires = Vec::new();
     let mut block_holds = local_block_holds(
         &hold_flows,
         &fire_levels,
         stops_recorded,
+        &|producer, topic| {
+            hold_stamps
+                .get(topic)
+                .and_then(Option::as_ref)
+                .is_some_and(|stamps| {
+                    writes_past_fires(
+                        stamps,
+                        fire_instants.get(producer).unwrap_or(&no_fires),
+                        first_fire_ns,
+                    )
+                })
+        },
         &|topic, consumer, input| {
             slot_record(
                 hold_stamps.get(topic).and_then(Option::as_ref),
@@ -40567,6 +40656,7 @@ mod trigger_input_capacity_tests {
                 .expect("builds"),
             &levels,
             true,
+            &|_, _| false,
             &record_of,
         );
         assert_eq!(
@@ -40582,12 +40672,28 @@ mod trigger_input_capacity_tests {
                 ("m".to_string(), vec![edge("n", 5, "/lb/bus")]),
             ])
         );
+        // A producer the bag shows writing more frames than it fires counts no
+        // edge of its topic.
+        let past = local_block_holds(
+            &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
+                .expect("builds"),
+            &levels,
+            true,
+            &|producer, topic| producer == "h" && topic == "/lb/h/out",
+            &record_of,
+        );
+        let mut expected_past = held.clone();
+        for e in expected_past.get_mut("h").expect("h produces a held topic") {
+            e.record = SlotRecord::Unaccounted;
+        }
+        assert_eq!(past, expected_past);
         // A bag whose trace does not hold its node stops counts no edge.
         let unstopped = local_block_holds(
             &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
                 .expect("builds"),
             &levels,
             false,
+            &|_, _| false,
             &record_of,
         );
         assert_eq!(
@@ -40607,6 +40713,35 @@ mod trigger_input_capacity_tests {
             expected,
             "no block input reads e's topic once f reads it drop_oldest"
         );
+    }
+
+    /// A producer writes past its fires where the bag records more frames at
+    /// one stamp than it fired at that instant, from the rank's first fire on:
+    /// hand table.
+    #[test]
+    fn a_producer_writes_past_its_fires_where_a_stamp_holds_more_frames_than_fires() {
+        for (frames, fires, from, past) in [
+            (&[][..], &[][..], 0, false),
+            (&[10, 20, 30], &[10, 20, 30], 10, false),
+            (&[10, 20, 20, 30], &[10, 20, 30], 10, true),
+            (&[10, 20, 20, 30], &[10, 20, 20, 30], 10, false),
+            (&[10, 20, 30], &[10, 30], 10, true),
+            (&[10, 20, 30], &[10, 20], 10, true),
+            // Fewer frames than fires: a fire that sent nothing.
+            (&[10, 30], &[10, 20, 30], 10, false),
+            // Frames before the rank's first fire precede the trace.
+            (&[5, 5, 10, 20], &[10, 20], 10, false),
+            (&[5, 5, 10, 20], &[10, 20], 5, true),
+            // A producer with no recorded fire and frames inside the trace.
+            (&[10, 20], &[][..], 10, true),
+            (&[10, 20], &[][..], u64::MAX, false),
+        ] {
+            assert_eq!(
+                writes_past_fires(frames, fires, from),
+                past,
+                "frames {frames:?}, fires {fires:?}, from {from}"
+            );
+        }
     }
 
     /// A consumer whose info says it needs a publisher for every output it
@@ -40926,6 +41061,7 @@ mod trigger_input_capacity_tests {
                     .expect("builds"),
                 &levels,
                 true,
+                &|_, _| false,
                 &|_, _, _| SlotRecord::Counted {
                     frame_stamps: vec![1_000],
                     drain: BodyDrain::PerFrame,
@@ -41160,6 +41296,7 @@ mod trigger_input_capacity_tests {
                     .expect("builds"),
                 &levels,
                 true,
+                &|_, _| false,
                 &|_, _, _| counted.clone(),
             )
             .remove("relay")
@@ -41965,12 +42102,19 @@ mod trailing_refill_tests {
     /// A step no carry explains on a held node (two frames popped and none
     /// fired) clears its carry, so the next fire step marks nothing; a hold
     /// that engages again after it marks its refill again. Depth 1, so every
-    /// fire fills the slot.
+    /// fire fills the slot, and the consumer `c` takes a frame at steps 1 and
+    /// 3, after `n`'s checks, so `n` can fire at steps 2 and 4.
     #[test]
     fn a_block_held_node_step_no_carry_explains_clears_its_carry() {
         let rows: Vec<Row> = [(0, 1, 1), (1, 2, 0), (2, 1, 1), (3, 1, 0), (4, 1, 1)]
             .into_iter()
-            .map(|(n, pops, fires)| (n, n * 5_000, vec![("n", pops, fires, 0)]))
+            .map(|(n, pops, fires)| {
+                let mut nodes = vec![("n", pops, fires, 0)];
+                if n == 1 || n == 3 {
+                    nodes.push(("c", 0, 1, 1));
+                }
+                (n, n * 5_000, nodes)
+            })
             .collect();
         let v = verification(
             vec![decl(
