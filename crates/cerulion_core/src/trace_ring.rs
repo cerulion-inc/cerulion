@@ -112,6 +112,18 @@ pub const RECORD_TYPE_READ_OUTCOME: u32 = 6;
 /// At most one per node per stop, so a ring sized for its fires holds them.
 pub const RECORD_TYPE_NODE_STOP: u32 = 7;
 
+/// The lowest `trace_format` whose trace follows every fire that stopped its
+/// node with a NODE-STOP record ([`RECORD_TYPE_NODE_STOP`]). The one place the
+/// number is written: the replay's constant of the same name in
+/// `cerulion_cli_engine::replay_engine` is this one.
+pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = 12;
+
+/// The highest `trace_format` this build reads. The replay's read gate of the
+/// same name in `cerulion_cli_engine::replay_engine` is this constant, and its
+/// doc names what each format adds. The capture judge words an unknown stop
+/// cause against it ([`TraceRecordFault::detail`]), as the replay does.
+pub const SUPPORTED_TRACE_FORMAT: u32 = NODE_STOPS_MIN_TRACE_FORMAT;
+
 /// Read-outcome kind: a fresh frame was served to the read (the low-16
 /// half of the kind-6 `global_level` packing). The wire constants are
 /// DERIVED from the portable [`ReadOutcomeKind`] enum's own discriminants
@@ -621,9 +633,8 @@ pub enum TraceRecordFault {
     /// [`NodeStopCause`](crate::scheduler::NodeStopCause) this build defines:
     /// a cause a newer or foreign writer added, or a corrupt record. The
     /// record walk runs before the version gate, so a newer writer's cause can
-    /// reach this check first. [`Self::detail`] names the newer or foreign
-    /// writer and says to upgrade; `run_replay` and the replay engine word
-    /// their own refusal from the bag's stamp.
+    /// reach this check first. [`Self::detail`] and the replay's refusal both
+    /// word it from the bag's stamp through [`unknown_stop_cause_origin`].
     UnknownStopCause {
         /// The record's rank.
         rank: u32,
@@ -640,13 +651,42 @@ pub enum TraceRecordFault {
     },
 }
 
+/// What a NODE-STOP record whose stop cause this build does not define says
+/// about its bag, read from the bag's `trace_format` stamp
+/// ([`unknown_stop_cause_origin`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnknownStopCauseOrigin {
+    /// The bag is stamped past the formats the reading build reads: a newer or
+    /// foreign writer added the cause, and upgrading is the remedy.
+    NewerWriter,
+    /// The bag is stamped at or below them, where the stamped format defines
+    /// every stop cause: the record is corrupt.
+    Corrupt,
+}
+
+/// PURE: where an unknown stop cause in a bag stamped `stamp` (`1` when the
+/// bag carries no stamp) came from, for a build that reads up to `supported`.
+/// The replay's refusal (`unknown_stop_cause_refusal` in
+/// `cerulion_cli_engine::replay_engine`) and the capture judge's reason
+/// ([`TraceRecordFault::detail`]) both branch on this one answer.
+pub fn unknown_stop_cause_origin(stamp: u32, supported: u32) -> UnknownStopCauseOrigin {
+    if stamp > supported {
+        UnknownStopCauseOrigin::NewerWriter
+    } else {
+        UnknownStopCauseOrigin::Corrupt
+    }
+}
+
 impl TraceRecordFault {
-    /// One sentence naming the fault, for a capture manifest's refusal reason.
+    /// One sentence naming the fault, for a capture manifest's refusal reason,
+    /// in a bag stamped `trace_format` (`1` when it carries no stamp). The
+    /// stamp words an unknown stop cause ([`unknown_stop_cause_origin`] against
+    /// [`SUPPORTED_TRACE_FORMAT`]) and no other fault.
     ///
     /// `run_replay` renders its own wording into its own error variants (it has
     /// the record INDEX and the manifest NAME, which this type deliberately does
     /// not carry); this is the capture side's rendering of the same fact.
-    pub fn detail(&self) -> String {
+    pub fn detail(&self, trace_format: u32) -> String {
         match self {
             Self::ForeignRank { rank, ranks_known } => format!(
                 "a trace record is stamped with rank {rank}, but this capture carries worker \
@@ -663,11 +703,20 @@ impl TraceRecordFault {
                  manifest lists only {nodes} node id(s)",
                 trace_record_noun(*record_type)
             ),
-            Self::UnknownStopCause { rank, code } => format!(
-                "a scheduler-trace NODE-STOP record of rank {rank} carries stop cause {code}, \
-                 which this Cerulion version does not define; the trace was written by a newer or \
-                 foreign writer, so upgrade cerulion to replay it"
-            ),
+            Self::UnknownStopCause { rank, code } => {
+                match unknown_stop_cause_origin(trace_format, SUPPORTED_TRACE_FORMAT) {
+                    UnknownStopCauseOrigin::NewerWriter => format!(
+                        "a scheduler-trace NODE-STOP record of rank {rank} carries stop cause \
+                         {code}, which this Cerulion version does not define; the trace was \
+                         written by a newer or foreign writer, so upgrade cerulion to replay it"
+                    ),
+                    UnknownStopCauseOrigin::Corrupt => format!(
+                        "a scheduler-trace NODE-STOP record of rank {rank} carries stop cause \
+                         {code}, which trace format {trace_format} does not define; the trace is \
+                         corrupt"
+                    ),
+                }
+            }
             Self::ZeroedRecord => {
                 "a scheduler-trace record has record_type 0 — an invalid (zeroed) record, so \
                  the trace is corrupt"
@@ -2777,6 +2826,31 @@ mod tests {
         assert_eq!(unknown.stop_cause(), None);
     }
 
+    /// An unknown stop cause's origin against a hand table: past the formats
+    /// the build reads, a newer writer's; at or below them, a corrupt record.
+    /// The rows move `supported` too, so the answer is read from both.
+    #[test]
+    fn an_unknown_stop_causes_origin_is_read_from_the_stamp() {
+        use UnknownStopCauseOrigin::{Corrupt, NewerWriter};
+        for (stamp, supported, want) in [
+            (1u32, 12u32, Corrupt),
+            (11, 12, Corrupt),
+            (12, 12, Corrupt),
+            (13, 12, NewerWriter),
+            (u32::MAX, 12, NewerWriter),
+            (13, 13, Corrupt),
+            (14, 13, NewerWriter),
+            (0, 0, Corrupt),
+            (1, 0, NewerWriter),
+        ] {
+            assert_eq!(
+                unknown_stop_cause_origin(stamp, supported),
+                want,
+                "stamp {stamp}, supported {supported}"
+            );
+        }
+    }
+
     /// The shared classifier admits a NODE-STOP record and bounds its
     /// `node_idx` like a FIRE's; the kinds past it stay refused.
     #[test]
@@ -2817,11 +2891,21 @@ mod tests {
             );
         }
         assert_eq!(trace_record_noun(RECORD_TYPE_NODE_STOP), "NODE-STOP");
+        // Past the formats this build reads, a newer writer's cause; at them,
+        // a corrupt record.
         assert_eq!(
-            TraceRecordFault::UnknownStopCause { rank: 1, code: 9 }.detail(),
+            TraceRecordFault::UnknownStopCause { rank: 1, code: 9 }
+                .detail(SUPPORTED_TRACE_FORMAT + 1),
             "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which this \
              Cerulion version does not define; the trace was written by a newer or foreign \
              writer, so upgrade cerulion to replay it"
+        );
+        assert_eq!(
+            TraceRecordFault::UnknownStopCause { rank: 1, code: 9 }.detail(SUPPORTED_TRACE_FORMAT),
+            format!(
+                "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which trace \
+                 format {SUPPORTED_TRACE_FORMAT} does not define; the trace is corrupt"
+            )
         );
         for kind in [4u32, 5, 8, u32::MAX] {
             let rec = TraceRingRecord {

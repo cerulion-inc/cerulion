@@ -1473,6 +1473,10 @@ bag stamped past the formats this build reads, a newer or foreign writer added
 the cause, and the resim refuses it as it refuses an unknown record kind,
 saying to upgrade cerulion. In a bag stamped 12 or below, that format defines
 every cause, so the bag is corrupt (`bag internal consistency check failed`).
+A Flashback capture that holds one is not resimmable, and its
+`anchor.resimmable_reason` reads the capture's own stamp the same way: a newer
+or foreign writer's cause, with the upgrade remedy, past the formats this
+build reads, and a corrupt trace at 12 or below.
 Four more stop records are refused before the first replayed step as a
 corrupt bag (`bag internal consistency check failed`, exit 2): one stamped
 with a rank the bag has no trace manifest for, and three shapes no recorder

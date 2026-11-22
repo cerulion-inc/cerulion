@@ -2648,10 +2648,10 @@ pub fn recorder_states_anchor_stops_at(recorder: Option<&RecorderInfo>) -> bool 
 /// node with a NODE-STOP record, so a stop the trace does not hold is a stop
 /// the recording did not make. Below it the trace says nothing about stops.
 ///
-/// The ONE place the node-stops format number is written: the stamp
-/// ([`stamp_trace_format`]) and the read gate ([`SUPPORTED_TRACE_FORMAT`])
-/// both read it from here.
-pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = 12;
+/// The stamp ([`stamp_trace_format`]) and the read gate
+/// ([`SUPPORTED_TRACE_FORMAT`]) both read it from here. The number is written
+/// once, in `cerulion_core::trace_ring`, where the capture judge reads it too.
+pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = cerulion_core::trace_ring::NODE_STOPS_MIN_TRACE_FORMAT;
 
 // The gate can never sit above what this binary reads.
 const _: () = assert!(NODE_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
@@ -2667,7 +2667,9 @@ pub fn recorder_records_node_stops_at(recorder: Option<&RecorderInfo>) -> bool {
 /// PURE: the refusal of trace record `index`, a NODE-STOP record of `rank`
 /// whose stop cause `code` names no cause this build defines, in a bag
 /// stamped `stamp` (`1` when unstamped) and read by a build that reads up to
-/// `supported`. Past `supported`, a newer or foreign writer added the cause:
+/// `supported`, as `cerulion_core::trace_ring::unknown_stop_cause_origin`
+/// reads it, the answer the capture judge's reason is worded from too. Past
+/// `supported`, a newer or foreign writer added the cause:
 /// [`ReplayError::TraceStopCauseUnknown`], with the upgrade remedy the unknown
 /// record kind gets. At or below it, that format defines every cause, so the
 /// bag is corrupt: [`ReplayError::RecordingInconsistent`]. The record gate and
@@ -2679,22 +2681,22 @@ pub(crate) fn unknown_stop_cause_refusal(
     stamp: u32,
     supported: u32,
 ) -> ReplayError {
-    if stamp > supported {
-        ReplayError::TraceStopCauseUnknown {
+    use cerulion_core::trace_ring::{unknown_stop_cause_origin, UnknownStopCauseOrigin};
+    match unknown_stop_cause_origin(stamp, supported) {
+        UnknownStopCauseOrigin::NewerWriter => ReplayError::TraceStopCauseUnknown {
             index,
             reason: format!(
                 "a NODE-STOP record of rank {rank} carries stop cause {code}, which this \
                  Cerulion version does not define; the bag was written by a newer or foreign \
                  writer; upgrade cerulion to replay it"
             ),
-        }
-    } else {
-        ReplayError::RecordingInconsistent {
+        },
+        UnknownStopCauseOrigin::Corrupt => ReplayError::RecordingInconsistent {
             detail: format!(
                 "trace record {index} is a NODE-STOP record of rank {rank} that carries stop \
                  cause {code}, which trace format {stamp} does not define"
             ),
-        }
+        },
     }
 }
 
@@ -2885,6 +2887,9 @@ pub fn replay_stages_batch_frames(
 /// holds none. The formats below it stay readable, and their traces say
 /// nothing about stops.
 ///
+/// The value is `cerulion_core::trace_ring`'s constant of the same name, which
+/// the capture judge words an unknown stop cause against.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
@@ -2896,7 +2901,7 @@ pub fn replay_stages_batch_frames(
 /// the two remain separate functions serving separate
 /// questions, and the READ gate still admits the formats below it
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = NODE_STOPS_MIN_TRACE_FORMAT;
+pub const SUPPORTED_TRACE_FORMAT: u32 = cerulion_core::trace_ring::SUPPORTED_TRACE_FORMAT;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see

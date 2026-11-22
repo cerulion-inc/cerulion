@@ -165,7 +165,9 @@ in prepare_pass_verification
 # Scope: in src/replay_engine.rs the trace format stamp and its node stops
 # predicates (`stamp_trace_format`, `recorder_records_node_stops`,
 # `recorder_records_node_stops_at`) and the remedy an unknown stop cause gets
-# from the bag's stamp (`unknown_stop_cause_refusal`), and in src/replay_rederive.rs where a
+# from the bag's stamp (`unknown_stop_cause_refusal`, which maps the answer of
+# `cerulion_core::trace_ring::unknown_stop_cause_origin`, in that crate's
+# baseline), and in src/replay_rederive.rs where a
 # recorded stop leaves a node (`StopPoint::is_after`, `StopPoint::burst_at`)
 # and the comparison of the recorded and re-executed stops at one step
 # (`first_stop_disagreement`). The trace read path (the fire demux reading a

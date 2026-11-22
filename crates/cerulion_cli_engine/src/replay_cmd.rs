@@ -2268,16 +2268,14 @@ struct RecorderRead {
 /// The `trace_format` a bag's `recorder.json` stamps, read on its own for the
 /// one record refusal whose remedy depends on it, which the record walk raises
 /// before [`read_recorder_info`] runs. `1` when the attachment is absent or
-/// carries no readable stamp, as an absent field reads.
+/// carries no readable stamp, as an absent field reads. Read through
+/// `cerulion_core::flashback::resim::recorded_trace_format`, as the capture
+/// judge reads it.
 fn stamped_trace_format(reader: &BagReader) -> u32 {
-    reader
-        .attachment(RECORDER_ATTACHMENT)
-        .ok()
-        .flatten()
-        .and_then(|att| serde_json::from_slice::<serde_json::Value>(&att.data).ok())
-        .and_then(|doc| doc.get("trace_format").and_then(serde_json::Value::as_u64))
-        .and_then(|f| u32::try_from(f).ok())
-        .unwrap_or(1)
+    let attachment = reader.attachment(RECORDER_ATTACHMENT).ok().flatten();
+    cerulion_core::flashback::resim::recorded_trace_format(
+        attachment.as_ref().map(|att| att.data.as_slice()),
+    )
 }
 
 fn read_recorder_info(reader: &BagReader, bag: &Path) -> Result<RecorderRead, ReplayError> {
