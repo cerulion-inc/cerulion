@@ -1533,7 +1533,10 @@ fn a_two_rank_capture_missing_one_rank_stamps_that_rank_in_the_bag() {
             "reason": "no_anchor_retained",
             "remedy": "this rank retained no checkpoint: it published no state ring, its \
                        plane was refused at arm time, or it had not reached its first anchor \
-                       cadence when the capture was triggered",
+                       cadence when the capture was triggered. A capture of several worker \
+                       ranks does not resume from their checkpoints, since per-rank resume is \
+                       not supported: \
+                       record the run from its first step with `cerulion graph run --record`",
         }]),
         "the capture names the ring and rank it lacks, the cause and the remedy: {m}"
     );
