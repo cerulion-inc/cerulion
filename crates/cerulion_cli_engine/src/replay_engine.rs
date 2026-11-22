@@ -17101,6 +17101,15 @@ fn run_rank_pass(
         )?;
         rec_step_stops.clear();
         if pass.stops_recorded {
+            // Every recorded stop reaches the rules, a driver's too: a stop
+            // releases the node's `block` slots whatever drives it. Only the
+            // compare leaves a driver's stops out, since a resim never gives
+            // a driver its device.
+            if !lockstep {
+                for stop in fire_cursors.step_stops() {
+                    rederive_stops.note_recorded(boundary.step, stop);
+                }
+            }
             rec_step_stops.extend(
                 fire_cursors
                     .step_stops()
@@ -17108,11 +17117,6 @@ fn run_rank_pass(
                     .filter(|s| !pass.driver_nodes.contains(&s.node_id))
                     .cloned(),
             );
-            if !lockstep {
-                for stop in &rec_step_stops {
-                    rederive_stops.note_recorded(boundary.step, stop);
-                }
-            }
         }
         // Accumulate this step for the rank-local re-derivation
         // verifier, which takes the whole slice (it re-derives a SCHEDULE, and a

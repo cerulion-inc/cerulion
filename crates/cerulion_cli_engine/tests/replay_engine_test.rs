@@ -57830,6 +57830,303 @@ fn a_short_last_step_after_a_live_consumer_stop_is_the_finding() {
     fp3_assert(&fp3_recording(10, 9), 9, "fp3_tail.mcap");
 }
 
+/// `rec` with the relay's FIRE record at `step` and the frame it sent taken
+/// out: the shape of a relay that popped a frame there and fired nothing.
+fn rs_drop_relay_fire(rec: &mut Recording, topic: &str, step: u64) {
+    let relay = rec.node_ids.iter().position(|n| n == "relay").unwrap() as u32;
+    let at = rec
+        .trace
+        .iter()
+        .position(|r| r.record_type == RECORD_TYPE_FIRE && r.node_idx == relay && r.step == step)
+        .expect("the relay fires at the step");
+    let fired_at = rec.trace.remove(at).fire_time_ns;
+    let frames = rec.messages.get_mut(topic).expect("the relay's frames");
+    let sent = frames
+        .iter()
+        .position(|f| WireHeader::read_from_buf(f).map(|h| h.timestamp_ns) == Some(fired_at))
+        .expect("the relay's frame of the step");
+    frames.remove(sent);
+}
+
+/// The stop records of `rec` as `(node, step, cause code)`.
+fn rs_stops(rec: &Recording) -> Vec<(String, u64, u64)> {
+    rec.trace
+        .iter()
+        .filter(|r| r.record_type == RECORD_TYPE_NODE_STOP)
+        .map(|r| {
+            (
+                rec.node_ids[r.node_idx as usize].clone(),
+                r.step,
+                r.duration_ns,
+            )
+        })
+        .collect()
+}
+
+/// The relay's FIFO pop finding at `step` of a [`rs_drop_relay_fire`] bag.
+fn rs_finding(step: u64) -> String {
+    format!(
+        "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' step \
+         {step} FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+    )
+}
+
+/// A 5 ms source that publishes its tick count and returns
+/// `NodeError::Fatal` on its fifth tick, so it publishes nothing from there.
+#[cerulion_node(period_ms = 5)]
+#[derive(Default)]
+struct StoppingPacerNode {
+    #[output]
+    out: Vector3,
+    ticks: u32,
+}
+
+#[cerulion_node_impl]
+impl StoppingPacerNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1;
+        if self.ticks == 5 {
+            return Err(NodeError::Fatal("the pacer stops".to_string()));
+        }
+        self.out.x = f64::from(self.ticks);
+        Ok(())
+    }
+}
+
+/// A sink triggered on `s` that reads the relay's frames through the context
+/// `block` input `x` (depth 2), publishes what it read, and whose tick panics
+/// on its fire `panic_on_fire`, after it read `x`.
+#[cerulion_node]
+#[derive(Default)]
+struct CtxPanickingSinkNode {
+    #[input(trigger)]
+    s: Vector3,
+    #[input(backpressure = block, depth = 2)]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+    /// The fire this build's tick panics on, if any. Set by the factory.
+    #[cerulion(reconstruct)]
+    panic_on_fire: Option<u32>,
+    fires: u32,
+}
+
+#[cerulion_node_impl]
+impl CtxPanickingSinkNode {
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.fires += 1;
+        let x = self.x.x;
+        assert!(
+            self.panic_on_fire != Some(self.fires),
+            "the sink's tick panics on this fire"
+        );
+        self.out.x = x;
+        Ok(())
+    }
+}
+
+const PS_YAML: &str = "name: psgraph\nprefix: ps\nnodes:\n\
+     \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: pacer\n    type: stopping_pacer_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: pace\n    type: relay_node\n    inputs:\n      - name: inp\n        source: pacer/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sink\n    type: ctx_panicking_sink_node\n    inputs:\n      - name: s\n        source: pace/out\n      - name: x\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+
+fn ps_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        ("pacer", Box::new(StoppingPacerNodeEntry::new())),
+        ("pace", Box::new(RelayNodeEntry::new())),
+        ("relay", Box::new(RelayNodeEntry::new())),
+        (
+            "sink",
+            Box::new(CtxPanickingSinkNodeEntry::with_state(
+                CtxPanickingSinkNode {
+                    panic_on_fire: Some(4),
+                    ..Default::default()
+                },
+            )),
+        ),
+    ])
+}
+
+/// A poisoned consumer's recorded stop alone releases its slot. The sink,
+/// triggered through `pace` by a pacer that stops after step 3, fires a level
+/// after the relay and reads the relay's frames through its context `block`
+/// input until its tick panics on its fourth fire, after the read (step 3):
+/// the bag holds an `EntryPoisoned` stop there, and with no trigger the sink
+/// fires no more. Then the relay's step 6
+/// fire and its frame are taken out. The slot is counted (one frame per fire,
+/// a pinned queue, no timeout, no read after the stop), and only the stop
+/// releases it: step 6 is the finding, where a slot left armed would count
+/// two frames there and excuse the step as the hold. The untampered bag
+/// replays with no divergence and every frame equal.
+#[test]
+#[serial]
+fn a_poisoned_consumers_recorded_stop_alone_releases_its_slot() {
+    let mut rec = record_uniform_with_read_log(PS_YAML, ps_factories, &[], 7);
+    assert_eq!(bh_fire_steps(&rec, "relay"), (0..7).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "sink"), (0..4).collect::<Vec<_>>());
+    assert_eq!(
+        rs_stops(&rec),
+        vec![
+            (
+                "sink".to_string(),
+                3,
+                u64::from(cerulion_core::scheduler::NodeStopCause::EntryPoisoned.code())
+            ),
+            (
+                "pacer".to_string(),
+                4,
+                u64::from(cerulion_core::scheduler::NodeStopCause::FatalError.code())
+            ),
+        ]
+    );
+    let one = |l: u32| std::collections::BTreeSet::from([l]);
+    let levels = nt_fire_levels(&rec);
+    assert_eq!(
+        (levels["relay"].clone(), levels["sink"].clone()),
+        (one(1), one(2))
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let healthy = dir.path().join("ps_healthy.mcap");
+    ri_bag_labelled(&rec, &healthy, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&healthy, ps_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        None
+    );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+
+    rs_drop_relay_fire(&mut rec, "/ps/relay/out", 6);
+    let short = dir.path().join("ps_short.mcap");
+    ri_bag_labelled(&rec, &short, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&short, ps_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.clone()),
+        Some(rs_finding(6))
+    );
+    assert!(!outcome.passed);
+}
+
+/// A driver that reads the relay's frames through the context `block` input
+/// `x` (depth 2) at every fire its device wakes, publishes what it read, and
+/// returns `NodeError::Fatal` on its build's `stop_tick`, after the read.
+#[cerulion_node(external)]
+#[derive(Default)]
+struct BlockDrvNode {
+    #[input(backpressure = block, depth = 2)]
+    x: Vector3,
+    #[output]
+    out: Vector3,
+    /// The tick this build stops at, if any.
+    #[cerulion(reconstruct)]
+    stop_tick: Option<u32>,
+    ticks: u32,
+}
+
+#[cerulion_node_impl]
+impl BlockDrvNode {
+    fn external_source(&mut self) -> ExternalSource {
+        panic!("a replay never queries a driver's external_source()")
+    }
+
+    fn tick(&mut self) -> Result<(), NodeError> {
+        self.ticks += 1;
+        let x = self.x.x;
+        if self.stop_tick == Some(self.ticks) {
+            return Err(NodeError::Fatal("the driver lost its device".to_string()));
+        }
+        self.out.x = x;
+        Ok(())
+    }
+}
+
+const BD_YAML: &str = "name: bdgraph\nprefix: bd\nlevel_assignments:\n  src: 0\n  relay: 1\n  drv: 2\nnodes:\n\
+     \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: relay_node\n    inputs:\n      - name: inp\n        source: src/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: drv\n    type: block_drv_node\n    inputs:\n      - name: x\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+
+fn bd_factories(stop_tick: Option<u32>) -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        ("relay", Box::new(RelayNodeEntry::new())),
+        (
+            "drv",
+            Box::new(BlockDrvNodeEntry::with_state(BlockDrvNode {
+                stop_tick,
+                ..Default::default()
+            })),
+        ),
+    ])
+}
+
+/// A driver consumer's recorded stop releases its slot, though a driver's
+/// stop is not compared. A driver wakes on no input, so only a graph's
+/// `level_assignments:` puts it a level after its producer, which a `block`
+/// edge needs to be counted. Woken before every step, the driver takes the
+/// relay's frames through its context `block` input until it stops on its
+/// fourth tick (step 3), after the read: its device was lost. Then the
+/// relay's last fire (step 6), and its frame, are taken out. Replayed with a build whose driver does not stop, only the
+/// recorded stop releases the slot: step 6 is the finding, where a slot left
+/// armed would count two frames there and excuse the step as the hold.
+#[test]
+#[serial]
+fn a_driver_consumers_recorded_stop_releases_its_slot() {
+    ri_take();
+    let mut rec = record_reference_impl_fed(
+        BD_YAML,
+        || bd_factories(Some(4)),
+        &[],
+        &[DELTA_MS; 7],
+        16,
+        true,
+        None,
+        &["drv"],
+    );
+    ri_take();
+    let stops = rs_stops(&rec);
+    assert_eq!(stops.len(), 1, "{stops:?}");
+    let (node, stop, cause) = stops[0].clone();
+    assert_eq!(
+        (node.as_str(), cause),
+        (
+            "drv",
+            u64::from(cerulion_core::scheduler::NodeStopCause::FatalError.code())
+        )
+    );
+    assert_eq!(
+        stop, 3,
+        "the driver stops on its fourth tick, three steps before the last"
+    );
+    assert_eq!(bh_fire_steps(&rec, "relay"), (0..7).collect::<Vec<_>>());
+    assert_eq!(bh_fire_steps(&rec, "drv"), (0..=stop).collect::<Vec<_>>());
+    let one = |l: u32| std::collections::BTreeSet::from([l]);
+    let levels = nt_fire_levels(&rec);
+    assert_eq!(
+        (levels["relay"].clone(), levels["drv"].clone()),
+        (one(1), one(2))
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let healthy = dir.path().join("bd_healthy.mcap");
+    ri_bag_labelled(&rec, &healthy, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&healthy, || bd_factories(None), bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        None
+    );
+
+    rs_drop_relay_fire(&mut rec, "/bd/relay/out", stop + 3);
+    let short = dir.path().join("bd_short.mcap");
+    ri_bag_labelled(&rec, &short, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&short, || bd_factories(None), bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.clone()),
+        Some(rs_finding(stop + 3))
+    );
+    assert!(!outcome.passed);
+}
+
 /// A relay nothing holds, on a bag that states its drain: its last fire is
 /// taken out, so its last step pops a frame and fires nothing. The finding is
 /// that step, and it carries no caveat.
