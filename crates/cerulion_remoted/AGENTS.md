@@ -13,7 +13,7 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
 - `PairingAuthorizer` gates accepts/verbs; unknown denies (`authorizer_matrix_test.rs`).
   Shell/exec: owner+policy; no file ON/invalid OFF; no handle: deny; immutable hard-off wins.
   Settings: validate first; either OFF wins.
-- Bootstrap verifies its proof (chassis secret/cert chain/owner grant/CPace witness). Pairing subject is TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
+- Bootstrap verifies chassis secret/cert chain/owner grant/CPace witness. Subject: TLS device key, never client arg; validity/TTL/rollback use RemotedClock.
 - `pair` takes ONE proof (`owner_certificate_postcard` or
   `presentation_postcard`); the versioned envelope rejects trailing bytes. Verify TLS
   key, owner, chain, scope, clocks and revocation, preserve the owner row, persist
@@ -28,14 +28,15 @@ One endpoint: public key=EndpointId, 32-byte pairing seed; wire/2+ops/1.
 - Pairing signing bytes use independent hand-serializer vectors (`format_vectors_test.rs`): change encoder AND oracle. Store bumps migrate or refuse loudly (v3 -> v4 migrates); epoch apply is monotonic wholesale-replace.
 - Rows keyed (account, device); one cloud predicate `TrustStore::cloud_allowed` ->
   `KeyAccess::CloudRefused` -> `authorizer::cloud_refusal` on every plane and verb.
-- `cerulion_link` framing is NOT cancel-safe: never `select!` on it, one dedicated
-  task per stream. connectd mirrors the robot protocol (no production remoted dep);
-  `protocol_parity_test.rs` gates parity: change both.
+- `cerulion_link` framing is NOT cancel-safe: never `select!` on it; one task per
+  stream. connectd mirrors robot protocol (no production remoted dep);
+  `protocol_parity_test.rs`: change both.
 - Sanitize/bound peer text at entry (`sanitize_peer_text`).
+- Audit verification: regular files, bounded lines; external witness required.
 - Desk keys: 32 raw bytes, `create_new`, 0600; NEVER overwrite.
   `~/.cerulion` secrets: `auth::atomic_write_secret`.
-  Epoch-cache resolution is homed in `cerulion_pairing::verify`: ONE resolver for the
-  writer and both desk readers, never hand-rolled (divergence stops revocations).
+  Epoch-cache resolver: `cerulion_pairing::verify`, ONE for writer and both
+  desk readers; never hand-roll (divergence stops revocations).
 - The revocation sweep runs on its OWN task and timer: assert the revocation stands
   and the peer ends evicted, never response ordering (`epoch_push_e2e_test.rs`).
 - Metadata: namespace-checked netd snapshots or `SchemaSource`; no startup.
