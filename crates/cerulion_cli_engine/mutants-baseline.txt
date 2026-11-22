@@ -199,6 +199,12 @@ in prepare_pass_verification
 #          mutants, 3 caught). The unviable one returns
 #          `Some(Default::default())` from `first_stop_disagreement`, and
 #          `StopDisagreement` has no default.
+#          Re-run on the lines a later change to `StopPoint::burst_at` (the
+#          fire position counted from 1) and `first_stop_disagreement` (each
+#          disagreement's rank) touched, with `-f src/replay_rederive.rs`,
+#          `--re 'StopPoint::|first_stop_disagreement'` and that change's diff
+#          (in 2 shards): 10 mutants, 9 caught, 1 unviable (the same
+#          `Some(Default::default())`), 0 missed.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
