@@ -3164,6 +3164,42 @@ fn test_trace_entry_partial_eq_ignores_duration_ns() {
 /// Two entries equal in `(node_id, fire_time_ns)` but differing ONLY in
 /// `global_level` must compare `!=` (proving inclusion); re-affirm that differing
 /// ONLY in `duration_ns` still compares `==` (exclusion holds alongside).
+/// `stop` is replay-deterministic (a fire's own outcome), so it is INCLUDED in
+/// `PartialEq`: two entries that differ only in their stop are different fires.
+#[test]
+fn test_trace_entry_partial_eq_includes_stop() {
+    let base = TraceEntry {
+        node_id: Arc::from("a"),
+        step: 2,
+        fire_time_ns: 30,
+        global_level: 0,
+        duration_ns: 5,
+        discarded: false,
+        stop: None,
+    };
+    for stop in [
+        cerulion_core::scheduler::NodeStopCause::FatalError,
+        cerulion_core::scheduler::NodeStopCause::EntryPoisoned,
+        cerulion_core::scheduler::NodeStopCause::DisabledAfterPanics,
+    ] {
+        let stopped = TraceEntry {
+            stop: Some(stop),
+            ..base.clone()
+        };
+        assert_ne!(base, stopped, "{stop:?}");
+        assert_eq!(stopped, stopped.clone());
+    }
+    let fatal = TraceEntry {
+        stop: Some(cerulion_core::scheduler::NodeStopCause::FatalError),
+        ..base.clone()
+    };
+    let poisoned = TraceEntry {
+        stop: Some(cerulion_core::scheduler::NodeStopCause::EntryPoisoned),
+        ..base.clone()
+    };
+    assert_ne!(fatal, poisoned, "two causes are two fires");
+}
+
 #[test]
 fn test_trace_entry_partial_eq_includes_global_level() {
     let base = TraceEntry {

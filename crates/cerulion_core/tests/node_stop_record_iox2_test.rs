@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The NODE-STOP trace record (kind 7, `trace_format` 11) at each site that
+//! The NODE-STOP trace record (kind 7, `trace_format` 12) at each site that
 //! stops a node.
 //!
 //! Each arm records a small graph through `GraphRuntime::build_for_test` (or a
@@ -416,6 +416,12 @@ fn the_parallel_merge_keeps_a_stop_record_directly_after_its_fire() {
         "fast_fatal_at_fourth",
         Box::new(FastFatalAtFourthEntry::new()),
     ));
+    // The level is 17 fires wide, at or past the threshold at which a level
+    // fires on the parallel path.
+    assert!(
+        SOURCES.len() + 1 >= GraphRuntime::parallel_fire_threshold(),
+        "the level is wide enough to take the parallel path"
+    );
     let records = record("parallel", members, 3, |_, _| {});
     let mut oracle = Vec::new();
     for k in 0..3u64 {

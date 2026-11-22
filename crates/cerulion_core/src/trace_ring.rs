@@ -92,7 +92,7 @@ pub const RECORD_TYPE_STEP_BOUNDARY: u32 = 3;
 ///   ring; `bagd` co-stamps the ring's header rank uniformly at drain time).
 pub const RECORD_TYPE_READ_OUTCOME: u32 = 6;
 
-/// Record kind: the fire that STOPPED a node (`trace_format` 11). Pushed on
+/// Record kind: the fire that STOPPED a node (`trace_format` 12). Pushed on
 /// the node's ring directly after that fire's FIRE record, so the stop's
 /// position among the node's fires of the step is the number of the node's
 /// FIRE records of that step up to and including the one before it. The
@@ -618,9 +618,11 @@ pub enum TraceRecordFault {
         record_type: u32,
     },
     /// A NODE-STOP record whose cause code names no
-    /// [`NodeStopCause`](crate::scheduler::NodeStopCause): a corrupt record,
-    /// since a cause a later writer adds comes with a `trace_format` this
-    /// build refuses first.
+    /// [`NodeStopCause`](crate::scheduler::NodeStopCause) this build defines:
+    /// a cause a newer or foreign writer added, or a corrupt record. The
+    /// record walk runs before the version gate, so a newer writer's cause can
+    /// reach this check first, and the sentence names the newer writer and
+    /// says to upgrade, as [`Self::UnsupportedRecordType`]'s does.
     UnknownStopCause {
         /// The record's rank.
         rank: u32,
@@ -662,7 +664,8 @@ impl TraceRecordFault {
             ),
             Self::UnknownStopCause { rank, code } => format!(
                 "a scheduler-trace NODE-STOP record of rank {rank} carries stop cause {code}, \
-                 which names no cause this Cerulion version defines, so the trace is corrupt"
+                 which this Cerulion version does not define; the trace was written by a newer or \
+                 foreign writer, so upgrade cerulion to replay it"
             ),
             Self::ZeroedRecord => {
                 "a scheduler-trace record has record_type 0 — an invalid (zeroed) record, so \
@@ -870,8 +873,9 @@ pub struct TraceRingRecord {
     /// outcome_kind:14)` word ([`pack_read_outcome_meta`]).
     pub global_level: u32,
     /// One of [`RECORD_TYPE_FIRE`] / [`RECORD_TYPE_DEPARTURE`] /
-    /// [`RECORD_TYPE_STEP_BOUNDARY`] / [`RECORD_TYPE_READ_OUTCOME`]
-    /// (0 invalid; 4/5 reserved for keyframe/nondeterminism; 7+ reserved).
+    /// [`RECORD_TYPE_STEP_BOUNDARY`] / [`RECORD_TYPE_READ_OUTCOME`] /
+    /// [`RECORD_TYPE_NODE_STOP`] (0 invalid; 4/5 reserved for
+    /// keyframe/nondeterminism; 8+ reserved).
     pub record_type: u32,
     /// 0 at mint — except a discard-marked FIRE, whose bit 31 carries
     /// [`TRACE_DISCARD_BIT`]. bagd co-stamps the owning worker
@@ -2814,8 +2818,9 @@ mod tests {
         assert_eq!(trace_record_noun(RECORD_TYPE_NODE_STOP), "NODE-STOP");
         assert_eq!(
             TraceRecordFault::UnknownStopCause { rank: 1, code: 9 }.detail(),
-            "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which names no \
-             cause this Cerulion version defines, so the trace is corrupt"
+            "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which this \
+             Cerulion version does not define; the trace was written by a newer or foreign \
+             writer, so upgrade cerulion to replay it"
         );
         for kind in [4u32, 5, 8, u32::MAX] {
             let rec = TraceRingRecord {
@@ -3144,7 +3149,8 @@ mod tests {
     #[test]
     fn annotation_kinds_live_in_the_outcome_space_not_the_record_space() {
         // The RECORD type is unchanged — a format-3 reader's `record_type`
-        // gate (kinds >= 7 are UnsupportedRecordType) never sees them.
+        // gate (kinds 4, 5 and from 8 on are UnsupportedRecordType; a format-3
+        // reader's gate refuses 7 too) never sees them.
         assert_eq!(
             TraceRingRecord::read_outcome_truncated(1, 0, 0, 3, ReadSiteRole::Drain).record_type,
             RECORD_TYPE_READ_OUTCOME
