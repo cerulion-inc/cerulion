@@ -19164,7 +19164,9 @@ impl GraphRuntime {
     /// ONE item per consumer edge in build order, allocating nothing (the
     /// strings are borrowed from the retained records), so a per-fire
     /// conservation assert is cheap. Empty for a graph that declares no `block`
-    /// input.
+    /// input. A `block` input a replay feeds from its recording
+    /// ([`crate::replay_feed::BagFedBlockEdges`]) has no in-graph producer and
+    /// no credit binding, so it has no item here.
     pub fn block_credits(&self) -> impl Iterator<Item = BlockCredit<'_>> + '_ {
         self.block_credit_edges.iter().map(|e| BlockCredit {
             topic: e.topic.as_str(),

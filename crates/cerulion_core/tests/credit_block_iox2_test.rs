@@ -5112,7 +5112,7 @@ fn overfill_input(
 /// the same build, which no entry names, keeps its `drop_oldest` probe and
 /// counts the three evictions, so the fed input alone lost its probe.
 ///
-/// The staged reads are written by hand. Frame `n` carries wire sequence
+/// The staged reads follow from these rules. Frame `n` carries wire sequence
 /// `n - 1`, and the topic has no producer in the build, so every read stages
 /// a `Producer` annotation (its read's sequence, popped 0) before it. A
 /// latest-value read serves its newest frame and stages each other frame it

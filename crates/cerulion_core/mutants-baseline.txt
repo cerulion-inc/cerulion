@@ -1,11 +1,13 @@
 # Mutation baseline for cerulion_core: the ROS IDL parser decision functions,
 # the live loop's wait sizing, its period-park decisions, the framework-section
-# codec and the capture judge's frame check.
+# codec, the capture judge's frame check and the replay-fed `block` edge
+# checks.
 #
 # Scope: the two pure parser files, the pure wait-sizing and period-park
 # functions named below, the framework-section codec in state_restore.rs (its
 # changed lines), the three frame-check functions in flashback/resim.rs named
-# below, and the oracle mutants listed below, each on one pure decision
+# below, the replay-fed `block` edge checks named below (their changed lines),
+# and the oracle mutants listed below, each on one pure decision
 # function. The rest of the crate holds transport and scheduler paths that the
 # mutation rule does not cover.
 #
@@ -82,9 +84,9 @@
 # `flashback::resim::tests::the_first_named_frame_the_capture_does_not_hold_is_the_gap`
 # hold its sort; its dedup changes no answer `first_frame_gap` gives.
 #
-# Replay-fed `block` edges: `BagFedBlockEdges::{new, is_empty, iter,
-# resolve}` and `BagFedEnds::{feeds_consumer, held_producers}` in
-# replay_feed.rs, the fed exemption in
+# Replay-fed `block` edges: `BagFedBlockEdges::{is_empty, iter, resolve}` and
+# `BagFedEnds::{feeds_consumer, held_producers}` in replay_feed.rs (`new` yields
+# no mutant: cargo-mutants skips every method named `new`), the fed exemption in
 # `GraphTopology::validate_with_credit_edges`, and the fed-edge mark read by
 # `Scheduler::set_replay_trailing_refills`, run on the changed lines only:
 #
@@ -102,6 +104,16 @@
 #          now pinned by
 #          `replay_feed::bag_fed_block_edge_tests::an_entry_a_credit_binding_of_the_build_names_is_refused`.
 #          Re-run over the five (--iterate): 5 mutants, 5 caught, 0 missed.
+#          No mutant removes a whole check, since a whole-body replacement of a
+#          `TransportResult` function does not compile. Each whole check is
+#          pinned by a named test instead: `resolve`'s refusals by
+#          `replay_feed::bag_fed_block_edge_tests::an_entry_whose_both_ends_this_build_holds_is_refused`,
+#          the fed exemption in `validate_with_credit_edges` by
+#          `replay_feed::bag_fed_block_edge_tests::a_consumer_end_is_exempt_from_the_producer_less_refusal`,
+#          the mark by
+#          `scheduler::tests::a_marked_node_below_the_cap_drives_its_trailing_refill`,
+#          and the `run_live` refusal by
+#          `credit_block_iox2_test::run_live_refuses_a_runtime_built_to_feed_a_block_edge`.
 #
 # Oracle mutants: seeded faults built with `--features oracle-mutants` and
 # armed by `CERULION_ORACLE_MUTANT=<name>`. A run with the variable must fail
