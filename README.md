@@ -43,17 +43,17 @@ A real episode, scored solved by the benchmark's own check. Claude Opus 5.5 solv
 
 | You use | What Cerulion adds |
 |---|---|
-| rosbag2, which records topics and plays them back | A [replay check](#try-the-runtime) re-executes your native Cerulion nodes on a recording and compares their outputs. A difference exits 1, so CI can stop the change. |
+| rosbag2, which records topics and plays them back | A [replay check](#try-the-runtime) re-executes your native Cerulion nodes on a recording and compares their outputs. An output difference exits 1 and a schedule divergence exits 6, so a CI runner that is signed in can stop the change. |
 | A ROS 2 middleware, such as `rmw_fastrtps_cpp` or `rmw_zenoh_cpp` | `rmw_cerulion` is a ROS 2 middleware too, so stock nodes run on it unchanged. Native nodes add typed inputs and outputs in loaned shared memory, always-on recording and replay. |
-| iceoryx2 or zenoh directly | Cerulion is built on iceoryx2 for shared memory and zenoh between machines, and adds nodes, scheduling and recording. At 64 B on one desktop, raw iceoryx2 reads 2.42 µs / 3.02 µs (p50 / p99), and native Cerulion reads 4.07 µs / 6.61 µs ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md)). |
+| iceoryx2 or zenoh directly | Cerulion is built on iceoryx2 for shared memory, and adds nodes, scheduling and recording. Between machines, account and paired access uses iroh, directly or through a relay, and zenoh carries only explicit open LAN access ([networking](docs/networking.md)). At 64 B on one desktop, raw iceoryx2 reads 2.42 µs / 3.02 µs (p50 / p99), and native Cerulion reads 4.07 µs / 6.61 µs ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md)). |
 
 <a id="quickstart"></a>
 
 ## Install
 
-Cerulion runs on Linux (x86_64 or ARM64, glibc 2.31 or later, such as Ubuntu 20.04) and macOS (Intel or Apple silicon).
+Cerulion runs on Linux (x86_64 or ARM64, glibc 2.31 or later, such as Ubuntu 20.04) and macOS (Intel or Apple silicon). The install command needs `curl`.
 
-The install script checks the release's SHA-256, puts the programs in `~/.cerulion/bin`, links them into `~/.local/bin`, adds one line to your shell startup files and adds Rust through rustup when yours is missing, or is older than 1.95 and rustup is installed. Release builds send coarse usage events, with your account id after sign-in. To opt out, run `export DO_NOT_TRACK=1` before your first command ([what the events carry](docs/telemetry.md)).
+The install script checks the release's SHA-256, puts the programs in `~/.cerulion/bin`, links them into `~/.local/bin`, adds one line to your shell startup files and adds Rust through rustup when yours is missing, or is older than 1.95 and rustup is installed. Release builds send coarse usage events, with your account id after sign-in (a CI run sends under a random id). To opt out, run `export DO_NOT_TRACK=1` before your first command ([what the events carry](docs/telemetry.md)).
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cerulion-inc/cerulion/main/tools/scripts/install.sh | sh && . "$HOME/.cerulion/env"
@@ -98,7 +98,7 @@ sh install.sh --uninstall
 
 An uninstall removes the programs and keeps your sign-in, settings, each harness copy (about 4 GB) and Rust ([Uninstall](docs/install.md#uninstall)).
 
-A usage event carries coarse fields, such as the command's name, its exit code and a duration bucket. It never carries arguments, paths or message contents. Its id is a random one until this machine signs in, and your account id after that. `cerulion telemetry off` stops the events, and a `--network off` run sends none ([every event and field](docs/telemetry.md)).
+A usage event carries coarse fields, such as the command's name, its exit code and a duration bucket. It never carries arguments, paths or message contents. Its id is a random one until this machine signs in, and your account id after that. A run under CI always sends under its own random id. `cerulion telemetry off` saves the choice in your consent file, `DO_NOT_TRACK=1` or `CERULION_TELEMETRY=0` turns events off for one shell, and the [first setting in this order](docs/telemetry.md#turning-it-off) wins. A `--network off` run sends none ([every event and field](docs/telemetry.md)).
 
 </details>
 
@@ -167,7 +167,7 @@ One line ends in `librmw_cerulion.so`. In the container run below, the output wa
 /root/.cerulion/bin/librmw_cerulion.so
 ```
 
-A stock `ros2 run demo_nodes_cpp listener` shows `librmw_fastrtps_cpp.so` in the same check. Stop both nodes with Ctrl+C.
+In a default Jazzy environment, a plain `ros2 run demo_nodes_cpp listener` shows `librmw_fastrtps_cpp.so` in the same check. Stop both nodes with Ctrl+C.
 
 <a id="no-linux-ros-2-machine"></a>
 
@@ -202,10 +202,11 @@ From a third terminal, run the check from step 3 in the container:
 docker exec readme-ros2-trial sh -c 'grep -o "/.*librmw_.*" /proc/$(pgrep -n -x listener)/maps | sort -u'
 ```
 
-Expected output, from a run on arm64. Near its end, the installer prints:
+Expected output, from a run on arm64. Near its end, the installer prints these lines (`...` marks lines left out):
 
 ```text
 Installed Cerulion v2.1.0 for aarch64-unknown-linux-gnu into /root/.cerulion/bin
+...
 The ROS 2 Jazzy rmw (librmw_cerulion.so) is installed beside the CLI for cerulion ros2 run and launch
 ```
 
@@ -230,7 +231,7 @@ This trial shows delivery over `rmw_cerulion`, not latency. [Latency](#latency) 
 - `cerulion topic list` shows the topics after you sign in. `ros2 topic list` and rqt do not.
 - Zero-copy needs the publisher to loan each message and the subscriber to take loaned ones. Jazzy lets a subscriber take loans only with `ROS_DISABLE_LOANED_MESSAGES=0`. Without loans, `rmw_cerulion` copies, and a loaned variable-size message can still copy some members, such as strings ([ROS 2 guide](https://docs.cerulion.com/cerulion/guides/bridge-ros2)).
 - SROS2 is not supported. `ROS_SECURITY_ENABLE=true` does not secure a Cerulion transport, so keep a stack that needs SROS2 on its current middleware.
-- `cerulion ros2 run` can also replay one recorded ROS 2 process against the deliveries it recorded. A replayed process still drives the devices it writes to, so read the limits and safety rules in [ROS 2 replay](docs/ros2_replay.md) first.
+- `cerulion ros2 run` can also replay one recorded ROS 2 process against the deliveries it recorded. A replayed process really sends on its recorded topics and services, and it still drives the devices it writes to, so read the limits and safety rules in [ROS 2 replay](docs/ros2_replay.md) first.
 
 </details>
 
@@ -240,7 +241,7 @@ Next: [the `cerulion ros2` commands](docs/ros2_compatibility.md#start-inspect-br
 
 Record a small robot program, replay it, then change one constant and see which output changed. You need no robot, simulator or ROS 2.
 
-**Before you start.** [Install Cerulion](#install). You also need a free Cerulion account and a C toolchain: `sudo apt-get install -y build-essential` on Debian or Ubuntu, or `xcode-select --install` on macOS.
+**Before you start.** [Install Cerulion](#install). You also need a free Cerulion account and a C toolchain: `sudo apt-get install -y curl git build-essential` on Debian or Ubuntu, or `xcode-select --install` on macOS.
 
 ![A terminal creates the starter, records a run, gets replay PASS, changes the controller and gets a divergence on the same recording.](docs/media/quickstart-record-verify.gif)
 
@@ -262,7 +263,7 @@ It prints a URL and a short code. Open the URL in a browser on any device, sign 
 <summary>What sign-in stores and sends, and the commands that skip it</summary>
 
 - **What stays on this machine.** `~/.cerulion/auth.json` holds your account id and session. `~/.cerulion/identity/device.key` is this machine's key, which lets the robots on your account admit it with no addresses to set.
-- **No network after that.** From then on, the account check reads that file and needs no network. The first node build and the first simulator start still download what they need.
+- **The account check is local after that.** From then on, the account check reads that file and needs no network. Telemetry, when it is on, and commands that reach other machines still use the network, and the first node build and the first simulator start download what they need.
 - **What the first sign-in links.** With telemetry on, a machine's first sign-in links its earlier usage events, sent under a random id, to your account. With telemetry off, it links nothing ([Usage telemetry](docs/telemetry.md)).
 - **Commands that skip the sign-in.** `doctor`, `telemetry`, `completions`, `ros2 run` and `ros2 launch`, among others ([full list](docs/user-api.md#cerulion-connect--rcp--login--logout--account)).
 
@@ -324,7 +325,7 @@ FRAME-CONTENT DIVERGENCE: recordings/obstacle_avoidance_<time>.mcap
   Topics passed: 1/2
 ```
 
-It exits 1 and names the topic, the field and both values: on the same sensor inputs, the changed controller commands a different speed. In CI, that exit code stops the change before it reaches a robot. [Bags and replay](docs/bag.md) explains every exit code and verdict line, and `--tolerance` for inexact data.
+It exits 1 and names the topic, the field and both values: on the same sensor inputs, the changed controller commands a different speed. In CI, that exit code stops the change before it reaches a robot. The CI runner must be a signed-in machine, because a gated command refuses on a machine that never signed in, and `cerulion login` is a device-code sign-in ([`cerulion login`](docs/user-api.md#cerulion-connect--rcp--login--logout--account)). [Bags and replay](docs/bag.md) explains every exit code and verdict line, and `--tolerance` for inexact data.
 
 **Before you replay your own nodes.** The starter's nodes touch no hardware. A replay re-executes your node, so a node that drives hardware or another network directly still does so during the replay. Replay such a node only where its devices are safe to drive or disconnected ([Bags and replay](docs/bag.md#playback-vs-re-simulation-two-modes-of-one-verb)).
 
