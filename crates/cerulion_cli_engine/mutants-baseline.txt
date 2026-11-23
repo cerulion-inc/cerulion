@@ -332,6 +332,27 @@ in prepare_pass_verification
 #          `--re 'SlotBound::step|fires_ended_before|consumer_reads_before'`:
 #          29 mutants, 28 caught, 1 unviable, which replaces
 #          `consumer_reads_before` with a value its type does not have.
+#          Re-run over the change that counts a slot only on a bag whose
+#          trace holds its node stops, holds a slot that counts past its
+#          depth to nothing from there, counts no slot whose producer writes
+#          more frames at a stamp than it fired at that stamp, releases a
+#          slot at a consumer stop only where the stop releases it live, and
+#          keeps one pending excuse per set of slots, in 6 shards, with
+#          `--re 'writes_past_fires|StopPoint::|PassStops::|SlotBound::|FifoDeferral::|FifoCarry::|FindingCaveat|verify_fifo|local_block_holds'`
+#          (shards 1/6 to 5/6 with `--baseline skip --build-timeout 600
+#          --timeout 120`, the unmutated baseline having passed in 0/6):
+#          78 mutants: 69 caught, 5 unviable, 4 timed out, none missed. Three
+#          of the 4 never end a loop: `==` replaced with `!=` where
+#          `writes_past_fires` counts the frames at a stamp, and `+=` with
+#          `*=` where `writes_past_fires` and `FifoCarry::settle_excuses` step
+#          their index. The fourth, `==` replaced with `!=` where
+#          `FifoCarry::settle_excuses` compares two excuses' slots, keeps every
+#          excuse, which the pending-length vector fails on, while the
+#          10003-step vector's settling grows with the list and does not
+#          finish. The 5 unviable replace `local_block_holds` (twice) with a
+#          map of an edge its type cannot default, and `FifoDeferral::step`,
+#          `FifoCarry::step` and `FifoCarry::settle_excuses` with a value
+#          their types do not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
