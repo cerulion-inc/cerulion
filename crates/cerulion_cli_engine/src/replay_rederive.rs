@@ -11541,6 +11541,56 @@ mod tests {
         );
     }
 
+    /// A hold that lasts with no read of its slot keeps one pending excuse,
+    /// whatever its length: excuses with the same slots settle together, so
+    /// only the first held step's stays. Depth 2 on a FIFO input, as `(step,
+    /// relay pops, relay fires)`: the sink takes the step 0 frame, the relay
+    /// fills the slot at steps 1 and 2, pops a frame at step 3 that it keeps
+    /// unfired through step 1002, and the sink never reads again. After each
+    /// of steps 0 to 2 nothing is pending; after each step from 3 on, step 3's
+    /// excuse alone is.
+    #[test]
+    fn a_hold_with_no_read_keeps_one_pending_excuse_however_long_it_lasts() {
+        const LAST: u64 = 1_002;
+        let mut rows: Vec<(u64, u32, u32)> = vec![(0, 1, 1), (1, 1, 1), (2, 1, 1), (3, 1, 0)];
+        rows.extend((4..=LAST).map(|n| (n, 0, 0)));
+        let steps: Vec<RecordedStep> = rows
+            .iter()
+            .map(|&(n, pops, fires)| {
+                if n == 0 {
+                    fifo_step(n, 0, &[("relay", pops, fires, 0), ("sink", 0, 1, 1)])
+                } else {
+                    fifo_step(n, n * 1_000, &[("relay", pops, fires, 0)])
+                }
+            })
+            .collect();
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let mut carry = FifoCarry::new(&decls[0], FifoDrain::Unified, false, &PassStops::none());
+        for (at, (step, &(n, pops, fires))) in steps.iter().zip(&rows).enumerate() {
+            let next_clock_ns = steps.get(at + 1).map(|s| s.clock_ns);
+            let fired: Vec<(&str, u64)> = step
+                .fires
+                .iter()
+                .map(|f| (f.node_id.as_str(), f.fire_time_ns))
+                .collect();
+            let judged = carry.step(
+                pops,
+                fires,
+                n,
+                step.clock_ns,
+                next_clock_ns,
+                &fired,
+                &step.reads,
+                STAMPED,
+            );
+            assert!(judged.outcome.is_ok(), "step {n}: {:?}", judged.outcome);
+            assert_eq!(judged.voided, None, "step {n}");
+            let pending: Vec<u64> = carry.pending.iter().map(|e| e.step).collect();
+            let expected: &[u64] = if n >= 3 { &[3] } else { &[] };
+            assert_eq!(pending, expected, "pending after step {n}");
+        }
+    }
+
     /// A slot its consumer's stop has released counts past its depth after the
     /// stop with nothing wrong: the same steps with the sink stopped by a
     /// fatal error at its step 3 fire, which returned before it read the input
