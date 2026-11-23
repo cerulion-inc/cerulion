@@ -32,6 +32,10 @@ Figure style: GitHub README typography, the in-plot mark key, filled p50 dots, p
 floors recorded and not drawn, all ten payload sizes labelled, "lower is better" after the title
 in the brand blue, the p50 at the last payload printed at the right end of every line in the
 series colour, no rate strip.
+
+Printed figures: every p50 the figure prints (the line-end values and the Mac footnote range) is
+spelled as its package's HEADLINE.md prints it, microseconds to two decimals and milliseconds to
+one, and the script asserts each one against the p50 cell of that package's row before it draws.
 """
 from __future__ import annotations
 import csv
@@ -74,6 +78,7 @@ HEROES_STOCK_ROS2_CELL = 'jazzy_stock_rclcpp_chrt0'
 JETSON = RESULTS/'9b0c5fbf0f55dea4-2026-09-17-fixed100-jetson-orin-nx'
 MAC = RESULTS/'446db2afb7d26dbc-2026-11-13-fixed100-apple-m4'
 MAC_BUILD, MAC_OS = 'Cerulion 2.0.0', 'macOS 27.2.1'
+JETSON_OS = 'Linux for Tegra R36.4.3'
 EXPECTED_SIZES = [64,256,1024,4096,16384,65536,262144,1048576,4194304,16777216]
 SIZE_LABELS = ['64 B','256 B','1 KiB','4 KiB','16 KiB','64 KiB','256 KiB','1 MiB','4 MiB','16 MiB']
 COLORS = dict(multi='#2563EB', single='#089D9E', stock='#D36B26', composed='#74708C', zenoh='#B58900',
@@ -305,10 +310,11 @@ jetson_floor=floor_row_p50_range(JETSON/'results_iox2_chrt0.csv')
 assert not (MAC/'results_iox2_chrt0.csv').exists(), 'Mac package carries a raw iceoryx2 row: cite its floor like the Jetson one'
 assert all(t in (MAC/'PROVENANCE.txt').read_text() for t in (MAC_BUILD,MAC_OS)), 'Mac footnote build or OS missing from the package provenance'
 record_source(MAC/'PROVENANCE.txt',role='Mac build and OS named in the platform footnote')
+assert all(t in (JETSON/'HEADLINE.md').read_text() for t in (JETSON_OS,'schedutil governor')), 'Jetson footnote OS or governor missing from the package headline'
+assert "schedutil IS this Jetson's stock governor" in (JETSON/'PROVENANCE.txt').read_text(), 'Jetson footnote: the package no longer calls schedutil the stock governor'
+record_source(JETSON/'PROVENANCE.txt',role='Jetson OS and governor named in the platform footnote')
 
 def us(ns): return ns/1000
-def fmt_range_us(values_ns):
-    return f'{us(min(values_ns)):.2f} to {us(max(values_ns)):.2f} µs'
 def date_of(package_dir):
     m=re.search(r'(\d{4}-\d{2}-\d{2})',package_dir.name); return m.group(1)
 
@@ -364,8 +370,39 @@ def latency_axis(ax, ymin, ymax, ticks):
     ax.set_ylabel('Round-trip latency',labelpad=12)
 
 def fmt_value(ns):
+    """A p50 as the packages' HEADLINE.md prints it: microseconds to two decimals, milliseconds to one."""
     v=ns/1000
-    return f'{v/1000:.3g} ms' if v>=1000 else f'{v:.3g} µs'
+    return f'{v/1000:.1f} ms' if v>=1000 else f'{v:.2f} µs'
+
+# The HEADLINE.md cell name of each CSV cell, for the printed-figure assertion below.
+HEADLINE_CELLS={'cerulion_workspace_split':'Cerulion split','cerulion_workspace_mono':'Cerulion mono',
+                'jazzy_stock_rclcpp':'stock ROS 2','jazzy_composed_ipcon_rclcpp':'ROS 2 composed+IPC',
+                'zenoh_shm':'zenoh SHM','jazzy_cerulion_shm_loan_be1':'ROS 2 over rmw_cerulion (loan)'}
+def printed_p50(series, payload_bytes):
+    """The p50 of `series` at `payload_bytes`, spelled by fmt_value, asserted to be the p50 cell its package's
+    HEADLINE.md prints for that cell and size: a row `| cell | size | p50 |`, or `| size | p50 |` under a
+    `## cell` heading. A figure on a chart is a figure the package prints."""
+    point=next(p for p in series['points'] if p['payload_bytes']==payload_bytes)
+    label=fmt_value(point['p50_ns'])
+    csv_path=SOURCE/series['source']
+    cell=HEADLINE_CELLS[re.fullmatch(r'results_(.+)_chrt0\.csv',csv_path.name).group(1)]
+    package=next(d for d in csv_path.parents if (d/'HEADLINE.md').exists())
+    headline=(package/'HEADLINE.md').read_text()
+    size=SIZE_LABELS[EXPECTED_SIZES.index(payload_bytes)]
+    in_row=f'| {cell} | {size} | {label} |' in headline
+    in_section=any(sec.startswith(cell) and f'\n| {size} | {label} |' in sec for sec in headline.split('\n## ')[1:])
+    assert in_row or in_section, f'{package.name}/HEADLINE.md prints no p50 {label} for {cell} at {size}'
+    record_source(package/'HEADLINE.md',role='prints every p50 the figures print')
+    return label
+def end_label_entries(series_list, colors):
+    return [(us(s['points'][-1]['p50_ns']),c,printed_p50(s,s['points'][-1]['payload_bytes']))
+            for s,c in zip(series_list,colors,strict=True)]
+def printed_range(series):
+    """'lo to hi µs' over the series' p50s, each end a p50 its package prints."""
+    lo=min(series['points'],key=lambda p:p['p50_ns']); hi=max(series['points'],key=lambda p:p['p50_ns'])
+    a,b=printed_p50(series,lo['payload_bytes']),printed_p50(series,hi['payload_bytes'])
+    assert a.endswith(' µs') and b.endswith(' µs'), (a,b)
+    return f'{a[:-3]} to {b}'
 
 def curve(ax, series, label, color, linestyle='-', zorder=3):
     """Band p50..p99, line through the p50s, filled p50 dot. The per-point floor is
@@ -695,7 +732,7 @@ for i,(series,label,color,style) in enumerate(zip(main_series,labels+[rmw_on_mai
     series['display_label']=label
     curve(ax,series,label,color,linestyle=style,zorder=10-i)
 payload_axis(ax,strip);latency_axis(ax,1,300000,[1,10,100,1000,10000,100000])
-ends=end_labels(ax,[(us(s['points'][-1]['p50_ns']),c,fmt_value(s['points'][-1]['p50_ns'])) for s,c in zip(main_series,main_colors,strict=True)])
+ends=end_labels(ax,end_label_entries(main_series,main_colors))
 series_legend(fig,height_pt,legend_top,*ax.get_legend_handles_labels(),ncol=2,columnspacing=2.2)
 key=draw_key(fig,height_pt,key_top)
 foot_lines=footer(fig,height_pt,foot)
@@ -738,9 +775,9 @@ def signed_range(values):
     return f'{lo:.1f} to {hi:.1f} µs above'
 foot=[
     'Commanded 100 Hz; five sessions, 10,000 samples per point. Always-on recording included. Payload fill excluded.',
-    'Jetson: NV Power Mode 40 W, governor schedutil, CPU clock capped at 1.4976 GHz (hardware max 1.984 GHz).',
+    f'Jetson: {JETSON_OS}, governor schedutil, the stock governor of the Jetson.',
     f'Mac: {MAC_BUILD} on {MAC_OS}, measured {mac_date}, a later build than the x86-64 and Jetson rows. A multi-process consumer wakes on the publish. '
-    f'Multi-process p50 {fmt_range_us(p50s(mac_split))}, single-process p50 {fmt_range_us(p50s(mac_mono))}.',
+    f'Multi-process p50 {printed_range(mac_split)}, single-process p50 {printed_range(mac_mono)}.',
 ]
 strip_pt=0
 legend_top,key_top,top_pt=header_height(len(subtitle),legend_rows=2)
@@ -751,7 +788,7 @@ for i,(series,color,style) in enumerate(zip(platforms,six_colors,six_styles,stri
 pl_floor=min(us(f['floor_ns']) for s_ in platforms for f in s_['v5']['floor'])
 ymin_pl=1.5 if pl_floor>=1.7 else 1
 payload_axis(ax,strip);latency_axis(ax,ymin_pl,300,[t for t in (1,2,3,10,30,100,300) if t>=ymin_pl])
-ends=end_labels(ax,[(us(s['points'][-1]['p50_ns']),c,fmt_value(s['points'][-1]['p50_ns'])) for s,c in zip(platforms,six_colors,strict=True)])
+ends=end_labels(ax,end_label_entries(platforms,six_colors))
 platform_handles=[Line2D([],[],color=c,lw=2.2,marker='o',markersize=6.4,markerfacecolor=c,markeredgecolor='white',markeredgewidth=.9) for c in platform_colors]
 shape_handles=[Line2D([],[],color=KEY_INK,lw=2.2,linestyle=s) for s in (DASH['solid'],DASH['dashed'])]
 series_legend(fig,height_pt,legend_top,platform_handles,platform_names,ncol=3,columnspacing=2.2)
@@ -765,7 +802,7 @@ save(fig,'platform-rtt',platforms,{'title':'Native Cerulion on three platforms',
     'platform_of_series':[{'series':i,'platform':platform_names[i//2],'shape':platforms[i]['display_label'],'colour':six_colors[i],'style':str(six_styles[i])} for i in range(6)],
     'footnote_numbers_read':{'jetson_floor_p50_ns':jetson_floor,'x86_floor_p50_ns':x86_floor,'jetson_elevation_ns':jet_elev,'x86_elevation_ns':x86_elev,
                              'mac_split_p50_ns':p50s(mac_split),'mac_mono_p50_ns':p50s(mac_mono),'mixed_cells':mixed_cells,
-                             'jetson_machine_configuration_source':'the footnote: machine configuration recorded after the campaign, not a measured latency'},
+                             'jetson_configuration_source':'the footnote: the OS and governor the package HEADLINE.md and PROVENANCE.txt print, not a measured latency'},
     'subtitle':subtitle,'footnote_lines':foot_lines,
 },{'mark_key':key,'end_labels':ends})
 

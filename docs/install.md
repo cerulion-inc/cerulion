@@ -1,6 +1,6 @@
 # Installation details
 
-The [README](../README.md#install) has the commands for every route. This page holds the rest: what the installer does to your machine, how the Rust compiler is provisioned on each route, and the cases where a node build needs care.
+The [README](../README.md#install) has the commands for the install script, Homebrew and crates.io, and [APT installation](packaging/apt.md#apt-installation) has the Debian and Ubuntu recipe. This page holds the rest: what the installer does to your machine, how the Rust compiler is provisioned on each route, and the cases where a node build needs care.
 
 ## What the install script does
 

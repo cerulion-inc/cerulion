@@ -246,22 +246,22 @@ L 847.08 522
 " style="fill: none; stroke: #ccd7e3; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="native-rtt-end-label:0">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #089d9e" x="836.408567" y="502.863812" transform="rotate(-0 836.408567 502.863812)">2.8 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #089d9e" x="836.408567" y="502.863812" transform="rotate(-0 836.408567 502.863812)">2.80 µs</text>
    </g>
    <g id="native-rtt-end-label:1">
     <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #2563eb" x="836.408567" y="487.863812" transform="rotate(-0 836.408567 487.863812)">4.43 µs</text>
    </g>
    <g id="native-rtt-end-label:2">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #a21caf" x="836.408567" y="457.282105" transform="rotate(-0 836.408567 457.282105)">17.5 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #a21caf" x="836.408567" y="457.282105" transform="rotate(-0 836.408567 457.282105)">17.47 µs</text>
    </g>
    <g id="native-rtt-end-label:3">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #74708c" x="836.408567" y="441.86073" transform="rotate(-0 836.408567 441.86073)">33.4 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #74708c" x="836.408567" y="441.86073" transform="rotate(-0 836.408567 441.86073)">33.41 µs</text>
    </g>
    <g id="native-rtt-end-label:4">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #b58900" x="836.408567" y="373.509481" transform="rotate(-0 836.408567 373.509481)">591 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #b58900" x="836.408567" y="373.509481" transform="rotate(-0 836.408567 373.509481)">591.34 µs</text>
    </g>
    <g id="native-rtt-end-label:5">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="250.565998" transform="rotate(-0 836.408567 250.565998)">104 ms</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="250.565998" transform="rotate(-0 836.408567 250.565998)">103.9 ms</text>
    </g>
    <g id="native-rtt-FillBetweenPolyCollection_1">
     <defs>

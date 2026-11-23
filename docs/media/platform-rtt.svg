@@ -261,7 +261,7 @@ L 847.08 501
 " style="fill: none; stroke: #ccd7e3; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="platform-rtt-end-label:0">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #2563eb" x="836.408567" y="469.374887" transform="rotate(-0 836.408567 469.374887)">2.8 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #2563eb" x="836.408567" y="469.374887" transform="rotate(-0 836.408567 469.374887)">2.80 µs</text>
    </g>
    <g id="platform-rtt-end-label:1">
     <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d1242f" x="836.408567" y="454.374888" transform="rotate(-0 836.408567 454.374888)">3.83 µs</text>
@@ -273,10 +273,10 @@ L 847.08 501
     <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d1242f" x="836.408567" y="399.574253" transform="rotate(-0 836.408567 399.574253)">9.54 µs</text>
    </g>
    <g id="platform-rtt-end-label:4">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="348.269017" transform="rotate(-0 836.408567 348.269017)">24.6 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="348.269017" transform="rotate(-0 836.408567 348.269017)">24.62 µs</text>
    </g>
    <g id="platform-rtt-end-label:5">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="333.269017" transform="rotate(-0 836.408567 333.269017)">29.5 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="333.269017" transform="rotate(-0 836.408567 333.269017)">29.50 µs</text>
    </g>
    <g id="platform-rtt-FillBetweenPolyCollection_1">
     <defs>
@@ -670,7 +670,7 @@ L 822.285042 439.631252
    <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="575.405781" transform="rotate(-0 93.6 575.405781)">Commanded 100 Hz; five sessions, 10,000 samples per point. Always-on recording included. Payload fill excluded.</text>
   </g>
   <g id="platform-rtt-text_23">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="591.905781" transform="rotate(-0 93.6 591.905781)">Jetson: NV Power Mode 40 W, governor schedutil, CPU clock capped at 1.4976 GHz (hardware max 1.984 GHz).</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="591.803359" transform="rotate(-0 93.6 591.803359)">Jetson: Linux for Tegra R36.4.3, governor schedutil, the stock governor of the Jetson.</text>
   </g>
   <g id="platform-rtt-text_24">
    <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="608.405781" transform="rotate(-0 93.6 608.405781)">Mac: Cerulion 2.0.0 on macOS 27.2.1, measured 2026-11-13, a later build than the x86-64 and Jetson rows. A multi-process consumer</text>
