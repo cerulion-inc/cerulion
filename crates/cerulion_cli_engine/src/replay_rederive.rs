@@ -1354,15 +1354,15 @@ pub enum FindingCaveat {
     /// step can be the hold.
     DrainUnrecordedHold,
     /// The step was excused as a hold by `block` slots that the bag shows
-    /// released, the last of them at `breach_step`, with no read of any of
+    /// released, the last of them at `release_step`, with no read of any of
     /// them by their consumers in between: the slot's producer fired while it
     /// counted its depth, or a producer that sends at most one frame per fire
     /// took its count past the depth. A slot that holds allows neither, so
     /// each was released with no record before then, and the hold is not
     /// allowed for.
-    SlotPastDepth {
+    UnrecordedRelease {
         /// The step at which the last of those slots showed its release.
-        breach_step: u64,
+        release_step: u64,
     },
 }
 
@@ -1375,12 +1375,12 @@ impl fmt::Display for FindingCaveat {
                  can read as this divergence; a bag that records how a FIFO input was read is \
                  judged with the hold",
             ),
-            Self::SlotPastDepth { breach_step } => write!(
+            Self::UnrecordedRelease { release_step } => write!(
                 f,
                 "the recording shows every `block` slot that excused this step released, the \
-                 last of them at step {breach_step}, with no read by their consumers in between: \
-                 its producer fired while it counted its depth, or a producer that sends one \
-                 frame per fire took it past its depth; a slot that holds allows neither, so \
+                 last of them at step {release_step}, with no read by their consumers in between: \
+                 its producer fired while it counted its depth, or a producer that sends at most \
+                 one frame per fire took it past its depth; a slot that holds allows neither, so \
                  each was released with no record and the hold is not allowed for"
             ),
         }
@@ -3938,8 +3938,8 @@ fn verify_fifo(
                     expected: StepFires::count(void.supply),
                     recorded: excused,
                     unread: None,
-                    caveat: Some(FindingCaveat::SlotPastDepth {
-                        breach_step: void.breach_step,
+                    caveat: Some(FindingCaveat::UnrecordedRelease {
+                        release_step: void.release_step,
                     }),
                 }),
                 OwedFire::StandsDown => report.stand_downs.push(StandDown {
@@ -4213,7 +4213,7 @@ struct SlotBound {
     consumer_stop: Option<StopPoint>,
     /// Has the slot shown a release the bag does not record ([`Self::step`])?
     /// It holds nothing from then on.
-    breached: bool,
+    unrecorded_release: bool,
     /// The inputs the consumer's tick reads before this one.
     reads_before: ReadsBefore,
     /// How many frames one fire of the producer can send on the topic.
@@ -4228,7 +4228,7 @@ pub(crate) struct SlotStep {
     /// The slot showed a release the bag does not record at the step, which
     /// a slot that holds never does ([`SlotBound::step`]): it holds nothing
     /// from here on.
-    pub breached: bool,
+    pub unrecorded_release: bool,
     /// The consumer's body read the input at the step, after the producer's
     /// checks, so the slot was still armed at every check up to them.
     pub read: bool,
@@ -4293,14 +4293,16 @@ impl SlotBound {
             .queued
             .map(|q| q.saturating_add(sent).saturating_sub(owed_now));
         // While it holds, a slot stops its producer at the depth. The producer
-        // is checked before each of its fires, at the decide gate
-        // (`Scheduler::decide_node`) and before every later fire of the burst
+        // is checked at the decide gate (`Scheduler::decide_node`) and before
+        // every fire of its burst, the first included
         // (`Scheduler::tick_data_burst`), and the check holds it while the slot
         // counts its depth (`scheduler::block::judge_slot`: `outstanding >=
         // depth`); each frame counts on the slot when it is sent
         // (`CerulionPublisher::send_counted`). A counted edge's consumer fires
-        // on a later level than its producer, and a level decides and fires
-        // before the next one does (`GraphRuntime::run_level`), so no read or
+        // on a later level than its producer, and a step runs its levels in
+        // order, each deciding before it fires (`GraphRuntime::step_live`:
+        // `run_level`, or `run_level_snapshot_phase` and then
+        // `run_level_tick_phase` around a mid-level rendezvous), so no read or
         // stop of the consumer comes between the step's start and the
         // producer's first check: the count before the step's sends is at most
         // the slot's there. So a producer that fires at a step whose slot
@@ -4318,9 +4320,10 @@ impl SlotBound {
         let fired_at_depth = producer_fired && before_sends.is_some_and(|c| c >= self.depth);
         let past_depth =
             self.producer_sends == SendsPerFire::AtMostOne && count.is_some_and(|c| c > self.depth);
-        let breached = !released && !self.breached && (fired_at_depth || past_depth);
-        self.breached |= breached;
-        let hold = !released && !self.breached && count.is_some_and(|c| c >= self.depth);
+        let unrecorded_release =
+            !released && !self.unrecorded_release && (fired_at_depth || past_depth);
+        self.unrecorded_release |= unrecorded_release;
+        let hold = !released && !self.unrecorded_release && count.is_some_and(|c| c >= self.depth);
         let mut removed = 0u64;
         let mut emptied = false;
         let mut lost = false;
@@ -4425,7 +4428,7 @@ impl SlotBound {
         }
         SlotStep {
             hold,
-            breached,
+            unrecorded_release,
             read: body_read,
         }
     }
@@ -4541,7 +4544,7 @@ pub(crate) struct StepDeferral {
 ///   one fire from a slot below its depth. From the step of such a release
 ///   the slot holds nothing, and a step only it excused since its consumer
 ///   last read it is voided ([`FifoStep::voided`]), a finding that says why
-///   ([`FindingCaveat::SlotPastDepth`]). A slot its consumer's stop already
+///   ([`FindingCaveat::UnrecordedRelease`]). A slot its consumer's stop already
 ///   released shows both after the stop, and is not held to them.
 ///   Where the bag cannot account for every frame sent or drained,
 ///   the edge explains no step: an unaccounted record
@@ -4607,7 +4610,7 @@ impl FifoDeferral {
                 read_seen: false,
                 first: true,
                 consumer_stop: stops.stop_point(&edge.consumer_node),
-                breached: false,
+                unrecorded_release: false,
                 reads_before: edge.reads_before.clone(),
                 producer_sends: edge.producer_sends,
             })
@@ -4708,7 +4711,7 @@ pub(crate) struct VoidedExcuse {
     /// The frames, or signals, it had to fire on.
     pub supply: u32,
     /// The step at which the last of those slots showed its release.
-    pub breach_step: u64,
+    pub release_step: u64,
 }
 
 /// A step only a hold excused, with the slots that held there, until one of
@@ -4809,14 +4812,14 @@ impl FifoCarry {
     /// for any more is voided; then a consumer's read confirms every excuse its
     /// slot gave, since its slot was armed at each of those checks.
     ///
-    /// Excuses with the same slots meet the same breaches and the same reads,
+    /// Excuses with the same slots meet the same releases and the same reads,
     /// and only the earliest of them can be voided, so only the earliest is
     /// kept: the pending list holds at most one excuse per set of slots, and a
     /// hold of any length costs the same per step.
     fn settle_excuses(&mut self, step: u64) -> Option<VoidedExcuse> {
         let slots = self.deferral.slot_steps();
         for excuse in &mut self.pending {
-            excuse.slots.retain(|&i| !slots[i].breached);
+            excuse.slots.retain(|&i| !slots[i].unrecorded_release);
         }
         let mut at = 0;
         while at < self.pending.len() {
@@ -4836,7 +4839,7 @@ impl FifoCarry {
             .map(|e| VoidedExcuse {
                 step: e.step,
                 supply: e.supply,
-                breach_step: step,
+                release_step: step,
             });
         self.pending
             .retain(|e| !e.slots.is_empty() && !e.slots.iter().any(|&i| slots[i].read));
@@ -10586,7 +10589,7 @@ mod tests {
         assert_eq!(findings_of(&no_stop), vec![finding("relay", 1, 1, 0)]);
         assert_eq!(
             no_stop.findings[0].caveat,
-            Some(FindingCaveat::SlotPastDepth { breach_step: 3 })
+            Some(FindingCaveat::UnrecordedRelease { release_step: 3 })
         );
     }
 
@@ -11526,7 +11529,7 @@ mod tests {
         assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
         assert_eq!(
             report.findings[0].caveat,
-            Some(FindingCaveat::SlotPastDepth { breach_step: 4 })
+            Some(FindingCaveat::UnrecordedRelease { release_step: 4 })
         );
         assert_eq!(
             report.findings[0].to_string(),
@@ -11534,7 +11537,7 @@ mod tests {
              fire(s), recorded 0 fire(s); the recording shows every `block` slot that excused \
              this step released, the last of them at step 4, with no read by their consumers \
              in between: its producer fired while it counted its depth, or a producer that \
-             sends one frame per fire took it past its depth; a slot that holds allows \
+             sends at most one frame per fire took it past its depth; a slot that holds allows \
              neither, so each was released with no record and the hold is not allowed for"
         );
     }
@@ -11598,7 +11601,7 @@ mod tests {
         assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
         assert_eq!(
             report.findings[0].caveat,
-            Some(FindingCaveat::SlotPastDepth { breach_step: LAST })
+            Some(FindingCaveat::UnrecordedRelease { release_step: LAST })
         );
     }
 
@@ -11760,7 +11763,7 @@ mod tests {
             assert_eq!(findings_of(report), vec![finding("relay", 1, 1, 0)]);
             assert_eq!(
                 report.findings[0].caveat,
-                Some(FindingCaveat::SlotPastDepth { breach_step: 2 })
+                Some(FindingCaveat::UnrecordedRelease { release_step: 2 })
             );
         };
         let nothing_sent = BlockHoldEdges::new(vec![BlockHoldEdge {
