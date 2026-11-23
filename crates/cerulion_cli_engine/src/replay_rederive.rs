@@ -4638,7 +4638,9 @@ pub(crate) struct VoidedExcuse {
 
 /// A step only a hold excused, with the slots that held there, until one of
 /// their consumers reads, which shows its slot armed at the step, or every one
-/// of them passes its depth first, which voids it.
+/// of them passes its depth first, which voids it. Two excuses whose slots are
+/// the same settle together, so only the earlier is kept
+/// ([`FifoCarry::settle_excuses`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingExcuse {
     step: u64,
@@ -4711,11 +4713,18 @@ impl FifoCarry {
             && fifo_carry_out(self.drain, self.carried, popped, fired, without_hold).is_err()
         {
             let slots = self.deferral.slot_steps();
-            self.pending.push(PendingExcuse {
-                step,
-                supply,
-                slots: (0..slots.len()).filter(|&i| slots[i].hold).collect(),
-            });
+            let held = || (0..slots.len()).filter(|&i| slots[i].hold);
+            if !self
+                .pending
+                .iter()
+                .any(|e| e.slots.iter().copied().eq(held()))
+            {
+                self.pending.push(PendingExcuse {
+                    step,
+                    supply,
+                    slots: held().collect(),
+                });
+            }
         }
         self.carried = *outcome.as_ref().unwrap_or(&0);
         let voided = self.settle_excuses(step);
@@ -4731,10 +4740,26 @@ impl FifoCarry {
     /// its depth stops vouching for each, and the earliest one no slot vouches
     /// for any more is voided; then a consumer's read confirms every excuse its
     /// slot gave, since its slot was armed at each of those checks.
+    ///
+    /// Excuses with the same slots meet the same breaches and the same reads,
+    /// and only the earliest of them can be voided, so only the earliest is
+    /// kept: the pending list holds at most one excuse per set of slots, and a
+    /// hold of any length costs the same per step.
     fn settle_excuses(&mut self, step: u64) -> Option<VoidedExcuse> {
         let slots = self.deferral.slot_steps();
         for excuse in &mut self.pending {
             excuse.slots.retain(|&i| !slots[i].breached);
+        }
+        let mut at = 0;
+        while at < self.pending.len() {
+            if self.pending[..at]
+                .iter()
+                .any(|e| e.slots == self.pending[at].slots)
+            {
+                self.pending.remove(at);
+            } else {
+                at += 1;
+            }
         }
         let voided = self
             .pending
@@ -11427,6 +11452,34 @@ mod tests {
         let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
         let report = verify_unrestored(&decls, &steps, &[], STAMPED);
         assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
+    /// A hold that lasts with no read of its slot keeps one pending excuse, its
+    /// first step's, so each held step costs the same however long the hold
+    /// runs. Depth 2 on a FIFO input: the sink takes the step 0 frame, the
+    /// relay fills the slot and pops a frame at step 3 that it keeps unfired
+    /// through step 10002, the sink never reads again, and at step 10003 the
+    /// relay fires the frame it kept and two more, so the slot counts five:
+    /// step 3, the first step the hold excused, is the finding, voided at step
+    /// 10003.
+    #[test]
+    fn a_hold_of_ten_thousand_steps_with_no_read_voids_its_first_step() {
+        const LAST: u64 = 10_003;
+        let mut steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 1_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 2_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 3_000, &[("relay", 1, 0, 0)]),
+        ];
+        steps.extend((4..LAST).map(|n| fifo_step(n, n * 1_000, &[])));
+        steps.push(fifo_step(LAST, LAST * 1_000, &[("relay", 2, 3, 0)]));
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 3, 1, 0)]);
+        assert_eq!(
+            report.findings[0].caveat,
+            Some(FindingCaveat::SlotPastDepth { breach_step: LAST })
+        );
     }
 
     /// A slot its consumer's stop has released counts past its depth after the
