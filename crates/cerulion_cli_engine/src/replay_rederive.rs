@@ -11798,6 +11798,26 @@ mod tests {
         ]
     }
 
+    /// The one-fire-two-frames rows' slot, at depth 1 on a latest-value input,
+    /// its frames stamped at steps 0 and 3, from a producer that sends as
+    /// `producer_sends` says.
+    fn one_fire_two_frames_slot(producer_sends: SendsPerFire) -> BlockHoldEdges {
+        BlockHoldEdges::new(vec![BlockHoldEdge {
+            producer_sends,
+            ..slot(
+                "sink",
+                1,
+                SlotRecord::Counted {
+                    frame_stamps: [0, 0, 15_000, 15_000]
+                        .iter()
+                        .map(|us| EPOCH + us * 1_000)
+                        .collect(),
+                    drain: BodyDrain::ToEmpty,
+                },
+            )
+        }])
+    }
+
     /// One fire that sends two frames takes its slot past the depth with
     /// nothing released when its producer can send several frames in one
     /// fire: the one-fire-two-frames rows then hold at steps 1 and 2 and read
@@ -11807,41 +11827,35 @@ mod tests {
     #[test]
     fn a_fire_that_sends_two_frames_holds_its_slot_by_what_its_producer_can_send() {
         let steps = one_fire_two_frames_steps();
-        let edge = |producer_sends| {
-            BlockHoldEdges::new(vec![BlockHoldEdge {
-                producer_sends,
-                ..slot(
-                    "sink",
-                    1,
-                    SlotRecord::Counted {
-                        frame_stamps: [0, 0, 15_000, 15_000]
-                            .iter()
-                            .map(|us| EPOCH + us * 1_000)
-                            .collect(),
-                        drain: BodyDrain::ToEmpty,
-                    },
-                )
-            }])
-        };
+        let edge = one_fire_two_frames_slot;
         let any = verify_unrestored(&relay(edge(SendsPerFire::Unbounded)), &steps, &[], STAMPED);
         assert!(any.is_clean(), "{:?}", any.findings);
         let one = verify_unrestored(&relay(edge(SendsPerFire::AtMostOne)), &steps, &[], STAMPED);
         assert_eq!(findings_of(&one), vec![finding("relay", 1, 1, 0)]);
     }
 
-    /// The several-frame and fire-at-full rows judged twice give one report
-    /// each time, field for field and in its rendering.
+    /// The several-frame, fire-at-full and one-fire-two-frames rows judged
+    /// twice give one report each time, field for field and in its rendering.
     #[test]
     fn the_several_frame_and_fire_at_full_rows_judge_the_same_twice() {
         let two = two_frame_fire_steps();
         let filled = filled_by_one_fire_steps();
         let full = fire_at_full_steps();
+        let one_fire = one_fire_two_frames_steps();
         let cases = [
             (relay(sending_any(sink_holds(1, &two))), two.clone()),
             (relay(sink_holds(1, &two)), two),
             (relay(sending_any(sink_holds(1, &filled))), filled.clone()),
             (relay(sink_holds(1, &filled)), filled),
             (relay(sending_any(sink_holds(1, &full))), full),
+            (
+                relay(one_fire_two_frames_slot(SendsPerFire::Unbounded)),
+                one_fire.clone(),
+            ),
+            (
+                relay(one_fire_two_frames_slot(SendsPerFire::AtMostOne)),
+                one_fire,
+            ),
         ];
         for (decls, steps) in &cases {
             let first = verify_unrestored(decls, steps, &[], STAMPED);

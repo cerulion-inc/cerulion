@@ -58217,10 +58217,11 @@ fn tf_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
 /// the relay is held between its fires and its slot counts past the depth at
 /// them, which from a producer that can send several frames in one fire is no
 /// release, and the bag shows more frames than fires at every stamp the relay
-/// fired at, which from such a producer refuses no count. Every hold stands:
-/// the replay reads clean, the same twice. Read by the sink's info, or as a
-/// producer that sends one frame per fire, the edge would hold nothing past
-/// the relay's first two fires.
+/// fired at, which from such a producer refuses no count. Every hold stands,
+/// and the replay reproduces every recorded frame and read with every node
+/// judged, the same twice. Read by the sink's info, or as a producer that
+/// sends at most one frame per fire, the edge would hold nothing past the
+/// relay's first two fires.
 #[test]
 #[serial]
 fn a_producer_that_can_send_several_frames_per_fire_is_judged_by_its_own_info() {
@@ -58245,16 +58246,51 @@ fn a_producer_that_can_send_several_frames_per_fire_is_judged_by_its_own_info() 
     let bag = dir.path().join("tf.mcap");
     ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
     let outcome = bh_replay_stamped(&bag, tf_factories, bh_clean_stamp(&rec));
-    assert_eq!(
-        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
-        None
-    );
+    bh_assert_replays(&outcome, "a producer that can send several frames per fire");
     let again = bh_replay_stamped(&bag, tf_factories, bh_clean_stamp(&rec));
     assert_eq!(
         serde_json::to_string(&outcome).unwrap(),
         serde_json::to_string(&again).unwrap(),
         "two replays of one bag are byte-identical"
     );
+}
+
+/// A `block` edge is read by its PRODUCER's info, the other way round: the
+/// relay is a `#[cerulion_node]` node, whose info says it needs a publisher
+/// for every output, and the sink's slot has depth 2. The test's bag builder
+/// writes a copy of the relay's step 2 frame at that fire's own stamp, under
+/// a sequence no relay frame carries, so the bag shows the relay sending a
+/// frame at step 2 that no recorded fire sent. From a producer that sends at most one frame per fire that counts no
+/// slot of the topic, so nothing holds the relay and the hold's onset, step 3,
+/// is the finding. Read as a producer that can send several frames in one
+/// fire, the slot would stay counted, the copy would keep it at its depth
+/// through the holds up to the sink's step 10 read, and the relay's step 11
+/// fire at a slot that already counts its depth would be the first finding.
+#[test]
+#[serial]
+fn a_one_frame_producer_with_a_frame_no_fire_sent_is_judged_by_its_own_info() {
+    let mut rec = bh_reference();
+    let frames = rec.messages.get_mut(BH_RELAY_TOPIC).unwrap();
+    let mut copy = frames[2].clone();
+    let mut header = WireHeader::read_from_buf(&copy).expect("the step 2 frame's header");
+    // A sequence no relay frame carries, so every recorded read still names
+    // one frame.
+    header.sequence = 1000;
+    header.write_to_buf(&mut copy);
+    frames.insert(3, copy);
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("bh_frame_no_fire_sent.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&bag, bh_held_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        Some(
+            "fire-schedule divergence: rank 0 \u{2014} fire-schedule divergence: node 'relay' \
+             step 3 FIFO pop count \u{2014} re-derived 1 fire(s), recorded 0 fire(s)"
+        )
+    );
+    assert!(!outcome.passed);
+    bh_assert_judged(&outcome, "a one-frame producer with a frame no fire sent");
 }
 
 /// A relay nothing holds, on a bag that states its drain: its last fire is
