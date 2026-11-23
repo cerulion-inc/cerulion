@@ -323,7 +323,10 @@ declaration order and ends at the first that serves nothing, which records an
 empty read: a step-boundary input read empty ends every fire of its step, and
 a `sample(N)` trigger input whose gate dropped the frame ends that fire. For a
 node whose metadata does not say it needs a publisher for every output, which
-that macro sets, every such fire can hide a drain.
+that macro sets, every such fire can hide a drain. A FIFO input drains only at
+its consumer's recorded reads: a FIFO read that errors has taken no frame with
+a header the bag can read, so a consumer fire with no read of it recorded
+drains nothing.
 A consumer's stop releases its slot from the next step on: a fatal error, or a
 poisoned node entry, whose node keeps firing with its tick skipped; the
 consecutive-panic breaker releases none. While a slot holds,

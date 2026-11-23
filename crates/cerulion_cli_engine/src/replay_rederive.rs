@@ -4177,11 +4177,6 @@ struct SlotBound {
     /// Has the count passed the depth? A slot that holds never does, so it
     /// was released with no record, for good.
     breached: bool,
-    /// Is the count exact, no fewer frames than the slot holds and no more?
-    /// A FIFO input's consumer fire with no read of it recorded can hide a
-    /// drain, which the count keeps; a read that finds the slot empty
-    /// resyncs it.
-    exact: bool,
     /// The inputs the consumer's tick reads before this one.
     reads_before: ReadsBefore,
 }
@@ -4257,8 +4252,7 @@ impl SlotBound {
         // producer at the depth, and each fire sends one frame. A slot that
         // counts past it was released with no record (a slot its consumer's
         // stop already released counts past it after the stop, and is skipped).
-        let breached =
-            !released && !self.breached && self.exact && count.is_some_and(|c| c > self.depth);
+        let breached = !released && !self.breached && count.is_some_and(|c| c > self.depth);
         self.breached |= breached;
         let hold = !released && !self.breached && count.is_some_and(|c| c >= self.depth);
         let mut removed = 0u64;
@@ -4304,11 +4298,12 @@ impl SlotBound {
             .filter(|(id, _)| *id == self.consumer_node)
             .count();
         // A `block` input is read only by its consumer's tick, which records
-        // the read unless it errors, and an erroring read can have popped
-        // first. So a consumer fire with no read of it recorded either ended
-        // before the input or hid a drain the bag lost. A fire the bag shows
-        // ended at an input the tick reads earlier drained nothing
-        // (`fires_ended_before`); any other one is unexplained.
+        // the read unless it errors, and an erroring latest-value read can
+        // have popped first. So a consumer fire with no read of it recorded
+        // either ended before the input or, on a latest-value input, hid a
+        // drain the bag lost. A fire the bag shows ended at an input the tick
+        // reads earlier drained nothing (`fires_ended_before`); any other one
+        // is unexplained.
         let unexplained = !body_read
             && consumer_fires
                 > fires_ended_before(
@@ -4325,9 +4320,6 @@ impl SlotBound {
         // input drains only at the reads its consumer's body makes, so no read
         // of it there is no drain.
         let drain_unrecorded = drain == BodyDrain::ToEmpty && unexplained;
-        if unexplained {
-            self.exact = false;
-        }
         if let Some(q) = self.queued {
             let available = q.saturating_add(sent);
             if clock_continues {
@@ -4353,7 +4345,6 @@ impl SlotBound {
             // of the clock's frames can be placed after the read.
             self.queued = Some(0);
             self.owed = 0;
-            self.exact = true;
             self.clock_frames_void = clock_continues;
         } else if !clock_continues {
             self.clock_frames_void = false;
@@ -4496,7 +4487,11 @@ pub(crate) struct StepDeferral {
 ///   records the read unless it errors, and a read that errors can have
 ///   popped first, so a fire with no read of it recorded can hide a drain
 ///   unless the bag shows the tick ended at an input it reads earlier
-///   ([`ReadsBefore`]). A
+///   ([`ReadsBefore`]). A FIFO input drains only at its consumer's recorded
+///   reads: a FIFO read records the frame it takes, and one that errors has
+///   taken none but frames too short for a wire header, whose stamps the bag
+///   cannot read, so their edge is unaccounted; a fire with no read of the
+///   input recorded drains nothing. A
 ///   resumed pass does not know what the slot held at its anchor,
 ///   so the edge explains no step until the consumer first reads its queue
 ///   empty. Frames stamped before the pass's first step are not its sends.
@@ -4540,7 +4535,6 @@ impl FifoDeferral {
                 first: true,
                 consumer_stop: stops.stop_point(&edge.consumer_node),
                 breached: false,
-                exact: true,
                 reads_before: edge.reads_before.clone(),
             })
             .collect::<Vec<_>>();
@@ -9425,19 +9419,6 @@ mod tests {
             .collect()
     }
 
-    /// `steps` with a fire of the sink that records no read added to step
-    /// `n`: a tick whose read of the input erred after it popped can hide a
-    /// drain there.
-    fn with_unread_sink_fire(mut steps: Vec<RecordedStep>, n: u64) -> Vec<RecordedStep> {
-        let step = steps
-            .iter_mut()
-            .find(|s| s.step == n)
-            .expect("the step the case names");
-        let at = step.clock_ns;
-        step.fires.push(fire("sink", at));
-        steps
-    }
-
     /// `steps` with `read` added to step `n`'s reads.
     fn with_read(mut steps: Vec<RecordedStep>, n: u64, read: RecordedRead) -> Vec<RecordedStep> {
         steps
@@ -10032,12 +10013,13 @@ mod tests {
     ///
     /// * the sink stops at step 1, which releases its slot for good, so the
     ///   relay's step 2 pop is a finding;
-    /// * after a hold the sink fires twice with no read, each a tick whose read
-    ///   erred after it popped, so the count can exceed the queue; at step 5
-    ///   it takes two frames and then reads its queue empty, which resyncs the
-    ///   slot, so the relay's step 7 pop is a finding; without the empty read,
-    ///   or with one at the drain site or on a bag whose roles cannot be
-    ///   believed, the slot still counts two;
+    /// * after the relay's step 3 hold the sink takes a frame at each of steps
+    ///   3 and 4 through a read that records nothing and pays the slot nothing
+    ///   (`CerulionSubscriber::try_receive_one`), so the slot counts two frames
+    ///   its queue no longer holds; at step 5 it reads its queue empty, which
+    ///   resyncs the slot, so the frame the relay carries unfired at step 6 is
+    ///   a finding; without the empty read, or with one at the drain site or on
+    ///   a bag whose roles cannot be believed, the slot still counts two;
     /// * a truncated read stream of the sink's input loses its drains, so from
     ///   its marker at step 2 nothing bounds the slot and the step 3 frame
     ///   carried unfired is a finding; without the marker it is the hold;
@@ -10075,22 +10057,21 @@ mod tests {
             None,
             ReadSiteRole::Body,
         );
-        let evicted_rows = [
-            (0, 1, 1, 1),
-            (1, 1, 1, 0),
-            (2, 1, 1, 0),
-            (3, 1, 0, 0),
-            (4, 0, 1, 0),
-            (5, 1, 1, 2),
-            (6, 0, 0, 0),
-            (7, 1, 0, 0),
-        ];
-        let unread_twice =
-            || with_unread_sink_fire(with_unread_sink_fire(relay_steps(&evicted_rows), 3), 4);
-        let evicted = with_read(unread_twice(), 5, empty);
-        let reset = verify_unrestored(&relay(sink_holds(2, &evicted)), &evicted, &[], STAMPED);
-        assert_eq!(findings_of(&reset), vec![finding("relay", 7, 1, 0)]);
-        let kept = unread_twice();
+        let taken = || {
+            vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+                fifo_step(3, 15_000, &[("relay", 1, 0, 0), ("sink", 0, 1, 0)]),
+                fifo_step(4, 20_000, &[("sink", 0, 1, 0)]),
+                fifo_step(5, 25_000, &[("sink", 0, 1, 0)]),
+                fifo_step(6, 30_000, &[]),
+            ]
+        };
+        let emptied = with_read(taken(), 5, empty);
+        let reset = verify_unrestored(&relay(sink_holds(2, &emptied)), &emptied, &[], STAMPED);
+        assert_eq!(findings_of(&reset), vec![finding("relay", 6, 1, 0)]);
+        let kept = taken();
         let not_reset = verify_unrestored(&relay(sink_holds(2, &kept)), &kept, &[], STAMPED);
         assert!(not_reset.is_clean(), "{:?}", not_reset.findings);
         // An empty read that is not the body's, or whose role cannot be
@@ -10103,7 +10084,7 @@ mod tests {
             None,
             ReadSiteRole::Drain,
         );
-        let trigger_empty = with_read(unread_twice(), 5, drain_site);
+        let trigger_empty = with_read(taken(), 5, drain_site);
         let kept_by_site = verify_unrestored(
             &relay(sink_holds(2, &trigger_empty)),
             &trigger_empty,
@@ -10112,8 +10093,8 @@ mod tests {
         );
         assert!(kept_by_site.is_clean(), "{:?}", kept_by_site.findings);
         let kept_by_trust = verify_unrestored(
-            &relay(sink_holds(2, &evicted)),
-            &evicted,
+            &relay(sink_holds(2, &emptied)),
+            &emptied,
             &[],
             RoleTrust::Declined,
         );
@@ -11424,6 +11405,30 @@ mod tests {
         assert!(report.is_clean(), "{:?}", report.findings);
     }
 
+    /// A consumer read confirms every hold its slot gave since the consumer
+    /// last read it. Depth 2 on a FIFO input: the sink takes the step 0 frame,
+    /// the relay fills the slot and pops a frame at step 3 that it keeps
+    /// unfired through step 5, the sink reads a frame at step 5, and at step 6
+    /// the relay fires the frame it kept and two more, so the slot counts four
+    /// with no read since step 5. The step 5 read shows the slot armed at the
+    /// checks of steps 3, 4 and 5, so those holds stand and the steps read
+    /// clean.
+    #[test]
+    fn a_consumer_read_confirms_every_hold_its_slot_gave_before_it() {
+        let steps = vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 1_000, &[("relay", 1, 1, 0)]),
+            fifo_step(2, 2_000, &[("relay", 1, 1, 0)]),
+            fifo_step(3, 3_000, &[("relay", 1, 0, 0)]),
+            fifo_step(4, 4_000, &[]),
+            fifo_step(5, 5_000, &[("sink", 0, 1, 1)]),
+            fifo_step(6, 6_000, &[("relay", 2, 3, 0)]),
+        ];
+        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
     /// A slot its consumer's stop has released counts past its depth after the
     /// stop with nothing wrong: the same steps with the sink stopped by its
     /// step 3 fire, which ended before it read the input, keep the step 3 hold.
@@ -11438,13 +11443,15 @@ mod tests {
     }
 
     /// An empty read leaves the slot empty. Depth 2: the sink takes the step 0
-    /// frame, the relay fills the slot, and after its step 3 hold the sink
-    /// fires twice with no read, each a tick whose read erred after it popped,
-    /// so the count can exceed the queue. At step 5 the sink takes two frames
-    /// and then reads its queue empty, which resyncs the slot, so the relay's
-    /// step 7 pop of two and fire of one leaves a frame unfired with one frame
-    /// in the slot, which is a finding; without the empty read the slot counts
-    /// two there and the step is the hold.
+    /// frame and the relay fills the slot. After the relay's step 3 hold the
+    /// sink takes a frame through a read that records nothing and pays the
+    /// slot nothing (`CerulionSubscriber::try_receive_one`), so the slot
+    /// counts one frame its queue no longer holds; it reads the other at step
+    /// 4, and at step 5 reads the frame the relay fires there and then reads
+    /// its queue empty, which leaves the slot empty. The relay's step 6 pop of
+    /// two and fire of one then leaves a frame unfired with one frame in the
+    /// slot, which is a finding; without the empty read the slot counts two
+    /// there and the step is the hold.
     #[test]
     fn an_empty_read_leaves_the_slot_empty() {
         let empty = read_with_role(
@@ -11456,24 +11463,22 @@ mod tests {
             ReadSiteRole::Body,
         );
         let rows = || {
-            let rows = relay_steps(&[
-                (0, 1, 1, 1),
-                (1, 1, 1, 0),
-                (2, 1, 1, 0),
-                (3, 1, 0, 0),
-                (4, 0, 1, 0),
-                (5, 1, 1, 2),
-                (6, 0, 0, 0),
-                (7, 2, 1, 0),
-            ]);
-            with_unread_sink_fire(with_unread_sink_fire(rows, 3), 4)
+            vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+                fifo_step(3, 15_000, &[("relay", 1, 0, 0), ("sink", 0, 1, 0)]),
+                fifo_step(4, 20_000, &[("sink", 0, 1, 1)]),
+                fifo_step(5, 25_000, &[("relay", 0, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(6, 30_000, &[("relay", 2, 1, 0)]),
+            ]
         };
         let kept = rows();
         let report = verify_unrestored(&relay(sink_holds(2, &kept)), &kept, &[], STAMPED);
         assert!(report.is_clean(), "{:?}", report.findings);
         let steps = with_read(rows(), 5, empty);
         let report = verify_unrestored(&relay(sink_holds(2, &steps)), &steps, &[], STAMPED);
-        assert_eq!(findings_of(&report), vec![finding("relay", 7, 2, 1)]);
+        assert_eq!(findings_of(&report), vec![finding("relay", 6, 2, 1)]);
     }
 
     /// A read of a latest-value input empties the slot, the frame its own step
