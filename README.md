@@ -17,6 +17,8 @@
   <a href="https://discord.gg/dqKFecngPy"><img src="https://img.shields.io/badge/chat-Discord-5865F2.svg" alt="Discord"></a>
 </p>
 
+<!-- FIRST_SCREEN_START -->
+
 **Cerulion is an open-source, zero-copy robot runtime that runs your ROS 2 nodes, replays recorded runs against new code and reaches your robots from anywhere.** Its experimental harness for physical AI gives your AI model MCP tools to see and move a simulated arm.
 
 - **For ROS 2 teams.** [Run a stock talker and listener on `rmw_cerulion`](#try-it-with-ros-2) in minutes, with Jazzy on Linux and no account ([also on a real arm](#runs-on-real-hardware)).
@@ -36,10 +38,13 @@ A real run on Cerulion 2.1.0: the recorded bag replays byte for byte, then one c
 
 A real episode, scored solved by the benchmark's own check. Claude Opus 5.5 solved this task on its third try, and the task is one the harness was built on ([how this GIF was made](docs/media/README.md#assets-the-root-readme-uses)).
 
+<!-- FIRST_SCREEN_END -->
+
 ## What Cerulion adds to the tools you use
 
 | You use | What Cerulion adds |
 |---|---|
+| A plain MCP robot server, or the three tools that a published study of zero-shot models on LIBERO-10 gave them (`move_to`, `done`, `give_up`) | The [harness](#try-the-harness) gives your model tools to look through the robot's cameras, move, touch, grasp and set things down. It also gives the model facts about the robot's body, such as its calibration record. You see the benchmark's own verdict for each episode. Against the three published tools, Gemini 3.8 Flash solved 73 of 100 start states with Cerulion and 25 without, on the benchmark family the harness was built on, and 4 of 16 models solved fewer ([limits](#evidence)). |
 | rosbag2, which records topics and plays them back | A [replay check](#try-the-runtime) re-executes your native Cerulion nodes on a recording and compares their outputs. An output difference exits 1 and a schedule divergence exits 6, so a CI runner that is signed in can stop the change. |
 | A ROS 2 middleware, such as `rmw_fastrtps_cpp` or `rmw_zenoh_cpp` | `rmw_cerulion` is a ROS 2 middleware too, so stock nodes run on it unchanged. Native nodes add typed inputs and outputs in loaned shared memory, always-on recording and replay. |
 | iceoryx2 or zenoh directly | Cerulion is built on iceoryx2 for shared memory, and adds nodes, scheduling and recording. Between machines, account and paired access uses iroh, directly or through a relay, and zenoh carries only explicit open LAN access ([networking](docs/networking.md)). At 64 B on one desktop, raw iceoryx2 reads 2.42 µs / 3.02 µs (p50 / p99), and native Cerulion reads 4.07 µs / 6.61 µs ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md)). |
@@ -252,7 +257,7 @@ A synthetic laser scanner reports an obstacle 0.3 m away for two seconds, then a
 cerulion login
 ```
 
-It prints a URL and a short code. Open the URL in a browser on any device, sign in to your Cerulion account and enter the code. The terminal then prints `Signed in as <account id>.`
+It prints a URL and a short code. Open the URL in a browser on any device, sign in to your Cerulion account and enter the code. The terminal then prints `Signed in as <account id>.` The CLI asks for an account because the account pairs your robots and computers, so they find each other with no addresses to set.
 
 <a id="what-sign-in-stores-and-sends"></a>
 
@@ -451,7 +456,7 @@ Every figure below is copied from a results package in this repository. The [evi
 
 ### Harness results
 
-Each of 16 models ran the same 100 LIBERO-PRO start states twice: with Cerulion, and without it on the benchmark's published minimal interface of three tools (arXiv:2610.30051). A start state is one task, such as "put the bowl on the stove", from one starting scene. Both runs had the same simulator, budget and success check.
+Each of 16 models ran the same 100 LIBERO-PRO start states twice: with Cerulion, and without it on a published minimal interface of three tools (arXiv:2610.30051). A start state is one task, such as "put the bowl on the stove", from one starting scene. Both runs had the same simulator, budget and success check.
 
 - **The main test, declared before the first episode.** Gemini 3.8 Flash solved 73 of 100 start states with Cerulion and 25 without (2.9 times as many; exact two-sided sign test p = 1.10e-11).
 - **All 16 models.** With Cerulion, 12 solved more and 4 solved fewer. After Holm's correction, the gain is established for 9 of 16.

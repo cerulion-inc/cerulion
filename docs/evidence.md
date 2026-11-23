@@ -4,7 +4,7 @@ Nothing to install. Every figure is copied from a results package in this reposi
 
 ## Harness results
 
-Each of 16 models ran the same 100 LIBERO-PRO start states twice. A start state is one task, such as "put the bowl on the stove", from one starting scene. The run without Cerulion used the benchmark's published minimal interface of three tools (arXiv:2610.30051). The run with Cerulion used the harness's tools and also read the robot's calibration record. Both had the same simulator, budget (80 model replies, 900 control steps) and success check.
+Each of 16 models ran the same 100 LIBERO-PRO start states twice. A start state is one task, such as "put the bowl on the stove", from one starting scene. The run without Cerulion used a published minimal interface of three tools (arXiv:2610.30051). The run with Cerulion used the harness's tools and also read the robot's calibration record. Both had the same simulator, budget (80 model replies, 900 control steps) and success check.
 
 - **The main test, declared before the first episode.** Gemini 3.8 Flash solved 73 of 100 start states with Cerulion and 25 without (2.9 times as many; exact two-sided sign test p = 1.10e-11).
 - **All 16 models.** With Cerulion, 12 solved more and 4 solved fewer. The 4 that solved fewer are the 4 with the highest scores without Cerulion. After Holm's correction, the gain is established for 9 of 16.

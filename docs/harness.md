@@ -142,8 +142,8 @@ so the network kill switch (`CERULION_NETWORK=off`) does not refuse it.
 ## What it measured
 
 The benchmark is LIBERO-PRO: simulated robot manipulation tasks, each start state run twice with the same model.
-Once without Cerulion, through the three-tool interface the benchmark's authors published for zero-shot models
-(`move_to`, `done`, `give_up`). Once with Cerulion, through the harness's tools. Same simulator, same start
+Once without Cerulion, through the three-tool interface a published zero-shot study used (arXiv:2610.30051:
+`move_to`, `done`, `give_up`). Once with Cerulion, through the harness's tools. Same simulator, same start
 state, same budget of 80 model replies and 900 control steps, and the benchmark's own success check. Sixteen
 models, 100 start states each, one episode a start state an arm. The start states are new start states of task
 rows the harness was developed on at other start states, so the tasks themselves are not new to it.
