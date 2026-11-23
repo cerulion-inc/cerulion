@@ -19,7 +19,7 @@
 
 **Cerulion is the harness for physical AI, on an open-source robot runtime.**
 
-The experimental harness lets your AI model see and move a simulated robot arm over MCP, and gives it facts about the arm's body, such as its calibration record. The zero-copy runtime runs stock ROS 2 nodes unchanged, records runs, replays native nodes against new code and reaches your robots from another network.
+The experimental harness lets your AI model see and move a simulated robot arm over MCP, and gives it facts about the arm's body, such as its calibration record. The runtime gives native nodes zero-copy shared memory and runs stock ROS 2 nodes unchanged (they copy unless they loan messages). It records runs, replays native nodes against new code and reaches your robots from another network.
 
 <p align="center">
   <img src="docs/media/harness-episode.gif" alt="Claude Opus 5.5 moves the simulated arm through the Cerulion harness and sets the bowl on the plate, and the last frame reads Benchmark verdict: solved." width="560">
@@ -177,7 +177,7 @@ claude "With cerulion-sim, put the bowl on the plate, and give me the link to wa
 
 **3. Watch the episode** at the link your model gives you, `http://127.0.0.1:8765/view/<episode id>`. With no link, `http://127.0.0.1:8765/episodes` lists every episode's `id`. The viewer shows the camera pictures, each tool call and result, and the model's claim. When scoring succeeds, it ends with `Benchmark verdict: solved` or `Benchmark verdict: not solved`.
 
-**Your setup works even when the model fails** if your client lists the `cerulion-sim` tools and the viewer shows the calls. Trust the verdict, not the model's claim. With no verdict, the episode was not scored, which tells you nothing about the model. When scoring raises an error, the simulator's terminal logs `episode <episode id> was not scored` with the reason. To try again, run the `claude` line again, because each MCP session is one episode.
+**Your setup works even when the model fails** if your client lists the `cerulion-sim` tools and the viewer shows the calls. Trust the verdict, not the model's claim. An episode that has ended with no verdict was not scored, which tells you nothing about the model. A live episode has no verdict yet. When scoring raises an error, the simulator's terminal logs `episode <episode id> was not scored` with the reason. To try again, run the `claude` line again, because each MCP session is one episode.
 
 <details>
 <summary>What Claude Opus 5.5 replied in the episode in the GIF</summary>
