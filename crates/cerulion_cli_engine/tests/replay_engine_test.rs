@@ -58260,12 +58260,13 @@ fn a_producer_that_can_send_several_frames_per_fire_is_judged_by_its_own_info() 
 /// for every output, and the sink's slot has depth 2. The test's bag builder
 /// writes a copy of the relay's step 2 frame at that fire's own stamp, under
 /// a sequence no relay frame carries, so the bag shows the relay sending a
-/// frame at step 2 that no recorded fire sent. From a producer that sends at most one frame per fire that counts no
-/// slot of the topic, so nothing holds the relay and the hold's onset, step 3,
-/// is the finding. Read as a producer that can send several frames in one
-/// fire, the slot would stay counted, the copy would keep it at its depth
-/// through the holds up to the sink's step 10 read, and the relay's step 11
-/// fire at a slot that already counts its depth would be the first finding.
+/// frame at step 2 that no recorded fire sent. For a producer that sends at
+/// most one frame per fire, such a frame leaves the topic's slot uncounted, so
+/// nothing holds the relay and the hold's onset, step 3, is the finding. Read
+/// as a producer that can send several frames in one fire, the slot would stay
+/// counted: the copy would keep it one past its depth through the holds up to
+/// the sink's step 10 read, which leaves it at its depth, so the relay's step
+/// 11 fire at a slot that already counts its depth would be the first finding.
 #[test]
 #[serial]
 fn a_one_frame_producer_with_a_frame_no_fire_sent_is_judged_by_its_own_info() {

@@ -11701,10 +11701,10 @@ mod tests {
         assert!(report.is_clean(), "{:?}", report.findings);
     }
 
-    /// A producer that sends at most one frame per fire stops at its slot's depth, so
-    /// a count past it is a release with no record: the same two-frame-fire
-    /// rows from a one-frame producer hold nothing after step 0, and the step 1
-    /// pop left unfired is the finding.
+    /// A producer that sends at most one frame per fire stops at its slot's
+    /// depth, so a count past it is a release with no record: the same
+    /// two-frame-fire rows from a one-frame producer hold nothing after step 0,
+    /// and the step 1 pop left unfired is the finding.
     #[test]
     fn a_slot_a_one_frame_producer_counts_past_its_depth_holds_nothing() {
         let steps = two_frame_fire_steps();
