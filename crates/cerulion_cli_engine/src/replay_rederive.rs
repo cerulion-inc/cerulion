@@ -4727,18 +4727,11 @@ impl FifoCarry {
             && fifo_carry_out(self.drain, self.carried, popped, fired, without_hold).is_err()
         {
             let slots = self.deferral.slot_steps();
-            let held = || (0..slots.len()).filter(|&i| slots[i].hold);
-            if !self
-                .pending
-                .iter()
-                .any(|e| e.slots.iter().copied().eq(held()))
-            {
-                self.pending.push(PendingExcuse {
-                    step,
-                    supply,
-                    slots: held().collect(),
-                });
-            }
+            self.pending.push(PendingExcuse {
+                step,
+                supply,
+                slots: (0..slots.len()).filter(|&i| slots[i].hold).collect(),
+            });
         }
         self.carried = *outcome.as_ref().unwrap_or(&0);
         let voided = self.settle_excuses(step);
