@@ -11784,6 +11784,51 @@ mod tests {
         voided(&verify_unrestored(&above_decls, &above, &[], STAMPED));
     }
 
+    /// Depth 1 on a latest-value input: the relay fires once at step 0 and
+    /// sends two frames, pops a frame at step 1 that it keeps unfired through
+    /// step 2, at which the sink reads the queue empty, and fires the kept
+    /// frame at step 3, sending two more. The relay's check found the slot
+    /// empty at each fire, and at its depth at steps 1 and 2.
+    fn one_fire_two_frames_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+            fifo_step(2, 10_000, &[("sink", 0, 1, 1)]),
+            fifo_step(3, 15_000, &[("relay", 0, 1, 0)]),
+        ]
+    }
+
+    /// One fire that sends two frames takes its slot past the depth with
+    /// nothing released when its producer can send several frames in one
+    /// fire: the one-fire-two-frames rows then hold at steps 1 and 2 and read
+    /// clean. From a producer that sends at most one frame per fire the same
+    /// count shows a release at step 0, so nothing holds at step 1 and it is
+    /// the finding.
+    #[test]
+    fn a_fire_that_sends_two_frames_holds_its_slot_by_what_its_producer_can_send() {
+        let steps = one_fire_two_frames_steps();
+        let edge = |producer_sends| {
+            BlockHoldEdges::new(vec![BlockHoldEdge {
+                producer_sends,
+                ..slot(
+                    "sink",
+                    1,
+                    SlotRecord::Counted {
+                        frame_stamps: [0, 0, 15_000, 15_000]
+                            .iter()
+                            .map(|us| EPOCH + us * 1_000)
+                            .collect(),
+                        drain: BodyDrain::ToEmpty,
+                    },
+                )
+            }])
+        };
+        let any = verify_unrestored(&relay(edge(SendsPerFire::Unbounded)), &steps, &[], STAMPED);
+        assert!(any.is_clean(), "{:?}", any.findings);
+        let one = verify_unrestored(&relay(edge(SendsPerFire::AtMostOne)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&one), vec![finding("relay", 1, 1, 0)]);
+    }
+
     /// The several-frame and fire-at-full rows judged twice give one report
     /// each time, field for field and in its rendering.
     #[test]

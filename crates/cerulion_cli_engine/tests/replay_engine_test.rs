@@ -58141,6 +58141,122 @@ fn a_driver_consumers_recorded_stop_releases_its_slot() {
     );
 }
 
+/// A FIFO relay written by hand whose info does not say it needs a publisher
+/// for every output: each fire reads one frame of `inp` and sends two frames
+/// on `out`, carrying `x` and `x + 0.5`.
+struct TwoFrameRelayEntry {
+    context: Option<cerulion_core::NodeContext>,
+}
+
+impl NodeEntry for TwoFrameRelayEntry {
+    fn info(&self) -> cerulion_core::TransportResult<cerulion_core::NodeInfo> {
+        use cerulion_core::graph::node::{
+            BackpressurePolicy, InputConsume, InputMeta, MacroPolicy, OutputMeta,
+        };
+        let hash = <Vector3 as cerulion_core::ShmMessage>::SCHEMA_HASH;
+        Ok(cerulion_core::NodeInfo::with_meta(
+            vec![InputMeta {
+                name: "inp".to_string(),
+                schema_hash: hash,
+                trigger: true,
+                depth: 11,
+                backpressure: BackpressurePolicy::DropOldest,
+                expect_within_ms: None,
+                accumulate: false,
+                consume: InputConsume::Fifo,
+            }],
+            vec![OutputMeta::new("out".to_string(), hash, None)],
+        )
+        .with_policy(MacroPolicy::DataTrigger {
+            input_name: "inp".to_string(),
+        }))
+    }
+
+    fn init(&mut self, context: cerulion_core::NodeContext) -> cerulion_core::TransportResult<()> {
+        self.context = Some(context);
+        Ok(())
+    }
+
+    fn tick(&mut self) -> cerulion_core::TransportResult<()> {
+        let ctx = self.context.as_mut().expect("init ran");
+        let x = ctx
+            .subscriber_mut("inp")
+            .expect("input 'inp' is wired")
+            .try_view::<Vector3, _>(|v| v.x)?
+            .unwrap_or(0.0);
+        for dx in [0.0, 0.5] {
+            let publisher = ctx.publisher_mut("out").expect("output 'out' is wired");
+            let mut proxy = publisher.loan_proxy::<Vector3>()?;
+            proxy.x = x + dx;
+            drop(proxy);
+        }
+        Ok(())
+    }
+}
+
+const TF_YAML: &str = "name: tfgraph\nprefix: tf\nnodes:\n\
+     \x20 - id: src\n    type: source_node\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: relay\n    type: two_frame_relay\n    inputs:\n      - name: inp\n        source: src/out\n        depth: 11\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n\
+     \x20 - id: sink\n    type: slow_block_sink_node\n    inputs:\n      - name: inp\n        source: relay/out\n    outputs:\n      - name: out\n        schema: geometry_msgs/Vector3\n";
+
+/// The steps the two-frame relay graph records.
+const TF_STEPS: usize = 30;
+
+fn tf_factories() -> IndexMap<String, Box<dyn NodeEntry>> {
+    factories(vec![
+        ("src", Box::new(SourceNodeEntry::new())),
+        ("relay", Box::new(TwoFrameRelayEntry { context: None })),
+        ("sink", Box::new(SlowBlockSinkNodeEntry::new())),
+    ])
+}
+
+/// A `block` edge is read by its PRODUCER's info. The relay's info does not
+/// say it needs a publisher for every output, and it sends two frames at every
+/// fire into the sink's `block` slot of depth 2; the sink, a
+/// `#[cerulion_node]` node whose info says so, takes one frame per 50 ms. So
+/// the relay is held between its fires and its slot counts past the depth at
+/// them, which from a producer that can send several frames in one fire is no
+/// release, and the bag shows more frames than fires at every stamp the relay
+/// fired at, which from such a producer refuses no count. Every hold stands:
+/// the replay reads clean, the same twice. Read by the sink's info, or as a
+/// producer that sends one frame per fire, the edge would hold nothing past
+/// the relay's first two fires.
+#[test]
+#[serial]
+fn a_producer_that_can_send_several_frames_per_fire_is_judged_by_its_own_info() {
+    let rec = record_uniform_with_read_log(TF_YAML, tf_factories, &[], TF_STEPS);
+    let fires = bh_fire_steps(&rec, "relay");
+    assert!(
+        fires.len() >= 2 && fires.len() < TF_STEPS,
+        "the relay fires, and its slot holds it at some steps: {fires:?}"
+    );
+    assert_eq!(
+        rec.messages["/tf/relay/out"].len(),
+        2 * fires.len(),
+        "two frames at every fire"
+    );
+    let one = |l: u32| std::collections::BTreeSet::from([l]);
+    let levels = nt_fire_levels(&rec);
+    assert_eq!(
+        (levels["relay"].clone(), levels["sink"].clone()),
+        (one(1), one(2))
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let bag = dir.path().join("tf.mcap");
+    ri_bag_labelled(&rec, &bag, ri_free_run_recorder_json(), false);
+    let outcome = bh_replay_stamped(&bag, tf_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
+        None
+    );
+    let again = bh_replay_stamped(&bag, tf_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
+}
+
 /// A relay nothing holds, on a bag that states its drain: its last fire is
 /// taken out, so its last step pops a frame and fires nothing. The finding is
 /// that step, and it carries no caveat.

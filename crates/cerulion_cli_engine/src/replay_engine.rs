@@ -13484,9 +13484,10 @@ fn recorded_fire_instants(
 /// fires at a stamp shows a fire that sent several frames, or a frame no
 /// recorded fire sent. Equal totals do not say which fire sent which frame:
 /// two fires at one stamp, the first sending nothing and the second two
-/// frames, match two frames. Whether one fire can send several frames is the
-/// producer's node info's to say ([`producer_sends_per_fire`]). Frames stamped
-/// before `from_ns` precede the trace and are not compared.
+/// frames, match two frames. [`local_block_holds`] reads the answer only for a
+/// producer that sends at most one frame per fire ([`producer_sends_per_fire`]),
+/// for which more frames than fires at a stamp is a frame no fire sent. Frames
+/// stamped before `from_ns` precede the trace and are not compared.
 fn writes_past_fires(frame_stamps: &[u64], fire_instants: &[u64], from_ns: u64) -> bool {
     let start = frame_stamps.partition_point(|&at| at < from_ns);
     let frames = &frame_stamps[start..];
@@ -13613,11 +13614,14 @@ fn producer_sends_per_fire(
 /// stops (`stops_recorded` false: a stamp below
 /// [`NODE_STOPS_MIN_TRACE_FORMAT`], or none): a consumer's stop releases its
 /// slot live, and such a trace keeps no record of it. And so does an edge
-/// whose producer the bag shows writing more frames to the topic than it
-/// fires (`writes_past_fires(producer, topic)`, [`writes_past_fires`]): its
-/// slot can pass the depth while it holds, which the replay reads as a
-/// release. Each edge carries how many frames one fire of its producer can
-/// send (`producer_sends(producer)`, [`producer_sends_per_fire`]): the replay
+/// whose producer sends at most one frame per fire and that the bag shows
+/// writing more frames to the topic than it fires (`writes_past_fires(producer,
+/// topic)`, [`writes_past_fires`]): for such a producer that shows a frame no
+/// fire sent, and its slot can pass the depth while it holds, which the replay
+/// reads as its release. A producer that can send several frames in one fire
+/// keeps its edges however its frames outnumber its fires. Each edge carries
+/// how many frames one fire of its producer can send
+/// (`producer_sends(producer)`, [`producer_sends_per_fire`]), and the replay
 /// reads a count past the depth as a release only from a producer that sends
 /// at most one.
 fn local_block_holds(
@@ -13631,6 +13635,7 @@ fn local_block_holds(
     let mut holds: BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> = BTreeMap::new();
     for flow in flows {
         for producer in &flow.producers {
+            let sends = producer_sends(producer);
             let edges = flow
                 .consumers
                 .iter()
@@ -13639,7 +13644,8 @@ fn local_block_holds(
                     consumer_input: c.input.clone(),
                     depth: c.depth,
                     record: if !stops_recorded
-                        || writes_past_fires(producer, &flow.topic)
+                        || (sends == replay_rederive::SendsPerFire::AtMostOne
+                            && writes_past_fires(producer, &flow.topic))
                         || c.released_on_timeout
                         || !c.pinned
                         || !recorded_after(levels, producer, &c.node)
@@ -13649,7 +13655,7 @@ fn local_block_holds(
                         record_of(&flow.topic, &c.node, &c.input)
                     },
                     reads_before: c.reads_before.clone(),
-                    producer_sends: producer_sends(producer),
+                    producer_sends: sends,
                 });
             holds.entry(producer.clone()).or_default().extend(edges);
         }
@@ -40723,19 +40729,23 @@ mod trigger_input_capacity_tests {
                 ("m".to_string(), vec![edge("n", 5, "/lb/bus")]),
             ])
         );
-        // A producer the bag shows writing more frames than it fires counts no
-        // edge of its topic.
+        // A producer that sends at most one frame per fire and that the bag
+        // shows writing more frames than it fires counts no edge of its topic;
+        // one that can send several frames in one fire keeps its edges.
         let past = local_block_holds(
             &block_hold_flows(&config, &infos, Some(&queues_as_built(&config, &infos)), 0)
                 .expect("builds"),
             &levels,
             true,
-            &|producer, topic| producer == "h" && topic == "/lb/h/out",
+            &|producer, topic| {
+                (producer == "h" && topic == "/lb/h/out")
+                    || (producer == "c" && topic == "/lb/c/out")
+            },
             &sends,
             &record_of,
         );
         let mut expected_past = held.clone();
-        for e in expected_past.get_mut("h").expect("h produces a held topic") {
+        for e in expected_past.get_mut("c").expect("c produces a held topic") {
             e.record = SlotRecord::Unaccounted;
         }
         assert_eq!(past, expected_past);

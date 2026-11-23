@@ -295,9 +295,10 @@ frame header it cannot parse, its record-health stamp is absent or malformed,
 keeps no entry for the topic, reports the topic lossy or written by several
 publishers (declared or observed), or any frame drained and never written,
 the bag has no `recorder.json` or one stamped below `trace_format` 12, so its
-trace does not hold the stop that releases a consumer's slot, the recording
-shows the producer sending more frames at a stamp than it fired at that stamp,
-which several steps can share, the graph lists the topic in
+trace does not hold the stop that releases a consumer's slot, the producer's
+metadata says it needs a publisher for every output and the recording shows it
+sending more frames at a stamp than it fired at that stamp, which several steps
+can share, the graph lists the topic in
 `multi_publisher_topics`, the recording does not pin
 the input's `block` policy and depth (its `recorder.json` names the input's
 queue with another policy or depth than the replayed build gives it, or, on a
