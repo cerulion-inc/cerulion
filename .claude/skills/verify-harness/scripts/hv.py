@@ -78,8 +78,6 @@ def get(url, timeout=10):
 
 
 def rpc(url, method, params, query, n=1, timeout=900):
-    """One MCP request in the per-request form (no session), as harness/tests/test_playground_transports.py
-    sends it. Returns the JSON-RPC answer."""
     message = {"jsonrpc": "2.0", "id": n, "method": method, "params": dict(params, _meta={
         "io.modelcontextprotocol/protocolVersion": PROTOCOL, "io.modelcontextprotocol/clientCapabilities": {}})}
     headers = {"content-type": "application/json", "accept": "application/json, text/event-stream",
@@ -116,9 +114,8 @@ def evidence(run, name):
     return folder, f"{seq:03d}-{re.sub(r'[^A-Za-z0-9_.-]+', '_', name)}"
 
 
-def clean_python():
-    """An interpreter for the unit tests that has no MCP SDK: the tests skip the transport cases without one,
-    and fail against an SDK of another version than the pinned one."""
+def python_without_mcp_sdk():
+    # harness/tests skips its transport cases without an MCP SDK and fails them against an unpinned one.
     names = []
     if shutil.which("uv"):
         for version in ("3.12", "3.13", "3.11", "3.10"):
@@ -151,7 +148,7 @@ def cmd_doctor(ns):
                    diff.stdout.strip().replace("\n", "; ") or ("git: " + diff.stderr.strip() if diff.returncode else ""))
     free_gb = shutil.disk_usage(h).free / 2**30
     good &= report(free_gb >= 5, "disk free beside the harness", f"{free_gb:.1f} GB (the install refuses under 5)")
-    py, version = clean_python()
+    py, version = python_without_mcp_sdk()
     good &= report(py is not None, "clean Python for the unit tests", f"{py} {version}" if py else
                    "no Python 3.10+ without an MCP SDK on PATH (uv python install 3.12 gives one)")
     cli = ns.cli or shutil.which("cerulion")
@@ -177,7 +174,7 @@ def cmd_test(ns):
     repo = h.parent
     run = RUNS / ("test-" + stamp())
     run.mkdir(parents=True, exist_ok=True)
-    py, version = clean_python()
+    py, version = python_without_mcp_sdk()
     steps = []
     if py:
         steps.append(("unit tests, " + version + " without an MCP SDK",
@@ -373,9 +370,8 @@ def cmd_episode(ns):
     return 0 if good else 1
 
 
-def ours(meta, eids):
-    """Processes left by this server's episodes: the simulators run in sessions of their own, so the server's
-    process group does not hold them, and each one's command line names its episode's work folder."""
+def leftover_episode_processes(meta, eids):
+    # The simulators run in sessions of their own, outside the server's process group.
     settings = json.loads((Path(meta["harness"]) / "playground" / "settings.json").read_text())
     work = settings["work_root"].replace("{uid}", str(os.getuid()))
     ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout.splitlines()
@@ -407,7 +403,7 @@ def cmd_down(ns):
         if alive(pid):
             print(f"hv: the server did not stop in {ns.wait} s; sending SIGKILL to its group")
             os.killpg(pid, signal.SIGKILL)
-    left = ours(meta, eids)
+    left = leftover_episode_processes(meta, eids)
     for p, command in left:
         print(f"hv: stopping a leftover process of this run: {p} {command}")
         os.kill(p, signal.SIGTERM)
@@ -417,8 +413,6 @@ def cmd_down(ns):
 
 
 def cmd_stdio(ns):
-    """The stdio transport as a client that starts the server itself sees it: every stdout line is a JSON-RPC
-    message, a claim ends the episode, and listing the tools again starts the next one."""
     import queue
     import threading
     h = harness_dir(ns.harness)

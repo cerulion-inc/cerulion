@@ -73,7 +73,8 @@ bash harness/install.sh --check    # exit 0 when installed; writes nothing
 
 It needs `git`, `curl`, network access to GitHub, Hugging Face and PyPI, and 5 GB free to start. It writes
 `harness/bx/`, `harness/venv/` and a body record for this machine, all ignored by git. With uv's cache warm,
-a second worktree installs in about 2.5 minutes and about 1.8 GB. The first episode of a robot body with no
+a second worktree installs in about 2.5 minutes and about 1.8 GB. On a small or shared disk, ask the operator before the
+first install. The first episode of a robot body with no
 record on this machine measures one first (one to two minutes).
 
 ## Tier 2: launch the sim server
@@ -84,8 +85,8 @@ $HV up --task open-drawer               # bowl-on-plate (default), open-drawer, 
 $HV up --cli "$(command -v cerulion)"   # the user path: cerulion rcp --sim, needs cerulion 2.1.0+ and login
 ```
 
-Ready means `/health` answers 200. `up` prints the MCP URL and the run folder. One server per checkout:
-`up` refuses while one runs. With `rcp.sh`, the server's own record goes to the run folder's `home/`
+Ready means `/health` answers 200. `up` prints the MCP URL and the run folder. Leave `--port` unset: a
+fixed port can collide with another server. One server per checkout: `up` refuses while one runs. With `rcp.sh`, the server's own record goes to the run folder's `home/`
 (`CERULION_HOME`). With `--cli`, the CLI needs the real `~/.cerulion` for its login, so episode records go
 to `~/.cerulion/sim/episodes/`.
 
