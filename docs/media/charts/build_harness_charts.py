@@ -15,6 +15,11 @@ total it leaves out. Standard library only: the same package gives the same byte
     python3 docs/media/charts/build_harness_charts.py           # write the two SVGs
     python3 docs/media/charts/build_harness_charts.py --check   # write nothing; exit 1 if a chart differs
 
+The two SVGs are theme-aware sources (see THEME). After a run, write their fixed-palette twins
+(docs/media/<name>-light.svg and <name>-dark.svg) with:
+
+    python3 tools/scripts/build_media_theme_variants.py
+
 The form of both charts:
   - one row per model, ordered by the share of finished episodes solved WITHOUT Cerulion, lowest
     first, ties by name; the same order in both charts; no model is marked for its results; a model
@@ -47,6 +52,7 @@ import html
 import importlib.util
 import json
 import os
+import re
 import sys
 import textwrap
 
@@ -66,13 +72,22 @@ PCT_FULL = 850      # x of 100 percent
 USD_CUT = 30.0      # the cost scale ends here
 USD_CUT_X = 810     # x of the cut
 USD_BROKEN_W = 650  # a broken bar is drawn this wide
-WITHOUT = "#eb6834"
-WITH = "#2a78d6"
-INK = "#171717"
-MUTED = "#555"
-SOFT = "#666"
-GRID = "#e6e6e6"
-AXIS = "#8a8a8a"
+# The charts are theme-aware: every colour is a CSS custom property, with the light value in `:root`
+# and the dark value in one `prefers-color-scheme: dark` block. tools/scripts/build_media_theme_variants.py
+# writes the fixed `-light` and `-dark` twins the README names in a <picture> block. The dark values are
+# for GitHub's dark page (#0d1117): the two arms and every text colour at least 3:1 against it.
+THEME = [  # (custom property, light, dark)
+    ("paper", "#fff", "#0d1117"),        # the ground, and the white gap that breaks a long bar
+    ("ink", "#171717", "#e6edf3"),
+    ("value", "#333", "#c9d1d9"),        # the figure at the end of a bar
+    ("muted", "#555", "#9da7b3"),
+    ("soft", "#666", "#9198a1"),
+    ("grid", "#e6e6e6", "#262c36"),
+    ("axis", "#8a8a8a", "#6e7681"),
+    ("without", "#eb6834", "#df6c32"),
+    ("with", "#2a78d6", "#498de5"),
+]
+PAPER, INK, VALUE, MUTED, SOFT, GRID, AXIS, WITHOUT, WITH = (f"var(--{name})" for name, _, _ in THEME)
 NUMBER_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
 
 
@@ -101,17 +116,24 @@ def esc(s):
     return html.escape(s, quote=True)
 
 
+def theme_style():
+    """The light values in `:root`, the dark values in one `prefers-color-scheme: dark` block."""
+    light = ";".join(f"--{name}:{value}" for name, value, _ in THEME)
+    dark = ";".join(f"--{name}:{value}" for name, _, value in THEME)
+    return f"<style>:root{{{light}}}@media(prefers-color-scheme:dark){{:root{{{dark}}}}}</style>"
+
+
 def text(x, y, s, size, fill, anchor=None, weight=None):
     a = f' text-anchor="{anchor}"' if anchor else ""
     w = f' font-weight="{weight}"' if weight else ""
-    return f'<text x="{x}" y="{y}" font-size="{size}"{w} fill="{fill}"{a}>{esc(s)}</text>'
+    return f'<text x="{x}" y="{y}" font-size="{size}"{w} style="fill:{fill}"{a}>{esc(s)}</text>'
 
 
 def bar(y, width, fill, title):
     """A bar from the zero line with its right end rounded."""
     r = min(4.0, width / 2)
     return (f'<path d="M{LEFT:.1f},{y} h{width - r:.1f} a{r:g},{r:g} 0 0 1 {r:g},{r:g} v{BAR - 2 * r:.1f} '
-            f'a{r:g},{r:g} 0 0 1 -{r:g},{r:g} h-{width - r:.1f} z" fill="{fill}"><title>{esc(title)}</title></path>')
+            f'a{r:g},{r:g} 0 0 1 -{r:g},{r:g} h-{width - r:.1f} z" style="fill:{fill}"><title>{esc(title)}</title></path>')
 
 
 def rows_of(rc):
@@ -139,24 +161,29 @@ def frame(title, subtitle, ticks, rows, footer):
     height = bottom + 48 + 18 * len(footer)
     s = [f'<svg viewBox="0 0 {WIDTH} {height}" xmlns="http://www.w3.org/2000/svg" '
          f'font-family="system-ui,-apple-system,Segoe UI,sans-serif" role="img" aria-label="{esc(title)}">',
-         f'<rect width="{WIDTH}" height="{height}" fill="#fff"/>',
+         theme_style(),
+         f'<rect width="{WIDTH}" height="{height}" style="fill:{PAPER}"/>',
          text(24, 34, title, 19, INK, weight="650")]
     s += [text(24, 56 + SUB_LINE * j, line, 13, MUTED) for j, line in enumerate(subtitle)]
-    s += [f'<rect x="24" y="{84 + shift}" width="14" height="10" rx="2" fill="{WITHOUT}"/>',
+    s += [f'<rect x="24" y="{84 + shift}" width="14" height="10" rx="2" style="fill:{WITHOUT}"/>',
           text(44, 93 + shift, f"without {NAME}", 13, INK),
-          f'<rect x="170" y="{84 + shift}" width="14" height="10" rx="2" fill="{WITH}"/>',
+          f'<rect x="170" y="{84 + shift}" width="14" height="10" rx="2" style="fill:{WITH}"/>',
           text(190, 93 + shift, f"with {NAME}", 13, INK)]
     for x, label in ticks:
-        s.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{bottom}" stroke="{GRID}" stroke-width="1"/>')
+        s.append(f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{bottom}" style="stroke:{GRID}" stroke-width="1"/>')
         s.append(text(f"{x:.1f}", bottom + 18, label, 12, SOFT, anchor="middle"))
-    s.append(f'<line x1="{LEFT:.1f}" y1="{top}" x2="{LEFT:.1f}" y2="{bottom}" stroke="{AXIS}" stroke-width="1"/>')
+    s.append(f'<line x1="{LEFT:.1f}" y1="{top}" x2="{LEFT:.1f}" y2="{bottom}" style="stroke:{AXIS}" stroke-width="1"/>')
     for i, parts in enumerate(rows):
         y = top + ROW * i
         s.extend(parts(y))
     for j, line in enumerate(footer):
         s.append(text(24, bottom + 44 + 18 * j, line, 12, SOFT))
     s.append("</svg>")
-    return "".join(s) + "\n"
+    svg = "".join(s) + "\n"
+    body = svg.replace(theme_style(), "", 1)
+    if re.search(r"#[0-9a-fA-F]{3,8}\b", body) or re.search(r'\b(?:fill|stroke)="', body):
+        raise SystemExit("build_harness_charts: a colour outside THEME")
+    return svg
 
 
 def star_footer(rows, when, cells):
@@ -241,7 +268,7 @@ def success_chart(rows, when, cells, task_rows, joined, filtered):
                 tip = f"{r['model']}, {arm} {NAME}: {solved_of(s)} solved"
                 if w > 0:
                     out.append(bar(y + dy, w, fill, tip))
-                out.append(text(f"{LEFT + w + 5:.1f}", y + dy + 11, solved_of(s), 11.5, "#333"))
+                out.append(text(f"{LEFT + w + 5:.1f}", y + dy + 11, solved_of(s), 11.5, VALUE))
             return out
         return parts
 
@@ -269,21 +296,21 @@ def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd, filtered)
                 s = r[arm]
                 v = s["usd_per_solved"]
                 if v is None:
-                    out.append(text(f"{LEFT + 5:.1f}", y + dy + 11, "none solved", 11.5, "#333"))
+                    out.append(text(f"{LEFT + 5:.1f}", y + dy + 11, "none solved", 11.5, VALUE))
                     continue
                 tip = f"{r['model']}, {arm} {NAME}: ${fnum(v, 2)} a success, {solved_of(s)} solved"
                 if v > USD_CUT:
                     out.append(bar(y + dy, USD_BROKEN_W, fill, tip))
                     for x0 in (LEFT + USD_BROKEN_W - 23, LEFT + USD_BROKEN_W - 16):
                         d = f"M{x0:.1f},{y + dy + 16} L{x0 + 6:.1f},{y + dy - 3}"
-                        out.append(f'<path d="{d}" stroke="#fff" stroke-width="4"/>')
-                        out.append(f'<path d="{d}" stroke="{MUTED}" stroke-width="1.2"/>')
-                    out.append(text(f"{LEFT + USD_BROKEN_W + 5:.1f}", y + dy + 11, f"${fnum(v, 2)}", 11.5, "#333",
+                        out.append(f'<path d="{d}" style="stroke:{PAPER}" stroke-width="4"/>')
+                        out.append(f'<path d="{d}" style="stroke:{MUTED}" stroke-width="1.2"/>')
+                    out.append(text(f"{LEFT + USD_BROKEN_W + 5:.1f}", y + dy + 11, f"${fnum(v, 2)}", 11.5, VALUE,
                                     weight="600"))
                     continue
                 w = v * scale
                 out.append(bar(y + dy, w, fill, tip))
-                out.append(text(f"{LEFT + w + 5:.1f}", y + dy + 11, f"${fnum(v, 2)}", 11.5, "#333"))
+                out.append(text(f"{LEFT + w + 5:.1f}", y + dy + 11, f"${fnum(v, 2)}", 11.5, VALUE))
             return out
         return parts
 

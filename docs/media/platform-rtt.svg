@@ -19,7 +19,7 @@
   </rdf:RDF>
  </metadata>
  <defs>
-  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}:root{--paper:#ffffff;--text:#172b45;--muted:#53677c;--grid:#e3eaf1;--frame:#ccd7e3;--key-ink:#4b5f78;--brand:#5d7491;--blue:#2563eb;--orange:#d36b26;--red:#d1242f}@media(prefers-color-scheme:dark){:root{--paper:#0d1117;--text:#e6edf3;--muted:#9198a1;--grid:#262c36;--frame:#3d444d;--key-ink:#9ba7b4;--brand:#7d8fa6;--blue:#4588f7;--orange:#d66400;--red:#e63e84}}</style>
  </defs>
  <g id="platform-rtt-figure_1">
   <g id="platform-rtt-patch_1">
@@ -28,7 +28,7 @@ L 936 650.5
 L 936 0 
 L 0 0 
 z
-" style="fill: #ffffff"/>
+" style="fill: var(--paper)"/>
   </g>
   <g id="platform-rtt-data-axes-0">
    <g id="platform-rtt-patch_2">
@@ -37,121 +37,121 @@ L 847.08 501
 L 847.08 201 
 L 93.6 201 
 z
-" style="fill: #ffffff"/>
+" style="fill: var(--paper)"/>
    </g>
    <g id="platform-rtt-matplotlib.axis_1">
     <g id="platform-rtt-xtick_1">
      <g id="platform-rtt-line2d_1">
       <path d="M 116.108789 501 
 L 116.108789 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_2"/>
      <g id="platform-rtt-text_1">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="116.108789" y="517.925781" transform="rotate(-0 116.108789 517.925781)">64 B</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="116.108789" y="517.925781" transform="rotate(-0 116.108789 517.925781)">64 B</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_2">
      <g id="platform-rtt-line2d_3">
       <path d="M 194.572817 501 
 L 194.572817 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_4"/>
      <g id="platform-rtt-text_2">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="194.572817" y="517.925781" transform="rotate(-0 194.572817 517.925781)">256 B</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="194.572817" y="517.925781" transform="rotate(-0 194.572817 517.925781)">256 B</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_3">
      <g id="platform-rtt-line2d_5">
       <path d="M 273.036845 501 
 L 273.036845 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_6"/>
      <g id="platform-rtt-text_3">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="273.036845" y="517.925781" transform="rotate(-0 273.036845 517.925781)">1 KiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="273.036845" y="517.925781" transform="rotate(-0 273.036845 517.925781)">1 KiB</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_4">
      <g id="platform-rtt-line2d_7">
       <path d="M 351.500873 501 
 L 351.500873 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_8"/>
      <g id="platform-rtt-text_4">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="351.500873" y="517.925781" transform="rotate(-0 351.500873 517.925781)">4 KiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="351.500873" y="517.925781" transform="rotate(-0 351.500873 517.925781)">4 KiB</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_5">
      <g id="platform-rtt-line2d_9">
       <path d="M 429.964902 501 
 L 429.964902 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_10"/>
      <g id="platform-rtt-text_5">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="429.964902" y="517.925781" transform="rotate(-0 429.964902 517.925781)">16 KiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="429.964902" y="517.925781" transform="rotate(-0 429.964902 517.925781)">16 KiB</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_6">
      <g id="platform-rtt-line2d_11">
       <path d="M 508.42893 501 
 L 508.42893 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_12"/>
      <g id="platform-rtt-text_6">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="508.42893" y="517.925781" transform="rotate(-0 508.42893 517.925781)">64 KiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="508.42893" y="517.925781" transform="rotate(-0 508.42893 517.925781)">64 KiB</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_7">
      <g id="platform-rtt-line2d_13">
       <path d="M 586.892958 501 
 L 586.892958 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_14"/>
      <g id="platform-rtt-text_7">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="586.892958" y="517.925781" transform="rotate(-0 586.892958 517.925781)">256 KiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="586.892958" y="517.925781" transform="rotate(-0 586.892958 517.925781)">256 KiB</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_8">
      <g id="platform-rtt-line2d_15">
       <path d="M 665.356986 501 
 L 665.356986 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_16"/>
      <g id="platform-rtt-text_8">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="665.356986" y="517.925781" transform="rotate(-0 665.356986 517.925781)">1 MiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="665.356986" y="517.925781" transform="rotate(-0 665.356986 517.925781)">1 MiB</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_9">
      <g id="platform-rtt-line2d_17">
       <path d="M 743.821014 501 
 L 743.821014 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_18"/>
      <g id="platform-rtt-text_9">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="743.821014" y="517.925781" transform="rotate(-0 743.821014 517.925781)">4 MiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="743.821014" y="517.925781" transform="rotate(-0 743.821014 517.925781)">4 MiB</text>
      </g>
     </g>
     <g id="platform-rtt-xtick_10">
      <g id="platform-rtt-line2d_19">
       <path d="M 822.285042 501 
 L 822.285042 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-opacity: 0.55; stroke-width: 0.7; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_20"/>
      <g id="platform-rtt-text_10">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #53677c" x="822.285042" y="517.925781" transform="rotate(-0 822.285042 517.925781)">16 MiB</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--muted)" x="822.285042" y="517.925781" transform="rotate(-0 822.285042 517.925781)">16 MiB</text>
      </g>
     </g>
     <g id="platform-rtt-text_11">
-     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #172b45" x="470.34" y="540.256328" transform="rotate(-0 470.34 540.256328)">Payload size (log scale)</text>
+     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--text)" x="470.34" y="540.256328" transform="rotate(-0 470.34 540.256328)">Payload size (log scale)</text>
     </g>
    </g>
    <g id="platform-rtt-matplotlib.axis_2">
@@ -159,124 +159,124 @@ L 822.285042 201
      <g id="platform-rtt-line2d_21">
       <path d="M 93.6 484.710938 
 L 847.08 484.710938 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-width: 0.9; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-width: 0.9; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_22"/>
      <g id="platform-rtt-text_12">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: #53677c" x="85.6" y="489.173828" transform="rotate(-0 85.6 489.173828)">2 µs</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--muted)" x="85.6" y="489.173828" transform="rotate(-0 85.6 489.173828)">2 µs</text>
      </g>
     </g>
     <g id="platform-rtt-ytick_2">
      <g id="platform-rtt-line2d_23">
       <path d="M 93.6 461.752794 
 L 847.08 461.752794 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-width: 0.9; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-width: 0.9; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_24"/>
      <g id="platform-rtt-text_13">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: #53677c" x="85.6" y="466.215684" transform="rotate(-0 85.6 466.215684)">3 µs</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--muted)" x="85.6" y="466.215684" transform="rotate(-0 85.6 466.215684)">3 µs</text>
      </g>
     </g>
     <g id="platform-rtt-ytick_3">
      <g id="platform-rtt-line2d_25">
       <path d="M 93.6 393.581747 
 L 847.08 393.581747 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-width: 0.9; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-width: 0.9; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_26"/>
      <g id="platform-rtt-text_14">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: #53677c" x="85.6" y="398.044638" transform="rotate(-0 85.6 398.044638)">10 µs</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--muted)" x="85.6" y="398.044638" transform="rotate(-0 85.6 398.044638)">10 µs</text>
      </g>
     </g>
     <g id="platform-rtt-ytick_4">
      <g id="platform-rtt-line2d_27">
       <path d="M 93.6 331.376397 
 L 847.08 331.376397 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-width: 0.9; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-width: 0.9; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_28"/>
      <g id="platform-rtt-text_15">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: #53677c" x="85.6" y="335.839288" transform="rotate(-0 85.6 335.839288)">30 µs</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--muted)" x="85.6" y="335.839288" transform="rotate(-0 85.6 335.839288)">30 µs</text>
      </g>
     </g>
     <g id="platform-rtt-ytick_5">
      <g id="platform-rtt-line2d_29">
       <path d="M 93.6 263.20535 
 L 847.08 263.20535 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-width: 0.9; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-width: 0.9; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_30"/>
      <g id="platform-rtt-text_16">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: #53677c" x="85.6" y="267.668241" transform="rotate(-0 85.6 267.668241)">100 µs</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--muted)" x="85.6" y="267.668241" transform="rotate(-0 85.6 267.668241)">100 µs</text>
      </g>
     </g>
     <g id="platform-rtt-ytick_6">
      <g id="platform-rtt-line2d_31">
       <path d="M 93.6 201 
 L 847.08 201 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #e3eaf1; stroke-width: 0.9; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--grid); stroke-width: 0.9; stroke-linecap: round"/>
      </g>
      <g id="platform-rtt-line2d_32"/>
      <g id="platform-rtt-text_17">
-      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: #53677c" x="85.6" y="205.462891" transform="rotate(-0 85.6 205.462891)">300 µs</text>
+      <text style="font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--muted)" x="85.6" y="205.462891" transform="rotate(-0 85.6 205.462891)">300 µs</text>
      </g>
     </g>
     <g id="platform-rtt-text_18">
-     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: #172b45" x="33.283594" y="351" transform="rotate(-90 33.283594 351)">Round-trip latency</text>
+     <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: middle; fill: var(--text)" x="33.283594" y="351" transform="rotate(-90 33.283594 351)">Round-trip latency</text>
     </g>
    </g>
    <g id="platform-rtt-end-leader:0">
     <path d="M 826.992884 465.618861 
 L 834.054646 466.042856 
-" style="fill: none; stroke: #2563eb; stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--blue); stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
    </g>
    <g id="platform-rtt-end-leader:1">
     <path d="M 826.992884 447.878455 
 L 834.054646 451.042856 
-" style="fill: none; stroke: #d1242f; stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--red); stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
    </g>
    <g id="platform-rtt-end-leader:2">
     <path d="M 826.992884 439.631252 
 L 834.054646 436.042856 
-" style="fill: none; stroke: #2563eb; stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--blue); stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
    </g>
    <g id="platform-rtt-end-leader:4">
     <path d="M 826.992884 342.555523 
 L 834.054646 344.936986 
-" style="fill: none; stroke: #d36b26; stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--orange); stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
    </g>
    <g id="platform-rtt-end-leader:5">
     <path d="M 826.992884 332.318449 
 L 834.054646 329.936986 
-" style="fill: none; stroke: #d36b26; stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--orange); stroke-opacity: 0.6; stroke-width: 0.8; stroke-linecap: round"/>
    </g>
    <g id="platform-rtt-patch_3">
     <path d="M 93.6 501 
 L 93.6 201 
-" style="fill: none; stroke: #ccd7e3; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+" style="fill: none; stroke: var(--frame); stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="platform-rtt-patch_4">
     <path d="M 93.6 501 
 L 847.08 501 
-" style="fill: none; stroke: #ccd7e3; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
+" style="fill: none; stroke: var(--frame); stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square"/>
    </g>
    <g id="platform-rtt-end-label:0">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #2563eb" x="836.408567" y="469.374887" transform="rotate(-0 836.408567 469.374887)">2.80 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--blue)" x="836.408567" y="469.374887" transform="rotate(-0 836.408567 469.374887)">2.80 µs</text>
    </g>
    <g id="platform-rtt-end-label:1">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d1242f" x="836.408567" y="454.374888" transform="rotate(-0 836.408567 454.374888)">3.83 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--red)" x="836.408567" y="454.374888" transform="rotate(-0 836.408567 454.374888)">3.83 µs</text>
    </g>
    <g id="platform-rtt-end-label:2">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #2563eb" x="836.408567" y="439.374888" transform="rotate(-0 836.408567 439.374888)">4.43 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--blue)" x="836.408567" y="439.374888" transform="rotate(-0 836.408567 439.374888)">4.43 µs</text>
    </g>
    <g id="platform-rtt-end-label:3">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d1242f" x="836.408567" y="399.574253" transform="rotate(-0 836.408567 399.574253)">9.54 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--red)" x="836.408567" y="399.574253" transform="rotate(-0 836.408567 399.574253)">9.54 µs</text>
    </g>
    <g id="platform-rtt-end-label:4">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="348.269017" transform="rotate(-0 836.408567 348.269017)">24.62 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--orange)" x="836.408567" y="348.269017" transform="rotate(-0 836.408567 348.269017)">24.62 µs</text>
    </g>
    <g id="platform-rtt-end-label:5">
-    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #d36b26" x="836.408567" y="333.269017" transform="rotate(-0 836.408567 333.269017)">29.50 µs</text>
+    <text style="font-weight: 700; font-size: 12.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--orange)" x="836.408567" y="333.269017" transform="rotate(-0 836.408567 333.269017)">29.50 µs</text>
    </g>
    <g id="platform-rtt-FillBetweenPolyCollection_1">
     <defs>
@@ -306,7 +306,7 @@ z
 "/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-mab85736259" x="0" y="650.5" style="fill: #d1242f; fill-opacity: 0.11"/>
+     <use xlink:href="#platform-rtt-mab85736259" x="0" y="650.5" style="fill: var(--red); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="platform-rtt-FillBetweenPolyCollection_2">
@@ -337,7 +337,7 @@ z
 "/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-m1561348cfe" x="0" y="650.5" style="fill: #d1242f; fill-opacity: 0.11"/>
+     <use xlink:href="#platform-rtt-m1561348cfe" x="0" y="650.5" style="fill: var(--red); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="platform-rtt-FillBetweenPolyCollection_3">
@@ -368,7 +368,7 @@ z
 "/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-m68bc409815" x="0" y="650.5" style="fill: #d36b26; fill-opacity: 0.11"/>
+     <use xlink:href="#platform-rtt-m68bc409815" x="0" y="650.5" style="fill: var(--orange); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="platform-rtt-line2d_33">
@@ -382,7 +382,7 @@ L 586.892958 449.755757
 L 665.356986 451.037581 
 L 743.821014 447.878455 
 L 822.285042 447.878455 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: #d1242f; stroke-width: 2.2"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: var(--red); stroke-width: 2.2"/>
     <defs>
      <path id="platform-rtt-m76b8c2f4d5" d="M 0 3.2 
 C 0.84865 3.2 1.662656 2.862828 2.262742 2.262742 
@@ -394,19 +394,19 @@ C -2.862828 -1.662656 -3.2 -0.84865 -3.2 0
 C -3.2 0.84865 -2.862828 1.662656 -2.262742 2.262742 
 C -1.662656 2.862828 -0.84865 3.2 0 3.2 
 z
-" style="stroke: #ffffff; stroke-width: 0.9"/>
+" style="stroke: var(--paper); stroke-width: 0.9"/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="116.108789" y="449.118015" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="194.572817" y="450.385321" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="273.036845" y="449.118015" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="351.500873" y="451.037581" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="429.964902" y="451.037581" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="508.42893" y="451.037581" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="586.892958" y="449.755757" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="665.356986" y="451.037581" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="743.821014" y="447.878455" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="822.285042" y="447.878455" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="116.108789" y="449.118015" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="194.572817" y="450.385321" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="273.036845" y="449.118015" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="351.500873" y="451.037581" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="429.964902" y="451.037581" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="508.42893" y="451.037581" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="586.892958" y="449.755757" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="665.356986" y="451.037581" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="743.821014" y="447.878455" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="822.285042" y="447.878455" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-FillBetweenPolyCollection_4">
@@ -437,7 +437,7 @@ z
 "/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-m83bd9dba49" x="0" y="650.5" style="fill: #d36b26; fill-opacity: 0.11"/>
+     <use xlink:href="#platform-rtt-m83bd9dba49" x="0" y="650.5" style="fill: var(--orange); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="platform-rtt-line2d_34">
@@ -451,18 +451,18 @@ L 586.892958 399.283824
 L 665.356986 395.253889 
 L 743.821014 395.993516 
 L 822.285042 396.242221 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #d1242f; stroke-width: 2.2; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--red); stroke-width: 2.2; stroke-linecap: round"/>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="116.108789" y="399.027658" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="194.572817" y="398.247596" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="273.036845" y="395.015286" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="351.500873" y="398.506424" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="429.964902" y="395.259721" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="508.42893" y="394.535315" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="586.892958" y="399.283824" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="665.356986" y="395.253889" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="743.821014" y="395.993516" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="822.285042" y="396.242221" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="116.108789" y="399.027658" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="194.572817" y="398.247596" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="273.036845" y="395.015286" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="351.500873" y="398.506424" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="429.964902" y="395.259721" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="508.42893" y="394.535315" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="586.892958" y="399.283824" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="665.356986" y="395.253889" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="743.821014" y="395.993516" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="822.285042" y="396.242221" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-FillBetweenPolyCollection_5">
@@ -493,7 +493,7 @@ z
 "/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-m558d289b12" x="0" y="650.5" style="fill: #2563eb; fill-opacity: 0.11"/>
+     <use xlink:href="#platform-rtt-m558d289b12" x="0" y="650.5" style="fill: var(--blue); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="platform-rtt-line2d_35">
@@ -507,7 +507,7 @@ L 586.892958 345.425359
 L 665.356986 343.482819 
 L 743.821014 347.271737 
 L 822.285042 342.555523 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: #d36b26; stroke-width: 2.2"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: var(--orange); stroke-width: 2.2"/>
     <defs>
      <path id="platform-rtt-me8921d5b67" d="M 0 3.2 
 C 0.84865 3.2 1.662656 2.862828 2.262742 2.262742 
@@ -519,19 +519,19 @@ C -2.862828 -1.662656 -3.2 -0.84865 -3.2 0
 C -3.2 0.84865 -2.862828 1.662656 -2.262742 2.262742 
 C -1.662656 2.862828 -0.84865 3.2 0 3.2 
 z
-" style="stroke: #ffffff; stroke-width: 0.9"/>
+" style="stroke: var(--paper); stroke-width: 0.9"/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-me8921d5b67" x="116.108789" y="348.077145" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="194.572817" y="346.635559" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="273.036845" y="345.772324" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="351.500873" y="347.234263" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="429.964902" y="346.793935" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="508.42893" y="347.351765" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="586.892958" y="345.425359" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="665.356986" y="343.482819" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="743.821014" y="347.271737" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="822.285042" y="342.555523" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="116.108789" y="348.077145" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="194.572817" y="346.635559" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="273.036845" y="345.772324" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="351.500873" y="347.234263" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="429.964902" y="346.793935" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="508.42893" y="347.351765" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="586.892958" y="345.425359" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="665.356986" y="343.482819" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="743.821014" y="347.271737" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="822.285042" y="342.555523" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-FillBetweenPolyCollection_6">
@@ -562,7 +562,7 @@ z
 "/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-m267b8a169c" x="0" y="650.5" style="fill: #2563eb; fill-opacity: 0.11"/>
+     <use xlink:href="#platform-rtt-m267b8a169c" x="0" y="650.5" style="fill: var(--blue); fill-opacity: 0.11"/>
     </g>
    </g>
    <g id="platform-rtt-line2d_36">
@@ -576,18 +576,18 @@ L 586.892958 331.586286
 L 665.356986 328.032613 
 L 743.821014 331.981699 
 L 822.285042 332.318449 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #d36b26; stroke-width: 2.2; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--orange); stroke-width: 2.2; stroke-linecap: round"/>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-me8921d5b67" x="116.108789" y="341.102731" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="194.572817" y="339.651322" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="273.036845" y="334.509649" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="351.500873" y="336.988788" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="429.964902" y="338.134019" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="508.42893" y="333.906461" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="586.892958" y="331.586286" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="665.356986" y="328.032613" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="743.821014" y="331.981699" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="822.285042" y="332.318449" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="116.108789" y="341.102731" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="194.572817" y="339.651322" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="273.036845" y="334.509649" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="351.500873" y="336.988788" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="429.964902" y="338.134019" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="508.42893" y="333.906461" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="586.892958" y="331.586286" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="665.356986" y="328.032613" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="743.821014" y="331.981699" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="822.285042" y="332.318449" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-line2d_37">
@@ -601,7 +601,7 @@ L 586.892958 467.530065
 L 665.356986 466.474006 
 L 743.821014 466.289671 
 L 822.285042 465.618861 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: #2563eb; stroke-width: 2.2"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: var(--blue); stroke-width: 2.2"/>
     <defs>
      <path id="platform-rtt-mf9d078ca8e" d="M 0 3.2 
 C 0.84865 3.2 1.662656 2.862828 2.262742 2.262742 
@@ -613,19 +613,19 @@ C -2.862828 -1.662656 -3.2 -0.84865 -3.2 0
 C -3.2 0.84865 -2.862828 1.662656 -2.262742 2.262742 
 C -1.662656 2.862828 -0.84865 3.2 0 3.2 
 z
-" style="stroke: #ffffff; stroke-width: 0.9"/>
+" style="stroke: var(--paper); stroke-width: 0.9"/>
     </defs>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="116.108789" y="468.033933" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="194.572817" y="468.097233" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="273.036845" y="468.52105" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="351.500873" y="468.20289" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="429.964902" y="467.802437" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="508.42893" y="466.761949" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="586.892958" y="467.530065" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="665.356986" y="466.474006" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="743.821014" y="466.289671" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="822.285042" y="465.618861" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="116.108789" y="468.033933" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="194.572817" y="468.097233" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="273.036845" y="468.52105" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="351.500873" y="468.20289" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="429.964902" y="467.802437" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="508.42893" y="466.761949" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="586.892958" y="467.530065" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="665.356986" y="466.474006" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="743.821014" y="466.289671" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="822.285042" y="465.618861" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-line2d_38">
@@ -639,47 +639,47 @@ L 586.892958 444.970446
 L 665.356986 444.398011 
 L 743.821014 440.988223 
 L 822.285042 439.631252 
-" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: #2563eb; stroke-width: 2.2; stroke-linecap: round"/>
+" clip-path="url(#platform-rtt-p5a0bcf8d58)" style="fill: none; stroke: var(--blue); stroke-width: 2.2; stroke-linecap: round"/>
     <g clip-path="url(#platform-rtt-p5a0bcf8d58)">
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="116.108789" y="444.523173" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="194.572817" y="445.947073" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="273.036845" y="445.322354" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="351.500873" y="445.336476" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="429.964902" y="445.223599" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="508.42893" y="444.830293" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="586.892958" y="444.970446" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="665.356986" y="444.398011" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="743.821014" y="440.988223" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="822.285042" y="439.631252" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="116.108789" y="444.523173" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="194.572817" y="445.947073" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="273.036845" y="445.322354" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="351.500873" y="445.336476" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="429.964902" y="445.223599" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="508.42893" y="444.830293" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="586.892958" y="444.970446" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="665.356986" y="444.398011" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="743.821014" y="440.988223" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="822.285042" y="439.631252" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
   </g>
   <g id="platform-rtt-text_19">
-   <text style="font-weight: 700; font-size: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="93.6" y="44.61875" transform="rotate(-0 93.6 44.61875)">Native Cerulion on three platforms</text>
+   <text style="font-weight: 700; font-size: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="93.6" y="44.61875" transform="rotate(-0 93.6 44.61875)">Native Cerulion on three platforms</text>
   </g>
   <g id="platform-rtt-title-note">
-   <text style="font-weight: 700; font-size: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #2563eb" x="432.27" y="44.28125" transform="rotate(-0 432.27 44.28125)">lower is better</text>
+   <text style="font-weight: 700; font-size: 20px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--blue)" x="432.27" y="44.28125" transform="rotate(-0 432.27 44.28125)">lower is better</text>
   </g>
   <g id="platform-rtt-text_20">
-   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="67.502187" transform="rotate(-0 93.6 67.502187)">Same payload sweep on three machines  ·  colour = platform, line style = run shape</text>
+   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="67.502187" transform="rotate(-0 93.6 67.502187)">Same payload sweep on three machines  ·  colour = platform, line style = run shape</text>
   </g>
   <g id="platform-rtt-text_21">
-   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="84.282812" transform="rotate(-0 93.6 84.282812)">STOCK  ·  recorder ON  ·  fixed 100 Hz  ·  k=5</text>
+   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="84.282812" transform="rotate(-0 93.6 84.282812)">STOCK  ·  recorder ON  ·  fixed 100 Hz  ·  k=5</text>
   </g>
   <g id="platform-rtt-text_22">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="575.405781" transform="rotate(-0 93.6 575.405781)">Commanded 100 Hz; five sessions, 10,000 samples per point. Always-on recording included. Payload fill excluded.</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="575.405781" transform="rotate(-0 93.6 575.405781)">Commanded 100 Hz; five sessions, 10,000 samples per point. Always-on recording included. Payload fill excluded.</text>
   </g>
   <g id="platform-rtt-text_23">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="591.803359" transform="rotate(-0 93.6 591.803359)">Jetson: Linux for Tegra R36.4.3, governor schedutil, the stock governor of the Jetson.</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="591.803359" transform="rotate(-0 93.6 591.803359)">Jetson: Linux for Tegra R36.4.3, governor schedutil, the stock governor of the Jetson.</text>
   </g>
   <g id="platform-rtt-text_24">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="608.405781" transform="rotate(-0 93.6 608.405781)">Mac: Cerulion 2.0.0 on macOS 27.2.1, measured 2026-11-13, a later build than the x86-64 and Jetson rows. A multi-process consumer</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="608.405781" transform="rotate(-0 93.6 608.405781)">Mac: Cerulion 2.0.0 on macOS 27.2.1, measured 2026-11-13, a later build than the x86-64 and Jetson rows. A multi-process consumer</text>
   </g>
   <g id="platform-rtt-text_25">
-   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #53677c" x="93.6" y="624.711719" transform="rotate(-0 93.6 624.711719)">wakes on the publish. Multi-process p50 9.04 to 9.83 µs, single-process p50 3.62 to 3.83 µs.</text>
+   <text style="font-size: 11.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--muted)" x="93.6" y="624.711719" transform="rotate(-0 93.6 624.711719)">wakes on the publish. Multi-process p50 9.04 to 9.83 µs, single-process p50 3.62 to 3.83 µs.</text>
   </g>
   <g id="platform-rtt-text_26">
-   <text style="font-weight: 700; font-size: 10px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: #5d7491" x="879.84" y="638.5" transform="rotate(-0 879.84 638.5)">CERULION</text>
+   <text style="font-weight: 700; font-size: 10px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: end; fill: var(--brand)" x="879.84" y="638.5" transform="rotate(-0 879.84 638.5)">CERULION</text>
   </g>
   <g id="platform-rtt-patch_5">
    <path d="M 88.609 183.375 
@@ -692,7 +692,7 @@ Q 81.109 144.125 81.109 151.625
 L 81.109 175.875 
 Q 81.109 183.375 88.609 183.375 
 z
-" style="fill: #ffffff; opacity: 0.97; stroke: #ccd7e3; stroke-width: 0.9; stroke-linejoin: miter"/>
+" style="fill: var(--paper); opacity: 0.97; stroke: var(--frame); stroke-width: 0.9; stroke-linejoin: miter"/>
   </g>
   <g id="platform-rtt-patch_6">
    <path d="M 109.234 167.35 
@@ -705,10 +705,10 @@ C 106.013319 161.879512 105.634 162.795269 105.634 163.75
 C 105.634 164.704731 106.013319 165.620488 106.688416 166.295584 
 C 107.363512 166.970681 108.279269 167.35 109.234 167.35 
 z
-" style="fill: #4b5f78"/>
+" style="fill: var(--key-ink)"/>
   </g>
   <g id="platform-rtt-text_27">
-   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="132.234" y="167.110703" transform="rotate(-0 132.234 167.110703)">dot = p50</text>
+   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="132.234" y="167.110703" transform="rotate(-0 132.234 167.110703)">dot = p50</text>
   </g>
   <g id="platform-rtt-patch_7">
    <path d="M 212.690562 168.25 
@@ -716,47 +716,47 @@ L 238.690562 168.25
 L 238.690562 159.25 
 L 212.690562 159.25 
 z
-" style="fill: #4b5f78; opacity: 0.26"/>
+" style="fill: var(--key-ink); opacity: 0.26"/>
   </g>
   <g id="platform-rtt-text_28">
-   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="248.690562" y="167.110703" transform="rotate(-0 248.690562 167.110703)">band = p50 to p99</text>
+   <text style="font-size: 13px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="248.690562" y="167.110703" transform="rotate(-0 248.690562 167.110703)">band = p50 to p99</text>
   </g>
   <g id="platform-rtt-legend_1">
    <g id="platform-rtt-line2d_39">
     <path d="M 87.984 106.142656 
 L 105.534 106.142656 
 L 123.084 106.142656 
-" style="fill: none; stroke: #2563eb; stroke-width: 2.2; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--blue); stroke-width: 2.2; stroke-linecap: round"/>
     <g>
-     <use xlink:href="#platform-rtt-mf9d078ca8e" x="105.534" y="106.142656" style="fill: #2563eb; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-mf9d078ca8e" x="105.534" y="106.142656" style="fill: var(--blue); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-text_29">
-    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="132.534" y="110.867656" transform="rotate(-0 132.534 110.867656)">x86-64 desktop (Core Ultra 9 285K)</text>
+    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="132.534" y="110.867656" transform="rotate(-0 132.534 110.867656)">x86-64 desktop (Core Ultra 9 285K)</text>
    </g>
    <g id="platform-rtt-line2d_40">
     <path d="M 376.050797 106.142656 
 L 393.600797 106.142656 
 L 411.150797 106.142656 
-" style="fill: none; stroke: #d36b26; stroke-width: 2.2; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--orange); stroke-width: 2.2; stroke-linecap: round"/>
     <g>
-     <use xlink:href="#platform-rtt-me8921d5b67" x="393.600797" y="106.142656" style="fill: #d36b26; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-me8921d5b67" x="393.600797" y="106.142656" style="fill: var(--orange); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-text_30">
-    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="420.600797" y="110.867656" transform="rotate(-0 420.600797 110.867656)">Jetson Orin NX (Linux aarch64)</text>
+    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="420.600797" y="110.867656" transform="rotate(-0 420.600797 110.867656)">Jetson Orin NX (Linux aarch64)</text>
    </g>
    <g id="platform-rtt-line2d_41">
     <path d="M 637.102828 106.142656 
 L 654.652828 106.142656 
 L 672.202828 106.142656 
-" style="fill: none; stroke: #d1242f; stroke-width: 2.2; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--red); stroke-width: 2.2; stroke-linecap: round"/>
     <g>
-     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="654.652828" y="106.142656" style="fill: #d1242f; stroke: #ffffff; stroke-width: 0.9"/>
+     <use xlink:href="#platform-rtt-m76b8c2f4d5" x="654.652828" y="106.142656" style="fill: var(--red); stroke: var(--paper); stroke-width: 0.9"/>
     </g>
    </g>
    <g id="platform-rtt-text_31">
-    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="681.652828" y="110.867656" transform="rotate(-0 681.652828 110.867656)">Apple M4 laptop (macOS)</text>
+    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="681.652828" y="110.867656" transform="rotate(-0 681.652828 110.867656)">Apple M4 laptop (macOS)</text>
    </g>
   </g>
   <g id="platform-rtt-legend_2">
@@ -764,19 +764,19 @@ L 672.202828 106.142656
     <path d="M 87.984 127.142656 
 L 105.534 127.142656 
 L 123.084 127.142656 
-" style="fill: none; stroke: #4b5f78; stroke-width: 2.2; stroke-linecap: round"/>
+" style="fill: none; stroke: var(--key-ink); stroke-width: 2.2; stroke-linecap: round"/>
    </g>
    <g id="platform-rtt-text_32">
-    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="132.534" y="131.867656" transform="rotate(-0 132.534 131.867656)">Multi-process (default)</text>
+    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="132.534" y="131.867656" transform="rotate(-0 132.534 131.867656)">Multi-process (default)</text>
    </g>
    <g id="platform-rtt-line2d_43">
     <path d="M 297.012516 127.142656 
 L 314.562516 127.142656 
 L 332.112516 127.142656 
-" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: #4b5f78; stroke-width: 2.2"/>
+" style="fill: none; stroke-dasharray: 13.2,6.6; stroke-dashoffset: 0; stroke: var(--key-ink); stroke-width: 2.2"/>
    </g>
    <g id="platform-rtt-text_33">
-    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: #172b45" x="341.562516" y="131.867656" transform="rotate(-0 341.562516 131.867656)">Single-process</text>
+    <text style="font-size: 13.5px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; text-anchor: start; fill: var(--text)" x="341.562516" y="131.867656" transform="rotate(-0 341.562516 131.867656)">Single-process</text>
    </g>
   </g>
  </g>

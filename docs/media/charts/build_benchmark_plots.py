@@ -12,6 +12,12 @@ a manifest of every source, point, floor and output hash under docs/media/charts
 by git). It refuses to run when anything under docs/benchmarks/results differs from HEAD, so a
 figure always describes a committed package.
 
+The two SVGs are theme-aware sources (light colours in `:root`, dark colours in one
+`prefers-color-scheme: dark` block; see THEME). After a run, write their fixed-palette twins
+(docs/media/<name>-light.svg and <name>-dark.svg) with:
+
+    python3 tools/scripts/build_media_theme_variants.py
+
 Inputs, all in the tree:
   docs/benchmarks/results/            the packages: CSVs, run.json, raw .bin samples, .rate sidecars
   expected-chart-points.json          the reviewed point ledger: every plotted p50 and p99, per series
@@ -90,7 +96,33 @@ FRAME = '#CCD7E3'
 STRIP_BG = '#F6F8FA'
 STRIP_BAR = '#C5D0DC'
 KEY_INK = '#4B5F78'
-DASH = dict(solid='-', dashed=(0,(6,3)), shortdash=(0,(3,2.4)), dashdot=(0,(6,2.5,1.8,2.5)), dotted=(0,(1.4,2.6)))
+BRAND = '#5D7491'
+# The SVGs are theme-aware: every colour is a CSS custom property, with the light value in `:root`
+# and the dark value in one `prefers-color-scheme: dark` block. The light values are the colours
+# above, so the light drawing is unchanged; tools/scripts/build_media_theme_variants.py writes the
+# fixed `-light` and `-dark` twins the README names in a <picture> block. The dark values are for
+# GitHub's dark page (#0d1117): every series and every text colour at least 3:1 against it, and
+# the series more distinct than the light ones (oklab), with the line styles as a second encoding.
+# One entry per light colour: the stock ROS 2 and Jetson series share the orange. The PNG twins
+# under out/ keep the light palette.
+THEME = [  # (custom property, light, dark)
+    ('paper', '#ffffff', '#0d1117'),          # figure and plot ground, marker rims, the key box
+    ('text', TEXT, '#e6edf3'),
+    ('muted', MUTED, '#9198a1'),
+    ('grid', GRID, '#262c36'),
+    ('frame', FRAME, '#3d444d'),
+    ('key-ink', KEY_INK, '#9ba7b4'),
+    ('brand', BRAND, '#7d8fa6'),
+    ('blue', COLORS['multi'], '#4588f7'),
+    ('teal', COLORS['single'], '#1ba79f'),
+    ('orange', COLORS['stock'], '#d66400'),
+    ('slate', COLORS['composed'], '#b6aacd'),
+    ('gold', COLORS['zenoh'], '#dcbc33'),
+    ('magenta', COLORS['rmw'], '#c955c8'),
+    ('red', COLORS['mac'], '#e63e84'),
+]
+assert COLORS['jetson']==COLORS['stock'] and len({light.lower() for _,light,_ in THEME})==len(THEME)
+DASH =dict(solid='-', dashed=(0,(6,3)), shortdash=(0,(3,2.4)), dashdot=(0,(6,2.5,1.8,2.5)), dotted=(0,(1.4,2.6)))
 
 # --- typography -----------------------------------------------------------------
 LAYOUT_SANS = ['Helvetica Neue', 'Helvetica']
@@ -586,7 +618,7 @@ def footer(fig,height_pt,lines):
     for i,line in enumerate(wrapped):
         top=FOOT_LAST_TOP+FOOT_PITCH*(len(wrapped)-1-i)
         fig.text(LEFT,top/height_pt,line,fontsize=SIZE['footnote'],color=MUTED,ha='left',va='top')
-    fig.text(RIGHT+.035,BRAND_Y/height_pt,'CERULION',fontsize=SIZE['brand'],fontweight='bold',color='#5D7491',ha='right',va='baseline')
+    fig.text(RIGHT+.035,BRAND_Y/height_pt,'CERULION',fontsize=SIZE['brand'],fontweight='bold',color=BRAND,ha='right',va='baseline')
     return wrapped
 
 def wrapped_count(lines):
@@ -631,6 +663,32 @@ def uniquify_svg_ids(path,prefix):
     dup=sorted({i for i in ids if ids.count(i)>1}); assert not dup, f'duplicate svg ids in {path.name}: {dup[:8]}'
     path.write_text(text)
     return len(ids)
+
+MPL_STYLE='<style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>'
+def theme_aware(path):
+    """Replace every colour in the SVG with its THEME custom property and declare the light and the dark
+    values in the SVG's one style element. Refuse a colour THEME does not name, and a colour left behind."""
+    text=path.read_text(encoding='utf-8')
+    assert 'prefers-color-scheme' not in text and 'var(--' not in text and text.count(MPL_STYLE)==1, path.name
+    named=set(re.findall(r'\b(?:fill|stroke|color|stop-color): ([a-z]+)',text))
+    assert named<={'none'}, f'{path.name}: named colours {named}'
+    name_of={light.lower():name for name,light,_ in THEME}
+    used=[]
+    def swap(m):
+        light=m.group(0).lower()
+        assert light in name_of, f'{path.name}: colour {light} has no dark value in THEME'
+        if name_of[light] not in used: used.append(name_of[light])
+        return f'var(--{name_of[light]})'
+    # matplotlib writes every colour as a six-digit hex inside a style attribute
+    text=re.sub(r'style="[^"]*"',lambda s:re.sub(r'#[0-9a-fA-F]{6}\b',swap,s.group(0)),text)
+    # after uniquify_svg_ids every #reference starts with the figure name, which is not hex
+    assert not re.search(r'#[0-9a-fA-F]{3,8}\b',text), f'{path.name}: a colour outside a style attribute'
+    light=';'.join(f'--{n}:{l.lower()}' for n,l,_ in THEME if n in used)
+    dark=';'.join(f'--{n}:{d}' for n,_,d in THEME if n in used)
+    text=text.replace(MPL_STYLE,MPL_STYLE[:-len('</style>')]+f':root{{{light}}}@media(prefers-color-scheme:dark){{:root{{{dark}}}}}</style>')
+    path.write_text(text,encoding='utf-8')
+    return [n for n,_,_ in THEME if n in used]
+
 def scrub_check(text):
     assert not re.search('[\u2013\u2014]',text), 'en or em dash in output'
     for prefix in ('/'+'Users'+'/', '/'+'home'+'/'):
@@ -674,6 +732,7 @@ def save(fig,name,series,notes,extra,added=(),added_info=None):
     fig.savefig(svg,metadata=metadata)
     families=github_typography(svg)
     svg_ids=uniquify_svg_ids(svg,name)
+    svg_theme=theme_aware(svg)
     for legend in fig.legends:          # raster twin: one face per label, so uniform sans
         for text in legend.get_texts():
             text.set_fontfamily(LAYOUT_SANS)
@@ -689,7 +748,8 @@ def save(fig,name,series,notes,extra,added=(),added_info=None):
         'points_sha256':points_sha,'points_sha256_equals_reviewed_hash':True,
         'floors':floors,'floors_sha256':floors_sha,
         'svg_sha256':sha(svg),'png_sha256':sha(png),
-        'svg_font_families':families,'svg_id_prefix':name,'svg_id_count':svg_ids,'figure_size_in':[round(v,3) for v in fig.get_size_inches()],
+        'svg_font_families':families,'svg_id_prefix':name,'svg_id_count':svg_ids,
+        'svg_theme':{'custom_properties':svg_theme,'twins':[f'docs/media/{name}-light.svg',f'docs/media/{name}-dark.svg']},'figure_size_in':[round(v,3) for v in fig.get_size_inches()],
         'render_css_px':[round(fig.get_figwidth()*72*4/3),round(fig.get_figheight()*72*4/3)],
         **extra,
     }
