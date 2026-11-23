@@ -31,7 +31,7 @@ the index before you drive anything, then use the matching feature file as the r
 
 Each feature file starts with an H1 title and one paragraph on the user-visible behavior. It then uses
 exactly four H2 sections in this order: `Sub-features`, `How to get to it (user POV)`,
-`Driving it with hv.py`, `Gotchas`.
+`Driving it with hv.py and the shell`, `Gotchas`.
 
 ## Features
 

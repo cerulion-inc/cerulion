@@ -14,14 +14,14 @@ It installs nothing and needs only `python3`.
 - `cerulion rcp bench --verify`.
 - A checkout runs the same program with `bash harness/rcp.sh verify`.
 
-## Driving it with hv.py
+## Driving it with hv.py and the shell
 
 Preconditions:
 
 - None. No install and no server.
 
-- **Untouched.** Run `bash harness/rcp.sh verify`. Exit 0, the lines
-  `plain: snapshot sha256:6f040ca7...` and `rcp: snapshot sha256:4f8bbe79...`, then
+- **Untouched.** Run `bash harness/rcp.sh verify`. Exit 0, one `plain: snapshot sha256:...` and one
+  `rcp: snapshot sha256:...` line with the snapshot ids that `docs/harness.md` names, then
   `verify: ok, this folder holds the code the benchmark measured`.
 - **Changed copy.** Copy the folder without its install and change one measured file in the copy:
   `C=$(mktemp -d)`, `rsync -a --exclude bx --exclude venv --exclude out harness/ "$C/"`, then

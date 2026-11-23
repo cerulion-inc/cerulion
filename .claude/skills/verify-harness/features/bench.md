@@ -21,7 +21,7 @@ once.
 - A checkout runs the same program with `bash harness/rcp.sh bench ...`, or the engine behind it with
   `cd harness && venv/bin/python -P -m cerulion_harness run-cell --model MODEL --image-mode swap --out DIR`.
 
-## Driving it with hv.py
+## Driving it with hv.py and the shell
 
 Preconditions:
 

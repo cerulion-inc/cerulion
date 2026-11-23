@@ -17,6 +17,7 @@ answer that ends it carries the benchmark's verdict. Pages beside `/mcp` show ea
 - `http-label` refuses a request with no session and no `episode` label.
 - `http-pages` serves `/`, `/view/ID`, `/api/episode/ID`, `/episodes`, `/health` and `/source`.
 - `http-stop` scores and stops every live episode on SIGTERM.
+- `http-smoke` solves `bowl-on-plate` by a fixed script, as a regression check of the whole path.
 
 ## How to get to it (user POV)
 
@@ -24,7 +25,7 @@ answer that ends it carries the benchmark's verdict. Pages beside `/mcp` show ea
   `http://127.0.0.1:8765/mcp` to an MCP client.
 - A checkout runs the same program with `bash harness/rcp.sh sim --http ADDR`.
 
-## Driving it with hv.py
+## Driving it with hv.py and the shell
 
 Preconditions:
 
@@ -54,6 +55,9 @@ Preconditions:
   first lists live and ended episodes; the second is the viewer page of one.
 - **Proof.** Run `$HV episode`. Each episode prints one line, for example
   `episode ID: ended (over), 3 calls, 11 events; verdict: solved=True claimed=None false_claim=False steps=153/900`.
+- **Smoke.** Run `$HV smoke`. It prints the `look` and `put` evidence, then a verdict line with
+  `solved=True`, and exits 0. With `--pick '[20, 240]' --to '[240, 20]'` the episode is not solved and it
+  exits 1.
 - **Stop.** Run `$HV down` while an episode is live. It prints `0 leftover processes stopped`, and that
   episode's record ends with reason `server_stopped`.
 

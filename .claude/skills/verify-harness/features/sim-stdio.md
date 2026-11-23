@@ -17,7 +17,7 @@ listing the tools again after an episode ends starts the next one.
 - `claude mcp add cerulion-sim -- cerulion rcp --sim`, then ask the client for a task.
 - A checkout runs the same program with `bash harness/rcp.sh sim`.
 
-## Driving it with hv.py
+## Driving it with hv.py and the shell
 
 Preconditions:
 

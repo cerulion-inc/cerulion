@@ -19,7 +19,7 @@ default start state's robot for this machine. A later run checks the install in 
   stderr.
 - A checkout runs `bash harness/install.sh` and `bash harness/install.sh --check`.
 
-## Driving it with hv.py
+## Driving it with hv.py and the shell
 
 Preconditions:
 

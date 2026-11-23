@@ -28,6 +28,23 @@ HV=.claude/skills/verify-harness/scripts/hv.py
 - Never drive a server that this checkout did not start (`hv.py doctor` shows the one it started).
 - Never commit `harness/bx/`, `harness/venv/`, `harness/out/` or a body record measured on this machine.
 
+## What you may change, and the gate for each
+
+| Path | What it is | Gates before you call it done |
+|---|---|---|
+| `harness/playground/` | the sim server: transports, episodes, labels, idle limit, pages, settings | Tier 1, `$HV stdio`, `$HV smoke`, the [sim-http](features/sim-http.md) recipes |
+| `harness/src/cerulion_harness/` | `run-cell` (bench), body records, prices, `verify` | Tier 1, the [bench](features/bench.md) refusals, [verify](features/verify-provenance.md) |
+| `harness/rcp.sh`, `harness/install.sh` | the CLI contract and the install | Tier 1, `$HV stdio`, [install](features/install.md); a flag change also edits `harness_cmd.rs` and `harness/tests/test_rcp_launcher.py` |
+| `crates/cerulion_cli_engine/src/harness_cmd.rs` | how `cerulion rcp` finds and runs the harness | the two cargo tests in Tier 1, then `$HV up --cli` with the built binary |
+| `harness/requirements/`, `harness/benchmarks/` | pins of every package and data file | a fresh install in a new worktree, then `$HV smoke` |
+| `harness/measured/`, `harness/provenance/` | the tools, their texts and the body knowledge a model sees | frozen (see Fences) |
+
+Measure a change by what it touches. A server, runner or install change must keep every recipe it touches
+green: run each before and after, and report both. `$HV smoke` must still end `solved=True` (the step count
+varies by a few steps between runs, so compare the verdict, not the steps). A change in what a model sees is
+measured only by the benchmark over many start states and models (`docs/harness.md`, "What it measured");
+episodes you drive yourself are examples for the proposal, not a rate.
+
 ## Doctor
 
 Run it first, and again after any surprise. It is read-only.
@@ -48,15 +65,15 @@ $HV test
 
 It runs, and logs each step to `~/.cache/cerulion-verify-harness/test-<time>/`:
 
-1. `python -I -B -m unittest discover -s harness/tests` on a Python 3.10+ with no MCP SDK (410 tests, about
-   40 s). The CI job `Harness (Linux)` runs the same.
+1. `python -I -B -m unittest discover -s harness/tests` on a Python 3.10+ with no MCP SDK (under a minute).
+   The CI job `Harness (Linux)` runs the same.
 2. With an install, the transport tests (`test_playground_*.py`) again with `harness/venv/bin/python`, which
    has the pinned MCP SDK, so the tests that skip in step 1 run.
 3. `shellcheck -x` over every tracked `harness/**/*.sh`.
 4. `bash harness/rcp.sh verify`: the measured code against its provenance ledger.
 
-A Python that has an MCP SDK of another version than the pin makes step 1 fail (13 failures and 1 error, in
-minutes instead of seconds). `hv.py` picks a clean interpreter for that reason. Do not "fix" those failures.
+A Python that has an MCP SDK of another version than the pin makes step 1 fail, and slowly. `hv.py` picks a
+clean interpreter for that reason. Do not "fix" those failures in the harness.
 
 A change to `crates/cerulion_cli_engine/src/harness_cmd.rs` or `rcp.sh` flags also needs
 `cargo test -p cerulion_cli_engine --lib harness_cmd` and
@@ -73,9 +90,9 @@ bash harness/install.sh --check    # exit 0 when installed; writes nothing
 
 It needs `git`, `curl`, network access to GitHub, Hugging Face and PyPI, and 5 GB free to start. It writes
 `harness/bx/`, `harness/venv/` and a body record for this machine, all ignored by git. With uv's cache warm,
-a second worktree installs in about 2.5 minutes and about 1.8 GB. On a small or shared disk, ask the operator before the
-first install. The first episode of a robot body with no
-record on this machine measures one first (one to two minutes).
+another worktree installs in minutes and uses less disk than the first. On a small or shared disk, ask the
+operator before the first install. The first episode of a robot body with no record on this machine
+measures one first (one to two minutes).
 
 ## Tier 2: launch the sim server
 
@@ -86,9 +103,9 @@ $HV up --cli "$(command -v cerulion)"   # the user path: cerulion rcp --sim, nee
 ```
 
 Ready means `/health` answers 200. `up` prints the MCP URL and the run folder. Leave `--port` unset: a
-fixed port can collide with another server. One server per checkout: `up` refuses while one runs. With `rcp.sh`, the server's own record goes to the run folder's `home/`
-(`CERULION_HOME`). With `--cli`, the CLI needs the real `~/.cerulion` for its login, so episode records go
-to `~/.cerulion/sim/episodes/`.
+fixed port can collide with another server. One server per checkout: `up` refuses while one runs. With
+`rcp.sh`, the server's own record goes to the run folder's `home/` (`CERULION_HOME`). With `--cli`, the CLI
+needs the real `~/.cerulion` for its login, so episode records go to `~/.cerulion/sim/episodes/`.
 
 ## Tier 3: drive one episode as the model
 
@@ -103,6 +120,10 @@ $HV call put '{"pick": {"look": "C1", "px": [U, V]}, "to": {"look": "C1", "px": 
 $HV call claim '{"statement": "...", "success": true}' --episode a
 $HV episode                              # status, end reason and the benchmark verdict of every episode
 ```
+
+`$HV smoke` runs the same two steps by a fixed script on a new label (`look` C1, then `put` from the bowl
+to the plate) and exits 0 only when the verdict is `solved=True`. Its default pixels fit the
+`bowl-on-plate` picture; `--pick` and `--to` take others as JSON.
 
 Read every image path that `call` prints with your image viewer before you pick pixels. Read the saved
 instructions file once: it is the system text a model gets, with the units, frames and budget (80 calls,
@@ -122,8 +143,10 @@ Everything goes under `~/.cache/cerulion-verify-harness/<run>/` (`HV_RUNS` moves
 - `evidence/NNN-episode-record-<id>.json`: the viewer record with the verdict.
 - `home/sim/episodes/<id>/`: the server's own transcript and pictures (rcp.sh mode).
 
-A proof cites the run folder and the verdict line. For a behavior change, show the same recipe before and
-after the change, each with its verdict.
+A proof cites the run folder and the verdict line, and drives the user's path (`/mcp`, `rcp.sh`, the CLI),
+never a test stand-in. Besides the run folder, a run writes: `harness/out/verify-current` (the pointer to the
+run), each episode's work folder under `/tmp/pg<uid>/` (removed when the episode ends), a body record in
+`harness/body_records/` on a first episode of a body, and, in `--cli` mode, `~/.cerulion/sim/`.
 
 ## Cleanup
 
@@ -131,7 +154,9 @@ after the change, each with its verdict.
 $HV down
 ```
 
-It sends SIGTERM to the server's process group, waits while the server scores and stops live episodes, then
+It checks that the recorded pid still runs the server it started (its command line names the listen
+address; a reused pid is left alone). It sends SIGTERM to the server's process group, waits while the
+server scores and stops live episodes, then
 stops any process whose command line still names one of this server's episode work folders (the simulators
 run in sessions of their own). It removes the `harness/out/verify-current` pointer and keeps the run folder.
 Check `ls /tmp/pg$(id -u)/` is empty of this run's episode ids afterwards. Delete old run folders only when
@@ -140,7 +165,8 @@ the operator asks. To remove an install, delete `harness/bx` and `harness/venv`.
 ## Helper reference
 
 `hv.py` verbs: `doctor`, `test`, `up [--task T] [--port P] [--cli PATH]`, `tools`, `call TOOL [JSON]`,
-`read URI`, `episode [ID]`, `down`, `stdio`. Exit codes: 0 ok, 1 failed, 2 usage, 3 the tool answered with
+`read URI`, `episode [ID] [--solved]`, `smoke [--pick JSON] [--to JSON]`, `stdio`, `down`. Exit codes: 0 ok,
+1 failed (for `episode --solved` and `smoke`: an episode not solved), 2 usage, 3 the tool answered with
 `isError`. It speaks MCP in the per-request form (protocol `2026-07-28`, no session), as
 `harness/tests/test_playground_transports.py` does.
 
