@@ -19,24 +19,28 @@
 
 <!-- FIRST_SCREEN_START -->
 
-**Cerulion is an open-source, zero-copy robot runtime that runs your ROS 2 nodes, replays recorded runs against new code and reaches your robots from anywhere.** Its experimental harness for physical AI gives your AI model MCP tools to see and move a simulated arm.
+**Cerulion is the harness for physical AI: experimental MCP tools and body facts that let your AI model see and move a robot, a simulated arm in this release.**
 
-- **For ROS 2 teams.** [Run a stock talker and listener on `rmw_cerulion`](#try-it-with-ros-2) in minutes, with Jazzy on Linux and no account ([also on a real arm](#runs-on-real-hardware)).
+Same model, with and without Cerulion: Gemini 3.8 Flash solved 73 of 100 LIBERO-PRO start states with Cerulion and 25 with a published three-tool interface, on the benchmark family the harness was built on. Of 16 models, 12 solved more with Cerulion and 4 solved fewer ([limits](#evidence)).
+
+- **For agent builders.** [Give your model the simulated arm](#try-the-harness) with a free account and an install of about 4 GB. Each tool call answers with what the robot measured. [See what the harness adds to a plain MCP robot server](#what-cerulion-adds-to-the-tools-you-use).
+- **For ROS 2 teams.** Cerulion's open-source runtime [runs stock ROS 2 nodes on `rmw_cerulion`](#try-it-with-ros-2), with Jazzy on Linux and no account. On one desktop, the median round trip at 64 B was 10.45 µs on `rmw_cerulion` with loaned messages, against 311.11 µs on ROS 2 Jazzy defaults ([latency](#latency)).
 - **For robot developers.** [Record a run, change one constant and replay it](#try-the-runtime) to see which output changed, with a free account and no robot.
-- **For agent builders.** [Give your model a simulated arm](#try-the-harness) after an install of about 4 GB. Gemini 3.8 Flash solved 73 of 100 start states with Cerulion and 25 without ([limits](#evidence)).
 - **To check the claims first.** [Read the evidence and its limits](#evidence), with nothing to install.
+
+<p align="center">
+  <img src="docs/media/harness-episode.gif" alt="Claude Opus 5.5 moves the simulated arm through the Cerulion harness and sets the bowl on the plate, and the last frame reads Benchmark verdict: solved." width="560">
+</p>
+
+A real episode, scored solved by the benchmark's own check. Claude Opus 5.5 looks through the cameras, then moves the simulated arm through the harness and sets the bowl on the plate. The model solved this task on its third try, and the task is one the harness was built on ([how this GIF was made](docs/media/README.md#assets-the-root-readme-uses)).
+
+**Cerulion is also an open-source, zero-copy robot runtime.** It records runs and reaches the robots on your account from another network. When you replay a recording against edited code, the replay check names the field that differs, such as `differs at x: recorded 0.3, replayed 0.25`.
 
 <p align="center">
   <img src="docs/media/replay-verdict.gif" alt="A recorded bag passes replay, then fails it after one changed constant: differs at x, recorded 0.3, replayed 0.25.">
 </p>
 
 A real run on Cerulion 2.1.0: the recorded bag replays byte for byte, then one changed constant in the safety controller makes the same bag fail at the exact frame and field ([how this GIF was made](docs/media/README.md#assets-the-root-readme-uses)).
-
-<p align="center">
-  <img src="docs/media/harness-episode.gif" alt="Claude Opus 5.5 moves the simulated arm through the Cerulion harness and sets the bowl on the plate, and the last frame reads Benchmark verdict: solved." width="480">
-</p>
-
-A real episode, scored solved by the benchmark's own check. Claude Opus 5.5 solved this task on its third try, and the task is one the harness was built on ([how this GIF was made](docs/media/README.md#assets-the-root-readme-uses)).
 
 <!-- FIRST_SCREEN_END -->
 
