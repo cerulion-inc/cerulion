@@ -47,6 +47,15 @@ sh install_rust.sh
 
 The 2.1.0 and 2.0.0 release binaries are built with Rust 1.95.0 and the 1.0.0 binaries were built with Rust 1.93.0, each pinned in the [artifact build workflow](../.github/workflows/release-artifacts.yml) at the release's tag. The workspace's minimum is Rust 1.95, and a node does not need the compiler that built the CLI.
 
+## Homebrew
+
+```bash
+brew tap cerulion-inc/cerulion
+brew install cerulion-inc/cerulion/cerulion
+```
+
+The formula lives in the tap repository `cerulion-inc/homebrew-cerulion` and tracks stable releases. If Homebrew refuses to load the formula from this tap, run `brew trust --formula cerulion-inc/cerulion/cerulion` and try again. `brew trust` is Homebrew's own command for formulae from a tap that Homebrew does not ship, and `brew help trust` describes it. On Linux the formula carries `rmw_cerulion`. No macOS package does, because ROS 2 Jazzy has no macOS binaries. The formula does not provision Rust: run `cerulion-install-rust` once, as [Rust on the other routes](#rust-on-the-other-routes) describes.
+
 ## What the Debian package requires and ships
 
 The package depends on `libc6 (>= 2.31)`, `libstdc++6` and `libgcc-s1`, so it installs on Ubuntu 20.04 and later, Debian 11 and later, or another distribution with glibc 2.31 or newer; `apt` refuses the install on an older release. ROS 2 is a `Suggests` (`ros-jazzy-ros-base`), not a dependency: the rmw is loaded by a ROS 2 process and links no ROS library of its own. The rmw works where ROS 2 Jazzy works, Ubuntu 24.04 with `ros-jazzy-ros-base` installed. The rmw library is built in the ROS 2 Jazzy image and is not held to the 2.31 floor, so on Ubuntu 20.04 or 22.04 the CLI, the daemons and the heap hook run but the packaged rmw needs Jazzy's glibc and does not load. On a host without ROS 2 the CLI installs, and `cerulion ros2 run` and `cerulion ros2 launch` exit with an error saying `ros2` was not found on `PATH`.
