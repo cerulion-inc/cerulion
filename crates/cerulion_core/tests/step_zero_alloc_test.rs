@@ -511,8 +511,9 @@ fn measure_capped_trace_step_allocs(measure_steps: usize) -> (u64, usize, usize)
 }
 
 /// With the `graph run` default trace cap set, `step()` allocates nothing of
-/// its own while the trace fills through 512, 1,024, 2,048 and 4,096 entries,
-/// the points where an unreserved deque reallocates and copies itself.
+/// its own while the trace fills from under 512 to over 4,096 entries, past
+/// every point in that range where an unreserved deque reallocates and copies
+/// itself.
 #[test]
 #[serial]
 fn test_graph_step_with_graph_run_trace_cap_is_zero_alloc_as_the_trace_fills() {

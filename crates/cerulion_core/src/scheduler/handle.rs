@@ -1230,6 +1230,14 @@ impl PartialEq for TraceEntry {
 
 impl Eq for TraceEntry {}
 
+// The per-entry size stated for `--trace-limit` in `docs/user-api.md` and
+// `docs/multi_process.md`, and in the docs of `Scheduler::set_trace_limit`,
+// `GraphRuntime::set_trace_limit` and the CLI engine's `PRODUCTION_TRACE_LIMIT`
+// (each `set_trace_limit` reserves `limit` entries of it up front). A field
+// change that moves it fails here; update all five.
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<TraceEntry>() == 56);
+
 // ---------------------------------------------------------------------------
 // This module's half of the ABI LAYOUT PIN (see `crate::abi_layout`).
 //

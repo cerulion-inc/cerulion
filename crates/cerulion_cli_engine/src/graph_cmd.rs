@@ -194,6 +194,10 @@ const CPU_DMA_LOCK_US_ENV: &str = "CERULION_CPU_DMA_LOCK_US";
 /// `WorkerPlan::trace_limit`. `0` (unbounded) is REJECTED at the CLI parse
 /// (`value_parser` range `1..`): unbounded growth costs ~2 GB/h at
 /// 1 kHz × 10 nodes, and there is deliberately no unbounded escape hatch.
+///
+/// `cerulion_core` cannot name this const: its `GRAPH_RUN_DEFAULT_TRACE_LIMIT`
+/// test copies (the scheduler unit tests, `tests/step_zero_alloc_test.rs`)
+/// and the 5.6 MB on both doc pages move with it.
 pub const PRODUCTION_TRACE_LIMIT: usize = 100_000;
 
 /// Free-run mode: the count of cross-process `block` credit words above which the
