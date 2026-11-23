@@ -56,8 +56,9 @@ $HV doctor            # add --cli PATH to check a cerulion binary for `rcp --sim
 ```
 
 Each line is `PASS` or `FAIL` with the reason: harness folder, install, `measured/` untouched, disk free, a
-clean Python for the unit tests, the optional `cerulion rcp`, and the server this checkout started (pid
-alive and `/health` 200). Exit 0 means every required line passed.
+clean Python for the unit tests, the optional `cerulion rcp`, and the server this checkout started: its
+recorded server pid still runs the playground on the run's address, and `/health` answers 200. A run whose
+server is gone fails this line (`hv.py down`, then `hv.py up`). Exit 0 means every required line passed.
 
 ## Tier 1: offline gates (no install, no network)
 
@@ -105,7 +106,8 @@ $HV up --task open-drawer               # bowl-on-plate (default), open-drawer, 
 $HV up --cli "$(command -v cerulion)"   # the user path: cerulion rcp --sim, needs cerulion 2.1.0+ and login
 ```
 
-Ready means `/health` answers 200. `up` prints the MCP URL and the run folder. Leave `--port` unset: a
+Ready means `/health` answers 200 and the answering server is a process `up` started (its command line runs
+the playground on this run's address). `up` prints the MCP URL, the server pid and the run folder. Leave `--port` unset: a
 fixed port can collide with another server. One server per checkout: `up` refuses while one runs. With
 `rcp.sh`, the server's own record goes to the run folder's `home/` (`CERULION_HOME`). With `--cli`, the CLI
 needs the real `~/.cerulion` for its login, so episode records go to `~/.cerulion/sim/episodes/`.
@@ -113,7 +115,11 @@ needs the real `~/.cerulion` for its login, so episode records go to `~/.cerulio
 ## Tier 3: drive one episode as the model
 
 An episode is named by a label (`--episode a`, the default). Calls with the same label share one robot, so
-several commands in a row drive one episode. Use a new label for each new episode.
+several commands in a row drive one episode. A label keeps the start state it was opened with: `--task` on a
+known label must match it. Use a new label for each new episode. Every drive verb first checks that the
+run's server is still its own process and refuses otherwise, so a crashed run never drives another
+checkout's server on a reused port. `$HV episode` lists the episodes this run drove, not the server's whole
+history.
 
 ```bash
 $HV tools --episode a                    # starts the episode (seconds); saves instructions and listing
@@ -121,7 +127,7 @@ $HV read robot://task --episode a        # the task sentence
 $HV call look '{"camera": "agentview"}' --episode a     # scene look C1; prints the image paths
 $HV call put '{"pick": {"look": "C1", "px": [U, V]}, "to": {"look": "C1", "px": [U, V]}, "clear": true}' --episode a
 $HV call claim '{"statement": "...", "success": true}' --episode a
-$HV episode                              # status, end reason and the benchmark verdict of every episode
+$HV episode                              # status, end reason and verdict of each episode this run drove
 ```
 
 `$HV smoke` runs the same two steps by a fixed script on a new label (`look` C1, then `put` from the bowl
@@ -158,10 +164,12 @@ $HV down
 ```
 
 It checks that the recorded pid still runs the server it started (its command line names the listen
-address; a reused pid is left alone). It sends SIGTERM to the server's process group, waits while the
-server scores and stops live episodes, then
-stops any process whose command line still names one of this server's episode work folders (the simulators
-run in sessions of their own). It removes the `harness/out/verify-current` pointer and keeps the run folder.
+address; a reused pid is left alone). It sends SIGTERM to the server's process group and waits while the
+server scores and stops live episodes. Then it finds this run's episode work folders by their owner file
+(the server's pid) and by the episodes it drove, and stops every process whose command line names one: the
+simulators run in sessions of their own and outlive a server that crashed. When a process survives SIGKILL,
+`down` prints `FAIL`, exits 1 and keeps the pointer, so it can run again. Otherwise it removes the work
+folders and the `harness/out/verify-current` pointer, and keeps the run folder.
 Check `ls /tmp/pg$(id -u)/` is empty of this run's episode ids afterwards. Delete old run folders only when
 the operator asks. To remove an install, delete `harness/bx` and `harness/venv`.
 

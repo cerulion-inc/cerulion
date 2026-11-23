@@ -9,7 +9,7 @@ client does, and keep the evidence. Standard library only.
     hv.py tools [--episode L]         start or join episode L; save its instructions, tools and resources
     hv.py call TOOL [JSON] [--episode L]
     hv.py read URI [--episode L]
-    hv.py episode [ID] [--solved]     the episode record and verdict; --solved: exit 1 unless solved
+    hv.py episode [ID] [--solved]     this run's episodes and verdicts; --solved: exit 1 unless solved
     hv.py smoke                       a scripted bowl-on-plate episode on the running server; exit 0 if solved
     hv.py stdio                       the stdio transport end to end, on a server of its own
     hv.py down                        stop the server this checkout started; evidence stays
@@ -111,14 +111,94 @@ def rpc(url, method, params, query, n=1, timeout=900):
     return answer
 
 
-def query_of(episode, task):
-    return f"?episode={episode}" + (f"&state={task}" if task else "")
+def processes():
+    """{pid: (ppid, command)} of every process."""
+    rows = {}
+    out = subprocess.run(["ps", "-axo", "pid=,ppid=,command="], capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].isdigit() and parts[1].isdigit():
+            rows[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) == 3 else "")
+    return rows
+
+
+def address(meta):
+    return meta["url"].split("//", 1)[1]
+
+
+def server_process(meta, rows=None):
+    # Another checkout's server can answer on a reused port, so only the process tree this run started counts.
+    rows = processes() if rows is None else rows
+    tree, frontier = set(), [meta["pid"]]
+    while frontier:
+        pid = frontier.pop()
+        if pid in rows and pid not in tree:
+            tree.add(pid)
+            frontier += [p for p, (ppid, _) in rows.items() if ppid == pid]
+    serving = f"playground --http {address(meta)}"
+    return next((p for p in sorted(tree) if serving in rows[p][1]), None)
+
+
+def save_meta(run, meta):
+    tmp = run / f"run.json.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(meta, indent=2))
+    os.replace(tmp, run / "run.json")
+
+
+def record_label(run, meta, label, state, eid):
+    """Add episode eid under label in run.json. Drive verbs can run in parallel, so the update reloads the file
+    under a lock instead of writing back the copy this process read."""
+    import fcntl
+    with open(run / "run.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        fresh = json.loads((run / "run.json").read_text())
+        entry = fresh.setdefault("labels", {}).setdefault(label, {"task": state, "episodes": []})
+        if entry["task"] != state:
+            sys.exit(f"hv: episode {label} runs {entry['task']}; name a new label for {state}")
+        if eid and eid not in entry["episodes"]:
+            entry["episodes"].append(eid)
+        save_meta(run, fresh)
+    meta["labels"] = fresh["labels"]
+
+
+def live_run(h):
+    """The run this checkout started, once its server is the process that answers at its address."""
+    run, meta = current_run(h)
+    if not meta.get("server_pid") or server_process(meta) != meta["server_pid"]:
+        sys.exit(f"hv: the server of run {run} is gone, and its address may answer for another server; "
+                 "run `hv.py down`, then `hv.py up`")
+    return run, meta
+
+
+def episode_query(run, meta, label, task, discover=False):
+    """The query that reaches episode label, and the server/discover answer when one was sent. The server tells
+    episodes without a session apart by start state and label, so a label keeps the state it was opened with."""
+    labels = meta.setdefault("labels", {})
+    known = labels.get(label)
+    state = task or (known or {}).get("task") or meta["default_state"]
+    if known and state != known["task"]:
+        sys.exit(f"hv: episode {label} runs {known['task']}; name a new label for {state}")
+    q = f"?episode={label}&state={state}"
+    if known and not discover:
+        return q, None, None
+    hello = rpc(meta["url"], "server/discover", {}, q)
+    if "error" in hello:
+        return q, hello, None
+    instructions = hello["result"].get("instructions", "")
+    folder, base = evidence(run, f"episode-{label}-instructions")
+    told = folder / f"{base}.md"
+    told.write_text(instructions)
+    (folder / f"{base}.json").write_text(json.dumps(hello, indent=2))
+    eid = re.search(r"/view/([A-Za-z0-9_-]+)", instructions)
+    record_label(run, meta, label, state, eid.group(1) if eid else None)
+    return q, hello, told
 
 
 def evidence(run, name):
     folder = run / "evidence"
     folder.mkdir(parents=True, exist_ok=True)
-    seq = len(list(folder.glob("[0-9][0-9][0-9]-*.json"))) + 1
+    prefixes = (p.name.partition("-")[0] for p in folder.glob("*.json"))
+    seq = 1 + max((int(x) for x in prefixes if x.isdigit()), default=0)
     return folder, f"{seq:03d}-{re.sub(r'[^A-Za-z0-9_.-]+', '_', name)}"
 
 
@@ -167,9 +247,11 @@ def cmd_doctor(ns):
                ", has no rcp verb: drive through rcp.sh, or pass --cli with a cerulion of 2.1.0 or later"))
     run, meta = current_run(h, required=False)
     if meta:
-        up = alive(meta["pid"])
-        good &= report(up, "server process of this checkout", f"pid {meta['pid']}, run {run}")
-        if up:
+        server = server_process(meta)
+        ours = server is not None and server == meta.get("server_pid")
+        good &= report(ours, "server of this checkout", f"pid {server}, run {run}" if ours else
+                       f"run {run} has no live server of its own; `hv.py down`, then `hv.py up`")
+        if ours:
             status, body = get(meta["url"] + "/health")
             good &= report(status == 200, "server health", body.strip()[:300])
     else:
@@ -229,13 +311,18 @@ def cmd_up(ns):
     if meta and alive(meta["pid"]):
         print(f"hv: this checkout's server already runs: {meta['url']} (pid {meta['pid']}); `hv.py down` first")
         return 1
+    if ns.port:
+        with socket.socket() as probe:
+            if probe.connect_ex(("127.0.0.1", ns.port)) == 0:
+                print(f"hv: port {ns.port} already answers; leave --port unset to get a free one")
+                return 1
     run = RUNS / stamp()
     home = run / "home"
     home.mkdir(parents=True)
     addr = f"127.0.0.1:{ns.port or free_port()}"
     env = dict(os.environ)
     if ns.cli:
-        argv = [ns.cli, "rcp", "--sim", "--http", addr]
+        argv = [os.path.abspath(ns.cli) if os.sep in ns.cli else ns.cli, "rcp", "--sim", "--http", addr]
         env["CERULION_HARNESS_DIR"] = str(h)
     else:
         argv = ["bash", str(h / "rcp.sh"), "sim", "--http", addr]
@@ -256,8 +343,11 @@ def cmd_up(ns):
             print(f"hv: the server exited with {proc.returncode}; see {run / 'server.log'}")
             return 1
         status, body = get(url + "/health", timeout=2)
-        if status == 200:
-            print(f"up: {url}/mcp (pid {proc.pid})\nrun: {run}\nhealth: {body.strip()[:300]}")
+        server = server_process(meta) if status == 200 else None
+        if server:
+            meta.update(server_pid=server, default_state=json.loads(body).get("default_state"), labels={})
+            save_meta(run, meta)
+            print(f"up: {url}/mcp (pid {server})\nrun: {run}\nhealth: {body.strip()[:300]}")
             return 0
         time.sleep(1)
     print(f"hv: no answer from {url}/health after {ns.wait} s; see {run / 'server.log'}; `hv.py down` stops it")
@@ -282,17 +372,13 @@ def save_answer(run, name, request, answer):
 
 def cmd_tools(ns):
     h = harness_dir(ns.harness)
-    run, meta = current_run(h)
-    q = query_of(ns.episode, ns.task)
-    hello = rpc(meta["url"], "server/discover", {}, q)
+    run, meta = live_run(h)
+    q, hello, told = episode_query(run, meta, ns.episode, ns.task, discover=True)
     if "error" in hello:
         print(json.dumps(hello["error"], indent=2))
         return 1
     instructions = hello["result"].get("instructions", "")
-    folder, base = evidence(run, f"episode-{ns.episode}-instructions")
-    told = folder / f"{base}.md"
-    told.write_text(instructions)
-    (folder / f"{base}.json").write_text(json.dumps(hello, indent=2))
+    folder = told.parent
     tools = rpc(meta["url"], "tools/list", {}, q, n=2)
     resources = rpc(meta["url"], "resources/list", {}, q, n=3)
     templates = rpc(meta["url"], "resources/templates/list", {}, q, n=4)
@@ -308,20 +394,28 @@ def cmd_tools(ns):
         print(f"resource  {r['uri']}")
     for r in (templates.get("result") or {}).get("resourceTemplates", []):
         print(f"template  {r['uriTemplate']}")
-    return 1 if "error" in tools else 0
+    failed = [(name, a["error"]) for name, a in (("tools/list", tools), ("resources/list", resources),
+                                                 ("resources/templates/list", templates)) if "error" in a]
+    for name, error in failed:
+        print(f"hv: {name} failed: {json.dumps(error)}")
+    return 1 if failed else 0
 
 
 def cmd_call(ns):
     h = harness_dir(ns.harness)
-    run, meta = current_run(h)
+    run, meta = live_run(h)
     try:
         args = json.loads(ns.args) if ns.args else {}
     except ValueError as exc:
         print(f"hv: the arguments are not JSON: {exc}")
         return 2
+    q, hello, _ = episode_query(run, meta, ns.episode, ns.task)
+    if hello and "error" in hello:
+        print(json.dumps(hello["error"], indent=2))
+        return 1
     params = {"name": ns.tool, "arguments": args}
     t0 = time.monotonic()
-    answer = rpc(meta["url"], "tools/call", params, query_of(ns.episode, ns.task))
+    answer = rpc(meta["url"], "tools/call", params, q)
     path, images = save_answer(run, ns.tool, params, answer)
     if "error" in answer:
         print(json.dumps(answer["error"], indent=2))
@@ -338,8 +432,12 @@ def cmd_call(ns):
 
 def cmd_read(ns):
     h = harness_dir(ns.harness)
-    run, meta = current_run(h)
-    answer = rpc(meta["url"], "resources/read", {"uri": ns.uri}, query_of(ns.episode, ns.task))
+    run, meta = live_run(h)
+    q, hello, _ = episode_query(run, meta, ns.episode, ns.task)
+    if hello and "error" in hello:
+        print(json.dumps(hello["error"], indent=2))
+        return 1
+    answer = rpc(meta["url"], "resources/read", {"uri": ns.uri}, q)
     folder, base = evidence(run, "read-" + ns.uri)
     (folder / f"{base}.json").write_text(json.dumps({"uri": ns.uri, "answer": answer}, indent=2))
     if "error" in answer:
@@ -349,15 +447,6 @@ def cmd_read(ns):
         print(c.get("text", f"<{c.get('mimeType')} blob>"))
     print(f"saved {folder / base}.json")
     return 0
-
-
-def episode_ids(url):
-    """Every episode id of the server at url, live first; None when /episodes does not answer."""
-    status, body = get(url + "/episodes")
-    if status != 200:
-        return None
-    listing = json.loads(body)
-    return [e["id"] for e in listing["live"]] + [e["id"] for e in listing["ended"]]
 
 
 def verdict_line(run, url, eid):
@@ -378,10 +467,10 @@ def verdict_line(run, url, eid):
 
 def cmd_episode(ns):
     h = harness_dir(ns.harness)
-    run, meta = current_run(h)
-    ids = [ns.id] if ns.id else episode_ids(meta["url"])
+    run, meta = live_run(h)
+    ids = [ns.id] if ns.id else [e for entry in meta.get("labels", {}).values() for e in entry["episodes"]]
     if not ids:
-        print(f"hv: no episode on {meta['url']}" + (" (/episodes does not answer)" if ids is None else ""))
+        print("hv: this run has driven no episode yet")
         return 1
     good = True
     for eid in ids:
@@ -394,10 +483,8 @@ def cmd_episode(ns):
 def cmd_smoke(ns):
     """bowl-on-plate by a fixed script: one scene look, one put from the bowl to the plate."""
     h = harness_dir(ns.harness)
-    run, meta = current_run(h)
-    label = "smoke-" + stamp()
-    q = query_of(label, "bowl-on-plate")
-    hello = rpc(meta["url"], "server/discover", {}, q)
+    run, meta = live_run(h)
+    q, hello, _ = episode_query(run, meta, "smoke-" + stamp(), "bowl-on-plate")
     eid = re.search(r"/view/([A-Za-z0-9_-]+)", (hello.get("result") or {}).get("instructions", ""))
     if eid is None:
         print(f"hv: the episode did not start: {json.dumps(hello)[:300]}")
@@ -413,21 +500,26 @@ def cmd_smoke(ns):
     return 0 if solved else 1
 
 
-def leftover_episode_processes(meta, eids):
-    # The simulators run in sessions of their own, outside the server's process group.
-    try:
-        settings = json.loads((Path(meta["harness"]) / "playground" / "settings.json").read_text())
-        work = settings["work_root"].replace("{uid}", str(os.getuid()))
-    except (OSError, ValueError, KeyError) as exc:
-        print(f"hv: no work_root in playground/settings.json ({exc}); leftover processes were not looked for")
-        return []
-    ps = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout.splitlines()
-    left = []
-    for line in ps:
-        pid, _, command = line.strip().partition(" ")
-        if any(f"{work}/{eid}" in command for eid in eids) and int(pid) != os.getpid():
-            left.append((int(pid), command[:160]))
-    return left
+def work_folders(meta):
+    """This run's episode work folders: those whose owner file names this run's server, and those of the
+    episodes it drove. The simulators run in sessions of their own, so the server's process group does not
+    hold them, and they outlive a server that crashed."""
+    settings = json.loads((Path(meta["harness"]) / "playground" / "settings.json").read_text())
+    root = Path(settings["work_root"].replace("{uid}", str(os.getuid())))
+    owner = str(meta.get("server_pid"))
+    folders = {root / e for entry in meta.get("labels", {}).values() for e in entry["episodes"]}
+    for folder in root.glob("*") if root.is_dir() else []:
+        with contextlib.suppress(OSError):
+            if (folder / ".playground_owner").read_text().strip() == owner:
+                folders.add(folder)
+    return folders
+
+
+def users_of(folders):
+    rows = processes()
+    return {pid: command[:160] for pid, (_, command) in rows.items()
+            if pid != os.getpid() and any(f"{folder}/" in command or command.endswith(str(folder))
+                                          for folder in folders)}
 
 
 def cmd_down(ns):
@@ -436,38 +528,49 @@ def cmd_down(ns):
     if not meta:
         print("hv: nothing to stop: no server started from this checkout")
         return 0
-    eids = episode_ids(meta["url"]) or []
-    pid, left, what = meta["pid"], [], "was not running"
+    rows = processes()
+    pid, what = meta["pid"], "was not running"
+    if pid in rows and address(meta) in rows[pid][1]:
+        what = "stopped"
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pid, signal.SIGTERM)
+        deadline = time.monotonic() + ns.wait
+        while alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.5)
+        if alive(pid):
+            print(f"hv: the server did not stop in {ns.wait} s; sending SIGKILL to its group")
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pid, signal.SIGKILL)
+    elif alive(pid):
+        what = f"is gone (pid {pid} now runs another program, not stopped)"
     try:
-        if alive(pid) and not started_here(meta):
-            what = f"is gone (pid {pid} now runs another program, not stopped)"
-        elif alive(pid):
-            what = "stopped"
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(pid, signal.SIGTERM)
-            deadline = time.monotonic() + ns.wait
-            while alive(pid) and time.monotonic() < deadline:
-                time.sleep(0.5)
-            if alive(pid):
-                print(f"hv: the server did not stop in {ns.wait} s; sending SIGKILL to its group")
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(pid, signal.SIGKILL)
-        left = leftover_episode_processes(meta, eids)
-        for p, command in left:
-            print(f"hv: stopping a leftover process of this run: {p} {command}")
-            with contextlib.suppress(ProcessLookupError):
-                os.kill(p, signal.SIGTERM)
-    finally:
-        pointer(h).unlink(missing_ok=True)
+        folders = work_folders(meta)
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"FAIL  no work_root in playground/settings.json ({exc}); the simulators were not looked for. "
+              f"The pointer stays, so `hv.py down` can run again")
+        return 1
+    left = users_of(folders)
+    for p, command in left.items():
+        print(f"hv: stopping a leftover process of this run: {p} {command}")
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(p, signal.SIGTERM)
+    deadline = time.monotonic() + 15
+    while users_of(folders) and time.monotonic() < deadline:
+        time.sleep(0.5)
+    for p in users_of(folders):
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(p, signal.SIGKILL)
+    time.sleep(0.5)
+    stuck = users_of(folders)
+    if stuck:
+        print(f"FAIL  {len(stuck)} processes of this run did not stop: {sorted(stuck)}. The pointer stays, so "
+              "`hv.py down` can run again")
+        return 1
+    for folder in folders:
+        shutil.rmtree(folder, ignore_errors=True)
+    pointer(h).unlink(missing_ok=True)
     print(f"down: server {pid} {what}, {len(left)} leftover processes stopped; evidence kept in {run}")
     return 0
-
-
-def started_here(meta):
-    """The process at meta's pid is still the server `up` started: its command line names the listen address."""
-    command = subprocess.run(["ps", "-o", "command=", "-p", str(meta["pid"])], capture_output=True,
-                             text=True).stdout
-    return meta["url"].split("//", 1)[1] in command
 
 
 def cmd_stdio(ns):
@@ -491,8 +594,19 @@ def cmd_stdio(ns):
     threading.Thread(target=pump, daemon=True).start()
     good, n = True, 0
 
+    def take(line):
+        nonlocal good
+        try:
+            doc = json.loads(line)
+        except ValueError:
+            good = report(False, "stdout carries only MCP messages", f"not JSON: {line[:160]!r}")
+            transcript.append({"stray": line})
+            return None
+        transcript.append({"got": doc})
+        return doc
+
     def ask(method, params=None, notify=False):
-        nonlocal n, good
+        nonlocal n
         message = {"jsonrpc": "2.0", "method": method, **({"params": params} if params is not None else {})}
         if not notify:
             n += 1
@@ -504,13 +618,8 @@ def cmd_stdio(ns):
             line = lines.get(timeout=ns.wait)
             if line is None:
                 raise RuntimeError("the server closed stdout")
-            try:
-                doc = json.loads(line)
-            except ValueError:
-                good = report(False, "stdout carries only MCP messages", f"not JSON: {line[:160]!r}")
-                continue
-            transcript.append({"got": doc})
-            if doc.get("id") == n:
+            doc = take(line)
+            if doc is not None and doc.get("id") == n:
                 return doc
 
     def text(doc):
@@ -536,12 +645,13 @@ def cmd_stdio(ns):
     except Exception as exc:
         good = report(False, "stdio exchange", f"{type(exc).__name__}: {exc}; see {run / 'server.log'}")
     finally:
-        (run / "transcript.json").write_text(json.dumps(transcript, indent=2))
+        hung = False
         with contextlib.suppress(BrokenPipeError):
             proc.stdin.close()
         try:
             code = proc.wait(timeout=ns.wait)
         except subprocess.TimeoutExpired:
+            hung = True
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGTERM)
             try:
@@ -549,8 +659,18 @@ def cmd_stdio(ns):
             except subprocess.TimeoutExpired:
                 os.killpg(proc.pid, signal.SIGKILL)
                 code = proc.wait()
+        while True:
+            try:
+                line = lines.get(timeout=10)
+            except queue.Empty:
+                break
+            if line is None:
+                break
+            take(line)
         err.close()
-    good &= report(code == 0, "the server exits 0 when stdin closes", f"exit {code}")
+        (run / "transcript.json").write_text(json.dumps(transcript, indent=2))
+    good &= report(code == 0 and not hung, "the server exits 0 when stdin closes",
+                   f"no exit in {ns.wait} s; stopped with SIGTERM" if hung else f"exit {code}")
     print(f"run: {run}")
     return 0 if good else 1
 
@@ -577,7 +697,7 @@ def main(argv=None):
         s.add_argument("--episode", default="a", help="the episode label; calls with one label share a robot")
         s.add_argument("--task", help="the start state of a new episode (default: the server's)")
     e = sub.add_parser("episode")
-    e.add_argument("id", nargs="?", help="the episode id (default: every episode of this server)")
+    e.add_argument("id", nargs="?", help="the episode id (default: every episode this run drove)")
     e.add_argument("--solved", action="store_true", help="exit 1 unless every episode listed is solved")
     k = sub.add_parser("smoke")
     k.add_argument("--pick", type=json.loads, default=[195, 152], help="the bowl's pixel in look C1, as JSON")
