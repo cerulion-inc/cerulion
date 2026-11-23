@@ -25,6 +25,9 @@ once.
 
 Preconditions:
 
+- For `bench-preflight`: `$HV doctor` passes its install line. Without an install, `rcp.sh bench` installs
+  first (minutes, network, several GB), and `run-cell` refuses before the test request when the simulator is
+  missing.
 - For `bench-run` and `bench-images`: the operator said yes in this session and named the endpoint and the
   key variable. Without that, stop after the refusals.
 
@@ -44,7 +47,10 @@ Preconditions:
 ## Gotchas
 
 - One episode is one draw at temperature 1.0. One pair proves the run works, not that a model does better.
-- A scored run bills the operator's endpoint for up to 80 replies with images per setup.
+- A scored run bills the operator's endpoint for up to 80 replies with images per setup and attempt;
+  `run-cell` retries an unscored episode up to 3 times.
 - `run-cell` must run inside `harness/` with `-P`: nothing from the starting folder may be imported.
 - Ctrl+C stops the run and its model client, but the episode's simulator runs in a session of its own.
-  After a stopped run, check `ls /tmp/pg$(id -u)/` and stop only what the run left.
+  `run-cell` works in `/tmp/cerulion-bench-XXXXXXXX` and removes it at the end, unless the stop timed out.
+  After a stopped run, check `ls -d /tmp/cerulion-bench-*` and stop only the processes whose command line
+  names that folder.

@@ -361,17 +361,17 @@ def episode_ids(url):
 
 
 def verdict_line(run, url, eid):
-    """(solved, the one-line summary) of episode eid, its record saved as evidence."""
+    """(fetched, solved, the one-line summary) of episode eid, its record saved as evidence."""
     status, body = get(f"{url}/api/episode/{eid}")
     folder, base = evidence(run, f"episode-record-{eid}")
     (folder / f"{base}.json").write_text(body)
     if status != 200:
-        return False, f"episode {eid}: /api/episode answered {status}"
+        return False, False, f"episode {eid}: /api/episode answered {status}"
     doc = json.loads(body)
     v = doc.get("verdict") or {}
     verdict = ("not scored yet" if not v else f"solved={v.get('solved')} claimed={v.get('claimed_success')} "
                f"false_claim={v.get('false_claim')} steps={v.get('steps_used')}/{v.get('budget_steps')}")
-    return v.get("solved") is True, (f"episode {eid}: {doc['status']}" + (f" ({doc['reason']})" if doc.get("reason")
+    return True, v.get("solved") is True, (f"episode {eid}: {doc['status']}" + (f" ({doc['reason']})" if doc.get("reason")
                                      else "") + f", {doc['calls']} calls, {doc['events_total']} events; verdict: "
                                      f"{verdict}; saved {folder / base}.json")
 
@@ -385,9 +385,9 @@ def cmd_episode(ns):
         return 1
     good = True
     for eid in ids:
-        solved, line = verdict_line(run, meta["url"], eid)
+        fetched, solved, line = verdict_line(run, meta["url"], eid)
         print(line)
-        good &= solved or not ns.solved
+        good &= fetched and (solved or not ns.solved)
     return 0 if good else 1
 
 
@@ -408,7 +408,7 @@ def cmd_smoke(ns):
         params = {"name": tool, "arguments": args}
         path, images = save_answer(run, tool, params, rpc(meta["url"], "tools/call", params, q))
         print(f"{tool}: saved {path}" + "".join(f"\nimage: {i}" for i in images))
-    solved, line = verdict_line(run, meta["url"], eid.group(1))
+    _, solved, line = verdict_line(run, meta["url"], eid.group(1))
     print(line)
     return 0 if solved else 1
 

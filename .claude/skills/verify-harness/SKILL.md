@@ -10,8 +10,9 @@ scores each episode with the benchmark's own success check. Read `harness/AGENTS
 contract and the invariants that this skill checks.
 
 All commands run from the repository root of the checkout you change. The helper is
-`.claude/skills/verify-harness/scripts/hv.py` (standard library Python). It always works on the `harness/`
-folder of the checkout it sits in, so each git worktree drives its own harness.
+`.claude/skills/verify-harness/scripts/hv.py` (standard library Python). It works on the `harness/` folder of
+the checkout it sits in, so each git worktree drives its own harness. `--harness DIR` and `HV_HARNESS` name
+another folder: leave both unset unless the operator asks for one.
 
 ```bash
 HV=.claude/skills/verify-harness/scripts/hv.py
@@ -24,7 +25,8 @@ HV=.claude/skills/verify-harness/scripts/hv.py
   (`look`, `put`, `robot://body`) lives there. A change to it is a new measured snapshot and a new benchmark
   run: stop and give the maintainer the proposal, with your episode evidence.
 - Never run `cerulion rcp bench` or `run-cell` against a model endpoint without the operator's yes in this
-  session. Each run sends up to 160 model requests with images, billed to the operator's key.
+  session. Each setup gets up to 80 model replies with images, billed to the operator's key, and `run-cell`
+retries an episode that was not scored up to 3 times, each with a new budget.
 - Never drive a server that this checkout did not start (`hv.py doctor` shows the one it started).
 - Never commit `harness/bx/`, `harness/venv/`, `harness/out/` or a body record measured on this machine.
 
@@ -84,11 +86,12 @@ A change to `crates/cerulion_cli_engine/src/harness_cmd.rs` or `rcp.sh` flags al
 `hv.py up` runs `rcp.sh`, which installs on first use. To install ahead, or to see the progress:
 
 ```bash
-bash harness/install.sh            # minutes; progress on stderr; resumes where it stopped
+bash harness/install.sh            # minutes; progress on stdout (rcp.sh sends it to stderr); resumes
 bash harness/install.sh --check    # exit 0 when installed; writes nothing
 ```
 
-It needs `git`, `curl`, network access to GitHub, Hugging Face and PyPI, and 5 GB free to start. It writes
+It needs `git`, `curl`, network access to GitHub, Hugging Face and PyPI (on Linux also
+download.pytorch.org), and 5 GB free to start. It writes
 `harness/bx/`, `harness/venv/` and a body record for this machine, all ignored by git. With uv's cache warm,
 another worktree installs in minutes and uses less disk than the first. On a small or shared disk, ask the
 operator before the first install. The first episode of a robot body with no record on this machine

@@ -23,7 +23,8 @@ default start state's robot for this machine. A later run checks the install in 
 
 Preconditions:
 
-- Network access to GitHub, Hugging Face and PyPI, and 5 GB free beside the harness.
+- Network access to GitHub, Hugging Face and PyPI (on Linux also download.pytorch.org), and 5 GB free
+  beside the harness.
 
 - **Check before.** Run `bash harness/install.sh --check`. On a fresh checkout it prints three
   `not installed:` lines and exits 1.
