@@ -24,14 +24,11 @@
 - **For agent builders.** [Give your model a simulated arm](#try-the-harness) after an install of about 4 GB. Gemini 3.8 Flash solved 73 of 100 start states with Cerulion and 25 without ([limits](#evidence)).
 - **To check the claims first.** [Read the evidence and its limits](#evidence), with nothing to install.
 
-Replay a recording, then change one constant and replay it again:
+<p align="center">
+  <img src="docs/media/replay-verdict.gif" alt="A recorded bag passes replay, then fails it after one changed constant: differs at x, recorded 0.3, replayed 0.25.">
+</p>
 
-```text
-# replay against the same code
-replay PASS: ... 2/2 topic(s) matched byte-for-byte ...
-# replay after the clear-path speed changed from 0.3 to 0.25
-... differs at x: recorded 0.3, replayed 0.25 ...
-```
+A real run on Cerulion 2.1.0: the recorded bag replays byte for byte, then one changed constant in the safety controller makes the same bag fail at the exact frame and field ([how this GIF was made](docs/media/README.md#assets-the-root-readme-uses)).
 
 <p align="center">
   <img src="docs/media/harness-episode.gif" alt="Claude Opus 5.5 moves the simulated arm through the Cerulion harness and sets the bowl on the plate, and the last frame reads Benchmark verdict: solved." width="480">
