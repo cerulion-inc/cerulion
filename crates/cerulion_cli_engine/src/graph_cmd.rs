@@ -174,7 +174,7 @@ const CPU_DMA_LOCK_US_ENV: &str = "CERULION_CPU_DMA_LOCK_US";
 
 /// Production trace cap for `graph run` / `graph run-worker`: the scheduler's
 /// execution trace becomes a ring keeping the NEWEST 100k `TraceEntry`s.
-/// Math: ~48 B/entry × 100_000 ≈ ~4.8 MB resident; at a busy 3k fires/s that
+/// Math: 56 B/entry × 100_000 = 5.6 MB, reserved up front; at a busy 3k fires/s that
 /// is a ≈33 s observability window. WITHOUT a cap the trace grows unbounded —
 /// ~2 GB/h at 1 kHz × 10 nodes — because no production build path ever set
 /// `max_trace_entries`. The trace is an OBSERVABILITY window, not a replay

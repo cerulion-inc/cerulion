@@ -2431,21 +2431,39 @@ impl Scheduler {
     /// Set maximum trace entries (ring buffer). Default: unbounded.
     ///
     /// When set, the trace operates as a ring buffer that drops the oldest
-    /// entries when full. When `None` (default), trace grows unbounded.
-    /// Use this for long-running sessions to prevent OOM.
+    /// entries when full, and its storage for `limit` entries is reserved
+    /// here (see [`Self::set_trace_limit`]). When `None` (default), trace
+    /// grows unbounded. Use this for long-running sessions to prevent OOM.
     pub fn with_trace_limit(mut self, limit: usize) -> Self {
-        self.max_trace_entries = Some(limit);
+        self.set_trace_limit(limit);
         self
     }
 
     /// Set the trace ring-buffer cap AFTER construction — the post-build twin
-    /// of [`Self::with_trace_limit`] (sets `max_trace_entries = Some(limit)`;
-    /// behaviorally identical, pinned by `set_trace_limit_matches_builder`).
-    /// The capped ring keeps the NEWEST entries. Production CLI paths apply a
-    /// default cap so long-running graphs don't grow their trace unbounded;
-    /// test builds never cap (replay / trace-compare tests need full traces).
+    /// of [`Self::with_trace_limit`] (behaviorally identical, pinned by
+    /// `set_trace_limit_matches_builder`). The capped ring keeps the NEWEST
+    /// entries. Production CLI paths apply a default cap so long-running
+    /// graphs don't grow their trace unbounded; test builds never cap
+    /// (replay / trace-compare tests need full traces).
+    ///
+    /// Reserves the ring's whole storage HERE, on this cold path: `limit`
+    /// times `size_of::<TraceEntry>()` bytes (56 on a 64-bit target), so
+    /// the per-fire append (`RingTraceSink::push_entry`) never grows the
+    /// deque on the step path. A reservation the allocator refuses (an
+    /// absurd `limit`, e.g. a saturated `usize::MAX`) warns once and leaves
+    /// the deque growing on demand; the cap itself still applies.
     pub fn set_trace_limit(&mut self, limit: usize) {
         self.max_trace_entries = Some(limit);
+        let additional = limit.saturating_sub(self.trace.len());
+        if let Err(error) = self.trace.try_reserve_exact(additional) {
+            tracing::warn!(
+                trace_limit = limit,
+                size_bytes = limit.saturating_mul(std::mem::size_of::<TraceEntry>()),
+                error = %error,
+                "fire trace cap could not be reserved up front; the trace grows on demand \
+                 and reallocates on the step path as it fills"
+            );
+        }
     }
 
     /// Add a node to the scheduler. Returns a handle for observing state.
@@ -10960,6 +10978,140 @@ mod tests {
             builder_trace, setter_trace,
             "post-build set_trace_limit must equal the with_trace_limit builder"
         );
+    }
+
+    /// The `graph run --trace-limit` default (`PRODUCTION_TRACE_LIMIT` in the
+    /// CLI engine, which this crate cannot name).
+    const GRAPH_RUN_DEFAULT_TRACE_LIMIT: usize = 100_000;
+
+    /// A scheduler stepping one Period(1ms) node on a virtual clock: one fire
+    /// per `step(1ms)`, the step index of the n-th fire (0-based) is n.
+    fn one_period_node(scheduler: &mut Scheduler) -> NodeHandle {
+        scheduler
+            .add_node(NodeConfig {
+                id: "n".to_string(),
+                policy: TriggerPolicy::Period {
+                    interval: Duration::from_millis(1),
+                    max_catchup: None,
+                },
+                callback: noop_callback(),
+            })
+            .unwrap()
+    }
+
+    /// With the `graph run` default cap set, the step path allocates nothing
+    /// once warm: not at the deque's old doubling points (fires 65, 129, ...,
+    /// 512, 1024, 2048, ..., 65,536, where an unreserved deque reallocates and
+    /// copies itself) and not when the ring wraps at the cap.
+    #[test]
+    fn default_trace_cap_step_path_never_allocates_past_warmup() {
+        use crate::fire_tap::tests::ALLOCATIONS;
+        const WARM_FIRES: u64 = 64;
+        const MEASURED_FIRES: u64 = GRAPH_RUN_DEFAULT_TRACE_LIMIT as u64 + 5_000;
+
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        scheduler.set_trace_limit(GRAPH_RUN_DEFAULT_TRACE_LIMIT);
+        let handle = one_period_node(&mut scheduler);
+        for _ in 0..WARM_FIRES {
+            scheduler.step(Duration::from_millis(1));
+        }
+
+        ALLOCATIONS.set(Some(0));
+        for _ in 0..MEASURED_FIRES {
+            scheduler.step(Duration::from_millis(1));
+        }
+        let allocations = ALLOCATIONS.replace(None).unwrap();
+        assert_eq!(
+            allocations, 0,
+            "the step path allocated {allocations} times over {MEASURED_FIRES} fires with the \
+             default trace cap set"
+        );
+
+        let total = WARM_FIRES + MEASURED_FIRES;
+        assert_eq!(handle.fire_count(), total);
+        assert_eq!(scheduler.entries_appended(), total);
+        let trace = scheduler.trace();
+        assert_eq!(trace.len(), GRAPH_RUN_DEFAULT_TRACE_LIMIT);
+        assert_eq!(trace.first().map(|e| e.step), Some(5_064));
+        assert_eq!(trace.last().map(|e| e.step), Some(105_063));
+    }
+
+    /// The capped ring keeps the NEWEST entries and drops the oldest at the
+    /// cap, inside the storage reserved when the cap was set: the capacity
+    /// never moves through two and a half wraps. Raising the cap later
+    /// reserves the new cap on that call.
+    #[test]
+    fn capped_ring_keeps_newest_in_the_storage_reserved_at_the_cap() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        scheduler.set_trace_limit(8);
+        let reserved = scheduler.trace.capacity();
+        assert!(
+            reserved >= 8,
+            "set_trace_limit(8) reserved {reserved} slots"
+        );
+        one_period_node(&mut scheduler);
+        for _ in 0..20 {
+            scheduler.step(Duration::from_millis(1));
+            assert_eq!(scheduler.trace.capacity(), reserved, "the ring grew");
+        }
+        let steps: Vec<u64> = scheduler.trace().iter().map(|e| e.step).collect();
+        assert_eq!(steps, vec![12, 13, 14, 15, 16, 17, 18, 19]);
+        assert_eq!(scheduler.entries_appended(), 20);
+
+        scheduler.set_trace_limit(32);
+        assert!(scheduler.trace.capacity() >= 32);
+
+        let built =
+            Scheduler::with_virtual_clock(Arc::new(VirtualClock::new())).with_trace_limit(8);
+        assert!(built.trace.capacity() >= 8, "with_trace_limit reserves too");
+    }
+
+    /// Two capped runs of the same graph give identical traces, and both
+    /// equal the newest `cap` entries of an uncapped run: eviction drops
+    /// exactly the oldest fires, in fire order.
+    #[test]
+    fn capped_trace_is_identical_across_runs_and_equals_the_uncapped_tail() {
+        const CAP: usize = 8;
+        let run = |cap: Option<usize>| {
+            let mut s = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+            if let Some(cap) = cap {
+                s.set_trace_limit(cap);
+            }
+            add_period(&mut s, "fast", Duration::from_millis(1));
+            add_period(&mut s, "slow", Duration::from_millis(3));
+            for _ in 0..30 {
+                s.step(Duration::from_millis(1));
+            }
+            s.trace().to_vec()
+        };
+        let first = run(Some(CAP));
+        let second = run(Some(CAP));
+        let uncapped = run(None);
+        assert_eq!(uncapped.len(), 40, "30 fast fires + 10 slow fires");
+        assert_eq!(first.len(), CAP);
+        assert_eq!(first, second, "two capped runs must be identical");
+        assert_eq!(first.as_slice(), &uncapped[uncapped.len() - CAP..]);
+    }
+
+    /// A cap the allocator cannot reserve (the saturated `usize::MAX` a
+    /// caller can compute) warns once with the cap and its size, does not
+    /// panic, and still applies the cap; the trace keeps recording.
+    #[test]
+    #[tracing_test::traced_test]
+    fn unreservable_trace_cap_warns_and_still_records() {
+        let mut scheduler = Scheduler::with_virtual_clock(Arc::new(VirtualClock::new()));
+        scheduler.set_trace_limit(usize::MAX);
+        assert!(logs_contain(
+            "fire trace cap could not be reserved up front"
+        ));
+        assert!(logs_contain(&format!("trace_limit={}", usize::MAX)));
+        assert_eq!(scheduler.max_trace_entries, Some(usize::MAX));
+        one_period_node(&mut scheduler);
+        for _ in 0..5 {
+            scheduler.step(Duration::from_millis(1));
+        }
+        let steps: Vec<u64> = scheduler.trace().iter().map(|e| e.step).collect();
+        assert_eq!(steps, vec![0, 1, 2, 3, 4]);
     }
     /// The COLLECT mirror's Period catch-up
     /// burst must stop at the panic circuit breaker too.
