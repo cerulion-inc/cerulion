@@ -362,6 +362,11 @@ in prepare_pass_verification
 #          replace `producer_sends_per_fire`, `local_block_holds` (twice, a map
 #          of an edge) and `FifoDeferral::step` with a value their types do not
 #          have.
+#          Re-run over the change that refuses a slot for frames past fires
+#          only from a producer that sends at most one frame per fire, in 3
+#          shards, with `--re 'local_block_holds|SlotBound::'`: 26 mutants: 24
+#          caught, 2 unviable, which replace `local_block_holds` with a map of
+#          an edge its type cannot default, none missed.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
