@@ -317,16 +317,19 @@ nor on a resumed pass until the consumer first reads its queue empty; nor, on
 a latest-value input, from the step after a consumer fire with no read of it
 recorded, which can hide a drain, through the step at which the consumer next
 reads it. Such an input is read only by its consumer's tick, which records the
-read unless it errors, and a read that errors can have popped first. A fire the
+read unless its receive fails, and a read whose receive fails can have popped
+first. A fire the
 recording shows ended at an input the tick reads earlier drained nothing: a
 `#[cerulion_node]` node's tick reads its inputs, `accumulate` ones aside, in
 declaration order and ends at the first that serves nothing, which records an
 empty read: a step-boundary input read empty ends every fire of its step, and
 a `sample(N)` trigger input whose gate dropped the frame ends that fire. For a
 node whose metadata does not say it needs a publisher for every output, which
-that macro sets, every such fire can hide a drain. A FIFO input drains only at
-its consumer's recorded reads: a FIFO read that errors has taken no frame with
-a header the bag can read, so a consumer fire with no read of it recorded
+that macro sets, every such fire can hide a drain of a latest-value input. A
+FIFO input drains only at its consumer's recorded reads: a FIFO read records
+the frame it takes before its view checks the frame, and one whose receive
+fails has taken only frames too short for a wire header, which leave the bag
+unable to account for the slot; so a consumer fire with no read of it recorded
 drains nothing.
 A consumer's stop releases its slot from the next step on: a fatal error, or a
 poisoned node entry, whose node keeps firing with its tick skipped; the

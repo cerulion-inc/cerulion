@@ -4312,12 +4312,14 @@ impl SlotBound {
             .filter(|(id, _)| *id == self.consumer_node)
             .count();
         // A `block` input is read only by its consumer's tick, which records
-        // the read unless it errors, and an erroring latest-value read can
-        // have popped first. So a consumer fire with no read of it recorded
-        // either ended before the input or, on a latest-value input, hid a
-        // drain the bag lost. A fire the bag shows ended at an input the tick
-        // reads earlier drained nothing (`fires_ended_before`); any other one
-        // is unexplained.
+        // the read unless its receive fails. A latest-value read whose receive
+        // fails can have popped first; a FIFO one has taken only frames too
+        // short for a wire header, which leave the edge unaccounted. So a
+        // consumer fire with no read of it recorded ended before the input,
+        // took nothing countable from a FIFO input, or, on a latest-value
+        // input, hid a drain the bag lost. A fire the bag shows ended at an
+        // input the tick reads earlier drained nothing (`fires_ended_before`);
+        // any other one is unexplained.
         let unexplained = !body_read
             && consumer_fires
                 > fires_ended_before(
@@ -4498,14 +4500,14 @@ pub(crate) struct StepDeferral {
 ///   latest-value input, from the step after a consumer
 ///   fire that can hide a drain of it through the step at which the consumer
 ///   next reads it. Such an input is read only by its consumer's tick, which
-///   records the read unless it errors, and a read that errors can have
-///   popped first, so a fire with no read of it recorded can hide a drain
-///   unless the bag shows the tick ended at an input it reads earlier
-///   ([`ReadsBefore`]). A FIFO input drains only at its consumer's recorded
-///   reads: a FIFO read records the frame it takes, and one that errors has
-///   taken none but frames too short for a wire header, whose stamps the bag
-///   cannot read, so their edge is unaccounted; a fire with no read of the
-///   input recorded drains nothing. A
+///   records the read unless its receive fails, and a read whose receive
+///   fails can have popped first, so a fire with no read of it recorded can
+///   hide a drain unless the bag shows the tick ended at an input it reads
+///   earlier ([`ReadsBefore`]). A FIFO input drains only at its consumer's
+///   recorded reads: a FIFO read records the frame it takes before its view
+///   checks the frame, and one whose receive fails has taken only frames too
+///   short for a wire header, whose stamps the bag cannot read, so their edge
+///   is unaccounted; a fire with no read of the input recorded drains nothing. A
 ///   resumed pass does not know what the slot held at its anchor,
 ///   so the edge explains no step until the consumer first reads its queue
 ///   empty. Frames stamped before the pass's first step are not its sends.
@@ -10073,18 +10075,25 @@ mod tests {
     }
 
     /// What the consumer's reads and its stop do to the bound, hand-built on
-    /// depth 2 as `(step, relay pops, relay fires, sink body pops)`, each a
-    /// relay that leaves a pop unfired where the slot no longer holds it:
+    /// depth 2, each a relay that leaves a pop unfired where the slot no
+    /// longer holds it. The rows are `(step, relay pops, relay fires, sink body
+    /// pops)`, and [`fifo_step`] node entries in the case whose sink fires with
+    /// no read:
     ///
     /// * the sink stops at step 1, which releases its slot for good, so the
     ///   relay's step 2 pop is a finding;
     /// * after the relay's step 3 hold the sink takes a frame at each of steps
     ///   3 and 4 through a read that records nothing and pays the slot nothing
     ///   (`CerulionSubscriber::try_receive_one`), so the slot counts two frames
-    ///   its queue no longer holds; at step 5 it reads its queue empty, which
-    ///   resyncs the slot, so the frame the relay carries unfired at step 6 is
-    ///   a finding; without the empty read, or with one at the drain site or on
-    ///   a bag whose roles cannot be believed, the slot still counts two;
+    ///   its queue no longer holds; at step 5 its body reads the queue empty,
+    ///   which resyncs the slot, so the frame the relay carries unfired at step
+    ///   6 is a finding. Without that read the slot still counts two, and so it
+    ///   does with the empty read at the drain site, which says nothing of the
+    ///   body's queue. A bag whose roles cannot be believed shows no empty read
+    ///   as the body's, so the rule counts two there as well, where the run
+    ///   these rows narrate resynced the word; no such bag counts a slot, since
+    ///   roles are believed from a trace format older than the one that holds
+    ///   node stops, so that half pins the rule alone;
     /// * a truncated read stream of the sink's input loses its drains, so from
     ///   its marker at step 2 nothing bounds the slot and the step 3 frame
     ///   carried unfired is a finding; without the marker it is the hold;
@@ -10139,8 +10148,9 @@ mod tests {
         let kept = taken();
         let not_reset = verify_unrestored(&relay(sink_holds(2, &kept)), &kept, &[], STAMPED);
         assert!(not_reset.is_clean(), "{:?}", not_reset.findings);
-        // An empty read that is not the body's, or whose role cannot be
-        // believed, says nothing of the slot's queue.
+        // An empty read that is not the body's says nothing of the slot's
+        // queue, and the rule takes none whose role it cannot believe as the
+        // body's.
         let drain_site = read_with_role(
             "sink",
             "inp",
