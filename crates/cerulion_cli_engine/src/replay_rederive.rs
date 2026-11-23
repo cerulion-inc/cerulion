@@ -944,6 +944,26 @@ pub struct BlockHoldEdge {
     pub record: SlotRecord,
     /// The inputs the consumer's tick reads before this one at every fire.
     pub reads_before: ReadsBefore,
+    /// How many frames one fire of the edge's producer can send on the topic.
+    pub producer_sends: SendsPerFire,
+}
+
+/// How many frames one fire of a `block` edge's producer can send on the
+/// slot's topic, as the producer's node info says
+/// ([`BlockHoldEdge::producer_sends`]). The bag cannot say: a FIRE record
+/// counts no frames, and the frames at a stamp do not say which of the fires
+/// at that stamp sent them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendsPerFire {
+    /// At most one: the producer's info says it needs a publisher for every
+    /// output it declares, which the `#[cerulion_node]` macro sets. Its
+    /// generated tick loans each output once and sends it once, when the loan
+    /// drops. A raw FFI info block that sets the flag is read the same way.
+    AtMostOne,
+    /// Any number: the producer's info does not set the flag. A raw FFI node
+    /// can commit several frames on one output in one fire. A Python node
+    /// sends at most one, but its info cannot set the flag.
+    Unbounded,
 }
 
 /// What a bag records of the frames sent to one `block` slot.
@@ -1333,13 +1353,15 @@ pub enum FindingCaveat {
     /// ([`FifoDrain::Unrecorded`]): the hold is not allowed for there, so the
     /// step can be the hold.
     DrainUnrecordedHold,
-    /// The step was excused as a hold by `block` slots whose counts the bag
-    /// shows past their depths, the last of them at `breach_step`, with no
-    /// read of any of them by their consumers in between. A slot that holds never
-    /// passes its depth, so each was released with no record before then, and
-    /// the hold is not allowed for.
+    /// The step was excused as a hold by `block` slots that the bag shows
+    /// released, the last of them at `breach_step`, with no read of any of
+    /// them by their consumers in between: the slot's producer fired while it
+    /// counted its depth, or a producer that sends at most one frame per fire
+    /// took its count past the depth. A slot that holds allows neither, so
+    /// each was released with no record before then, and the hold is not
+    /// allowed for.
     SlotPastDepth {
-        /// The step at which the last of those slots passed its depth.
+        /// The step at which the last of those slots showed its release.
         breach_step: u64,
     },
 }
@@ -1355,10 +1377,11 @@ impl fmt::Display for FindingCaveat {
             ),
             Self::SlotPastDepth { breach_step } => write!(
                 f,
-                "every `block` slot that excused this step counts past its depth in the \
-                 recording, the last of them at step {breach_step}, with no read by their \
-                 consumers in between; a slot that holds never passes its depth, so each was \
-                 released with no record and the hold is not allowed for"
+                "the recording shows every `block` slot that excused this step released, the \
+                 last of them at step {breach_step}, with no read by their consumers in between: \
+                 its producer fired while it counted its depth, or a producer that sends one \
+                 frame per fire took it past its depth; a slot that holds allows neither, so \
+                 each was released with no record and the hold is not allowed for"
             ),
         }
     }
@@ -4188,11 +4211,13 @@ struct SlotBound {
     /// Where the consumer stopped: a stopped consumer releases its slot for
     /// good (`release_held_block_slots`).
     consumer_stop: Option<StopPoint>,
-    /// Has the count passed the depth? A slot that holds never does, so it
-    /// was released with no record, for good.
+    /// Has the slot shown a release the bag does not record ([`Self::step`])?
+    /// It holds nothing from then on.
     breached: bool,
     /// The inputs the consumer's tick reads before this one.
     reads_before: ReadsBefore,
+    /// How many frames one fire of the producer can send on the topic.
+    producer_sends: SendsPerFire,
 }
 
 /// One slot's answer at one step ([`SlotBound::step`]).
@@ -4200,8 +4225,9 @@ struct SlotBound {
 pub(crate) struct SlotStep {
     /// The bag shows the slot full at the step's pre-fire check.
     pub hold: bool,
-    /// The slot's count passed its depth at the step, which a slot that holds
-    /// never does: it holds nothing from here on.
+    /// The slot showed a release the bag does not record at the step, which
+    /// a slot that holds never does ([`SlotBound::step`]): it holds nothing
+    /// from here on.
     pub breached: bool,
     /// The consumer's body read the input at the step, after the producer's
     /// checks, so the slot was still armed at every check up to them.
@@ -4213,11 +4239,15 @@ impl SlotBound {
     /// pre-fire check, then the step's sends and the consumer's drains. `next_clock_ns`
     /// is the next step's gating clock (`None` on the pass's last step): a
     /// frame whose stamp several steps share counts at the last of them.
+    /// `producer_fired` says whether the bag records a fire of the edge's
+    /// producer at the step.
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
         step: u64,
         clock_ns: u64,
         next_clock_ns: Option<u64>,
+        producer_fired: bool,
         fires: &[(&str, u64)],
         reads: &[RecordedRead],
         trust: RoleTrust,
@@ -4262,11 +4292,33 @@ impl SlotBound {
         let count = self
             .queued
             .map(|q| q.saturating_add(sent).saturating_sub(owed_now));
-        // While it holds, a slot counts at most its depth: the check holds the
-        // producer at the depth, and each fire sends one frame. A slot that
-        // counts past it was released with no record (a slot its consumer's
-        // stop already released counts past it after the stop, and is skipped).
-        let breached = !released && !self.breached && count.is_some_and(|c| c > self.depth);
+        // While it holds, a slot stops its producer at the depth. The producer
+        // is checked before each of its fires, at the decide gate
+        // (`Scheduler::decide_node`) and before every later fire of the burst
+        // (`Scheduler::tick_data_burst`), and the check holds it while the slot
+        // counts its depth (`scheduler::block::judge_slot`: `outstanding >=
+        // depth`); each frame counts on the slot when it is sent
+        // (`CerulionPublisher::send_counted`). A counted edge's consumer fires
+        // on a later level than its producer, and a level decides and fires
+        // before the next one does (`GraphRuntime::run_level`), so no read or
+        // stop of the consumer comes between the step's start and the
+        // producer's first check: the count before the step's sends is at most
+        // the slot's there. So a producer that fires at a step whose slot
+        // already counts its depth before the step's sends was released with
+        // no record, whatever the fire sends. A producer that sends at most one
+        // frame per fire stops at the depth, so a slot that counts past it was
+        // released too; any other producer can send several frames in one fire
+        // from a slot below its depth, and its count past the depth shows
+        // nothing. A slot its consumer's stop already released shows both after
+        // the stop, and is skipped.
+        let before_sends = self.queued.map(|q| {
+            q.saturating_add(u64::try_from(older).unwrap_or(u64::MAX))
+                .saturating_sub(owed_now)
+        });
+        let fired_at_depth = producer_fired && before_sends.is_some_and(|c| c >= self.depth);
+        let past_depth =
+            self.producer_sends == SendsPerFire::AtMostOne && count.is_some_and(|c| c > self.depth);
+        let breached = !released && !self.breached && (fired_at_depth || past_depth);
         self.breached |= breached;
         let hold = !released && !self.breached && count.is_some_and(|c| c >= self.depth);
         let mut removed = 0u64;
@@ -4479,13 +4531,18 @@ pub(crate) struct StepDeferral {
 ///   releases its slot for good, so from the step after it the edge holds
 ///   nothing: a fatal error, or a poisoned entry, whose node keeps firing
 ///   with its tick skipped ([`StopPoint::slots_released_after`]); the
-///   consecutive-panic breaker releases none. While a slot holds, its count never passes the depth: the check
-///   stops the producer there, and each fire sends one frame. So a slot that
-///   counts past it was released with no record: from that step it holds
-///   nothing, and a step only it excused since its consumer last read it is
-///   voided ([`FifoStep::voided`]), a finding that says why
+///   consecutive-panic breaker releases none. While a slot holds, the check
+///   stops the producer at its depth before each of its fires, so a producer
+///   that fires at a step whose slot already counts its depth before the
+///   step's sends was released with no record. A producer whose info says it
+///   sends at most one frame per fire ([`SendsPerFire::AtMostOne`]) never
+///   takes a slot that holds past its depth either, so its count past the
+///   depth is a release too; any other producer can send several frames in
+///   one fire from a slot below its depth. From the step of such a release
+///   the slot holds nothing, and a step only it excused since its consumer
+///   last read it is voided ([`FifoStep::voided`]), a finding that says why
 ///   ([`FindingCaveat::SlotPastDepth`]). A slot its consumer's stop already
-///   released counts past the depth after the stop, and is not held to it.
+///   released shows both after the stop, and is not held to them.
 ///   Where the bag cannot account for every frame sent or drained,
 ///   the edge explains no step: an unaccounted record
 ///   ([`SlotRecord::Unaccounted`], which an input that sets
@@ -4552,6 +4609,7 @@ impl FifoDeferral {
                 consumer_stop: stops.stop_point(&edge.consumer_node),
                 breached: false,
                 reads_before: edge.reads_before.clone(),
+                producer_sends: edge.producer_sends,
             })
             .collect::<Vec<_>>();
         let slot_steps = vec![SlotStep::default(); slots.len()];
@@ -4614,8 +4672,9 @@ impl FifoDeferral {
             self.last_fire_ns = last;
         }
         let mut hold = false;
+        let fired = !own.is_empty();
         for (slot, answer) in self.slots.iter_mut().zip(self.slot_steps.iter_mut()) {
-            *answer = slot.step(step, clock_ns, next_clock_ns, fires, reads, trust);
+            *answer = slot.step(step, clock_ns, next_clock_ns, fired, fires, reads, trust);
             hold |= answer.hold;
         }
         StepDeferral {
@@ -4635,26 +4694,26 @@ pub(crate) struct FifoStep {
     /// What the step carries out, or the mismatch no carry explains.
     pub outcome: Result<u32, FifoCarryMismatch>,
     /// An earlier step's excuse that this step voids: every slot whose hold
-    /// excused it counted past its depth here, with no read by its consumer
-    /// since.
+    /// excused it showed a release by here ([`SlotBound::step`]), with no read
+    /// by its consumer since.
     pub voided: Option<VoidedExcuse>,
 }
 
-/// A step a hold excused, voided by a later step at which every slot that
-/// held there counted past its depth ([`FifoStep::voided`]).
+/// A step a hold excused, voided by a later step by which every slot that
+/// held there showed a release ([`FifoStep::voided`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct VoidedExcuse {
     /// The excused step.
     pub step: u64,
     /// The frames, or signals, it had to fire on.
     pub supply: u32,
-    /// The step at which the last of those slots passed its depth.
+    /// The step at which the last of those slots showed its release.
     pub breach_step: u64,
 }
 
 /// A step only a hold excused, with the slots that held there, until one of
 /// their consumers reads, which shows its slot armed at the step, or every one
-/// of them passes its depth first, which voids it. Two excuses whose slots are
+/// of them shows a release first, which voids it. Two excuses whose slots are
 /// the same settle together, so only the earlier is kept
 /// ([`FifoCarry::settle_excuses`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4745,8 +4804,8 @@ impl FifoCarry {
         }
     }
 
-    /// Settle the pending excuses on the last step's slot answers: a slot past
-    /// its depth stops vouching for each, and the earliest one no slot vouches
+    /// Settle the pending excuses on the last step's slot answers: a slot that
+    /// showed a release stops vouching for each, and the earliest one no slot vouches
     /// for any more is voided; then a consumer's read confirms every excuse its
     /// slot gave, since its slot was armed at each of those checks.
     ///
@@ -9415,6 +9474,7 @@ mod tests {
             depth,
             record,
             reads_before: ReadsBefore::Unknown,
+            producer_sends: SendsPerFire::AtMostOne,
         }
     }
 
@@ -11471,10 +11531,11 @@ mod tests {
         assert_eq!(
             report.findings[0].to_string(),
             "fire-schedule divergence: node 'relay' step 3 FIFO pop count \u{2014} re-derived 1 \
-             fire(s), recorded 0 fire(s); every `block` slot that excused this step counts past \
-             its depth in the recording, the last of them at step 4, with no read by their \
-             consumers in between; a slot that holds never passes its depth, so each was \
-             released with no record and the hold is not allowed for"
+             fire(s), recorded 0 fire(s); the recording shows every `block` slot that excused \
+             this step released, the last of them at step 4, with no read by their consumers \
+             in between: its producer fired while it counted its depth, or a producer that \
+             sends one frame per fire took it past its depth; a slot that holds allows \
+             neither, so each was released with no record and the hold is not allowed for"
         );
     }
 
@@ -11588,6 +11649,157 @@ mod tests {
             let pending: Vec<u64> = carry.pending.iter().map(|e| e.step).collect();
             let expected: &[u64] = if n >= 3 { &[3] } else { &[] };
             assert_eq!(pending, expected, "pending after step {n}");
+        }
+    }
+
+    /// `edges` with every producer able to send several frames in one fire
+    /// ([`SendsPerFire::Unbounded`]), as a raw FFI node can.
+    fn sending_any(edges: BlockHoldEdges) -> BlockHoldEdges {
+        BlockHoldEdges::new(
+            edges
+                .edges()
+                .iter()
+                .cloned()
+                .map(|e| BlockHoldEdge {
+                    producer_sends: SendsPerFire::Unbounded,
+                    ..e
+                })
+                .collect(),
+        )
+    }
+
+    /// Depth 1 on a FIFO input: at step 0 the relay pops two frames and fires
+    /// twice, sending nothing from its first fire and two frames from its
+    /// second, and the sink reads one; at step 1 the relay pops a frame and
+    /// fires nothing. Each step 0 check found the slot empty, and at step 1
+    /// the slot counts one, its depth, at the relay's check.
+    fn two_frame_fire_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 2, 2, 0), ("sink", 0, 1, 1)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+        ]
+    }
+
+    /// A producer that can send several frames in one fire counts past its
+    /// slot's depth with nothing released: on the two-frame-fire rows the slot
+    /// counts two at step 0 and one at step 1, so the step 1 pop left unfired
+    /// is the hold, and the steps read clean.
+    #[test]
+    fn a_slot_a_several_frame_fire_counts_past_its_depth_still_holds() {
+        let steps = two_frame_fire_steps();
+        let decls = relay(sending_any(sink_holds(1, &steps)));
+        let report = verify_unrestored(&decls, &steps, &[], STAMPED);
+        assert!(report.is_clean(), "{:?}", report.findings);
+    }
+
+    /// A producer that sends one frame per fire stops at its slot's depth, so
+    /// a count past it is a release with no record: the same two-frame-fire
+    /// rows from a one-frame producer hold nothing after step 0, and the step 1
+    /// pop left unfired is the finding.
+    #[test]
+    fn a_slot_a_one_frame_producer_counts_past_its_depth_holds_nothing() {
+        let steps = two_frame_fire_steps();
+        let report = verify_unrestored(&relay(sink_holds(1, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&report), vec![finding("relay", 1, 1, 0)]);
+        assert_eq!(report.findings[0].caveat, None);
+    }
+
+    /// Depth 1 on a FIFO input: at step 0 the relay pops three frames and
+    /// fires twice, sending nothing and then two frames, so its check before
+    /// a third fire finds the slot full; at step 1 it fires nothing and the
+    /// sink reads one frame.
+    fn filled_by_one_fire_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 3, 2, 0)]),
+            fifo_step(1, 5_000, &[("sink", 0, 1, 1)]),
+        ]
+    }
+
+    /// A fire that sends several frames fills its slot at its own step, and
+    /// the hold that follows stands: from a producer that can send several
+    /// frames in one fire the step 0 frame left unfired is the hold, and the
+    /// steps read clean; from a one-frame producer the slot counts past its
+    /// depth at step 0, so nothing holds there and step 0 is the finding.
+    #[test]
+    fn a_several_frame_fire_that_fills_its_slot_excuses_its_steps_unfired_frame() {
+        let steps = filled_by_one_fire_steps();
+        let any = verify_unrestored(
+            &relay(sending_any(sink_holds(1, &steps))),
+            &steps,
+            &[],
+            STAMPED,
+        );
+        assert!(any.is_clean(), "{:?}", any.findings);
+        let one = verify_unrestored(&relay(sink_holds(1, &steps)), &steps, &[], STAMPED);
+        assert_eq!(findings_of(&one), vec![finding("relay", 0, 3, 2)]);
+    }
+
+    /// Depth 1 on a FIFO input: the relay fires one frame at step 0 and the
+    /// sink never reads; the relay pops a frame at step 1 that it keeps
+    /// unfired, which the full slot excuses, and fires it at step 2; the
+    /// slot's record says what that fire sent.
+    fn fire_at_full_steps() -> Vec<RecordedStep> {
+        vec![
+            fifo_step(0, 0, &[("relay", 1, 1, 0)]),
+            fifo_step(1, 5_000, &[("relay", 1, 0, 0)]),
+            fifo_step(2, 10_000, &[("relay", 0, 1, 0)]),
+        ]
+    }
+
+    /// A producer that fires while its slot already counts its depth was
+    /// released with no record, whatever the fire sends: its check holds it
+    /// there. On the fire-at-full rows, from a producer that can send several
+    /// frames in one fire, the step 2 fire comes at a count of one, the depth,
+    /// so the step 1 hold is voided with the caveat, whether the fire sends a
+    /// frame or none; the same holds where the step 0 fires sent two frames
+    /// and the count before step 2 is two.
+    #[test]
+    fn a_producer_that_fires_at_a_full_slot_was_released_whatever_it_sends() {
+        let steps = fire_at_full_steps();
+        let voided = |report: &RederivationReport| {
+            assert_eq!(findings_of(report), vec![finding("relay", 1, 1, 0)]);
+            assert_eq!(
+                report.findings[0].caveat,
+                Some(FindingCaveat::SlotPastDepth { breach_step: 2 })
+            );
+        };
+        let nothing_sent = BlockHoldEdges::new(vec![BlockHoldEdge {
+            producer_sends: SendsPerFire::Unbounded,
+            ..slot("sink", 1, stamped_at(&[0]))
+        }]);
+        voided(&verify_unrestored(
+            &relay(nothing_sent),
+            &steps,
+            &[],
+            STAMPED,
+        ));
+        let one_sent = relay(sending_any(sink_holds(1, &steps)));
+        voided(&verify_unrestored(&one_sent, &steps, &[], STAMPED));
+        let mut above = steps.clone();
+        above[0] = fifo_step(0, 0, &[("relay", 2, 2, 0)]);
+        let above_decls = relay(sending_any(sink_holds(1, &above)));
+        voided(&verify_unrestored(&above_decls, &above, &[], STAMPED));
+    }
+
+    /// The several-frame and fire-at-full rows judged twice give one report
+    /// each time, field for field and in its rendering.
+    #[test]
+    fn the_several_frame_and_fire_at_full_rows_judge_the_same_twice() {
+        let two = two_frame_fire_steps();
+        let filled = filled_by_one_fire_steps();
+        let full = fire_at_full_steps();
+        let cases = [
+            (relay(sending_any(sink_holds(1, &two))), two.clone()),
+            (relay(sink_holds(1, &two)), two),
+            (relay(sending_any(sink_holds(1, &filled))), filled.clone()),
+            (relay(sink_holds(1, &filled)), filled),
+            (relay(sending_any(sink_holds(1, &full))), full),
+        ];
+        for (decls, steps) in &cases {
+            let first = verify_unrestored(decls, steps, &[], STAMPED);
+            let second = verify_unrestored(decls, steps, &[], STAMPED);
+            assert_eq!(first, second);
+            assert_eq!(format!("{first:?}"), format!("{second:?}"));
         }
     }
 

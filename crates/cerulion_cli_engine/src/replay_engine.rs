@@ -13480,11 +13480,13 @@ fn recorded_fire_instants(
 /// (`frame_stamps`, ascending) than its producer fired at that instant
 /// (`fire_instants`, ascending), at any stamp from `from_ns` (the rank's first
 /// recorded fire) on? A fire stamps every frame it sends with its step's
-/// gating clock, which is also its FIRE record's instant, and a
-/// `#[cerulion_node]` node sends one frame per output per fire, so its slot
-/// never counts past the depth while it holds. A producer that sends more, or
-/// a frame no recorded fire sent, can. Frames stamped before `from_ns` precede
-/// the trace and are not compared.
+/// gating clock, which is also its FIRE record's instant, so more frames than
+/// fires at a stamp shows a fire that sent several frames, or a frame no
+/// recorded fire sent. Equal totals do not say which fire sent which frame:
+/// two fires at one stamp, the first sending nothing and the second two
+/// frames, match two frames. Whether one fire can send several frames is the
+/// producer's node info's to say ([`producer_sends_per_fire`]). Frames stamped
+/// before `from_ns` precede the trace and are not compared.
 fn writes_past_fires(frame_stamps: &[u64], fire_instants: &[u64], from_ns: u64) -> bool {
     let start = frame_stamps.partition_point(|&at| at < from_ns);
     let frames = &frame_stamps[start..];
@@ -13580,6 +13582,21 @@ fn block_hold_flows(
         .collect())
 }
 
+/// PURE: how many frames one fire of a `block` edge's producer can send on
+/// the slot's topic, from its node info (`info`, `None` for a node the build
+/// has no info for): at most one where the info says it needs a publisher for
+/// every output it declares, which the `#[cerulion_node]` macro sets, the
+/// marker [`consumer_reads_before`] reads too; any number otherwise.
+fn producer_sends_per_fire(
+    info: Option<&cerulion_core::graph::NodeInfo>,
+) -> replay_rederive::SendsPerFire {
+    if info.is_some_and(|info| info.publisher_for_every_output()) {
+        replay_rederive::SendsPerFire::AtMostOne
+    } else {
+        replay_rederive::SendsPerFire::Unbounded
+    }
+}
+
 /// PURE: per node of the rank, the `block` edges that can hold its fire, for
 /// [`replay_rederive::NodeDecl::may_be_held_by`]: per producer, one edge per
 /// `block` consumer of each topic it produces, each with what the bag records
@@ -13599,12 +13616,16 @@ fn block_hold_flows(
 /// whose producer the bag shows writing more frames to the topic than it
 /// fires (`writes_past_fires(producer, topic)`, [`writes_past_fires`]): its
 /// slot can pass the depth while it holds, which the replay reads as a
-/// release.
+/// release. Each edge carries how many frames one fire of its producer can
+/// send (`producer_sends(producer)`, [`producer_sends_per_fire`]): the replay
+/// reads a count past the depth as a release only from a producer that sends
+/// at most one.
 fn local_block_holds(
     flows: &[BlockHoldFlow],
     levels: &BTreeMap<String, RecordedLevel>,
     stops_recorded: bool,
     writes_past_fires: &dyn Fn(&str, &str) -> bool,
+    producer_sends: &dyn Fn(&str) -> replay_rederive::SendsPerFire,
     record_of: &dyn Fn(&str, &str, &str) -> replay_rederive::SlotRecord,
 ) -> BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> {
     let mut holds: BTreeMap<String, Vec<replay_rederive::BlockHoldEdge>> = BTreeMap::new();
@@ -13628,6 +13649,7 @@ fn local_block_holds(
                         record_of(&flow.topic, &c.node, &c.input)
                     },
                     reads_before: c.reads_before.clone(),
+                    producer_sends: producer_sends(producer),
                 });
             holds.entry(producer.clone()).or_default().extend(edges);
         }
@@ -15809,6 +15831,7 @@ fn prepare_pass_verification(
                     )
                 })
         },
+        &|producer| producer_sends_per_fire(node_infos.get(producer)),
         &|topic, consumer, input| {
             slot_record(
                 hold_stamps.get(topic).and_then(Option::as_ref),
@@ -40642,6 +40665,20 @@ mod trigger_input_capacity_tests {
             depth,
             record: record_of(topic, node, "x"),
             reads_before: replay_rederive::ReadsBefore::Unknown,
+            producer_sends: replay_rederive::SendsPerFire::AtMostOne,
+        };
+        // The producer `h` can send several frames in one fire; every other
+        // producer sends at most one. Each edge carries its producer's answer.
+        let sends = |producer: &str| {
+            if producer == "h" {
+                replay_rederive::SendsPerFire::Unbounded
+            } else {
+                replay_rederive::SendsPerFire::AtMostOne
+            }
+        };
+        let unbounded = |e: BlockHoldEdge| BlockHoldEdge {
+            producer_sends: replay_rederive::SendsPerFire::Unbounded,
+            ..e
         };
         // The recorded levels: each consumer fires a level after its producer.
         let levels: BTreeMap<String, RecordedLevel> = [
@@ -40667,6 +40704,7 @@ mod trigger_input_capacity_tests {
             &levels,
             true,
             &|_, _| false,
+            &sends,
             &record_of,
         );
         assert_eq!(
@@ -40676,7 +40714,10 @@ mod trigger_input_capacity_tests {
                 ("e".to_string(), vec![edge("f", 1, "/lb/e/out")]),
                 (
                     "h".to_string(),
-                    vec![edge("i", 2, "/lb/h/out"), edge("k", 4, "/lb/h/out")]
+                    vec![
+                        unbounded(edge("i", 2, "/lb/h/out")),
+                        unbounded(edge("k", 4, "/lb/h/out"))
+                    ]
                 ),
                 ("l".to_string(), vec![edge("n", 5, "/lb/bus")]),
                 ("m".to_string(), vec![edge("n", 5, "/lb/bus")]),
@@ -40690,6 +40731,7 @@ mod trigger_input_capacity_tests {
             &levels,
             true,
             &|producer, topic| producer == "h" && topic == "/lb/h/out",
+            &sends,
             &record_of,
         );
         let mut expected_past = held.clone();
@@ -40704,6 +40746,7 @@ mod trigger_input_capacity_tests {
             &levels,
             false,
             &|_, _| false,
+            &sends,
             &record_of,
         );
         assert_eq!(
@@ -40735,6 +40778,9 @@ mod trigger_input_capacity_tests {
             (&[10, 20, 30], &[10, 20, 30], 10, false),
             (&[10, 20, 20, 30], &[10, 20, 30], 10, true),
             (&[10, 20, 20, 30], &[10, 20, 20, 30], 10, false),
+            // Two fires and two frames at one stamp match, whichever fire sent
+            // them: one fire can have sent both and the other none.
+            (&[20, 20], &[20, 20], 20, false),
             (&[10, 20, 30], &[10, 30], 10, true),
             (&[10, 20, 30], &[10, 20], 10, true),
             // Fewer frames than fires: a fire that sent nothing.
@@ -40834,6 +40880,24 @@ mod trigger_input_capacity_tests {
             ReadsBefore::Unknown
         );
         assert_eq!(consumer_reads_before(None, "x"), ReadsBefore::Unknown);
+    }
+
+    /// A `block` edge's producer sends at most one frame per fire only where
+    /// its info says it needs a publisher for every output it declares: hand
+    /// table over a marked info, an unmarked one and none.
+    #[test]
+    fn a_producer_sends_one_frame_per_fire_only_where_its_info_says_it_needs_every_publisher() {
+        use cerulion_core::graph::node::NodeInfo;
+        use replay_rederive::SendsPerFire;
+        let unmarked = NodeInfo::with_meta(vec![], vec![]);
+        let marked = NodeInfo::with_meta(vec![], vec![]).with_publisher_for_every_output();
+        for (info, sends) in [
+            (Some(&marked), SendsPerFire::AtMostOne),
+            (Some(&unmarked), SendsPerFire::Unbounded),
+            (None, SendsPerFire::Unbounded),
+        ] {
+            assert_eq!(producer_sends_per_fire(info), sends, "{info:?}");
+        }
     }
 
     /// A raw FFI info block that sets `publisher_for_every_output` is read as
@@ -41072,6 +41136,7 @@ mod trigger_input_capacity_tests {
                 &levels,
                 true,
                 &|_, _| false,
+                &|_| replay_rederive::SendsPerFire::AtMostOne,
                 &|_, _, _| SlotRecord::Counted {
                     frame_stamps: vec![1_000],
                     drain: BodyDrain::PerFrame,
@@ -41307,6 +41372,7 @@ mod trigger_input_capacity_tests {
                 &levels,
                 true,
                 &|_, _| false,
+                &|_| replay_rederive::SendsPerFire::AtMostOne,
                 &|_, _, _| counted.clone(),
             )
             .remove("relay")
@@ -41318,6 +41384,7 @@ mod trigger_input_capacity_tests {
             depth: 1,
             record,
             reads_before: replay_rederive::ReadsBefore::Unknown,
+            producer_sends: replay_rederive::SendsPerFire::AtMostOne,
         };
         let beside = format!(
             "name: bs\nprefix: bs\nnodes:\n\
@@ -41746,6 +41813,7 @@ mod trailing_refill_tests {
                 drain: replay_rederive::BodyDrain::PerFrame,
             },
             reads_before: replay_rederive::ReadsBefore::Unknown,
+            producer_sends: replay_rederive::SendsPerFire::AtMostOne,
         }])
     }
 

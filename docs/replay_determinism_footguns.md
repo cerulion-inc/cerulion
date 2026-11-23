@@ -333,13 +333,21 @@ unable to account for the slot; so a consumer fire with no read of it recorded
 drains nothing.
 A consumer's stop releases its slot from the next step on: a fatal error, or a
 poisoned node entry, whose node keeps firing with its tick skipped; the
-consecutive-panic breaker releases none. While a slot holds,
-its count never passes the input's depth: the check stops the producer there,
-and each fire sends one frame. So a slot the recording counts past its depth
-was released with no record: it allows for no hold from that step on, and a
-step only it excused since its consumer last read it is a divergence that says
-so. A slot that a consumer's stop released is not held to its depth after the
-stop. As for a throttle,
+consecutive-panic breaker releases none. While a slot holds, the
+check stops the producer at the input's depth before each of its fires, so a
+producer the recording shows firing at a step whose slot already counts its
+depth before that step's frames was released with no record. A
+`#[cerulion_node]` or Python node sends at most one frame per output per fire,
+so its slot never passes the depth while it holds, and the verifier reads a
+count past the depth as a release where the producer's metadata says it needs
+a publisher for every output, which the macro sets (a `--raw-ffi` node whose
+metadata sets that flag by hand is read the same way). A `--raw-ffi` node can
+send several frames in one fire, so a count past the depth from any producer
+whose metadata does not set the flag, a Python node's included, is not read as
+a release. A released slot allows for no hold from that step on, and a step
+only it excused since its consumer last read it is a divergence that says so. A
+slot that a consumer's stop released is not held to either after the stop. As
+for a throttle,
 whose window the rule reads off the recorded clock, a step no such check could
 defer owes every popped frame a fire. Read through one
 subscriber, such a node may leave one popped frame unfired at a step a check
