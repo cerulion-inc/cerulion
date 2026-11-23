@@ -58007,6 +58007,12 @@ fn a_poisoned_consumers_recorded_stop_alone_releases_its_slot() {
         Some(rs_finding(6))
     );
     assert!(!outcome.passed);
+    let again = bh_replay_stamped(&short, ps_factories, bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
 /// A driver that reads the relay's frames through the context `block` input
@@ -58115,6 +58121,8 @@ fn a_driver_consumers_recorded_stop_releases_its_slot() {
         outcome.trace_divergence.as_ref().map(|d| d.detail.as_str()),
         None
     );
+    assert!(outcome.violations.is_empty(), "{:?}", outcome.violations);
+    assert!(outcome.passed);
 
     rs_drop_relay_fire(&mut rec, "/bd/relay/out", stop + 3);
     let short = dir.path().join("bd_short.mcap");
@@ -58125,6 +58133,12 @@ fn a_driver_consumers_recorded_stop_releases_its_slot() {
         Some(rs_finding(stop + 3))
     );
     assert!(!outcome.passed);
+    let again = bh_replay_stamped(&short, || bd_factories(None), bh_clean_stamp(&rec));
+    assert_eq!(
+        serde_json::to_string(&outcome).unwrap(),
+        serde_json::to_string(&again).unwrap(),
+        "two replays of one bag are byte-identical"
+    );
 }
 
 /// A relay nothing holds, on a bag that states its drain: its last fire is

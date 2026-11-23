@@ -17101,10 +17101,10 @@ fn run_rank_pass(
         )?;
         rec_step_stops.clear();
         if pass.stops_recorded {
-            // Every recorded stop reaches the rules, a driver's too: a stop
-            // releases the node's `block` slots whatever drives it. Only the
-            // compare leaves a driver's stops out, since a resim never gives
-            // a driver its device.
+            // Every recorded stop reaches the rules, a driver's too: a fatal or
+            // poisoned stop releases the node's `block` slots whatever drives
+            // it. Only the compare leaves a driver's stops out, since a resim
+            // never gives a driver its device.
             if !lockstep {
                 for stop in fire_cursors.step_stops() {
                     rederive_stops.note_recorded(boundary.step, stop);
@@ -17264,16 +17264,22 @@ fn run_rank_pass(
                 if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
                 {
                     // The trace holds exactly this step's fires (it is
-                    // cleared below every step), the stopping fire included.
-                    let fires = runtime
+                    // cleared below every step), the stopping fire included,
+                    // and the fire that disabled the node carries its cause.
+                    // A trace that kept no entry naming it releases the
+                    // node's slots, as a fatal stop does.
+                    let (fires, cause) = runtime
                         .trace()
                         .iter()
                         .filter(|e| *e.node_id == *decl.node_id)
-                        .count();
+                        .fold((0usize, None), |(fires, cause), e| {
+                            (fires + 1, cause.or(e.stop))
+                        });
                     rederive_stops.note(
                         &decl.node_id,
                         boundary.step,
                         u32::try_from(fires).unwrap_or(u32::MAX),
+                        cause.unwrap_or(cerulion_core::scheduler::NodeStopCause::FatalError),
                     );
                 }
             }

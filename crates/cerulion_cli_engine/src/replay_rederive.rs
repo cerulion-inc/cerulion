@@ -296,7 +296,7 @@ impl PassRestore {
 /// recording's trace states stopped it (a NODE-STOP record, on a bag at the
 /// node-stops `trace_format` or later); or by a fire the re-execution performed (a
 /// `NodeError::Fatal` return or the panic breaker), with the stopping fire's
-/// position in that step's burst.
+/// position in that step's burst and its cause.
 ///
 /// A stopped node never fires again, so the recording holds no fire of it
 /// after the stop, and every decider must stop predicting there: the clock
@@ -324,9 +324,9 @@ pub(crate) enum StopPoint {
         /// The checkpoint's step, `S`.
         anchor_step: u64,
     },
-    /// The re-execution stopped the node at `step`, and `fires` is how many
-    /// fires of the node that step's re-execution performed, the stopping
-    /// fire included (`1` = the first fire of the burst stopped it).
+    /// The re-execution stopped the node at `step` with `cause`, and `fires`
+    /// is how many fires of the node that step's re-execution performed, the
+    /// stopping fire included (`1` = the first fire of the burst stopped it).
     ///
     /// The position is what holds a stop INSIDE a burst to the recording: a
     /// replay that stops on the first of three recorded fires skips the other
@@ -337,6 +337,9 @@ pub(crate) enum StopPoint {
         step: u64,
         /// The stopping fire's position in that step's burst.
         fires: u32,
+        /// Why the node stopped: a fatal error or the consecutive-panic
+        /// breaker, the two stops that disable a node.
+        cause: NodeStopCause,
     },
     /// The recording's trace states that the `fires`-th fire of the node at
     /// `step` stopped it, with `cause`. A stop whose cause leaves the node
@@ -370,14 +373,23 @@ impl StopPoint {
     /// at the checkpoint released them before it, and a fatal error or a
     /// poisoned entry releases them at the stopping fire
     /// (`release_held_block_slots`), though a poisoned node keeps firing; the
-    /// consecutive-panic breaker releases none.
+    /// consecutive-panic breaker releases none, in the re-execution as in the
+    /// recording.
     fn slots_released_after(self, step: u64) -> bool {
         match self {
             Self::AtAnchor { anchor_step } => step > anchor_step,
-            Self::InPass { step: stop, .. } => step > stop,
-            Self::Recorded {
+            Self::InPass {
                 step: stop, cause, ..
-            } => cause != NodeStopCause::DisabledAfterPanics && step > stop,
+            }
+            | Self::Recorded {
+                step: stop, cause, ..
+            } => {
+                let releases = match cause {
+                    NodeStopCause::FatalError | NodeStopCause::EntryPoisoned => true,
+                    NodeStopCause::DisabledAfterPanics => false,
+                };
+                releases && step > stop
+            }
         }
     }
 
@@ -386,7 +398,9 @@ impl StopPoint {
     /// at every step for a stop at the checkpoint.
     fn burst_at(self, step: u64) -> Option<u32> {
         match self {
-            Self::InPass { step: stop, fires } if stop == step => Some(fires),
+            Self::InPass {
+                step: stop, fires, ..
+            } if stop == step => Some(fires),
             Self::Recorded {
                 step: stop,
                 fires,
@@ -419,14 +433,14 @@ impl PassStops {
         }
     }
 
-    /// Note that `node_id` was stopped by a fire at `step`, the `fires`-th
-    /// fire of the node in that step (the stopping fire included). The FIRST
-    /// stop wins: a node is stopped once, and a node stopped at the
+    /// Note that `node_id` was stopped with `cause` by a fire at `step`, the
+    /// `fires`-th fire of the node in that step (the stopping fire included).
+    /// The FIRST stop wins: a node is stopped once, and a node stopped at the
     /// checkpoint keeps that stop.
-    pub(crate) fn note(&mut self, node_id: &str, step: u64, fires: u32) {
+    pub(crate) fn note(&mut self, node_id: &str, step: u64, fires: u32, cause: NodeStopCause) {
         self.stopped_at
             .entry(node_id.to_string())
-            .or_insert(StopPoint::InPass { step, fires });
+            .or_insert(StopPoint::InPass { step, fires, cause });
     }
 
     /// Note the stop the recording's trace states at `step` ([`StopPoint::Recorded`]).
@@ -1319,13 +1333,13 @@ pub enum FindingCaveat {
     /// ([`FifoDrain::Unrecorded`]): the hold is not allowed for there, so the
     /// step can be the hold.
     DrainUnrecordedHold,
-    /// The step was excused as a hold by a `block` slot whose count the bag
-    /// shows past its depth at `breach_step`, with no read of it by its
-    /// consumer in between. A slot that holds never passes its depth, so it
-    /// was released with no record before then, and the hold is not allowed
-    /// for.
+    /// The step was excused as a hold by `block` slots whose counts the bag
+    /// shows past their depths, the last of them at `breach_step`, with no
+    /// read of any of them by their consumers in between. A slot that holds never
+    /// passes its depth, so each was released with no record before then, and
+    /// the hold is not allowed for.
     SlotPastDepth {
-        /// The step at which the slot's count passed its depth.
+        /// The step at which the last of those slots passed its depth.
         breach_step: u64,
     },
 }
@@ -1341,10 +1355,10 @@ impl fmt::Display for FindingCaveat {
             ),
             Self::SlotPastDepth { breach_step } => write!(
                 f,
-                "the recording counts more frames in the `block` slot that excused this step \
-                 than its depth at step {breach_step}, with no read of the slot by its consumer \
-                 in between; a slot that holds never passes its depth, so it was released with \
-                 no record and the hold is not allowed for"
+                "every `block` slot that excused this step counts past its depth in the \
+                 recording, the last of them at step {breach_step}, with no read by their \
+                 consumers in between; a slot that holds never passes its depth, so each was \
+                 released with no record and the hold is not allowed for"
             ),
         }
     }
@@ -6288,10 +6302,11 @@ mod tests {
         stopped_at_fire(node_id, step, 1)
     }
 
-    /// `node_id` stopped by the `fires`-th fire of its burst at `step`.
+    /// `node_id` stopped by a fatal error at the `fires`-th fire of its burst
+    /// at `step`.
     fn stopped_at_fire(node_id: &str, step: u64, fires: u32) -> PassStops {
         let mut stops = PassStops::none();
-        stops.note(node_id, step, fires);
+        stops.note(node_id, step, fires, NodeStopCause::FatalError);
         stops
     }
 
@@ -6501,11 +6516,15 @@ mod tests {
     #[test]
     fn pass_stops_keeps_the_first_stop_of_a_node() {
         let mut stops = PassStops::none();
-        stops.note("a", 4, 2);
-        stops.note("a", 9, 1);
+        stops.note("a", 4, 2, NodeStopCause::FatalError);
+        stops.note("a", 9, 1, NodeStopCause::FatalError);
         assert_eq!(
             stops.stop_point("a"),
-            Some(StopPoint::InPass { step: 4, fires: 2 })
+            Some(StopPoint::InPass {
+                step: 4,
+                fires: 2,
+                cause: NodeStopCause::FatalError,
+            })
         );
         assert!(stops.contains("a"));
         assert!(!stops.contains("b"));
@@ -6514,24 +6533,42 @@ mod tests {
     }
 
     /// Both stop kinds against a hand table: a stop at the checkpoint comes
-    /// before every judged step and has no stopping step; an in-pass stop is
-    /// after its own step only, and carries its burst at that step alone.
+    /// before every judged step, has no stopping step and released the node's
+    /// slots before it; an in-pass stop is after its own step only, carries
+    /// its burst at that step alone, and releases the slots after it unless
+    /// the consecutive-panic breaker made it.
     #[test]
     fn a_stop_point_answers_its_hand_table() {
         let at_anchor = StopPoint::AtAnchor { anchor_step: 3 };
-        let in_pass = StopPoint::InPass { step: 5, fires: 2 };
-        let rows: &[(StopPoint, u64, bool, Option<u32>)] = &[
-            (at_anchor, 2, false, None),
-            (at_anchor, 3, false, None),
-            (at_anchor, 4, true, None),
-            (at_anchor, 9, true, None),
-            (in_pass, 4, false, None),
-            (in_pass, 5, false, Some(2)),
-            (in_pass, 6, true, None),
+        let in_pass = StopPoint::InPass {
+            step: 5,
+            fires: 2,
+            cause: NodeStopCause::FatalError,
+        };
+        let breaker = StopPoint::InPass {
+            step: 5,
+            fires: 3,
+            cause: NodeStopCause::DisabledAfterPanics,
+        };
+        let rows: &[(StopPoint, u64, bool, Option<u32>, bool)] = &[
+            (at_anchor, 2, false, None, false),
+            (at_anchor, 3, false, None, false),
+            (at_anchor, 4, true, None, true),
+            (at_anchor, 9, true, None, true),
+            (in_pass, 4, false, None, false),
+            (in_pass, 5, false, Some(2), false),
+            (in_pass, 6, true, None, true),
+            (breaker, 5, false, Some(3), false),
+            (breaker, 6, true, None, false),
         ];
-        for (stop, step, after, burst) in rows {
+        for (stop, step, after, burst, released) in rows {
             assert_eq!(stop.is_after(*step), *after, "{stop:?} at step {step}");
             assert_eq!(stop.burst_at(*step), *burst, "{stop:?} at step {step}");
+            assert_eq!(
+                stop.slots_released_after(*step),
+                *released,
+                "{stop:?} at step {step}"
+            );
         }
     }
 
@@ -6541,14 +6578,18 @@ mod tests {
     #[test]
     fn pass_stops_seeded_at_the_anchor_are_not_renoted() {
         let mut stops = PassStops::at_anchor(3, ["sink", "relay"]);
-        stops.note("sink", 4, 0);
-        stops.note("other", 6, 1);
+        stops.note("sink", 4, 0, NodeStopCause::FatalError);
+        stops.note("other", 6, 1, NodeStopCause::FatalError);
         let at_anchor = Some(StopPoint::AtAnchor { anchor_step: 3 });
         assert_eq!(stops.stop_point("sink"), at_anchor);
         assert_eq!(stops.stop_point("relay"), at_anchor);
         assert_eq!(
             stops.stop_point("other"),
-            Some(StopPoint::InPass { step: 6, fires: 1 })
+            Some(StopPoint::InPass {
+                step: 6,
+                fires: 1,
+                cause: NodeStopCause::FatalError,
+            })
         );
         assert_eq!(PassStops::at_anchor(3, []), PassStops::none());
     }
@@ -6560,7 +6601,8 @@ mod tests {
 
     /// A recorded stop against the same hand table: a stop that ends the
     /// node's fires is judged as an in-pass stop is, and a poisoned entry's
-    /// stop, after which the node keeps firing, owes nothing and cuts no burst.
+    /// stop, after which the node keeps firing, owes nothing and cuts no burst
+    /// but releases the slots after it, as a fatal stop does.
     #[test]
     fn a_recorded_stop_point_answers_its_hand_table() {
         let fatal = StopPoint::Recorded {
@@ -6578,19 +6620,24 @@ mod tests {
             fires: nz(1),
             cause: NodeStopCause::EntryPoisoned,
         };
-        let rows: &[(StopPoint, u64, bool, Option<u32>)] = &[
-            (fatal, 4, false, None),
-            (fatal, 5, false, Some(2)),
-            (fatal, 6, true, None),
-            (breaker, 5, false, Some(3)),
-            (breaker, 9, true, None),
-            (poisoned, 4, false, None),
-            (poisoned, 5, false, None),
-            (poisoned, 6, false, None),
+        let rows: &[(StopPoint, u64, bool, Option<u32>, bool)] = &[
+            (fatal, 4, false, None, false),
+            (fatal, 5, false, Some(2), false),
+            (fatal, 6, true, None, true),
+            (breaker, 5, false, Some(3), false),
+            (breaker, 9, true, None, false),
+            (poisoned, 4, false, None, false),
+            (poisoned, 5, false, None, false),
+            (poisoned, 6, false, None, true),
         ];
-        for (stop, step, after, burst) in rows {
+        for (stop, step, after, burst, released) in rows {
             assert_eq!(stop.is_after(*step), *after, "{stop:?} at step {step}");
             assert_eq!(stop.burst_at(*step), *burst, "{stop:?} at step {step}");
+            assert_eq!(
+                stop.slots_released_after(*step),
+                *released,
+                "{stop:?} at step {step}"
+            );
         }
     }
 
@@ -6608,7 +6655,7 @@ mod tests {
         let mut stops = PassStops::at_anchor(3, ["sink"]);
         stops.note_recorded(5, &stop("sink", 1, NodeStopCause::FatalError));
         stops.note_recorded(6, &stop("relay", 2, NodeStopCause::EntryPoisoned));
-        stops.note("relay", 6, 1);
+        stops.note("relay", 6, 1, NodeStopCause::FatalError);
         stops.note_recorded(8, &stop("relay", 1, NodeStopCause::FatalError));
         assert_eq!(
             stops.stop_point("sink"),
@@ -7242,7 +7289,7 @@ mod tests {
             .collect();
         let mut from_start_stops = PassStops::none();
         for stopped in ["fifo", "latest", "ticker"] {
-            from_start_stops.note(stopped, 2, 1);
+            from_start_stops.note(stopped, 2, 1, NodeStopCause::FatalError);
         }
         let from_start = verify(
             &nodes,
@@ -10054,7 +10101,7 @@ mod tests {
     fn the_bound_follows_the_consumer_reads_and_stop() {
         let stopped = relay_steps(&[(0, 1, 1, 0), (1, 1, 1, 0), (2, 1, 0, 0)]);
         let mut stops = PassStops::none();
-        stops.note("sink", 1, 1);
+        stops.note("sink", 1, 1, NodeStopCause::FatalError);
         let held = verify(
             &relay(sink_holds(2, &stopped)),
             &stopped,
@@ -10421,7 +10468,7 @@ mod tests {
     fn a_held_fifo_relay_is_judged_at_every_edge_of_its_hold() {
         let stopped_at_2 = || {
             let mut stops = PassStops::none();
-            stops.note("sink", 2, 1);
+            stops.note("sink", 2, 1, NodeStopCause::FatalError);
             stops
         };
         let cases: Vec<HoldEdgeCase> = vec![
@@ -10711,7 +10758,7 @@ mod tests {
         // recorded none.
         let stop_step = relay_steps(&[(0, 1, 1, 0), (1, 2, 0, 0)]);
         let mut stops = PassStops::none();
-        stops.note("relay", 1, 1);
+        stops.note("relay", 1, 1, NodeStopCause::FatalError);
         let stopped = verify(
             &[decl(FifoDrain::Unrecorded, sink_holds(1, &stop_step), None)],
             &stop_step,
@@ -11330,7 +11377,7 @@ mod tests {
         assert_eq!(report.findings[0].caveat, None);
 
         let mut stops = PassStops::none();
-        stops.note("sink", 30, 1);
+        stops.note("sink", 30, 1, NodeStopCause::FatalError);
         let report = verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops);
         assert_eq!(findings_of(&report), vec![finding("relay", 40, 1, 0)]);
     }
@@ -11340,23 +11387,28 @@ mod tests {
     /// poisoned node keeps firing; the consecutive-panic breaker releases
     /// none. Depth 2 on a FIFO input: the sink takes the step 0 frame, the
     /// relay fills the slot, the sink takes a frame at step 3 and stops
-    /// there, fires again at step 4 with no read (a poisoned node's skipped
-    /// tick), and the relay fires one frame at step 4 and pops one at step 5
-    /// that it does not fire. Released after step 3, nothing holds the relay
-    /// at step 5, so it is the finding; armed, the slot counts two there and
-    /// the step is the hold.
+    /// there, and the relay fires one frame at step 4 and pops one at step 5
+    /// that it does not fire. A poisoned sink also fires at step 4 with no
+    /// read (its tick skipped); a fatal or breaker stop ends the sink's
+    /// fires. Released after step 3, nothing holds the relay at step 5, so it
+    /// is the finding; armed, the slot counts two there and the step is the
+    /// hold.
     #[test]
     fn a_consumer_stop_releases_its_slot_where_it_does_live() {
-        let steps = vec![
-            fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
-            fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
-            fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
-            fifo_step(3, 15_000, &[("sink", 0, 1, 1)]),
-            fifo_step(4, 20_000, &[("relay", 1, 1, 0), ("sink", 0, 1, 0)]),
-            fifo_step(5, 25_000, &[("relay", 1, 0, 0)]),
-        ];
-        let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
-        let judged = |cause| {
+        let judged = |cause, sink_fires_at_4| {
+            let steps = vec![
+                fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
+                fifo_step(1, 5_000, &[("relay", 1, 1, 0)]),
+                fifo_step(2, 10_000, &[("relay", 1, 1, 0)]),
+                fifo_step(3, 15_000, &[("sink", 0, 1, 1)]),
+                fifo_step(
+                    4,
+                    20_000,
+                    &[("relay", 1, 1, 0), ("sink", 0, sink_fires_at_4, 0)],
+                ),
+                fifo_step(5, 25_000, &[("relay", 1, 0, 0)]),
+            ];
+            let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
             let mut stops = PassStops::none();
             stops.note_recorded(
                 3,
@@ -11369,14 +11421,17 @@ mod tests {
             );
             verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops)
         };
-        for cause in [NodeStopCause::EntryPoisoned, NodeStopCause::FatalError] {
+        for (cause, sink_fires_at_4) in [
+            (NodeStopCause::EntryPoisoned, 1),
+            (NodeStopCause::FatalError, 0),
+        ] {
             assert_eq!(
-                findings_of(&judged(cause)),
+                findings_of(&judged(cause, sink_fires_at_4)),
                 vec![finding("relay", 5, 1, 0)],
                 "{cause:?}"
             );
         }
-        let breaker = judged(NodeStopCause::DisabledAfterPanics);
+        let breaker = judged(NodeStopCause::DisabledAfterPanics, 0);
         assert!(breaker.is_clean(), "{:?}", breaker.findings);
     }
 
@@ -11384,7 +11439,8 @@ mod tests {
     /// fills the slot at steps 1 and 2, pops a frame at step 3 and fires
     /// nothing, which the full slot excuses, and at step 4 fires the frame it
     /// kept and the next: the slot then counts four with no read of it by the
-    /// sink since step 0. `stops` is what the pass knows of the sink.
+    /// sink since step 0. `sink_at_3` is one more `(node, pops, fires, body
+    /// pops)` entry at step 3, as [`fifo_step`] takes it.
     fn voided_hold_steps(sink_at_3: (&'static str, u32, u32, u32)) -> Vec<RecordedStep> {
         vec![
             fifo_step(0, 0, &[("relay", 1, 1, 0), ("sink", 0, 1, 1)]),
@@ -11412,10 +11468,10 @@ mod tests {
         assert_eq!(
             report.findings[0].to_string(),
             "fire-schedule divergence: node 'relay' step 3 FIFO pop count \u{2014} re-derived 1 \
-             fire(s), recorded 0 fire(s); the recording counts more frames in the `block` slot \
-             that excused this step than its depth at step 4, with no read of the slot by its \
-             consumer in between; a slot that holds never passes its depth, so it was released \
-             with no record and the hold is not allowed for"
+             fire(s), recorded 0 fire(s); every `block` slot that excused this step counts past \
+             its depth in the recording, the last of them at step 4, with no read by their \
+             consumers in between; a slot that holds never passes its depth, so each was \
+             released with no record and the hold is not allowed for"
         );
     }
 
@@ -11483,14 +11539,16 @@ mod tests {
     }
 
     /// A slot its consumer's stop has released counts past its depth after the
-    /// stop with nothing wrong: the same steps with the sink stopped by its
-    /// step 3 fire, which ended before it read the input, keep the step 3 hold.
+    /// stop with nothing wrong: the same steps with the sink stopped by a
+    /// fatal error at its step 3 fire, which returned before it read the input
+    /// (a tick replay cannot see into, so the fire drains nothing), keep the
+    /// step 3 hold.
     #[test]
     fn a_slot_released_by_its_consumers_stop_is_not_held_to_its_depth() {
         let steps = voided_hold_steps(("sink", 0, 1, 0));
         let decls = relay(sink_slot(2, &steps, BodyDrain::PerFrame));
         let mut stops = PassStops::none();
-        stops.note("sink", 3, 1);
+        stops.note("sink", 3, 1, NodeStopCause::FatalError);
         let report = verify(&decls, &steps, &[], STAMPED, &PassRestore::none(), &stops);
         assert!(report.is_clean(), "{:?}", report.findings);
     }
