@@ -44,10 +44,10 @@ and `cerulion rcp bench` run it; the user guide is `docs/harness.md`, the folder
 - No hosted piece ships here: no sign-in backend, no shared ledger, no cloud storage name.
 - Scripts run under bash 3.2 (macOS): no associative arrays, no empty-array expansion under
   `set -u`. Every tracked `*.sh` passes `shellcheck -x`.
-- Python tests use the standard library only and need no simulator and no network.
+- Python tests use only the standard library, no simulator and no network.
 
 ## Tests
 - `python3 -B -m unittest discover -s harness/tests` (the CI job `Harness (Linux)` runs it,
-  with shellcheck over every tracked script).
+  with shellcheck over every tracked script). Live: skill `verify-harness`.
 - The CLI side: `cargo test -p cerulion_cli_engine --lib harness_cmd` and
   `cargo test -p cerulion_cli --test login_gate_e2e_test -- --test-threads=1`.
