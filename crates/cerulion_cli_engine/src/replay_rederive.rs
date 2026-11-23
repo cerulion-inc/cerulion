@@ -957,8 +957,9 @@ pub struct BlockHoldEdge {
 pub enum SendsPerFire {
     /// At most one: the producer's info says it needs a publisher for every
     /// output it declares, which the `#[cerulion_node]` macro sets. Its
-    /// generated tick loans each output once and sends it once, when the loan
-    /// drops. A raw FFI info block that sets the flag is read the same way.
+    /// generated tick loans each output at most once, on its first write, and
+    /// sends it at most once, when the loan drops. A raw FFI info block that
+    /// sets the flag is read the same way.
     AtMostOne,
     /// Any number: the producer's info does not set the flag. A raw FFI node
     /// can commit several frames on one output in one fire. A Python node
@@ -9469,7 +9470,9 @@ mod tests {
     }
 
     /// One `block` input, `consumer.inp` at `depth`, with `record`, on a
-    /// consumer whose tick replay cannot know.
+    /// consumer whose tick replay cannot know, from a producer that sends at
+    /// most one frame per fire ([`SendsPerFire::AtMostOne`]), as a
+    /// `#[cerulion_node]` node does.
     fn slot(consumer: &str, depth: u64, record: SlotRecord) -> BlockHoldEdge {
         BlockHoldEdge {
             consumer_node: consumer.to_string(),
@@ -10526,10 +10529,11 @@ mod tests {
     /// fires everything it holds. Each reads clean for a held relay and
     /// convicts the first held step of a relay nothing holds. The stop is what
     /// the last one is judged on: after it, a step that leaves one frame
-    /// unfired is a finding. With no stop known, the relay's five step 3
-    /// frames put the slot past its depth with no read since step 0, which a
-    /// slot that holds never reaches, so it was released with no record: the
-    /// holds at steps 1 and 2 are voided, and step 1 is the finding.
+    /// unfired is a finding. With no stop known, the relay fires at step 3
+    /// while the slot already counts its depth, with no read since step 0,
+    /// which a slot that holds never allows, so it was released with no
+    /// record: the holds at steps 1 and 2 are voided, and step 1 is the
+    /// finding.
     #[test]
     fn a_held_fifo_relay_is_judged_at_every_edge_of_its_hold() {
         let stopped_at_2 = || {
@@ -11409,8 +11413,9 @@ mod tests {
         assert_eq!(findings_of(&report), vec![finding("relay", 2, 2, 1)]);
     }
 
-    /// A slot that counts past its depth holds nothing from that step on: while
-    /// it holds, the check stops the producer at the depth. Depth 4, a
+    /// A slot that counts past its depth from a producer that sends at most one
+    /// frame per fire holds nothing from that step on: while it holds, the
+    /// check stops the producer at the depth. Depth 4, a
     /// latest-value input on a consumer throttled to one fire per 50 ms, on a
     /// 20 ms step: the sink fires at steps 0, 3, 6 and so on through 30, taking
     /// every frame, so the slot never reaches 4. It stops at its step 30 fire
@@ -11518,9 +11523,10 @@ mod tests {
     }
 
     /// A hold the slot later counts past its depth for, with no read of it by
-    /// its consumer in between, is voided: a slot that holds never passes its
-    /// depth, so it was released before then with no record, and the step it
-    /// excused is the finding, saying why.
+    /// its consumer in between, is voided: from a producer that sends at most
+    /// one frame per fire, a slot that holds never passes its depth, so it was
+    /// released before then with no record, and the step it excused is the
+    /// finding, saying why.
     #[test]
     fn a_hold_its_slot_later_counts_past_the_depth_for_is_the_finding() {
         let steps = voided_hold_steps(("relay", 0, 0, 0));
@@ -11695,7 +11701,7 @@ mod tests {
         assert!(report.is_clean(), "{:?}", report.findings);
     }
 
-    /// A producer that sends one frame per fire stops at its slot's depth, so
+    /// A producer that sends at most one frame per fire stops at its slot's depth, so
     /// a count past it is a release with no record: the same two-frame-fire
     /// rows from a one-frame producer hold nothing after step 0, and the step 1
     /// pop left unfired is the finding.

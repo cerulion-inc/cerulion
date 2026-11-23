@@ -13486,7 +13486,8 @@ fn recorded_fire_instants(
 /// two fires at one stamp, the first sending nothing and the second two
 /// frames, match two frames. [`local_block_holds`] reads the answer only for a
 /// producer that sends at most one frame per fire ([`producer_sends_per_fire`]),
-/// for which more frames than fires at a stamp is a frame no fire sent. Frames
+/// for which more frames than fires at a stamp is a frame no fire sent, or a
+/// fire of a node that sets the flag by hand and sent several frames. Frames
 /// stamped before `from_ns` precede the trace and are not compared.
 fn writes_past_fires(frame_stamps: &[u64], fire_instants: &[u64], from_ns: u64) -> bool {
     let start = frame_stamps.partition_point(|&at| at < from_ns);
@@ -13617,7 +13618,8 @@ fn producer_sends_per_fire(
 /// whose producer sends at most one frame per fire and that the bag shows
 /// writing more frames to the topic than it fires (`writes_past_fires(producer,
 /// topic)`, [`writes_past_fires`]): for such a producer that shows a frame no
-/// fire sent, and its slot can pass the depth while it holds, which the replay
+/// fire sent, or a fire of a node that sets the flag by hand and sent several
+/// frames, and its slot can pass the depth while it holds, which the replay
 /// reads as its release. A producer that can send several frames in one fire
 /// keeps its edges however its frames outnumber its fires. Each edge carries
 /// how many frames one fire of its producer can send
