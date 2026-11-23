@@ -19,7 +19,7 @@
 
 **Cerulion is the harness for physical AI, on an open-source robot runtime.**
 
-The experimental harness lets your AI model see and move a simulated robot arm over MCP, and gives it facts about the arm's body, such as its calibration record. The zero-copy runtime runs your ROS 2 nodes, records runs, replays them against new code and reaches your robots from another network.
+The experimental harness lets your AI model see and move a simulated robot arm over MCP, and gives it facts about the arm's body, such as its calibration record. The zero-copy runtime runs stock ROS 2 nodes unchanged, records runs, replays native nodes against new code and reaches your robots from another network.
 
 <p align="center">
   <img src="docs/media/harness-episode.gif" alt="Claude Opus 5.5 moves the simulated arm through the Cerulion harness and sets the bowl on the plate, and the last frame reads Benchmark verdict: solved." width="560">
@@ -123,7 +123,7 @@ This build has no `rmw_cerulion`, so it cannot run the ROS 2 trial. It also has 
 | Early access | The hosted Cerulion MCP (closed source) and Cerulion Studio. |
 | Not supported | Windows, SROS2, Cerulion topics in `ros2 topic list` and rqt, and a packaged `rmw_cerulion` for macOS. |
 
-**License.** The runtime is open source under [AGPL-3.0-only](LICENSE). Running it on your own robots needs no source release ([License](#license)).
+**License.** The runtime is open source under [AGPL-3.0-only](LICENSE). Running it inside your own organization, such as on your own robots, needs no source release ([License](#license)).
 
 ### Sign in
 
@@ -164,7 +164,7 @@ With early access, the [hosted Cerulion MCP](#give-your-model-cerulion) needs no
 cerulion rcp --sim --http 127.0.0.1:8765
 ```
 
-It is ready when it logs `serving MCP at http://127.0.0.1:8765/mcp`.
+It is ready when `curl -fsS http://127.0.0.1:8765/health`, run in a second terminal, prints a line that starts with `{"ok":true`. If the simulator exits first, its terminal says why.
 
 **Keep `--http` on a loopback address.** Anyone who can reach it can start simulators on your machine and watch every episode.
 
@@ -442,7 +442,7 @@ This trial shows delivery over `rmw_cerulion`, not latency. [Latency](#latency) 
 - `cerulion topic list` shows the topics after you sign in. `ros2 topic list` and rqt do not.
 - Zero-copy needs the publisher to loan each message and the subscriber to take loaned ones. Jazzy lets a subscriber take loans only with `ROS_DISABLE_LOANED_MESSAGES=0`. Without loans, `rmw_cerulion` copies, and a loaned variable-size message can still copy some members, such as strings ([ROS 2 guide](https://docs.cerulion.com/cerulion/guides/bridge-ros2)).
 - SROS2 is not supported. `ROS_SECURITY_ENABLE=true` does not secure a Cerulion transport, so keep a stack that needs SROS2 on its current middleware.
-- `cerulion ros2 run` can also replay one recorded ROS 2 process against the deliveries it recorded. A replayed process really sends on its recorded topics and services, and it still drives the devices it writes to, so read the limits and safety rules in [ROS 2 replay](docs/ros2_replay.md) first.
+- `cerulion ros2 run` can also replay one recorded ROS 2 process against the deliveries it recorded. This replay is narrower than the native one in the runtime trial. It reproduces a run of the same binaries, parameters and distro, and only for a process that meets its conditions. A replayed process really sends on its recorded topics and services, and it still drives the devices it writes to, so read the limits and safety rules in [ROS 2 replay](docs/ros2_replay.md) first.
 
 </details>
 
@@ -676,12 +676,12 @@ Cerulion is built by [Cerulion Inc.](https://cerulion.com), a YC S24 company. Co
 
 ## License
 
-Cerulion is [AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. Internal use on your own robots, research and evaluation are free, with no obligation to release your source.
+Cerulion is [AGPL-3.0-only](LICENSE), with a [commercial license](docs/legal/COMMERCIAL.md) available. Use inside your own organization, such as on your own robots or for research and evaluation, is free and needs no source release.
 
 <details>
 <summary>When the AGPL asks you to offer source, what the commercial license covers, and the MIT OR Apache-2.0 crates</summary>
 
-- Internal use on your own robots, research and evaluation are free, with no obligation to release your source.
+- Use inside your own organization, such as on your robots, your test rigs or your lab, is free and needs no source release. Research and evaluation are free on the same terms, and a derivative work that you publish or distribute falls under the AGPL.
 - If you convey Cerulion, you must offer its corresponding source (AGPL sections 4 to 6).
 - If you modify it and users interact with your version over a network, you must offer them its source (AGPL section 13).
 - The commercial license covers a closed-source product that includes or links the AGPL code. It also covers a network service for third parties that does not offer them its source.
