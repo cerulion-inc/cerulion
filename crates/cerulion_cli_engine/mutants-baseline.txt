@@ -353,6 +353,15 @@ in prepare_pass_verification
 #          map of an edge its type cannot default, and `FifoDeferral::step`,
 #          `FifoCarry::step` and `FifoCarry::settle_excuses` with a value
 #          their types do not have.
+#          Re-run over the change that reads a slot past its depth as a
+#          release only from a producer that sends at most one frame per fire,
+#          and a fire at a step whose slot already counts its depth as a
+#          release from any producer, in 3 shards, with
+#          `--re 'SlotBound::|local_block_holds|producer_sends_per_fire|FifoDeferral::step'`:
+#          21 mutants: 17 caught, 4 unviable, none missed. The 4 unviable
+#          replace `producer_sends_per_fire`, `local_block_holds` (twice, a map
+#          of an edge) and `FifoDeferral::step` with a value their types do not
+#          have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
