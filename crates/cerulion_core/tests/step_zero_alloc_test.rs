@@ -474,6 +474,71 @@ fn test_graph_step_is_zero_alloc_at_steady_state() {
     );
 }
 
+/// The `graph run --trace-limit` default (`PRODUCTION_TRACE_LIMIT` in the CLI
+/// engine, which this crate cannot name).
+const GRAPH_RUN_DEFAULT_TRACE_LIMIT: usize = 100_000;
+
+/// The moat chain with the trace capped the way `graph run` caps it, before
+/// the first step and never cleared: a short warm (the trace stays under 512
+/// entries), then a measured window of `step()` calls. Returns the window's
+/// allocations and the trace length before and after it.
+fn measure_capped_trace_step_allocs(measure_steps: usize) -> (u64, usize, usize) {
+    let mut runtime = build_moat_runtime();
+    disable_liveliness_sweep(&mut runtime);
+    runtime.set_trace_limit(GRAPH_RUN_DEFAULT_TRACE_LIMIT);
+
+    LATENCY_FIRES.store(0, Ordering::SeqCst);
+    let mut warm = 0usize;
+    while LATENCY_FIRES.load(Ordering::Relaxed) < 50 {
+        runtime.step(Duration::from_millis(1));
+        warm += 1;
+        assert!(warm < 10_000, "moat chain did not reach steady state");
+    }
+    for _ in 0..20 {
+        runtime.step(Duration::from_millis(1));
+    }
+    let entries_before = runtime.trace().len();
+
+    ALLOCATOR.enable();
+    for _ in 0..measure_steps {
+        runtime.step(Duration::from_millis(1));
+    }
+    let allocs = ALLOCATOR.disable();
+    let entries_after = runtime.trace().len();
+
+    runtime.shutdown();
+    (allocs, entries_before, entries_after)
+}
+
+/// With the `graph run` default trace cap set, `step()` allocates nothing of
+/// its own while the trace fills through 512, 1,024, 2,048 and 4,096 entries,
+/// the points where an unreserved deque reallocates and copies itself.
+#[test]
+#[serial]
+fn test_graph_step_with_graph_run_trace_cap_is_zero_alloc_as_the_trace_fills() {
+    PAYLOAD_SIZE.store(64, Ordering::Relaxed);
+    const MEASURE_STEPS: usize = 1_500;
+    let (allocs, entries_before, entries_after) = measure_capped_trace_step_allocs(MEASURE_STEPS);
+    assert!(
+        entries_before < 512 && entries_after > 4_096,
+        "the measured window must cover trace lengths 512 to 4,096 (it covered \
+         {entries_before} to {entries_after})"
+    );
+    // The same upstream 2035 waiver as `test_graph_step_is_zero_alloc_at_steady_state`:
+    // one allocation per loan, two publishing ports, one loan each per step.
+    const MOAT_PUBLISHING_PORTS: u64 = 2;
+    let waived = cerulion_core::testing::upstream_2035_publish_allocs(
+        MOAT_PUBLISHING_PORTS * MEASURE_STEPS as u64,
+    );
+    let ours = allocs.saturating_sub(waived);
+    assert_eq!(
+        allocs, waived,
+        "{allocs} heap allocations over {MEASURE_STEPS} steps with the graph run trace cap set; \
+         {waived} are the waived upstream loans and {ours} are OURS: the fire trace grew on the \
+         step path instead of using the storage reserved when the cap was set."
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Block-graph zero-alloc proof
 //
