@@ -4291,7 +4291,7 @@ fn a_send_that_reaches_no_subscriber_keeps_its_count() {
 /// The configuration that makes an `Err` from `send()` mean that no consumer's
 /// queue received the frame, which is what lets the take-back above be exact.
 ///
-/// Read in the pinned iceoryx2 revision (8e8766a3):
+/// Read in the pinned iceoryx2 revision (c9e5c085):
 ///
 /// - `iceoryx2/src/port/publisher.rs:373-384`: `send_sample` fails before it
 ///   delivers anything when the port is inactive or `update_connections`
@@ -4304,7 +4304,7 @@ fn a_send_that_reaches_no_subscriber_keeps_its_count() {
 /// - `iceoryx2-cal/src/zero_copy_connection/common.rs:751`: with safe overflow
 ///   on, `blocking_send` skips its wait and calls `try_send` (`:823`), whose
 ///   only full-queue error needs safe overflow off (`:687`).
-/// - `iceoryx2/src/service/port_factory/publisher.rs:145` and `:175`: a
+/// - `iceoryx2/src/service/port_factory/publisher.rs:148` and `:179`: a
 ///   publisher's degradation action is `Warn` unless a handler is set.
 ///
 /// So the pin is two facts: the service a graph's block topic is created on
