@@ -13,10 +13,10 @@ The [README](../README.md#bring-your-ros-2-stack) starts a stock talker and list
 
 | To | Run | Needs and limits |
 |---|---|---|
-| Start your stack on Cerulion | `cerulion ros2 launch <package> <file>.launch.py` or `cerulion ros2 run <package> <executable>` | ROS 2 Jazzy on Linux (Lyrical: a [separate download](install.md#what-the-install-script-does)). `cerulion topic list` shows the topics. `ros2 topic list` and rqt do not. A publisher that copies keeps copying until you move it to loans. |
-| See what a running stack publishes | `cerulion ros2 attach --iface <local-interface-IP> --dry-run` | This computer's IP address on the robot's network. If the robot's `ROS_DOMAIN_ID` is not 0, pass it as `--domain`. Writes nothing and needs no workspace. |
-| Bridge a running stack into a graph | `cerulion ros2 attach --iface <local-interface-IP>` | A workspace with the `dds_bridge` node type, as in the [Go2 example](../examples/go2/). Writes `graphs/attach.yaml` and its bridge config, then runs it after you confirm. |
-| Move C++ publishers to zero-copy loans | `cerulion ros2 migrate --workspace <colcon workspace>`, then `--write` for one commit | A compile database and the `cerulion-ros2-migrate-clang` engine, [built from this repository](../tools/ros2_migrate/README.md). Without it the command exits 69. |
+| Start your stack on Cerulion | `cerulion ros2 launch <package> <file>.launch.py` or `cerulion ros2 run <package> <executable>` | ROS 2 Jazzy on Linux (Lyrical: a [separate download](install.md#what-the-install-script-does)). Needs no sign-in. `cerulion topic list` shows the topics on a signed-in machine (`cerulion login`). `ros2 topic list` and rqt do not. A publisher that copies keeps copying until you move it to loans. |
+| See what a running stack publishes | `cerulion ros2 attach --iface <local-interface-IP> --dry-run` | A signed-in machine (`cerulion login`) and this computer's IP address on the robot's network. If the robot's `ROS_DOMAIN_ID` is not 0, pass it as `--domain`. Writes nothing and needs no workspace. |
+| Bridge a running stack into a graph | `cerulion ros2 attach --iface <local-interface-IP>` | A signed-in machine (`cerulion login`) and a workspace with the `dds_bridge` node type, as in the [Go2 example](../examples/go2/). Writes `graphs/attach.yaml` and its bridge config, then runs it after you confirm. |
+| Move C++ publishers to zero-copy loans | `cerulion ros2 migrate --workspace <colcon workspace>`, then `--write` for one commit | A signed-in machine (`cerulion login`), a compile database and the `cerulion-ros2-migrate-clang` engine, [built from this repository](../tools/ros2_migrate/README.md). Without it the command exits 69. |
 
 **Replaying one ROS 2 process (`cerulion ros2 run --replay-deliveries`) publishes live and still drives any device it writes to directly, such as a serial port or CAN bus. Run it where neither reaches a live robot** ([ROS 2 replay](ros2_replay.md)).
 

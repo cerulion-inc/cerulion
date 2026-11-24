@@ -117,8 +117,12 @@ pub(crate) const ROS_TOPIC_CREATE_SUBSCRIBERS: usize = 32;
 /// created buffer ceiling to `(16 * 4).div_ceil(3)` = 22. The publisher and
 /// the subscription both carry it, so the first opener of a topic creates the
 /// service any later rmw opener needs, and open order cannot refuse a deeper
-/// TRANSIENT_LOCAL publisher. A late joiner's share of the retained frames is
-/// set per subscription by its history request (see `rmw_create_subscription`).
+/// TRANSIENT_LOCAL publisher. The history is room, not a retention: each
+/// publisher on such a topic retains only its own clamped depth (VOLATILE
+/// none), so a VOLATILE publisher's loans keep reusing the slot its
+/// subscriptions just released. A late joiner's share of the retained frames
+/// is set per subscription by its history request (see
+/// `rmw_create_subscription`).
 /// Types whose slice ceiling exceeds [`ROS_TOPIC_FULL_HISTORY_MAX_SLICE`] take
 /// [`ROS_TOPIC_LARGE_SLICE_HISTORY_DEPTH`] instead; see
 /// [`ros_topic_history_depth`].
@@ -663,12 +667,11 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // `topic_config.subscriber_max_buffer_size` computed below and NOT
         // the service history. A TRANSIENT_LOCAL depth-1000 publisher of a
         // small type reports 16 (the clamp), a depth-5 one reports 5, and a
-        // VOLATILE one reports 0. The service history is the topic's limit for
-        // every publisher (iceoryx2 sizes a publisher's retained ring from the
-        // service), and a late joiner takes up to its own history request from
-        // that ring, so a subscription deeper than this publisher's depth can
-        // receive more than the reported depth. The 22 ceiling stays pinned by
-        // the require-N probes in `rmw_transient_local_ceiling_test.rs`.
+        // VOLATILE one reports 0. On a topic an rmw endpoint created the port
+        // retains exactly that many frames (cerulion_core bounds a publisher on
+        // a floored service to its own history), and a late joiner takes up to
+        // its own history request of them. The 22 ceiling stays pinned by the
+        // require-N probes in `rmw_transient_local_ceiling_test.rs`.
         let requested_depth = (*qos).depth;
         // A TRANSIENT_LOCAL publisher makes its own history request SATISFIABLE
         // by provisioning the
@@ -785,12 +788,12 @@ pub unsafe extern "C" fn rmw_create_publisher(
         // depth-N reports N clamped to the type's limit (KEEP_ALL reports the
         // limit), VOLATILE reports 0.
         // Every rmw endpoint creates the service at that limit
-        // (`create_history_floor`), so the retained ring is that deep whatever
-        // this publisher asked; what a late joiner takes from it is its own
-        // history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth or, when
-        // KEEP_ALL, the limit), set in
-        // `rmw_create_subscription`. The open requirement is at-least, so an
-        // opened service always holds at least `history` frames.
+        // (`create_history_floor`), and on such a service the port retains
+        // exactly `history` frames; what a late joiner takes from them is its
+        // own history request (VOLATILE 0, TRANSIENT_LOCAL up to its depth or,
+        // when KEEP_ALL, the limit), set in `rmw_create_subscription`. The open
+        // requirement is at-least, so an opened service always has room for
+        // `history` frames.
         let provisioned_depth = history;
 
         // Say LOUDLY, at create time, that the ask was not what the

@@ -4,11 +4,11 @@ Build a complete obstacle-avoidance safety controller from scratch with the
 `cerulion` CLI: create a workspace, write three nodes, wire them in a graph file,
 run it, record it, and verify a code change against the recording.
 
-New to Cerulion? Run the [README quickstart](../../README.md#quickstart) first: it records and verifies a ready-made version of this controller and tries the harness, and this tutorial then builds one from scratch.
+New to Cerulion? First run the [README quickstart](../../README.md#quickstart) with your coding agent, or the [runtime trial](../../README.md#try-the-runtime) by hand: each records and verifies a ready-made version of this controller, and this tutorial then builds one from scratch.
 
 ![A terminal creates the starter, records a run, gets replay PASS, changes the controller and gets a divergence on the same recording.](../media/quickstart-record-verify.gif)
 
-This is a recording of the commands of the README's [runtime trial](../../README.md#try-the-runtime) on Cerulion 2.1.0, made after an off-screen sign-in and warm-up build, with the waits sped up ([how it was recorded](../media/README.md#assets-the-root-readme-uses)).
+This is a recording of the commands of the README's [runtime trial](../../README.md#try-the-runtime) on Cerulion 2.1.0, made after an off-screen sign-in and warm-up build, with the waits sped up ([how it was recorded](../media/README.md#assets-the-readme-and-docs-use)).
 
 **What you'll build:**
 
@@ -43,7 +43,8 @@ Three nodes forming a reactive pipeline:
   with `xcode-select --install`. The installer above says so too when it finds
   no C linker on the machine.
 
-- A Cerulion account. Every `cerulion` command runs under one, and signing in is a
+- A Cerulion account. Almost every `cerulion` command runs under one (`ros2 run`,
+  `ros2 launch` and `doctor` are among those that do not), and signing in is a
   once-per-machine step that later commands read locally, so they keep working
   offline:
 
