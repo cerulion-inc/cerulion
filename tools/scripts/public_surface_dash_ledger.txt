@@ -250,7 +250,7 @@
 8 crates/rmw_cerulion/src/api/guard_wait.rs
 4 crates/rmw_cerulion/src/api/init.rs
 1 crates/rmw_cerulion/src/api/misc.rs
-27 crates/rmw_cerulion/src/api/pubsub.rs
+26 crates/rmw_cerulion/src/api/pubsub.rs
 8 crates/rmw_cerulion/src/borrow_degrade_latch.rs
 13 crates/rmw_cerulion/src/decode_failure_latch.rs
 5 crates/rmw_cerulion/src/era.rs

@@ -4507,7 +4507,7 @@ unsafe fn take_loaned_impl(
             drop(owned);
             hold_copy(&mut inner, runtime::TakeCopy::Fixed(words))
         } else {
-            // Alignment gate (fail closed — never hand out a misaligned struct
+            // Alignment gate (fail closed: never hand out a misaligned struct
             // pointer). Expected to ALWAYS hold: the sample header is align 8 and
             // its size is a multiple of 8 (measured, see
             // `IOX2_SAMPLE_HEADER_BYTES` in cerulion_core, currently 48) and a
@@ -4517,7 +4517,7 @@ unsafe fn take_loaned_impl(
             // the service builder's `.payload_alignment()` override is
             // deliberately NOT used (it would change the slot layout the
             // `iceoryx2_slot_bytes` closed form documents as exact for
-            // exactly-this builder shape) — so THIS assert is the guard: an
+            // exactly-this builder shape), so THIS assert is the guard: an
             // iceoryx2 bump that moves the payload offset fails loudly here
             // instead of handing rclcpp UB.
             let ros_ptr = frame.as_ptr().add(WireHeader::SIZE);
@@ -4527,7 +4527,7 @@ unsafe fn take_loaned_impl(
                     ptr = ros_ptr as usize,
                     fixed_align,
                     "loaned take: SHM payload pointer is misaligned for the message \
-                     struct — refusing to hand it out (the iceoryx2 payload offset \
+                     struct, refusing to hand it out (the iceoryx2 payload offset \
                      moved?)"
                 );
                 return RMW_RET_ERROR;
@@ -4536,8 +4536,9 @@ unsafe fn take_loaned_impl(
             // but the subscriber-side loan contract is read-only: the mapping IS
             // read-only (iceoryx2 opens subscriber data segments
             // `AccessMode::Read`), so a caller writing through it faults loudly
-            // rather than corrupting the frame every other subscriber reads —
-            // inherent to the rmw loan ABI, not specific to this implementation.
+            // rather than corrupting the frame every other subscriber reads,
+            // which is inherent to the rmw loan ABI, not specific to this
+            // implementation.
             inner.pending_takes.push(runtime::PendingTake {
                 key: ros_ptr as usize,
                 shadow: None,
@@ -4714,7 +4715,7 @@ pub unsafe extern "C" fn rmw_return_loaned_message_from_subscription(
             let runtime::PendingTake { shadow, sample, .. } = inner.pending_takes.swap_remove(pos);
             // Ordering, load-bearing: the shadow is
             // UN-FORGED (inside `release`) and back in the pool BEFORE
-            // the sample's SHM borrow is released — nothing in the rmw
+            // the sample's SHM borrow is released: nothing in the rmw
             // references the frame once the transport may reclaim it.
             if let Some(shadow) = shadow {
                 inner.shadows.release(shadow);

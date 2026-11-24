@@ -6110,13 +6110,16 @@ fn loans_and_an_adopted_message_share_the_budget_and_each_refusal_names_its_hold
     );
     // The loaned take's refusal ladder over ten refusals: one loud head, the
     // repeats at debug, the decade line, one recovery when a take is served.
-    use cerulion_core::testing::{count_at, debug_lines_expected};
+    use cerulion_core::testing::{count_at, debug_lines_expected, never_loud};
     let lines: Vec<&str> = err.lines().collect();
     const HEAD: &str = "loaned take refused: the transport refused the receive";
     const REPEAT: &str = "loaned take refused (suppressed repeat)";
     const DECADE: &str = "loaned take STILL refused:";
     const RECOVERED: &str = "loaned take recovered";
     assert_eq!(count_at(&lines, "ERROR", HEAD), 1, "one loud head:\n{err}");
+    // The repeats must never be loud (the half that holds where debug! is
+    // compiled out), and count eight where it is compiled in.
+    never_loud(&lines, REPEAT).unwrap_or_else(|e| panic!("{e}:\n{err}"));
     assert_eq!(
         count_at(&lines, "DEBUG", REPEAT),
         debug_lines_expected(8),

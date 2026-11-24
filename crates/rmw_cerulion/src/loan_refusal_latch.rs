@@ -1228,8 +1228,9 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn the_shadow_pool_exhausted_refusal_names_its_kind_and_remedy() {
-        use cerulion_core::testing::{debug_lines_expected, line_level};
+        use cerulion_core::testing::{debug_lines_expected, line_level, never_loud};
         const TOPIC: &str = "probe/pool";
+        const REPEAT: &str = "loaned take refused (suppressed repeat)";
         let latch = Mutex::new(FailureRegimeLatch::new());
         for _ in 0..2 {
             report_loan_refused(&latch, TOPIC, LoanRefusal::ShadowPoolExhausted, 3, 0, 4, "");
@@ -1265,11 +1266,14 @@ mod tests {
                     "the head must carry the pool's headline and remedy: {head}"
                 ));
             }
+            // The repeat must never be loud (the half that holds where debug!
+            // is compiled out), and counts once where it is compiled in.
+            never_loud(lines, REPEAT)?;
             let repeats = lines
                 .iter()
                 .filter(|l| {
                     line_level(l) == Some("DEBUG")
-                        && l.contains("loaned take refused (suppressed repeat)")
+                        && l.contains(REPEAT)
                         && token(l, "kind", "shadow_pool_exhausted")
                 })
                 .count();
