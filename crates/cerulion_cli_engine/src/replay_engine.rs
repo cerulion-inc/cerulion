@@ -4858,6 +4858,9 @@ pub struct CompiledTolerance {
 /// [`crate::replay_cmd::run_replay`] assembles this after its entry gates pass.
 pub struct ReplayInputs {
     /// The parsed graph (topic-name truth comes from its resolved `prefix`).
+    /// `cerulion bag play --resim` passes one `validate_graph` accepted; the
+    /// split `block` edge check's account of which rank build fails relies on
+    /// it.
     pub config: GraphConfig,
     /// The recorded scheduler trace (rank 0 — gate-checked), streamed from the
     /// mapped bag per pass instead of materialized (see [`RecordedTrace`]).
@@ -5541,21 +5544,31 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // is what `run_engine` returns. A pass that fails is not harvested (its
     // runtime dies with the iteration, as it always did): the partial report
     // holds exactly the ranks that COMPLETED.
-    // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
-    //        the first pass ────────────────────────────────────────────────
-    //
-    // A refusal that is a fact about the RECORDING is whole-RUN, so it must not
-    // wait for a rank's turn to execute: this plans every rank's gated edges from
-    // the bag's own staging rows and refuses here, before rank 0 has run a step.
-    // What stays per rank is the pair that needs a built runtime (see
-    // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
     // ── 4a'. Every rank's unlisted `#[cerulion_node]` output, BEFORE the
     //         first pass ─────────────────────────────────────────────────
     //
-    // The same whole-RUN rule: a later rank's node with an unlisted output
-    // is a fact about the recording, so it refuses the replay before rank 0
-    // has run a step.
+    // A refusal that is a fact about the recording is whole-RUN. A later rank's
+    // node with an unlisted output is one, so it refuses the replay before rank
+    // 0 has run a step.
     refuse_unlisted_macro_output_in_every_pass(&plans, &factories)?;
+    // ── 4a''. Every `block` edge the rank manifests split, BEFORE the first
+    //          pass ───────────────────────────────────────────────────────
+    //
+    // The same whole-RUN rule, read off the whole graph: a split `block`
+    // edge no credit word can count exactly (two or more in-graph producers,
+    // or `block_timeout_ms`) refuses the replay before rank 0 has run a step,
+    // when the whole graph builds (and, for `block_timeout_ms`, validates).
+    // One plan holds every node, so it splits nothing.
+    if plans.len() > 1 {
+        refuse_uncreditable_split_block_edges(&config, &plans, &factories)?;
+    }
+    // ── 4a. The BAG SIDE of the read-log enforcement, for EVERY rank, BEFORE
+    //        the first pass ────────────────────────────────────────────────
+    //
+    // The same whole-RUN rule: this plans every rank's gated edges from the
+    // bag's own staging rows and refuses here, before rank 0 has run a step.
+    // What stays per rank is the pair that needs a built runtime (see
+    // `plan_bag_side_admissions`), and each pass CONSUMES the plan made here.
     let bag_side = plan_bag_side_admissions(
         &plans,
         &trace,
@@ -9914,6 +9927,71 @@ fn refuse_unlisted_macro_output_in_every_pass(
     plans
         .iter()
         .try_for_each(|plan| refuse_unlisted_macro_output(plan.subgraph(), entries))
+}
+
+/// Refuse a replay of more than one rank whose manifests split a `block` edge
+/// no cross-process credit word can count exactly (two or more in-graph
+/// producers, or `block_timeout_ms`)
+/// ([`replay_rank::classify_split_block_edges`]).
+///
+/// The classifier reads the WHOLE graph the bag embeds and each node's
+/// declaration in this build, before any pass takes its entry; a node whose
+/// metadata cannot be read is left out, as [`collect_pass_node_infos`] leaves
+/// it out, and its own pass build reports it.
+///
+/// The classifier asks for a split edge with two or more in-graph producers
+/// after the whole-graph build and before its validation, and for a split
+/// edge with `block_timeout_ms` after both. So a whole-graph build fault skips
+/// the whole check, and a validation fault skips only the `block_timeout_ms`
+/// check; neither refuses anything here. Each such fault fails some rank's
+/// build, since a rank's pass carries no credit word: a `block` input with no
+/// producer in its rank is refused there, an ingress input among them (the
+/// bag's graph passed `validate_graph` at load, which refuses an in-graph
+/// producer on an ingress topic); a `block` ring lies in one rank, whose build
+/// refuses it, or crosses ranks on a split edge, which has one producer (the
+/// split check refused one with more) and so is refused at its consumer's
+/// rank; and every other topology fault the replay can meet is a fact about
+/// one input or one node, which that node's rank build sees.
+/// The replay keeps the exit, the order and the partial report it gave such a
+/// bag before: a refusal made before the first pass and an earlier rank's
+/// failure still come first. An engine bug the classifier reports is
+/// [`ReplayError::Internal`] (exit 5). The creditable split edges the
+/// classifier returns are not read here: a pass build refuses a `block` input
+/// whose producer runs in another rank.
+fn refuse_uncreditable_split_block_edges(
+    config: &GraphConfig,
+    plans: &[RankPlan],
+    entries: &IndexMap<String, Box<dyn NodeEntry>>,
+) -> Result<(), ReplayError> {
+    let infos: IndexMap<String, cerulion_core::graph::NodeInfo> = config
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let info = entries.get(&node.id)?.info().ok()?;
+            Some((node.id.clone(), info))
+        })
+        .collect();
+    let node_rank = replay_rank::plan_node_ranks(plans);
+    match replay_rank::classify_split_block_edges(config, &infos, &node_rank) {
+        Ok(_) => Ok(()),
+        Err(replay_rank::SplitBlockEdgeError::Topology { reason }) => {
+            tracing::debug!(
+                error = %reason,
+                "replay: the whole graph does not build or validate with this build's \
+                 declarations, so its remaining split `block` edges are left to each rank's build"
+            );
+            Ok(())
+        }
+        Err(e @ replay_rank::SplitBlockEdgeError::EngineBug { .. }) => Err(ReplayError::Internal {
+            reason: e.to_string(),
+        }),
+        Err(replay_rank::SplitBlockEdgeError::Uncreditable(edge)) => {
+            Err(ReplayError::SplitBlockEdgeUncreditable { edge })
+        }
+        Err(replay_rank::SplitBlockEdgeError::Timeout(edge)) => {
+            Err(ReplayError::SplitBlockEdgeTimeout { edge })
+        }
+    }
 }
 
 /// Refuse a graph in which a `#[cerulion_node]` node declares an output that
