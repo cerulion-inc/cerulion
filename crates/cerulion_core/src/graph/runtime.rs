@@ -18546,12 +18546,14 @@ impl GraphRuntime {
 
     /// Cap the execution trace as a ring buffer keeping the NEWEST `limit`
     /// entries (forwards to `Scheduler::set_trace_limit`, the post-build twin
-    /// of the scheduler's `with_trace_limit` builder). Production CLI paths
-    /// (`graph run` / `graph run-worker`) apply a default cap so a
-    /// long-running graph does not grow its trace unbounded (~48 B/entry —
-    /// hours at kHz rates are gigabytes); test builds never cap (replay /
-    /// trace-compare tests need full traces). Determinism-safe: the cap
-    /// changes only how much HISTORY is retained, never what fires (the
+    /// of the scheduler's `with_trace_limit` builder), reserving the ring's
+    /// storage on this call so the step path never grows it. Production CLI
+    /// paths (`graph run` / `graph run-worker`) apply a default cap so a
+    /// long-running graph does not grow its trace unbounded (56 B/entry on a
+    /// 64-bit target, so hours at kHz rates are gigabytes); a build that never
+    /// calls this keeps the whole trace (replay and trace-compare tests rely
+    /// on that). Determinism-safe: the cap changes only how much HISTORY is
+    /// retained, never what fires (the
     /// live loop's fire detection differences the cap-immune
     /// `Scheduler::entries_appended` counter, not the trace length).
     pub fn set_trace_limit(&mut self, limit: usize) {
