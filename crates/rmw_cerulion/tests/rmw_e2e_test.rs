@@ -2439,15 +2439,20 @@ fn c_abi_loaned_take_hold_across_publish_pins_the_slot() {
     }
 }
 
-/// Borrow-budget exhaustion is LOUD and bounded: with the whole
-/// RMW_TAKE_LOAN_BORROW_BUDGET (4) held, the next loaned take fails with
-/// RMW_RET_ERROR (no silent loss, no hang — the queued frames survive);
-/// returning ONE loan recovers the next take, still in FIFO order. The
-/// exact 4/5 boundary also behaviorally pins that the rmw create really
-/// provisioned the service at the documented budget.
+/// A consumer that keeps every loaned message keeps receiving. The
+/// subscription's borrow ceiling is RMW_TAKE_LOAN_BORROW_BUDGET (4) and the take
+/// keeps one borrow in reserve, so with six messages taken and all held the
+/// first three are zero-copy loans and the 4th, the 5th and the 6th are served
+/// by COPY: RMW_RET_OK, taken, FIFO values, a `message_info` with a nonzero
+/// source timestamp and the publication sequence number, the copy counter at
+/// 3 and nothing refused. The 3/4
+/// boundary also pins that the rmw create provisioned the service at the
+/// documented budget: a service minted at the iceoryx2 default of 2 would copy
+/// from the 2nd take on. Returning every loan, copies included, succeeds and
+/// the queue is then empty.
 #[test]
 #[serial]
-fn c_abi_loaned_take_budget_exhaustion_is_loud_and_recovers() {
+fn c_abi_loaned_take_past_the_reserve_is_served_by_copy_and_keeps_receiving() {
     unsafe {
         let suffix = unique_suffix();
         let type_name = format!("PtLB{suffix}");
@@ -2461,12 +2466,13 @@ fn c_abi_loaned_take_budget_exhaustion_is_loud_and_recovers() {
 
         let subscription = rmw_create_subscription(node, ts, topic.as_ptr(), &qos, &sub_opts);
         let publisher = rmw_create_publisher(node, ts, topic.as_ptr(), &qos, &pub_opts);
+        let data = &*((*subscription).data as *const rmw_cerulion::runtime::SubscriptionData);
 
-        for i in 0..5u32 {
+        for i in 0..6u32 {
             let msg = CPoint {
                 x: f64::from(i),
-                y: 0.0,
-                z: 0.0,
+                y: 0.5,
+                z: -2.0,
             };
             assert_eq!(
                 rmw_publish(
@@ -2478,61 +2484,69 @@ fn c_abi_loaned_take_budget_exhaustion_is_loud_and_recovers() {
             );
         }
 
-        // Hold the whole budget: 4 concurrent loans, FIFO values 0..=3.
+        // Take all six and hold every one. Copies counted after each take:
+        // 0, 0, 0 (zero-copy), then 1, 2, 3.
+        let expected_copies = [0u64, 0, 0, 1, 2, 3];
         let mut held: Vec<*mut c_void> = Vec::new();
-        for i in 0..4u32 {
+        for i in 0..6u32 {
             let mut t = false;
             let mut p: *mut c_void = std::ptr::null_mut();
+            let mut info: ffi::rmw_message_info_t = std::mem::zeroed();
             assert_eq!(
-                rmw_take_loaned_message(subscription, &mut p, &mut t, std::ptr::null_mut()),
+                rmw_take_loaned_message_with_info(
+                    subscription,
+                    &mut p,
+                    &mut t,
+                    &mut info,
+                    std::ptr::null_mut()
+                ),
                 RMW_RET_OK,
-                "take {i} within the budget must succeed"
+                "take {i} must be served whatever the consumer holds"
             );
-            assert!(t);
-            assert_eq!((*(p as *const CPoint)).x, f64::from(i));
+            assert!(t, "take {i} is taken");
+            assert_eq!(p as usize % 8, 0, "take {i}'s pointer is 8-aligned");
+            assert_eq!(
+                *(p as *const CPoint),
+                CPoint {
+                    x: f64::from(i),
+                    y: 0.5,
+                    z: -2.0
+                },
+                "take {i}: FIFO, byte-exact"
+            );
+            assert!(
+                info.source_timestamp > 0,
+                "take {i} carries its source stamp"
+            );
+            #[cfg(cerulion_has_message_info_sequence_numbers)]
+            assert_eq!(
+                info.publication_sequence_number,
+                u64::from(i),
+                "take {i} carries its publication sequence number"
+            );
+            assert_eq!(
+                data.loan_copy_count(),
+                expected_copies[i as usize],
+                "after take {i}"
+            );
             held.push(p);
         }
+        assert_eq!(data.loan_refusal_count(), 0, "nothing was refused");
 
-        // The 5th concurrent loan is refused loudly — RMW_RET_ERROR, taken
-        // stays false, and the queued 5th frame is NOT lost.
-        let mut t5 = false;
-        let mut p5: *mut c_void = std::ptr::null_mut();
-        assert_eq!(
-            rmw_take_loaned_message(subscription, &mut p5, &mut t5, std::ptr::null_mut()),
-            ffi::RMW_RET_ERROR,
-            "a take past the borrow budget must fail loudly, never hang"
-        );
-        assert!(!t5);
-        assert!(p5.is_null(), "no pointer may escape a refused take");
-
-        // Returning ONE loan recovers; the next take serves the surviving
-        // 5th frame (x = 4.0).
-        assert_eq!(
-            rmw_return_loaned_message_from_subscription(subscription, held.remove(0)),
-            RMW_RET_OK
-        );
-        let mut t = false;
-        let mut p: *mut c_void = std::ptr::null_mut();
-        assert_eq!(
-            rmw_take_loaned_message(subscription, &mut p, &mut t, std::ptr::null_mut()),
-            RMW_RET_OK
-        );
-        assert!(t, "returning a loan must recover the take path");
-        assert_eq!(
-            (*(p as *const CPoint)).x,
-            4.0,
-            "the frame behind the refused take must not have been lost"
-        );
-        assert_eq!(
-            rmw_return_loaned_message_from_subscription(subscription, p),
-            RMW_RET_OK
-        );
         for p in held {
             assert_eq!(
                 rmw_return_loaned_message_from_subscription(subscription, p),
                 RMW_RET_OK
             );
         }
+        let mut t = false;
+        let mut p: *mut c_void = std::ptr::null_mut();
+        assert_eq!(
+            rmw_take_loaned_message(subscription, &mut p, &mut t, std::ptr::null_mut()),
+            RMW_RET_OK
+        );
+        assert!(!t, "every published frame was served exactly once");
+        assert!(p.is_null());
 
         assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
         assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
