@@ -631,6 +631,20 @@ pub enum ReplayError {
         reason: String,
     },
 
+    /// A NODE-STOP record (kind 7, which this build reads) whose stop cause
+    /// this build does not define, in a bag stamped past the formats this
+    /// build reads: a newer or foreign writer added the cause. Exit 2. At or
+    /// below the formats this build reads, which define no other cause, the
+    /// same record is a corrupt bag ([`ReplayError::RecordingInconsistent`]);
+    /// `replay_engine::unknown_stop_cause_refusal` picks between the two.
+    #[error("scheduler-trace record {index}: {reason}")]
+    TraceStopCauseUnknown {
+        /// The offending record's index in the trace channel (write order).
+        index: usize,
+        /// What the record carries and the remedy.
+        reason: String,
+    },
+
     /// A recorded topic is neither produced nor consumed by the bag's embedded
     /// graph — the recording and its graph.yaml disagree (corrupt or
     /// hand-edited). Exit 2. (Fires at classification time.)
@@ -853,6 +867,7 @@ impl ReplayError {
             | ReplayError::MultiRankManifestGap { .. }
             | ReplayError::DegradedRecordingDeparture { .. }
             | ReplayError::TraceRecordUnsupported { .. }
+            | ReplayError::TraceStopCauseUnknown { .. }
             | ReplayError::BagGraphMismatch { .. }
             | ReplayError::BagNoStepBoundaries
             | ReplayError::RecordingInconsistent { .. }
@@ -1767,6 +1782,15 @@ pub fn run_replay(bag: &Path, opts: ReplayOptions) -> Result<ReplayOutcome, Repl
                         cerulion_core::trace_ring::trace_record_noun(record_type)
                     ),
                 },
+                TraceRecordFault::UnknownStopCause { rank, code } => {
+                    replay_engine::unknown_stop_cause_refusal(
+                        index,
+                        rank,
+                        code,
+                        stamped_trace_format(&reader),
+                        replay_engine::SUPPORTED_TRACE_FORMAT,
+                    )
+                }
                 TraceRecordFault::ZeroedRecord => ReplayError::TraceRecordUnsupported {
                     index,
                     record_type: 0,
@@ -2220,6 +2244,19 @@ struct RecorderRead {
     /// NEWER Cerulion is refused by the version gate first, which names the
     /// cause.
     driver_stamp: replay_engine::RecordedDriverStamp,
+}
+
+/// The `trace_format` a bag's `recorder.json` stamps, read on its own for the
+/// one record refusal whose remedy depends on it, which the record walk raises
+/// before [`read_recorder_info`] runs. `1` when the attachment is absent or
+/// carries no readable stamp, as an absent field reads. Read through
+/// `cerulion_core::flashback::resim::recorded_trace_format`, as the capture
+/// judge reads it.
+fn stamped_trace_format(reader: &BagReader) -> u32 {
+    let attachment = reader.attachment(RECORDER_ATTACHMENT).ok().flatten();
+    cerulion_core::flashback::resim::recorded_trace_format(
+        attachment.as_ref().map(|att| att.data.as_slice()),
+    )
 }
 
 /// Read the OPTIONAL
@@ -2859,6 +2896,13 @@ mod tests {
                     index: 7,
                     record_type: 2,
                     reason: "departure".to_string(),
+                },
+                2,
+            ),
+            (
+                ReplayError::TraceStopCauseUnknown {
+                    index: 7,
+                    reason: "cause".to_string(),
                 },
                 2,
             ),

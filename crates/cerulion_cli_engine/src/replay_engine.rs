@@ -96,7 +96,8 @@ use cerulion_core::trace_ring::{
     unpack_read_outcome_popped, unpack_read_outcome_run, TraceRingRecord, AUTHORITATIVE_TRACE_RANK,
     READ_OUTCOME_DECIMATED, READ_OUTCOME_DRAINED_BATCH, READ_OUTCOME_HELD, READ_OUTCOME_NONE,
     READ_OUTCOME_NO_FRAME, READ_OUTCOME_PRODUCER, READ_OUTCOME_SERVED, READ_OUTCOME_TRUNCATED,
-    RECORD_TYPE_DEPARTURE, RECORD_TYPE_FIRE, RECORD_TYPE_READ_OUTCOME, RECORD_TYPE_STEP_BOUNDARY,
+    RECORD_TYPE_DEPARTURE, RECORD_TYPE_FIRE, RECORD_TYPE_NODE_STOP, RECORD_TYPE_READ_OUTCOME,
+    RECORD_TYPE_STEP_BOUNDARY,
 };
 use cerulion_core::wire::{MaxSliceLen, WireHeader};
 use cerulion_core::{NodeEntry, TransportManager, VirtualClock};
@@ -2347,12 +2348,13 @@ const EMITTED_TRACE_RECORD_KINDS: &[u32] = &[
     RECORD_TYPE_DEPARTURE,
     RECORD_TYPE_STEP_BOUNDARY,
     RECORD_TYPE_READ_OUTCOME,
+    RECORD_TYPE_NODE_STOP,
 ];
 
-/// The highest trace-record kind a format-3 reader can decode. `trace_ring`
-/// reserves kinds 7+; a stream carrying one is not format-3-clean, and a bag
-/// carrying it MUST stamp >= 4 ([`stamp_trace_format`]'s never-under-claim
-/// law).
+/// The highest trace-record kind a format-3 reader can decode. A stream
+/// carrying a higher kind (the NODE-STOP record, kind 7, is one) is not
+/// format-3-clean, and a bag carrying it MUST stamp >= 4
+/// ([`stamp_trace_format`]'s never-under-claim law).
 ///
 /// # The two ANNOTATION kinds are deliberately NOT record kinds
 ///
@@ -2364,18 +2366,20 @@ const EMITTED_TRACE_RECORD_KINDS: &[u32] = &[
 /// marker-bearing or token-bearing LOCKSTEP bag to stamp format 4 and lose
 /// the byte-exact replay of older lockstep bags. Inside kind 6 an old reader passes both records through
 /// `classify_trace_record`, decodes every field it reads to the value the
-/// writer meant, and renders the kind as `unknown(6)`/`unknown(7)` — so the
-/// RECORD-kind inventory above is unchanged and `recorder_stream_needs_v4`
-/// stays `false`, which is exactly what
-/// `the_emitted_kind_inventory_is_format_three_clean` pins.
+/// writer meant, and renders the kind as `unknown(6)`/`unknown(7)`, so the
+/// annotations add no record kind to the inventory above. The NODE-STOP record
+/// is a record kind of its own, which is why `recorder_stream_needs_v4` answers
+/// `true`, as `the_emitted_kind_inventory_carries_the_stop_record_past_format_three`
+/// pins.
 const FORMAT_3_MAX_RECORD_KIND: u32 = RECORD_TYPE_READ_OUTCOME;
 
 /// Does THIS binary's recorder emit anything a format-3 reader cannot decode?
 ///
-/// `false` today: the recorder emits nothing above kind 6, which is what lets a lockstep
-/// bag keep stamping 3. Adding a kind >= 7 to the module-private
-/// `EMITTED_TRACE_RECORD_KINDS` inventory flips this on its own and every
-/// lockstep bag starts stamping 4 — the never-under-claim law.
+/// `true` since the NODE-STOP record (kind 7) joined the module-private
+/// `EMITTED_TRACE_RECORD_KINDS` inventory: a kind above 6 flips it on its own,
+/// the never-under-claim law. It decides nothing for a bag this binary writes,
+/// whose stamp comes from the terms [`stamp_trace_format`] tests before the
+/// mode and stream arms; it is the stream fact those arms would read.
 ///
 /// # The inventory is a LITERAL LIST, held by a WALK — not "by construction"
 ///
@@ -2430,16 +2434,19 @@ pub struct RecorderClaims {
     /// window, and the boundary there carries the reopen flag
     /// ([`recorder_names_window_heads`]).
     pub names_window_heads: bool,
+    /// Every fire that stopped its node is followed by a NODE-STOP record
+    /// ([`recorder_records_node_stops`]).
+    pub records_node_stops: bool,
 }
 
 impl RecorderClaims {
     /// What THIS binary's recorder claims for a run, with `folds_runs` read
     /// from the run's one fold switch (`cerulion_core::read_outcome::fold_enabled`).
     ///
-    /// The window heads, stops, identity and consult terms are tested first,
-    /// so a bag this binary writes stamps the same with folding on or off; the
-    /// fold term decides the stamp only on the ladder below 7, the arm an
-    /// older recorder's bag took.
+    /// The node stops, window heads, stops, identity and consult terms are
+    /// tested first, so a bag this binary writes stamps the same with folding
+    /// on or off; the fold term decides the stamp only on the ladder below 7,
+    /// the arm an older recorder's bag took.
     #[must_use]
     pub fn of_this_recorder(folds_runs: bool) -> Self {
         Self {
@@ -2460,6 +2467,9 @@ impl RecorderClaims {
             // Every read site's writer run reopens at each checkpoint window
             // head, and the boundary there says so.
             names_window_heads: recorder_names_window_heads(),
+            // Every fire that stopped its node is followed by a NODE-STOP
+            // record.
+            records_node_stops: recorder_records_node_stops(),
         }
     }
 }
@@ -2476,14 +2486,16 @@ impl RecorderClaims {
 ///
 /// - the READ gate ([`SUPPORTED_TRACE_FORMAT`]) is the MAX this binary replays;
 /// - the WRITE stamp is per BAG in SHAPE, but today every bag
-///   this binary writes takes the WINDOW HEADS term and stamps 11, because
+///   this binary writes takes the NODE STOPS term and stamps
+///   [`NODE_STOPS_MIN_TRACE_FORMAT`], because
 ///   [`recorder_stamps_consult_records`], [`recorder_records_read_identity`],
-///   [`recorder_states_anchor_stops`] and [`recorder_names_window_heads`] are
-///   unconditionally true and this function returns before the ladder is
-///   consulted. The ladder below (the fold term at 6, the role term at 5, then
-///   the mode and stream arms) is the `records_consults == false` fallback,
-///   i.e. the rules that produced the bags recorded before each term existed,
-///   and NO bag written today reaches it.
+///   [`recorder_states_anchor_stops`], [`recorder_names_window_heads`] and
+///   [`recorder_records_node_stops`] are unconditionally true and this
+///   function returns before the ladder is consulted. The ladder below (the
+///   fold term at 6, the role term at 5, then the mode and stream arms) is the
+///   `records_consults == false` fallback, i.e. the rules that produced the
+///   bags recorded before each term existed, and NO bag written today reaches
+///   it.
 ///
 /// The claims arrive as one [`RecorderClaims`] value with a name on every
 /// term, so two of them cannot trade places at a call site.
@@ -2509,7 +2521,24 @@ pub fn stamp_trace_format(coordination: CoordinationMode, claims: RecorderClaims
         records_identity,
         states_anchor_stops,
         names_window_heads,
+        records_node_stops,
     } = claims;
+    if records_consults
+        && records_identity
+        && states_anchor_stops
+        && names_window_heads
+        && records_node_stops
+    {
+        // Every fire that stopped its node is followed, on its rank's ring,
+        // by a NODE-STOP record (kind 7) naming the cause, so the trace states
+        // where the recording stopped each node. A reader below this format
+        // does not define kind 7: its record walk, which runs before its
+        // version gate, refuses the first stop record as an unknown record
+        // kind (exit 2, with the upgrade remedy), and its version gate refuses
+        // a bag that holds none. The term claims nothing without the window
+        // heads, stops, identity and consult terms under it.
+        return NODE_STOPS_MIN_TRACE_FORMAT;
+    }
     if records_consults && records_identity && states_anchor_stops && names_window_heads {
         // Every read site's first read that serves a frame after a step a
         // checkpoint was due at carries its writer's annotation again, and
@@ -2651,6 +2680,17 @@ pub fn recorder_records_read_identity() -> bool {
     true
 }
 
+/// Does THIS binary's recorder follow every fire that stopped its node with a
+/// NODE-STOP record (`cerulion_core::trace_ring::RECORD_TYPE_NODE_STOP`)?
+///
+/// `true`, unconditionally: the scheduler marks the stopping fire's trace entry
+/// (`cerulion_core::scheduler::TraceEntry::stop`) at each site that stops a
+/// node, and the recording ring pushes the record directly after that fire's
+/// FIRE record.
+pub fn recorder_records_node_stops() -> bool {
+    true
+}
+
 /// Does THIS binary's recorder state, in every complete checkpoint part, whether
 /// the scheduler had stopped the node at that boundary?
 ///
@@ -2728,6 +2768,63 @@ const _: () = assert!(WINDOW_HEADS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
 /// An ABSENT `recorder.json` answers `false`.
 pub fn recorder_names_window_heads_at(recorder: Option<&RecorderInfo>) -> bool {
     recorder.is_some_and(|r| r.trace_format >= WINDOW_HEADS_MIN_TRACE_FORMAT)
+}
+
+/// The lowest `trace_format` whose trace follows every fire that stopped its
+/// node with a NODE-STOP record, so a stop the trace does not hold is a stop
+/// the recording did not make. Below it the trace says nothing about stops.
+///
+/// The stamp ([`stamp_trace_format`]) and the read gate
+/// ([`SUPPORTED_TRACE_FORMAT`]) both read it from here. The number is written
+/// once, in `cerulion_core::trace_ring`, where the capture judge reads it too.
+pub const NODE_STOPS_MIN_TRACE_FORMAT: u32 = cerulion_core::trace_ring::NODE_STOPS_MIN_TRACE_FORMAT;
+
+// The gate can never sit above what this binary reads.
+const _: () = assert!(NODE_STOPS_MIN_TRACE_FORMAT <= SUPPORTED_TRACE_FORMAT);
+
+/// Does this bag's trace hold a NODE-STOP record for every stop the recording
+/// made?
+///
+/// An ABSENT `recorder.json` answers `false`.
+pub fn recorder_records_node_stops_at(recorder: Option<&RecorderInfo>) -> bool {
+    recorder.is_some_and(|r| r.trace_format >= NODE_STOPS_MIN_TRACE_FORMAT)
+}
+
+/// PURE: the refusal of trace record `index`, a NODE-STOP record of `rank`
+/// whose stop cause `code` names no cause this build defines, in a bag
+/// stamped `stamp` (`1` when unstamped) and read by a build that reads up to
+/// `supported`, as `cerulion_core::trace_ring::unknown_stop_cause_origin`
+/// reads it, the answer the capture judge's reason is worded from too. Past
+/// `supported`, a newer or foreign writer added the cause:
+/// [`ReplayError::TraceStopCauseUnknown`], with the upgrade remedy the unknown
+/// record kind gets. At or below it, a format at or below this build's
+/// defines no other cause, so the bag is corrupt:
+/// [`ReplayError::RecordingInconsistent`]. The record gate and
+/// the engine both refuse through this one function.
+pub(crate) fn unknown_stop_cause_refusal(
+    index: usize,
+    rank: u32,
+    code: u64,
+    stamp: u32,
+    supported: u32,
+) -> ReplayError {
+    use cerulion_core::trace_ring::{unknown_stop_cause_origin, UnknownStopCauseOrigin};
+    match unknown_stop_cause_origin(stamp, supported) {
+        UnknownStopCauseOrigin::NewerWriter => ReplayError::TraceStopCauseUnknown {
+            index,
+            reason: format!(
+                "a NODE-STOP record of rank {rank} carries stop cause {code}, which this \
+                 Cerulion version does not define; the bag was written by a newer or foreign \
+                 writer; upgrade cerulion to replay it"
+            ),
+        },
+        UnknownStopCauseOrigin::Corrupt => ReplayError::RecordingInconsistent {
+            detail: format!(
+                "trace record {index} is a NODE-STOP record of rank {rank} that carries stop \
+                 cause {code}, which trace format {stamp} does not define"
+            ),
+        },
+    }
 }
 
 /// The lowest `trace_format` whose kind-6 records may be TRUSTED
@@ -2922,19 +3019,33 @@ pub fn replay_stages_batch_frames(
 /// the bag. Formats 1 to 10 stay readable: their boundaries carry no flag and
 /// their stages are never reopened mid-pass.
 ///
+/// Bumped to [`NODE_STOPS_MIN_TRACE_FORMAT`] (12) by node stops: every fire
+/// that stopped its node (a
+/// `NodeError::Fatal` return, a tick panic or a poisoned entry, the
+/// consecutive-panic breaker) is followed on its rank's ring by a NODE-STOP
+/// record, kind 7, naming the cause ([`NODE_STOPS_MIN_TRACE_FORMAT`]). A
+/// reader below 12 does not define kind 7: its record walk, which runs before
+/// its version gate, refuses the first stop record as an unknown record kind
+/// (exit 2, with the upgrade remedy), and its version gate refuses a bag that
+/// holds none. The formats below it stay readable, and their traces say
+/// nothing about stops.
+///
+/// The value is `cerulion_core::trace_ring`'s constant of the same name, which
+/// the capture judge words an unknown stop cause against.
+///
 /// THIS IS THE READ GATE ONLY. What a bag is STAMPED with is per-bag and comes
 /// from [`stamp_trace_format`], which is exactly the decoupling free-run recording
 /// introduced (see that function's docs for why the two roles cannot share one
 /// constant). The never-under-claim stamp narrowed the VISIBLE distance between
-/// them to zero for the bags this binary writes (every one of them stamps 11,
+/// them to zero for the bags this binary writes (every one of them stamps 12,
 /// because every one records every consult, every frame each read
 /// consumed when its batch fits the read stage's window, the stopped flag
-/// in every complete checkpoint part of a stopped node, and the writer of
-/// every read site at every checkpoint window head), but the two remain
-/// separate functions serving separate
-/// questions, and the READ gate still admits 1 to 10
+/// in every complete checkpoint part of a stopped node, the writer of
+/// every read site at every checkpoint window head, and every stop), but
+/// the two remain separate functions serving separate
+/// questions, and the READ gate still admits the formats below it
 /// while the WRITE stamp never emits them.
-pub const SUPPORTED_TRACE_FORMAT: u32 = 11;
+pub const SUPPORTED_TRACE_FORMAT: u32 = cerulion_core::trace_ring::SUPPORTED_TRACE_FORMAT;
 
 /// The replay-side view of the bag's `__cerulion/record_health.json`
 /// stamp (written by bagd for every cleanly-finalized bag — see
@@ -5267,6 +5378,9 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
     // the read gate's rule and the shape predicate branch on. `false` on every
     // archived bag and on an absent attachment: the counted arm.
     let consults_recorded = recorder_records_every_consult(recorder.as_ref());
+    // And whether its trace holds a NODE-STOP record for every stop, so a
+    // re-executed stop can be held to the recorded one.
+    let stops_recorded = recorder_records_node_stops_at(recorder.as_ref());
     // …and, separately, how wide its kind field is. ABSENT is NOT the archived
     // arm here (see `KindFieldWidth`), which is why this is not `!roles_stamped`.
     let kind_width = kind_field_width(recorder.as_ref());
@@ -5605,6 +5719,12 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
         covered_range.as_ref(),
         &producing_rank,
     )?;
+    validate_stop_records(
+        &trace,
+        &rank_tables,
+        stops_recorded,
+        recorder.as_ref().map_or(1, |r| r.trace_format),
+    )?;
 
     // 3c. The per-rank ragged-shutdown-tail context, derived from the
     //     boundary summaries the ONE walk above already produced. It feeds BOTH
@@ -5775,6 +5895,7 @@ pub fn run_engine(inputs: ReplayInputs, nodes: ReplayNodes) -> Result<ReplayOutc
                 coordination,
                 roles_stamped,
                 consults_recorded,
+                stops_recorded,
                 stages_every_consult,
                 stages_batch_frames,
                 identity: edge_identity,
@@ -10282,6 +10403,12 @@ struct PassInputs<'a> {
     /// the counted arm, under which an empty drain wrote no record and a
     /// consult past the plan is a reported number.
     consults_recorded: bool,
+    /// Does this bag's trace hold a NODE-STOP record for every stop the
+    /// recording made (`trace_format >= NODE_STOPS_MIN_TRACE_FORMAT`)? Then
+    /// each recorded stop is the one the schedule check judges by, and a
+    /// re-executed stop that differs from it is a fire-schedule divergence.
+    /// `false` on every bag below that format and on an absent attachment.
+    stops_recorded: bool,
     /// Does the replay's staging write a record at an empty consult, the
     /// shape this bag's recorder wrote (`replay_stages_every_consult`)?
     ///
@@ -16533,6 +16660,19 @@ fn run_rank_pass(
     };
     let mut rec_step_fires: Vec<RecordedFire> = Vec::new(); // reused per step.
     let mut rep_step_fires: Vec<ReplayedFire> = Vec::new(); // reused per step.
+
+    // The step's stops, as the recording's trace holds them and as the
+    // re-execution made them, reused per step; and the first step at which the
+    // two differ (a bag at the node-stops format or later only), outside the
+    // stops of the `external` (driver) nodes, whose recorded stops a replay
+    // cannot re-execute without their devices.
+    let mut rec_step_stops: Vec<replay_rederive::StepStop> = Vec::new();
+    let mut rep_step_stops: Vec<replay_rederive::StepStop> = Vec::new();
+    let mut stop_report: Option<(u64, replay_rederive::StopDisagreement)> = None;
+    // A re-executed stop in a short rank's tolerated tail is part of the
+    // re-fire the other gates tolerate there, so the stop compare skips it
+    // under the same window.
+    let stop_tail = TailWindow::from_ragged(pass.ragged);
     let mut ticks_replayed = 0usize;
     // This pass's own EXECUTION range, for `rank_execution`.
     // `first_step`/`last_step` are the steps actually EXECUTED (not the ones the
@@ -16705,6 +16845,21 @@ fn run_rank_pass(
             pass.rank_tables,
             &mut rec_step_fires,
         )?;
+        rec_step_stops.clear();
+        if pass.stops_recorded {
+            rec_step_stops.extend(
+                fire_cursors
+                    .step_stops()
+                    .iter()
+                    .filter(|s| !pass.driver_nodes.contains(&s.node_id))
+                    .cloned(),
+            );
+            if !lockstep {
+                for stop in &rec_step_stops {
+                    rederive_stops.note_recorded(boundary.step, stop);
+                }
+            }
+        }
         // Accumulate this step for the rank-local re-derivation
         // verifier, which takes the whole slice (it re-derives a SCHEDULE, and a
         // schedule is a statement about a sequence of steps). The reads were
@@ -16829,6 +16984,45 @@ fn run_rank_pass(
             });
         }
         runtime.step(Duration::from_nanos(delta));
+        if pass.stops_recorded && stop_report.is_none() {
+            // The trace holds exactly this step's fires (it is cleared below
+            // every step); a stopping fire's position is its node's entries up
+            // to and including it.
+            rep_step_stops.clear();
+            let trace = runtime.trace();
+            for (i, e) in trace.iter().enumerate() {
+                if let Some(cause) = e.stop {
+                    if pass.driver_nodes.contains(e.node_id.as_ref()) {
+                        continue;
+                    }
+                    let node_rank = pass
+                        .node_rank
+                        .and_then(|m| m.get(e.node_id.as_ref()).copied());
+                    if stop_tail.is_tail(node_rank, boundary.step) {
+                        continue;
+                    }
+                    // The entry itself is counted, so the position is at least 1.
+                    let fires = trace[..=i]
+                        .iter()
+                        .filter(|x| *x.node_id == *e.node_id)
+                        .count();
+                    rep_step_stops.push(replay_rederive::StepStop {
+                        node_id: e.node_id.to_string(),
+                        rank: node_rank.unwrap_or_else(|| plan.rank()),
+                        fires: u32::try_from(fires)
+                            .ok()
+                            .and_then(std::num::NonZeroU32::new)
+                            .unwrap_or(std::num::NonZeroU32::MAX),
+                        cause,
+                    });
+                }
+            }
+            if let Some(disagreement) =
+                replay_rederive::first_stop_disagreement(&rec_step_stops, &rep_step_stops)
+            {
+                stop_report = Some((boundary.step, disagreement));
+            }
+        }
         if !lockstep {
             for decl in &verification.decls {
                 if !rederive_stops.contains(&decl.node_id) && runtime.is_node_stopped(&decl.node_id)
@@ -17745,6 +17939,21 @@ fn run_rank_pass(
             context: Vec::new(),
         }),
     };
+    // A re-executed stop that differs from the recorded one is a fire-schedule
+    // divergence too, reported when the compare above found none.
+    let divergence = divergence.or_else(|| {
+        stop_report.map(|(step, disagreement)| TraceDivergenceReport {
+            position: 0,
+            detail: format!(
+                "{}: rank {} step {step}: {disagreement}",
+                DivergenceClass::FireSchedule.phrase(),
+                disagreement.rank()
+            ),
+            recorded: None,
+            replayed: None,
+            context: Vec::new(),
+        })
+    });
     tail_notes.extend(read_log.take_tail_notes());
     let read_log_outcome = read_log.finalize();
 
@@ -18901,11 +19110,12 @@ impl RaggedTailContext {
 }
 
 /// The tolerated-window RULE — which `(rank, step)` pairs lie in a
-/// ragged rank's legitimate re-fire window — kept in ONE place because THREE
+/// ragged rank's legitimate re-fire window, kept in ONE place because FOUR
 /// gates consult it: the structural trace comparator ([`TailTolerance`]),
 /// the per-topic frame diff (step 6, which reads [`RaggedTailContext`]
-/// directly for its per-rank WIDTH), and the read-log verifier
-/// ([`ReadLogTail`]). Two gates disagreeing about one tolerated window IS the
+/// directly for its per-rank WIDTH), the read-log verifier
+/// ([`ReadLogTail`]) and the stop compare, which skips a re-executed stop in
+/// the window. Two gates disagreeing about one tolerated window IS the
 /// ragged-tail flake class, and a second copy of this predicate is exactly how they
 /// would come to disagree.
 #[derive(Clone)]
@@ -26270,6 +26480,102 @@ impl<'a> RankBoundaryCursors<'a> {
     }
 }
 
+/// Refuse, before any runtime is built, every NODE-STOP record this replay
+/// cannot read as a stop: one stamped with a rank the bag has no trace
+/// manifest for; one in a bag that does not claim the node-stops format
+/// (`stops_recorded` false, which covers a bag with no stamp); one whose cause
+/// names no cause this build defines ([`unknown_stop_cause_refusal`], whose
+/// remedy depends on `stamp`, the bag's `trace_format`); one that does not
+/// directly follow, on its own rank, the FIRE record of the fire that stopped
+/// its node (same node, step, instant and level); and a second one of a node
+/// that already stopped. All but the unknown cause are shapes no recorder
+/// writes. The fire demux then reads every stop record as a stop at a fire
+/// from 1.
+fn validate_stop_records(
+    trace: &RecordedTrace,
+    rank_tables: &[Vec<Arc<str>>],
+    stops_recorded: bool,
+    stamp: u32,
+) -> Result<(), ReplayError> {
+    let rank_count = rank_tables.len();
+    let mut prev: Vec<Option<TraceRingRecord>> = vec![None; rank_count];
+    let mut stopped: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); rank_count];
+    let mut index = 0usize;
+    trace.for_each(|rec| {
+        let at = index;
+        index += 1;
+        let rank = rec.rank() as usize;
+        // A FIRE or BOUNDARY record's out-of-range rank is refused by the
+        // walks above, and a stop record's here, as the FIRE walk words it.
+        if rank >= rank_count {
+            if rec.record_type == RECORD_TYPE_NODE_STOP {
+                return Err(ReplayError::RecordingInconsistent {
+                    detail: format!(
+                        "trace record {at} is a NODE-STOP record stamped with rank {} \
+                         (reserved) but the bag carries worker trace manifests only for ranks \
+                         0..={}",
+                        rec.rank(),
+                        rank_count - 1
+                    ),
+                });
+            }
+            return Ok(());
+        }
+        let before = prev[rank].replace(*rec);
+        if rec.record_type != RECORD_TYPE_NODE_STOP {
+            return Ok(());
+        }
+        if !stops_recorded {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "trace record {at} is a NODE-STOP record, and a bag stamped below trace \
+                     format {NODE_STOPS_MIN_TRACE_FORMAT}, or with no trace format stamp, holds \
+                     no NODE-STOP record"
+                ),
+            });
+        }
+        if rec.stop_cause().is_none() {
+            return Err(unknown_stop_cause_refusal(
+                at,
+                rec.rank(),
+                rec.duration_ns,
+                stamp,
+                SUPPORTED_TRACE_FORMAT,
+            ));
+        }
+        let node = rank_tables[rank].get(rec.node_idx as usize).map_or_else(
+            || format!("<node_idx {}>", rec.node_idx),
+            |id| id.to_string(),
+        );
+        let follows_its_fire = before.is_some_and(|f| {
+            f.record_type == RECORD_TYPE_FIRE
+                && f.node_idx == rec.node_idx
+                && f.step == rec.step
+                && f.fire_time_ns == rec.fire_time_ns
+                && f.global_level == rec.global_level
+        });
+        if !follows_its_fire {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "trace record {at} is a NODE-STOP record of node '{node}' at step {} on rank \
+                     {rank}, and the record before it on that rank is not the FIRE record of the \
+                     fire that stopped the node (the same node, step, instant and level)",
+                    rec.step
+                ),
+            });
+        }
+        if !stopped[rank].insert(rec.node_idx) {
+            return Err(ReplayError::RecordingInconsistent {
+                detail: format!(
+                    "trace record {at} is a second NODE-STOP record of node '{node}' on rank \
+                     {rank}; a node stops once in a run"
+                ),
+            });
+        }
+        Ok(())
+    })
+}
+
 /// Cross-check the recording's internal consistency BEFORE the replay loop —
 /// the corruption tripwire (all violations are
 /// [`ReplayError::RecordingInconsistent`], exit 2):
@@ -27537,6 +27843,10 @@ struct RankedFireCursors<'a> {
     stamp_rank: bool,
     /// Per-step merge scratch: `(global_level, rank, seq, fire)` — reused.
     scratch: Vec<(u32, u32, u32, RecordedFire)>,
+    /// The NODE-STOP records of the step the last pull read, in rank order and
+    /// each rank's stream order, with the stopping fire's position among its
+    /// node's FIRE records of that step on its rank; reused.
+    stops: Vec<replay_rederive::StepStop>,
 }
 
 impl<'a> RankedFireCursors<'a> {
@@ -27550,7 +27860,14 @@ impl<'a> RankedFireCursors<'a> {
             ranks: (0..rank_count as u32).collect(),
             stamp_rank: rank_count > 1,
             scratch: Vec::new(),
+            stops: Vec::new(),
         })
+    }
+
+    /// The NODE-STOP records of the step the last
+    /// [`Self::pull_merged_step_fires`] read.
+    fn step_stops(&self) -> &[replay_rederive::StepStop] {
+        &self.stops
     }
 
     /// The MIN absolute bag offset across every rank's FIRE cursor — the
@@ -27579,6 +27896,7 @@ impl<'a> RankedFireCursors<'a> {
             ranks: vec![rank],
             stamp_rank: true,
             scratch: Vec::new(),
+            stops: Vec::new(),
         })
     }
 
@@ -27596,6 +27914,7 @@ impl<'a> RankedFireCursors<'a> {
         out: &mut Vec<RecordedFire>,
     ) -> Result<(), ReplayError> {
         self.scratch.clear();
+        self.stops.clear();
         // Rank is a diagnostic on multi-rank bags only (`None` keeps
         // single-rank divergence output byte-identical).
         let multi_rank = self.stamp_rank;
@@ -27645,6 +27964,42 @@ impl<'a> RankedFireCursors<'a> {
                         },
                     ));
                     seq += 1;
+                } else if r.record_type == RECORD_TYPE_NODE_STOP && r.step == step {
+                    // The recorder pushes a stop directly after the FIRE record of
+                    // the fire that made it, so its position is its node's FIRE
+                    // records of this step on this rank so far. `validate_stop_records`
+                    // refused every other shape before the pass began.
+                    let node_id = rank_tables[rank]
+                        .get(r.node_idx as usize)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            Arc::from(format!("<node_idx {}>", r.node_idx).as_str())
+                        });
+                    let fires = self
+                        .scratch
+                        .iter()
+                        .filter(|e| e.1 == rank as u32 && e.3.node_id == node_id)
+                        .count();
+                    let (Some(cause), Some(fires)) = (
+                        r.stop_cause(),
+                        u32::try_from(fires)
+                            .ok()
+                            .and_then(std::num::NonZeroU32::new),
+                    ) else {
+                        return Err(ReplayError::Internal {
+                            reason: format!(
+                                "a NODE-STOP record of node '{node_id}' at step {step} reached \
+                                 the fire demux without the stop record checks; this is a bug \
+                                 in the replay engine, please report"
+                            ),
+                        });
+                    };
+                    self.stops.push(replay_rederive::StepStop {
+                        node_id: node_id.to_string(),
+                        rank: rank as u32,
+                        fires,
+                        cause,
+                    });
                 }
             }
         }
@@ -33677,12 +34032,13 @@ mod recorder_info_version_tests {
         // plans no position for), and v8 marks a stream in which every edge
         // names its frames' writers by run (read identity), v9 names every
         // frame of a batch that fits its read stage, v10 states every
-        // stopped node in its checkpoints, and v11 names every read site's
+        // stopped node in its checkpoints, v11 names every read site's
         // writer again at every checkpoint window head and flags the boundary
-        // there. A recorder.json stamped v10 is NOT newer than this binary,
-        // and the absent-field back-compat default stays v1
+        // there, and v12 follows every fire that stopped its node with a
+        // NODE-STOP record. A recorder.json stamped v11 is NOT newer than this
+        // binary, and the absent-field back-compat default stays v1
         // (`trace_format_v1`). A bump must move this pin DELIBERATELY.
-        assert_eq!(SUPPORTED_TRACE_FORMAT, 11);
+        assert_eq!(SUPPORTED_TRACE_FORMAT, 12);
         assert_eq!(trace_format_v1(), 1);
         // The two trust gates are the formats the roles and the consult
         // records arrived in, and neither can sit above what this binary
@@ -33695,6 +34051,7 @@ mod recorder_info_version_tests {
         assert_eq!(BATCH_FRAME_MIN_TRACE_FORMAT, 9);
         assert_eq!(ANCHOR_STOPS_MIN_TRACE_FORMAT, 10);
         assert_eq!(WINDOW_HEADS_MIN_TRACE_FORMAT, 11);
+        assert_eq!(NODE_STOPS_MIN_TRACE_FORMAT, 12);
     }
 
     /// No claim at all: the base every hand row below states its claims over,
@@ -33707,6 +34064,7 @@ mod recorder_info_version_tests {
         records_identity: false,
         states_anchor_stops: false,
         names_window_heads: false,
+        records_node_stops: false,
     };
 
     /// The decoupling pin.
@@ -33714,9 +34072,9 @@ mod recorder_info_version_tests {
     /// It cannot assert `stamp == 3` AND `stamp < SUPPORTED_TRACE_FORMAT`.
     /// Under the never-under-claim stamp EVERY bag this binary writes records
     /// its consults and the frames of every batch that fits its read stage's
-    /// window, flags every complete checkpoint part of a stopped node and
-    /// names every read site's writer at every checkpoint window head, and
-    /// therefore stamps 11, so the write
+    /// window, flags every complete checkpoint part of a stopped node, names
+    /// every read site's writer at every checkpoint window head, and records
+    /// every stop, and therefore stamps 12, so the write
     /// stamp EQUALS the read
     /// gate and that inequality is unsatisfiable: the DEMONSTRATION retires with
     /// the property it demonstrated ("a lockstep bag stamps 3"), which is
@@ -33725,9 +34083,10 @@ mod recorder_info_version_tests {
     /// What holds, and is what this pins: the two are separate
     /// FUNCTIONS answering separate questions; the write stamp never EXCEEDS
     /// the read gate (a bag this binary writes must be one it can read); and
-    /// the gate still admits formats 1 to 10, which the write stamp never
-    /// emits. The decoupling is therefore alive in both directions, the READ
-    /// side reading ten formats the WRITE side never produces.
+    /// the gate still admits every format below its own, which the write
+    /// stamp never emits. The decoupling is therefore alive in both
+    /// directions, the READ side reading formats the WRITE side never
+    /// produces.
     #[test]
     fn write_stamp_and_read_gate_stay_two_decisions() {
         let stamp = stamp_trace_format(
@@ -33735,24 +34094,25 @@ mod recorder_info_version_tests {
             RecorderClaims::of_this_recorder(true),
         );
         assert_eq!(
-            stamp, 11,
+            stamp, 12,
             "a recorder that records every consult, the frames of every batch \
              that fits its read stage, flags every complete checkpoint part of a \
-             stopped node AND names every read site's writer at every checkpoint \
-             window head stamps 11: a format-7 reader would replay its reads by \
-             queue re-creation and call the result clean, a format-8 reader does \
-             not know the batch frame record, a format-9 reader reads past the \
-             stopped flag, and a format-10 reader never mirrors the reopen, so an \
-             ungated stage near its rim reports a false read_log_diverged, and \
-             never checks the flags word"
+             stopped node, names every read site's writer at every checkpoint \
+             window head AND records every stop stamps 12: a format-7 reader would \
+             replay its reads by queue re-creation and call the result clean, a \
+             format-8 reader does not know the batch frame record, a format-9 \
+             reader reads past the stopped flag, a format-10 reader never mirrors \
+             the reopen, so an ungated stage near its rim reports a false \
+             read_log_diverged, and never checks the flags word; and a reader \
+             below 12 refuses the stop record"
         );
         assert!(
             stamp <= SUPPORTED_TRACE_FORMAT,
             "a bag this binary WRITES must be one it can READ"
         );
-        // The gate is strictly WIDER than the stamp: ten formats this binary
-        // reads and never writes.
-        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10] {
+        // The gate is strictly WIDER than the stamp: eleven formats this
+        // binary reads and never writes, listed by hand.
+        for archived in [1u32, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11] {
             assert!(
                 archived < SUPPORTED_TRACE_FORMAT,
                 "format {archived} stays replayable"
@@ -33770,9 +34130,9 @@ mod recorder_info_version_tests {
     /// pre-existing arms and the pre-roles table survives intact underneath it.
     /// Every row then carries more expected values: `folds_runs` alone is 6,
     /// `records_consults` is 7 with folding on or off, consults with identity
-    /// is 9, consults with identity and checkpoint stops is 10, and those three
-    /// with window heads is 11, the strongest claim. Each claim is set by name
-    /// over the row's base.
+    /// is 9, consults with identity and checkpoint stops is 10, those three
+    /// with window heads is 11, and those four with node stops is 12, the
+    /// strongest claim. Each claim is set by name over the row's base.
     #[test]
     fn stamp_trace_format_answers_its_hand_table() {
         let cases = [
@@ -33925,6 +34285,72 @@ mod recorder_info_version_tests {
                     ) < 7,
                     "{row}: window heads alone claim nothing above the ladder"
                 );
+                // Node stops ride all four: 12 over every axis, and the term
+                // claims nothing without the window heads, stops, identity and
+                // consult terms under it.
+                let node_stops = RecorderClaims {
+                    records_node_stops: true,
+                    ..heads
+                };
+                assert_eq!(
+                    stamp_trace_format(mode, node_stops),
+                    12,
+                    "{row}: node stops"
+                );
+                assert_eq!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            names_window_heads: false,
+                            ..node_stops
+                        }
+                    ),
+                    10,
+                    "{row}: node stops without window heads stay at the stops term's 10"
+                );
+                assert_eq!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            states_anchor_stops: false,
+                            ..node_stops
+                        }
+                    ),
+                    9,
+                    "{row}: node stops without checkpoint stops stay at the identity term's 9"
+                );
+                assert_eq!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_identity: false,
+                            ..node_stops
+                        }
+                    ),
+                    7,
+                    "{row}: node stops without identity stay at the consult term's 7"
+                );
+                assert!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_consults: false,
+                            ..node_stops
+                        }
+                    ) < 8,
+                    "{row}: node stops without the consult records are not format 8 or above"
+                );
+                assert!(
+                    stamp_trace_format(
+                        mode,
+                        RecorderClaims {
+                            records_node_stops: true,
+                            folds_runs: folds,
+                            ..base
+                        }
+                    ) < 7,
+                    "{row}: node stops alone claim nothing above the ladder"
+                );
             }
         }
         // This binary's own claims are the strongest row.
@@ -33933,7 +34359,7 @@ mod recorder_info_version_tests {
                 CoordinationMode::FreeRun,
                 RecorderClaims::of_this_recorder(false)
             ),
-            11
+            12
         );
     }
 
@@ -34356,6 +34782,53 @@ mod recorder_info_version_tests {
         assert!(!recorder_names_window_heads_at(None));
     }
 
+    /// The unknown-cause refusal against a hand table: at or below the
+    /// formats the build reads, a corrupt bag naming the stamp; one format
+    /// past it, the upgrade remedy; exit 2 either way.
+    #[test]
+    fn the_unknown_stop_cause_refusal_branches_on_the_stamp() {
+        let corrupt = |stamp: u32| ReplayError::RecordingInconsistent {
+            detail: format!(
+                "trace record 4 is a NODE-STOP record of rank 1 that carries stop cause 9, \
+                 which trace format {stamp} does not define"
+            ),
+        };
+        let newer = || ReplayError::TraceStopCauseUnknown {
+            index: 4,
+            reason: "a NODE-STOP record of rank 1 carries stop cause 9, which this Cerulion \
+                     version does not define; the bag was written by a newer or foreign \
+                     writer; upgrade cerulion to replay it"
+                .to_string(),
+        };
+        for (stamp, want) in [
+            (1u32, corrupt(1)),
+            (11, corrupt(11)),
+            (12, corrupt(12)),
+            (13, newer()),
+            (u32::MAX, newer()),
+        ] {
+            let got = unknown_stop_cause_refusal(4, 1, 9, stamp, 12);
+            assert_eq!(got.to_string(), want.to_string(), "stamp {stamp}");
+            assert_eq!(got.exit_code(), 2, "stamp {stamp}");
+        }
+    }
+
+    /// From the node-stops format a bag's trace holds every stop; a bag below
+    /// it, or with no `recorder.json`, makes no such claim.
+    #[test]
+    fn node_stops_are_recorded_from_their_format() {
+        for older in 1..NODE_STOPS_MIN_TRACE_FORMAT {
+            assert!(
+                !recorder_records_node_stops_at(Some(&recorder_info_at(older))),
+                "a format-{older} trace says nothing about stops"
+            );
+        }
+        assert!(recorder_records_node_stops_at(Some(&recorder_info_at(
+            NODE_STOPS_MIN_TRACE_FORMAT
+        ))));
+        assert!(!recorder_records_node_stops_at(None));
+    }
+
     /// One complete anchor part for a node saving a `u64`, carrying
     /// `framework` when it is given and no framework section otherwise, built
     /// by the encoder `cerulion_core`'s `state_restore_test` pins to its hand
@@ -34689,25 +35162,28 @@ mod recorder_info_version_tests {
     }
 
     /// `stream_needs_v4` is a STATIC property of this
-    /// binary's emitted-kind inventory, not an observation of one trace — the
+    /// binary's emitted-kind inventory, not an observation of one trace: the
     /// `bag_cmd --run` attach copies a stamp frozen at run start into a bag
     /// whose records are drained later, so an observed-stream basis could
     /// under-claim there. This pins BOTH halves: the inventory's own maximum is
-    /// the format-3 ceiling, and the derived answer is therefore `false`.
+    /// the NODE-STOP record, one past the format-3 ceiling, and the derived
+    /// answer is therefore `true`.
     #[test]
-    fn the_emitted_kind_inventory_is_format_three_clean() {
+    fn the_emitted_kind_inventory_carries_the_stop_record_past_format_three() {
         assert!(
             !EMITTED_TRACE_RECORD_KINDS.is_empty(),
             "an EMPTY inventory would make `recorder_stream_needs_v4` vacuously false"
         );
         let max = EMITTED_TRACE_RECORD_KINDS.iter().copied().max().unwrap();
         assert_eq!(
-            max, FORMAT_3_MAX_RECORD_KIND,
-            "the recorder emits nothing above kind 6 — a new kind here must be a deliberate edit"
+            max, RECORD_TYPE_NODE_STOP,
+            "the highest kind the recorder emits is the NODE-STOP record; a new kind here \
+             must be a deliberate edit"
         );
+        assert!(max > FORMAT_3_MAX_RECORD_KIND);
         assert!(
-            !recorder_stream_needs_v4(),
-            "…so a lockstep bag written by this binary is format-3-clean"
+            recorder_stream_needs_v4(),
+            "…so a bag written by this binary is not format-3-clean"
         );
         // The two ANNOTATION kinds (the overflow marker
         // and the producer token) ride INSIDE record-type 6 as new OUTCOME

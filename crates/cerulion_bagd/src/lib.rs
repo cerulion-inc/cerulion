@@ -9887,6 +9887,10 @@ fn judge_capture_resimmable(
         .filter(|(rank, _)| worker_manifest_ranks.contains(rank))
         .filter_map(|(rank, per)| per.first_recorded_step.map(|step| (*rank, step)))
         .collect();
+    let recorder_json = attachments
+        .iter()
+        .find(|(name, _)| name == RECORDER_JSON_ATTACHMENT)
+        .map(|(_, bytes)| bytes.as_slice());
     cerulion_core::flashback::resim::judge_resimmable(
         &cerulion_core::flashback::resim::ResimFacts {
             trace_records: trimmed.records.len(),
@@ -9895,12 +9899,10 @@ fn judge_capture_resimmable(
             // The contract the capture's own `recorder.json` states, the stamp
             // `bag play --resim` reads off the same attachment. No document
             // reads as an unstamped recording.
-            coordination: cerulion_core::flashback::resim::recorded_coordination(
-                attachments
-                    .iter()
-                    .find(|(name, _)| name == RECORDER_JSON_ATTACHMENT)
-                    .map(|(_, bytes)| bytes.as_slice()),
-            ),
+            coordination: cerulion_core::flashback::resim::recorded_coordination(recorder_json),
+            // The stamp the same document states, which words an unknown stop
+            // cause as `bag play --resim` words it.
+            trace_format: cerulion_core::flashback::resim::recorded_trace_format(recorder_json),
             // The hole this recorder watched open in its own
             // read of the ring, and the edges of the record stream that has to
             // straddle it for this capture to be holding it. Measured HERE, over
@@ -29421,6 +29423,9 @@ mod ranks_begin_apart_judge_tests {
         Unknown,
         NotJson,
         Absent,
+        /// A document with no `coordination` key that stamps this
+        /// `trace_format`.
+        Format(u32),
     }
     const STAMPS: [Stamp; 6] = [
         Stamp::FreeRun,
@@ -29640,6 +29645,10 @@ mod ranks_begin_apart_judge_tests {
                 attachments.push((RECORDER_JSON_ATTACHMENT.to_string(), b"{\"arch\":".to_vec()))
             }
             Stamp::Absent => {}
+            Stamp::Format(trace_format) => attachments.push((
+                RECORDER_JSON_ATTACHMENT.to_string(),
+                format!(r#"{{"arch":"aarch64","trace_format":{trace_format}}}"#).into_bytes(),
+            )),
         }
         let node_counts = vec![1usize; shape.worker_ranks.len()];
         judge_capture_resimmable(
@@ -29665,6 +29674,55 @@ mod ranks_begin_apart_judge_tests {
             true,
             None,
         )
+    }
+
+    /// A NODE-STOP record whose stop cause this build does not define is worded
+    /// from the stamp the capture's own `recorder.json` states, as `bag play
+    /// --resim` words it: at the formats this build reads, the trace is
+    /// corrupt; one format past them, a newer or foreign writer's.
+    #[test]
+    fn an_unknown_stop_cause_is_worded_from_the_captures_recorder_stamp() {
+        let mut records = rank_steps(0, 0..=8);
+        // Step 1's FIRE, directly followed by a stop record of cause 9.
+        let fire = records[3];
+        assert_eq!((fire.record_type, fire.step), (RECORD_TYPE_FIRE, 1));
+        records.insert(
+            4,
+            TraceRingRecord {
+                duration_ns: 9,
+                record_type: cerulion_core::trace_ring::RECORD_TYPE_NODE_STOP,
+                ..fire
+            },
+        );
+        let shape = Shape {
+            records,
+            anchored: None,
+            worker_ranks: &[0],
+        };
+        let supported = cerulion_core::trace_ring::SUPPORTED_TRACE_FORMAT;
+        let reason = |trace_format: u32| {
+            verdict(&shape, Stamp::Format(trace_format))
+                .expect_err("an unknown stop cause is not resimmable")
+                .reason()
+        };
+        assert_eq!(
+            reason(supported),
+            format!(
+                "a scheduler-trace NODE-STOP record of rank 0 carries stop cause 9, which trace \
+                 format {supported} does not define; the trace is corrupt. `cerulion bag play \
+                 --resim` refuses a trace on that record before it loads anything, so this \
+                 capture cannot be re-executed. The frames, the state and the trace are all in \
+                 the bag and readable"
+            )
+        );
+        assert_eq!(
+            reason(supported + 1),
+            "a scheduler-trace NODE-STOP record of rank 0 carries stop cause 9, which this \
+             Cerulion version does not define; the trace was written by a newer or foreign \
+             writer, so upgrade cerulion to replay it. `cerulion bag play --resim` refuses a \
+             trace on that record before it loads anything, so this capture cannot be \
+             re-executed. The frames, the state and the trace are all in the bag and readable"
+        );
     }
 
     /// The first step each rank keeps, so a verdict below is about the shape

@@ -2,8 +2,9 @@
 # `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
 # resumed replay make about a node a checkpoint states as stopped, the
 # stand-downs a resumed replay applies to a node whose stop the recording
-# does not state, the verifier budget's pure decision functions, and the
-# decisions a replay makes about checkpoint window heads.
+# does not state, the verifier budget's pure decision functions, the
+# decisions a replay makes about checkpoint window heads, and those it makes
+# about a recorded node stop.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -224,6 +225,94 @@ in prepare_pass_verification
 #          shard (the unmutated baseline passed)
 # Result:  3 mutants, 3 caught, 0 missed. Over the scope as it stands:
 #          47 mutants, 31 caught, 16 unviable, 0 missed.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Sixth scope: the pure decisions a replay makes about a recorded node stop.
+#
+# Scope: in src/replay_engine.rs the trace format stamp and its node stops
+# predicates (`stamp_trace_format`, `recorder_records_node_stops`,
+# `recorder_records_node_stops_at`), and in src/replay_rederive.rs where a
+# recorded stop leaves a node (`StopPoint::is_after`, `StopPoint::burst_at`)
+# and the comparison of the recorded and re-executed stops at one step
+# (`first_stop_disagreement`). The trace read path (the fire demux reading a
+# step's stop records, and the replay reading its own stops off its trace) and
+# the record gate walk the bag and drive the scheduler, which the mutation
+# rule does not cover. They are pinned in tests/replay_engine_test.rs by the
+# red-first vectors
+# `a_replay_that_does_not_re_execute_the_recorded_stop_is_a_fire_schedule_divergence`,
+# `a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges`,
+# `a_stop_in_a_ragged_tail_is_tolerated_with_its_re_fire`,
+# `a_stop_before_the_tail_the_recording_lacks_diverges_and_names_its_rank`, the
+# three refusals of a stop record shape no recorder writes,
+# `a_stop_record_of_a_rank_with_no_manifest_is_refused_exit_2` and
+# `a_stop_record_with_an_unknown_cause_is_refused_by_the_engine_with_the_gate_text`;
+# by `a_replay_that_stops_where_the_recording_did_passes`, a pin that passed
+# before the compare existed; by
+# `below_the_node_stops_format_a_recorded_stop_is_not_read`, which pins the
+# compare's format gate and was seen failing with that gate deleted; by the two
+# driver vectors, seen failing with their filters deleted; and in
+# tests/replay_gates_test.rs by `a_node_stop_record_*` and the two
+# `a_stop_cause_unknown_*` boundary vectors.
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re 'StopPoint::|first_stop_disagreement|stamp_trace_format|recorder_records_node_stops' \
+#            --timeout 600 -- --lib -- replay_engine:: replay_rederive:: graph_cmd::
+#          (in 6 shards, --shard k/6; the unmutated baseline passed)
+# Result:  35 mutants: 31 caught, 1 unviable, 3 missed, killed since: the
+#          three on `recorder_records_node_stops_at` (its body replaced with
+#          true or with false, and `>=` replaced with `<`), which no lib test
+#          asked. Killed by
+#          `replay_engine::recorder_info_version_tests::node_stops_are_recorded_from_their_format`
+#          (re-run with `--re 'recorder_records_node_stops_at' --iterate`: 3
+#          mutants, 3 caught). The unviable one returns
+#          `Some(Default::default())` from `first_stop_disagreement`, and
+#          `StopDisagreement` has no default.
+#          Re-run on the lines a later change to `StopPoint::burst_at` (the
+#          fire position counted from 1) and `first_stop_disagreement` (each
+#          disagreement's rank) touched, with
+#          `-f crates/cerulion_cli_engine/src/replay_rederive.rs`,
+#          `--re 'StopPoint::|first_stop_disagreement'`, that change's diff and
+#          `-- --lib -- replay_rederive::` (in 2 shards): 10 mutants, 9 caught,
+#          1 unviable (the same `Some(Default::default())`), 0 missed.
+#
+# The stamp over the claims this build's recorder makes, where the node stops
+# term also requires the window heads term (`stamp_trace_format`,
+# `RecorderClaims::of_this_recorder`), re-run on the lines a later change
+# added to the two:
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <that change's diff of the file> \
+#            --re '\bstamp_trace_format\b|RecorderClaims::of_this_recorder' \
+#            --exclude-re 'delete field' --timeout 600 \
+#            -- --lib -- replay_engine:: graph_cmd::
+#          (the unmutated baseline passed)
+# Result:  7 mutants: 6 caught, 1 unviable, 0 missed. The caught ones return
+#          0 or 1 from `stamp_trace_format` and replace each `&&` of the node
+#          stops term with `||`. The unviable one replaces
+#          `RecorderClaims::of_this_recorder` with `Default::default()`, and
+#          `RecorderClaims` has no default.
+#
+# The refusal an unknown stop cause gets from the bag's stamp
+# (`unknown_stop_cause_refusal` in src/replay_engine.rs), added after the runs
+# above. It maps the answer of
+# `cerulion_core::trace_ring::unknown_stop_cause_origin`, which that crate's
+# baseline judges:
+#
+# List:    cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --re 'unknown_stop_cause_refusal' --list
+# Result:  1 mutant of the function, its body replaced with
+#          `Default::default()`, which cannot compile because `ReplayError` has
+#          no default, so it was not run.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

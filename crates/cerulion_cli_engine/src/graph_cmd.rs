@@ -17786,9 +17786,11 @@ pub fn render_recorder_json(
         // writers by run, v9 one in which every multi-frame read whose batch
         // fits its read stage's window names each frame it consumed, v10 one
         // in which every complete checkpoint part of a stopped node carries
-        // the stopped flag, and v11 one in which every read site names its
+        // the stopped flag, v11 one in which every read site names its
         // writer again at every checkpoint window head and the boundary there
-        // carries the reopen flag, all four also every bag this binary writes.
+        // carries the reopen flag, and v12 one in which every fire that
+        // stopped its node is followed by a NODE-STOP record, all five also
+        // every bag this binary writes.
         // A replaying binary that supports a LOWER version
         // refuses this bag with a clear "recorded by a newer Cerulion, upgrade
         // to replay" message (rather than mis-decoding it). An absent field =
@@ -17796,9 +17798,9 @@ pub fn render_recorder_json(
         "trace_format": crate::replay_engine::stamp_trace_format(
             coordination,
             // THIS binary's claims, with whether THIS run folds identical runs
-            // read from the one switch. The window heads, stops, identity and
-            // consult terms are tested first, so every bag this binary writes
-            // stamps 11 with folding on or off.
+            // read from the one switch. The node stops, window heads, stops,
+            // identity and consult terms are tested first, so every bag this
+            // binary writes stamps 12 with folding on or off.
             crate::replay_engine::RecorderClaims::of_this_recorder(
                 cerulion_core::read_outcome::fold_enabled(),
             ),
@@ -31335,15 +31337,17 @@ nodes:
             )
         );
         assert_eq!(
-            v["trace_format"], 11,
+            v["trace_format"], 12,
             "every bag this binary writes carries read-site roles, folds runs, \
              records an empty consult a replay also makes, names the writer and \
              sequence of every frame each read consumed when its batch fits the \
              read stage's window, flags every complete checkpoint part of a stopped \
-             node AND names every read site's writer at every checkpoint window \
-             head: a reader below 11 never mirrors the reopen, so an ungated stage \
-             near its rim reports a false read_log_diverged, and never checks the \
-             flags word, so the stamp makes it refuse the bag"
+             node, names every read site's writer at every checkpoint window head \
+             AND records every stop: a reader below 11 never mirrors the reopen, so \
+             an ungated stage near its rim reports a false read_log_diverged, and \
+             never checks the flags word; a reader below 12 refuses a bag that \
+             holds a stop record as an unknown record kind, and the stamp makes it \
+             refuse one that holds none by its format"
         );
     }
 
@@ -31354,13 +31358,13 @@ nodes:
     ///
     /// Each later term overrides the free-run arm in turn: the role term takes
     /// it to 5, folding to 6, the consult record to 7, read identity to 8,
-    /// per-frame batch identity to 9, checkpoint stops to 10 and checkpoint
-    /// window heads to the 11 asserted here.
+    /// per-frame batch identity to 9, checkpoint stops to 10, checkpoint
+    /// window heads to 11 and node stops to the 12 asserted here.
     /// The test NAME is part of the oracle: it states the number the renderer
     /// stamps.
     #[cfg(unix)]
     #[test]
-    fn a_free_run_recorder_json_stamps_free_run_and_format_eleven() {
+    fn a_free_run_recorder_json_stamps_free_run_and_the_node_stops_format() {
         use crate::replay_engine::CoordinationMode;
         let now = Duration::from_nanos(7);
         let v: serde_json::Value = serde_json::from_slice(&render_recorder_json(
@@ -31376,9 +31380,10 @@ nodes:
         // folding. 8, not 7: read identity rides the consult record. 9, not 8:
         // every consumed frame of a batch is named. 10, not 9: every complete
         // checkpoint part of a stopped node carries the stopped flag. 11, not
-        // 10: every read site names its writer at every checkpoint window head
-        // (`stamp_trace_format`'s hand table pins the whole matrix).
-        assert_eq!(v["trace_format"], 11);
+        // 10: every read site names its writer at every checkpoint window head.
+        // 12, not 11: every stop is a NODE-STOP record (`stamp_trace_format`'s
+        // hand table pins the whole matrix).
+        assert_eq!(v["trace_format"], 12);
     }
 
     /// The driver flags render in id order whatever order the nodes arrive in,
@@ -31412,7 +31417,7 @@ nodes:
         let b = render(&backward);
         assert_eq!(a, b, "the node order must not reach the bytes");
         let expected = format!(
-            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":11}}"#,
+            r#"{{"arch":"{}","cerulion_version":"{}","coordination":"free_run","env_names_left_out":0,"node_external":{{"cam":true,"meter":false}},"os":"{}","recorded_at_ns":7,"trace_format":12}}"#,
             std::env::consts::ARCH,
             env!("CARGO_PKG_VERSION"),
             std::env::consts::OS,

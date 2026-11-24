@@ -130,6 +130,12 @@ pub struct ResimFacts<'a> {
     /// [`ResimGap::RankWithoutBoundaryStream`] and
     /// [`ResimGap::FreeRunResumeUnsupported`].
     pub coordination: RecordedCoordination,
+    /// The `trace_format` the capture's `__cerulion/recorder.json` stamps,
+    /// read through [`recorded_trace_format`] (`1` for a recording with no
+    /// stamp). It words an unknown stop cause in the record walk's refusal
+    /// ([`crate::trace_ring::TraceRecordFault::detail`]), as `bag play
+    /// --resim` words its own from the same stamp.
+    pub trace_format: u32,
     /// Whether the bag carries a `graph.yaml` attachment `run_replay` can
     /// actually USE — present, UTF-8, and parsing as a graph (its gate 4,
     /// immediately after the trace-presence gate).
@@ -551,6 +557,20 @@ impl std::fmt::Display for UnreadableCoordination {
             Self::UnknownStamp(value) => f.write_str(value),
         }
     }
+}
+
+/// PURE: the `trace_format` `recorder_json`, the bytes of a recording's
+/// `__cerulion/recorder.json` (`None` when the recording carries none),
+/// stamps: `1` when there is no document, the bytes are not JSON, or the
+/// document holds no `trace_format` that is a whole number up to `u32::MAX`,
+/// as a recording with no stamp reads. `bag play --resim` reads the stamp it
+/// words an unknown stop cause from through this function too.
+pub fn recorded_trace_format(recorder_json: Option<&[u8]>) -> u32 {
+    recorder_json
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(|doc| doc.get("trace_format").and_then(serde_json::Value::as_u64))
+        .and_then(|f| u32::try_from(f).ok())
+        .unwrap_or(1)
 }
 
 /// PURE: the coordination contract `recorder_json`, the bytes of a recording's
@@ -1486,7 +1506,7 @@ pub fn judge_resimmable(facts: &ResimFacts<'_>) -> Result<(), ResimGap> {
                 departures: facts.departure_records.max(1),
             },
             TraceRecordRefusal::Fault(fault) => ResimGap::TraceRecordRejected {
-                detail: fault.detail(),
+                detail: fault.detail(facts.trace_format),
             },
         });
     }
@@ -1986,6 +2006,70 @@ mod tests {
         }
     }
 
+    /// The capture judge words an unknown stop cause from the capture's own
+    /// stamp, as the replay does: at the formats this build reads, which
+    /// define no other cause, the trace is corrupt; one format past them, a
+    /// newer or foreign writer added the cause. The full reason, each side.
+    #[test]
+    fn an_unknown_stop_cause_is_worded_from_the_captures_stamp() {
+        use crate::trace_ring::SUPPORTED_TRACE_FORMAT;
+        let anchors = vec![fact("a", 40, AnchorOutcome::Complete)];
+        let reason = |trace_format: u32| {
+            judge_resimmable(&ResimFacts {
+                trace_format,
+                first_record_refusal: Some(TraceRecordRefusal::Fault(
+                    TraceRecordFault::UnknownStopCause { rank: 1, code: 9 },
+                )),
+                ..healthy(&[], &anchors)
+            })
+            .expect_err("an unknown stop cause is not resimmable")
+            .reason()
+        };
+        assert_eq!(
+            reason(SUPPORTED_TRACE_FORMAT),
+            format!(
+                "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which trace \
+                 format {SUPPORTED_TRACE_FORMAT} does not define; the trace is corrupt. `cerulion \
+                 bag play --resim` refuses a trace on that record before it loads anything, so \
+                 this capture cannot be re-executed. The frames, the state and the trace are all \
+                 in the bag and readable"
+            )
+        );
+        assert_eq!(
+            reason(SUPPORTED_TRACE_FORMAT + 1),
+            "a scheduler-trace NODE-STOP record of rank 1 carries stop cause 9, which this \
+             Cerulion version does not define; the trace was written by a newer or foreign \
+             writer, so upgrade cerulion to replay it. `cerulion bag play --resim` refuses a \
+             trace on that record before it loads anything, so this capture cannot be \
+             re-executed. The frames, the state and the trace are all in the bag and readable"
+        );
+    }
+
+    /// The stamp a capture's `recorder.json` states, against a hand table:
+    /// a whole number up to `u32::MAX` as written, and `1` for every document
+    /// that states none.
+    #[test]
+    fn the_recorded_trace_format_is_the_stamp_or_one() {
+        for (doc, want) in [
+            (Some(r#"{"trace_format":12}"#), 12u32),
+            (Some(r#"{"arch":"aarch64","trace_format":13}"#), 13),
+            (Some(r#"{"trace_format":4294967295}"#), u32::MAX),
+            (Some(r#"{"trace_format":4294967296}"#), 1),
+            (Some(r#"{"trace_format":"12"}"#), 1),
+            (Some(r#"{"trace_format":-12}"#), 1),
+            (Some(r#"{"arch":"aarch64"}"#), 1),
+            (Some("[12]"), 1),
+            (Some(r#"{"trace_format":"#), 1),
+            (None, 1),
+        ] {
+            assert_eq!(
+                recorded_trace_format(doc.map(str::as_bytes)),
+                want,
+                "{doc:?}"
+            );
+        }
+    }
+
     /// A capture that passes every arm.
     fn healthy<'a>(nodes: &'a [String], anchors: &'a [AnchorFact]) -> ResimFacts<'a> {
         ResimFacts {
@@ -1998,6 +2082,7 @@ mod tests {
             // A recording with no stamp, judged as lockstep, so the two
             // free-run arms are inert unless an arm says otherwise.
             coordination: RecordedCoordination::Lockstep { stamped: false },
+            trace_format: 1,
             // One declared ring, and this recorder is reading it — so
             // the partial-trace gate is inert unless an arm says otherwise.
             trace_rings_declared: 1,
@@ -2102,6 +2187,7 @@ mod tests {
             rank_first_steps: &NO_FIRST_STEP,
             // Free run, which the two free-run arms read, hostile as well.
             coordination: RecordedCoordination::FreeRun,
+            trace_format: 1,
             // A ring nobody read, too — so this also pins that the
             // partial-trace gate does not preempt the no-trace one.
             trace_rings_declared: 2,
@@ -2172,6 +2258,7 @@ mod tests {
             departure_records: 3,
             rank_first_steps: &NO_FIRST_STEP,
             coordination: RecordedCoordination::FreeRun,
+            trace_format: 1,
             // A rank left without a step, hostile as well.
             ranks_without_a_kept_step: &[1],
             state_rings_declared: 4,
@@ -2546,14 +2633,14 @@ mod tests {
             // A contiguous single-worker roster — the ordinary shape,
             // so the new gate is inert unless an arm says otherwise.
             worker_manifest_ranks: &[0],
-            first_record_refusal: fault(7),
+            first_record_refusal: fault(8),
             ..healthy(&[], &anchors)
         };
         let gap = judge_resimmable(&faulted).expect_err("a refused record is not resimmable");
         match &gap {
             ResimGap::TraceRecordRejected { detail } => {
                 assert!(
-                    detail.contains("record_type 7"),
+                    detail.contains("record_type 8"),
                     "the reason must name the record kind an operator has to act on: {detail}"
                 );
             }
@@ -2572,9 +2659,9 @@ mod tests {
             }),
             Err(ResimGap::TraceRecordRejected {
                 detail: crate::trace_ring::TraceRecordFault::UnsupportedRecordType {
-                    record_type: 7
+                    record_type: 8
                 }
-                .detail(),
+                .detail(1),
             }),
             "a fault BEFORE a departure is the gap the gate names"
         );
@@ -3526,7 +3613,7 @@ mod tests {
                     ..mixed.clone()
                 },
                 ResimGap::TraceRecordRejected {
-                    detail: TraceRecordFault::UnsupportedRecordType { record_type: 9 }.detail(),
+                    detail: TraceRecordFault::UnsupportedRecordType { record_type: 9 }.detail(1),
                 },
             ),
             // The backstop: departures counted with no walk to place them.
@@ -3929,7 +4016,7 @@ mod tests {
             ResimGap::RankManifestGap { missing: 1 },
             ResimGap::AmbiguousNodeMap,
             ResimGap::TraceRecordRejected {
-                detail: crate::trace_ring::TraceRecordFault::ZeroedRecord.detail(),
+                detail: crate::trace_ring::TraceRecordFault::ZeroedRecord.detail(1),
             },
             ResimGap::FaultReplay { departures: 1 },
             ResimGap::NoBoundary,
