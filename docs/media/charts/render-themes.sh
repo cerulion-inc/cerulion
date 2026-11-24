@@ -5,7 +5,7 @@
 # twin for that theme, <name>-light.svg or <name>-dark.svg (the file the README's <picture> block
 # picks), or <name>.svg when the figure has no twins.
 #
-#   docs/media/charts/render-themes.sh native-rtt platform-rtt harness-success-rate harness-cost-per-success
+#   docs/media/charts/render-themes.sh native-rtt platform-rtt harness-results harness-success-rate harness-cost-per-success
 #
 # It reads the SVGs in docs/media/ and needs Google Chrome on macOS. Nothing it writes is
 # tracked: out/ is ignored by git.

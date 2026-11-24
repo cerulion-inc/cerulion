@@ -45,9 +45,10 @@ both arms' counts of solved start states out of 100.](../../../media/harness-suc
 ![Model cost per successful episode, without and with Cerulion, in the same order, on a linear scale cut at 30 USD,
 each row carrying both arms' costs.](../../../media/harness-cost-per-success.svg)
 
-Both charts are drawn from this package's CSV files by
-[build_harness_charts.py](../../../media/charts/build_harness_charts.py), which takes every count and cost from
-recompute.py, so each figure on them is the figure SUMMARY.md prints.
+Both charts, and the repository README's harness results chart, are drawn from this package's CSV files by
+[build_harness_charts.py](../../../media/charts/build_harness_charts.py), which takes every count, cost and
+factor from recompute.py, so each figure on them is the figure SUMMARY.md prints (the README chart's factors
+are its "Model cost and wall time per scored episode" table).
 
 ## Start here
 
@@ -179,7 +180,7 @@ is in cells.csv, and the success predicate was false at reset on every one.
   states had not all ended at a read is marked incomplete, with its n and the read time: start states that end
   first are the short episodes, so an incomplete row is not a fair sample.
 - GPT-6.1 Terra was added to the grid after its first rows had been seen, and Gemini 4 Neon after every other
-  column had finished and been read. Both columns are marked so in SUMMARY.md and on both charts.
+  column had finished and been read. Both columns are marked so in SUMMARY.md and on both charts above.
 - Gemini 4 Neon's 200 episodes ran on 2026-11-21 from 06:54Z to 09:39Z, after the other 15 columns' rows
   had been read at 2026-11-19T20:35:04Z. They ran on one machine, up to 8 at once, with other work on that
   machine; the two arms of each start state started within 4 minutes of each other. Its price row was read on
