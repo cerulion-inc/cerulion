@@ -3512,7 +3512,7 @@ fn is_sync_head_record(read: &RecordedRead, trust: RoleTrust) -> bool {
 /// * [`ReadOutcomeKind::Decimated`] on a trigger input is ignored — a decimated
 ///   pop installs no head, so it moves none of the three arms (`verify_fifo`
 ///   declines on it for a different reason: pop counts).
-// Ten arguments. Bundling any subset into a struct would break the shape it
+// Eleven arguments. Bundling any subset into a struct would break the shape it
 // shares with `verify_period` / `verify_fifo` / `verify_throttle` — every one of
 // them is `(node, steps, its own declared parameters, the gates, report)` — and
 // a per-rule parameter bag for exactly ONE of the four is a worse boundary than
@@ -3871,10 +3871,11 @@ fn verify_sync(
         // its first owed fire stands arm C down by name, once, and arm C
         // owes nothing at any later step. Arms B and A judge only recorded
         // fires, and such a node has none. At a step where the bag shows a
-        // `block` slot full, the hold can defer an aligned set's fire at the
-        // decide gate, or stop a burst before its next set, with no record:
-        // the first such step stands the owed fire down by name, and the node
-        // is still judged on every other step and on arms A and B. Such a
+        // `block` slot full, the hold can defer the step's first aligned set,
+        // at the decide gate or the burst's first re-check, with no record:
+        // such a step owes no fire, the first one notes the node
+        // ([`HoldAllowedForNote`]), and the node is still judged on every other
+        // step and on arms A and B. Such a
         // step waits on the slots that held there, as a FIFO node's does: a
         // step at which every one of them shows a release with no record
         // before its consumer next reads it voids the excuse, and the held
@@ -4114,7 +4115,7 @@ fn carried_heads(wide_carry: &BTreeMap<String, Vec<u64>>, input: &str) -> u32 {
         .map_or(0, |v| u32::try_from(v.len()).unwrap_or(u32::MAX))
 }
 
-// Ten parameters, mirroring the shape of `verify_sync`'s.
+// Ten parameters, in the shape of `verify_sync`'s.
 #[allow(clippy::too_many_arguments)]
 fn verify_fifo(
     node: &NodeDecl,
@@ -4745,13 +4746,14 @@ pub(crate) struct StepDeferral {
 
 /// PURE state: whether a node's pre-fire check can have deferred its fire at
 /// each step of a pass, read off the recording alone. The FIFO rule reads both
-/// halves; the Period and Sync rules read the hold (a `period_ms` node takes
-/// no `throttle_ms`, and the Sync rule judges a throttled node on its own).
-/// A Period node's check runs at the decide gate and again before each
-/// catch-up fire, a Sync node's before each aligned set it fires; a Period
-/// catch-up fire's instant is its deadline, not the step's clock, but the
-/// hold half reads only the slot, whose frames carry the step's clock, so the
-/// count is the step's either way.
+/// halves; the Period and Sync rules read the hold (the Period rule reads no
+/// throttle, which `#[cerulion_node]` refuses on a `period_ms` node, and the
+/// Sync rule judges a throttled node on its own). A Period node's check runs
+/// at the decide gate and again before each catch-up fire, a Sync node's at
+/// the decide gate and before each aligned set it fires; a Period fire's
+/// instant is its deadline, not the step's clock, but the hold half reads only
+/// the slot, whose frames carry the step's clock, so the count is the step's
+/// either way.
 ///
 /// Every check of a Data node's step runs at the step's gating clock, which
 /// every fire of the step records (`FireKind::Data` takes `current_time_ns`
@@ -12384,8 +12386,8 @@ mod tests {
     }
 
     /// The `block` edge `src` sends into, `sink.inp` at `depth`, filled by
-    /// `src`'s fires in `steps`: a catch-up fire's frame carries its step's
-    /// clock, not its deadline.
+    /// `src`'s fires in `steps`: a fire's frame carries its step's clock, not
+    /// its deadline.
     fn src_holds(depth: u64, steps: &[RecordedStep]) -> BlockHoldEdges {
         BlockHoldEdges::new(vec![slot("sink", depth, sent_by(steps, &["src"]))])
     }

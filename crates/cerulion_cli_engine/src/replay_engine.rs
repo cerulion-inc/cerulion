@@ -13727,8 +13727,8 @@ fn recorded_fire_levels(
 /// ascending: the gating clock of the fire's step, which the step's
 /// STEP_BOUNDARY record carries ([`StepBoundary::target_ns`]) and which every
 /// frame the fire sends is stamped with. A Data, Sync or external fire records
-/// that clock as its instant; a `period_ms` catch-up fire records its
-/// deadline, which can be below it. A fire of a step the rank holds no
+/// that clock as its instant; a `period_ms` fire records its deadline, which
+/// can be below it. A fire of a step the rank holds no
 /// boundary of gives its own instant. A node the trace holds no fire of is
 /// absent.
 ///
