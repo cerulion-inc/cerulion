@@ -1460,10 +1460,11 @@ names the writer of every read it holds, and `--verify` feeds a free-run bag of
 one worker rank that begins mid-run by read identity. A replay reopens its own
 read stages before the step whose recorded boundary sets the bit (in a lockstep
 bag, the nodes of the rank whose boundary sets it), so its stages hold the same
-records as the recording's at each window head. A format 11 bag whose boundary
-sets any other bit is refused before the first step (`bag internal consistency
-check failed`, exit 2). A reader below 11 never reopens its stages and does not
-read the bit, so the stamp moves and that reader refuses the bag.
+records as the recording's at each window head. A bag stamped 11 or later
+whose boundary sets any other bit is refused before the first step (`bag
+internal consistency check failed`, exit 2). A reader below 11 never reopens
+its stages and does not read the bit, so the stamp moves and that reader
+refuses the bag.
 
 Two limits that held only in a recording's first window now hold at every
 checkpoint window, on bags recorded from the start too. A writer switch on a

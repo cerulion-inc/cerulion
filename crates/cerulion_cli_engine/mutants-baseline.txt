@@ -2,8 +2,9 @@
 # `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
 # resumed replay make about a node a checkpoint states as stopped, the
 # stand-downs a resumed replay applies to a node whose stop the recording
-# does not state, the verifier budget's pure decision functions, and the
-# decisions a replay makes about checkpoint window heads.
+# does not state, the verifier budget's pure decision functions, the
+# decisions a replay makes about checkpoint window heads, and those it makes
+# about a recorded node stop.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -281,6 +282,24 @@ in prepare_pass_verification
 #          `--re 'StopPoint::|first_stop_disagreement'`, that change's diff and
 #          `-- --lib -- replay_rederive::` (in 2 shards): 10 mutants, 9 caught,
 #          1 unviable (the same `Some(Default::default())`), 0 missed.
+#
+# The stamp over the claims this build's recorder makes, where the node stops
+# term also requires the window heads term (`stamp_trace_format`,
+# `RecorderClaims::of_this_recorder`), re-run on the lines a later change
+# added to the two:
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <that change's diff of the file> \
+#            --re '\bstamp_trace_format\b|RecorderClaims::of_this_recorder' \
+#            --exclude-re 'delete field' --timeout 600 \
+#            -- --lib -- replay_engine:: graph_cmd::
+#          (the unmutated baseline passed)
+# Result:  7 mutants: 6 caught, 1 unviable, 0 missed. The caught ones return
+#          0 or 1 from `stamp_trace_format` and replace each `&&` of the node
+#          stops term with `||`. The unviable one replaces
+#          `RecorderClaims::of_this_recorder` with `Default::default()`, and
+#          `RecorderClaims` has no default.
 #
 # The refusal an unknown stop cause gets from the bag's stamp
 # (`unknown_stop_cause_refusal` in src/replay_engine.rs), added after the runs

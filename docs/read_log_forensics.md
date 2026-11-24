@@ -101,8 +101,8 @@ A step boundary record (`record_type` 3) uses the same `global_level` slot for
 flags from `trace_format` 11 on: bit 0 (`STEP_BOUNDARY_FLAG_RUNS_REOPENED`)
 says the recorder reopened every read site's writer run right before this
 step, at a checkpoint, so each site's first read that serves a frame from this
-step on carries a `producer` annotation. A format 11 bag whose boundary sets
-any other bit is refused.
+step on carries a `producer` annotation. A bag stamped 11 or later whose
+boundary sets any other bit is refused.
 
 ### The outcome kinds
 

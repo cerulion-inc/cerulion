@@ -26981,20 +26981,19 @@ fn a_latest_node_stopped_before_a_resumed_pass_stands_down_by_name_and_is_not_si
 ///
 /// The bag is recorded with a checkpoint due at its anchor, so `--verify` feeds
 /// the slice by read identity (the sink's body reads one frame at each of its
-/// fires at steps 4 to 6 and its drain one at each of the eight steps 4 to 11)
-/// and convicts the same missed fire, exit 6. A neutral `--resim all` replays
-/// it. The bag holds the stop as a
-/// NODE-STOP record, so the schedule check judges the sink by it and owes it no
-/// fire after step 6, and the finding is the recorded stop the candidate did
-/// not make: a fire-schedule finding (the class `--verify` exits 6 on) with
-/// nothing stood down, which the neutral summary reports as a differing fire
-/// schedule. The same recording stamped below the node-stops format says
-/// nothing about stops, and the slice shows the node running, so the
-/// unread-frame rule judges it, under `--verify` (fed the same way, exit 6)
-/// and in the neutral resim: the fourth count after the fire at step 6
-/// (step 10) passes the frame that fire's read took and two in delivery. The
-/// build the recording ran re-executes the stop at step 6 and re-derives clean,
-/// with nothing stood down either.
+/// fires at steps 4 to 6 and its drain one at each of the eight steps 4 to 11).
+/// The bag holds the stop as a NODE-STOP record, so the schedule check judges
+/// the sink by it and owes it no fire after step 6: under `--verify` (exit 6)
+/// and in a neutral `--resim all` the finding is the recorded stop the
+/// candidate did not make, a fire-schedule finding with nothing stood down,
+/// which the neutral summary reports as a differing fire schedule. The same
+/// recording stamped 11, the window-heads format (`--verify` refuses a bag that
+/// begins mid-run below it), says nothing about stops, and the slice shows the
+/// node running, so the unread-frame rule judges it, under `--verify` (fed the
+/// same way, exit 6) and in the neutral resim: the fourth count after the fire
+/// at step 6 (step 10) passes the frame that fire's read took and two in
+/// delivery. The build the recording ran re-executes the stop at step 6 and
+/// re-derives clean, with nothing stood down either.
 #[test]
 #[serial]
 fn a_latest_node_that_runs_in_a_resumed_pass_and_then_misses_a_fire_is_still_convicted() {
