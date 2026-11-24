@@ -384,7 +384,14 @@ the first such step is noted once (a `hold_allowed_for` note of code
 unfired. The first such step is noted once (a `hold_allowed_for` note of code
 `sync_block_held`), and the node is still judged on every other step and on
 the sets it fired. At any other step either node owes every fire. A
-`hold_allowed_for` note is not a `stand_down`: the rule judged the node.
+`hold_allowed_for` note is not a `stand_down`: the rule judged the node. A
+neutral `--resim all` reaches the `Sync` rule for such a node. A `--verify`
+replay of a free-run bag from trace format 8 refuses a per-set `Sync` node
+before its first step (`read_identity_ungateable_stage`, exit 2), whichever
+worker process its trigger topics come from, so it does not reach the rule
+there. Where such an input holds a `Sync` node, the neutral `--resim all`
+reports a read-log divergence at the node's first fire after the hold, and
+exits 0.
 
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
