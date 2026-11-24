@@ -58,7 +58,11 @@ const BRIDGED_VARIABLE_SLICE_LEN: MaxSliceLen = MaxSliceLen::const_new(128 * 102
 ///   concurrently-executing callback — bounded in practice by the executor's
 ///   thread count, but not by the rmw;
 /// - plus 1 transient for the `receive()` in progress on a plain `rmw_take`
-///   racing held loans.
+///   racing held loans;
+/// - from rclcpp 28.1.23 (Jazzy), which returns a loan when the application
+///   drops its last reference rather than right after the callback, one
+///   loan per received message the application keeps (a `message_filters`
+///   cache), which no budget bounds; the reserve below serves those by copy.
 ///
 /// 4 = 3 concurrently-held loans + 1 transient headroom — enough for the
 /// STE (1) and a small MTE, without inflating every rmw topic's publisher
@@ -4097,14 +4101,12 @@ pub unsafe extern "C" fn rmw_take_sequence(
 
 /// Track a take served by copy and return the pointer handed to the caller
 /// (the copy's own address, so it is the return's key).
-fn hold_copy(inner: &mut SubscriptionInner, mut copy: runtime::TakeCopy) -> *mut c_void {
-    let ptr = copy.as_ptr();
+fn hold_copy(inner: &mut SubscriptionInner, copy: runtime::TakeCopy) -> *mut c_void {
+    let mut take = runtime::CopiedTake::new(copy);
+    let ptr = take.loaned_ptr();
     // The table of copies grows only on the degraded path past the reserve,
     // where the copy itself has just been allocated.
-    inner.copied_takes.push(runtime::CopiedTake {
-        key: ptr as usize,
-        copy,
-    });
+    inner.copied_takes.push(take);
     ptr
 }
 
@@ -4216,7 +4218,10 @@ unsafe fn take_loaned_impl(
     // consumes NO frame, so the queued frame is served by a later take. A
     // zero-copy take recycles one from the pool; a take served by copy builds
     // a fresh, unpooled one, which drops (and runs `fini`) on every early
-    // return below.
+    // return below. The copy's shadow is built before the receive on
+    // purpose, for that same guarantee (a failed allocation consumes no
+    // frame); the price is one build and destroy per take past the reserve
+    // that finds the queue empty.
     let mut shadow = None;
     let mut copy_shadow = None;
     if forged {
@@ -4243,6 +4248,7 @@ unsafe fn take_loaned_impl(
                     &data.topic,
                     kind,
                     held_loans,
+                    0,
                     budget,
                     "",
                 );
@@ -4266,11 +4272,17 @@ unsafe fn take_loaned_impl(
             if let Some(s) = shadow.take() {
                 inner.shadows.release(s);
             }
+            // Who else holds borrows: adopted messages of this subscription
+            // (none unless adopt-take is armed). The line's remedy names them.
+            let adopted_outstanding = data.adopt.as_ref().map_or(0, |adopt| {
+                adopt.stats.outstanding.load(Ordering::Relaxed) as usize
+            });
             crate::loan_refusal_latch::report_loan_refused(
                 &data.loan_refusals,
                 &data.topic,
                 crate::loan_refusal_latch::LoanRefusal::ReceiveFailed,
                 held_loans,
+                adopted_outstanding,
                 ceiling,
                 &e.to_string(),
             );
@@ -4430,8 +4442,9 @@ unsafe fn take_loaned_impl(
         // subscriber side (iceoryx2 opens data segments `AccessMode::Read`):
         // a caller writing through a forged `data()` faults LOUDLY, never
         // silently and never into another subscriber's view — the documented
-        // loaned-take contract (message valid only inside the callback,
-        // read-only). The shadow's own fields are ordinary heap memory.
+        // loaned-take contract (message valid until the loan is returned, which
+        // rclcpp before 28.1.23 does right after the callback; read-only). The
+        // shadow's own fields are ordinary heap memory.
         let ptr = shadow.as_ptr();
         inner.pending_takes.push(runtime::PendingTake {
             key: ptr as usize,
@@ -4549,6 +4562,10 @@ unsafe fn take_loaned_impl(
     // The rollback keeps the same invariant as that path: on failure
     // the caller holds nothing of ours and we hold nothing of the caller's.
     // Dropping the `PendingTake` releases the borrow (and its shadow).
+    // Read before the guarded window: a zero-copy take closes the
+    // served-by-copy regime only once no copy is outstanding (see
+    // `report_loan_served_zero_copy`).
+    let copies_outstanding = !inner.copied_takes.is_empty();
     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::loan_refusal_latch::report_loan_served(
             &data.loan_refusals,
@@ -4556,7 +4573,7 @@ unsafe fn take_loaned_impl(
             crate::loan_refusal_latch::LoanServed::Loaned,
         );
         // The served-by-copy regime: opened (or repeated) by a copy, closed
-        // by a take served zero-copy.
+        // by a take served zero-copy with no copy outstanding.
         if by_copy {
             crate::loan_refusal_latch::report_loan_copied(
                 &data.loan_copies,
@@ -4564,7 +4581,7 @@ unsafe fn take_loaned_impl(
                 held_loans,
                 ceiling,
             );
-        } else {
+        } else if !copies_outstanding {
             crate::loan_refusal_latch::report_loan_served_zero_copy(&data.loan_copies, &data.topic);
         }
         // The seam travels WITH this reporter, inside the guarded window.
@@ -4576,7 +4593,7 @@ unsafe fn take_loaned_impl(
         // the copy.
         let key = loaned_ptr as usize;
         if by_copy {
-            inner.copied_takes.retain(|c| c.key != key);
+            inner.copied_takes.retain(|c| c.key() != key);
         } else {
             inner.pending_takes.retain(|p| p.key != key);
         }
@@ -4705,7 +4722,7 @@ pub unsafe extern "C" fn rmw_return_loaned_message_from_subscription(
         }
         // A take served by copy holds no sample: dropping it frees the copy
         // (a forged type's through its typesupport `fini`).
-        match inner.copied_takes.iter().position(|c| c.key == key) {
+        match inner.copied_takes.iter().position(|c| c.key() == key) {
             Some(pos) => {
                 drop(inner.copied_takes.swap_remove(pos));
                 RMW_RET_OK

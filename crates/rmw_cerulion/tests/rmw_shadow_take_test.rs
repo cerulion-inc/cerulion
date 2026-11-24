@@ -1157,6 +1157,62 @@ fn a_panic_in_the_loaned_serve_report_releases_the_loan() {
     }
 }
 
+/// The same rollback for a take served by COPY: with three zero-copy loans
+/// held, the 4th take is a copy, and a panic in its serve report must free
+/// the copy (its shadow destroyed through `fini` once) and leave it untracked,
+/// with the three loans still held and nothing handed out.
+#[test]
+#[serial]
+fn a_panic_in_the_serve_report_of_a_copy_frees_the_copy() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = scan_ts(&format!("ServeRepCopy{suffix}"));
+        let (node, publisher, subscription) = setup_pair(ts, "serverepcopy", suffix);
+        for _ in 0..4 {
+            publish_scan(publisher, &scan_oracle(64));
+        }
+        for i in 0..3 {
+            let (ret, taken, loaned, _) = take_loaned(subscription);
+            assert_eq!(ret, RMW_RET_OK, "zero-copy take {i}");
+            assert!(taken && !loaned.is_null());
+        }
+        assert_eq!(outstanding(subscription), 3);
+
+        C_FINI_CALLS.store(0, Ordering::SeqCst);
+        let fired_before = rmw_cerulion::test_seams::loaned_serve_report_panics_fired();
+        let (ret, taken, loaned, _) = {
+            let _seam = rmw_cerulion::test_seams::LoanedServeReportPanicGuard::arm();
+            take_loaned(subscription)
+        };
+        assert_eq!(
+            rmw_cerulion::test_seams::loaned_serve_report_panics_fired(),
+            fired_before + 1,
+            "the serve-report seam must have fired on the copy take"
+        );
+        assert_eq!(ret, ffi::RMW_RET_ERROR, "the panic surfaces as an error");
+        assert!(!taken, "and nothing is handed out");
+        assert!(loaned.is_null(), "the out-param is never written");
+        let copies = sub_data(subscription)
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .copied_takes
+            .len();
+        assert_eq!(copies, 0, "the unwind must untrack the copy");
+        assert_eq!(
+            C_FINI_CALLS.load(Ordering::SeqCst),
+            1,
+            "...and free it: its shadow is destroyed through fini exactly once"
+        );
+        assert_eq!(
+            outstanding(subscription),
+            3,
+            "the three loans are untouched"
+        );
+        teardown(node, publisher, subscription);
+    }
+}
+
 /// TWO `float32[]` members aim into the held sample, 4-aligned, and the
 /// return re-points both at `{NULL, 0, 0}`.
 #[test]

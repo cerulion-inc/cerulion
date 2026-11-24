@@ -5952,9 +5952,11 @@ fn the_borrow_ceiling_refusal_says_why_and_an_ordinary_service_does_not() {
 /// service is minted at `max(1, RMW_TAKE_LOAN_BORROW_BUDGET)` = 4). Four loaned
 /// takes leave a borrow free, because the 4th is served by copy and holds
 /// nothing, so the adopted take that follows is served. With three loans and
-/// one adopted message holding all four, a loaned take past the reserve is
-/// refused by the transport and so is the next adopted take. The parent reads
-/// both refusal lines off stderr.
+/// one adopted message holding all four, ten loaned takes past the reserve are
+/// refused by the transport (the whole regime ladder); freeing the adopted
+/// message lets the next loaned take be served (the recovery), and with a new
+/// adopted message the next adopted take is refused too. The parent reads the
+/// lines off stderr.
 #[test]
 #[ignore]
 fn child_loans_and_an_adopted_message_share_the_borrow_budget() {
@@ -5970,9 +5972,9 @@ fn child_loans_and_an_adopted_message_share_the_borrow_budget() {
         let (node, publisher, subscription) = setup_pair(ts, "item10", suffix);
         let stats = adopt_stats(subscription);
         let o = scan_oracle(3, 2, 2.0);
-        // Six frames are served below and two stay queued, so neither
-        // refusal is an empty queue.
-        for _ in 0..8 {
+        // Seven frames are served below and two stay queued, so no refusal
+        // is an empty queue.
+        for _ in 0..9 {
             publish_scan(publisher, &o);
         }
         let take_loan = |subscription: *const ffi::rmw_subscription_t| {
@@ -6007,21 +6009,33 @@ fn child_loans_and_an_adopted_message_share_the_borrow_budget() {
         assert_eq!(stats.outstanding.load(Ordering::Relaxed), 1);
         assert_eq!(stats.budget_refusals.load(Ordering::Relaxed), 0);
 
-        // Three loans and one adopted message hold all four borrows: a loaned
-        // take past the reserve cannot receive.
-        let (ret, taken, p) = take_loan(subscription);
-        assert_eq!(
-            ret,
-            rmw_cerulion::ffi::RMW_RET_ERROR,
-            "the transport refuses the receive"
-        );
-        assert!(!taken);
-        assert!(p.is_null());
-        assert_eq!(sub_data(subscription).loan_refusal_count(), 1);
+        // Three loans and one adopted message hold all four borrows: ten
+        // loaned takes past the reserve cannot receive.
+        for i in 0..10 {
+            let (ret, taken, p) = take_loan(subscription);
+            assert_eq!(
+                ret,
+                rmw_cerulion::ffi::RMW_RET_ERROR,
+                "refused loaned take {i}: the transport refuses the receive"
+            );
+            assert!(!taken);
+            assert!(p.is_null());
+        }
+        assert_eq!(sub_data(subscription).loan_refusal_count(), 10);
 
-        // Free the adopted message and adopt another: that served take closes
-        // the refusal regime, so the next refusal is loud again.
+        // Free the adopted message: the next loaned take receives (by copy,
+        // three loans still held) and closes the refusal regime.
         free_adopted_scan(*msg_a);
+        let (ret, taken, p) = take_loan(subscription);
+        assert_eq!(ret, RMW_RET_OK, "the freed borrow serves the loaned take");
+        assert!(taken);
+        assert_eq!(sub_data(subscription).loan_copy_count(), 2);
+        assert_eq!(
+            rmw_return_loaned_message_from_subscription(subscription, p),
+            RMW_RET_OK
+        );
+
+        // Adopt another: the next refusal is loud again.
         let (taken_b, msg_b, _) = take_scan(subscription);
         assert!(taken_b, "the freed borrow lets an adopted take through");
         assert_eq!(
@@ -6038,6 +6052,11 @@ fn child_loans_and_an_adopted_message_share_the_borrow_budget() {
             stats.budget_refusals.load(Ordering::Relaxed),
             1,
             "the adopted refusal"
+        );
+        assert_eq!(
+            sub_data(subscription).loan_refusal_count(),
+            11,
+            "one latch, one count: ten loaned refusals and the adopted one"
         );
         scan_fini(&mut *msg_mixed as *mut _ as *mut c_void);
         free_adopted_scan(*msg_b);
@@ -6060,18 +6079,25 @@ fn child_loans_and_an_adopted_message_share_the_borrow_budget() {
 /// samples do. Loaned takes keep one borrow in reserve (a take past it is
 /// served by copy), so loans alone never hold the whole budget: no
 /// `kind=loaned_borrows_exhausted` line appears where four loans are held.
-/// With three loans and an adopted message holding it, the loaned take is
+/// With three loans and an adopted message holding it, ten loaned takes are
 /// refused by the transport (`kind=receive_failed`, the transport's own
-/// `ExceedsMaxBorrows`), and the adopted take's line names BOTH holders.
+/// `ExceedsMaxBorrows`, a remedy naming both holders) through the whole
+/// regime ladder (one ERROR head, eight DEBUG repeats, the ERROR decade line,
+/// one INFO recovery), and the adopted take's line names BOTH holders too.
 ///
 /// Fields are asserted as whole `key=value` tokens (`loaned_outstanding=3` is a
 /// substring of `loaned_outstanding=30`), and each remedy is pinned.
 #[test]
 #[serial]
 fn loans_and_an_adopted_message_share_the_budget_and_each_refusal_names_its_holders() {
+    // At debug, so the suppressed repeats are on stderr too.
     let (status, err) = run_child(
         "child_loans_and_an_adopted_message_share_the_borrow_budget",
-        &[(ADOPT_TAKE_ENV, "1"), (ADOPT_TAKE_BUDGET_ENV, "1")],
+        &[
+            (ADOPT_TAKE_ENV, "1"),
+            (ADOPT_TAKE_BUDGET_ENV, "1"),
+            ("RUST_LOG", "rmw_cerulion=debug"),
+        ],
     );
     assert!(status.success(), "child failed:\n{err}");
     assert!(
@@ -6082,20 +6108,66 @@ fn loans_and_an_adopted_message_share_the_budget_and_each_refusal_names_its_hold
         !err.contains("kind=loaned_borrows_exhausted"),
         "four loaned takes keep a borrow in reserve, so loans alone never exhaust it:\n{err}"
     );
-    let loaned = err
-        .lines()
-        .find(|l| l.contains("ERROR") && l.contains("loaned take refused"))
-        .unwrap_or_else(|| panic!("no loaned-take refusal; stderr:\n{err}"));
+    // The loaned take's refusal ladder over ten refusals: one loud head, the
+    // repeats at debug, the decade line, one recovery when a take is served.
+    use cerulion_core::testing::{count_at, debug_lines_expected};
+    let lines: Vec<&str> = err.lines().collect();
+    const HEAD: &str = "loaned take refused: the transport refused the receive";
+    const REPEAT: &str = "loaned take refused (suppressed repeat)";
+    const DECADE: &str = "loaned take STILL refused:";
+    const RECOVERED: &str = "loaned take recovered";
+    assert_eq!(count_at(&lines, "ERROR", HEAD), 1, "one loud head:\n{err}");
+    assert_eq!(
+        count_at(&lines, "DEBUG", REPEAT),
+        debug_lines_expected(8),
+        "eight repeats at debug (ten refusals less the head and the decade line):\n{err}"
+    );
+    assert_eq!(
+        count_at(&lines, "ERROR", DECADE),
+        1,
+        "one decade line:\n{err}"
+    );
+    assert_eq!(
+        count_at(&lines, "INFO", RECOVERED),
+        1,
+        "one recovery:\n{err}"
+    );
+    let loaned = lines
+        .iter()
+        .find(|l| l.contains("ERROR") && l.contains(HEAD))
+        .expect("the head");
     assert!(
         has_field(loaned, "kind", "receive_failed")
             && has_field(loaned, "outstanding_loans", "3")
+            && has_field(loaned, "adopted_outstanding", "1")
             && has_field(loaned, "budget", "4"),
-        "the loaned refusal must carry kind=receive_failed, the three loans and the \
+        "the loaned refusal must carry kind=receive_failed, both holders' counts and the \
          ceiling: {loaned}"
     );
     assert!(
         loaned.contains("ExceedsMaxBorrows"),
         "...and the transport's own reason: {loaned}"
+    );
+    assert!(
+        loaned.contains("free adopted messages")
+            && loaned.contains("rmw_return_loaned_message_from_subscription"),
+        "its remedy names BOTH holders, since the adopted message holds the reserve: {loaned}"
+    );
+    let decade = lines
+        .iter()
+        .find(|l| l.contains("ERROR") && l.contains(DECADE))
+        .expect("the decade line");
+    assert!(
+        has_field(decade, "total_failures", "10") && has_field(decade, "suppressed_count", "8"),
+        "the decade line carries total_failures=10 suppressed_count=8: {decade}"
+    );
+    let recovered = lines
+        .iter()
+        .find(|l| l.contains("INFO") && l.contains(RECOVERED))
+        .expect("the recovery");
+    assert!(
+        has_field(recovered, "suppressed_count", "8"),
+        "the recovery reports the eight suppressed: {recovered}"
     );
 
     // The MIXED holder: both counters nonzero, so neither single-sided remedy

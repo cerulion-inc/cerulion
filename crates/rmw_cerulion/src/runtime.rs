@@ -947,17 +947,41 @@ pub struct PendingTake {
 
 /// One loaned take served by COPY past the borrow ceiling's zero-copy loans.
 ///
-/// `key` is what the caller holds and later returns: the address of the
-/// copy's own memory.
+/// Its key, what the caller holds and later returns, is the address of the
+/// copy's own memory, derived from the copy itself so the two cannot
+/// disagree.
 pub struct CopiedTake {
-    /// The loaned pointer as handed to the caller.
-    pub key: usize,
-    /// The copy itself.
-    pub copy: TakeCopy,
+    copy: TakeCopy,
 }
 
-/// The private memory a copied take hands out.
-pub enum TakeCopy {
+impl CopiedTake {
+    /// Track `copy`.
+    pub(crate) fn new(copy: TakeCopy) -> Self {
+        Self { copy }
+    }
+
+    /// The pointer handed to the caller (the copy's address, mutable: the
+    /// memory is private to this take).
+    pub(crate) fn loaned_ptr(&mut self) -> *mut std::os::raw::c_void {
+        match &mut self.copy {
+            TakeCopy::Fixed(words) => words.as_mut_ptr() as *mut std::os::raw::c_void,
+            TakeCopy::Shadow(shadow) => shadow.as_ptr(),
+        }
+    }
+
+    /// The return's key: the copy's address.
+    pub fn key(&self) -> usize {
+        match &self.copy {
+            TakeCopy::Fixed(words) => words.as_ptr() as usize,
+            TakeCopy::Shadow(shadow) => shadow.as_ptr() as usize,
+        }
+    }
+}
+
+/// The private memory a copied take hands out. Moving it (into the table of
+/// copies, or as that table grows) never moves the memory the caller's
+/// pointer aims at: both variants own a heap allocation.
+pub(crate) enum TakeCopy {
     /// A FIXED type: the frame's fixed section (the C struct, byte for byte)
     /// in heap words, so the struct is 8-aligned (`WireLayout::fixed_align`
     /// is at most 8).
@@ -966,16 +990,6 @@ pub enum TakeCopy {
     /// copying decode, so every member owns its storage and nothing aliases
     /// shared memory. Dropping it runs the typesupport's `fini`.
     Shadow(TakeShadow),
-}
-
-impl TakeCopy {
-    /// The address handed to the caller.
-    pub fn as_ptr(&mut self) -> *mut std::os::raw::c_void {
-        match self {
-            Self::Fixed(words) => words.as_mut_ptr() as *mut std::os::raw::c_void,
-            Self::Shadow(shadow) => shadow.as_ptr(),
-        }
-    }
 }
 
 /// One rmw-owned SHADOW message — the object a forged
