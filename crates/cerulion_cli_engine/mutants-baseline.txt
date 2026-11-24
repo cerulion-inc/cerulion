@@ -2,8 +2,11 @@
 # `cerulion ros2 run` and `ros2 launch`, the decisions the recorder and a
 # resumed replay make about a node a checkpoint states as stopped, the
 # stand-downs a resumed replay applies to a node whose stop the recording
-# does not state, and how a replay judges and re-executes a node that a
-# `block` input in its own rank holds.
+# does not state, the verifier budget's pure decision functions, the
+# decisions a replay makes about checkpoint window heads, those it makes about
+# a recorded node stop, how a replay judges and re-executes a FIFO node that a
+# `block` input in its own rank holds, and how it judges a `period_ms` or Sync
+# node that such an input holds.
 #
 # Scope: `delivery_flag_token` in src/ros2_cmd.rs, which reads a forwarded
 # argument as `--record-deliveries` or `--replay-deliveries`, alone or with an
@@ -124,14 +127,205 @@
 
 (none)
 
-# Fourth scope: a FIFO node that a `block` input in its own rank holds.
+# Fourth scope: the verifier budget's pure decision functions.
+#
+# Scope: the functions in src/replay_engine.rs that count one rank's reads
+# against the verifier's record budget, place the step the count ran past it,
+# and pick and render what a refusal over the budget says and which remedy it
+# names. The rest of the file walks bags and drives the replay loop over the
+# transport, which the mutation rule does not cover.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --re 'BudgetTally::add|RunOutTime::from_targets|ReadLogOverrun::sentence|FrameIndexOverrun::sentence|seconds_text|VerifierDecline::remedy|declined_census_detail|enforcement_blocked_by_decline' \
+#            --timeout 300 --cap-lints true -- --lib
+#          (run in 5 shards, --shard k/5, in place in a scratch checkout, with
+#          the lib tests' fixture cdylibs built first; the unmutated baseline
+#          passed)
+# Lints:   --cap-lints true, so a body replacement that leaves a parameter
+#          unused still compiles and meets the tests.
+# Result:  22 mutants: 19 caught, 2 unviable, 1 missed. The unviable ones
+#          replace a body with Default::default() on a type that has no
+#          Default (RunOutTime, ReplayError), so they do not compile. Two of
+#          the 22 are field deletions the tool generated in functions outside
+#          the list (InjectionWindow::cross_rank, caught, and
+#          prepare_pass_verification, listed below).
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+replay_engine.rs: delete field channel from struct SidecarReading expression
+in prepare_pass_verification
+  Equivalent. The field is set only when no injected topic is listed in
+  multi_publisher_topics, and with the field deleted the reading falls back to
+  its default channel, Unreadable. Every reader of that reading in
+  prepare_pass_verification (the label join, describe_label_reading and
+  classify_label_reading) runs only for a topic in that empty set, so no
+  output changes.
+
+# Fifth scope: the decisions a replay makes about checkpoint window heads.
+#
+# Scope: the pure decision functions on the lines the window-head change added
+# or changed. In src/replay_engine.rs: the recorder's trace format stamp
+# (`stamp_trace_format`) over the claims this build's recorder makes
+# (`RecorderClaims::of_this_recorder`); whether this build's recorder and a
+# bag's recorder name the writer at every checkpoint window
+# (`recorder_names_window_heads`, `recorder_names_window_heads_at`); a step
+# boundary record's decode (`StepBoundary::from_record`) and the refusal of a
+# flags word with a bit the bag's format does not define
+# (`boundary_flags_refusal`); and the reopen mirror's inputs and choice: the
+# flags and rank map each pass hands it (`reopen_flags`), a node's recorded
+# rank (`recorded_rank_of`) and whether a node is reopened (`reopens_node`). In
+# src/replay_feed.rs: the cause a read with no writer names on a bag that
+# begins mid-run (`absent_writer_cause`), and the code and text a feed refusal
+# renders (`FeedRefusalReason::code`, `<FeedRefusal as Display>::fmt`). The
+# change's other lines in the two files read the bag (the boundary walk and
+# the per-rank cursors, the feed planner's lookups), carry these answers
+# through a pass, or drive the replay loop (the mirror's call before each
+# step), which the mutation rule does not cover; the engine tests that fail
+# with the mirror off pin that call.
+#
+# Run:     cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_feed.rs \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re '\babsent_writer_cause\b|\brecorder_names_window_heads_at\b|\bboundary_flags_refusal\b|\breopens_node\b|\bstamp_trace_format\b|\brecorder_names_window_heads\b|RecorderClaims::of_this_recorder|StepBoundary::from_record|\brecorded_rank_of\b|\breopen_flags\b' \
+#            --cap-lints true --in-place --timeout 600 --shard 0/7 \
+#            -- --lib -- replay_feed:: replay_engine::
+#          and the same with `--shard k/7 --baseline=skip` for k = 1 to 6
+#          (the unmutated baseline passed on shard 0/7)
+# Result:  shard 0/7: 7 mutants, 6 caught, 1 unviable; 1/7: 7 mutants,
+#          6 caught, 1 unviable; 2/7: 7 mutants, 4 caught, 3 unviable;
+#          3/7: 7 mutants, 1 caught, 6 unviable; 4/7: 7 mutants, 1 caught,
+#          6 unviable; 5/7: 7 mutants, 5 caught, 2 unviable; 6/7: 2 mutants,
+#          2 caught. Total: 44 mutants, 25 caught, 19 unviable, 0 missed.
+#          Four of the unviable replace `RecorderClaims::of_this_recorder`,
+#          `StepBoundary::from_record`, `boundary_flags_refusal` and
+#          `absent_writer_cause` with a default of a type that has none. The
+#          other 15 replaced `reopen_flags` with a rank map named `HashMap`,
+#          which the file did not import at that run.
+#
+# With `HashMap` imported, `reopen_flags`'s own mutants:
+#
+# Run:     the same with `--re '\breopen_flags\b'`, over
+#          crates/cerulion_cli_engine/src/replay_engine.rs alone, and
+#          `--shard k/3` (`--baseline=skip` for k = 1 and 2; the unmutated
+#          baseline passed on shard 0/3)
+# Result:  shard 0/3: 6 mutants, 2 caught, 4 unviable; 1/3: 6 mutants,
+#          2 caught, 4 unviable; 2/3: 6 mutants, 2 caught, 4 unviable.
+#          Total: 18 mutants, 6 caught, 12 unviable, 0 missed. Each flags
+#          value (empty, `[true]`, `[false]`) with no rank map and with an
+#          empty one is caught; the 12 unviable build a one-entry map keyed
+#          by `Arc::new("")` or `Arc::new("xyzzy")`, an `Arc<&str>` where the
+#          map's key is `Arc<str>`, so they do not compile.
+#
+# And the refusal's code and text:
+#
+# Run:     the same over crates/cerulion_cli_engine/src/replay_feed.rs alone,
+#          with `--re 'FeedRefusal>::fmt|FeedRefusalReason::code'` and no
+#          shard (the unmutated baseline passed)
+# Result:  3 mutants, 3 caught, 0 missed. Over the scope as it stands:
+#          47 mutants, 31 caught, 16 unviable, 0 missed.
+#
+# Every mutant that survives the test suite is listed below with the reason it
+# is not killed. A survivor that is not listed here is a gap in the tests: kill
+# it with a test, or list it here with a reason.
+
+(none)
+
+# Sixth scope: the pure decisions a replay makes about a recorded node stop.
+#
+# Scope: in src/replay_engine.rs the trace format stamp and its node stops
+# predicates (`stamp_trace_format`, `recorder_records_node_stops`,
+# `recorder_records_node_stops_at`), and in src/replay_rederive.rs where a
+# recorded stop leaves a node (`StopPoint::is_after`, `StopPoint::burst_at`)
+# and the comparison of the recorded and re-executed stops at one step
+# (`first_stop_disagreement`). The trace read path (the fire demux reading a
+# step's stop records, and the replay reading its own stops off its trace) and
+# the record gate walk the bag and drive the scheduler, which the mutation
+# rule does not cover. They are pinned in tests/replay_engine_test.rs by the
+# red-first vectors
+# `a_replay_that_does_not_re_execute_the_recorded_stop_is_a_fire_schedule_divergence`,
+# `a_replay_that_stops_at_an_earlier_fire_of_the_burst_diverges`,
+# `a_stop_in_a_ragged_tail_is_tolerated_with_its_re_fire`,
+# `a_stop_before_the_tail_the_recording_lacks_diverges_and_names_its_rank`, the
+# three refusals of a stop record shape no recorder writes,
+# `a_stop_record_of_a_rank_with_no_manifest_is_refused_exit_2` and
+# `a_stop_record_with_an_unknown_cause_is_refused_by_the_engine_with_the_gate_text`;
+# by `a_replay_that_stops_where_the_recording_did_passes`, a pin that passed
+# before the compare existed; by
+# `below_the_node_stops_format_a_recorded_stop_is_not_read`, which pins the
+# compare's format gate and was seen failing with that gate deleted; by the two
+# driver vectors, seen failing with their filters deleted; and in
+# tests/replay_gates_test.rs by `a_node_stop_record_*` and the two
+# `a_stop_cause_unknown_*` boundary vectors.
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
+#            --in-diff <the change's diff of the two files> \
+#            --re 'StopPoint::|first_stop_disagreement|stamp_trace_format|recorder_records_node_stops' \
+#            --timeout 600 -- --lib -- replay_engine:: replay_rederive:: graph_cmd::
+#          (in 6 shards, --shard k/6; the unmutated baseline passed)
+# Result:  35 mutants: 31 caught, 1 unviable, 3 missed, killed since: the
+#          three on `recorder_records_node_stops_at` (its body replaced with
+#          true or with false, and `>=` replaced with `<`), which no lib test
+#          asked. Killed by
+#          `replay_engine::recorder_info_version_tests::node_stops_are_recorded_from_their_format`
+#          (re-run with `--re 'recorder_records_node_stops_at' --iterate`: 3
+#          mutants, 3 caught). The unviable one returns
+#          `Some(Default::default())` from `first_stop_disagreement`, and
+#          `StopDisagreement` has no default.
+#          Re-run on the lines a later change to `StopPoint::burst_at` (the
+#          fire position counted from 1) and `first_stop_disagreement` (each
+#          disagreement's rank) touched, with
+#          `-f crates/cerulion_cli_engine/src/replay_rederive.rs`,
+#          `--re 'StopPoint::|first_stop_disagreement'`, that change's diff and
+#          `-- --lib -- replay_rederive::` (in 2 shards): 10 mutants, 9 caught,
+#          1 unviable (the same `Some(Default::default())`), 0 missed.
+#
+# The stamp over the claims this build's recorder makes, where the node stops
+# term also requires the window heads term (`stamp_trace_format`,
+# `RecorderClaims::of_this_recorder`), re-run on the lines a later change
+# added to the two:
+#
+# Run:     cargo mutants -p cerulion_cli_engine --in-place --cap-lints true \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --in-diff <that change's diff of the file> \
+#            --re '\bstamp_trace_format\b|RecorderClaims::of_this_recorder' \
+#            --exclude-re 'delete field' --timeout 600 \
+#            -- --lib -- replay_engine:: graph_cmd::
+#          (the unmutated baseline passed)
+# Result:  7 mutants: 6 caught, 1 unviable, 0 missed. The caught ones return
+#          0 or 1 from `stamp_trace_format` and replace each `&&` of the node
+#          stops term with `||`. The unviable one replaces
+#          `RecorderClaims::of_this_recorder` with `Default::default()`, and
+#          `RecorderClaims` has no default.
+#
+# The refusal an unknown stop cause gets from the bag's stamp
+# (`unknown_stop_cause_refusal` in src/replay_engine.rs), added after the runs
+# above. It maps the answer of
+# `cerulion_core::trace_ring::unknown_stop_cause_origin`, which that crate's
+# baseline judges:
+#
+# List:    cargo mutants -p cerulion_cli_engine \
+#            -f crates/cerulion_cli_engine/src/replay_engine.rs \
+#            --re 'unknown_stop_cause_refusal' --list
+# Result:  1 mutant of the function, its body replaced with
+#          `Default::default()`, which cannot compile because `ReplayError` has
+#          no default, so it was not run.
+
+# Seventh scope: a FIFO node that a `block` input in its own rank holds.
 #
 # Scope: the pure decision functions on the lines the change added or
 # changed. In src/replay_rederive.rs: the edges that can hold a node
 # (`BlockHoldEdges`), the counted carry, the supply and the carry dispatcher
 # (`fifo_step_backlog`, `fifo_supply`, `fifo_carry_out`), the deferral
 # predicate and the per-step walk that feeds it, with the slot bound it folds
-# (`fifo_carry_deferrable`, `PreFireDeferral`, `SlotBound`), the carry walk the
+# and its count of a consumer's fires that ended before the input
+# (`fifo_carry_deferrable`, `PreFireDeferral`, `SlotBound`,
+# `fires_ended_before`), the carry walk the
 # verdict and the refill plan share (`FifoCarry`), the caveat a finding on a
 # node whose drain the bag does not record carries and its text
 # (`FindingCaveat`, `ScheduleFinding`), the rules that read them
@@ -140,8 +334,9 @@
 # trailing refill plan (`fifo_trailing_refills`), the drain a FIFO input's
 # recording or declaration settles (`node_trigger_decl`,
 # `declared_latest_drain`, `never_unifies`), and the edges that can hold a
-# node with what the bag records of each slot (`local_block_holds`,
-# `slot_record`, `topic_recorded_whole`, `consumer_body_drain`), with the
+# node with what the bag records of each slot and the inputs its consumer
+# reads before it (`local_block_holds`, `slot_record`, `topic_recorded_whole`,
+# `consumer_body_drain`, `consumer_reads_before`), with the
 # recorded order of its consumer and producer (`fold_fire_level`,
 # `recorded_after`). The rank's topology read (`block_hold_flows`), the walk
 # of the bag's frames (`recorded_frame_stamps`), the walk of its fire levels
@@ -153,7 +348,7 @@
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
 #            -f crates/cerulion_cli_engine/src/replay_engine.rs \
 #            --in-diff <the change's diff of the two files> \
-#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|PreFireDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain' \
+#            --re 'BlockHoldEdges::|fifo_step_backlog|fifo_carry_out|fifo_carry_deferrable|fifo_supply|PreFireDeferral::|SlotBound::|FifoCarry::|FindingCaveat|ScheduleFinding|verify_fifo|verify_latest|\bverify\b|fifo_trailing_refills|node_trigger_decl|declared_latest_drain|never_unifies|local_block_holds|fold_fire_level|recorded_after|slot_record|topic_recorded_whole|consumer_body_drain|fires_ended_before|consumer_reads_before' \
 #            --cap-lints true --in-place --timeout 600 \
 #            -- --lib -- replay_engine:: replay_rederive::
 #          (in 4 shards; the unmutated baseline passed)
@@ -217,6 +412,51 @@
 #          with `--re 'fold_fire_level|recorded_after|local_block_holds'`:
 #          13 mutants, 11 caught, 2 unviable, which replace
 #          `local_block_holds` with a map of an edge its type cannot default.
+#          Re-run over the change that leaves a latest-value slot unknown
+#          from a consumer fire with no read of it recorded until the
+#          consumer next reads it, with `--re 'SlotBound::step'`: 11 mutants,
+#          11 caught.
+#          Re-run over the change that starts that unknown at the step after
+#          the fire and keeps the count where the bag shows the fire's tick
+#          ended at an input it reads earlier, with
+#          `--re 'SlotBound::step|fires_ended_before|consumer_reads_before'`:
+#          29 mutants, 28 caught, 1 unviable, which replaces
+#          `consumer_reads_before` with a value its type does not have.
+#          Re-run over the change that counts a slot only on a bag whose
+#          trace holds its node stops, holds a slot that counts past its
+#          depth to nothing from there, counts no slot whose producer writes
+#          more frames at a stamp than it fired at that stamp, releases a
+#          slot at a consumer stop only where the stop releases it live, and
+#          keeps one pending excuse per set of slots, in 6 shards, with
+#          `--re 'writes_past_fires|StopPoint::|PassStops::|SlotBound::|PreFireDeferral::|FifoCarry::|PendingExcuse::|FindingCaveat|verify_fifo|local_block_holds'`
+#          (shards 1/6 to 5/6 with `--baseline skip --build-timeout 600
+#          --timeout 120`, the unmutated baseline having passed in 0/6):
+#          78 mutants: 69 caught, 5 unviable, 4 timed out, none missed. Three
+#          of the 4 never end a loop: `==` replaced with `!=` where
+#          `writes_past_fires` counts the frames at a stamp, and `+=` with
+#          `*=` where `writes_past_fires` and `PendingExcuse::settle` step
+#          their index. The fourth, `==` replaced with `!=` where
+#          `PendingExcuse::settle` compares two excuses' slots, keeps every
+#          excuse, which the pending-length vector fails on, while the
+#          10003-step vector's settling grows with the list and does not
+#          finish. The 5 unviable replace `local_block_holds` (twice) with a
+#          map of an edge its type cannot default, and `PreFireDeferral::step`,
+#          `FifoCarry::step` and `PendingExcuse::settle` with a value
+#          their types do not have.
+#          Re-run over the change that reads a slot past its depth as a
+#          release only from a producer that sends at most one frame per fire,
+#          and a fire at a step whose slot already counts its depth as a
+#          release from any producer, in 3 shards, with
+#          `--re 'SlotBound::|local_block_holds|producer_sends_per_fire|PreFireDeferral::step'`:
+#          21 mutants: 17 caught, 4 unviable, none missed. The 4 unviable
+#          replace `producer_sends_per_fire`, `local_block_holds` (twice, a map
+#          of an edge) and `PreFireDeferral::step` with a value their types do not
+#          have.
+#          Re-run over the change that refuses a slot for frames past fires
+#          only from a producer that sends at most one frame per fire, in 3
+#          shards, with `--re 'local_block_holds|SlotBound::'`: 26 mutants: 24
+#          caught, 2 unviable, which replace `local_block_holds` with a map of
+#          an edge its type cannot default, none missed.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
@@ -224,16 +464,25 @@
 
 (none)
 
-# Fifth scope: a `period_ms` or Sync node that a `block` input in its own rank
-# holds.
+# Eighth scope: a `period_ms` or Sync node that a `block` input in its own
+# rank holds.
 #
 # Scope: the pure decision functions on the lines the change added or
-# changed, all in src/replay_rederive.rs: the held Period burst
+# changed. In src/replay_rederive.rs: the held Period burst
 # (`is_block_held_period_burst`), the two rules that read it and the
 # per-step hold bound (`verify_period`, `verify_sync`), the walk that bounds
 # it and the fires and clocks it folds (`PreFireDeferral`,
-# `step_fire_instants`, `next_clock_ns`) and the text of a stand down
-# (`StandDownReason`).
+# `step_fire_instants`, `next_clock_ns`), the text of a stand down
+# (`StandDownReason`), and the excuse a held step keeps until its consumer's
+# read confirms it or a release with no record voids it, which the FIFO rule
+# shares (`PendingExcuse`, `FifoCarry::step`). In src/replay_engine.rs: the
+# frames-past-fires gate (`writes_past_fires`), which compares a producer's
+# frames with the clocks its fires ran at. The walk that reads those clocks
+# off the bag's trace (`recorded_fire_clocks`) reads the bag, which the
+# mutation rule does not cover. It is pinned in tests/replay_engine_test.rs
+# by `a_period_source_a_block_input_in_its_rank_holds_replays_clean` and
+# `a_period_source_the_middle_of_a_block_chain_holds_replays_clean`, which
+# fail when it gives a `period_ms` fire's own instant, its deadline.
 #
 # Run:     cargo mutants -p cerulion_cli_engine \
 #            -f crates/cerulion_cli_engine/src/replay_rederive.rs \
@@ -256,6 +505,22 @@
 #          whether the pass resumed again and the held Period stand-down names
 #          the rank, with `--re 'verify_period|verify_sync|StandDownReason::label'`:
 #          11 mutants, 11 caught.
+#          Re-run over the merge with the FIFO rules of the Seventh scope, which
+#          voids a held Period or Sync step as it voids a FIFO one, through
+#          the settle that moved from `FifoCarry` to `PendingExcuse`, and
+#          compares a producer's frames with the clocks its fires ran at, with
+#          `-f` both files, `--in-diff` the merge's diff of them against the
+#          FIFO change, `--re` the full one above plus
+#          `|PendingExcuse::|FifoCarry::step|writes_past_fires`, and
+#          `--timeout 120 --build-timeout 900`: 54 mutants: 48 caught, 3
+#          unviable, 3 timed out, none missed. The 3 timeouts never end a
+#          loop, as in the Seventh scope's run: `==` replaced with `!=` where
+#          `writes_past_fires` counts the frames at a stamp, `+=` with `*=`
+#          where `PendingExcuse::settle` steps its index, and `==` with `!=`
+#          where it compares two excuses' slots, which keeps every excuse.
+#          The 3 unviable replace `PendingExcuse::held`, `PendingExcuse::settle`
+#          (with `Some(Default::default())`) and `FifoCarry::step` with a
+#          value their types do not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill

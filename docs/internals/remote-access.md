@@ -192,6 +192,41 @@ the same entry instead of running the daemon.
 
 Load-bearing boundary contracts:
 
+- **Session audit inspection**: `remote_session::list_recordings_with_incomplete`
+  returns sorted complete heads and unfinished paths. A locally computed head
+  checks structure, not authenticity; `verify_recording_file` and
+  `verify_recording_prefix_file` require a separately retained witness.
+  Complete verification requires an Exit and newline-terminated events.
+  Prefix verification commits only the witnessed events and reports all
+  following bytes as unverified, including malformed or interrupted tails.
+  Inspections open only regular files, bound each event to twice the session
+  frame cap and make no writes. Unix opens refuse final-component symlinks,
+  use nonblocking mode for raced special files and compare descriptor identity.
+
+- **Session settings**: `remote_session::SessionLimits` supplies resource
+  defaults, and `shell_config::ShellFlags` validates parsed options before
+  changing `RemotedConfig`. The caller supplies environment text explicitly;
+  either local off wins, invalid text refuses, and parsing opens no state.
+  Concurrency and recording limits must be positive; zero disables optional
+  wall/idle timeouts, while zero exec stream budgets permit no bytes on that
+  stream. The I/O timeout stays positive. These types configure a session
+  service; the option resolver does not start or install that service.
+  Rust callers constructing `RemotedConfig` with a literal must supply the
+  shell prohibition, resource limits and concurrency fields, or use
+  `RemotedConfig::from_state_root` to obtain their defaults.
+
+- **Shell policy**: `cerulion_remoted::shell_policy::ShellPolicy` and
+  `PairingAuthorizer::with_shell_policy` share a live owner setting. Shell and
+  exec require the owner tier and the effective policy; a missing policy handle
+  refuses execution. An absent persisted file defaults on, while unreadable,
+  malformed, oversized, symlinked or wrongly permissioned files disable access.
+  On Unix, the opened file must match the inspected file. The immutable robot-local
+  prohibition wins over the owner setting. Settings are synced before becoming
+  effective, and a failed persistence attempt disables live access. Ordinary
+  ops and the owner policy handler remain available while shell access is off.
+  These library components authorize and persist settings; they do not launch
+  a process or register a daemon command themselves.
+
 - **Local identity**: `cerulion_wireclient::local_identity` holds the existing
   never-renamed auth-store lock while reading the account and actual machine key.
   A busy writer refuses immediately. Identity-only reads never open certificate
@@ -205,6 +240,13 @@ Load-bearing boundary contracts:
   FIFO, regular-symlink and size-bound tests pinning parity. An empty saved
   session token is metadata for account actions, not a new prior-login or
   durable-pairing prerequisite; the public identity stamp excludes token bytes.
+
+- **Owner presentation**: the wireclient owner-pair exchange offers ordinary ops
+  versions 1 through 2. Its checked entry point runs the caller's identity check
+  once after a supported acknowledgement and before writing the certificate.
+  A failed check sends no pairing request. The caller owns the account/key/epoch
+  comparison and the transport deadline, and must discard a failed stream.
+  The original entry point remains available to callers with a fixed identity.
 
 - **Linux session cleanup**: `remote_session::processes` checks non-reaping waits,
   process enumeration, readiness and signal syscalls before spawn. Native pidfds

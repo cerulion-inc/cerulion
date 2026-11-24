@@ -118,6 +118,8 @@ pub mod rcp;
 pub mod remote_session;
 pub mod robot_settings;
 pub mod serving_hold;
+pub mod shell_config;
+pub mod shell_policy;
 pub mod shutdown;
 pub mod tap;
 pub mod trust;

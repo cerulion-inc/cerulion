@@ -711,9 +711,9 @@ const UNDENIED_TYPES: &[(&str, &str, Classification, &str)] = &[
     ),
     (
         "cerulion_cli_engine/src/replay_engine.rs",
-        "CoordinationMode",
+        "InputQueue",
         Classification::ExemptWithReason,
-        "NO NAMED FIELDS to deny: a unit/newtype-variant enum, so serde's variant matcher already rejects an unknown VALUE loudly",
+        "not user-authored: an entry of the `node_inputs` map this build WRITES into a bag's `__cerulion/recorder.json` and reads back, inside `RecorderInfo`, which is exempt for the same reason: denying here would make an old build refuse a new bag whose recorder adds a field to an input's queue",
     ),
     (
         "cerulion_cli_engine/src/replay_engine.rs",

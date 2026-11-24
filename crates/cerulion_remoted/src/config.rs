@@ -63,6 +63,14 @@ pub struct RemotedConfig {
     /// Whether `--network off` / `CERULION_NETWORK=off` is engaged (R8): the
     /// daemon refuses to serve, logs loudly, and exits cleanly.
     pub network_disabled: bool,
+    /// Robot-local shell prohibition; no remote policy can clear this.
+    pub remote_shell_off: bool,
+    /// Per-session execution, recording, and stream resource bounds.
+    pub remote_shell_limits: crate::remote_session::SessionLimits,
+    /// Maximum simultaneous shell/exec sessions across all devices.
+    pub remote_shell_max_sessions: usize,
+    /// Maximum simultaneous shell/exec sessions from a single device.
+    pub remote_shell_max_per_device: usize,
 }
 
 impl RemotedConfig {
@@ -84,6 +92,10 @@ impl RemotedConfig {
             rcp: crate::rcp::RcpLink::under(&dir),
             relay,
             network_disabled,
+            remote_shell_off: false,
+            remote_shell_limits: crate::remote_session::SessionLimits::default(),
+            remote_shell_max_sessions: 4,
+            remote_shell_max_per_device: 2,
         }
     }
 }

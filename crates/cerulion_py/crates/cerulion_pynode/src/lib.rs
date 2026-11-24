@@ -725,13 +725,22 @@ impl Host {
 
     /// The compiled INFO is the declaration with each port's `schema` name
     /// removed; any other difference (policy, depth, timing, backpressure,
-    /// sizes) means the scheduler would run a stale compiled shape.
+    /// sizes) means the scheduler would run a stale compiled shape. A
+    /// declaration that carries `publisher_for_every_output` is refused: only
+    /// the `#[cerulion_node]` macro sets it.
     fn validate_declaration_matches_info(info: &[u8], declaration: &str) -> Result<(), String> {
         let info = info.strip_suffix(&[0]).unwrap_or(info);
         let compiled: serde_json::Value = serde_json::from_slice(info)
             .map_err(|error| format!("invalid node metadata: {error}"))?;
         let mut current: serde_json::Value = serde_json::from_str(declaration)
             .map_err(|error| format!("invalid Python declaration metadata: {error}"))?;
+        if current.get("publisher_for_every_output").is_some() {
+            return Err(
+                "`publisher_for_every_output` is set by the `#[cerulion_node]` macro and \
+                 cannot appear in a Python node declaration"
+                    .to_string(),
+            );
+        }
         for section in ["inputs", "outputs"] {
             if let Some(ports) = current
                 .get_mut(section)
@@ -1625,6 +1634,16 @@ mod tests {
         assert_eq!(
             Host::validate_declaration_matches_info(INFO, declaration),
             Err("node metadata is stale: compiled policy {\"period_ms\":10}, declaration absent; run `cerulion node build`".to_string())
+        );
+    }
+
+    #[test]
+    fn a_declaration_that_sets_publisher_for_every_output_is_refused() {
+        let info = br#"{"inputs":[],"outputs":[{"name":"out","schema_hash":7}],"policy":{"period_ms":10},"publisher_for_every_output":true}"#;
+        let declaration = r#"{"inputs":[],"outputs":[{"name":"out","schema":"Point","schema_hash":7}],"policy":{"period_ms":10},"publisher_for_every_output":true}"#;
+        assert_eq!(
+            Host::validate_declaration_matches_info(info, declaration),
+            Err("`publisher_for_every_output` is set by the `#[cerulion_node]` macro and cannot appear in a Python node declaration".to_string())
         );
     }
 

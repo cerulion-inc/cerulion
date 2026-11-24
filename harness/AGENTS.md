@@ -7,9 +7,11 @@ and `cerulion rcp bench` run it; the user guide is `docs/harness.md`, the folder
 - The CLI finds this folder (`CERULION_HARNESS_DIR`, then beside the canonicalized binary, then
   the root of the checkout the binary sits in, proven by `crates/cerulion_cli/Cargo.toml`; never
   the current directory) by two marker files, `rcp.sh` and `install.sh`. Renaming any of the
-  three breaks the search. The last two places take nothing from a folder other users can write
-  to (mode `o+w`, as `/tmp`): the walk up to a checkout root stops at the first one. No release
-  package installs this folder. A test that runs the built binary without
+  three breaks the search. `CERULION_HARNESS_DIR` is taken as given; the last two places are never
+  taken from a folder every user can write to (mode `o+w`, as `/tmp`; group write is not read): the
+  walk up to a checkout root stops at the first one. Every release package installs this folder
+  beside `cerulion`, staged by `tools/scripts/stage_harness.sh`, which leaves out `tests/`,
+  `.gitignore` and the agent instruction files. A test that runs the built binary without
   `CERULION_HARNESS_DIR` finds this checkout's own harness: set the variable, or run a link to
   the binary from outside the checkout (`login_gate_e2e_test` does both).
 - It runs `bash rcp.sh --home DIR [--packaged] sim [--http ADDR] [--task NAME]`, `... bench --model M
@@ -42,10 +44,10 @@ and `cerulion rcp bench` run it; the user guide is `docs/harness.md`, the folder
 - No hosted piece ships here: no sign-in backend, no shared ledger, no cloud storage name.
 - Scripts run under bash 3.2 (macOS): no associative arrays, no empty-array expansion under
   `set -u`. Every tracked `*.sh` passes `shellcheck -x`.
-- Python tests use the standard library only and need no simulator and no network.
+- Python tests use only the standard library, no simulator and no network.
 
 ## Tests
 - `python3 -B -m unittest discover -s harness/tests` (the CI job `Harness (Linux)` runs it,
-  with shellcheck over every tracked script).
+  with shellcheck over every tracked script). Live: skill `verify-harness`.
 - The CLI side: `cargo test -p cerulion_cli_engine --lib harness_cmd` and
   `cargo test -p cerulion_cli --test login_gate_e2e_test -- --test-threads=1`.

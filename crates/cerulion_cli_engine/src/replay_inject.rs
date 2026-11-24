@@ -5074,6 +5074,10 @@ mod tests {
             &index,
             &BTreeMap::new(),
             None,
+            crate::replay_feed::FeedBagFacts {
+                begins_mid_run: false,
+                trace_format: Some(11),
+            },
         )
         .expect_err("frame 2 carries no annotation of its own");
         assert_eq!(refusal.reason.code(), "read_identity_absent");

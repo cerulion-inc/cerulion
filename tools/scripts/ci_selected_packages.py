@@ -58,7 +58,8 @@ test that loads it.
 
 `all` in the observed column means the observer reached something this walk
 could not attribute to one package: it rides every selection that names a
-package, and no step of it may be gated.
+package, and no step of it may carry a per-package gate. The `code` gate holds
+on every such selection, so a step may carry that one.
 
 WITHOUT `--observation-edges` the answer is the cargo closure alone. That is what
 the flag's absence means, and it is what the self-test's live rows compare
@@ -365,7 +366,7 @@ def read_metadata(source):
 # dev-dependency edges dropped)`, and LIVE_MEMBER_COUNT is the workspace member
 # count, all measured off this workspace independently of this script. The two
 # sizes in a row differ wherever a dev-dependency edge carries the closure, and
-# `cerulion_cli_engine` is the extreme case: 72 packages can observe a change to
+# `cerulion_cli_engine` is the extreme case: 75 packages can observe a change to
 # it, six of them without dev-dependency edges. That gap is what proves the edges
 # are followed on the real graph rather than only on a fixture.
 #
@@ -377,16 +378,16 @@ def read_metadata(source):
 # LIVE_ORACLE_MEASURED is False while a measurement is outstanding, and the live
 # arm then reports a miss rather than passing on numbers nobody measured.
 LIVE_ORACLE_MEASURED = True
-LIVE_MEMBER_COUNT = 90
+LIVE_MEMBER_COUNT = 93
 LIVE_ORACLE = {
-    'cerulion_bag': (72, 10),
+    'cerulion_bag': (75, 10),
     'cerulion_cli': (1, 1),
-    'cerulion_cli_engine': (72, 6),
-    'cerulion_core': (72, 72),
+    'cerulion_cli_engine': (75, 6),
+    'cerulion_core': (75, 75),
     'cerulion_viz': (2, 2),
     'cerulion_vizd': (1, 1),
     'go2_tf': (4, 4),
-    'native_ros2_messages': (72, 61),
+    'native_ros2_messages': (75, 64),
 }
 
 

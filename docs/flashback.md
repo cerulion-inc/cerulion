@@ -45,8 +45,9 @@ Multi-process runs, the default shape on Linux and macOS, provision the
 scheduler-trace rings without requiring `--record`. Declining those rings with
 `--no-rings` also stops the window recorder. Each capture reports in
 `anchor.resimmable` whether `cerulion bag play --resim all --verify` can judge
-it: its retained trace, its checkpoint boundary and every frame its trace reads,
-with a reason when they do not; `cerulion bag info` shows that verdict.
+it: its retained trace, its checkpoint boundary and every frame its trace reads.
+`cerulion flashback` prints that verdict when the capture lands, and
+`anchor.resimmable_reason` in the bag's `__cerulion/flashback.json` says why.
 
 What makes that possible is that **every multi-process `cerulion graph run`
 provisions the scheduler-trace rings**, whether or not you asked it to record.
@@ -58,8 +59,14 @@ executor unit, `cerulion ros2 attach`, `cerulion node run`, or a virtual or
 external time source. They still take captures, and those captures are
 frames-only. A `--single-process` run of a graph whose nodes split into several
 units runs them in one worker process, which mints the rings like any
-multi-process run and takes no checkpoints, since it hosts several units. Each
-capture records which of the two it is; see [Limitations](#limitations).
+multi-process run. Each capture records which of the two it is; see
+[Limitations](#limitations).
+
+A run takes no checkpoints when any of its processes hosts several executor
+units, whatever its shape: that `--single-process` run, or a multi-process run
+with a process group that holds an `isolate: true` node beside others, or that
+the graph's profile splits into units. A capture of such a run is resimmable
+only when its window reaches the run's step 0.
 
 ---
 
@@ -101,6 +108,14 @@ needs a checkpoint at or before its own start to be re-runnable from there.
 Shortening it below that would produce captures anchored *after* the thing that
 went wrong.
 
+A `--verify` of a capture of a graph run in free-run mode is held to the
+limits of any free-run recording: up to 200000 reads, and 200000 recorded
+frames consumed, per process or executor unit (see `docs/bag.md`, Known
+limits). A capture of a graph run in lockstep mode is not limited. A capture
+of the default length, 30 s back and 15 s forward, is refused only when one
+process or executor unit of the graph makes more reads, or consumes more
+frames, than that within it.
+
 ## Captures the runtime takes on its own
 
 The runtime also requests a capture when it sees a fault or a declared
@@ -138,7 +153,7 @@ Open one with `cerulion bag info`. Beyond the frames, a capture carries:
 | `__cerulion/flashback.json` | What the capture was ABOUT: `causes[]` (each with the `detail` your `--note` became), the window it claimed (`span_ms`) against the window it achieved (`achieved_span_ms`), a `handoff` object saying what this recorder was given, and `anchor.resimmable`, whether `bag play --resim all --verify` can judge this bag: its trace, its checkpoint and every frame its trace reads are in it. |
 | `__cerulion/state_coverage.json` | The node-state side: which nodes have an anchor, and which were skipped and why. Absent when the recorder had nothing to say about the state plane. |
 | `graph.yaml`, `env.json` | The graph as executed and the environment it ran in. Bare names, not `__cerulion/`-prefixed: that namespace is reserved for manifests the recorder mints itself. |
-| `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew, and the replay contract its trace is judged under (`trace_format`, `coordination`, `node_external`). A run that could not write it into its run directory warns, and a capture of it that carries the trace carries no `graph.yaml` either, so `anchor.resimmable` is false. |
+| `__cerulion/recorder.json` | The host that wrote the bag, so a reader can warn about cross-architecture float skew, and the replay contract its trace is judged under (`trace_format`, `coordination`, `node_external`, `node_inputs`). A run that could not write it into its run directory warns, and a capture of it that carries the trace carries no `graph.yaml` either, so `anchor.resimmable` is false. A capture whose `recorder.json` cannot be read as a JSON object, or stamps a `coordination` this build does not know, is not resimmable either, since `bag play --resim` refuses it. |
 | `__cerulion/trace_manifest_rank<N>.json` | Which node ids the rank's trace records refer to. `bag play --resim` needs it to resolve a FIRE to a node. |
 
 `anchor.resimmable` is the field to read first: a plain `true`/`false`, always
@@ -152,6 +167,19 @@ trace rings held nothing yet because its nodes had not fired inside the window,
 or that the capture's trace retention hit its byte ceiling
 (`CERULION_FLASHBACK_TRACE_MAX_MB`, 64 MiB).
 
+Beside `resimmable`, `resim_covered_through_ns` and `resimmable_reason`, the
+`anchor` object names the checkpoint the capture embeds. With `embedded: false`
+it carries the `reason` there is none. With `embedded: true` it carries the
+checkpoint's `run_id`, `step`, `nodes`, `complete`, `records`, `fit`,
+`taken_at_ns`, `frames_before_anchor_ms` and `frames_missing_after_anchor_ms`,
+and two per-rank keys:
+
+- `per_rank.<r>`: rank `r`'s own checkpoint, as `capture_seq`, `step`,
+  `taken_at_ns`, `nodes`, `complete`, `records`, `fit`,
+  `frames_before_anchor_ms` and `frames_missing_after_anchor_ms`.
+- `missing_ranks`: each state ring with no checkpoint in the capture, as `ring`,
+  `rank` (`null` when nothing names its rank), `reason` and `remedy`.
+
 A capture's trace ends at the last step each rank finished recording: a step
 is kept only when the trace also holds that rank's next step boundary, so a
 capture taken while a step was running never holds an output whose read record
@@ -162,6 +190,17 @@ target, after the covered range (`anchor.resim_covered_through_ns`), and
 `bag play --resim --verify` reports them as trailing rather than comparing
 them. A capture that leaves some rank with no complete step while another rank
 keeps one is not resimmable, and `anchor.resimmable_reason` names the rank.
+
+Each worker rank's trace begins at that rank's own checkpoint, or, for a rank
+that kept none, where its retained trace begins, so the ranks of one capture can
+begin at different steps. A capture of a free-run graph with several worker
+ranks is resimmable only when every worker rank begins at step 0. When one
+begins at step 0 and another past it, as in a capture where one rank kept no
+checkpoint (`anchor.missing_ranks`), `anchor.resimmable_reason` names each rank
+that kept a step boundary and the step it begins at. When every rank that kept a
+step boundary begins at step 0 and a worker rank's trace holds none,
+`anchor.resimmable_reason` names that rank. When rank 0 begins past step 0, the
+capture is not resimmable either, since per-rank resume is not supported.
 
 ---
 
@@ -200,9 +239,19 @@ When the run reports no standing consumer, the attach discovers available state
 rings. It does not arm checkpoints itself, so discovery alone does not promise
 a usable anchor. `bag info` reports the captured state coverage and
 `bag play --resim all --verify` checks the actual trace and resume boundary.
-Mid-run free-run recordings require independent per-rank resume support, which
-is not supported; recordings beginning at step zero do not need a resume
-anchor.
+Recordings beginning at step zero do not need a resume anchor.
+
+A free-run capture of one worker rank that begins mid-run resumes from its
+checkpoint, and from trace format 11 `bag play --resim all --verify` feeds its
+reads by read identity: at every checkpoint the recorder names each read
+site's writer again at its first read that serves a frame after it, so a
+capture whose window starts after the run's first reads still names the writer
+of every read it holds. A capture recorded below format 11 is refused under
+`--verify` when a single-writer read in it continues a writer run begun before
+the capture (`read_identity_absent`, with a message to record the run again);
+`--resim all` without `--verify` replays it. A process that runs several
+executor units takes no checkpoints. A mid-run free-run recording of several
+worker ranks is refused, since per-rank resume is not supported.
 
 ---
 
@@ -345,17 +394,28 @@ own graph, and the resim exits 2 blaming corruption.
 **A capture from a run's first seconds may not be re-runnable.** A
 `graph run` takes its first checkpoint at step 0, and its window recorder starts
 a moment after the run is released, so its taps miss the frames published before
-they attach. A capture taken within one Flashback window of the start resumes
-from that checkpoint. When a step it re-executes reads a frame published before
+they attach. On a graph with one worker rank, a capture taken within one
+Flashback window of the start resumes from that checkpoint. When a step it re-executes reads a frame published before
 the taps attached, the capture is stamped not resimmable, and
 `anchor.resimmable_reason` names the topic, the step, the writer and the
 sequences. A capture whose trace reads a frame the window lost later in the run
-is refused the same way. Take the capture more than one Flashback window into the
-run (`CERULION_FLASHBACK_WINDOW_MS`), or record with
-`cerulion graph run --record`, whose recorder is ready before step 0. A capture
+is refused the same way. For a graph with one worker rank, take the capture more
+than one Flashback window into the run (`CERULION_FLASHBACK_WINDOW_MS`); a later
+capture of several worker ranks is not resimmable either, since per-rank resume
+is not supported. Either way, `cerulion graph run --record`
+records the run with a recorder that is ready before step 0. A capture
 written by 2.0.0 was not checked this way: it can claim
 `anchor.resimmable: true` and then be refused by
 `bag play --resim all --verify`, so take it again.
+
+**An early capture whose free-run worker ranks begin apart is not resimmable.** In a
+capture taken within one Flashback window of the start, a rank that kept no
+checkpoint keeps its trace from step 0, while a rank that kept one begins at
+its checkpoint. Re-executing ranks that begin apart is not supported, so the
+capture is stamped not resimmable, and `anchor.resimmable_reason` names each
+rank and the step it begins at. Record the run with
+`cerulion graph run --record`. A capture of that shape written by 2.1.0 or
+earlier can claim `anchor.resimmable: true`.
 
 **A topic that first publishes mid-recording gets no channel.** A
 bag's channel set is fixed when the bag is created, so a producer that appears

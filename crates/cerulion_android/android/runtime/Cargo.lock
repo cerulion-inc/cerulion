@@ -427,7 +427,7 @@ dependencies = [
 
 [[package]]
 name = "cerud"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_ops_proto",
  "clap",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_bagd",
@@ -463,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_android_remote"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_android",
  "cerulion_core",
@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bag"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
  "crc32fast",
@@ -491,7 +491,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_bagd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_bag",
  "cerulion_core",
@@ -510,7 +510,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_cli_engine"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_bag",
@@ -551,7 +551,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_core"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_macros",
@@ -600,7 +600,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_dds"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "thiserror 2.0.17",
  "tracing",
@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_discovery"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "dirs",
  "serde",
@@ -618,7 +618,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_hygiene"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libc",
  "rustix",
@@ -627,7 +627,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_link"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "iroh",
  "rustls",
@@ -638,7 +638,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_macros"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -649,7 +649,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_mdns"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_discovery",
  "mdns-sd",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_msgio"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
@@ -676,7 +676,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_netd"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
  "cerulion_discovery",
@@ -699,7 +699,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_node_abi"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "libloading",
  "stabby",
@@ -708,7 +708,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_ops_proto"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_pairing"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "dirs",
  "ed25519-dalek 2.2.0",
@@ -737,13 +737,14 @@ dependencies = [
 
 [[package]]
 name = "cerulion_remoted"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerud",
  "cerulion_core",
  "cerulion_link",
  "cerulion_msgio",
  "cerulion_netd",
+ "cerulion_ops_proto",
  "cerulion_pairing",
  "cerulion_wireclient",
  "clap",
@@ -780,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "cerulion_wireclient"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "base64 0.22.1",
  "cerulion_core",
@@ -1751,9 +1752,9 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "form_urlencoded"
-version = "1.2.2"
+version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb4cb245038516f5f85277875cdaa4f7d2c9a0fa0468de06ed190163b1581fcf"
+checksum = "afa489199eaffb1211795df1c6236ce1ad0d41a6fa45250add73e3b02420f06e"
 dependencies = [
  "percent-encoding",
 ]
@@ -3418,7 +3419,7 @@ dependencies = [
 
 [[package]]
 name = "native_ros2_messages"
-version = "2.0.0"
+version = "2.1.0"
 dependencies = [
  "cerulion_core",
 ]
@@ -5922,9 +5923,9 @@ dependencies = [
 
 [[package]]
 name = "url"
-version = "2.5.8"
+version = "2.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff67a8a4397373c3ef660812acab3268222035010ab8680ec4215f38ba3d0eed"
+checksum = "f00cd2407bb42c0ef17be88d4cf020f5cceffd121665bac9b8b9493a369b3b1a"
 dependencies = [
  "form_urlencoded",
  "idna",

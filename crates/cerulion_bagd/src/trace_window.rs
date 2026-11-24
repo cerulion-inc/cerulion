@@ -338,23 +338,6 @@ pub(crate) struct TrimmedTrace {
     /// Counted here rather than re-derived at the verdict, so the number the
     /// manifest reports and the number the verdict judges are the same walk.
     pub departures: usize,
-    /// The step of the AUTHORITATIVE rank's first kept step-boundary record: what
-    /// `resolve_resume` will derive the resume point from.
-    ///
-    /// The two endpoints this struct carries fold in OPPOSITE directions, and the
-    /// difference is which side each one has to be safe for:
-    ///
-    /// - the covered range's END ([`last_boundary_target_ns`](Self::last_boundary_target_ns))
-    ///   is the EARLIEST last kept boundary across the ranks that kept one, because
-    ///   a resume covers the graph only as far as its slowest rank can back it;
-    /// - the resume's START is rank 0's own first kept boundary, because the replay
-    ///   window is rank 0's boundary stream by construction and that is the step a
-    ///   resume actually begins at.
-    ///
-    /// Rank-blind, this would be the first boundary in retained order, which on a
-    /// capture whose peer carries no anchor is the peer's step 0 and makes the
-    /// verdict claim a from-start resume the reader refuses.
-    pub first_recorded_step: Option<u64>,
     /// The gating-clock value at the ANCHOR step's own boundary — `target(S−1)`.
     ///
     /// `None` when that boundary is not in the retention. It is the floor for the
@@ -475,7 +458,9 @@ pub(crate) struct TrimmedTrace {
     /// (`ResimGap::RankWithoutCompleteStep`). Empty when no rank keeps a
     /// boundary, which the judge reports as `ResimGap::NoBoundary` instead.
     pub ranks_without_a_kept_step: Vec<u32>,
-    /// The same five facts PER RANK, keyed by the rank on the record.
+    /// Each rank's first kept boundary, and its twins of `anchor_target_ns`,
+    /// `last_boundary_target_ns`, `executed_nodes` and `discarded`, keyed by the
+    /// rank on the record.
     ///
     /// # Why the scalars above cannot serve
     ///
@@ -486,19 +471,24 @@ pub(crate) struct TrimmedTrace {
     /// this map answers the question a per-rank reader asks, which is the one
     /// `bag play --resim` will ask once it stops refusing k>1.
     ///
-    /// Exactly one entry for a lockstep or k=1 capture, whose numbers ARE the
+    /// Exactly one entry for a k=1 capture, whose four twinned numbers ARE the
     /// scalars.
     pub per_rank: BTreeMap<u32, RankTrim>,
 }
 
 /// What ONE rank's half of a trimmed trace reports.
 ///
-/// Every field is the per-rank twin of the identically named field on
-/// [`TrimmedTrace`], measured over that rank's own records only. The docs on
-/// those fields apply here unchanged; what differs is the scope.
+/// Every field but the first is the per-rank twin of the identically named
+/// field on [`TrimmedTrace`], measured over that rank's own records only. The
+/// docs on those fields apply here unchanged; what differs is the scope.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RankTrim {
     /// The step of this rank's FIRST kept step-boundary record.
+    ///
+    /// The capture judge reads rank 0's as the step a resume begins at, since
+    /// the replay window is rank 0's boundary stream, and every worker rank's to
+    /// tell free-run ranks that begin apart from ranks that begin together
+    /// (`cerulion_core::flashback::resim::ResimFacts::rank_first_steps`).
     pub first_recorded_step: Option<u64>,
     /// The gating-clock value at THIS rank's anchor step's own boundary.
     pub anchor_target_ns: Option<u64>,
@@ -998,28 +988,6 @@ fn walk(
     {
         out.last_boundary_target_ns = Some(earliest);
     }
-    // The RESUME's start, and the fold here is the opposite shape to the one
-    // above: the AUTHORITATIVE rank's own first kept boundary, not the first
-    // boundary in retained order and not a minimum over the ranks.
-    //
-    // The replay window IS rank 0's boundary stream by construction
-    // (`resolve_resume` reads `first_recorded_boundary`, which walks
-    // `AUTHORITATIVE_TRACE_RANK` only), so rank 0's first kept boundary is the
-    // step a resume actually begins at. Read rank-blind, this scalar took
-    // whichever rank's boundary the retention happened to bank first: on a
-    // capture where rank 0 resumes from a mid-run anchor and a peer carries no
-    // anchor at all, the peer's step-0 boundary is retained and lands first, the
-    // scalar read 0, and `judge_resimmable` stamped the capture resimmable FROM
-    // START while the replay resolved rank 0's later boundary into a mid-run
-    // resume and refused it. The verdict promised a resume the reader rejects.
-    //
-    // `None` when rank 0 kept no boundary, which is the same bag
-    // `first_recorded_boundary` answers `None` for and
-    // `validate_step_boundaries` refuses as `BagNoStepBoundaries`.
-    out.first_recorded_step = out
-        .per_rank
-        .get(&AUTHORITATIVE_TRACE_RANK)
-        .and_then(|r| r.first_recorded_step);
     out
 }
 
@@ -1028,6 +996,14 @@ mod tests {
     use super::*;
 
     const MS: u64 = 1_000_000;
+
+    /// Rank 0's first kept step boundary: the step the capture judge reads as
+    /// the start of a resume.
+    fn rank_0_first_step(out: &TrimmedTrace) -> Option<u64> {
+        out.per_rank
+            .get(&AUTHORITATIVE_TRACE_RANK)
+            .and_then(|r| r.first_recorded_step)
+    }
 
     fn boundary(step: u64, target_ns: u64) -> TraceRingRecord {
         TraceRingRecord {
@@ -1242,13 +1218,13 @@ mod tests {
         let out = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
 
         // `anchor_step + 1` == 5: everything below step 5 is discarded.
-        assert_eq!(out.first_recorded_step, Some(5));
+        assert_eq!(rank_0_first_step(&out), Some(5));
         assert_eq!(out.records.len(), 2);
         assert!(out.records.iter().all(|r| r.step == 5));
         assert_eq!(out.discarded, 5);
         // …and resim's own derivation lands back on OUR anchor.
         assert_eq!(
-            out.first_recorded_step.map(|s| s - 1),
+            rank_0_first_step(&out).map(|s| s - 1),
             Some(4),
             "the whole point of the trim"
         );
@@ -1356,7 +1332,7 @@ mod tests {
             &cut(0),
             &nodes(),
         );
-        assert_eq!(out.first_recorded_step, Some(1));
+        assert_eq!(rank_0_first_step(&out), Some(1));
         assert_eq!(out.records.len(), 1);
         assert_eq!(out.anchor_target_ns, Some(0), "step 0's own target");
 
@@ -1371,7 +1347,7 @@ mod tests {
             "no step can follow u64::MAX, so nothing is after the anchor"
         );
         assert_eq!(out.discarded, 2);
-        assert_eq!(out.first_recorded_step, None);
+        assert_eq!(rank_0_first_step(&out), None);
         // …and the anchor step's own target is still recovered on the way past,
         // exactly as it is for any other anchor.
         assert_eq!(out.anchor_target_ns, Some(9));
@@ -1382,7 +1358,7 @@ mod tests {
     #[test]
     fn a_trace_with_no_boundary_reports_no_first_step() {
         let out = trim_to_anchor(vec![fire(5, 0), fire(6, 1)].into_iter(), &cut(4), &nodes());
-        assert_eq!(out.first_recorded_step, None);
+        assert_eq!(rank_0_first_step(&out), None);
         assert_eq!(out.records.len(), 2);
         // And it claims NO covered range. A capture with no boundary
         // is refused separately (`BagNoStepBoundaries`), so a range here would
@@ -1428,7 +1404,7 @@ mod tests {
             "…while the range's LOWER endpoint is still the discarded anchor \
              boundary's target — two records, two endpoints"
         );
-        assert_eq!(out.first_recorded_step, Some(5));
+        assert_eq!(rank_0_first_step(&out), Some(5));
     }
 
     /// A capture with NOTHING after its anchor claims no range at all.
@@ -1545,26 +1521,21 @@ mod tests {
         );
     }
 
-    /// A PEER with no anchor does not make the capture claim a from-start resume.
+    /// A PEER with no anchor keeps its own first step, and rank 0 keeps its own.
     ///
     /// The shape, which is an ordinary multi rank capture and not a crafted one:
     /// rank 0 resumes from a MID RUN anchor, so its records below the resume are
     /// discarded, while rank 1 carries NO anchor and keeps everything including its
     /// step 0 boundary. Retained order then puts rank 1's step 0 boundary FIRST.
     ///
-    /// Read rank-blind, the scalar took that 0 and `judge_resimmable` returned on
-    /// its step 0 arm, stamping the capture resimmable FROM START. The replay does
-    /// not agree: `resolve_resume` reads `first_recorded_boundary`, which walks
-    /// rank 0 only, resolves rank 0's step 42 into a mid run resume, needs an
-    /// anchor for it, and for k>1 refuses the recording. The verdict promised a
-    /// resume the reader rejects.
+    /// The capture judge reads rank 0's entry as the resume's start (`resolve_resume`
+    /// reads `first_recorded_boundary`, which walks rank 0 only), so a per-rank first
+    /// step that took the first boundary in retained order would hand it the peer's
+    /// 0 and a from-start claim the reader refuses.
     ///
-    /// HAND ORACLE. Rank 0 keeps from 42, rank 1 keeps from 0, so the scalar is 42,
-    /// which is above 0 and therefore NOT the from-start arm. 0 is asserted absent
-    /// from the scalar, which is the number the rank-blind read produced, so a
-    /// return to it fails here rather than in a replay.
+    /// HAND ORACLE. Rank 0 keeps from 42, rank 1 keeps from 0.
     #[test]
-    fn a_peers_step_zero_boundary_does_not_make_the_resume_claim_from_start() {
+    fn a_peers_step_zero_boundary_does_not_become_rank_0s_first_step() {
         let out = trim_to_anchor(
             vec![
                 // Rank 1 has no anchor, so its step 0 boundary is KEPT and, banked
@@ -1585,21 +1556,62 @@ mod tests {
         assert_eq!(
             out.per_rank[&1].first_recorded_step,
             Some(0),
-            "PRECONDITION: rank 1 really did keep its step 0 boundary, which is the \
-             whole shape of this arm"
+            "rank 1 keeps its step 0 boundary, which is the whole shape of this arm"
         );
         assert_eq!(
-            out.first_recorded_step,
+            rank_0_first_step(&out),
             Some(42),
-            "the resume's START is rank 0's own first kept boundary, which is the \
-             step `resolve_resume` will reach for"
+            "rank 0's first step is its own first kept boundary, the step \
+             `resolve_resume` will reach for, never the peer's step 0"
         );
-        assert_ne!(
-            out.first_recorded_step,
-            Some(0),
-            "and never the peer's step 0, which is what made the verdict claim a \
-             from-start resume the reader refuses"
+    }
+
+    /// The reverse shape: rank 0 kept no checkpoint and keeps its retention from
+    /// step 0, while rank 1 resumes from its anchor at step 5.
+    ///
+    /// HAND ORACLE. Rank 0 keeps steps 0 to 7, rank 1 keeps 6 and 7, so the first
+    /// steps are `{0: 0, 1: 6}`, and rank 1's steps 0 to 5 are the only discards.
+    #[test]
+    fn an_unanchored_rank_0_keeps_step_0_beside_a_peer_cut_at_its_anchor() {
+        let records: Vec<TraceRingRecord> = (0..=7u64)
+            .flat_map(|k| {
+                [
+                    ranked_boundary(0, k, k * 1_000),
+                    ranked_boundary(1, k, k * 1_000 + 100),
+                ]
+            })
+            .collect();
+        let out = trim_to_anchor(
+            records.into_iter(),
+            // Rank 1 alone carries an anchor; rank 0 is absent from the cut table.
+            &BTreeMap::from([(1, 5u64)]),
+            &ranked_nodes(),
         );
+        let kept: Vec<(u32, u64)> = out.records.iter().map(|r| (r.rank(), r.step)).collect();
+        assert_eq!(
+            kept,
+            vec![
+                (0, 0),
+                (0, 1),
+                (0, 2),
+                (0, 3),
+                (0, 4),
+                (0, 5),
+                (0, 6),
+                (1, 6),
+                (0, 7),
+                (1, 7),
+            ]
+        );
+        let firsts: Vec<(u32, Option<u64>)> = out
+            .per_rank
+            .iter()
+            .map(|(rank, per)| (*rank, per.first_recorded_step))
+            .collect();
+        assert_eq!(firsts, vec![(0, Some(0)), (1, Some(6))]);
+        assert_eq!(out.per_rank[&0].discarded, 0);
+        assert_eq!(out.per_rank[&1].discarded, 6);
+        assert_eq!(out.per_rank[&1].anchor_target_ns, Some(5_100));
     }
 
     /// The two ranks' own manifests, DIFFERENT lists at the same indices, which
@@ -1785,7 +1797,7 @@ mod tests {
             &nodes(),
         );
         assert_eq!(out.last_boundary_target_ns, Some(1_000));
-        assert_eq!(out.first_recorded_step, Some(0));
+        assert_eq!(rank_0_first_step(&out), Some(0));
     }
 
     /// The same input trimmed twice is the same output — the retention feeds a
@@ -1803,7 +1815,7 @@ mod tests {
         let b = trim_to_anchor(records.into_iter(), &cut(4), &nodes());
         assert_eq!(a, b);
         // …and against a HAND oracle, so this is not two runs of one closure.
-        assert_eq!(a.first_recorded_step, Some(5));
+        assert_eq!(rank_0_first_step(&a), Some(5));
         assert_eq!(a.anchor_target_ns, Some(4_000));
         assert_eq!(a.last_boundary_target_ns, Some(5_000));
         assert_eq!(a.executed_nodes, vec!["relay", "ticker"]);
@@ -1882,7 +1894,7 @@ mod tests {
         // covers to, and its read is present.
         let trimmed = trim_to_anchor(out.records.into_iter(), &cut(3), &nodes());
         assert_eq!(trimmed.last_boundary_target_ns, Some(5_000));
-        assert_eq!(trimmed.first_recorded_step, Some(4));
+        assert_eq!(rank_0_first_step(&trimmed), Some(4));
         assert_eq!(
             trimmed
                 .records
@@ -2232,6 +2244,75 @@ mod tests {
             2,
             "the mutant leaves the first read unattributed"
         );
+    }
+
+    /// A capture whose window head reopened every writer run: the first kept
+    /// read of each site is already the reopen annotation, here with the body
+    /// site's writer switched from 0xA to 0xB at the head, so the trim keeps
+    /// the window's records exactly as pushed, re-states no dropped note and
+    /// names the body read under 0xB. The control drops the two annotations
+    /// and gets two carried notes, so the dropped notes the carry would
+    /// re-state are present in the input.
+    #[test]
+    fn the_trim_carry_adds_nothing_before_an_annotated_first_read() {
+        use cerulion_core::flashback::resim::NamedFrame;
+        use cerulion_core::read_outcome::ReadSiteRole::{Body, Drain};
+        use cerulion_core::trace_ring::{
+            unpack_read_outcome_meta_full, READ_OUTCOME_PRODUCER, STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+        };
+        let dropped = vec![
+            boundary(3, 3_000),
+            note(3, 1, 0, 30, 0xA, Body),
+            served(3, 1, 0, 30, Body),
+            note(3, 1, 0, 31, 0xE, Drain),
+            served(3, 1, 0, 31, Drain),
+            boundary(4, 4_000),
+            served(4, 1, 0, 40, Body),
+        ];
+        let window = vec![
+            TraceRingRecord {
+                global_level: STEP_BOUNDARY_FLAG_RUNS_REOPENED,
+                ..boundary(5, 5_000)
+            },
+            note(5, 1, 0, 50, 0xB, Body),
+            served(5, 1, 0, 50, Body),
+            note(5, 1, 0, 51, 0xE, Drain),
+            served(5, 1, 0, 51, Drain),
+        ];
+        let out = trim_to_anchor(
+            dropped.iter().chain(window.iter()).copied(),
+            &cut(4),
+            &nodes(),
+        );
+        assert_eq!(out.records, window, "no carried note, nothing reordered");
+        assert_eq!(out.discarded, 7, "steps 3 and 4 hold seven records");
+        let named = |step, writer, sequence| NamedFrame {
+            step,
+            writer,
+            sequence,
+        };
+        assert_eq!(out.named_frames, vec![named(5, 0xB, 50), named(5, 0xE, 51)]);
+
+        let unannotated: Vec<TraceRingRecord> = window
+            .iter()
+            .filter(|r| {
+                r.record_type != cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+                    || unpack_read_outcome_meta_full(r.global_level).1 != READ_OUTCOME_PRODUCER
+            })
+            .copied()
+            .collect();
+        assert_eq!(unannotated.len(), 3, "premise: the two notes are removed");
+        let control = trim_to_anchor(dropped.into_iter().chain(unannotated), &cut(4), &nodes());
+        let carried: Vec<(u64, u64)> = control
+            .records
+            .iter()
+            .filter(|r| {
+                r.record_type == cerulion_core::trace_ring::RECORD_TYPE_READ_OUTCOME
+                    && unpack_read_outcome_meta_full(r.global_level).1 == READ_OUTCOME_PRODUCER
+            })
+            .map(|r| (r.duration_ns, r.fire_time_ns))
+            .collect();
+        assert_eq!(carried, vec![(0xA, 50), (0xE, 51)]);
     }
 
     /// The walk names every frame a kept read consumed under the writer its

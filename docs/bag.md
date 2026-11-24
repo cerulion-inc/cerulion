@@ -1123,15 +1123,21 @@ never as clean coverage.
 ## The replay contract a bag declares
 
 A replay-grade bag (`cerulion graph run --record`) declares, in
-`__cerulion/recorder.json`, the three things re-execution must not guess: the
-trace stream's FORMAT, the run's COORDINATION contract and which nodes ran as
-DRIVERS.
+`__cerulion/recorder.json`, the four things re-execution must not guess: the
+trace stream's FORMAT, the run's COORDINATION contract, which nodes ran as
+DRIVERS and how each input queued its frames.
 
 | Key | Answers |
 |---|---|
 | `trace_format` | "Can this binary decode my trace records at all?" A reader refuses a bag stamped ABOVE its own supported version, rather than decoding a stream it does not understand |
 | `coordination` | "Which execution contract was I recorded under?": `lockstep` or `free_run` |
 | `node_external` | "Which of my nodes ran as `external` (driver) nodes?": a map of node id to `true` or `false`, one entry for every node of the recorded graph but its `ros2:` entries, `true` where the loaded node declared the `external` policy. A resim judges drivers by it and refuses a build that declares any node differently (exit 2, naming each node). ABSENT on a bag recorded before the key existed: the build you replay declares the drivers, and a warning says so. A value that is not such a map (`null` included), or one that names a node the embedded graph does not run or leaves one out, is refused with exit 2. A Cerulion older than the key reads the bag and ignores it |
+| `node_inputs` | "How did each of my inputs queue its frames?": a map of node id to a map of input name to `{"backpressure": ..., "depth": ...}`, one entry for every node of the recorded graph but its `ros2:` entries, holding every input the graph wires it. `backpressure` is `block`, `drop_oldest` or `sample(N)` and `depth` the queue depth, as the run read the input: the graph's `backpressure:` and `depth:` keys where it sets them, the node's `#[input]` declaration otherwise. A `--verify` resim allows for a `block` input holding its producer only where this map names the input `block` at the depth the build you replay gives it; any other input's slot is judged as if nothing held its producer. ABSENT on a bag recorded before the key: a `block` input counts only where the embedded graph sets both `backpressure: block` and `depth:` for it. A value that is not such a map counts as absent. A Cerulion older than the key reads the bag and ignores it |
+
+`recorder.json` also carries `env_names_left_out`: how many environment
+variables the bag's `env.json` left out because their name is not valid UTF-8,
+`0` when none was. It is data, not part of the contract: a replay does not read
+it. A bag recorded before the count has no such key.
 
 ### The `coordination` contract, and what each reading does
 
@@ -1159,12 +1165,12 @@ describe current behaviour.
 
 
 **A stamp never under-claims, which means every bag this build writes with a
-`recorder.json` stamps 10.** (A bag with no recorder attachment carries no
-stamp at all and reads as the "absent" row above, not as a 10; a
+`recorder.json` stamps 12.** (A bag with no recorder attachment carries no
+stamp at all and reads as the "absent" row above, not as a 12; a
 `cerulion bag record` without `--run` pushes none.) The rule: a
 bag is stamped at whatever format a reader needs in order to decode everything
-in it. Six encodings set the number; the last three, read identity, batch
-frames and checkpoint stops, have their own sections below. Every kind-6 record carries a
+in it. Eight encodings set the number; the last five, read identity, batch
+frames, checkpoint stops, window heads and node stops, have their own sections below. Every kind-6 record carries a
 READ-SITE ROLE (`ReadSiteRole`, bits 14..16 of the record's meta word), and
 reading those bits as roles is exactly what `trace_format` 5 means. The
 recorder also FOLDS a run of consecutive identical reads into one counted
@@ -1175,15 +1181,21 @@ role on a `none` record as that empty consult is what `trace_format` 7 means,
 and producer annotations on every edge (before every read of a multi-writer
 edge, once per writer run on a single-writer one) are what `trace_format` 8
 means, a `batch_frame` record for each frame a multi-frame read consumed
-besides the one it served is what `trace_format` 9 means, and a stopped flag in
+besides the one it served is what `trace_format` 9 means, a stopped flag in
 every complete checkpoint part of a node the scheduler had stopped is what
-`trace_format` 10 means.
+`trace_format` 10 means, a writer annotation at every read site's first
+read that serves a frame after each checkpoint, with bit 0 of the next step
+boundary's
+`global_level` saying so, is what `trace_format` 11 means, and a NODE-STOP
+record (record kind 7) after every fire that stopped its node is what
+`trace_format` 12 means.
 (The one empty consult it does not record is a burst's between-fires refill,
 whose empty answer ends a burst a replay does not re-derive.) Every bag this
 binary writes is a format-7 bag, lockstep or free-run, folding on or off (a
 fold-off stream's run words are structurally zero, which a format-7 reader
 decodes as one occurrence each), since read identity every such bag is
-format 8, since batch frames format 9, and since checkpoint stops format 10. A bag
+format 8, since batch frames format 9, since checkpoint stops format 10,
+since window heads format 11, and since node stops format 12. A bag
 stamped 3 or 4 was recorded before the role bits existed: 4 when it is free-run
 or its trace carries something a format-3 reader cannot decode, else 3. This
 build writes neither.
@@ -1222,7 +1234,9 @@ that site up to the next annotation was served by that writer. A read site is
 the node body's reads, or the scheduler's trigger drain and `Sync` peek
 together, so a reader that splits an input's records by site finds each read's
 annotation in its own split. A single-writer edge therefore carries one
-annotation per read site for the whole recording. Before format 8 only
+annotation per read site per checkpoint window: the recording's first window,
+and from format 11 each window that begins after a checkpoint (see "Window
+heads" below). Before format 8 only
 multi-writer edges carried the annotation. A reader below 8 decodes such a
 stream (it strips annotations before comparing) but would replay it by
 re-creating each consumer's queue, so the stamp moves and that reader refuses
@@ -1247,8 +1261,8 @@ stamp moves and that reader refuses the bag. A replay of a bag below format 9
 stages no `batch_frame` record either, as its recorder staged none, so the two
 read logs hold the same positions.
 
-On a single-writer edge the read log grows by one record per read site for the
-whole recording, and its stage holds its plain bound plus two records (one
+On a single-writer edge the read log grows by one record per read site per
+checkpoint window, and its stage holds its plain bound plus two records (one
 run-opening annotation per read site); a read of the run equal to the run's
 first read folds into it. A multi-writer edge's records and its stage's pair
 factor of two are what they were before format 8, so a replay of any bag
@@ -1296,13 +1310,55 @@ the bag's frames are walked (exit 2, `read_identity_feed_index_budget`), naming
 the bytes the reads need, the frame identities and labels they are charged for,
 the budget and the flag.
 
+A replay of a free-run recording also holds in memory, for each rank (one
+process or executor unit of the recording), the rank's reads, a folded record
+of N identical reads counting N, and the recorded frames with a wire header on
+the topics the rank consumes, up to the verifier's budget of 200000 of each.
+Both cover the whole recording, whatever `--duration` bounds. A lockstep
+recording replays on its one gating clock and plans no read from the bag, so
+neither budget limits its replay; the 200000 recorded frames that attributing
+a `multi_publisher_topics` topic's frames to their writers needs, above, apply
+to it as to any replay. A free-run rank over a budget is refused only where
+the replay feeds or gates its recorded reads:
+
+- A `--verify` of a recording at `trace_format` 8 or later feeds every read,
+  as above, so a rank that consumes any topic is refused (exit 2): over the
+  reads before the replay's first step, with `read_identity_unplanned`, and
+  over the frames before the rank's first step, with
+  `read_log_budget_declined`.
+- Any other replay of a free-run recording, a resim without `--verify` or a
+  `--verify` of a recording below `trace_format` 8, gates only the reads of a
+  topic that one rank both produces and consumes and no other rank writes,
+  such as a topic inside a `process_groups:` group holding its producer and
+  its consumer. A rank that consumes such a topic is refused before its first
+  step (exit 2, `read_log_budget_declined`).
+
+Neither refuses a rank over the frames when the recording holds no read of
+that rank. A rank that is not refused runs, and a warning names the count and
+the budget. Its re-derivation verdict stands down with a note that names the
+cause (`verifier_declined_read_log_budget` or
+`verifier_declined_frame_index_budget`) and the count, and where it injects
+recorded topics, they fall back to the recorded-clock injection window, so the
+frame comparison on the topics it produces is declined, neither passed nor
+failed (`declined_frame_comparisons`). The read-log verifier still compares
+the rank's reads with the recording, so under `--verify` a read the fallback
+moves is reported as an edge-read difference (exit 6).
+
+A refusal names how many reads or frames the rank holds and the budget. A read
+refusal also names the step of the first read past the budget and that step's
+time into the rank's recording, counted from the rank's first step in the bag,
+so on a bag that begins mid-run it is time into the bag, not into the run. The
+remedy it names is a shorter recording: the longest that fits is about the
+budget divided by the rank's reads per second, or by the frames per second on
+the topics it consumes, whichever is reached first.
+
 What cannot be fed is refused by name before the first step (exit 2), with the
 node, the input, the writer and the sequence:
 
 | Cause (`--report` code) | Meaning |
 |---|---|
 | `read_identity_frame_missing` | The bag holds no frame of that writer at that sequence: the recorder lost it |
-| `read_identity_absent` | A read popped frames and no annotation named their writer, or a read or a `batch_frame` record on a multi-writer edge carries no annotation of its own |
+| `read_identity_absent` | A read popped frames and no annotation named their writer, or a read or a `batch_frame` record on a multi-writer edge carries no annotation of its own. On a bag recorded below format 11 that begins mid-run, the message says the read continues a writer run the bag does not hold and to record the run again |
 | `read_identity_writers_indistinguishable` | Several recorded frames carry one writer and one sequence; a gateway that republishes several remote writers under its own port produces this |
 | `read_identity_batch_unattributed` | A read popped several frames and the recording does not name each one: a bag recorded below format 9, or a batch deeper than its read stage's window, names only the newest |
 | `read_identity_batch_miscounted` | The recording names more frames for a read than it popped: a `batch_frame` record before it belongs to no frame it consumed |
@@ -1333,11 +1389,13 @@ fed:
   any bag a batch deeper than its read stage's window
   (`read_identity_batch_unattributed`): the read names only its newest frame.
 - A bag that starts mid-run (a `bag record --run` attach, a lapped ring, a
-  Flashback window): on a free-run bag with one worker rank, a read that
-  continues a writer run begun before the bag's first step names no writer
-  (`read_identity_absent`). A free-run bag with several worker ranks is refused
-  by every replay, `--resim all` included, since per-rank resume anchors are
-  not supported.
+  Flashback window) and was recorded below format 11: on a free-run bag with
+  one worker rank, a read that continues a writer run begun before the bag's
+  first step names no writer (`read_identity_absent`), and the message says to
+  record the run again. From format 11 a bag that begins at a checkpoint names
+  the writer of every read in it and is fed. A free-run bag with several worker
+  ranks is refused by every replay, `--resim all` included, since per-rank
+  resume anchors are not supported.
 
  Replay such a bag with `--resim all` and no
 `--verify`, which re-creates each consumer's queue and labels its reads best
@@ -1391,6 +1449,87 @@ bits, which this build reads past; a change to what they mean for a resim
 comes with a new `trace_format`, which this build refuses with "upgrade to
 replay it".
 
+### Window heads (`trace_format` 11)
+
+At the end of every step a checkpoint is due at, the recorder reopens every
+read site's writer run, so each site's first read that serves a frame in the
+next checkpoint window stages its writer's annotation again, and the next
+step's STEP_BOUNDARY record sets bit 0 of its `global_level`
+(`STEP_BOUNDARY_FLAG_RUNS_REOPENED`). A bag that begins at a checkpoint, such as
+a Flashback capture whose window starts after the run's first reads, therefore
+names the writer of every read it holds, and `--verify` feeds a free-run bag of
+one worker rank that begins mid-run by read identity. A replay reopens its own
+read stages before the step whose recorded boundary sets the bit (in a lockstep
+bag, the nodes of the rank whose boundary sets it), so its stages hold the same
+records as the recording's at each window head. A bag stamped 11 or later
+whose boundary sets any other bit is refused before the first step (`bag
+internal consistency check failed`, exit 2). A reader below 11 never reopens
+its stages and does not read the bit, so the stamp moves and that reader
+refuses the bag.
+
+Two limits that held only in a recording's first window now hold at every
+checkpoint window, on bags recorded from the start too. A writer switch on a
+single-writer edge opens a third run in a window whose two read sites already
+opened, and a stage near its rim drops that annotation and its read as one
+pair. The overflow marker it leaves refuses every free-run replay whose read
+gate drives that stage before its first step, `--resim all` included
+(`read_log_record_dropped`, exit 2). A multi-frame read whose frames do not
+fit below the rim after the window's openings names only its newest frame,
+which `--verify` refuses (`read_identity_batch_unattributed`, exit 2).
+
+### Node stops (`trace_format` 12)
+
+A format 12 recording holds every stop the scheduler made: the fire that
+stopped a node (a `NodeError::Fatal` return, a tick panic or a node entry found
+poisoned, or the consecutive-panic breaker) is followed, on its rank's trace
+ring, by a NODE-STOP record, record kind 7 in the 40-byte layout. Its `step`,
+`fire_time_ns`, `node_idx` and `global_level` are those of the stopping fire,
+`duration_ns` is the cause (`1` fatal error, `2` entry poisoned, `3` disabled
+after consecutive panics) and `reserved` carries the rank. The stop's position
+in its step's burst is the number of that node's FIRE records of the step on
+its rank up to the stop record. A node stopped by a fatal error or by the
+breaker fires no more; a poisoned node keeps firing with its tick skipped, so
+its FIRE records go on after its stop record.
+
+A resim of a format 12 bag holds each re-executed stop to the recorded one at
+every step it executes. A stop at another fire of the burst or for another
+cause, a recorded stop the re-execution does not make, and a re-executed stop
+the recording does not hold are each a fire-schedule difference (exit 6 under
+`--verify`), reported when the fire comparison finds no other difference, as
+in `fire-schedule divergence: rank 0 step 4: the recording stops node 'sink' at
+its fire 1 of the step (returned_fatal_error), and this re-execution does not
+stop it there`. The schedule check judges each node by its recorded stop, so
+it owes a node no fire after a recorded fatal or breaker stop whether or not
+the re-execution stops it. The stops of an `external` (driver) node are not
+compared, because a resim never gives a driver its device. A stop the resim
+makes in a short rank's tolerated ragged tail is tolerated with the re-fire
+that made it, under the same window as the fire comparison.
+
+A NODE-STOP record whose cause is none of the three is refused (exit 2). In a
+bag stamped past the formats this build reads, a newer or foreign writer added
+the cause, and the resim refuses it as it refuses an unknown record kind,
+saying to upgrade cerulion. In a bag stamped 12 or below, the cause cannot be
+a newer writer's, since a format at or below this build's defines no other
+cause, so the bag is corrupt (`bag internal consistency check failed`).
+A Flashback capture that holds one is not resimmable, and its
+`anchor.resimmable_reason` reads the capture's own stamp the same way: a newer
+or foreign writer's cause, with the upgrade remedy, past the formats this
+build reads, and a corrupt trace at 12 or below.
+Four more stop records are refused before the first replayed step as a
+corrupt bag (`bag internal consistency check failed`, exit 2): one stamped
+with a rank the bag has no trace manifest for, and three shapes no recorder
+writes: a stop record that does not directly follow, on its own rank, the
+FIRE record of the fire that stopped its node; a second stop record of a node
+that already stopped; and a stop record in a bag stamped below 12 or with no
+trace format stamp.
+
+Below 12 the trace holds no stop record, and a resim judges stops as before:
+by the re-execution, and by the checkpoint a resumed bag begins at. A reader
+below 12 does not define record kind 7: its record walk, which runs before its
+version gate, refuses the first stop record as an unknown record kind (exit 2,
+saying to upgrade cerulion), and its version gate refuses a format 12 bag that
+holds no stop record.
+
 ### The kind-6 annotations ride INSIDE the record kind
 
 The read log's two annotation kinds, the OVERFLOW MARKER (outcome kind **6**)
@@ -1398,8 +1537,9 @@ and the PRODUCER TOKEN (outcome kind **7**), are *outcome* kinds in the low
 half of a READ-OUTCOME record's packed field. They are **not record types of their own**,
 and that encoding has two consequences:
 
-- the record-type gate hard-refuses record kinds ≥ 7 **regardless of the
-  stamp**, so a record type of their own would push every marker-bearing or
+- the record-type gate hard-refuses every record kind it does not define
+  (4, 5 and from 8 on) **regardless of the stamp**, so a record type of their
+  own would push every marker-bearing or
   token-bearing LOCKSTEP bag up a format. A format bump is for a WIRE change,
   which is what the role bits and run folding each are; an annotation a reader
   can pass through is not one;
@@ -1557,3 +1697,4 @@ holding those `.msg` files, or point `DDS_BRIDGE_CONFIG` at a config whose
 | **With discovery OFF** (which is `cerulion bag record` always, and any recorder run under `CERULION_RECORD_DISCOVERY=off`), a topic that appears mid-recording is neither recorded NOR named | `bag record` sets `discover_live = false` (it owns its own selection policy), and that flag short-circuits discovery entirely, so nothing is watching for the topic and there is nothing to write into `untapped` either. The bag records `enumerated: false`, which is the accurate form of "nobody looked", but it cannot name what it did not look for | Nothing widens a window that is not open. Re-run the capture with the producer already live, or use `graph run --record` (where discovery is on) if you need the recorder to pick up producers that register after it arms. `--discovery-settle-ms` is **inert** here: the hold is released immediately when discovery is off |
 | A non-finalized bag cannot be played | The zero-copy frame walk needs the summary footer | None: only a finalized bag is playable |
 | A type NEITHER this machine NOR the bag defines still renders nothing | Nothing anywhere knows it: the bag can only carry what its recording machine could resolve | Re-record from a workspace that holds the `.msg` files |
+| A replay of a free-run recording holds each rank's reads and the recorded frames it consumes in memory, up to 200000 of each, so over either a rank whose recorded reads it feeds or gates is refused (exit 2) before its first step, and any other rank runs with its re-derivation verdict stood down. A lockstep recording is not limited | The replay plans those reads from the whole recording before the first step, so it holds both whole; `--duration` shortens neither. A lockstep replay plans no read from the bag | Replay a shorter recording. The refusal names the count, the budget and, for the reads, the step and time at which the rank ran past it; the longest recording that fits is about the budget divided by the rank's reads, or consumed frames, per second. Which ranks a replay feeds or gates is under "Read identity" above |
