@@ -781,6 +781,7 @@ pub(crate) fn report_forge_clean(latch: &Mutex<FailureRegimeLatch>, topic: &str)
 /// and released the borrow. The take succeeded with the published contents;
 /// what the operator learns is that this consumer retains loans and is paying
 /// a copy for every take past them.
+#[cold]
 pub(crate) fn report_loan_copied(
     latch: &Mutex<FailureRegimeLatch>,
     topic: &str,
@@ -854,6 +855,7 @@ pub(crate) fn report_loan_copied(
 /// consumer that keeps the newest N messages alternates zero-copy takes and
 /// copies for as long as it runs, and closing on each zero-copy take would
 /// print a loud head and a recovery line every few messages.
+#[cold]
 pub(crate) fn report_loan_served_zero_copy(latch: &Mutex<FailureRegimeLatch>, topic: &str) {
     let (recovered, total) = observe_success(latch);
     if let Some(suppressed) = recovered {

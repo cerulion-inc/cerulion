@@ -912,6 +912,12 @@ pub struct SubscriptionInner {
     /// `pending_takes` alone. Returned through the same call as a loan;
     /// dropped (freed) at subscription destroy.
     pub copied_takes: Vec<CopiedTake>,
+    /// Whether the served-by-copy regime is open: set by a take served by
+    /// copy, cleared by the first take served zero-copy with no copy
+    /// outstanding, which is the only take that reports to the copy latch's
+    /// success side. A zero-copy take while it is clear touches no copy
+    /// bookkeeping at all.
+    pub copy_regime_open: bool,
     /// The recyclable shadow messages the forged take hands
     /// out, sized to the loan budget. Empty (nothing built) until the first
     /// forged take; never touched by a fixed type's take.

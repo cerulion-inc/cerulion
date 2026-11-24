@@ -2687,6 +2687,7 @@ pub unsafe extern "C" fn rmw_create_subscription(
                 // Takes served by copy past that reserve; empty (and
                 // unallocated) until a consumer retains loans.
                 copied_takes: Vec::new(),
+                copy_regime_open: false,
                 // Shadows for the forged take, built lazily
                 // up to the loan budget and then recycled (see
                 // `TakeShadowPool`); a fixed type never touches it.
@@ -4100,6 +4101,33 @@ pub unsafe extern "C" fn rmw_take_sequence(
     })
 }
 
+/// Report the served-by-copy regime to its latch, under its own panic guard: a
+/// copy opens or repeats it, otherwise this take closes it (the recovery line
+/// prints when anything was suppressed). Out of line and cold: the common
+/// zero-copy take never calls it. A panic comes back as `Err` so the caller
+/// untracks the take, as it does for the serve report.
+#[cold]
+#[inline(never)]
+fn report_copy_regime(
+    data: &SubscriptionData,
+    by_copy: bool,
+    held_loans: usize,
+    ceiling: usize,
+) -> std::thread::Result<()> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if by_copy {
+            crate::loan_refusal_latch::report_loan_copied(
+                &data.loan_copies,
+                &data.topic,
+                held_loans,
+                ceiling,
+            );
+        } else {
+            crate::loan_refusal_latch::report_loan_served_zero_copy(&data.loan_copies, &data.topic);
+        }
+    }))
+}
+
 /// Track a take served by copy and return the pointer handed to the caller
 /// (the copy's own address, so it is the return's key).
 fn hold_copy(inner: &mut SubscriptionInner, copy: runtime::TakeCopy) -> *mut c_void {
@@ -4568,29 +4596,33 @@ unsafe fn take_loaned_impl(
     // Read before the guarded window: a zero-copy take closes the
     // served-by-copy regime only once no copy is outstanding (see
     // `report_loan_served_zero_copy`).
-    let copies_outstanding = !inner.copied_takes.is_empty();
+    // The served-by-copy regime: a copy opens (or repeats) it, and the first
+    // take served zero-copy with no copy outstanding closes it. Only those two
+    // takes report to the copy latch; every other zero-copy take skips it.
+    let close_copy_regime = !by_copy && inner.copy_regime_open && inner.copied_takes.is_empty();
+    if by_copy {
+        inner.copy_regime_open = true;
+    } else if close_copy_regime {
+        inner.copy_regime_open = false;
+    }
     let served = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::loan_refusal_latch::report_loan_served(
             &data.loan_refusals,
             &data.topic,
             crate::loan_refusal_latch::LoanServed::Loaned,
         );
-        // The served-by-copy regime: opened (or repeated) by a copy, closed
-        // by a take served zero-copy with no copy outstanding.
-        if by_copy {
-            crate::loan_refusal_latch::report_loan_copied(
-                &data.loan_copies,
-                &data.topic,
-                held_loans,
-                ceiling,
-            );
-        } else if !copies_outstanding {
-            crate::loan_refusal_latch::report_loan_served_zero_copy(&data.loan_copies, &data.topic);
-        }
         // The seam travels WITH this reporter, inside the guarded window.
         #[cfg(feature = "test-seams")]
         crate::test_seams::maybe_panic_in_loaned_serve_report();
     }));
+    // The copy-regime report runs under its own guard, out of line, so the
+    // common take's guarded window is the single reporter call it always was.
+    let served = match served {
+        Ok(()) if by_copy || close_copy_regime => {
+            report_copy_regime(data, by_copy, held_loans, ceiling)
+        }
+        other => other,
+    };
     if let Err(payload) = served {
         // Dropping the entry releases the borrow (and its shadow), or frees
         // the copy.

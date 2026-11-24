@@ -850,6 +850,86 @@ fn fixed_takes_past_the_reserve_are_served_by_copy_counted_always_and_recover() 
 /// and its four bytes.
 type ServedBlob = (u32, bool, [u8; 4]);
 
+/// The copy regime closes and opens again. Regime 1: three zero-copy loans
+/// held, then two copies (one WARN head, one suppressed repeat); both copies
+/// and a loan returned, the next take is zero-copy and closes it (one INFO
+/// recovery, which prints because a repeat was suppressed). Regime 2 repeats
+/// the same shape: a second WARN head (the recovery re-armed the latch) and a
+/// second recovery. A zero-copy take while no regime is open reports nothing.
+#[test]
+#[serial]
+#[traced_test]
+fn the_copy_regime_closes_and_opens_again_with_one_head_and_one_recovery_each() {
+    unsafe {
+        let suffix = unique_suffix();
+        let ts = point_ts(&format!("PtRe{suffix}"));
+        let (node, publisher, subscription, _topic) = setup_pair(ts, "pt_reopen", suffix);
+        let mut held = Vec::new();
+        let mut next = 0;
+        let mut take = |want_zero_copy: bool, held: &mut Vec<*mut c_void>| {
+            let p = publish_and_take_point(publisher, subscription, next);
+            assert_eq!(
+                is_zero_copy(subscription, p),
+                want_zero_copy,
+                "point {next}: zero-copy {want_zero_copy}"
+            );
+            next += 1;
+            held.push(p);
+        };
+        let give_back = |held: &mut Vec<*mut c_void>, index: usize| {
+            let p = held.remove(index);
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        };
+        for _ in 0..3 {
+            take(true, &mut held);
+        }
+        for _regime in 0..2 {
+            take(false, &mut held);
+            take(false, &mut held);
+            // The two copies sit last; give them back, then the oldest loan.
+            let last = held.len() - 1;
+            give_back(&mut held, last);
+            let last = held.len() - 1;
+            give_back(&mut held, last);
+            give_back(&mut held, 0);
+            // Below the reserve with no copy outstanding: zero-copy, closing it.
+            take(true, &mut held);
+        }
+        give_back(&mut held, 0);
+        take(true, &mut held);
+        assert_eq!(copy_count(subscription), 4, "two copies in each regime");
+
+        logs_assert(|lines: &[&str]| {
+            let heads = count_at_exclusively(lines, "WARN", &[COPY_LOUD])?;
+            let recoveries = count_at_exclusively(lines, "INFO", &[COPY_RECOVERY])?;
+            if heads != 2 {
+                return Err(format!(
+                    "expected 2 WARN heads (one per regime), got {heads}"
+                ));
+            }
+            if recoveries != 2 {
+                return Err(format!(
+                    "expected 2 INFO recoveries (one per regime), got {recoveries}"
+                ));
+            }
+            Ok(())
+        });
+
+        for p in held {
+            assert_eq!(
+                rmw_return_loaned_message_from_subscription(subscription, p),
+                RMW_RET_OK
+            );
+        }
+        assert_eq!(rmw_destroy_subscription(node, subscription), RMW_RET_OK);
+        assert_eq!(rmw_destroy_publisher(node, publisher), RMW_RET_OK);
+        assert_eq!(rmw_destroy_node(node), RMW_RET_OK);
+    }
+}
+
 /// Run the fixed sequence on a fresh topic: six takes held, a copy and a
 /// zero-copy loan returned, two takes more. Returns what was served and the
 /// final copy and refusal counts.
