@@ -1862,6 +1862,19 @@ fn regenerate_info_block_with_port_schemas(
     Ok(result)
 }
 
+/// Why a Python node declaration that carries `publisher_for_every_output` is
+/// refused: only the `#[cerulion_node]` macro sets that key.
+const PYTHON_PUBLISHER_KEY_REFUSAL: &str = "`publisher_for_every_output` is set by the \
+     `#[cerulion_node]` macro and cannot appear in a Python node declaration";
+
+/// The refusal of a Python node declaration that sets a key only the
+/// `#[cerulion_node]` macro sets, or `None` when it sets none.
+fn python_declaration_refusal(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("publisher_for_every_output")
+        .map(|_| PYTHON_PUBLISHER_KEY_REFUSAL.to_string())
+}
+
 /// Moves each port's `schema` name out of the Python info document: the
 /// runtime reads the rest as INFO_BYTES, `node_metadata` reads the names from
 /// the `CERULION:PORT_SCHEMAS` line.
@@ -2121,6 +2134,12 @@ if write_workspace_stubs is not None:
             target: node_type.to_string(),
             reason: "python metadata generation produced invalid JSON: expected object with inputs and outputs arrays"
                 .to_string(),
+        });
+    }
+    if let Some(reason) = python_declaration_refusal(&value) {
+        return Err(CliError::BuildFailed {
+            target: node_type.to_string(),
+            reason,
         });
     }
     let (info_json, port_schemas) =
@@ -2642,6 +2661,29 @@ mod tests {
         let none: serde_json::Value =
             serde_json::from_str(r#"{"inputs":["inp"],"outputs":[]}"#).unwrap();
         assert_eq!(split_port_schemas(none).unwrap().1, None);
+    }
+
+    #[test]
+    fn a_python_declaration_that_sets_publisher_for_every_output_is_refused() {
+        let declaration = |key: &str| {
+            serde_json::from_str::<serde_json::Value>(&format!(
+                r#"{{"inputs":[],"outputs":[{{"name":"out","schema_hash":7}}]{key}}}"#
+            ))
+            .unwrap()
+        };
+        let refusal = "`publisher_for_every_output` is set by the `#[cerulion_node]` macro and \
+                       cannot appear in a Python node declaration";
+        for set in [
+            r#","publisher_for_every_output":true"#,
+            r#","publisher_for_every_output":false"#,
+        ] {
+            assert_eq!(
+                python_declaration_refusal(&declaration(set)).as_deref(),
+                Some(refusal),
+                "{set}"
+            );
+        }
+        assert_eq!(python_declaration_refusal(&declaration("")), None);
     }
 
     #[test]

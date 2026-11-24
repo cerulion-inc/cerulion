@@ -1633,6 +1633,7 @@ fn te(node_id: &str, duration_ns: u64) -> TraceEntry {
         global_level: 0,
         duration_ns,
         discarded: false,
+        stop: None,
     }
 }
 

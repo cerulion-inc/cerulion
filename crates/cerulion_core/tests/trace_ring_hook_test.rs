@@ -169,6 +169,7 @@ fn ring_receives_all_fires_when_in_memory_trace_is_capped() {
             global_level: 0,
             duration_ns: 0,
             discarded: false,
+            stop: None,
         })
         .collect();
     assert_eq!(
@@ -376,6 +377,7 @@ fn recording_on_vs_off_trace_is_byte_identical() {
         global_level: 0,
         duration_ns: 0,
         discarded: false,
+        stop: None,
     };
     let trace_oracle = vec![
         oracle("src", 0, 10_000_000),

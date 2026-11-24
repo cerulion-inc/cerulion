@@ -6,21 +6,37 @@ It replots a committed package. It never runs a benchmark and never edits a pack
 
   docs/media/harness-success-rate.svg       success rate per model, without and with Cerulion
   docs/media/harness-cost-per-success.svg   model cost per successful episode, without and with Cerulion
+  docs/media/harness-results.svg            the README's chart: solved start states per model, without and
+                                            with Cerulion, and the factors in model cost and wall time
+                                            per scored episode
 
 Every count and cost is computed by the package's own recompute.py from the package's CSV files,
 so a figure on a chart is the figure SUMMARY.md prints (cost per success is SUMMARY.md's "USD per
-solved start state"). A chart prints no figure the package does not: no ratio of two of its figures, no
-total it leaves out. Standard library only: the same package gives the same bytes on every machine.
+solved start state"; the README chart's factors are its "cost with Cerulion" and "time with Cerulion"
+columns, from the package's episode_cost_factor() and episode_time_factor()). A chart prints no figure the package does not: no ratio of two of its figures the
+package leaves unprinted, no total it leaves out. Standard library only: the same package gives the same bytes on every machine.
 
-    python3 docs/media/charts/build_harness_charts.py           # write the two SVGs
+    python3 docs/media/charts/build_harness_charts.py           # write the three SVGs
     python3 docs/media/charts/build_harness_charts.py --check   # write nothing; exit 1 if a chart differs
 
-The two SVGs are theme-aware sources (see THEME). After a run, write their fixed-palette twins
+The three SVGs are theme-aware sources (see THEME and RESULTS_THEME). After a run, write their fixed-palette twins
 (docs/media/<name>-light.svg and <name>-dark.svg) with:
 
     python3 tools/scripts/build_media_theme_variants.py
 
-The form of both charts:
+The README's chart (harness-results.svg) has its own form:
+  - the same rows in the same order as the two charts below; the main test's model (the package's
+    MAIN_MODEL, declared before the first episode) on a tinted band;
+  - per model, solved without and with as "a -> b%" (every arm finished all 100 start states, so the
+    count is the percent): a grey bar up to the smaller of the two counts, then a blue bar for the net
+    gain with Cerulion or a hatched bar for the net loss, so the bar ends at the larger count;
+  - two columns of the package's factors per scored episode (episode_cost_factor, episode_time_factor):
+    model cost and wall time, green where the arm with Cerulion is cheaper or faster, red with an up arrow
+    where it is dearer and a down arrow where it is slower;
+  - each maker's mark beside its models (brand_marks.py), the Cerulion lockup, and a dagger on a model whose
+    arm without Cerulion ended scored episodes on replies the provider's content filter stopped.
+
+The form of the two detailed charts:
   - one row per model, ordered by the share of finished episodes solved WITHOUT Cerulion, lowest
     first, ties by name; the same order in both charts; no model is marked for its results; a model
     whose column was added after grid rows had been seen (the package's ADDED_LATE) carries a
@@ -54,6 +70,7 @@ import json
 import os
 import re
 import sys
+import base64
 import textwrap
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
@@ -343,6 +360,164 @@ def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd, filtered)
                  ticks, [parts_for(r) for r in rows], footer)
 
 
+# The README's chart, 1080 by 1350. Colours as in THEME: light values in
+# `:root`, dark in one `prefers-color-scheme: dark` block; the two Cerulion lockups (the committed light and
+# dark twins, their animation off) swap by `display`.
+RESULTS_THEME = [  # (custom property, light, dark)
+    ("r-paper", "#ffffff", "#0d1117"),
+    ("r-ink", "#0f1419", "#e6edf3"),
+    ("r-muted", "#6b7280", "#9198a1"),
+    ("r-shared", "#8c8c8c", "#6e7681"),   # up to the smaller count
+    ("r-gain", "#2b7bd8", "#4a8fe6"),     # gained with Cerulion, and the hatch of those lost
+    ("r-better", "#1d7f56", "#3fb950"),   # cheaper or faster with Cerulion
+    ("r-worse", "#c62828", "#f85149"),    # dearer or slower with Cerulion
+    ("r-band", "#eef4fc", "#152133"),     # the main test's row
+    ("r-axis", "#9ca3af", "#3d444d"),
+    ("r-logo-light", "inline", "none"),
+    ("r-logo-dark", "none", "inline"),
+]
+R_FONT = "Inter, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif"
+R_W, R_H = 1080, 1350
+R_X0, R_PER = 321, 3.70     # x of the zero line; width of one start state
+R_COST_X, R_TIME_X = 905, 1043   # right edges of the cost and the time columns
+R_TOP, R_PITCH, R_BH = 335, 60, 27
+R_STILL = ".identity{animation:none !important;opacity:1 !important} .sheen{display:none !important} " \
+          "*{animation:none !important}"
+
+
+def r_var(name):
+    return f"var(--r-{name})"
+
+
+def results_style():
+    light = ";".join(f"--{name}:{value}" for name, value, _ in RESULTS_THEME)
+    dark = ";".join(f"--{name}:{value}" for name, _, value in RESULTS_THEME)
+    return f"<style>:root{{{light}}}@media(prefers-color-scheme:dark){{:root{{{dark}}}}}</style>"
+
+
+def still_lockup(theme):
+    """The committed Cerulion lockup twin for one theme, its animation off, as a data URI."""
+    with open(os.path.join(MEDIA, f"cerulion-logo-{theme}.svg"), encoding="utf-8") as fh:
+        svg = fh.read()
+    if svg.count("</style>") != 1:
+        raise SystemExit(f"build_harness_charts: cerulion-logo-{theme}.svg no longer has one <style> to still")
+    svg = svg.replace("</style>", R_STILL + "</style>", 1)
+    return "data:image/svg+xml;base64," + base64.b64encode(svg.encode("utf-8")).decode("ascii")
+
+
+def maker_mark(model, cy, marks):
+    """A model maker's mark at the name's right, inside a `data-mark` group: the only colours outside
+    RESULTS_THEME, the makers' own."""
+    if model.startswith("GPT"):
+        body = (f'<svg x="275" y="{cy - 15}" width="30" height="30" viewBox="0 0 24 24" '
+                f'style="fill:{r_var("ink")}">{marks.OPENAI}</svg>')
+        name = "openai"
+    elif model.startswith("Claude"):
+        body = (f'<svg x="275" y="{cy - 15}" width="30" height="30" viewBox="0 0 24 24" '
+                f'fill="{marks.CLAUDE_FILL}">{marks.CLAUDE}</svg>')
+        name = "claude"
+    elif model.startswith("Gemini"):
+        body = f'<svg x="275" y="{cy - 15}" width="30" height="30" viewBox="0 0 24 24">{marks.GOOGLE}</svg>'
+        name = "google"
+    elif model.startswith("Grok"):
+        body = (f'<svg x="271" y="{cy - 7}" width="38" height="14.5" viewBox="{marks.XAI_VIEWBOX}" '
+                f'style="fill:{r_var("ink")}"><path d="{marks.XAI}"/></svg>')
+        name = "xai"
+    else:
+        raise SystemExit(f"build_harness_charts: no maker's mark for {model}")
+    return f'<g data-mark="{name}">{body}</g>'
+
+
+def results_chart(rows, cols, rc, filtered, cells):
+    spec = importlib.util.spec_from_file_location(
+        "harness_brand_marks", os.path.join(os.path.dirname(os.path.abspath(__file__)), "brand_marks.py"))
+    marks = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(marks)
+    factor = {c.model: (rc.episode_cost_factor(c), rc.episode_time_factor(c)) for c in cols}
+    cut = {c.model for c, arm, f in filtered if arm == "without" and f["ended"]}
+    ink, muted = r_var("ink"), r_var("muted")
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{R_W}" height="{R_H}" viewBox="0 0 {R_W} {R_H}" '
+         f'font-family="{R_FONT}" role="img" aria-label="Robot task success rate, without and with {NAME}, for '
+         f'{len(rows)} models on the LIBERO-PRO benchmark">',
+         results_style(),
+         f'<defs><pattern id="lost" patternUnits="userSpaceOnUse" width="7" height="7" patternTransform="rotate(45)">'
+         f'<rect width="7" height="7" style="fill:{r_var("paper")}"/>'
+         f'<rect width="3.2" height="7" style="fill:{r_var("gain")}"/></pattern></defs>',
+         f'<rect width="{R_W}" height="{R_H}" style="fill:{r_var("paper")}"/>',
+         f'<text x="37" y="82" font-size="47" font-weight="700" style="fill:{ink}" letter-spacing="-0.5">'
+         f'Robot task success rate,</text>',
+         f'<text x="37" y="139" font-size="47" font-weight="700" style="fill:{ink}" letter-spacing="-0.5">'
+         f'without and with {NAME}</text>']
+    for theme in ("light", "dark"):
+        o.append(f'<image x="790" y="37" width="262" height="62" style="display:{r_var("logo-" + theme)}" '
+                 f'href="{still_lockup(theme)}"/>')
+    o.append(f'<text x="37" y="186" font-size="25" style="fill:{muted}">LIBERO-PRO benchmark \u00b7 the same '
+             f'{cells} new simulated start states per model</text>')
+    ly = 218
+    o += [f'<rect x="37" y="{ly}" width="24" height="20" rx="4" style="fill:{r_var("shared")}"/>'
+          f'<text x="73" y="{ly + 18}" font-size="24" style="fill:{ink}">without</text>',
+          f'<rect x="202" y="{ly}" width="24" height="20" rx="4" style="fill:{r_var("gain")}"/>'
+          f'<text x="238" y="{ly + 18}" font-size="24" style="fill:{ink}">gained with {NAME}</text>',
+          f'<rect x="518" y="{ly}" width="24" height="20" rx="4" style="fill:url(#lost);stroke:{r_var("gain")}" '
+          f'stroke-width="1.5"/><text x="554" y="{ly + 18}" font-size="24" style="fill:{ink}">lost</text>',
+          f'<text x="{R_COST_X}" y="297" font-size="22" font-weight="700" style="fill:{ink}" text-anchor="end">'
+          f'\u00d7 cheaper</text>',
+          f'<text x="{R_TIME_X}" y="297" font-size="22" font-weight="700" style="fill:{ink}" text-anchor="end">'
+          f'\u00d7 faster</text>']
+    top0, bot = R_TOP - R_PITCH / 2 + 8, R_TOP + (len(rows) - 1) * R_PITCH + R_PITCH / 2 - 8
+    for i, r in enumerate(rows):
+        if r["model"] == rc.MAIN_MODEL:
+            o.append(f'<rect x="20" y="{R_TOP + i * R_PITCH - 24}" width="1040" height="48" rx="10" '
+                     f'style="fill:{r_var("band")}"/>')
+    o.append(f'<line x1="{R_X0}" y1="{top0:g}" x2="{R_X0}" y2="{bot:g}" style="stroke:{r_var("axis")}" '
+             f'stroke-width="1.5"/>')
+    for i, r in enumerate(rows):
+        m, cy = r["model"], R_TOP + i * R_PITCH
+        wo, wi = r["without"], r["with"]
+        if wo["finished"] != cells or wi["finished"] != cells:
+            raise SystemExit(f"build_harness_charts: {m} did not finish all {cells} start states in both arms, so a "
+                             f"count is not a percent")
+        a, b = wo["solved"], wi["solved"]
+        bold = ' font-weight="700"' if m == rc.MAIN_MODEL else ""
+        o.append(f'<text x="261" y="{cy + 9}" font-size="25" style="fill:{ink}" text-anchor="end"{bold}>'
+                 f'{esc(m)}{chr(0x2020) if m in cut else ""}</text>')
+        o.append(maker_mark(m, cy, marks))
+        y, lo = cy - R_BH / 2, min(a, b)
+        if lo > 0:
+            o.append(f'<rect x="{R_X0 + 1}" y="{y:g}" width="{lo * R_PER:.1f}" height="{R_BH}" rx="2.5" '
+                     f'style="fill:{r_var("shared")}"/>')
+        gap = 2 if lo > 0 else 0
+        if b > a:
+            o.append(f'<rect x="{R_X0 + 1 + lo * R_PER + gap:.1f}" y="{y:g}" width="{(b - a) * R_PER - gap:.1f}" '
+                     f'height="{R_BH}" rx="2.5" style="fill:{r_var("gain")}"/>')
+        elif a > b:
+            o.append(f'<rect x="{R_X0 + 1 + lo * R_PER + 2:.1f}" y="{y + 0.75:g}" width="{(a - b) * R_PER - 2:.1f}" '
+                     f'height="{R_BH - 1.5:g}" rx="2" style="fill:url(#lost);stroke:{r_var("gain")}" '
+                     f'stroke-width="1.5"/>')
+        end = R_X0 + 1 + max(a, b) * R_PER + 13
+        o.append(f'<text x="{end:.1f}" y="{cy + 9}" font-size="26"><tspan style="fill:{muted}">{a} \u2192 </tspan>'
+                 f'<tspan font-weight="700" style="fill:{ink}">{b}%</tspan></text>')
+        (_uo, _ui, uf, uword), (_so, _si, sf, sword) = factor[m]
+        if uf is None or sf is None:
+            raise SystemExit(f"build_harness_charts: {m} has no cost or time factor in the package")
+        for x, f, good in ((R_COST_X, uf, uword != "dearer"), (R_TIME_X, sf, sword != "slower")):
+            # a factor in Cerulion's favour in green; against it in red, with an arrow for dearer (up) or slower (down)
+            shown = f"{f}\u00d7" if good else (f"\u2191 {f}\u00d7" if x == R_COST_X else f"\u2193 {f}\u00d7")
+            o.append(f'<text x="{x}" y="{cy + 9}" font-size="26" font-weight="700" '
+                     f'style="fill:{r_var("better" if good else "worse")}" text-anchor="end">{shown}</text>')
+    note = "without = a published 3-tool interface" + (" \u00b7 \u2020 baseline cut short by a content filter" if cut else "")
+    o.append(f'<text x="37" y="1288" font-size="20" style="fill:{muted}">{note}</text>')
+    o.append(f'<text x="37" y="1317" font-size="20" style="fill:{muted}">cheaper, faster = model cost and wall time per '
+             f'episode, with and without {NAME}</text>')
+    o.append("</svg>")
+    svg = "".join(o) + "\n"
+    body = re.sub(r'<g data-mark="[a-z]+">.*?</g>', "", svg.replace(results_style(), "", 1))
+    body = re.sub(r'href="data:image/svg\+xml;base64,[A-Za-z0-9+/=]+"', "", body)
+    if re.search(r"#[0-9a-fA-F]{3,8}\b", body) or re.search(r'\b(?:fill|stroke)="', body):
+        raise SystemExit("build_harness_charts: a colour outside RESULTS_THEME and the makers' marks")
+    return svg
+
+
 def main(argv):
     check = "--check" in argv[1:]
     rc = load_recompute()
@@ -354,7 +529,8 @@ def main(argv):
     filtered = rc.filtered_arms(cols)
     outputs = {"harness-success-rate.svg": success_chart(rows, when, cells, task_rows, rc.joined, filtered),
                "harness-cost-per-success.svg": cost_chart(rows, when, cells, task_rows, rc.fnum, len(uns), lost_usd,
-                                                          filtered)}
+                                                          filtered),
+               "harness-results.svg": results_chart(rows, cols, rc, filtered, cells)}
     stale = []
     for name, svg in outputs.items():
         path = os.path.join(MEDIA, name)

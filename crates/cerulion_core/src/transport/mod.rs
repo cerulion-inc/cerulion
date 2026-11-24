@@ -817,10 +817,14 @@ const _: () = assert!(
 /// # WHAT THIS BOUNDS — resident pinning, NOT the apparent reservation
 ///
 /// Said once, here, because the number an operator sees first is the wrong one.
-/// A publisher's pool is sized from the SERVICE's static config —
+/// A publisher's pool is sized from the SERVICE's static config and its own
+/// retained history:
 /// `max_subscribers * (subscriber_max_buffer_size + subscriber_max_borrowed_samples)
-/// + history_size + max_loaned` slots
-/// (`iceoryx2-0.9.1/src/service/static_config/publish_subscribe.rs:79`) — and a
+/// + retained history + max_loaned` slots, where the retained history is the
+/// service's `history_size`, or the publisher's own on a floored service when
+/// the iceoryx2 build has a per-publisher history size
+/// (`iceoryx2/src/service/static_config/publish_subscribe.rs:82-91` in the
+/// workspace's fork), and a
 /// SUBSCRIBER's own depth is not a term in it. So shallowing a tap does not move
 /// the pool by one byte: **VIRT stays at the topic's provisioned slot count
 /// (~112 slots for a `--record`-raised topic) whatever this rule returns.**
@@ -1074,9 +1078,13 @@ pub struct TopicServiceConfig {
     /// [`Self::subscriber_max_buffer_size`]. Set by `rmw_cerulion`'s publisher
     /// and subscription create paths, so every rmw endpoint creates a ROS
     /// topic with the same history and buffer and a later opener is never
-    /// refused for asking more than the first opener did. A pre-existing
-    /// service below the floor still attaches and is warned about once.
-    /// `None` (the default everywhere) changes nothing.
+    /// refused for asking more than the first opener did. A service created
+    /// with a floor carries `cerulion.history_floor`, and a publisher on it
+    /// retains only its own `history_size` of sent frames where the iceoryx2
+    /// build supports it (see `retain_own_history`), so a publisher that asks
+    /// for none keeps no sent frame out of its pool. A pre-existing service
+    /// below the floor still attaches and is warned about once. `None` (the
+    /// default everywhere) changes nothing.
     pub create_history_floor: Option<usize>,
     /// Service-level `max_subscribers`. `Some(n)`
     /// provisions the topic for at most `n` subscribers AND requires ≥ `n`
@@ -2213,6 +2221,78 @@ impl From<OpenServicesFailure> for TransportError {
     fn from(f: OpenServicesFailure) -> Self {
         f.error
     }
+}
+
+/// The publisher-port builder for a service whose history is a create-leg
+/// floor (`history_is_floor`): the port retains its own `history_size` of sent
+/// frames for late subscribers, so a publisher that asks for none keeps no
+/// sent frame out of its pool and its next loan takes the slot its subscribers
+/// just released. On any other service the port retains the service history.
+#[cfg(iceoryx2_publisher_history)]
+fn retain_own_history<'a>(
+    builder: iceoryx2::service::port_factory::publisher::PortFactoryPublisher<
+        'a,
+        CerService,
+        [u8],
+        (),
+    >,
+    history_is_floor: bool,
+    history_size: usize,
+) -> iceoryx2::service::port_factory::publisher::PortFactoryPublisher<'a, CerService, [u8], ()> {
+    if history_is_floor {
+        builder.history_size(history_size)
+    } else {
+        builder
+    }
+}
+
+/// An iceoryx2 without a per-publisher history size (the released 0.10.0, or a
+/// fork revision before it) sizes every publisher's retained ring from the
+/// service, so the builder is returned unchanged and a publisher on a floored
+/// service retains the whole floor.
+#[cfg(not(iceoryx2_publisher_history))]
+fn retain_own_history<'a>(
+    builder: iceoryx2::service::port_factory::publisher::PortFactoryPublisher<
+        'a,
+        CerService,
+        [u8],
+        (),
+    >,
+    _history_is_floor: bool,
+    _history_size: usize,
+) -> iceoryx2::service::port_factory::publisher::PortFactoryPublisher<'a, CerService, [u8], ()> {
+    builder
+}
+
+/// How many sent frames `publisher` retains for late subscribers, as its port
+/// reports it.
+#[cfg(iceoryx2_publisher_history)]
+fn retained_history(
+    publisher: &iceoryx2::port::publisher::Publisher<CerService, [u8], ()>,
+    _data_service: &iceoryx2::service::port_factory::publish_subscribe::PortFactory<
+        CerService,
+        [u8],
+        (),
+    >,
+) -> usize {
+    publisher.history_size()
+}
+
+/// How many sent frames `publisher` retains for late subscribers: under an
+/// iceoryx2 without a per-publisher history size (the released 0.10.0, or a
+/// fork revision before it) every port retains the service history.
+/// iceoryx2's `.history_size(N)` open check is at-least, so that can exceed
+/// the publisher's own request when someone created the service deeper.
+#[cfg(not(iceoryx2_publisher_history))]
+fn retained_history(
+    _publisher: &iceoryx2::port::publisher::Publisher<CerService, [u8], ()>,
+    data_service: &iceoryx2::service::port_factory::publish_subscribe::PortFactory<
+        CerService,
+        [u8],
+        (),
+    >,
+) -> usize {
+    data_service.static_config().history_size()
 }
 
 /// Is this open failure the BUFFER-CEILING refusal — i.e. does it
@@ -3454,12 +3534,18 @@ impl TransportManager {
         // A publisher that asks for history of its own states it in its port
         // name, which other processes read from the service's dynamic config
         // (`topic_publisher_retain_marks`). The service history alone cannot
-        // say it: every publisher's retained ring is sized from the service.
+        // say it: it is the most any publisher on the topic may retain.
         if history_size > 0 {
             let name = PortName::new(RETAINING_PUBLISHER_NAME)
                 .map_err(|e| map_err(format!("retaining publisher port name: {e:?}")))?;
             publisher_builder = publisher_builder.name(&name);
         }
+        // On a service whose history is a create-leg floor (the
+        // `cerulion.history_floor` attribute) that history is room for a
+        // deeper publisher that may open later, not a request of this one, so
+        // the port retains only its own `history_size`.
+        let history_is_floor = wire_header_attribute::history_is_floor(data_service.attributes());
+        publisher_builder = retain_own_history(publisher_builder, history_is_floor, history_size);
         if let Some(max_loaned) = topic_config.publisher_max_loaned_samples {
             // Raise the simultaneous-loan budget above the iceoryx2
             // default (2) — the rmw borrow window holds ~4 outstanding loans per
@@ -3567,6 +3653,25 @@ impl TransportManager {
             &self.shm_segment_prefix(),
         );
 
+        let provisioned_history_size = retained_history(&publisher, data_service);
+        // A floored service where the port still retains more than it asked
+        // for: this build's iceoryx2 has no per-publisher history size (see
+        // `retain_own_history`), so every send keeps that many frames' slots.
+        if history_is_floor
+            && provisioned_history_size > history_size
+            && self.mark_degraded_once(topic, "history_floor_retention")
+        {
+            tracing::warn!(
+                topic = %topic,
+                history_size,
+                retained = provisioned_history_size,
+                "this publisher retains the topic's whole history floor, more than it \
+                 asked for, because the iceoryx2 it was built against has no \
+                 per-publisher history size; each send then keeps that many slots \
+                 out of its pool. Build against the iceoryx2 revision the workspace \
+                 pins to retain only the requested history"
+            );
+        }
         Ok(CerulionPublisher::new(CerulionPublisherConfig {
             // Topic as `Arc<str>`. Single alloc per
             // publisher; every `loan_proxy` does just an atomic refcount
@@ -3578,14 +3683,9 @@ impl TransportManager {
             clock: Arc::clone(&self.clock),
             max_slice_len,
             history_size,
-            // The history the service
-            // really provides, read back rather than assumed equal to the
-            // request. iceoryx2's `.history_size(N)` open verification is
-            // AT-LEAST, so this open may have attached to a service someone
-            // created DEEPER — and the port it just handed us is sized from
-            // this static config, so that publisher really retains the
-            // deeper value.
-            provisioned_history_size: data_service.static_config().history_size(),
+            // The history the port really retains, read back rather than
+            // assumed equal to the request (see `retained_history`).
+            provisioned_history_size,
             // Hand the topic's event-service factory to the
             // publisher (last use of the owned local) so the notify-elision gate
             // can read its live `number_of_listeners()`.
@@ -6069,8 +6169,9 @@ impl TransportManager {
         }
         // A caller that asks for no particular history takes iceoryx2's default
         // (the service history, capped at the port buffer), except on a service
-        // whose history is a create-leg floor: every publisher there retains
-        // frames, VOLATILE ones included, so such a caller takes none.
+        // whose history is a create-leg floor: that history is room for a later
+        // publisher, not a retention anyone asked this caller to replay, so
+        // such a caller takes none.
         let history_request = history_request.or_else(|| {
             wire_header_attribute::history_is_floor(data_service.attributes()).then_some(0)
         });
@@ -6961,7 +7062,9 @@ impl TransportManager {
             if history_size > 0 {
                 // Arm iceoryx2 NATIVE publisher history at the
                 // CREATOR/precreate site. The publisher port iceoryx2 hands back
-                // on this service automatically gets a history queue of this size
+                // on this service gets a history queue of this size (on a
+                // floored service, its own `history_size`; see
+                // `retain_own_history`)
                 // — it retains the last N sent frames by SHM offset (zero-copy)
                 // and auto-delivers them to a late subscriber on
                 // `update_connections()`. Setting the value ALSO arms iceoryx2's
@@ -6970,8 +7073,8 @@ impl TransportManager {
                 // so graph body/trigger subscribers and CLI introspection (which
                 // go through `open_existing_topic_services` / the open-only path,
                 // never setting it) impose no requirement and open fine. The
-                // pool grows by `history_size` SHM slots
-                // (max_subscribers*(buffer+borrow) + history_size +
+                // pool grows by the retained history's SHM slots
+                // (max_subscribers*(buffer+borrow) + retained history +
                 // publisher_max_loaned). `enable_safe_overflow` stays at its
                 // default (true), so `history_size > subscriber buffer` is a soft
                 // per-consumer truncation, not a hard open failure.
@@ -9211,6 +9314,17 @@ mod tests {
             Some(SUBSCRIBER_MAX_BORROWED_HELD)
         );
     }
+
+    // The workspace builds against its iceoryx2 fork, whose build script
+    // reports the per-publisher history size. If that report were lost, every
+    // publisher on a floored service would go back to retaining the whole
+    // floor with no other test or build step noticing, so a test build without
+    // it does not compile.
+    #[cfg(not(iceoryx2_publisher_history))]
+    compile_error!(
+        "cerulion_core's build script did not see DEP_ICEORYX2_PUBLISHER_HISTORY: the \
+         iceoryx2 in this test build is not the workspace's fork revision"
+    );
 
     /// `create_history_floor` raises the CREATE leg's history and buffer
     /// ceiling only; the open requirement (the pub fields) is untouched, so a
