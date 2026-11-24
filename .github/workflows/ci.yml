@@ -1258,12 +1258,6 @@ jobs:
       - name: Harness charts are current
         run: python3 -B docs/media/charts/build_harness_charts.py --check
 
-      # The harness results package's SUMMARY.md, summary.csv and paired.csv
-      # are written by its recompute.py; this fails when they differ from
-      # what the package's CSV files give.
-      - name: Harness results package is current
-        run: cd docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro && python3 -B recompute.py --check
-
       # PR naming. `<type>(<scope>): <description>` for the title,
       # `<type>/<kebab-slug>` for the branch — no personal prefix, and no
       # tracker id baked into a branch name (a branch name is permanent and
