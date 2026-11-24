@@ -1163,6 +1163,19 @@ The variable is an execution-mode switch rather than a tuning knob; see
 [`docs/multi_process.md`](multi_process.md) for the contract. All four rows
 describe current behaviour.
 
+**A bag from a newer Cerulion is refused with the upgrade remedy.** A resim
+refuses (exit 2) a bag stamped with a `trace_format` above the highest this
+build reads, and a bag whose `coordination` stamp this build does not know at
+a format it reads. The message says a newer Cerulion recorded the bag, adds
+the bag's `cerulion_version` in parentheses when it is a plain version token
+(ASCII letters, digits, `.`, `-` and `+`, at most 64 bytes), names the format
+or the stamp and this Cerulion's version, and ends
+`Upgrade Cerulion to replay it.` The recording is sound, and an upgraded
+Cerulion replays it. On 2.0.0 and 2.1.0 the same refusal names the newer
+scheduler-trace format, or the unknown `coordination` stamp, and then calls the
+recording corrupt or hand-edited and says to re-record it. That recording is
+sound too: upgrade Cerulion to replay it.
+
 
 **A stamp never under-claims, which means every bag this build writes with a
 `recorder.json` stamps 12.** (A bag with no recorder attachment carries no
@@ -1446,8 +1459,8 @@ did before format 10. A reader below 10 reads past the flag and would judge a
 node stopped before the checkpoint as one that owed fires, so the stamp moves
 and that reader refuses the bag. A later section version can define more flag
 bits, which this build reads past; a change to what they mean for a resim
-comes with a new `trace_format`, which this build refuses with "upgrade to
-replay it".
+comes with a new `trace_format`, which this build refuses with "Upgrade
+Cerulion to replay it."
 
 ### Window heads (`trace_format` 11)
 
