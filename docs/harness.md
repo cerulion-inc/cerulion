@@ -79,8 +79,8 @@ The hosted Cerulion MCP also serves the harness's tools on a simulated arm, with
 
 The hosted Cerulion MCP gives your model a simulated arm in Cerulion's cloud (paid in sim credits), analysis of
 your MCAP recordings and a view of your robots. It needs no install, only your Cerulion account. It is closed
-source and in early access: request access on the [Hindsight page](https://docs.cerulion.com/cerulion/hindsight). After you add it, run
-`/mcp` in Claude Code, pick `cerulion` and sign in with your Cerulion account. Another MCP client takes the same
+source and in early access: request access on the
+[Hindsight page](https://docs.cerulion.com/cerulion/hindsight). After you add it, run `/mcp` in Claude Code, pick `cerulion` and sign in with your Cerulion account. Another MCP client takes the same
 URL.
 
 ```bash

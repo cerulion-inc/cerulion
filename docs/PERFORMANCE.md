@@ -178,11 +178,12 @@ The two-process median falls 6.7x at 64 B, 6.1x at 4 KiB and 5.0x at 1 MiB,
 with disjoint per-rep ranges. The single-process rows moved by one to three
 ticks of the 24 MHz timebase (41.667 ns per tick), inside overlapping per-rep
 ranges, so no change in either direction is resolved there. The Apple M4 row
-of the platform chart (README and evidence page) is a later build, Cerulion 2.0.0 on macOS 27.2.1,
-which carries this change and later changes to the wake path, among them a
-publish that rings every topic a graph produces and a cross-process wake on a
-busy Mac that no longer waits out a yield. It is measured on another machine at
-the chart's fixed 100 Hz, so it is not a third column of this table
+of the platform chart (README and evidence page) is a later build, Cerulion
+2.0.0 on macOS 27.2.1, which carries this change and later changes to the wake
+path, among them a publish that rings every topic a graph produces and a
+cross-process wake on a busy Mac that no longer waits out a yield. It is
+measured on another machine at the chart's fixed 100 Hz, so it is not a third
+column of this table
 ([Apple M4 campaign](benchmarks/results/446db2afb7d26dbc-2026-11-13-fixed100-apple-m4/HEADLINE.md)). Package:
 [campaign directory](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/),
 [HEADLINE.md](benchmarks/results/a83b79d4f8a3eb1b-2026-10-02-quiescent-macos-wake/HEADLINE.md), and
