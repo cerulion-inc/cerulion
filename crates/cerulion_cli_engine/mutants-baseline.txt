@@ -564,6 +564,16 @@ in prepare_pass_verification
 #          14 mutants: 13 caught, 1 unviable, none missed. The unviable
 #          replaces `hold_allowed_for_note` with a default its type does not
 #          have.
+#          Re-run over the change that reports a held step's void before a
+#          stand-down or arm of the step that voids it, in the Sync and FIFO
+#          rules (`PendingExcuse::voided`, `FifoCarry::voided_at`,
+#          `report_fifo_void`, `verify_sync`, `verify_fifo`), and qualifies the
+#          note's sentences by that void, with `--in-diff` that change's diff
+#          of the two files and the `--re` above plus
+#          `|verify_fifo|FifoCarry::|report_fifo_void`: 10 mutants: 8 caught,
+#          2 unviable, none missed. The unviable replace
+#          `PendingExcuse::voided` and `FifoCarry::voided_at` with
+#          `Some(Default::default())`, a default `VoidedExcuse` does not have.
 #
 # Every mutant that survives the test suite is listed below with the reason it
 # is not killed. A survivor that is not listed here is a gap in the tests: kill
