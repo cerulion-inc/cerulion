@@ -34,7 +34,7 @@ Claude Opus 5.5 sets the bowl on the plate on its third try, at a task the harne
 
 On 100 new starting scenes of such tasks, Gemini 3.8 Flash solved 73 with Cerulion's tools and calibration record, and 25 with a published three-tool interface. The test covers one benchmark family, and 4 of 16 models solved fewer with Cerulion ([limits](#evidence)).
 
-On one desktop, a native round trip at 64 B with recording on had a 4.07 µs median, against 311.11 µs on ROS 2 Jazzy defaults ([limits](#latency)).
+On one desktop, a native round trip at 64 B with recording on had a 4.07 µs median over 2 worker processes and 1 process crossing, against 311.11 µs on ROS 2 Jazzy defaults over 3 processes and 2 crossings ([limits](#latency)).
 
 <p align="center">
   <img src="docs/media/replay-verdict.gif" alt="A recorded bag passes replay, then fails it after one changed constant: differs at x, recorded 0.3, replayed 0.25." width="640">
@@ -103,7 +103,7 @@ Release builds send coarse usage events, with your account id after sign-in. To 
 
 If the script stops, fix the cause its `error:` line names and run the script again. Once `cerulion --version` works, `cerulion doctor` names each problem, with a `fix:` line where it knows one.
 
-Node builds need Rust 1.95 or newer. With neither Rust nor rustup, the script installs rustup and current stable. With rustup and an older default, it adds stable, keeps your default and prints how to select stable. With an older Rust and no rustup, it stops and installs nothing ([every case](docs/install.md#how-the-install-script-provisions-rust)).
+Node builds need Rust 1.95 or newer and a [C toolchain](docs/install.md#the-c-toolchain), which goes on before rustup. With neither Rust nor rustup, the script installs rustup and current stable. With rustup and an older default, it adds stable, keeps your default and prints how to select stable. With an older Rust and no rustup, it stops and installs nothing ([every case](docs/install.md#how-the-install-script-provisions-rust)).
 
 The script also links the programs into `/usr/local/bin` when `~/.local/bin` is not on your PATH, `/usr/local/bin` is, and you can write there without sudo, unless one of its safety checks fails. `--no-modify-path` leaves your startup files and both folders alone and prints the PATH line to add yourself. [Installation details](docs/install.md#what-the-install-script-does) list every step and check.
 
@@ -164,7 +164,7 @@ Open the printed URL on any device and enter the printed code. The terminal then
 
 - **What stays on this machine.** `~/.cerulion/auth.json` holds your account id and session. `~/.cerulion/identity/device.key` is this machine's key, which lets the robots on your account admit it with no addresses to set.
 - **What still uses the network.** The account check reads `auth.json` and works offline. Telemetry, when it is on, and commands that reach other machines still use the network, and the first node build and the first simulator start download what they need.
-- **What the first sign-in links.** With telemetry on, a machine's first sign-in links its earlier usage events, sent under a random id, to your account. With telemetry off, it links nothing ([Usage telemetry](docs/telemetry.md)).
+- **What the first sign-in links.** With telemetry on, a machine's first sign-in outside CI links its earlier usage events, sent under a random id, to your account. A sign-in under CI, or with telemetry off, links nothing ([Usage telemetry](docs/telemetry.md)).
 - **Commands that skip the sign-in.** `doctor`, `telemetry`, `completions`, `ros2 run` and `ros2 launch`, among others ([full list](docs/user-api.md#cerulion-connect--rcp--login--logout--account)).
 - **Sign-in for CI.** A runner that cannot open a browser uses the state of a machine that signed in ([Automation and CI](docs/user-api.md#automation-and-ci)).
 
@@ -176,7 +176,7 @@ Next, [give your model the arm](#try-the-harness) or [record and replay a run](#
 
 **Before you start.** [Install Cerulion](#install) 2.1.0 or later and [sign in](#sign-in). You also need:
 
-- macOS on Apple silicon, or Linux on x86_64 or ARM64, with `git` and `curl`. On Linux, also the CPU renderer: `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0` on Ubuntu. No GPU.
+- macOS on Apple silicon, or Linux on x86_64 or ARM64, with `bash`, `git` and `curl`. On Linux, also the CPU renderer: `sudo apt-get install libosmesa6 libegl1 libgl1 libglib2.0-0` on Ubuntu. No GPU.
 - 5 GiB of free disk: the first run installs about 4 GB and refuses to start with less.
 - An MCP client whose model calls tools and reads images, such as Claude Code. Your provider bills the model calls.
 
@@ -264,7 +264,7 @@ Next: [rerun a start state](docs/evidence.md#rerun-a-start-state-against-your-ow
 
 ## Try the runtime
 
-**Before you start.** [Install Cerulion](#install), [sign in](#sign-in) and add a C toolchain: `sudo apt-get install -y curl git build-essential` on Debian or Ubuntu, or `xcode-select --install` on macOS. If Rust is missing, `cerulion workspace create` offers to install it. You need no robot, simulator or ROS 2.
+**Before you start.** Add a C toolchain before you [install Cerulion](#install): `sudo apt-get install -y curl git build-essential` on Debian or Ubuntu, or `xcode-select --install` on macOS. Then [sign in](#sign-in). If Rust is missing, `cerulion workspace create` offers to install it. You need no robot, simulator or ROS 2.
 
 A synthetic laser scanner reports an obstacle 0.3 m away for two seconds, then a clear path for two seconds, and repeats. A safety controller publishes a forward velocity `x` of `0.3` on a clear path and `0.0` when an obstacle is closer than 0.5 m.
 
@@ -523,7 +523,7 @@ The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-1
 
 ### Latency
 
-On one x86-64 Linux desktop, a native Cerulion multi-process round trip had a median of 4.07 µs at 64 B and 4.08 µs at 1 MiB, with always-on recording. At the same sizes, ROS 2 Jazzy read 311.11 µs and 11.0 ms on `rmw_fastrtps_cpp` defaults, not a tuned setup, and 24.64 µs and 29.79 µs composed with intra-process. Jazzy nodes that publish and take loaned messages on `rmw_cerulion` read 10.45 µs at 64 B ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/)). These figures time the transport only.
+On one x86-64 Linux desktop, with always-on recording, a native round trip over 2 worker processes and 1 process crossing had a median of 4.07 µs at 64 B and 4.08 µs at 1 MiB. ROS 2 Jazzy on `rmw_fastrtps_cpp` defaults, not a tuned setup, read 311.11 µs and 11.0 ms over 3 processes and 2 crossings. Jazzy nodes that publish and take loaned messages on `rmw_cerulion` read 10.45 µs at 64 B ([package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-18-fixed100-rmw-cerulion/)). The timer leaves out the application filling the payload ([benchmark suite](benches/latency/README.md)).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/native-rtt-dark.svg">
@@ -531,27 +531,28 @@ On one x86-64 Linux desktop, a native Cerulion multi-process round trip had a me
   <img src="docs/media/native-rtt.svg" alt="Native round-trip latency, with median lines and p50-to-p99 bands, from 64 B to 16 MiB.">
 </picture>
 
-The stock ROS 2 lane pipelines requests, so at 16 MiB a round trip outlasts the 10 ms pacing interval and requests overlap in flight. The [benchmark suite](benches/latency/README.md) documents the process layouts and timing boundaries.
+The stock ROS 2 lane pipelines requests, so at 16 MiB a round trip outlasts the 10 ms pacing interval and requests overlap in flight.
 
 <details>
 <summary>The latency table, and what these figures leave out</summary>
 
 Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultra 9 285K, performance governor, no real-time tuning), 2026-09-16, at a nominal 100 Hz offered load. The native Cerulion columns include always-on Flashback, the default recorder.
 
-| Payload | Native Cerulion, multi-process (default) | Native Cerulion, single process | ROS 2 Jazzy, `rmw_fastrtps_cpp` defaults | ROS 2 Jazzy, composed with intra-process |
+| Payload | Native Cerulion, 2 worker processes | Native Cerulion, single process | ROS 2 Jazzy, `rmw_fastrtps_cpp` defaults, 3 processes | ROS 2 Jazzy, composed with intra-process, 1 process |
 |---|---:|---:|---:|---:|
 | 64 B | 4.07 µs / 6.61 µs | 2.69 µs / 9.41 µs | 311.11 µs / 568.17 µs | 24.64 µs / 31.47 µs |
 | 1 MiB | 4.08 µs / 7.38 µs | 2.76 µs / 10.74 µs | 11.0 ms / 43.4 ms | 29.79 µs / 36.99 µs |
 | 16 MiB | 4.43 µs / 10.45 µs | 2.80 µs / 14.23 µs | 103.9 ms / 156.9 ms | 33.41 µs / 37.34 µs |
 
-- **Transport only.** The timer leaves out the application filling the payload, so a node's own work adds to these figures. A copy the transport makes on receive is timed, as in the ROS 2 defaults lane ([methodology](benches/latency/METHODOLOGY.md)).
+- **Process layouts.** The native multi-process lane runs a graph that declares 2 process groups, not the layout the runtime picks for a graph that declares none. It has 2 worker processes and 1 process crossing in the timed window, against 3 processes and 2 crossings for ROS 2 defaults. Native single process and the composed ROS 2 lane run in 1 process with no crossing, so they are the matched pair ([pairing table](benches/latency/README.md#boundary-discipline-read-before-quoting-any-number)).
+- **What the timer covers.** It leaves out the application filling the payload, so a node's own work adds to these figures. It includes each lane's wake-ups on receive and any copy the middleware makes on receive, as in the ROS 2 defaults lane. With intra-process on, the composed lane bypasses the middleware, so it times framework overhead, not transport ([methodology](benches/latency/METHODOLOGY.md)).
 - **One desktop, against defaults.** These figures are not a guarantee. The largest gap is against ROS 2 defaults, not a tuned ROS 2 setup.
 - **Slower than raw iceoryx2.** At 64 B on the same desktop, raw iceoryx2 reads 2.42 µs / 3.02 µs (p50 / p99), and native Cerulion reads 4.07 µs / 6.61 µs. The [native package](docs/benchmarks/results/8a84baf25d5d1710-2026-09-16-fixed100-heroes/HEADLINE.md) has every lane.
 - **ROS 2 on `rmw_cerulion`.** With loaned publishing and loaned takes, Jazzy nodes read 10.45 µs / 36.18 µs at 64 B on the same desktop. Loaned publishing is a code change in your nodes, and the package has no figure for nodes on `rmw_cerulion` that do not loan.
 
 </details>
 
-The [evidence page](docs/evidence.md) has the rest: the cost of a solved start state, the other limits (a filtered baseline, more false claims per failure, one draw each), latency on Linux, NVIDIA Jetson and Apple silicon, and a rerun against your own model.
+The [evidence page](docs/evidence.md) has the rest: the cost of a solved start state, the other limits (a filtered baseline, more false claims per failure, one draw each) and a rerun against your own model.
 
 ### Runs on real hardware
 
@@ -569,7 +570,7 @@ Cerulion has run this arm with MoveIt 2 on `rmw_cerulion`, and has run on an [NV
   <img src="docs/media/platform-rtt.svg" alt="Native round-trip latency on Linux x86_64, NVIDIA Jetson and Apple Silicon, with single- and multi-process results.">
 </picture>
 
-The Apple M4 row is measured on Cerulion 2.0.0 under macOS 27.2.1, a later build than the x86-64 and Jetson rows, in which a multi-process consumer wakes on the publish. [macOS two-process data wake](docs/PERFORMANCE.md#macos-two-process-data-wake) measures that change on its own, before and after, on an Apple M3 Max. Lines show p50 and bands extend to p99. Both figures show round trips.
+The Apple M4 row is measured on Cerulion 2.0.0 under macOS 27.2.1, a later build than the x86-64 and Jetson rows, in which a multi-process consumer wakes on the publish. [macOS two-process data wake](docs/PERFORMANCE.md#macos-two-process-data-wake) measures that change on an Apple M3 Max. Lines show p50 and bands extend to p99.
 
 ## Build on the runtime
 
@@ -641,7 +642,7 @@ A graph that runs on the robot serves its topics, unless `--local`, `--network o
 
 ### How Cerulion fits together
 
-A node runs on a timer or when its trigger input gets a message, and nodes exchange loaned shared-memory messages ([Execution](https://docs.cerulion.com/cerulion/execution-order)).
+A node runs on a timer, on messages at its trigger inputs, or on a device or SDK signal, and nodes exchange loaned shared-memory messages ([Execution](https://docs.cerulion.com/cerulion/execution-order)).
 
 <details>
 <summary>Diagrams of the architecture and the development loop, and the guides</summary>
