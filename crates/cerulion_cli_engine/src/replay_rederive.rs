@@ -12942,8 +12942,8 @@ mod tests {
     /// too. Two held steps, one note. Not held, or held before it has sent a
     /// frame, or after its consumer took the frame (a step later, or in the
     /// step that sent it), the aligned unfired step is the finding, and so is
-    /// one at the step after a held step whose read emptied the slot. A
-    /// stand-down after the held step withdraws the note.
+    /// one at the step after a held step whose read emptied the slot. Each of
+    /// the rule's stand-downs at a later step withdraws the note.
     #[test]
     fn a_held_sync_node_stands_its_owed_fire_down_once_and_is_still_judged() {
         let unheld_node = node(
@@ -13138,6 +13138,70 @@ mod tests {
             "{:?}",
             stood.holds_allowed_for
         );
+        // The same from each of the rule's two other stand-downs at a step:
+        // a truncated read of `a` at step 2, and a drain-site read of it with
+        // no wire stamp.
+        let cuts = [
+            (
+                "truncated",
+                read_with_role(
+                    "fusion",
+                    "a",
+                    ReadOutcomeKind::Truncated,
+                    0,
+                    None,
+                    ReadSiteRole::Drain,
+                ),
+                StandDownReason::TruncatedReadLog,
+            ),
+            (
+                "unstamped",
+                read_with_role(
+                    "fusion",
+                    "a",
+                    ReadOutcomeKind::DrainedBatch,
+                    1,
+                    None,
+                    ReadSiteRole::Drain,
+                ),
+                StandDownReason::MissingWireStamp,
+            ),
+        ];
+        let judged: Vec<_> = cuts
+            .iter()
+            .map(|(shape, cut_read, _)| {
+                let mut cut = quiet[..2].to_vec();
+                cut.push(RecordedStep {
+                    step: 2,
+                    clock_ns: EPOCH + 20 * MS,
+                    fires: vec![],
+                    reads: vec![cut_read.clone()],
+                });
+                let stood = verify_unrestored(&held_over(&cut), &cut, &[], STAMPED);
+                (
+                    *shape,
+                    stood.findings,
+                    stood.stand_downs,
+                    stood.holds_allowed_for,
+                )
+            })
+            .collect();
+        let expected: Vec<_> = cuts
+            .iter()
+            .map(|(shape, _, reason)| {
+                (
+                    *shape,
+                    Vec::new(),
+                    vec![StandDown {
+                        node_id: "fusion".to_string(),
+                        decider: Decider::Sync,
+                        reason: reason.clone(),
+                    }],
+                    Vec::new(),
+                )
+            })
+            .collect();
+        assert_eq!(judged, expected);
 
         let unheld = verify_unrestored(&[unheld_node], &quiet, &[], STAMPED);
         assert_eq!(unheld.findings.len(), 1, "{:?}", unheld.findings);
