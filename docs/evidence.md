@@ -40,7 +40,7 @@ Round trips, **p50 / p99**, on one x86-64 Linux desktop (24-core Intel Core Ultr
 - At 1 MiB the ROS 2 defaults median is 2,687× the Cerulion default median.
 - From 1 MiB up, the ROS 2 defaults median is longer than the 10 ms pacing interval (11.0 ms at 1 MiB), so those requests overlap.
 - The composed lane runs every node in one process. Compare it with the single-process column.
-- ROS 2 Jazzy on `rmw_cerulion`, three nodes in three processes with loaned publishing and loaned takes, reads **11.12 µs p50 / 37.21 µs p99** at 1 MiB. A publisher that still copies does not get these figures.
+- ROS 2 Jazzy on `rmw_cerulion`, three nodes in three processes with loaned publishing and loaned takes, reads **11.12 µs p50 / 37.21 µs p99** at 1 MiB. Loaned publishing is a code change, and the package has no figure for nodes that do not loan. In 4 of its 105,050 echoes, one of them at 1 MiB, the echo node borrowed its reply loan inside the timed window; the published p50 is unaffected.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="media/native-rtt-dark.svg">

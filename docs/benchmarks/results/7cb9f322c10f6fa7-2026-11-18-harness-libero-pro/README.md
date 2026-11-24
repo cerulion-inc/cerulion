@@ -39,11 +39,11 @@ earlier files had named were left out, not replaced). Supporting evidence, not a
 LIBERO-10 start states, 0 to 3 of each task, are ones the harness was developed on: development cells, not a
 result, printed apart as counts only.
 
-![Success rate per model, without and with Cerulion, ordered by the success rate without it, with the factor of
-improvement at the right of each row.](../../../media/harness-success-rate.svg)
+![Success rate per model, without and with Cerulion, ordered by the success rate without it, each row carrying
+both arms' counts of solved start states out of 100.](../../../media/harness-success-rate.svg)
 
 ![Model cost per successful episode, without and with Cerulion, in the same order, on a linear scale cut at 30 USD,
-with the factor at the right of each row.](../../../media/harness-cost-per-success.svg)
+each row carrying both arms' costs.](../../../media/harness-cost-per-success.svg)
 
 Both charts are drawn from this package's CSV files by
 [build_harness_charts.py](../../../media/charts/build_harness_charts.py), which takes every count and cost from
