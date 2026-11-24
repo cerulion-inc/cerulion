@@ -1037,10 +1037,11 @@ pub struct ReplayOutcome {
     /// looked at), a conservation breach (evidence about the RECORDING's
     /// credit accounting, which `RederivationReport::is_clean` deliberately
     /// ignores), and the evidence notes: a read-site census, a producer-label
-    /// fault, a carried-heads note, and the queue a `consume = latest` input
+    /// fault, a carried-heads note, the queue a `consume = latest` input
     /// was judged with before its node's first fire
-    /// (`latest_before_first_fire`). [`RederivationNoteKind`] is the closed set
-    /// of kinds. Additive + skipped when empty.
+    /// (`latest_before_first_fire`), and the hold a `period_ms` or Sync node
+    /// was judged with (`hold_allowed_for`). [`RederivationNoteKind`] is the
+    /// closed set of kinds. Additive + skipped when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rederivation_notes: Vec<RederivationNote>,
     /// Every node whose trace-driven burst was UNDER-FED by the
@@ -1939,18 +1940,15 @@ pub struct ReplayInputShortfall {
 
 /// What a [`RederivationNote`] can be — a CLOSED set, so no producer can emit
 /// a spelling by typo and no reader has to guess which arm an unknown one
-/// belongs in. SIX variants; the count is pinned by the exhaustive `match`
-/// in `rederivation_note_serde_spelling_is_pinned` (a seventh is a
+/// belongs in. SEVEN variants; the count is pinned by the exhaustive `match`
+/// in `rederivation_note_serde_spelling_is_pinned` (an eighth is a
 /// compile error there), not by an ordinal claim here — each variant's own
 /// doc says what it adds and why it is additive on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RederivationNoteKind {
     /// A decider the verifier declined to judge, so a clean report never
-    /// covers it; or one direction of a rule withdrawn at some steps while
-    /// the rule judges the node on (`period_block_held`, and the
-    /// `suppressible_fire` of a Sync node a `block` input in its rank holds),
-    /// whose `detail` leads with "judged with a hold allowed for".
+    /// covers it.
     StandDown,
     /// A credit-conservation breach — evidence about the RECORDING's
     /// accounting, which `RederivationReport::is_clean` deliberately ignores.
@@ -2014,6 +2012,18 @@ pub enum RederivationNoteKind {
     /// array, names why not. See [`replay_rederive::LatestBeforeFirstFireNote`].
     /// Additive on the wire, as the third to fifth variants are.
     LatestBeforeFirstFire,
+    /// A `period_ms` or Sync node that a `block` input in its own rank can
+    /// hold was judged with that hold allowed for, at the steps where the bag
+    /// shows the slot full. The subject is the node, and the code says which
+    /// rule: `period_block_held` or `sync_block_held`.
+    ///
+    /// NOT a [`RederivationNoteKind::StandDown`], for the reason
+    /// [`RederivationNoteKind::CarriedHeads`] is not: the rule judged the node,
+    /// on an allowance that can only drop a finding, so a `stand_down` would
+    /// tell a reader the node went unjudged. See
+    /// [`replay_rederive::HoldAllowedForNote`]. Additive on the wire, as the
+    /// third to sixth variants are.
+    HoldAllowedFor,
 }
 
 /// One thing the rank-local re-derivation verifier said that is
@@ -2021,20 +2031,19 @@ pub enum RederivationNoteKind {
 ///
 /// Several kinds, kept in one array because they all answer "what did the
 /// verifier do beyond passing or failing": a `stand_down` (a decider it
-/// declined to judge, so a clean report never covers it, or one direction of
-/// a rule withdrawn at some steps while it judges on), a `conservation`
+/// declined to judge, so a clean report never covers it), a `conservation`
 /// breach (evidence about the recording's credit accounting, which
 /// [`replay_rederive::RederivationReport::is_clean`] ignores by design), and the
 /// EVIDENCE kinds: a read-site census, a producer-label fault, the
-/// carried-heads disclosure, and the queue a `consume = latest` input was
-/// judged with before its node's first fire. See [`RederivationNoteKind`].
+/// carried-heads disclosure, the queue a `consume = latest` input was
+/// judged with before its node's first fire, and the hold a `period_ms` or
+/// Sync node was judged with. See [`RederivationNoteKind`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct RederivationNote {
     /// The rank whose pass produced it.
     pub rank: u32,
     /// Which of the [`RederivationNoteKind`]s it is — the machine token, as a
-    /// CLOSED set. A `stand_down` can withdraw one direction of a rule at some
-    /// steps while the rule judges the node on; its `detail` says which.
+    /// CLOSED set.
     ///
     /// A closed enum rather than a `String`: a free-form spelling is something
     /// a producer can get wrong and a reader has to match on literally. The
@@ -2042,8 +2051,8 @@ pub struct RederivationNote {
     /// undeclared value by typo.
     pub kind: RederivationNoteKind,
     /// What it is about: the node id for a stand-down, a read-site census, a
-    /// carried-heads note or a before-first-fire note; the topic for a
-    /// conservation breach or a producer-label note.
+    /// carried-heads note, a before-first-fire note or a hold-allowed-for
+    /// note; the topic for a conservation breach or a producer-label note.
     pub subject: String,
     /// The rendered sentence, from the pure module's own `Display`.
     pub detail: String,
@@ -2063,6 +2072,9 @@ pub struct RederivationNote {
     /// `StandDownReason` is exactly a closed enum — and without the token
     /// a CI job asking "did any bag report an impossible read shape this
     /// week?" has to substring-match a REWORDABLE sentence out of `detail`.
+    /// **And for a `hold_allowed_for` note**, from
+    /// [`replay_rederive::HeldRule::code`], a closed set too:
+    /// `period_block_held` or `sync_block_held`.
     ///
     /// Still `None` for a conservation breach, a read-site census, a
     /// carried-heads note and a `latest_before_first_fire` note: those are
@@ -2074,6 +2086,23 @@ pub struct RederivationNote {
     /// report carrying neither is byte-identical.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+}
+
+/// The `--report` note for one node judged with a hold by a `block` input in
+/// its rank allowed for: kind [`RederivationNoteKind::HoldAllowedFor`], the
+/// node as its subject, the note's own sentence as its detail, and the rule's
+/// code.
+fn hold_allowed_for_note(
+    rank: u32,
+    note: &replay_rederive::HoldAllowedForNote,
+) -> RederivationNote {
+    RederivationNote {
+        rank,
+        kind: RederivationNoteKind::HoldAllowedFor,
+        subject: note.node_id.clone(),
+        detail: note.to_string(),
+        code: Some(note.rule.code().to_string()),
+    }
 }
 
 /// The `--report` note for one input judged with one queue excused before its
@@ -18530,6 +18559,19 @@ fn run_rank_pass(
                 );
                 rederivation_notes.push(latest_before_first_fire_note(plan.rank(), e));
             }
+            // A hold a judged rule allowed for is a judged note too: `debug!`,
+            // and the note carries it into the `--report` with its rule's code.
+            for h in &report.holds_allowed_for {
+                tracing::debug!(
+                    rank = plan.rank(),
+                    node_id = %h.node_id,
+                    code = h.rule.code(),
+                    detail = %h,
+                    "replay: this node was judged with a hold by a block input in its rank \
+                     allowed for (report-only; see `detail`)"
+                );
+                rederivation_notes.push(hold_allowed_for_note(plan.rank(), h));
+            }
             // Conservation is LOUD and NEVER a verdict (the pure module's own
             // rule — `is_clean` ignores it): a breach is evidence about the
             // RECORDING's credit accounting, not a claim the candidate's
@@ -23099,6 +23141,34 @@ mod node_trigger_decl_tests {
         let json = serde_json::to_value(&notes[0]).expect("a note serializes");
         assert_eq!(json["kind"], "latest_before_first_fire");
         assert!(json.get("code").is_none(), "{json}");
+    }
+
+    /// A node judged with a hold allowed for reaches the `--report` as one
+    /// `hold_allowed_for` note about the node, with its rule's code and the
+    /// note's own sentence as its detail.
+    #[test]
+    fn a_hold_allowed_for_reaches_the_report_as_a_judged_note_with_its_rules_code() {
+        use super::replay_rederive::{HeldRule, HoldAllowedForNote};
+        use super::{hold_allowed_for_note, RederivationNoteKind};
+        for (rule, code) in [
+            (HeldRule::Period, "period_block_held"),
+            (HeldRule::Sync, "sync_block_held"),
+        ] {
+            let held = HoldAllowedForNote {
+                node_id: "src".to_string(),
+                rule,
+            };
+            let note = hold_allowed_for_note(3, &held);
+            assert_eq!(note.rank, 3);
+            assert_eq!(note.kind, RederivationNoteKind::HoldAllowedFor);
+            assert_eq!(note.subject, "src");
+            assert_eq!(note.code.as_deref(), Some(code));
+            assert_eq!(note.detail, held.to_string());
+            let json = serde_json::to_value(&note).expect("a note serializes");
+            assert_eq!(json["kind"], "hold_allowed_for");
+            assert_eq!(json["code"], code);
+            assert_eq!(json["subject"], "src");
+        }
     }
 
     /// The recording's stage set names a latest input's drain discipline: a

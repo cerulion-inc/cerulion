@@ -7466,7 +7466,20 @@ fn rederivation_note_serde_spelling_is_pinned() {
         "a before-first-fire note mints no token: {json}"
     );
 
-    // …and the six spellings are DISTINCT, which a per-variant assertion
+    // The SEVENTH kind: a `period_ms` or Sync node judged with a hold by a
+    // `block` input in its rank allowed for. Judged, so never a `stand_down`;
+    // unlike the before-first-fire note it carries the rule's code, a closed
+    // set.
+    let held = replay_engine::RederivationNote {
+        kind: replay_engine::RederivationNoteKind::HoldAllowedFor,
+        code: Some("sync_block_held".to_string()),
+        ..excused
+    };
+    let json = serde_json::to_value(&held).unwrap();
+    assert_eq!(json["kind"], "hold_allowed_for");
+    assert_eq!(json["code"], "sync_block_held");
+
+    // …and the seven spellings are DISTINCT, which a per-variant assertion
     // above cannot see (two variants renamed to one string would satisfy both).
     let all = [
         replay_engine::RederivationNoteKind::StandDown,
@@ -7475,6 +7488,7 @@ fn rederivation_note_serde_spelling_is_pinned() {
         replay_engine::RederivationNoteKind::ProducerLabels,
         replay_engine::RederivationNoteKind::CarriedHeads,
         replay_engine::RederivationNoteKind::LatestBeforeFirstFire,
+        replay_engine::RederivationNoteKind::HoldAllowedFor,
     ];
     let kinds: std::collections::BTreeSet<String> = all
         .iter()
@@ -7486,9 +7500,9 @@ fn rederivation_note_serde_spelling_is_pinned() {
                 .to_string()
         })
         .collect();
-    assert_eq!(kinds.len(), 6, "every note kind has its own wire spelling");
+    assert_eq!(kinds.len(), 7, "every note kind has its own wire spelling");
     // The list above is TOTAL — an EXHAUSTIVE match over the
-    // enum, with no wildcard, so adding a seventh kind (or deleting one) fails
+    // enum, with no wildcard, so adding an eighth kind (or deleting one) fails
     // to COMPILE here rather than leaving the spelling walk one short.
     for k in &all {
         let _spelled: &str = match k {
@@ -7500,6 +7514,7 @@ fn rederivation_note_serde_spelling_is_pinned() {
             replay_engine::RederivationNoteKind::LatestBeforeFirstFire => {
                 "latest_before_first_fire"
             }
+            replay_engine::RederivationNoteKind::HoldAllowedFor => "hold_allowed_for",
         };
         assert_eq!(serde_json::to_value(k).unwrap(), _spelled);
     }
@@ -61364,8 +61379,8 @@ fn a_period_source_the_middle_of_a_block_chain_holds_replays_clean() {
 }
 
 /// Assert a held `period_ms` source replays clean: no data violation, no
-/// read-log divergence, a clean verdict, and one stand-down note, the
-/// `period_block_held` of `src`, whose rule judged on.
+/// read-log divergence, a clean verdict, and one note, the `hold_allowed_for`
+/// of `src` with code `period_block_held`, and no stand-down.
 fn bh_assert_period_held_replays(outcome: &ReplayOutcome, label: &str) {
     assert_eq!(bh_violations(outcome), Vec::<String>::new(), "{label}");
     assert!(
@@ -61374,21 +61389,22 @@ fn bh_assert_period_held_replays(outcome: &ReplayOutcome, label: &str) {
         outcome.read_log_divergence
     );
     assert_clean_verdict(outcome, label);
-    let stood_down: Vec<_> = outcome
-        .rederivation_notes
-        .iter()
-        .filter(|n| n.kind == replay_engine::RederivationNoteKind::StandDown)
-        .map(|n| {
-            (
-                n.subject.as_str(),
-                n.code.as_deref(),
-                n.detail.starts_with("judged with a hold allowed for: "),
-            )
-        })
-        .collect();
     assert_eq!(
-        stood_down,
-        vec![("src", Some("period_block_held"), true)],
+        rederivation_note_rows(outcome),
+        vec![(
+            "hold_allowed_for".to_string(),
+            "src".to_string(),
+            Some("period_block_held".to_string())
+        )],
+        "{label}"
+    );
+    assert_eq!(
+        outcome.rederivation_notes[0].detail,
+        "node 'src' period_ms schedule: judged with a hold allowed for, since a block input in \
+        its own rank reads a topic the node produces and its pre-fire check can hold the period \
+        fires a step owed with no record in the bag; at a step where the bag shows the slot full \
+        the node is judged on the first fires it owed, and the rest of its schedule is still \
+        judged (report-only; the allowance can only drop a finding, never invent one)",
         "{label}"
     );
 }

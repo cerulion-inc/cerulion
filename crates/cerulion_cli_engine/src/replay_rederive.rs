@@ -1141,10 +1141,9 @@ pub struct NodeDecl {
     /// last fire, as the live burst did. For a `drop_oldest` input on a bag
     /// with no stage set ([`FifoDrain::Unrecorded`]) the hold is not allowed
     /// for. The `period_ms` rule judges a step at which an edge's slot was
-    /// full by the bag's own record on the first fires it owed
-    /// ([`StandDownReason::PeriodBlockHeld`]), and the Sync rule does not
-    /// convict an aligned set left unfired there
-    /// ([`StandDownReason::SuppressibleFire`] with `in_rank_hold`). The
+    /// full by the bag's own record on the first fires it owed, and the Sync
+    /// rule does not convict an aligned set left unfired there; each notes the
+    /// node once ([`HoldAllowedForNote`]). The
     /// `consume = latest` rule holds such a node to no fire it did not
     /// record: the first step that would owe one stands the rule down
     /// ([`StandDownReason::LatestBlockHeld`]). A `block` edge is counted only
@@ -1604,21 +1603,11 @@ pub enum StandDownReason {
     /// A trigger input served a frame whose WIRE stamp the caller could not
     /// join, so the alignment spread cannot be computed.
     MissingWireStamp,
-    /// The node is gated by something that can only SUPPRESS a fire, so
-    /// "aligned but did not fire" is not evidence of divergence there. The
-    /// opposite direction, "fired while misaligned", is still judged.
-    SuppressibleFire {
-        /// `false`: a `throttle_ms` cap or a cross-rank `block` edge, which
-        /// withdraws the owed fire at every step. `true`: a `block` edge in the
-        /// node's rank ([`NodeDecl::may_be_held_by`]), which withdraws it only
-        /// at a step where the bag shows the edge's slot full, the first such
-        /// step noted once; the rule judges every other step's owed fire, and
-        /// the rendering leads with "judged with a hold allowed for". Such a
-        /// step is still a finding where every slot that held there shows a
-        /// release with no record before its consumer next reads it
-        /// ([`FindingCaveat::UnrecordedRelease`]).
-        in_rank_hold: bool,
-    },
+    /// The node is gated by something that can only SUPPRESS a fire (a
+    /// `throttle_ms` cap, or a block edge), so "aligned but did not fire"
+    /// is not evidence of divergence. The opposite direction — "fired while
+    /// misaligned" — is still judged.
+    SuppressibleFire,
     /// A trigger input's physical queue (its effective
     /// capacity — declared depth × publisher connections — plus the frozen
     /// head and the parked `next_head`) exceeds [`SYNC_CARRY_ROOM`], the most
@@ -1825,20 +1814,6 @@ pub enum StandDownReason {
     /// the rule that owed the fire stops for the node; the one-fire bound
     /// still holds.
     LatestBlockHeld,
-    /// A `period_ms` node that a `block` edge can hold
-    /// ([`NodeDecl::may_be_held_by`]) recorded, at a step where the bag shows
-    /// the edge's slot full, fewer of the fires its schedule owed than it
-    /// owed: none (the decide gate deferred the step), or the first few at
-    /// their instants (the re-check stopped the catch-up burst). The pre-fire
-    /// check that holds such a node while the `block` consumer's queue is full
-    /// leaves no record, so the owed fires such a step did not record are not
-    /// convicted, and the first such step is noted once. The schedule is
-    /// still judged: the node's next deadline is the first owed instant it
-    /// did not fire, so a fire off that schedule, or past what a step owed,
-    /// is still a finding, and so is such a step where every slot that held
-    /// there shows a release with no record before its consumer next reads
-    /// it ([`FindingCaveat::UnrecordedRelease`]).
-    PeriodBlockHeld,
     /// A resumed pass holds no fire of a `consume = latest` node and no read
     /// its body made, while the node's trigger drain counted frames that owed
     /// it a fire: read through one subscriber, a step whose drain popped a
@@ -1887,7 +1862,7 @@ impl StandDownReason {
             Self::TruncatedReadLog => "the read log is truncated on an input it reads",
             Self::DecimatedRead => "a trigger input read was decimated",
             Self::MissingWireStamp => "a served frame's wire stamp could not be joined",
-            Self::SuppressibleFire { .. } => "a suppressing gate can explain a missing fire",
+            Self::SuppressibleFire => "a suppressing gate can explain a missing fire",
             Self::QueueExceedsVerifierRoom => {
                 "a trigger input's queue holds more heads than the verifier can carry across \
                  a step"
@@ -1925,12 +1900,6 @@ impl StandDownReason {
             Self::LatestBlockHeld => {
                 "the node produces a topic a block input in its own rank reads, and that edge's \
                  pre-fire check can hold the fire a step owed with no record in the bag"
-            }
-            Self::PeriodBlockHeld => {
-                "the node produces a topic a block input in its own rank reads, and that edge's \
-                 pre-fire check can hold the period fires a step owed with no record in the bag; \
-                 a step at which the bag shows the slot full is judged on the first fires it \
-                 owed, and the rest of the schedule is still judged"
             }
             Self::LatestUnfiredSinceAnchor => {
                 "the resumed pass holds no fire of the node and no read its body made while its \
@@ -1974,7 +1943,7 @@ impl StandDownReason {
             Self::TruncatedReadLog => "truncated_read_log",
             Self::DecimatedRead => "decimated_read",
             Self::MissingWireStamp => "missing_wire_stamp",
-            Self::SuppressibleFire { .. } => "suppressible_fire",
+            Self::SuppressibleFire => "suppressible_fire",
             Self::QueueExceedsVerifierRoom => "queue_exceeds_verifier_room",
             Self::AmbiguousReadSite => "ambiguous_read_site",
             Self::ImpossibleReadShape => "impossible_read_shape",
@@ -1985,44 +1954,9 @@ impl StandDownReason {
             Self::LatestWritersUncapped => "latest_writers_uncapped",
             Self::LatestWritersUnnamed => "latest_writers_unnamed",
             Self::LatestBlockHeld => "latest_block_held",
-            Self::PeriodBlockHeld => "period_block_held",
             Self::LatestUnfiredSinceAnchor => "latest_unfired_since_anchor",
             Self::FifoUnfiredSinceAnchor => "fifo_unfired_since_anchor",
             Self::SyncUnfiredSinceAnchor => "sync_unfired_since_anchor",
-        }
-    }
-
-    /// What a stand-down of this reason did to the rule, as its rendering
-    /// leads with it: every rule stopped judging what the reason names, but
-    /// the rule of a `period_ms` or Sync node a `block` edge in its rank holds
-    /// judges on, with the hold allowed for at the steps the bag shows it.
-    fn lead(&self) -> &'static str {
-        match self {
-            Self::PeriodBlockHeld | Self::SuppressibleFire { in_rank_hold: true } => {
-                "judged with a hold allowed for"
-            }
-            Self::BlockGated
-            | Self::NoPhaseAnchor
-            | Self::ZeroInterval
-            | Self::TruncatedReadLog
-            | Self::DecimatedRead
-            | Self::MissingWireStamp
-            | Self::SuppressibleFire {
-                in_rank_hold: false,
-            }
-            | Self::QueueExceedsVerifierRoom
-            | Self::AmbiguousReadSite
-            | Self::ImpossibleReadShape
-            | Self::UnattributableCredit
-            | Self::SyncHeadStampRegressed
-            | Self::CaptureTimeSync
-            | Self::LatestDrainUnrecorded
-            | Self::LatestWritersUncapped
-            | Self::LatestWritersUnnamed
-            | Self::LatestBlockHeld
-            | Self::LatestUnfiredSinceAnchor
-            | Self::FifoUnfiredSinceAnchor
-            | Self::SyncUnfiredSinceAnchor => "not verified",
         }
     }
 }
@@ -2033,11 +1967,7 @@ impl fmt::Display for StandDownReason {
     }
 }
 
-/// A decider declined to judge, and says so. A stand-down can instead withdraw
-/// one direction of a rule at some steps while the rule judges the node on
-/// ([`StandDownReason::PeriodBlockHeld`], and
-/// [`StandDownReason::SuppressibleFire`] with `in_rank_hold`); its rendering
-/// leads with which.
+/// A decider declined to judge, and says so.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandDown {
     /// The node (for [`Decider::BlockCredit`], the CONSUMING node of the edge).
@@ -2052,11 +1982,8 @@ impl fmt::Display for StandDown {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}: node '{}' {} — {}", // dash-ok
-            self.reason.lead(),
-            self.node_id,
-            self.decider,
-            self.reason
+            "not verified: node '{}' {} — {}",
+            self.node_id, self.decider, self.reason
         )
     }
 }
@@ -2234,6 +2161,80 @@ impl fmt::Display for LatestBeforeFirstFireNote {
     }
 }
 
+/// Which rule judged a node with a hold allowed for ([`HoldAllowedForNote`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldRule {
+    /// The `period_ms` schedule.
+    Period,
+    /// The Sync alignment's owed fire.
+    Sync,
+}
+
+impl HeldRule {
+    /// The stable machine token of a note of this rule, a closed set:
+    /// `period_block_held` or `sync_block_held`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Period => "period_block_held",
+            Self::Sync => "sync_block_held",
+        }
+    }
+}
+
+/// A `period_ms` or Sync node that a `block` input in its own rank can hold
+/// ([`NodeDecl::may_be_held_by`]) was judged with that hold allowed for, at the
+/// steps where the bag shows the edge's slot full. The pre-fire check that
+/// holds such a node leaves no record, so the Period rule judges such a step
+/// on the first fires it owed and moves the deadline to the first owed instant
+/// it did not fire, and the Sync rule does not convict an aligned set left
+/// unfired there. Every other step, and every fire the node recorded, is
+/// judged as before, and a step only the hold excused is still a finding where
+/// every slot that held there shows a release with no record before its
+/// consumer next reads it ([`FindingCaveat::UnrecordedRelease`]).
+///
+/// It is NOT a [`StandDown`], for the reason a [`CarriedHeadsNote`] is not:
+/// the rule judged the node, on an allowance that can only drop a finding, so
+/// a stand-down would tell a reader the node went unjudged. Report-only and
+/// never a gate: [`RederivationReport::is_clean`] ignores it. Emitted once per
+/// node, at its first held step, and withdrawn when a stand-down then stops
+/// the rule for the node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldAllowedForNote {
+    /// The held node.
+    pub node_id: String,
+    /// The rule that judged it with the hold allowed for.
+    pub rule: HeldRule,
+}
+
+impl fmt::Display for HoldAllowedForNote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.rule {
+            HeldRule::Period => write!(
+                f,
+                "node '{}' {}: judged with a hold allowed for, since a block input in its own \
+                 rank reads a topic the node produces and its pre-fire check can hold the \
+                 period fires a step owed with no record in the bag; at a step where the bag \
+                 shows the slot full the node is judged on the first fires it owed, and the \
+                 rest of its schedule is still judged (report-only; the allowance can only \
+                 drop a finding, never invent one)",
+                self.node_id,
+                Decider::Period
+            ),
+            HeldRule::Sync => write!(
+                f,
+                "node '{}' {}: judged with a hold allowed for, since a block input in its own \
+                 rank reads a topic the node produces and its pre-fire check can hold an \
+                 aligned set's fire with no record in the bag; at a step where the bag shows \
+                 the slot full an aligned set left unfired is not convicted, and every other \
+                 step and every set the node fired is still judged (report-only; the \
+                 allowance can only drop a finding, never invent one)",
+                self.node_id,
+                Decider::Sync
+            ),
+        }
+    }
+}
+
 /// Everything one rank's re-derivation concluded.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RederivationReport {
@@ -2254,6 +2255,9 @@ pub struct RederivationReport {
     /// their node's first fire. Never a gate, see
     /// [`LatestBeforeFirstFireNote`].
     pub before_first_fire: Vec<LatestBeforeFirstFireNote>,
+    /// The `period_ms` and Sync nodes judged with a hold by a `block` input in
+    /// their rank allowed for. Never a gate, see [`HoldAllowedForNote`].
+    pub holds_allowed_for: Vec<HoldAllowedForNote>,
 }
 
 impl RederivationReport {
@@ -2885,7 +2889,7 @@ fn verify_period(
         .map(|f| f.fire_time_ns)
         .expect("the anchor step contains a fire of this node (position() found one)");
 
-    // The first step a hold shortened stands the owed fires down, once.
+    // The first step a hold shortened notes the node, once.
     let mut held_noted = false;
     // The steps only a hold shortened, each until a consumer's read confirms
     // it or a release with no record voids it ([`PendingExcuse`]), with what
@@ -3011,10 +3015,9 @@ fn verify_period(
         next_fire_ns = match held_fires {
             Some(at) => {
                 if !held_noted {
-                    report.stand_downs.push(StandDown {
+                    report.holds_allowed_for.push(HoldAllowedForNote {
                         node_id: node.node_id.clone(),
-                        decider: Decider::Period,
-                        reason: StandDownReason::PeriodBlockHeld,
+                        rule: HeldRule::Period,
                     });
                     held_noted = true;
                 }
@@ -3566,9 +3569,7 @@ fn verify_sync(
         report.stand_downs.push(StandDown {
             node_id: node.node_id.clone(),
             decider: Decider::Sync,
-            reason: StandDownReason::SuppressibleFire {
-                in_rank_hold: false,
-            },
+            reason: StandDownReason::SuppressibleFire,
         });
     }
     // The carry widening is OPERATOR-VISIBLE: the rule DOES run, so this is a
@@ -3624,8 +3625,10 @@ fn verify_sync(
     // NARROW map: the head this rule believes the matcher was holding. Its own
     // carry is the ordinary `supply > k` rule — never the carry widening.
     let mut narrow: BTreeMap<String, u64> = BTreeMap::new();
-    // The first aligned step a `block` hold left unfired stands down, once.
+    // The first aligned step a `block` hold left unfired notes the node, once,
+    // and a stand-down below withdraws the note (`withdraw_hold_allowed_for`).
     let mut held_noted = false;
+    let held_at = report.holds_allowed_for.len();
     // The aligned steps only a hold left unfired, each until a consumer's read
     // confirms it or a release with no record voids it ([`PendingExcuse`]).
     let mut excuses: Vec<PendingExcuse> = Vec::new();
@@ -3731,6 +3734,7 @@ fn verify_sync(
                 // is any longer the map the scheduler held.
                 ReadOutcomeKind::Truncated => {
                     withdraw_carried_heads(report, note_at);
+                    withdraw_hold_allowed_for(report, held_at);
                     report.stand_downs.push(StandDown {
                         node_id: node.node_id.clone(),
                         decider: Decider::Sync,
@@ -3765,6 +3769,7 @@ fn verify_sync(
                     // both in the convicting direction.
                     let Some(ts) = read.wire_stamp_ns else {
                         withdraw_carried_heads(report, note_at);
+                        withdraw_hold_allowed_for(report, held_at);
                         report.stand_downs.push(StandDown {
                             node_id: node.node_id.clone(),
                             decider: Decider::Sync,
@@ -3784,6 +3789,7 @@ fn verify_sync(
                         if let Some(prev) = narrow_floor.get(&read.input) {
                             if ts < *prev {
                                 withdraw_carried_heads(report, note_at);
+                                withdraw_hold_allowed_for(report, held_at);
                                 report.stand_downs.push(StandDown {
                                     node_id: node.node_id.clone(),
                                     decider: Decider::Sync,
@@ -3877,10 +3883,9 @@ fn verify_sync(
             match owed_fire {
                 OwedFire::Judged if hold_possible => {
                     if !held_noted {
-                        report.stand_downs.push(StandDown {
+                        report.holds_allowed_for.push(HoldAllowedForNote {
                             node_id: node.node_id.clone(),
-                            decider: Decider::Sync,
-                            reason: StandDownReason::SuppressibleFire { in_rank_hold: true },
+                            rule: HeldRule::Sync,
                         });
                         held_noted = true;
                     }
@@ -4061,6 +4066,13 @@ fn verify_sync(
 /// note: a conviction is a judgment, and it was reached on the widened carry.
 fn withdraw_carried_heads(report: &mut RederivationReport, note_at: usize) {
     report.carried_heads.truncate(note_at);
+}
+
+/// Withdraw the [`HoldAllowedForNote`] `verify_sync` pushed for a node it then
+/// stood down on mid-loop, for the reason [`withdraw_carried_heads`] gives: the
+/// note says the rule judged the node, the stand-down that no rule did.
+fn withdraw_hold_allowed_for(report: &mut RederivationReport, note_at: usize) {
+    report.holds_allowed_for.truncate(note_at);
 }
 
 /// A trigger input's PHYSICAL carry ceiling — its effective
@@ -12378,6 +12390,14 @@ mod tests {
         BlockHoldEdges::new(vec![slot("sink", depth, sent_by(steps, &["src"]))])
     }
 
+    /// The note of `node` judged by `rule` with a hold allowed for.
+    fn held_note(node: &str, rule: HeldRule) -> HoldAllowedForNote {
+        HoldAllowedForNote {
+            node_id: node.to_string(),
+            rule,
+        }
+    }
+
     fn held_period(interval_ns: u64, max_catchup: Option<u32>, holds: BlockHoldEdges) -> NodeDecl {
         let mut decl = node("src", period(interval_ns, max_catchup));
         decl.may_be_held_by = holds;
@@ -12423,8 +12443,9 @@ mod tests {
     }
 
     /// The recording reads clean with the held source judged on every step:
-    /// the owed fires it did not record stand down once, at step 4, and its
-    /// deadline follows the first owed instant it did not fire. Judged with
+    /// the hold is noted once, at step 4, as a judged note and not a
+    /// stand-down, and its deadline follows the first owed instant it did not
+    /// fire. Judged with
     /// nothing holding it, step 4 is a `period_ms` schedule finding: four
     /// owed fires re-derived at their instants, none recorded.
     #[test]
@@ -12432,21 +12453,19 @@ mod tests {
         let steps = ws3_steps();
         let held = verify_unrestored(&ws3_nodes(src_holds(2, &steps)), &steps, &[], STAMPED);
         assert!(held.is_clean(), "unexpected: {:?}", held.findings);
+        assert!(held.stand_downs.is_empty(), "{:?}", held.stand_downs);
         assert_eq!(
-            held.stand_downs,
-            vec![StandDown {
-                node_id: "src".to_string(),
-                decider: Decider::Period,
-                reason: StandDownReason::PeriodBlockHeld,
-            }]
+            held.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
         );
+        assert_eq!(held.holds_allowed_for[0].rule.code(), "period_block_held");
         assert_eq!(
-            held.stand_downs[0].to_string(),
-            "judged with a hold allowed for: node 'src' period_ms schedule \u{2014} the node \
-             produces a topic a block input in its own rank reads, and that edge's pre-fire check \
-             can hold the period fires a step owed with no record in the bag; a step at which the \
-             bag shows the slot full is judged on the first fires it owed, and the rest of the \
-             schedule is still judged"
+            held.holds_allowed_for[0].to_string(),
+            "node 'src' period_ms schedule: judged with a hold allowed for, since a block input in \
+            its own rank reads a topic the node produces and its pre-fire check can hold the period \
+            fires a step owed with no record in the bag; at a step where the bag shows the slot full \
+            the node is judged on the first fires it owed, and the rest of its schedule is still \
+            judged (report-only; the allowance can only drop a finding, never invent one)"
         );
         assert_eq!(
             held,
@@ -12499,6 +12518,11 @@ mod tests {
         assert_eq!((finding.node_id.as_str(), finding.step), ("src", 4));
         assert_eq!(finding.recorded, StepFires::at(vec![]));
         assert!(judged.stand_downs.is_empty(), "{:?}", judged.stand_downs);
+        assert!(
+            judged.holds_allowed_for.is_empty(),
+            "{:?}",
+            judged.holds_allowed_for
+        );
 
         let read = unread(vec![read_with_role(
             "sink",
@@ -12515,8 +12539,11 @@ mod tests {
             STAMPED,
         );
         assert!(held.is_clean(), "unexpected: {:?}", held.findings);
-        assert_eq!(held.stand_downs.len(), 1, "{:?}", held.stand_downs);
-        assert_eq!(held.stand_downs[0].reason, StandDownReason::PeriodBlockHeld);
+        assert!(held.stand_downs.is_empty(), "{:?}", held.stand_downs);
+        assert_eq!(
+            held.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
+        );
     }
 
     /// The held rule keeps judging after the hold engages, so what a
@@ -12765,13 +12792,10 @@ mod tests {
                 caveat: Some(FindingCaveat::UnrecordedRelease { release_step: 3 }),
             }]
         );
+        assert!(voided.stand_downs.is_empty(), "{:?}", voided.stand_downs);
         assert_eq!(
-            voided.stand_downs,
-            vec![StandDown {
-                node_id: "src".to_string(),
-                decider: Decider::Period,
-                reason: StandDownReason::PeriodBlockHeld,
-            }]
+            voided.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
         );
         assert_eq!(
             voided,
@@ -12782,11 +12806,14 @@ mod tests {
         read[1] = timed_step(2, 10 * MS, &[], &[("sink", 1, 1, 1)]);
         let confirmed = verify_unrestored(&held(&read), &read, &[], STAMPED);
         assert!(confirmed.is_clean(), "unexpected: {:?}", confirmed.findings);
-        assert_eq!(
-            confirmed.stand_downs.len(),
-            1,
+        assert!(
+            confirmed.stand_downs.is_empty(),
             "{:?}",
             confirmed.stand_downs
+        );
+        assert_eq!(
+            confirmed.holds_allowed_for,
+            vec![held_note("src", HeldRule::Period)]
         );
 
         let unheld = verify_unrestored(
@@ -12803,16 +12830,17 @@ mod tests {
     }
 
     /// A Sync node whose output a depth-1 `block` input reads: an aligned set
-    /// it left unfired while the bag shows its slot full stands the owed fire
-    /// down once, and the node is still judged, so a later fire while
-    /// misaligned is a finding. Hand-built: it fires at step 0, so the slot
+    /// it left unfired while the bag shows its slot full is not convicted, the
+    /// node is noted once with the hold allowed for, and it is still judged,
+    /// so a later fire while misaligned is a finding. Hand-built: it fires at step 0, so the slot
     /// holds that frame at step 1, where the set is left unfired and the
     /// consumer fires and its body takes the frame; the held set fires at step
     /// 2, which fills the slot again, and step 3's aligned set is left unfired
-    /// too. Two held steps, one stand-down. Not held, or held before it has sent a
+    /// too. Two held steps, one note. Not held, or held before it has sent a
     /// frame, or after its consumer took the frame (a step later, or in the
     /// step that sent it), the aligned unfired step is the finding, and so is
-    /// one at the step after a held step whose read emptied the slot.
+    /// one at the step after a held step whose read emptied the slot. A
+    /// stand-down after the held step withdraws the note.
     #[test]
     fn a_held_sync_node_stands_its_owed_fire_down_once_and_is_still_judged() {
         let unheld_node = node(
@@ -12888,20 +12916,20 @@ mod tests {
         );
         assert_eq!(resumed.findings.len(), 1, "{:?}", resumed.findings);
         assert_eq!(resumed.findings[0].step, 1);
+        assert!(held.stand_downs.is_empty(), "{:?}", held.stand_downs);
         assert_eq!(
-            held.stand_downs,
-            vec![StandDown {
-                node_id: "fusion".to_string(),
-                decider: Decider::Sync,
-                reason: StandDownReason::SuppressibleFire { in_rank_hold: true },
-            }]
+            held.holds_allowed_for,
+            vec![held_note("fusion", HeldRule::Sync)]
         );
-        assert!(
-            held.stand_downs[0]
-                .to_string()
-                .starts_with("judged with a hold allowed for: node 'fusion' sync alignment "),
-            "{}",
-            held.stand_downs[0]
+        assert_eq!(held.holds_allowed_for[0].rule.code(), "sync_block_held");
+        assert_eq!(
+            held.holds_allowed_for[0].to_string(),
+            "node 'fusion' sync alignment: judged with a hold allowed for, since a block input in its \
+            own rank reads a topic the node produces and its pre-fire check can hold an aligned \
+            set's fire with no record in the bag; at a step where the bag shows the slot full an \
+            aligned set left unfired is not convicted, and every other step and every set the node \
+            fired is still judged (report-only; the allowance can only drop a finding, never invent \
+            one)"
         );
 
         // After the first held step, step 3 fires on two heads 400 ms apart,
@@ -12938,6 +12966,11 @@ mod tests {
         assert_eq!(taken.findings.len(), 1, "{:?}", taken.findings);
         assert_eq!(taken.findings[0].step, 1);
         assert!(taken.stand_downs.is_empty(), "{:?}", taken.stand_downs);
+        assert!(
+            taken.holds_allowed_for.is_empty(),
+            "{:?}",
+            taken.holds_allowed_for
+        );
 
         let freed = vec![
             aligned(0, EPOCH, true),
@@ -12974,12 +13007,44 @@ mod tests {
                 caveat: None,
             }]
         );
-        assert_eq!(owed.stand_downs, held.stand_downs);
+        assert!(owed.stand_downs.is_empty(), "{:?}", owed.stand_downs);
+        assert_eq!(owed.holds_allowed_for, held.holds_allowed_for);
+
+        // A stand-down after the held step stops the rule for the node, so the
+        // note that the rule judged the node is withdrawn: step 2's head on `a`
+        // is stamped before step 1's.
+        let mut regressed = quiet[..2].to_vec();
+        regressed.push(RecordedStep {
+            step: 2,
+            clock_ns: EPOCH + 20 * MS,
+            fires: vec![],
+            reads: vec![head("a", EPOCH), head("b", EPOCH + 20 * MS)],
+        });
+        let stood = verify_unrestored(&held_over(&regressed), &regressed, &[], STAMPED);
+        assert!(stood.is_clean(), "unexpected: {:?}", stood.findings);
+        assert_eq!(
+            stood.stand_downs,
+            vec![StandDown {
+                node_id: "fusion".to_string(),
+                decider: Decider::Sync,
+                reason: StandDownReason::SyncHeadStampRegressed,
+            }]
+        );
+        assert!(
+            stood.holds_allowed_for.is_empty(),
+            "{:?}",
+            stood.holds_allowed_for
+        );
 
         let unheld = verify_unrestored(&[unheld_node], &quiet, &[], STAMPED);
         assert_eq!(unheld.findings.len(), 1, "{:?}", unheld.findings);
         assert_eq!(unheld.findings[0].step, 1);
         assert!(unheld.stand_downs.is_empty(), "{:?}", unheld.stand_downs);
+        assert!(
+            unheld.holds_allowed_for.is_empty(),
+            "{:?}",
+            unheld.holds_allowed_for
+        );
     }
 
     /// A held Sync step waits on the slot that held there, as a FIFO node's
@@ -13047,13 +13112,10 @@ mod tests {
                 caveat: Some(FindingCaveat::UnrecordedRelease { release_step: 2 }),
             }]
         );
+        assert!(voided.stand_downs.is_empty(), "{:?}", voided.stand_downs);
         assert_eq!(
-            voided.stand_downs,
-            vec![StandDown {
-                node_id: "fusion".to_string(),
-                decider: Decider::Sync,
-                reason: StandDownReason::SuppressibleFire { in_rank_hold: true },
-            }]
+            voided.holds_allowed_for,
+            vec![held_note("fusion", HeldRule::Sync)]
         );
         assert_eq!(
             voided,
@@ -13072,11 +13134,14 @@ mod tests {
         read[1].fires.push(fire("ctl", EPOCH + 10 * MS));
         let confirmed = verify_unrestored(&held_over(&read), &read, &[], STAMPED);
         assert!(confirmed.is_clean(), "unexpected: {:?}", confirmed.findings);
-        assert_eq!(
-            confirmed.stand_downs.len(),
-            1,
+        assert!(
+            confirmed.stand_downs.is_empty(),
             "{:?}",
             confirmed.stand_downs
+        );
+        assert_eq!(
+            confirmed.holds_allowed_for,
+            vec![held_note("fusion", HeldRule::Sync)]
         );
     }
 
@@ -15049,9 +15114,7 @@ mod tests {
         assert!(report.stand_downs.contains(&StandDown {
             node_id: "fusion".to_string(),
             decider: Decider::Sync,
-            reason: StandDownReason::SuppressibleFire {
-                in_rank_hold: false
-            },
+            reason: StandDownReason::SuppressibleFire,
         }));
 
         // MISALIGNED and the recording fires anyway — still caught.
@@ -15607,9 +15670,7 @@ mod tests {
             StandDownReason::TruncatedReadLog,
             StandDownReason::DecimatedRead,
             StandDownReason::MissingWireStamp,
-            StandDownReason::SuppressibleFire {
-                in_rank_hold: false,
-            },
+            StandDownReason::SuppressibleFire,
             StandDownReason::QueueExceedsVerifierRoom,
             StandDownReason::AmbiguousReadSite,
             StandDownReason::ImpossibleReadShape,
@@ -15620,7 +15681,6 @@ mod tests {
             StandDownReason::LatestWritersUncapped,
             StandDownReason::LatestWritersUnnamed,
             StandDownReason::LatestBlockHeld,
-            StandDownReason::PeriodBlockHeld,
             StandDownReason::LatestUnfiredSinceAnchor,
             StandDownReason::FifoUnfiredSinceAnchor,
             StandDownReason::SyncUnfiredSinceAnchor,
@@ -18780,10 +18840,10 @@ mod tests {
             // The throttle stands the OWED-FIRE arm down (report-only), which is
             // exactly why arms A and B stay live on this node and had to be right.
             assert!(
-                report.stand_downs.iter().any(|s| s.reason
-                    == StandDownReason::SuppressibleFire {
-                        in_rank_hold: false
-                    }),
+                report
+                    .stand_downs
+                    .iter()
+                    .any(|s| s.reason == StandDownReason::SuppressibleFire),
                 "{report:?}"
             );
         }

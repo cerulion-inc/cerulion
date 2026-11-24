@@ -379,11 +379,12 @@ the same terms. At a step where the recording shows the slot full, a
 `period_ms` node may fire fewer of the fires its schedule owes there: none, or
 the first of them at their instants. Its next deadline is then the first owed
 instant it did not fire, a fire off that schedule is still a divergence, and
-the first such step is noted once (a `stand_down` of code `period_block_held`,
-judged with a hold allowed for). At such a step a `Sync` node may leave an
-aligned set unfired. The first such step is noted once (a `suppressible_fire`
-judged with a hold allowed for), and the node is still judged on every other
-step and on the sets it fired. At any other step either node owes every fire.
+the first such step is noted once (a `hold_allowed_for` note of code
+`period_block_held`). At such a step a `Sync` node may leave an aligned set
+unfired. The first such step is noted once (a `hold_allowed_for` note of code
+`sync_block_held`), and the node is still judged on every other step and on
+the sets it fired. At any other step either node owes every fire. A
+`hold_allowed_for` note is not a `stand_down`: the rule judged the node.
 
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
