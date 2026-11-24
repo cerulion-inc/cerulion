@@ -64,6 +64,14 @@
 //! flapping. A service that allows a single borrow copies every take and has
 //! its own headline: the remedy is the service's borrow limit, not a return.
 //!
+//! A small fixed type's loaned take is always a private copy, from a pool of
+//! reused buffers sized to the loan budget, and holds no borrow. A take that
+//! finds every pooled buffer loaned out is served by copy into newly
+//! allocated memory and counted on the same latch (`CopyBound::Pool`), with
+//! no line of its own; that regime closes, silently, on the first take
+//! served from the pool with no unpooled copy outstanding
+//! (`report_loan_served_from_pool`).
+//!
 //! # The policy, as every latch consumer applies it
 //!
 //! Loud head (full context + the remedy), `debug!` repeats carrying the
@@ -775,20 +783,36 @@ pub(crate) fn report_forge_clean(latch: &Mutex<FailureRegimeLatch>, topic: &str)
     }
 }
 
-/// Record a loaned take served by COPY: the subscription already held
-/// `held_loans` zero-copy loans, one below its borrow `ceiling`, so the take
-/// received into the reserved borrow, copied the message into private memory
-/// and released the borrow. The take succeeded with the published contents;
-/// what the operator learns is that this consumer retains loans and is paying
-/// a copy for every take past them.
+/// What a take served by COPY was past: the line's headline, fields and
+/// remedy follow it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CopyBound {
+    /// The borrow reserve: the subscription held `held_loans` zero-copy loans,
+    /// one below its borrow `ceiling`.
+    Reserve { held_loans: usize, ceiling: usize },
+    /// A small fixed type's copy pool, every reused buffer loaned out: counted,
+    /// with no line.
+    Pool,
+}
+
+/// Record a loaned take served by COPY into fresh memory. Past the reserve
+/// ([`CopyBound::Reserve`]) the take received into the reserved borrow, copied
+/// the message into private memory and released the borrow; the take
+/// succeeded with the published contents, and what the operator learns is
+/// that this consumer retains loans and pays a copy for every take past them.
+/// Past a small fixed type's pool ([`CopyBound::Pool`]) it copied into newly
+/// allocated memory because every reused buffer was loaned out: counted and
+/// the regime opened, with no line.
 #[cold]
-pub(crate) fn report_loan_copied(
-    latch: &Mutex<FailureRegimeLatch>,
-    topic: &str,
-    held_loans: usize,
-    ceiling: usize,
-) {
+pub(crate) fn report_loan_copied(latch: &Mutex<FailureRegimeLatch>, topic: &str, bound: CopyBound) {
     let (decision, total) = observe_failure(latch);
+    let (held_loans, ceiling) = match bound {
+        CopyBound::Reserve {
+            held_loans,
+            ceiling,
+        } => (held_loans, ceiling),
+        CopyBound::Pool => return,
+    };
     // A service that allows one borrow has none to lend: every take needs it
     // to receive, so every take is copied whatever the consumer returns, and
     // the remedy is on the service, not the consumer.
@@ -869,6 +893,16 @@ pub(crate) fn report_loan_served_zero_copy(latch: &Mutex<FailureRegimeLatch>, to
              at debug while the regime was open (total_failures counts every copy)"
         );
     }
+}
+
+/// Record a small fixed type's loaned take served FROM THE POOL while no
+/// unpooled copy is outstanding: closes an open regime of takes past the pool
+/// and re-arms, with no line. The caller calls it only while a regime is open
+/// and no unpooled copy is held, for the reason
+/// [`report_loan_served_zero_copy`] gives.
+#[cold]
+pub(crate) fn report_loan_served_from_pool(latch: &Mutex<FailureRegimeLatch>) {
+    observe_success(latch);
 }
 
 #[cfg(test)]
