@@ -279,89 +279,91 @@ re-derive on its own (`Period` schedule and `throttle_ms` from the recorded
 clock, `Sync` alignment, FIFO pop counts from the read log, and a
 `consume = latest` node's one fire per step from the read log's drains) are
 re-derived and positionally compared, so policy or declaration drift on those is still caught.
-A node that produces a topic a `block` input in its own rank reads can have a
-fire held by that edge's pre-fire check after its trigger drain popped, with no
-record. The FIFO rule allows for it only at a step where the recording shows
-the slot full: where the frames the bag records on the topic, the step's own
-included, outnumber those the consumer's body reads drained before that step
-by at least the input's depth. A frame whose stamp several steps share counts
-at the last of them, and a drain at an earlier one is owed against it there.
-A body read that finds the queue empty, or any body read of a latest-value
-input (`consume = latest`, or any input that is not a FIFO trigger), leaves
-the slot empty, and inside a stamp several
-steps share it counts none of that stamp's frames. A slot the bag cannot
-account for allows for no hold: the bag records no frames of the topic or a
-frame header it cannot parse, its record-health stamp is absent or malformed,
-keeps no entry for the topic, reports the topic lossy or written by several
-publishers (declared or observed), or any frame drained and never written,
-the bag has no `recorder.json` or one stamped below `trace_format` 12, so its
-trace does not hold the stop that releases a consumer's slot, the producer's
-metadata says it needs a publisher for every output and the recording shows it
-sending more frames at a stamp than it fired at that stamp, which several steps
-can share, the graph lists the topic in
-`multi_publisher_topics`, the recording does not pin
-the input's `block` policy and depth (its `recorder.json` names the input's
-queue with another policy or depth than the replayed build gives it, or, on a
-bag recorded before that key, its graph does not set both `backpressure: block`
-and `depth:` for the input), the input sets
-`block_timeout_ms`, whose release forgives the slot's frames with no record,
-the bag's fire records do not put the reading node on a later level than the
-producer (its read can then drain the slot before the producer decides in the
-same step, or the bag does not show the order, and such an edge leaves the
-slot uncounted), or the input is a Sync node's trigger input, which its
-matcher pops outside the node's body. A node the recording fired at more than
-one level, or never fired, orders no edge. From the step after a truncated
-read of the input, a drain whose site the read log does not say, or, before
-any body read of the input is recorded, a consumer fire the recording does not
-show ended before the input, the slot allows for none;
-nor on a resumed pass until the consumer first reads its queue empty; nor, on
-a latest-value input, from the step after a consumer fire with no read of it
-recorded, which can hide a drain, through the step at which the consumer next
-reads it. Such an input is read only by its consumer's tick, which records the
-read unless its receive fails, and a read whose receive fails can have popped
-first. A fire the
-recording shows ended at an input the tick reads earlier drained nothing: a
-`#[cerulion_node]` node's tick reads its inputs, `accumulate` ones aside, in
-declaration order and ends at the first that serves nothing, which records an
-empty read: a step-boundary input read empty ends every fire of its step, and
-a `sample(N)` trigger input whose gate dropped the frame ends that fire. For a
-node whose metadata does not say it needs a publisher for every output, which
-that macro sets, every such fire can hide a drain of a latest-value input. A
-FIFO input drains only at its consumer's recorded reads: a FIFO read records
-the frame it takes before its view checks the frame, and one whose receive
-fails has taken only frames too short for a wire header, which leave the bag
-unable to account for the slot; so a consumer fire with no read of it recorded
-drains nothing.
-A consumer's stop releases its slot from the next step on: a fatal error, or a
-poisoned node entry, whose node keeps firing with its tick skipped; the
-consecutive-panic breaker releases none. While a slot holds, the
-check stops the producer at the input's depth before each of its fires, so a
-producer the recording shows firing at a step whose slot already counts its
-depth before that step's frames was released with no record. A
-`#[cerulion_node]` or Python node sends at most one frame per output per fire,
-so its slot never passes the depth while it holds, and the verifier reads a
-count past the depth as a release where the producer's metadata says it needs
-a publisher for every output, which the macro sets (a `--raw-ffi` node whose
-metadata sets that flag by hand is read the same way). A `--raw-ffi` node can
-send several frames in one fire, so a count past the depth from any producer
-whose metadata does not set the flag, a Python node's included, is not read as
-a release. A released slot allows for no hold from that step on, and a step
-only it excused since its consumer last read it is a divergence that says so. A
-slot that a consumer's stop released is not held to either after the stop. As
-for a throttle,
-whose window the rule reads off the recorded clock, a step no such check could
-defer owes every popped frame a fire. Read through one
-subscriber, such a node may leave one popped frame unfired at a step a check
-could defer, or at a step that fired the scheduler's cap of 64, and the
-replay pops that frame after the step's last fire, as the live burst did, so
-the next fire serves it. Read through two subscribers (a
-`block` or `sample(N)` trigger input, or `CERULION_DRAIN_DISCIPLINE=separate`),
-it carries every signal such a step left unfired, up to the scheduler's clamp.
-A bag that does not record how a FIFO input was read judges a `drop_oldest`
-trigger input without allowing for the hold, and a fire-schedule divergence on
-a short step there at which the bag shows the slot full says so; a `block` or
-`sample(N)` trigger input is read through two subscribers on any bag, and is
-judged as above.
+
+**A node held by a `block` input in its own rank.** When a `block` input reads
+a topic that a node in the same rank produces, that edge's pre-fire check can
+hold the producer after its trigger drain popped a frame, and nothing records
+the hold. The FIFO rule allows for it only at a step where the recording shows
+the slot full: the frames the bag records on the topic, that step's included,
+outnumber those the consumer's body reads drained before that step by at least
+the input's depth.
+
+- A frame whose stamp several steps share counts at the last of them, and a
+  drain at an earlier one is owed against it there.
+- A body read that finds the queue empty, or any body read of a latest-value
+  input (`consume = latest`, or any input that is not a FIFO trigger), empties
+  the slot; inside a shared stamp, such a read leaves none of that stamp's
+  frames counted.
+- A FIFO input drains only at its consumer's recorded reads.
+- A fire the recording shows ended at an input the tick reads earlier drained
+  nothing of the `block` input. A `#[cerulion_node]` tick reads its inputs in
+  declaration order, `accumulate` ones aside, and ends at the first that serves
+  nothing; an empty read of a context input that the tick reads frozen at the
+  step boundary ends every fire of its step. The recording shows such an end
+  only for a consumer whose metadata says it needs a publisher for every
+  output, which that macro sets.
+
+The slot is released, and holds nothing from then on:
+
+- from the step after its consumer stops on a fatal error or a poisoned node
+  entry;
+- with no record, at a step where the recording shows the producer firing
+  while the slot already counts its depth before that step's frames, since,
+  while the slot holds, the check stops the producer at the depth before each
+  fire;
+- with no record, at a step where the slot counts past its depth, if the
+  producer's metadata says it needs a publisher for every output.
+
+The consecutive-panic breaker releases no slot. After a stop that releases
+the slot, the two releases with no record do not apply. `#[cerulion_node]`
+sets that metadata, a `--raw-ffi` node may set it by hand, and a Python node
+cannot. Without it, a count past the depth is no release, since a `--raw-ffi`
+node can send several frames in one fire. A step excused only by holds is a
+divergence, and the finding says why, if every slot that excused it shows a
+release with no record before its consumer next reads it.
+
+The slot allows for no hold where:
+
+- the bag records no frame of the topic, or a frame header it cannot parse;
+- its record-health stamp is absent or malformed, has no entry for the topic,
+  reports the topic lossy or written by several publishers (declared or
+  observed), or reports any frame in the bag drained and never written;
+- the bag has no `recorder.json`, or one stamped below `trace_format` 12;
+- the producer's metadata says it needs a publisher for every output, and the
+  recording shows it sending more frames at a stamp than it fired there;
+- the graph lists the topic in `multi_publisher_topics`;
+- the recording does not pin the input's `block` policy and depth: the
+  `node_inputs` entry of its `recorder.json` gives another policy or depth
+  than the replayed build, or, on a bag recorded before `node_inputs`, its
+  graph does not set both `backpressure: block` and `depth:` for the input;
+- the input sets `block_timeout_ms`;
+- the bag's fire records do not put the consumer on a later level than the
+  producer (a node fired at more than one level, or never, orders no edge);
+- the input is a Sync node's trigger input.
+
+It also allows for no hold:
+
+- from the step after a truncated read of the input, or a drain whose site
+  the read log does not say;
+- before any body read of the input is recorded, from the step after a
+  consumer fire that the recording does not show ended before the input;
+- on a resumed pass, until the consumer first reads its queue empty;
+- on a latest-value input, from the step after a consumer fire that can hide
+  a drain of it (no read of it recorded, and the recording does not show the
+  fire ended before it), through the consumer's next read of it.
+
+A step that neither the throttle nor the hold could defer owes every popped
+frame a fire; the throttle's window comes from the recorded clock. Read through
+one subscriber, a held node may leave one popped frame unfired at a step the
+throttle or the hold could defer, or at a step that fired the scheduler's cap
+of 64; the replay pops that frame after the step's last fire, as the live burst
+did, so the next fire serves it. Read through two subscribers (a `block` or
+`sample(N)` trigger input, or `CERULION_DRAIN_DISCIPLINE=separate`), it carries
+every signal such a step left unfired, up to the same cap. On a bag that does
+not record how a FIFO input was read, a `drop_oldest` trigger input is judged
+without the hold, and a divergence on a short step there at which the bag
+shows the slot full says so.
+
 A `consume = latest` input read through a second subscriber is also held to the
 frames its trigger drain counted: a step that counted more frames since the
 node's last fire than that fire's read took, plus two per writer still
