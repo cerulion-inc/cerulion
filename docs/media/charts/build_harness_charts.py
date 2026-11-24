@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""Draw the two harness benchmark charts from their results package.
+"""Draw the three harness benchmark charts from their results package.
 
 It replots a committed package. It never runs a benchmark and never edits a package.
 
@@ -47,8 +47,8 @@ The form of the two detailed charts:
     finished ("73 of 100", SUMMARY.md's form);
   - the cost scale ends at 30 USD, and a bar past it is drawn to the edge with a break and its value
     printed at its end; an arm that solved nothing reads "none solved", as in SUMMARY.md;
-  - no factor column: a ratio of two package figures is a number the package does not print, so each
-    row carries only the two arms' own figures;
+  - no factor column: the package prints no factor of its USD per solved start state or of its solved
+    counts per model, so each row carries only the two arms' own figures;
   - a model whose column had not finished at the package's read carries a star, and a footnote gives
     its finished counts and the read time;
   - the success chart's footer counts the models that solved fewer start states with Cerulion and
@@ -366,6 +366,7 @@ def cost_chart(rows, when, cells, task_rows, fnum, unscored, lost_usd, filtered)
 RESULTS_THEME = [  # (custom property, light, dark)
     ("r-paper", "#ffffff", "#0d1117"),
     ("r-ink", "#0f1419", "#e6edf3"),
+    ("r-mark", "#000000", "#ffffff"),     # the OpenAI and xAI marks, black or white as their owners offer them
     ("r-muted", "#6b7280", "#9198a1"),
     ("r-shared", "#8c8c8c", "#6e7681"),   # up to the smaller count
     ("r-gain", "#2b7bd8", "#4a8fe6"),     # gained with Cerulion, and the hatch of those lost
@@ -410,7 +411,7 @@ def maker_mark(model, cy, marks):
     RESULTS_THEME, the makers' own."""
     if model.startswith("GPT"):
         body = (f'<svg x="275" y="{cy - 15}" width="30" height="30" viewBox="0 0 24 24" '
-                f'style="fill:{r_var("ink")}">{marks.OPENAI}</svg>')
+                f'style="fill:{r_var("mark")}">{marks.OPENAI}</svg>')
         name = "openai"
     elif model.startswith("Claude"):
         body = (f'<svg x="275" y="{cy - 15}" width="30" height="30" viewBox="0 0 24 24" '
@@ -421,7 +422,7 @@ def maker_mark(model, cy, marks):
         name = "google"
     elif model.startswith("Grok"):
         body = (f'<svg x="271" y="{cy - 7}" width="38" height="14.5" viewBox="{marks.XAI_VIEWBOX}" '
-                f'style="fill:{r_var("ink")}"><path d="{marks.XAI}"/></svg>')
+                f'style="fill:{r_var("mark")}"><path d="{marks.XAI}"/></svg>')
         name = "xai"
     else:
         raise SystemExit(f"build_harness_charts: no maker's mark for {model}")
@@ -474,7 +475,7 @@ def results_chart(rows, cols, rc, filtered, cells):
     for i, r in enumerate(rows):
         m, cy = r["model"], R_TOP + i * R_PITCH
         wo, wi = r["without"], r["with"]
-        if wo["finished"] != cells or wi["finished"] != cells:
+        if cells != 100 or wo["finished"] != cells or wi["finished"] != cells:
             raise SystemExit(f"build_harness_charts: {m} did not finish all {cells} start states in both arms, so a "
                              f"count is not a percent")
         a, b = wo["solved"], wi["solved"]
@@ -491,16 +492,20 @@ def results_chart(rows, cols, rc, filtered, cells):
             o.append(f'<rect x="{R_X0 + 1 + lo * R_PER + gap:.1f}" y="{y:g}" width="{(b - a) * R_PER - gap:.1f}" '
                      f'height="{R_BH}" rx="2.5" style="fill:{r_var("gain")}"/>')
         elif a > b:
-            o.append(f'<rect x="{R_X0 + 1 + lo * R_PER + 2:.1f}" y="{y + 0.75:g}" width="{(a - b) * R_PER - 2:.1f}" '
-                     f'height="{R_BH - 1.5:g}" rx="2" style="fill:url(#lost);stroke:{r_var("gain")}" '
-                     f'stroke-width="1.5"/>')
+            w = (a - b) * R_PER - 2
+            # a narrow loss keeps its hatch: under 4 px the outline would cover it and read as a gain
+            edge = f';stroke:{r_var("gain")}" stroke-width="1.5' if w >= 4 else ""
+            o.append(f'<rect x="{R_X0 + 1 + lo * R_PER + 2:.1f}" y="{y + 0.75:g}" width="{w:.1f}" '
+                     f'height="{R_BH - 1.5:g}" rx="2" style="fill:url(#lost){edge}"/>')
         end = R_X0 + 1 + max(a, b) * R_PER + 13
         o.append(f'<text x="{end:.1f}" y="{cy + 9}" font-size="26"><tspan style="fill:{muted}">{a} \u2192 </tspan>'
                  f'<tspan font-weight="700" style="fill:{ink}">{b}%</tspan></text>')
         (_uo, _ui, uf, uword), (_so, _si, sf, sword) = factor[m]
         if uf is None or sf is None:
             raise SystemExit(f"build_harness_charts: {m} has no cost or time factor in the package")
-        for x, f, good in ((R_COST_X, uf, uword != "dearer"), (R_TIME_X, sf, sword != "slower")):
+        if uword not in ("cheaper", "dearer") or sword not in ("faster", "slower"):
+            raise SystemExit(f"build_harness_charts: {m} has a factor word the chart does not draw: {uword}, {sword}")
+        for x, f, good in ((R_COST_X, uf, uword == "cheaper"), (R_TIME_X, sf, sword == "faster")):
             # a factor in Cerulion's favour in green; against it in red, with an arrow for dearer (up) or slower (down)
             shown = f"{f}\u00d7" if good else (f"\u2191 {f}\u00d7" if x == R_COST_X else f"\u2193 {f}\u00d7")
             o.append(f'<text x="{x}" y="{cy + 9}" font-size="26" font-weight="700" '
@@ -508,7 +513,7 @@ def results_chart(rows, cols, rc, filtered, cells):
     note = "without = a published 3-tool interface" + (" \u00b7 \u2020 baseline cut short by a content filter" if cut else "")
     o.append(f'<text x="37" y="1288" font-size="20" style="fill:{muted}">{note}</text>')
     o.append(f'<text x="37" y="1317" font-size="20" style="fill:{muted}">cheaper, faster = model cost and wall time per '
-             f'episode, with and without {NAME}</text>')
+             f'scored episode, with and without {NAME}</text>')
     o.append("</svg>")
     svg = "".join(o) + "\n"
     body = re.sub(r'<g data-mark="[a-z]+">.*?</g>', "", svg.replace(results_style(), "", 1))
@@ -547,7 +552,8 @@ def main(argv):
                 fh.write(svg)
             print(f"wrote docs/media/{name}")
     if stale:
-        print("build_harness_charts: differs from the package (run without --check): " + ", ".join(stale))
+        print("build_harness_charts: differs from the package or the Cerulion lockup twins (run without --check): "
+              + ", ".join(stale))
         return 1
     print(f"build_harness_charts: OK ({len(outputs)} charts, {len(rows)} models, read {when})")
     return 0

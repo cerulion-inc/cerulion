@@ -414,12 +414,12 @@ Each of 16 models ran the same 100 LIBERO-PRO start states twice, with the same 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/harness-results-dark.svg">
   <source media="(prefers-color-scheme: light)" srcset="docs/media/harness-results-light.svg">
-  <img src="docs/media/harness-results.svg" alt="Robot task success rate per model, without and with Cerulion, for 16 models on the same 100 LIBERO-PRO start states, with each model's cost and wall time per episode with Cerulion as a factor of its cost and time without.">
+  <img src="docs/media/harness-results.svg" alt="Robot task success rate per model, without and with Cerulion, for 16 models on the same 100 LIBERO-PRO start states, and how many times cheaper or dearer, and faster or slower, a scored episode was with Cerulion; Claude Fable 5.2's was dearer and slower.">
 </picture>
 
-Cost is model spend per scored episode at the list prices of one dated table, cached input at the cached rate, and part of the gap is caching; wall time includes each endpoint's stalls. A red arrow marks the one model whose episodes cost more (up) and took longer (down) with Cerulion.
+Cost and wall time are per scored episode: cost is model spend at the list prices of one dated table, cached input at the cached rate, and part of the gap is caching; wall time includes each endpoint's stalls and resent requests, on machines shared with other work. A red arrow marks the one model whose episodes cost more (up) and took longer (down) with Cerulion; counting its one episode the 90 minute clock ended, Claude Fable 5.2's episodes averaged 2.00 against 1.50 USD and 535.0 against 250.4 seconds.
 
-**Limits:** one benchmark family, and while the 100 start states are new, their 25 task rows are ones the harness was developed on; the run with Cerulion also reads the robot's calibration record; the 4 models that solved fewer are the 4 with the highest scores without Cerulion, and none of those 4 differences is established; GPT-6.1 Terra was added after the grid's first rows had been seen and Gemini 4 Neon after every other column had been read; simulation only. The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) has every episode and a script that recomputes every figure.
+**Limits:** one benchmark family, and while the 100 start states are new, their 25 task rows are ones the harness was developed on; the run with Cerulion also reads the robot's calibration record; the 4 models that solved fewer are the 4 with the highest scores without Cerulion, and none of those 4 is significant at 0.05, so each reads "no difference shown"; GPT-6.1 Terra was added after the grid's first rows had been seen and Gemini 4 Neon after every other column had finished and been read; simulation only. The [harness results package](docs/benchmarks/results/7cb9f322c10f6fa7-2026-11-18-harness-libero-pro/) has every episode and a script that recomputes every figure.
 
 <a id="performance"></a>
 

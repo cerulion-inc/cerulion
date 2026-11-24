@@ -29,7 +29,7 @@ for name in "${@:-native-rtt}"; do
 </div></body>
 HTML
     "$CHROME" --headless=new --disable-gpu --hide-scrollbars --force-device-scale-factor=2 \
-      --window-size=984,1000 --screenshot="out/renders/$name.github-$theme.png" "file://$PWD/$page" 2>/dev/null
+      --window-size=984,1400 --screenshot="out/renders/$name.github-$theme.png" "file://$PWD/$page" 2>/dev/null
     rm -f "$page"
     echo "rendered $name in the $theme theme"
   done
